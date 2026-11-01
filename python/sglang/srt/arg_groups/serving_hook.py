@@ -888,6 +888,21 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
         requested_transport = "cpu"
 
+    if cfg.mm_admission_timeout_ms is not None:
+        if cfg.mm_admission_timeout_ms < 0:
+            raise ValueError("--mm-admission-timeout-ms must be non-negative")
+        if requested_transport not in ("cuda_ipc", "cuda_vmm"):
+            raise ValueError("--mm-admission-timeout-ms requires GPU feature transport")
+        if cfg.disaggregation_mode != "null" or cfg.encoder_only:
+            raise ValueError(
+                "Multimodal admission currently supports normal serving only"
+            )
+        logger.info(
+            "GPU feature publication admission: timeout=%d ms; pool exhaustion "
+            "rejects requests without CPU spill (preprocessing is not bounded).",
+            cfg.mm_admission_timeout_ms,
+        )
+
     if requested_transport == "cuda_vmm":
         if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")

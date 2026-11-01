@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,8 @@ class PoolLease:
 class StreamOrderedMmFeaturePool:
     """Bounded GPU pool with generation-safe producer/consumer leases."""
 
+    on_capacity_change = None
+
     def __init__(
         self,
         *,
@@ -227,6 +230,8 @@ class StreamOrderedMmFeaturePool:
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
         self._lock = threading.Lock()
+        self.on_capacity_change = None
+        self._pool_error = None
         self._recycle_interval = recycle_interval
         self._recycler_stop_event = threading.Event()
         self._recycle_thread = threading.Thread(
@@ -254,14 +259,15 @@ class StreamOrderedMmFeaturePool:
         ]
         if not candidates or not self._available_slots:
             return None
+        slot = self._available_slots[-1]
+        generation = self._slot_generations[slot] + 1
+        if generation > 0x7FFFFFFF:
+            raise RuntimeError(f"{self.transport_name} pool slot generation exhausted")
         _, index, start, end = min(candidates)
         self._available_ranges.pop(index)
         if start + allocation_bytes < end:
             self._available_ranges.append((start + allocation_bytes, end))
-        slot = self._available_slots.pop()
-        generation = self._slot_generations[slot] + 1
-        if generation > 0x7FFFFFFF:
-            raise RuntimeError(f"{self.transport_name} pool slot generation exhausted")
+        self._available_slots.pop()
         self._slot_generations[slot] = generation
         ready_byte_offset = slot * self.control_words_per_slot * CONTROL_WORD_BYTES
         lease = PoolLease(
@@ -275,6 +281,65 @@ class StreamOrderedMmFeaturePool:
         )
         self._occupied[slot] = lease
         return lease
+
+    def try_reserve_batch(self, sizes: list[int]) -> Optional[list[PoolLease]]:
+        """Reserve all ranges and control slots, or leave no partial ownership."""
+        required = sum(align_up(size, DATA_ALIGNMENT) for size in sizes)
+        if required > self.usable_size or len(sizes) > self.max_inflight_slices:
+            raise MmMemoryRequestTooLarge(
+                f"CUDA IPC publication needs {required} bytes/{len(sizes)} slots; "
+                f"capacity is {self.usable_size} bytes/{self.max_inflight_slices} slots"
+            )
+        with self._lock:
+            if self._pool_error is not None:
+                raise RuntimeError("CUDA IPC feature pool failed") from self._pool_error
+            if self._recycler_stop_event.is_set():
+                raise RuntimeError("CUDA IPC feature pool is closing")
+            leases = []
+            complete = False
+            try:
+                for size in sizes:
+                    lease = self._allocate_locked(size)
+                    if lease is None:
+                        return None
+                    leases.append(lease)
+                complete = True
+                return leases
+            finally:
+                if not complete:
+                    for lease in leases:
+                        self._release_locked(lease)
+                    self._merge_ranges_locked()
+
+    def release_reserved_batch(self, leases: list[PoolLease]) -> None:
+        """Release reservations only before copy starts or after stream completion."""
+        with self._lock:
+            for lease in leases:
+                self._release_locked(lease)
+            self._merge_ranges_locked()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
+
+    def copy_reserved_batch(
+        self, tensors: list[torch.Tensor], leases: list[PoolLease]
+    ) -> list[torch.Tensor]:
+        destinations = []
+        try:
+            for tensor, lease in zip(tensors, leases, strict=True):
+                _, destination = self.copy_tensor(tensor, lease=lease)
+                destinations.append(destination)
+            torch.cuda.current_stream(self.device_id).synchronize()
+            return destinations
+        except BaseException:
+            # cancellation/failure cannot make bytes reusable while an enqueued
+            # copy still touches them; a failed CUDA sync poisons the pool
+            try:
+                torch.cuda.current_stream(self.device_id).synchronize()
+            except BaseException as error:
+                self._pool_error = error
+                raise
+            self.release_reserved_batch(leases)
+            raise
 
     def _release_locked(self, lease: PoolLease) -> None:
         active_lease = self._occupied.get(lease.slot)
@@ -296,10 +361,11 @@ class StreamOrderedMmFeaturePool:
                 merged.append((start, end))
         self._available_ranges = merged
 
-    def _recycle_ready_leases_locked(self) -> None:
-        if not self._occupied:
+    def _recycle_ready_leases(self) -> None:
+        with self._lock:
+            leases = list(self._occupied.values())
+        if not leases:
             return
-        leases = list(self._occupied.values())
         slot_indices = torch.tensor(
             [lease.slot for lease in leases],
             dtype=torch.long,
@@ -316,17 +382,22 @@ class StreamOrderedMmFeaturePool:
             .cpu()
             .tolist()
         )
-        for lease, is_complete in zip(leases, completed):
-            if is_complete:
-                self._release_locked(lease)
-        self._merge_ranges_locked()
+        reclaimed = False
+        with self._lock:
+            for lease, is_complete in zip(leases, completed):
+                if is_complete and self._occupied.get(lease.slot) is lease:
+                    self._release_locked(lease)
+                    reclaimed = True
+            self._merge_ranges_locked()
+        if reclaimed and self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _recycle_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         while not self._recycler_stop_event.is_set():
             try:
-                with self._lock, torch.cuda.device(self.device_id):
-                    self._recycle_ready_leases_locked()
+                with torch.cuda.device(self.device_id):
+                    self._recycle_ready_leases()
             except Exception:
                 logger.warning(
                     "%s multimodal pool recycle failed",
@@ -336,7 +407,7 @@ class StreamOrderedMmFeaturePool:
             self._recycler_stop_event.wait(self._recycle_interval)
 
     def copy_tensor(
-        self, tensor: torch.Tensor
+        self, tensor: torch.Tensor, *, lease: Optional[PoolLease] = None
     ) -> tuple[Optional[PoolLease], Optional[torch.Tensor]]:
         if not tensor.is_cuda:
             raise ValueError(f"{self.transport_name} requires a CUDA tensor")
@@ -344,8 +415,10 @@ class StreamOrderedMmFeaturePool:
         nbytes = source.numel() * source.element_size()
         if nbytes == 0:
             raise ValueError(f"{self.transport_name} cannot transport an empty tensor")
-        with self._lock:
-            lease = self._allocate_locked(nbytes)
+        reserved = lease is not None
+        if not reserved:
+            with self._lock:
+                lease = self._allocate_locked(nbytes)
         if lease is None:
             return None, None
 
@@ -362,9 +435,13 @@ class StreamOrderedMmFeaturePool:
                     self.transport_name,
                 )
         except Exception:
-            with self._lock:
-                self._release_locked(lease)
-                self._merge_ranges_locked()
+            if not reserved:
+                try:
+                    torch.cuda.current_stream(self.device_id).synchronize()
+                except BaseException as error:
+                    self._pool_error = error
+                    raise
+                self.release_reserved_batch([lease])
             raise
         return lease, destination
 

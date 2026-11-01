@@ -17,7 +17,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
@@ -199,6 +201,8 @@ def get_vmm_feature_consumer_count() -> int:
 class CudaVmmMemoryPool:
     """Bounded CUDA VMM pool shared through FABRIC or a local POSIX FD."""
 
+    on_capacity_change = None
+
     def __init__(
         self,
         memory_size: int,
@@ -226,6 +230,7 @@ class CudaVmmMemoryPool:
         self._stop_recycler = threading.Event()
         self._pool_error: BaseException | None = None
         self._closed = False
+        self.on_capacity_change = None
 
         self._allocation: VmmReservation | None = None
         self.allocation_size = 0
@@ -388,12 +393,67 @@ class CudaVmmMemoryPool:
             if self._active_publishers == 0:
                 self._publisher_condition.notify_all()
 
-    def wrap_tensor(self, tensor: torch.Tensor):
-        self._raise_if_failed()
+    def reservation_size(self, nbytes: int) -> int:
+        return align_up(self.control_size + nbytes, _CONTROL_ALIGNMENT)
+
+    @property
+    def publication_capacity(self):
+        return self.allocation_size
+
+    def set_capacity_callback(self, callback):
+        self.on_capacity_change = callback
+
+    def try_reserve_batch(self, sizes: list[int]):
+        required = [self.reservation_size(size) for size in sizes]
+        if sum(required) > self.allocation_size:
+            raise MmMemoryRequestTooLarge(
+                f"CUDA VMM publication needs {sum(required)} bytes; "
+                f"capacity is {self.allocation_size} bytes"
+            )
+        with self._publisher_condition:
+            self._raise_if_failed()
+            if self._closing or self._closed:
+                raise RuntimeError("CUDA VMM multimodal pool is closing")
+            chunks = []
+            for size in required:
+                chunk = self._reserve_chunk(size)
+                if chunk is None:
+                    for reserved in chunks:
+                        self._release_reserved_chunk(reserved)
+                    return None
+                chunks.append(chunk)
+            self._active_publishers += len(chunks)
+            return chunks
+
+    def release_reserved_batch(self, chunks) -> None:
+        with self._publisher_condition:
+            for chunk in chunks:
+                self._release_reserved_chunk(chunk)
+            self._active_publishers -= len(chunks)
+            self._publisher_condition.notify_all()
+
+    def publish_reserved_batch(self, tensors, chunks):
+        proxies = []
+        try:
+            for tensor, chunk in zip(tensors, chunks, strict=True):
+                proxies.append(self.wrap_tensor(tensor, reserved_chunk=chunk))
+            return proxies
+        except BaseException:
+            # wrap_tensor owns the failed slice; the rest have never seen CUDA
+            self.release_reserved_batch(chunks[len(proxies) + 1 :])
+            for proxy in proxies:
+                self.cancel_proxy(proxy)
+            raise
+
+    def wrap_tensor(self, tensor: torch.Tensor, *, reserved_chunk=None):
+        if reserved_chunk is None:
+            self._raise_if_failed()
         data_nbytes = tensor.numel() * tensor.element_size()
         required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
 
-        chunk = self._reserve_for_publish(required_size)
+        chunk = reserved_chunk
+        if chunk is None:
+            chunk = self._reserve_for_publish(required_size)
         if chunk is None:
             self._warn_pool_full_once(data_nbytes)
             return tensor.cpu()
@@ -401,6 +461,7 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
+            self._raise_if_failed()
             if tensor.is_cuda:
                 self._publish_stream.wait_stream(
                     torch.cuda.current_stream(tensor.device)
@@ -569,6 +630,8 @@ class CudaVmmMemoryPool:
             self.occupied_chunks.remove(chunk)
         self.available_chunks.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
         self._merge_chunks()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _cancel_control_offset(self, control_offset: int) -> None:
         with self._lock:
@@ -649,6 +712,8 @@ class CudaVmmMemoryPool:
                         _CudaVmmMemoryChunk(chunk.start, chunk.end)
                     )
             self._merge_chunks()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _merge_chunks(self) -> None:
         merged = []
@@ -1002,6 +1067,8 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
 class CudaVmmFeatureTransport:
     """Tokenizer-owned VMM transport for one tokenizer worker."""
 
+    _guarded_publisher = None
+
     def __init__(self, server_args, mm_processor) -> None:
         self.pool: CudaVmmMemoryPool | None = None
         self._publisher_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -1027,6 +1094,10 @@ class CudaVmmFeatureTransport:
             max_workers=1,
             thread_name_prefix="cuda-vmm-publisher",
         )
+        if get_mm().mm_admission_timeout_ms is not None:
+            self._guarded_publisher = BoundedFeaturePublisher(
+                self.pool, get_mm().mm_admission_timeout_ms, cpu_tensors=True
+            )
 
     async def prepare_for_dispatch_async(
         self,
@@ -1034,6 +1105,8 @@ class CudaVmmFeatureTransport:
     ) -> list[MultimodalDataItem]:
         """Publish features without blocking the tokenizer event loop."""
         mm_inputs_batch = tuple(mm_inputs_batch)
+        if self._guarded_publisher is not None:
+            return await self._guarded_publisher.prepare(mm_inputs_batch)
         if self.pool is None or not any(
             mm_inputs is not None and mm_inputs.mm_items
             for mm_inputs in mm_inputs_batch
@@ -1194,6 +1267,8 @@ class CudaVmmFeatureTransport:
     def shutdown(self) -> None:
         if self.pool is None:
             return
+        if self._guarded_publisher is not None:
+            self._guarded_publisher.shutdown()
         publisher_executor = self._publisher_executor
         if publisher_executor is not None:
             publisher_executor.shutdown(wait=True, cancel_futures=True)

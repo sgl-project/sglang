@@ -2839,12 +2839,9 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming chat completion request"""
-        try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
-        except ValueError as e:
-            return self.create_error_response(str(e))
+        ret = await self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
 
         if not isinstance(ret, list):
             ret = [ret]

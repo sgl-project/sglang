@@ -6,9 +6,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.transport.memory_pool import (
+    DATA_ALIGNMENT,
     DEFAULT_MAX_INFLIGHT_SLICES,
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,
+    align_up,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,41 @@ class MmItemMemoryPool:
     @property
     def active_lease_count(self) -> int:
         return self._pool.active_lease_count
+
+    @property
+    def publication_capacity(self):
+        return self._pool.usable_size
+
+    def reservation_size(self, nbytes):
+        return align_up(nbytes, DATA_ALIGNMENT)
+
+    def set_capacity_callback(self, callback):
+        self._pool.on_capacity_change = callback
+
+    def try_reserve_batch(self, sizes):
+        return self._pool.try_reserve_batch(sizes)
+
+    def release_reserved_batch(self, leases):
+        self._pool.release_reserved_batch(leases)
+
+    def publish_reserved_batch(self, tensors, leases):
+        destinations = self._pool.copy_reserved_batch(tensors, leases)
+        return [
+            CudaIpcTensorTransportProxy(
+                data=destination,
+                info_data=tensor,
+                pool_ipc_handle=self._pool_ipc_handle,
+                pool_byte_offset=lease.start,
+                ready_byte_offset=lease.ready_byte_offset,
+                ack_byte_offset=lease.ack_byte_offset,
+                generation=lease.generation,
+                total_consumer_count=self.consumer_count,
+                use_pool_handle_cache=envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get(),
+            )
+            for tensor, lease, destination in zip(
+                tensors, leases, destinations, strict=True
+            )
+        ]
 
     def wrap_tensor(
         self, tensor: torch.Tensor, *, use_pool_handle_cache: bool

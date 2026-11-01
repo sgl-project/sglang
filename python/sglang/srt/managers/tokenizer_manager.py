@@ -1818,6 +1818,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prepared_embeds = []
         dispatched = False
         try:
+            if get_mm().mm_admission_timeout_ms is not None:
+                await self._prepare_guarded_cuda_ipc((tokenized_obj.mm_inputs,))
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     (tokenized_obj.mm_inputs,)
@@ -1847,8 +1849,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
             if not dispatched:
+                if get_mm().mm_admission_timeout_ms is not None:
+                    self._cancel_cuda_ipc_features((tokenized_obj,))
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+
+    async def _prepare_guarded_cuda_ipc(self, mm_inputs_batch):
+        if (
+            self.mm_processor is not None
+            and self.mm_processor.cuda_ipc_publisher is not None
+        ):
+            await self.mm_processor.cuda_ipc_publisher.prepare(mm_inputs_batch)
 
     def _drop_aborted_before_dispatch(self, tokenized_objs):
         """Return *tokenized_objs* without the requests aborted before dispatch.
@@ -1935,6 +1946,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prepared_embeds = []
         dispatched = False
         try:
+            if get_mm().mm_admission_timeout_ms is not None:
+                await self._prepare_guarded_cuda_ipc(
+                    tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+                )
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
@@ -1971,6 +1986,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
         finally:
             if not dispatched:
+                if get_mm().mm_admission_timeout_ms is not None:
+                    self._cancel_cuda_ipc_features(tokenized_objs)
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
 

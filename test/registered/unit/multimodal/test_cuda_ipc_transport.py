@@ -5,6 +5,7 @@ the bounded pool and the scheduler process opens the shared CUDA allocation.
 CPU-only policy tests intentionally cannot exercise this cross-process handle.
 """
 
+import asyncio
 import gc
 import multiprocessing as mp
 import queue
@@ -20,11 +21,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.admission import MmMemoryOverloaded
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -80,6 +83,46 @@ class TestCudaIpcTransport(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is required")
+
+    def test_guarded_batch_never_spills_and_recovers_after_ack(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        publisher = BoundedFeaturePublisher(pool, 0, cpu_tensors=False)
+        source = torch.arange(120000, dtype=torch.float32, device="cuda")
+
+        def request():
+            return MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=source)],
+            )
+
+        async def run():
+            first, second, rejected = request(), request(), request()
+            await publisher.prepare([first, second])
+            self.assertEqual(pool.active_lease_count, 2)
+            with self.assertRaises(MmMemoryOverloaded):
+                await publisher.prepare([rejected])
+            self.assertIs(rejected.mm_items[0].feature, source)
+            for output in (first, second):
+                proxy = output.mm_items[0].feature
+                self.assertIsInstance(proxy, CudaIpcTensorTransportProxy)
+                copied = proxy.reconstruct_on_target_device(0)
+                self.assertTrue(torch.equal(copied, source))
+            torch.cuda.synchronize()
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            publisher.admission.timeout_ms = 1000
+            await publisher.prepare([rejected])
+            pool.cancel_proxy(rejected.mm_items[0].feature)
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+
+        try:
+            asyncio.run(run())
+        finally:
+            publisher.shutdown()
+            pool.shutdown()
+            _pool_handle_cache_clear()
 
     def test_pooled_tensor_reconstructs_in_spawned_process(self):
         """Consumer releases the pool mapping before the producer tears down."""
