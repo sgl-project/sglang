@@ -31,7 +31,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -100,6 +100,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import get_device_sm
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -121,6 +122,20 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+
+
+# The fused FP8 prefix-valid commit kernel (set_kv_buffer_prefix_valid_tiled_fp8)
+# compiles fp8e4nv in Triton, which only lowers on SM89+ (Ada/Hopper). sm_86
+# (Ampere, e.g. RTX 3090) cannot build it and must fall back to the eager
+# quantization path below instead of crashing. ROCm's fp8 types are unaffected,
+# so gate by HIP first and apply the SM89+ threshold only on CUDA. Evaluated
+# lazily (at first dispatch, not at import) so we never initialize CUDA at
+# import time and poison fork() startup (see get_device_sm's comment).
+@lru_cache(maxsize=1)
+def _fp8_fused_prefix_valid_supported() -> bool:
+    return _is_hip or get_device_sm() >= 89
+
+
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -2105,6 +2120,7 @@ def _set_mha_kv_buffer_prefix_valid(
         and pool.dtype == fp8_dtype
         and fused_k_scale is not None
         and fused_v_scale is not None
+        and _fp8_fused_prefix_valid_supported()
     ):
         _set_kv_buffer_prefix_valid_impl_fp8(
             cache_k,
