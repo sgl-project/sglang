@@ -135,6 +135,25 @@ class TestRouterGemv(CustomTestCase):
         for out, ref in zip(outs, eager):
             self.assertTrue(torch.equal(out, ref))
 
+    def test_partials_survive_a_router_call_on_another_stream(self):
+        """Each stream has its own scratch, so another stream's router call leaves a
+        caller's split-K partials as they were."""
+        from sglang.kernels.ops.gemm.router_gemv import (
+            router_gemv,
+            router_gemv_partials,
+        )
+
+        x, other = self._x(256), self._x(512)
+        partials = router_gemv_partials(x, self.w)
+        ref = partials.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            router_gemv(other, self.w)
+            router_gemv_partials(other, self.w)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(partials, ref))
+
 
 if __name__ == "__main__":
     unittest.main()
