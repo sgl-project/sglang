@@ -4637,7 +4637,7 @@ class Scheduler(
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
-        self.invariant_checker.maybe_check_inflight_steps(batch)
+        self.invariant_checker.maybe_check_batch_consistency(batch)
         batch.drop_inflight_step()
         # Running requests finish only in a step's processing.
         self.running_reqs.leave_finished()

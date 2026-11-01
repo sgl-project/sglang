@@ -503,7 +503,7 @@ class SchedulerInvariantChecker:
             chunked_req=self.get_chunked_req(),
         )
 
-    def maybe_check_inflight_steps(self, batch: ScheduleBatch) -> None:
+    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed with the
         requests it was launched with, each counted in flight."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
