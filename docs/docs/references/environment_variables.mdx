@@ -577,6 +577,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Split CUDA k-pool prefill query rows across attention TP ranks when a batch has at least 4096 rows and rows times pooled keys reach 100 million. Each rank computes logits and top-k for its own rows, then gathers the selected indices. Prefill context parallelism, scattered attention inputs, and graph capture and replay keep the replicated path. Checked on B200 at TP2 and TP4 only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use deterministic FlashInfer topk kernels when either <code>--dsa-topk-backend=flashinfer</code> or <code>--speculative-dsa-topk-backend=flashinfer</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -2398,7 +2403,3 @@ MPS and does not read them.
     </tr>
   </tbody>
 </table>
-
-### K-pool indexer prefill query sharding
-
-Set `SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP=1` to partition large CUDA k-pool prefill query rows across attention TP ranks. The default is off. Each rank computes its own logits and top-k rows, then gathers the selected indices in place. Prefill context parallelism, scattered attention inputs, graph capture and replay, small batches, and empty pooled-key sets retain the replicated path. This path was checked on TP4 B200. Other GPU types and TP sizes still need validation.
