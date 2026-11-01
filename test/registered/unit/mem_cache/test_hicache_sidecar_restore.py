@@ -30,6 +30,7 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     node = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
     node.component_data[ComponentType.MAMBA].host_value = torch.tensor([2])
     component = object.__new__(MambaComponent)
+    component.host_only_checkpoint = False
     transfers = component.build_hicache_transfers(
         node,
         CacheTransferPhase.LOAD_BACK,
