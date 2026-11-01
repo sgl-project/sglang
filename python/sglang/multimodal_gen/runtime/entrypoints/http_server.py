@@ -545,15 +545,13 @@ def create_app(
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
 
-    if (
-        server_args.api_key
-        or server_args.admin_api_key
-        or app_has_admin_force_endpoints(app)
-    ):
+    api_key = getattr(server_args, "api_key", None)
+    admin_api_key = getattr(server_args, "admin_api_key", None)
+    if api_key or admin_api_key or app_has_admin_force_endpoints(app):
         add_api_key_middleware(
             app,
-            api_key=server_args.api_key,
-            admin_api_key=server_args.admin_api_key,
+            api_key=api_key,
+            admin_api_key=admin_api_key,
         )
 
     app.add_middleware(

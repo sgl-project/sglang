@@ -15,7 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.srt.utils.auth import (
     AuthLevel,
     _iter_effective_routes,
@@ -175,6 +175,10 @@ def test_websocket_auth_handshake_on_the_wire(token, status):
             assert response.status_code == status
             assert entered == (status == 101)
         finally:
+            # Let Uvicorn observe the HTTP client's closed upgrade connection.
+            deadline = time.monotonic() + 5
+            while server.server_state.connections and time.monotonic() < deadline:
+                time.sleep(0.01)
             server.should_exit = True
             thread.join(timeout=5)
             assert not thread.is_alive(), "Uvicorn failed to stop"
@@ -227,8 +231,15 @@ def test_cli_parser_accepts_api_keys_without_exposing_them_in_repr():
     assert not server_arg_fields["admin_api_key"].repr
 
 
-def test_normal_routes_remain_open_when_no_key_is_configured():
-    client = TestClient(create_app(_server_args()))
+@pytest.mark.parametrize(
+    "missing_fields",
+    [(), ("api_key",), ("admin_api_key",), ("api_key", "admin_api_key")],
+)
+def test_normal_routes_remain_open_when_no_key_is_configured(missing_fields):
+    server_args = _server_args()
+    for name in missing_fields:
+        delattr(server_args, name)
+    client = TestClient(create_app(server_args))
 
     assert client.get("/openapi.json").status_code == 200
     assert client.post("/v1/set_lora").status_code == 422
