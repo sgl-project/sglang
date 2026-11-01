@@ -109,12 +109,20 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     def supports_sequential_multi_output_inference(self):
         return True
 
-    def validate_server_args(self, server_args) -> None:
-        if server_args.num_gpus != 1:
+    @staticmethod
+    def validate_single_gpu_replica(server_args) -> None:
+        """Allow replicated serving while rejecting intra-replica sharding."""
+        num_gpus = int(server_args.num_gpus)
+        dp_size = int(getattr(server_args, "dp_size", 1) or 1)
+        if num_gpus % dp_size != 0 or num_gpus // dp_size != 1:
             raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
+                "SenseNovaU1Pipeline currently requires one GPU per DP replica. "
+                "Set --num-gpus equal to --dp-size for replicated serving; "
+                "native tensor/pipeline parallelism is not implemented yet."
             )
+
+    def validate_server_args(self, server_args) -> None:
+        self.validate_single_gpu_replica(server_args)
         if getattr(server_args, "enable_torch_compile", False):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
