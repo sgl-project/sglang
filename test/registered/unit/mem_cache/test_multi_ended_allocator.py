@@ -1333,6 +1333,28 @@ class TestJointLRUEviction(unittest.TestCase):
         # The legacy SWA walk evicts the whole SWA leaf, Full included.
         self.assertIsNone(self._node(cache, [30, 31]))
 
+    def test_joint_walk_evicts_a_picked_window_above_a_fork(self):
+        """The SWA walk spares a window above a fork, but not one the joint order
+        picked: that entry goes, and the windows after it stay."""
+        cache, allocator = self._cache("joint_lru")
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        self._insert(cache, allocator, list(range(1, 11)))
+        other_branch = [1, 2, 3, 4, *range(30, 36)]
+        self._insert(cache, allocator, other_branch)
+        # Both matches refresh every Full leaf but not [1..4]'s SWA, outside the window.
+        self._match(cache, other_branch)
+        self._match(cache, list(range(1, 11)))
+        victims = self._record_victims(cache)
+
+        cache.evict(EvictParams(swa_num_tokens=4))
+
+        self.assertEqual(victims, [(self.SWA, [1, 2, 3, 4])])
+        fork = self._node(cache, [1, 2, 3, 4])
+        self.assertIsNone(fork.component_data[self.SWA].value)
+        self.assertIsNotNone(
+            self._node(cache, [7, 8, 9, 10]).component_data[self.SWA].value
+        )
+
     def test_dispatch_needs_joint_lru_and_unblocked_compaction(self):
         for policy, blocked, joint in (
             ("lru", False, False),
