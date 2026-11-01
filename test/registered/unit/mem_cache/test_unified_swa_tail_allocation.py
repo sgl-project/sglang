@@ -60,7 +60,11 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     allocator = bundle.token_to_kv_pool_allocator
                     if seq_len is None:
                         seq_len = allocator.available_size() + page_size
-                        self.assertFalse(allocator.can_reserve(seq_len, seq_len))
+                        self.assertFalse(
+                            allocator.admits(
+                                seq_len, allocator._window_demand(seq_len, seq_len)
+                            )
+                        )
                     prefix_capacity = -(-prefix_len // page_size) * page_size
                     prefix = allocator.alloc(prefix_capacity)[:prefix_len]
                     prefix_swa = allocator.translate_swa_indices_for_transfer(

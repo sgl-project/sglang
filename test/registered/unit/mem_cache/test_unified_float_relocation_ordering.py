@@ -14,6 +14,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    open_float_side,
     setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
@@ -76,12 +77,12 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
         torch.cuda.synchronize()
         return pool, flt, live, epp, ask, schedule, forward
 
-    def test_make_room_waits_on_the_gpu_not_the_host(self):
-        """REGRESSION: `make_room` waited for the forward before reading its
+    def test_float_move_waits_on_the_gpu_not_the_host(self):
+        """REGRESSION: a float move waited for the forward before reading its
         holes and built its page lists with pageable copies, so the scheduler
         thread stalled until the forward ended. Every live float page is
         rewritten by a delayed forward; the moved pages must carry those
-        bytes, and `make_room` must return before the forward does."""
+        bytes, and the move must return before the forward does."""
         pool, flt, live, epp, ask, schedule, forward = self._float()
         pages = flt.ids.virtual_to_physical[live].tolist()
         done = torch.cuda.Event()
@@ -94,8 +95,8 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
         flt.set_inflight_forward(done, live)
 
         with torch.cuda.stream(schedule):
-            opened = flt.make_room(side="low", min_bytes=ask)
-            self.assertFalse(done.query(), "make_room blocked the host on the forward")
+            opened = open_float_side(flt, "low", ask)
+            self.assertFalse(done.query(), "the move blocked the host on the forward")
         torch.cuda.synchronize()
         self.assertGreaterEqual(opened, ask)
         moved = flt.ids.virtual_to_physical[live].tolist()
@@ -109,7 +110,7 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
 
     def test_pages_a_forward_only_reads_move_at_once_and_stay_fenced(self):
         """A move waits only for a forward that writes a moved page. A delayed
-        forward that only reads the live pages must not hold `make_room`: the
+        forward that only reads the live pages must not hold the move: the
         copies run while it still runs. The pages it vacates stay readable:
         a take that lands on them, and a write into them, wait that forward."""
         pool, flt, live, epp, ask, schedule, forward = self._float()
@@ -126,7 +127,7 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
         flt.set_inflight_forward(done, None)
 
         with torch.cuda.stream(schedule):
-            opened = flt.make_room(side="low", min_bytes=ask)
+            opened = open_float_side(flt, "low", ask)
             copied = torch.cuda.Event()
             copied.record()
         copied.synchronize()

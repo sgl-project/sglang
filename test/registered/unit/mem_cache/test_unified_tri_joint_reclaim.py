@@ -19,10 +19,8 @@ from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     FLUSH_ENDS,
     NO_MOVE,
-    float_byte_shortfall,
-    float_end_certificate,
-    float_high_target,
-    float_reclaim_satisfied,
+    RELAYOUT,
+    feasible,
     plan,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -35,14 +33,19 @@ from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
-    chain_snapshot,
-    float_chain,
     hold_band,
+    open_float_side,
     release_band,
     setup_allocator_context,
 )
 
 register_cpu_ci(est_time=39, suite="base-a-test-cpu")
+
+
+def _pages(allocator, full_tokens, swa_tokens):
+    """A token demand as the planner reads it: pages per demanded band."""
+    demands = allocator.page_demands(full_tokens, swa_tokens)
+    return {name: pages for name, pages in demands.items() if pages}
 
 
 class TestTriJointReclaim(CustomTestCase):
@@ -229,7 +232,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Require one token pair beyond free space, so the unlocked state
         # checkpoints must make room while every token binding stays locked.
         demand = a.available_size() + 1
-        self.assertFalse(a.can_reserve(demand, demand))
+        self.assertFalse(a.admits(demand, a._window_demand(demand, demand)))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
@@ -294,16 +297,13 @@ class TestTriJointReclaim(CustomTestCase):
                             value=slots[i * 4 : (i + 1) * 4],
                         )
                     )
-                self.assertGreater(
-                    float_byte_shortfall(
-                        chain_snapshot(a),
-                        float_chain(a),
+                # No layout holds 400 tokens even with every cached entry evicted.
+                self.assertFalse(
+                    a.admits(
                         400,
-                        full_reclaim=c.full_evictable_size(),
-                        swa_reclaim=c.swa_evictable_size(),
-                        state_reclaim=c.mamba_evictable_size(),
-                    ),
-                    0,
+                        a._window_demand(400, 400),
+                        evictable=a.admission_evictable(c),
+                    )
                 )
                 prefix = torch.tensor([0])
                 seq = torch.tensor([396])
@@ -401,7 +401,7 @@ class TestTriJointReclaim(CustomTestCase):
                     key = RadixKey(array("q", range(len(slots))))
                     c.insert(InsertParams(key=key, value=slots))
                     records = [(key, slots.clone())]
-                for member in a._flush_targets():
+                for member in a.members:
                     hold_band(member)
                 if grouped:
                     a.free_group_begin()
@@ -441,7 +441,7 @@ class TestTriJointReclaim(CustomTestCase):
             self.assertEqual(walks.call_count, 0)
         # Close every movement gate. The finite request quotas may still reclaim
         # cache bytes; actual allocation and each phase remain separately visible.
-        for member in a._flush_targets():
+        for member in a.members:
             hold_band(member)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
@@ -483,7 +483,7 @@ class TestTriJointReclaim(CustomTestCase):
                 demand = a.available_size()
                 self.assertGreater(demand, a.conserve_full_available_size())
                 self.assertTrue(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), demand)
+                    feasible(a.pricing_snapshot(), _pages(a, demand, demand))
                 )
                 if entry == "direct":
                     self.assertTrue(a.ensure_capacity(demand, demand))
@@ -582,12 +582,7 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 6)
                     self.assertGreaterEqual(allocator.swa_available_size(), 6)
                     self.assertGreaterEqual(allocator.available_size(), 6)
-                    self.assertEqual(
-                        float_byte_shortfall(
-                            chain_snapshot(allocator), float_chain(allocator), 6
-                        ),
-                        0,
-                    )
+                    self.assertTrue(feasible(allocator.pricing_snapshot(), six))
                     if recovery == "prepare":
                         self.assertTrue(allocator.ensure_capacity(6, 6))
                     elif recovery == "decode":
@@ -781,12 +776,6 @@ class TestTriJointReclaim(CustomTestCase):
                     patch.object(a, "_units_fit", side_effect=checked_query),
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
                     patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError(
-                            "certified allocation used fallback"
-                        ),
-                    ),
                     patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
                     ) as prepare,
@@ -821,9 +810,10 @@ class TestTriJointReclaim(CustomTestCase):
                 self.insert_parts(c, slots, states)
                 c.evict(EvictParams(num_tokens=1))
                 self.assertEqual(c.full_evictable_size(), 95)
-                self.assertEqual(
-                    float_high_target(chain_snapshot(a), float_chain(a), 4), 256
-                )
+                # Four tokens fit only once the float moves.
+                four = _pages(a, 4, 4)
+                self.assertIsNone(plan(a.pricing_snapshot(), four, FLUSH_ENDS))
+                self.assertIsNotNone(plan(a.pricing_snapshot(), four, RELAYOUT))
                 members = {
                     "full": a.full_attn_allocator,
                     "mamba": a.mamba_allocator,
@@ -835,12 +825,8 @@ class TestTriJointReclaim(CustomTestCase):
                 self.assertTrue(a.ensure_capacity(4, 4))
                 hold_band(member)
                 bound = member.ids.virtual_to_physical.clone()
-                with patch(
-                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                    side_effect=AssertionError("a pinned plan used fallback"),
-                ):
-                    fits = a.ensure_capacity(4, 4)
-                    got = a.alloc(4)
+                fits = a.ensure_capacity(4, 4)
+                got = a.alloc(4)
                 # With the owner pinned the float still moves out of its way;
                 # a pinned state end or float leaves no layout that serves it.
                 self.assertEqual(fits, owner == "full")
@@ -873,23 +859,15 @@ class TestTriJointReclaim(CustomTestCase):
                     ids = fa.ids.translate(extra)
                     b.token_to_kv_pool.get_key_buffer(layer)[ids] = 701 + layer
                     b.token_to_kv_pool.get_value_buffer(layer)[ids] = 801 + layer
-                target = float_high_target(chain_snapshot(a), float_chain(a), 12)
-                self.assertIsNotNone(target)
-                self.assertFalse(
-                    float_end_certificate(chain_snapshot(a), float_chain(a), 12)
-                )
-                gap = sa._gap_pages()[1]
-                retreat = target // sa.entry_bytes_per_page - gap
-                self.assertGreaterEqual(retreat, sa._live_pages())
-                with (
-                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as whole,
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError(
-                            "positive certificate used fallback"
-                        ),
-                    ),
-                ):
+                # Twelve tokens fit only once the float moves, wholly clear of
+                # the pages it holds now.
+                twelve = _pages(a, 12, 12)
+                self.assertIsNone(plan(a.pricing_snapshot(), twelve, FLUSH_ENDS))
+                moved = plan(a.pricing_snapshot(), twelve, RELAYOUT)
+                first, end = moved.targets[sa.sub_pool_name]
+                lo, hi = sa._span_range()
+                self.assertTrue(end <= lo or first >= hi, (first, end, lo, hi))
+                with patch.object(sa, "relocate_into", wraps=sa.relocate_into) as whole:
                     self.assertTrue(a.ensure_capacity(12, 12))
                     self.assertIsNotNone(a.alloc(12))
                 self.assertEqual(whole.call_count, 1)
@@ -978,47 +956,37 @@ class TestTriGeometry(CustomTestCase):
                     ma.flush_for_allocation()
                     extra = fa.alloc(extra_pages * ps)
                     self.assertIsNotNone(extra)
+                    # Pack the float against the owner end: the owner has no
+                    # room left, and the demand needs the float to step back.
+                    open_float_side(sa, "high", 0)
                     demand = 2 * ps
-                    target = float_high_target(
-                        chain_snapshot(a), float_chain(a), demand
-                    )
-                    self.assertIsNotNone(target)
-                    lo, hi = sa._region_bounds_pages()
-                    retreat = target // sa.entry_bytes_per_page - (hi - sa.high_wm_page)
-                    self.assertEqual(sa.low_wm_page - lo, retreat)
-                    self.assertLess(retreat, sa._live_pages())
-                    self.assertFalse(
-                        float_end_certificate(chain_snapshot(a), float_chain(a), demand)
-                    )
+                    pages = _pages(a, demand, demand)
+                    # The demand fits only once the float moves, and its new
+                    # block overlaps the one it holds now.
+                    self.assertIsNone(plan(a.pricing_snapshot(), pages, FLUSH_ENDS))
+                    moved = plan(a.pricing_snapshot(), pages, RELAYOUT)
+                    first, end = moved.targets[sa.sub_pool_name]
+                    lo, hi = sa._span_range()
+                    self.assertTrue(first < hi and end > lo, (first, end, lo, hi))
                     if one_short:
                         # Bind an existing FULL-only ID into the roomier LOW gap.
                         low_before = sa.low_wm_page
                         sa.alloc_with_virtual(extra[:1] // ps)
                         self.assertEqual(sa.low_wm_page, low_before - 1)
                         before = snapshot(a)
-                        self.assertIsNone(
-                            float_high_target(chain_snapshot(a), float_chain(a), demand)
-                        )
+                        # Pricing moves nothing, and its answer is the take's.
+                        fits = a.ensure_capacity(demand, demand)
                         self.assertEqual(snapshot(a), before)
+                        self.assertEqual(a.alloc(demand) is not None, fits)
                         self.assertFalse(a.verify_byte_accounting())
                         continue
                     saved = payload(a, kv, mk)
-                    with (
-                        patch.object(
-                            sa,
-                            "_relocate_to_positions",
-                            wraps=sa._relocate_to_positions,
-                        ) as whole,
-                        patch(
-                            "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                            side_effect=AssertionError(
-                                "positive certificate used fallback"
-                            ),
-                        ),
-                    ):
+                    with patch.object(
+                        sa, "relocate_into", wraps=sa.relocate_into
+                    ) as moves:
                         self.assertTrue(a.ensure_capacity(demand, demand))
                         self.assertIsNotNone(a.alloc(demand))
-                    self.assertEqual(whole.call_count, 0)
+                    self.assertEqual(moves.call_count, 1)
                     self.check_saved(a, saved)
 
     def test_float_certificates_match_executor_across_page_grids(self):
@@ -1033,25 +1001,37 @@ class TestTriGeometry(CustomTestCase):
         ):
             a, kv, mk = build_geometry(ps, ratio, lazy, pattern, gated)
             prior = snapshot(a)
-            target = float_high_target(chain_snapshot(a), float_chain(a), npage * ps)
+            pages = _pages(a, npage * ps, npage * ps)
+            moved = plan(a.pricing_snapshot(), pages, RELAYOUT)
             self.assertEqual(snapshot(a), prior)
-            if gated or pattern == "empty":
-                self.assertIsNone(target)
-            if target is None or float_end_certificate(
-                chain_snapshot(a), float_chain(a), npage * ps
-            ):
+            flushed = plan(a.pricing_snapshot(), pages, FLUSH_ENDS)
+            if pattern == "empty":
+                # An empty float is no obstacle: moving it adds nothing to
+                # compacting the ends.
+                self.assertEqual(moved is None, flushed is None)
+            # Demands that fit only once the float is laid out anew.
+            if moved is None or flushed is not None:
                 continue
             with self.subTest(
                 ps=ps, ratio=ratio, lazy=lazy, pattern=pattern, npage=npage
             ):
                 recognized.add(ps)
                 saved = payload(a, kv, mk)
-                with patch(
-                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                    side_effect=AssertionError("FLOAT certificate used fallback"),
-                ):
-                    self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
-                    self.assertIsNotNone(a.alloc(npage * ps))
+                held = {
+                    member.sub_pool_name: {
+                        p: int(member.ids.physical_to_virtual[p])
+                        for p in member.fixed_pages()
+                    }
+                    for member in a.members
+                }
+                self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
+                self.assertIsNotNone(a.alloc(npage * ps))
+                # A held float is laid out around its pages: none of them moves.
+                for member in a.members:
+                    for page, virtual in held[member.sub_pool_name].items():
+                        self.assertEqual(
+                            int(member.ids.physical_to_virtual[page]), virtual
+                        )
                 self.check_saved(a, saved)
         self.assertEqual(recognized, {1, 4, 16})
 
@@ -1072,8 +1052,9 @@ class TestTriGeometry(CustomTestCase):
             demands = {
                 n: d for n, d in a.page_demands(npage * ps, npage * ps).items() if d
             }
-            if plan(a.pricing_snapshot(), demands, NO_MOVE) is not None or not (
-                float_end_certificate(chain_snapshot(a), float_chain(a), npage * ps)
+            if (
+                plan(a.pricing_snapshot(), demands, NO_MOVE) is not None
+                or plan(a.pricing_snapshot(), demands, FLUSH_ENDS) is None
             ):
                 continue
             with self.subTest(page_size=ps, ratio=ratio, cut=cut, demand=npage):
@@ -1083,15 +1064,13 @@ class TestTriGeometry(CustomTestCase):
                 saved = payload(a, kv, mk)
                 prior = snapshot(a)
                 for _ in range(20):
-                    self.assertTrue(
-                        float_end_certificate(
-                            chain_snapshot(a), float_chain(a), npage * ps
-                        )
+                    self.assertIsNotNone(
+                        plan(a.pricing_snapshot(), demands, FLUSH_ENDS)
                     )
                 self.assertEqual(snapshot(a), prior)
                 sa = a.swa_attn_allocator
                 with (
-                    patch.object(sa, "make_room", wraps=sa.make_room) as moves,
+                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as moves,
                     patch.object(
                         sa, "flush_for_allocation", wraps=sa.flush_for_allocation
                     ) as flush,
@@ -1112,18 +1091,13 @@ class TestTriGeometry(CustomTestCase):
                 five = {n: d for n, d in a.page_demands(5, 5).items() if d}
                 self.assertIsNone(plan(a.pricing_snapshot(), five, NO_MOVE))
                 self.assertGreaterEqual(a.available_size(), 5)
-                self.assertTrue(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
-                )
+                self.assertTrue(feasible(a.pricing_snapshot(), five))
                 saved = payload(a, kv, mk)
-                for member in a._flush_targets():
+                for member in a.members:
                     # Two holders; the band stays while either holds it.
                     for key, opened in (("pd", pd_open), ("host", host_open)):
                         if not opened:
                             hold_band(member, key)
-                self.assertFalse(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
-                )
                 # Held pages stay put; the planner may still lay the rest out
                 # around them, and its answer is the take's.
                 held = {
@@ -1131,12 +1105,12 @@ class TestTriGeometry(CustomTestCase):
                         p: int(member.ids.physical_to_virtual[p])
                         for p in member.fixed_pages()
                     }
-                    for member in a._flush_targets()
+                    for member in a.members
                 }
                 fits = a.ensure_capacity(5, 5)
                 got = a.alloc(5)
                 self.assertEqual(fits, got is not None)
-                for member in a._flush_targets():
+                for member in a.members:
                     for page, virtual in held[member.sub_pool_name].items():
                         self.assertEqual(
                             int(member.ids.physical_to_virtual[page]), virtual
@@ -1144,7 +1118,7 @@ class TestTriGeometry(CustomTestCase):
                 self.check_saved(a, saved)
                 if got is not None:
                     a.free(got)
-                for member in a._flush_targets():
+                for member in a.members:
                     release_band(member, "pd")
                     release_band(member, "host")
                 self.assertTrue(a.ensure_capacity(5, 5))
@@ -1179,25 +1153,17 @@ class TestTriGeometry(CustomTestCase):
                 self.assertGreater(fa._flush(urgent=False), 0)
                 self.assertGreater(len(fa.usage.pending_pages), 0)
                 saved = payload(a, kv, mk)
-                for member in a._flush_targets():
+                for member in a.members:
                     hold_band(member)
                 before = snapshot(a)
-                predictions = [
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), n * ps)
-                    for n in range(1, 10)
-                ]
+                predictions = [a.ensure_capacity(n * ps, n * ps) for n in range(1, 10)]
                 for _ in range(20):
                     self.assertEqual(
                         predictions,
-                        [
-                            float_reclaim_satisfied(
-                                chain_snapshot(a), float_chain(a), n * ps
-                            )
-                            for n in range(1, 10)
-                        ],
+                        [a.ensure_capacity(n * ps, n * ps) for n in range(1, 10)],
                     )
                 self.assertEqual(snapshot(a), before)
-                for member in a._flush_targets():
+                for member in a.members:
                     release_band(member)
                 if not urgent:
                     event.fired = True
@@ -1206,11 +1172,7 @@ class TestTriGeometry(CustomTestCase):
                     fa.flush_for_allocation()
                     self.assertFalse(fa.usage.pending_by_key())
                     n = max(
-                        n
-                        for n in range(1, 10)
-                        if float_reclaim_satisfied(
-                            chain_snapshot(a), float_chain(a), n * ps
-                        )
+                        n for n in range(1, 10) if a.ensure_capacity(n * ps, n * ps)
                     )
                     self.assertTrue(a.ensure_capacity(n * ps, n * ps))
                     self.assertIsNotNone(a.alloc(n * ps))

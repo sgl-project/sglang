@@ -259,12 +259,16 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
 
                     def check_boundary():
                         capacity = allocator.available_size()
-                        self.assertTrue(allocator.can_reserve(capacity, capacity))
+                        self.assertTrue(
+                            allocator.admits(
+                                capacity, allocator._window_demand(capacity, capacity)
+                            )
+                        )
                         # Admission may see room past the advertised capacity
                         # (a relayout opens it); whatever it admits, the take
                         # serves.
                         more = capacity + page_size
-                        if allocator.can_reserve(more, more):
+                        if allocator.admits(more, allocator._window_demand(more, more)):
                             taken = allocator.alloc(more)
                             self.assertIsNotNone(taken)
                             allocator.free(taken)
@@ -368,9 +372,7 @@ class TestPagedStepKeepsTheEpoch(unittest.TestCase):
                 self.assertEqual(owner._chain_capacity_epoch(), epoch)
             with (
                 patch.object(
-                    allocator._policy,
-                    "_compute_available_size",
-                    wraps=allocator._policy._compute_available_size,
+                    allocator, "_units_fit", wraps=allocator._units_fit
                 ) as joint,
                 patch.object(
                     owner, "_available_tokens", wraps=owner._available_tokens

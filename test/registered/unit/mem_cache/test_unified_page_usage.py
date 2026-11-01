@@ -59,7 +59,12 @@ def _decisions(rank: _Rank):
             if use.writes and use.release is not None
         ),
         frozenset(usage.pending_pages),
+        # Fenced bytes stop an opportunistic walk.
+        tuple(usage.fence_meets(b, b + 1) for b in range(_FENCE_BYTES)),
     )
+
+
+_FENCE_BYTES = 32
 
 
 class TestPageUsageAcrossRanks(CustomTestCase):
@@ -72,7 +77,18 @@ class TestPageUsageAcrossRanks(CustomTestCase):
                 next_page = 0
                 for _ in range(40):
                     op = rng.choice(
-                        ["forward", "retire", "transfer", "release", "vacate", "drain"]
+                        [
+                            "forward",
+                            "retire",
+                            "transfer",
+                            "release",
+                            "vacate",
+                            "drain",
+                            "fence",
+                            "recent",
+                            "resolve",
+                            "write",
+                        ]
                     )
                     if op == "forward":
                         unknown = rng.random() < 0.2
@@ -136,6 +152,42 @@ class TestPageUsageAcrossRanks(CustomTestCase):
                             for rank in ranks
                         ]
                         self.assertEqual(drained[0], drained[1])
+                    elif op == "fence":
+                        # Bytes a move took out of the band while readers ran.
+                        first = rng.randrange(_FENCE_BYTES - 4)
+                        runs = [(first, first + rng.randrange(1, 4))]
+                        for rank in ranks:
+                            readers = tuple(
+                                (signal, release) if release is not None else signal
+                                for signal, release in rank.transfers[-1:]
+                            )
+                            key = tuple(
+                                k
+                                for k in (rank.usage.latest_forward, *readers)
+                                if k is not None
+                            )
+                            if key:
+                                rank.usage.vacate(
+                                    key if len(key) > 1 else key[0], runs, page_bytes=1
+                                )
+                    elif op == "recent" and ranks[0].usage.latest_forward is not None:
+                        # Pages freed while the newest forward may still write.
+                        freed = [rng.randrange(_FENCE_BYTES) for _ in range(2)]
+                        for rank in ranks:
+                            rank.usage.record_recent_holes(
+                                rank.usage.latest_forward,
+                                torch.tensor(freed),
+                                torch.tensor(freed),
+                            )
+                    elif op == "resolve":
+                        for rank in ranks:
+                            rank.usage.resolve_recent_holes(1, None)
+                    elif op == "write":
+                        # A copy into some bytes waits the fences they meet;
+                        # how many it waits may differ, as it skips fired ones.
+                        lo = rng.randrange(_FENCE_BYTES - 2)
+                        for rank in ranks:
+                            rank.usage.take_fences_meeting(lo, lo + 2)
                     # Signals complete independently on each rank.
                     for rank in ranks:
                         for signal in [*rank.forwards, *(s for s, _ in rank.transfers)]:
