@@ -20,6 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from types import SimpleNamespace
 
+from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import index_slots
@@ -40,7 +41,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
@@ -3250,7 +3250,7 @@ class TestDcpWidening(unittest.TestCase):
                 if grouped_free:
                     allocator.free_group_begin()
 
-                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+                result = cache.evict_for_alloc(AllocDemand(mamba_num=1))
 
                 self.assertEqual(walk["freed_leaves"], expected_leaves)
                 self.assertEqual(
@@ -3297,7 +3297,7 @@ class TestDcpWidening(unittest.TestCase):
             full.flush_for_allocation = MagicMock(wraps=original_flush)
             allocator.free_group_begin()
 
-            result = cache.evict_for_alloc(EvictParams(mamba_num=4))
+            result = cache.evict_for_alloc(AllocDemand(mamba_num=4))
 
             self.assertGreater(walk["freed_leaves"], 1)
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])

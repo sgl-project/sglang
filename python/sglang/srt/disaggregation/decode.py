@@ -98,8 +98,8 @@ from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     BasePrefixCache,
-    EvictParams,
     TreeLock,
     window_sub_pool_of,
 )
@@ -2551,7 +2551,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=required_alloc_tokens)
+                AllocDemand(num_tokens=required_alloc_tokens)
             )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(

@@ -625,7 +625,9 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        self.cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+        )
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
         # can be reclaimed.
@@ -713,7 +715,9 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         # Submitted after the move: the copy reads where the rows went.
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        self.cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+        )
         req = self._request(tokens + list(range(17, 21)))
         verdict = self._adder().add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
@@ -743,7 +747,9 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         ids, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        self.cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+        )
         # Window rows that end up below the load's reservation, freed once the
         # load is queued so that compaction moves the reserved rows into them.
         gap = self.allocator.alloc(2 * PAGE)

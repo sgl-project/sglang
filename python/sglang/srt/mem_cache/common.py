@@ -313,9 +313,7 @@ def _evict_until_allocatable(
         result = tree_cache.evict(
             EvictParams(num_tokens=max(shortfall, allocator.page_size))
         )
-        total.num_tokens_evicted += result.num_tokens_evicted
-        total.swa_num_tokens_evicted += result.swa_num_tokens_evicted
-        total.mamba_num_evicted += result.mamba_num_evicted
+        total.add(result)
         if result.num_tokens_evicted == 0:
             return total
 

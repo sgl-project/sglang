@@ -6,8 +6,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -1243,11 +1243,8 @@ class SWAComponent(TreeComponent):
             num_tokens = len(tail_keys) * page
             storage, sub_pool = self.storage_and_sub_pool()
             if storage.available_units(sub_pool) < num_tokens:
-                ct = self.component_type
                 self.cache.evict_for_alloc(
-                    EvictParams(swa_num_tokens=num_tokens)
-                    if ct == ComponentType.SWA
-                    else EvictParams(window_num_tokens={ct: num_tokens})
+                    AllocDemand(window_num_tokens={self.component_type: num_tokens})
                 )
             transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:

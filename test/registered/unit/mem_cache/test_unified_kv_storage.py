@@ -347,7 +347,7 @@ class TestHostStack(CustomTestCase):
         swa.device_evict_fn(1 << 30)
         ((kind, params),) = cache.calls
         self.assertEqual(kind, "device")
-        self.assertGreater(params.swa_num_tokens, 0)
+        self.assertGreater(sum(params.window_num_tokens.values()), 0)
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
     def test_host_transfers_translate_through_the_storage(self):

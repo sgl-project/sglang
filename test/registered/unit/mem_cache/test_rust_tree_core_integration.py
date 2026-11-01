@@ -3116,7 +3116,7 @@ def test_internal_swa_write_back_preserves_window_until_ack(
     _mock_swa_write_back_io(case, backup)
     cache, core = case.cache, case.core
     parent, leaf = case.nodes
-    params = EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+    params = EvictParams(window_num_tokens={ComponentType.SWA: case.segment})
     if backup in ("raised", "ack_raised"):
         with pytest.raises(RuntimeError, match="DMA .* failed"):
             cache.evict(params)
@@ -3133,14 +3133,17 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         # The driver's finally block must discard the paused walk even when
         # submission or completion fails, so a new eviction can make progress.
         _mock_swa_write_back_io(case)
-        assert cache.evict(params).swa_num_tokens_evicted == case.segment
+        assert (
+            cache.evict(params).window_num_tokens_evicted.get(ComponentType.SWA, 0)
+            == case.segment
+        )
         assert core.get_component_device_value(parent, ComponentType.SWA) is None
         cache.dec_lock_ref(leaf, case.leaf_lock)
         core.sanity_check([], [])
         return
 
     result = cache.evict(params)
-    assert result.swa_num_tokens_evicted == case.segment
+    assert result.window_num_tokens_evicted.get(ComponentType.SWA, 0) == case.segment
     assert result.num_tokens_evicted == 0
     assert result.mamba_num_evicted == int(with_mamba)
     if with_mamba:
@@ -3188,8 +3191,10 @@ def test_internal_swa_write_back_reserves_entire_unbacked_window(backend):
     # SWA LRU, and its backup window includes both unbacked prefix segments.
     cache.match_prefix(MatchPrefixParams(key=_key(list(range(case.segment)))))
     _mock_swa_write_back_io(case, "host_pressure")
-    result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=case.segment))
-    assert result.swa_num_tokens_evicted == case.segment
+    result = cache.evict(
+        EvictParams(window_num_tokens={ComponentType.SWA: case.segment})
+    )
+    assert result.window_num_tokens_evicted.get(ComponentType.SWA, 0) == case.segment
     assert case.events[:2] == [("host_evict", 2 * case.segment), ("write", victim)]
     (submission,) = case.submissions
     (transfer,) = submission[2][ComponentType.SWA]
@@ -3243,8 +3248,8 @@ def test_internal_swa_write_back_respects_active_window_locks(backend, guard):
         cache._finish_write_through_ack(parent)
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(window_num_tokens={ComponentType.SWA: case.segment})
+        ).window_num_tokens_evicted.get(ComponentType.SWA, 0)
         == case.segment
     )
     assert core.component_has_host_value_only(parent, ComponentType.SWA)
@@ -3271,8 +3276,8 @@ def test_internal_swa_write_back_follows_runtime_policy_update(backend):
     assert cache._tree_core_backend == backend
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(window_num_tokens={ComponentType.SWA: case.segment})
+        ).window_num_tokens_evicted.get(ComponentType.SWA, 0)
         == case.segment
     )
     assert core.component_has_host_value_only(case.nodes[0], ComponentType.SWA)

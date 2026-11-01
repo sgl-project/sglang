@@ -16,6 +16,7 @@ from typing import (
     Optional,
     Sequence,
     TypeVar,
+    Union,
 )
 
 import msgspec
@@ -33,6 +34,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     BasePrefixCache,
     CacheRequestHandle,
     DecLockRefParams,
@@ -719,7 +721,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._evict(params)
 
     @rank_consensus(same_params=True, same_results=True)
-    def evict_for_alloc(self, demand: EvictParams) -> EvictResult:
+    def evict_for_alloc(self, demand: AllocDemand) -> EvictResult:
         """Evict so that an allocation of ``demand`` (what it will take, not
         what to evict) can be served.
 
@@ -744,12 +746,11 @@ class UnifiedRadixCache(BasePrefixCache):
             return EvictResult()
         return self._evict(
             EvictParams(
-                num_tokens=short.get(ComponentType.FULL, 0),
-                swa_num_tokens=short.get(ComponentType.SWA, 0),
+                num_tokens=short.get(self.slot_id(TREE_TOKEN), 0),
                 window_num_tokens={
-                    ct: short[ct] for ct in self.window_slots()[1:] if ct in short
+                    ct: short[ct] for ct in self.window_slots() if ct in short
                 },
-                mamba_num=short.get(ComponentType.MAMBA, 0),
+                mamba_num=short.get(self.slot_id(TREE_STATE), 0),
             ),
             demand={ct: demand_by_type[ct] for ct in short},
         )
@@ -765,17 +766,21 @@ class UnifiedRadixCache(BasePrefixCache):
             return EvictResult()
         return self._evict(params, satisfied=satisfied)
 
-    def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
-        fixed = {
-            ComponentType.FULL: params.num_tokens,
-            ComponentType.SWA: params.swa_num_tokens,
-            ComponentType.MAMBA: params.mamba_num,
-            ComponentType.C128: 0,
-        }
-        further = set(self.tree_components) - set(fixed)
-        unknown = set(params.window_num_tokens) - further
-        assert not unknown, f"no further window slots {sorted(unknown)} in this tree"
-        return fixed | {ct: params.window_num_tokens.get(ct, 0) for ct in further}
+    def _evict_request_by_type(
+        self, params: Union[EvictParams, AllocDemand]
+    ) -> dict[ComponentType, int]:
+        """Per tree component, what ``params`` asks of it."""
+        windows = self.window_slots()
+        unknown = set(params.window_num_tokens) - set(windows)
+        assert not unknown, f"no window slots {sorted(unknown)} in this tree"
+        request = {ct: 0 for ct in self.tree_components}
+        request[BASE_COMPONENT_TYPE] = params.num_tokens
+        state = self.slot_id(TREE_STATE)
+        if state is not None:
+            request[state] = params.mamba_num
+        for ct in windows:
+            request[ct] = params.window_num_tokens.get(ct, 0)
+        return request
 
     def _pool_available(self, component_type: ComponentType) -> int:
         """What the component's own pool can serve now: the read a cache over
@@ -784,8 +789,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.supports_swa():
                 return self.token_to_kv_pool_allocator.full_available_size()
             return self.token_to_kv_pool_allocator.available_size()
-        if component_type == self.slot_id(TREE_WINDOW):
-            return self.token_to_kv_pool_allocator.swa_available_size()
+        if component_type in self.window_slots():
+            return self.window_available_size(component_type)
         if component_type == self.slot_id(TREE_STATE):
             return (
                 self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
@@ -819,10 +824,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
-            swa_num_tokens_evicted=tracker.get(self.slot_id(TREE_WINDOW), 0),
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
             window_num_tokens_evicted={
-                ct: tracker.get(ct, 0) for ct in self.window_slots()[1:]
+                ct: tracker.get(ct, 0) for ct in self.window_slots()
             },
         )
 
@@ -1951,7 +1955,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         token_slot = self.slot_id(TREE_TOKEN)
         if self._pool_available(token_slot) < kv_tokens:
-            self.evict_for_alloc(EvictParams(num_tokens=kv_tokens))
+            self.evict_for_alloc(AllocDemand(num_tokens=kv_tokens))
             if self._pool_available(token_slot) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)

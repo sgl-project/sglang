@@ -28,7 +28,7 @@ import torch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -462,11 +462,13 @@ class TestUnifiedTriPool(_PoolTestCase):
                 cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
 
                 swa_live_before = allocator.swa_attn_allocator._live_pages()
-                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+                result = cache.evict_for_alloc(AllocDemand(mamba_num=1))
 
                 self.assertEqual(walk["freed_leaves"], 1)
                 self.assertEqual(result.num_tokens_evicted, page_size)
-                self.assertEqual(result.swa_num_tokens_evicted, 0)
+                self.assertEqual(
+                    result.window_num_tokens_evicted.get(ComponentType.SWA, 0), 0
+                )
                 self.assertEqual(result.mamba_num_evicted, 0)
                 self.assertEqual(
                     allocator.swa_attn_allocator._live_pages(), swa_live_before

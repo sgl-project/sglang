@@ -8,12 +8,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -166,7 +168,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 if allocation:
                     # The demand: two tokens past what the owner serves now.
                     demand = allocator.full_available_size() + 2
-                    result = cache.evict_for_alloc(EvictParams(num_tokens=demand))
+                    result = cache.evict_for_alloc(AllocDemand(num_tokens=demand))
                 else:
                     result = cache.evict(EvictParams(num_tokens=2))
                 # Allocation asks for a demand: a cascaded SWA free also
@@ -466,7 +468,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_until(
-                EvictParams(swa_num_tokens=2),
+                EvictParams(window_num_tokens={ComponentType.SWA: 2}),
                 lambda: allocator.ensure_capacity(4, 4),
             )
         self.assertTrue(

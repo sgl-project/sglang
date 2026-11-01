@@ -163,13 +163,23 @@ def window_sub_pool_of(allocator) -> str:
 
 @dataclasses.dataclass
 class EvictParams:
-    """Unified parameters for evict across different cache types"""
+    """How much to evict from each component: tokens of the token component,
+    tokens of each window slot by its component id, and state entries."""
 
     num_tokens: int = 0
-    swa_num_tokens: int = 0
     mamba_num: int = 0
-    # Tokens per further window slot (any window but the tree's first, whose
-    # tokens are ``swa_num_tokens``), by component id.
+    window_num_tokens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+@dataclasses.dataclass
+class AllocDemand:
+    """What an allocation is about to take from each component, in the same
+    units as `EvictParams`; the cache evicts whatever lets it be served."""
+
+    num_tokens: int = 0
+    mamba_num: int = 0
     window_num_tokens: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict
     )
@@ -177,15 +187,21 @@ class EvictParams:
 
 @dataclasses.dataclass
 class EvictResult:
-    """Result of an evict operation"""
+    """What an eviction freed from each component."""
 
     num_tokens_evicted: int = 0
-    swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
-    # Tokens evicted per further window slot, by component id.
     window_num_tokens_evicted: dict[ComponentType, int] = dataclasses.field(
         default_factory=dict
     )
+
+    def add(self, other: EvictResult) -> None:
+        self.num_tokens_evicted += other.num_tokens_evicted
+        self.mamba_num_evicted += other.mamba_num_evicted
+        for component, tokens in other.window_num_tokens_evicted.items():
+            self.window_num_tokens_evicted[component] = (
+                self.window_num_tokens_evicted.get(component, 0) + tokens
+            )
 
 
 @dataclasses.dataclass
@@ -539,10 +555,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, demand: EvictParams) -> EvictResult:
-        """Evict so that an allocation of ``demand`` (what it will take, not
-        what to evict) can be served: here, the shortfall of each pool the
-        allocator reads, evicted as counts."""
+    def evict_for_alloc(self, demand: AllocDemand) -> EvictResult:
+        """Evict so that an allocation of ``demand`` can be served: here, the
+        shortfall of each pool the allocator reads, evicted as counts. A
+        cache without window slots keeps a single pool, which serves the
+        demand's tokens and windows alike."""
         allocator = self.token_to_kv_pool_allocator
         shortfall = EvictParams(mamba_num=demand.mamba_num)
         if demand.num_tokens > 0:
@@ -552,15 +569,35 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 else allocator.available_size()
             )
             shortfall.num_tokens = max(0, demand.num_tokens - available)
-        if demand.swa_num_tokens > 0:
-            shortfall.swa_num_tokens = max(
-                0, demand.swa_num_tokens - allocator.swa_available_size()
+        windows = self.window_slots()
+        if windows:
+            for component, tokens in demand.window_num_tokens.items():
+                if tokens > 0:
+                    short = max(0, tokens - self.window_available_size(component))
+                    if short:
+                        shortfall.window_num_tokens[component] = short
+        elif demand.window_num_tokens:
+            tokens = max(demand.window_num_tokens.values())
+            available = (
+                allocator.swa_available_size()
+                if self.supports_swa()
+                else allocator.available_size()
             )
+            shortfall.num_tokens = max(shortfall.num_tokens, tokens - available)
         if not (
-            shortfall.num_tokens or shortfall.swa_num_tokens or shortfall.mamba_num
+            shortfall.num_tokens or shortfall.window_num_tokens or shortfall.mamba_num
         ):
             return EvictResult()
         return self.evict(shortfall)
+
+    def window_available_size(self, component: ComponentType) -> int:
+        """What the pool of window slot ``component`` can serve now."""
+        return self.token_to_kv_pool_allocator.swa_available_size()
+
+    def all_windows(self, tokens: int) -> dict[ComponentType, int]:
+        """``tokens`` for every window slot of this tree: the window part of a
+        demand whose windows all take the same tokens."""
+        return {component: tokens for component in self.window_slots()}
 
     def evict_until(
         self, params: EvictParams, satisfied: Callable[[], bool]

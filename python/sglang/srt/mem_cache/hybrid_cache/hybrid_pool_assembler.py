@@ -65,15 +65,17 @@ def _get_allocator_type() -> str:
 
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 
-    cache.evict_for_alloc(EvictParams(swa_num_tokens=required_size))
+    cache.evict_for_alloc(
+        AllocDemand(window_num_tokens=cache.all_windows(required_size))
+    )
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 
-    cache.evict_for_alloc(EvictParams(mamba_num=required_size))
+    cache.evict_for_alloc(AllocDemand(mamba_num=required_size))
 
 
 def _make_layer_mapper(
@@ -1537,15 +1539,12 @@ def _evict_for_host_load(
     component: ComponentType,
     required_size: int,
 ) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 
-    if component == ComponentType.SWA:
-        demand = EvictParams(swa_num_tokens=required_size)
-    elif component == ComponentType.MAMBA:
-        demand = EvictParams(mamba_num=required_size)
+    if component == ComponentType.MAMBA:
+        demand = AllocDemand(mamba_num=required_size)
     else:
-        assert component in cache.window_slots(), component
-        demand = EvictParams(window_num_tokens={component: required_size})
+        demand = AllocDemand(window_num_tokens={component: required_size})
     cache.evict_for_alloc(demand)
 
 
