@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.checksum import state_indices_for_request
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     alloc_for_decode_prealloc,
@@ -168,6 +169,34 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     )
                 }
                 self.assertEqual(received, sent)
+
+    def test_checksum_digests_each_window_entry_by_its_own_rows(self):
+        storage = _storage()
+        allocator = storage.allocator
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=storage.requests,
+            sliding_window_size=_TARGET_WINDOW,
+        )
+        for seq_len in (23, 37):
+            with self.subTest(seq_len=seq_len):
+                req = SimpleNamespace(kv=ReqKvInfo())
+                row = storage.acquire([req])[0]
+                tokens = allocator.alloc(-(-seq_len // _PAGE) * _PAGE)
+                storage.requests.req_to_token[row, : len(tokens)] = tokens.to(
+                    torch.int32
+                )
+                rows = state_indices_for_request(scheduler, req, seq_len)
+                self.assertEqual(len(rows), len(storage.wire_entries()))
+                for entry, entry_rows in zip(storage.wire_entries(), rows):
+                    sent = storage.resume_units(
+                        entry.sub_pool, req, token_start=0, token_boundary=seq_len
+                    )
+                    torch.testing.assert_close(
+                        entry_rows, sent.unit_ids.to(entry_rows.dtype)
+                    )
+                allocator.free(tokens)
+                storage.requests.free(req)
 
     @unittest.skipUnless(torch.cuda.is_available(), "the paged take runs on CUDA")
     def test_prealloc_binds_each_window_its_own_tail(self):
