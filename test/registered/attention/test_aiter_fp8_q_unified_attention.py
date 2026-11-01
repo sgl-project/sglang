@@ -697,6 +697,90 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
                         expected = cache_bytes[idx].repeat_interleave(repeat, dim=1)
                         self.assertTrue(torch.equal(got.view(torch.uint8), expected))
 
+    def test_prefill_writes_into_the_attention_output_buffer(self):
+        """A contiguous bf16 attention output buffer on the batch (the breakable
+        prefill graph's static output) goes to the kernel as `out` and comes
+        back as the result, so the caller has nothing to copy."""
+        num_q_heads, num_kv_heads, head_dim, device = 24, 4, 256, "cuda"
+        repeat = _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads)
+        num_tokens, width = 9, num_q_heads * head_dim
+        cache = torch.zeros(
+            16, num_kv_heads, head_dim, dtype=torch.uint8, device=device
+        ).view(fp8_dtype)
+        backend = object.__new__(AiterAttnBackend)
+        backend.input_dtype = torch.bfloat16
+        backend.k_scale = torch.ones(1, device=device)
+        backend.qo_indptr = torch.tensor(
+            [0, num_tokens], dtype=torch.int32, device=device
+        )
+        backend.token_to_kv_pool = _FakeKVPool(cache, cache)
+        backend.forward_metadata = SimpleNamespace(
+            max_q_len=num_tokens, max_kv_len=num_tokens
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=backend.k_scale,
+            scaling=head_dim**-0.5,
+        )
+        q = torch.randn(num_tokens, width, dtype=torch.bfloat16, device=device)
+        tok_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cu_k = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        static = torch.zeros(num_tokens + 3, width, dtype=torch.bfloat16).to(device)
+        cases = {
+            "graph buffer": (static[:num_tokens], True, True),
+            "older AITER": (static[:num_tokens], False, False),
+            "no buffer": (None, True, False),
+            "strided": (static[:num_tokens, : width // 2], True, False),
+            "other rows": (static, True, False),
+            "fp32": (static.float()[:num_tokens], True, False),
+        }
+        for label, (buf, takes_out, expect_out) in cases.items():
+            with self.subTest(label):
+                seen = []
+
+                def fake_attention(q, *args, out=None, **kwargs):
+                    seen.append(out)
+                    result = torch.full(
+                        q.shape, 1.5, dtype=torch.bfloat16, device=q.device
+                    )
+                    return result if out is None else out.copy_(result)
+
+                with (
+                    mock.patch.object(
+                        backend,
+                        "_asm_context_prefill_indices",
+                        return_value=(tok_idx, cu_k),
+                    ),
+                    mock.patch.object(
+                        aiter_backend,
+                        "flash_attn_varlen_fp8_pertensor_func",
+                        side_effect=fake_attention,
+                    ),
+                    mock.patch.object(
+                        aiter_backend, "_FP8_VARLEN_PREFILL_TAKES_OUT", takes_out
+                    ),
+                ):
+                    o = backend._forward_extend_fp8_asm_gqa_repeat(
+                        q,
+                        layer,
+                        SimpleNamespace(batch_size=1, _attn_output=buf),
+                        repeat,
+                        2,
+                        backend.k_scale,
+                        backend.k_scale,
+                    )
+                self.assertEqual(tuple(o.shape), (num_tokens, width))
+                self.assertTrue(bool((o == 1.5).all()))
+                if expect_out:
+                    self.assertEqual(seen[0].data_ptr(), buf.data_ptr())
+                    self.assertEqual(o.data_ptr(), buf.data_ptr())
+                else:
+                    self.assertIsNone(seen[0])
+
 
 if __name__ == "__main__":
     unittest.main()

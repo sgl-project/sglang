@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 end to end attention solution with aiter kernels
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -72,6 +73,14 @@ except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
+
+try:
+    # Whether AITER's FP8 varlen prefill writes into a caller's output buffer.
+    _FP8_VARLEN_PREFILL_TAKES_OUT = (
+        "out" in inspect.signature(flash_attn_varlen_fp8_pertensor_func).parameters
+    )
+except NameError:
+    _FP8_VARLEN_PREFILL_TAKES_OUT = False
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
@@ -1383,6 +1392,23 @@ class AiterAttnBackend(AttentionBackend):
         fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k = tok_idx, cu_k
         return tok_idx, cu_k
 
+    def _fp8_prefill_out_args(
+        self, forward_batch: ForwardBatch, layer: RadixAttention, num_tokens: int
+    ) -> dict:
+        """The attention output buffer (e.g. a breakable prefill CUDA graph's
+        static output) for the FP8 varlen prefill to write into, so the caller
+        skips copying the result into it."""
+        out = getattr(forward_batch, "_attn_output", None)
+        if (
+            out is None
+            or not _FP8_VARLEN_PREFILL_TAKES_OUT
+            or out.dtype != torch.bfloat16
+            or not out.is_contiguous()
+            or out.numel() != num_tokens * layer.tp_q_head_num * layer.v_head_dim
+        ):
+            return {}
+        return {"out": out.view(num_tokens, layer.tp_q_head_num, layer.v_head_dim)}
+
     def _forward_extend_fp8_asm_gqa_repeat(
         self,
         q: torch.Tensor,
@@ -1430,6 +1456,7 @@ class AiterAttnBackend(AttentionBackend):
             int(self.forward_metadata.max_kv_len),
             softmax_scale=layer.scaling,
             causal=True,
+            **self._fp8_prefill_out_args(forward_batch, layer, q_fp8.shape[0]),
         )
         if o.dtype != self.input_dtype:
             o = o.to(self.input_dtype)
