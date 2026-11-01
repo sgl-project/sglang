@@ -429,9 +429,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
                         "auto_map": {"AutoModel": "custom.TestVAE"},
                     },
                 ),
-                patch.object(
-                    loader, "target_device", return_value=torch.device("cpu")
-                ),
+                patch.object(loader, "target_device", return_value=torch.device("cpu")),
                 self.assertRaisesRegex(
                     ComponentCheckpointUnsupportedError, "trust-remote-code"
                 ),
