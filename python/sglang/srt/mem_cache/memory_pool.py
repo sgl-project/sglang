@@ -85,7 +85,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
@@ -2600,7 +2600,15 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     # Only CUDA's trtllm fmha_v2 prefill reads the fused layout,
                     # and same-node Mooncake PD on ROCm decodes garbage when V
                     # sits inside K's allocation, so ROCm allocates them apart.
-                    if k_shape == v_shape and not _is_hip:
+                    # torch.compile also keeps them apart: the KV store op mutates
+                    # k_cache and v_cache, and when they alias one allocation
+                    # AOTAutograd functionalizes it through a synthetic base that
+                    # clones the layer's whole KV allocation on every decode step.
+                    if (
+                        k_shape == v_shape
+                        and not _is_hip
+                        and not get_flags().capture.enable_torch_compile
+                    ):
                         # Store K and V as block-aligned halves of one allocation
                         # so paged kernels with a single pool base can reach V
                         # via block offsets. Each half keeps its standalone
@@ -5305,13 +5313,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
             IndexKeyBufferInfo,
-            IndexKeyFormat,
+            IndexKeyLayout,
         )
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
         if (self.index_head_dim, self.quant_block_size) != (128, 128):
             raise ValueError(
-                f"DSA_FP8 index key format requires index_head_dim=128 and "
+                f"PAGED_FP8_KEYS_WITH_SCALES index key layout requires index_head_dim=128 and "
                 f"quant_block_size=128, got {self.index_head_dim} and {self.quant_block_size}"
             )
 
@@ -5337,7 +5345,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 buffers=tuple(
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
-                key_format=IndexKeyFormat.DSA_FP8,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
             ),
         )
         return (*kv_infos, index_info)
