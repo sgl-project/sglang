@@ -392,6 +392,10 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                             is_sm90=platform == "hopper",
                             is_blackwell=platform == "blackwell",
                         ),
+                        # ModelConfig reads hardware helpers directly.
+                        patch(
+                            "sglang.srt.configs.model_config.is_hip", return_value=False
+                        ),
                         patch(
                             "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
                             return_value=183000,
