@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    JOINT_LRU_EVICTION_POLICY,
     BufferBackupSnapshot,
     BufferBackupState,
     DecSwaLockOnlyResult,
@@ -467,13 +468,23 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
         has_mamba = TREE_STATE in families
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            host_only_mamba_checkpoint,
+        )
+
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
-                eviction_policy=params.eviction_policy,
+                # This core keeps no joint order; joint_lru evicts each
+                # component as lru here.
+                eviction_policy=(
+                    "lru"
+                    if params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
+                    else params.eviction_policy
+                ),
                 slru_protected_threshold=getattr(
                     eviction_strategy, "protected_threshold", 2
                 ),
@@ -497,6 +508,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     mamba_max_states_per_path
                     if mamba_max_states_per_path >= 0
                     else None
+                ),
+                mamba_host_only_checkpoint=(
+                    host_only_mamba_checkpoint() if has_mamba else False
                 ),
             ),
             # Each slot's id and family: the native core picks a slot's driver
@@ -834,6 +848,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_salt=key.cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
+                mamba_host_value=params.mamba_host_value,
+                allow_missing_mamba=params.allow_missing_mamba,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,

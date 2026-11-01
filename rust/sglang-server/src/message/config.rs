@@ -44,6 +44,9 @@ pub struct RustServerServerArgs {
     /// the base port does: every listener would render the same node-wide
     /// files, so a scraper of each DP rank's port would count them N times.
     pub metrics_listener: bool,
+    /// How long a drain's listeners keep open connections once its requests
+    /// finished (see `CoreHandle::drain_close_deadline`).
+    pub graceful_close_timeout: std::time::Duration,
 }
 
 impl Default for RustServerServerArgs {
@@ -57,6 +60,7 @@ impl Default for RustServerServerArgs {
             stage_channel_cap: 8192,
             cores: None,
             metrics_listener: true,
+            graceful_close_timeout: crate::api_server::handlers::GRACEFUL_CLOSE_TIMEOUT,
         }
     }
 }
