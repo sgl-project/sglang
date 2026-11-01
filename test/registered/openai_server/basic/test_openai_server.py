@@ -722,26 +722,6 @@ class OpenAIServerResponsesMixin:
             final_usage_ok,
         )
 
-    def run_responses_chat_completion_stream(
-        self, logprobs=None, parallel_sample_num=1
-    ):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        generator = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "What is the capital of France?"},
-            ],
-            temperature=0,
-            logprobs=logprobs is not None and logprobs > 0,
-            top_logprobs=logprobs,
-            stream=True,
-            stream_options={"include_usage": True},
-            n=parallel_sample_num,
-        )
-        for _ in generator:
-            pass
-
     # ---- tests ----
     def test_response(self):
         resp = self.run_response(temperature=0, max_output_tokens=32)
