@@ -86,29 +86,11 @@ def sglang_per_token_group_quant_fp8_dsv4_wo_a(
     conversion kernel. Group size is fixed to 128 and the absmax floor is fixed
     to 1e-10.
     """
-    num_tokens, num_groups, hidden = x.shape
-    hidden_groups = hidden // _GROUP_SIZE
-    packed_hidden_groups = (
-        hidden_groups + _UE8M0_SCALES_PER_PACK - 1
-    ) // _UE8M0_SCALES_PER_PACK
-    aligned_num_tokens = (
-        (num_tokens + _UE8M0_SCALES_PER_PACK - 1)
-        // _UE8M0_SCALES_PER_PACK
-        * _UE8M0_SCALES_PER_PACK
-    )
-    x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
-    x_s_storage = torch.empty(
-        (num_groups, packed_hidden_groups, aligned_num_tokens),
-        device=x.device,
-        dtype=torch.int32,
-    )
+    x_q, x_s_storage, x_s = _allocate_wo_a_quant_outputs(x)
 
     if x.numel() > 0:
         fp8_wo_a_group_major_quant_ue8m0(x, x_q, x_s_storage)
 
-    # DeepGEMM permutes this to [G, T, packed_hidden_groups], where tokens are
-    # contiguous and the packed-hidden stride is aligned_num_tokens.
-    x_s = x_s_storage.transpose(-1, -2)[:, :num_tokens, :].transpose(0, 1)
     return x_q, x_s
 
 
@@ -146,20 +128,36 @@ def sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
         freqs_cis = torch.view_as_real(freqs_cis)
     freqs_cis = freqs_cis.flatten(1).contiguous()
     positions = positions.to(torch.int64).contiguous()
-    num_tokens, num_groups, hidden = x.shape
-    assert hidden % 512 == 0
+    assert x.dtype == torch.bfloat16 and x.shape[-1] % 512 == 0
     assert freqs_cis.dtype == torch.float32 and freqs_cis.shape[1] == 64
-    packed_hidden_groups = hidden // 512
-    aligned_num_tokens = (num_tokens + 3) // 4 * 4
+    x_q, x_s_storage, x_s = _allocate_wo_a_quant_outputs(x)
+    if x.numel() > 0:
+        _fp8_wo_a_group_major_quant_ue8m0_rope_custom_op(
+            x, freqs_cis, positions, x_q, x_s_storage
+        )
+    return x_q, x_s
+
+
+def _allocate_wo_a_quant_outputs(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, num_groups, hidden = x.shape
+    hidden_groups = hidden // _GROUP_SIZE
+    packed_hidden_groups = (
+        hidden_groups + _UE8M0_SCALES_PER_PACK - 1
+    ) // _UE8M0_SCALES_PER_PACK
+    aligned_num_tokens = (
+        (num_tokens + _UE8M0_SCALES_PER_PACK - 1)
+        // _UE8M0_SCALES_PER_PACK
+        * _UE8M0_SCALES_PER_PACK
+    )
     x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
     x_s_storage = torch.empty(
         (num_groups, packed_hidden_groups, aligned_num_tokens),
         device=x.device,
         dtype=torch.int32,
     )
-    if x.numel() > 0:
-        _fp8_wo_a_group_major_quant_ue8m0_rope_custom_op(
-            x, freqs_cis, positions, x_q, x_s_storage
-        )
+
+    # DeepGEMM consumes the logical [T, G, packed_hidden] view of this storage.
     x_s = x_s_storage.transpose(-1, -2)[:, :num_tokens, :].transpose(0, 1)
-    return x_q, x_s
+    return x_q, x_s_storage, x_s

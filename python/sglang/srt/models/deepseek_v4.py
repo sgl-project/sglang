@@ -1537,6 +1537,15 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
+        self.use_fused_rope_quant = (
+            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
+            and self.wo_a_fp8
+            and _FP8_WO_A_UE8M0
+            and not _is_npu
+            and not _is_hip
+            and self.qk_rope_head_dim == 64
+            and self.head_dim == 512
+        )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
 
@@ -2936,14 +2945,9 @@ class MQALayer(MqaAttentionBase):
             )
 
             fuse_rope_quant = (
-                envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
-                and self.wo_a_fp8
-                and _FP8_WO_A_UE8M0
-                and not _is_npu
-                and not _is_hip
+                self.use_fused_rope_quant
                 and not is_in_breakable_cuda_graph()
                 and inv_rope is None
-                and self.qk_rope_head_dim == 64
                 and o.shape[-1] == 512
                 and o.dtype == torch.bfloat16
             )
