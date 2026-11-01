@@ -622,6 +622,110 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                         )
                     )
 
+    def test_host_offsets_are_bit_identical_without_syncs(self):
+        """With cu_seqlens_cpu the scan plans from the host offsets instead of
+        reading cu_seqlens back: the same bits as without it, in one pass and
+        pipelined, and no synchronizing call once the kernels are compiled."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V, pool_size = 2, 6, 128, 128, 4
+        torch.manual_seed(0)
+        cases = (
+            # label, rows, sequence lengths, pipeline
+            ("three sequences, one pass", 3000, [1000, 64, 1936], False),
+            ("16384 tokens, pipelined", 16384, [16384], True),
+            ("10000 tokens + padded tail, pipelined", 10240, [10000], True),
+            ("1696 tokens + padded tail, one pass", 2048, [1696], True),
+        )
+        for label, T, lens, pipeline in cases:
+            with self.subTest(label):
+                pool_init = (
+                    torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device)
+                    * 0.1
+                )
+                cache_indices = torch.arange(
+                    1, len(lens) + 1, dtype=torch.int32, device=device
+                )
+                q = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                k = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                offsets = [0, *itertools.accumulate(lens)]
+
+                def run(host):
+                    # Fresh offsets per call, as per forward pass: nothing comes
+                    # from the index caches of an earlier call.
+                    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+                    cu_seqlens_cpu = (
+                        torch.tensor(offsets, dtype=torch.int32) if host else None
+                    )
+                    pool = pool_init.clone()
+                    output = torch.full_like(v, float("nan"))
+                    torch.cuda.synchronize()
+                    with envs.SGLANG_GDN_CHUNK_PIPELINE.override(pipeline):
+                        if host and torch.cuda.is_available():
+                            torch.cuda.set_sync_debug_mode("error")
+                        try:
+                            o, _, h = chunk_gated_delta_rule(
+                                q=q,
+                                k=k,
+                                v=v,
+                                g=g,
+                                beta=beta,
+                                initial_state=pool,
+                                initial_state_indices=cache_indices,
+                                cu_seqlens=cu_seqlens,
+                                head_first=False,
+                                use_qk_l2norm_in_kernel=True,
+                                output=output,
+                                cu_seqlens_cpu=cu_seqlens_cpu,
+                            )
+                        finally:
+                            if torch.cuda.is_available():
+                                torch.cuda.set_sync_debug_mode(0)
+                    return o, h, pool
+
+                o0, h0, pool0 = run(host=False)
+                o1, h1, pool1 = run(host=True)
+                self.assertTrue(torch.equal(o1, o0))
+                self.assertTrue(torch.equal(h1, h0))
+                self.assertTrue(torch.equal(pool1, pool0))
+
+    def test_chunk_indices_and_offsets_from_host_offsets(self):
+        """Chunk indices built from host offsets and chunk offsets padded on
+        the device match the device-read versions, values and dtype."""
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        device = get_device()
+        for lens in ([1], [64], [65], [1000, 64, 1936], [5, 0, 3], [16384]):
+            for dtype in (torch.int32, torch.long):
+                with self.subTest(lens=lens, dtype=dtype):
+                    offsets = [0, *itertools.accumulate(lens)]
+                    cu_seqlens = torch.tensor(offsets, dtype=dtype, device=device)
+                    expected = prepare_chunk_indices(cu_seqlens.clone(), 64)
+                    actual = prepare_chunk_indices(
+                        cu_seqlens, 64, torch.tensor(offsets, dtype=dtype)
+                    )
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertEqual(actual.device, expected.device)
+                    self.assertTrue(torch.equal(actual, expected))
+
+                    lens_t = cu_seqlens[1:] - cu_seqlens[:-1]
+                    expected = torch.cat(
+                        [cu_seqlens.new_tensor([0]), (lens_t + 63) // 64]
+                    ).cumsum(-1)
+                    actual = prepare_chunk_offsets(cu_seqlens.clone(), 64)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertTrue(torch.equal(actual, expected))
+
     # ------------------------------------------------------------------
     # The fused kkt + solve kernel writes all of A (no zero fill first)
     # ------------------------------------------------------------------

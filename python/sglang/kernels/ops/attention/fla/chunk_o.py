@@ -163,13 +163,17 @@ def chunk_fwd_o(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
     output: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    # chunk_indices: the caller's, for chunk_size; a short input uses smaller
+    # chunks and needs its own.
+    if cu_seqlens is None:
+        chunk_indices = None
+    elif chunk_indices is None or BT != chunk_size:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
