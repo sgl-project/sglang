@@ -1482,7 +1482,11 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
             reqs_to_exclude.add(req)
-            self.checkpoint_disagg_prefill(req)
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV to checkpoint or send.
+            computed = req.extend_end > req.prefix_len
+            if computed:
+                self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1499,13 +1503,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if not self.enable_overlap or req.inflight_middle_chunks == 0:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif computed and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif computed:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:

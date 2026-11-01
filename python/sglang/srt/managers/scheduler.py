@@ -4166,8 +4166,8 @@ class Scheduler(
             # only finished requests to running_batch.
             reqs_to_exclude.add(self.chunked_req)
 
-            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
-            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV, so nothing to stash.
             if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
@@ -4483,11 +4483,16 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # A parked chunk found no budget in this pass: admit no one ahead of it,
+        # so no batch carries a chunked request it does not run.
+        chunk_parked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
