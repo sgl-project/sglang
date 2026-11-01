@@ -22,11 +22,9 @@ on:
           - '1-gpu-small'
           - '1-gpu-large'
           - '2-gpu-large'
-          - '2-gpu-gb300'
           - '4-gpu-h100'
           - '4-gpu-b200'
           - '4-gpu-gb300'
-          - '8-gpu-h20'
           - '8-gpu-h200'
           - '8-gpu-b200'
           - '8-gpu-b300'
@@ -128,21 +126,6 @@ jobs:
       scheduled: true
     secrets: inherit
 
-  nightly-2-gpu-gb300:
-    needs: check-changes
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-gb300')
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: nightly-test-2-gpu-gb300
-      runner_config: 2-gpu-gb300
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '360'
-      job_timeout_minutes: '420'
-      scheduled: true
-    secrets: inherit
-
   nightly-4-gpu-h100:
     needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-h100')
@@ -185,21 +168,6 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
-      scheduled: true
-    secrets: inherit
-
-  nightly-8-gpu-h20:
-    needs: check-changes
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h20')
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: nightly-test-8-gpu-h20
-      runner_config: 8-gpu-h20
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '300'
-      job_timeout_minutes: '360'
       scheduled: true
     secrets: inherit
 
@@ -328,11 +296,9 @@ jobs:
       - nightly-1-gpu-small
       - nightly-1-gpu-large
       - nightly-2-gpu-large
-      - nightly-2-gpu-gb300
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
       - nightly-4-gpu-gb300
-      - nightly-8-gpu-h20
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
       - nightly-8-gpu-b300
@@ -379,11 +345,9 @@ jobs:
       - nightly-1-gpu-small
       - nightly-1-gpu-large
       - nightly-2-gpu-large
-      - nightly-2-gpu-gb300
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
       - nightly-4-gpu-gb300
-      - nightly-8-gpu-h20
       - nightly-8-gpu-h200
       - nightly-8-gpu-b200
       - nightly-8-gpu-b300
