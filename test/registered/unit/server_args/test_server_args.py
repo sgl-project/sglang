@@ -2040,6 +2040,45 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
                 validate_hisparse(server_args)
 
 
+class TestHiSparseUnifiedKvFp8Guard(unittest.TestCase):
+    """ROCm DSv4 HiSparse is wired for bf16 unified-KV only; fp8 is refused."""
+
+    def _v4_hisparse_args(self):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+        return args
+
+    @override_platform(is_hip=True)
+    def test_rejects_unified_kv_fp8(self):
+        with patch(
+            "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_fp8",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"SGLANG_DSV4_UNIFIED_KV_FP8"):
+                validate_hisparse(self._v4_hisparse_args())
+
+    @override_platform(is_hip=True)
+    def test_accepts_unified_kv_bf16(self):
+        # bf16 unified-KV HiSparse is allowed; only fp8 is refused.
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_fp8",
+                return_value=False,
+            ),
+        ):
+            validate_hisparse(self._v4_hisparse_args())
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the
