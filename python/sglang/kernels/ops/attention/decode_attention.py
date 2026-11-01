@@ -37,6 +37,9 @@ from sglang.srt.utils import (
     is_hip,
 )
 
+# Above this split budget the grouped stage 1 loops over splits in a fixed number of
+# blocks per (request, head tile) instead of launching one block per split.
+_MAX_SPLIT_PROGRAMS = 32
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
@@ -576,6 +579,7 @@ def _fwd_grouped_kernel_stage1(
     USE_FORCED: tl.constexpr = False,
     uneven_batch=None,
     ROTATE_BATCH: tl.constexpr = False,
+    SPLIT_STRIDE: tl.constexpr = 0,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -632,12 +636,6 @@ def _fwd_grouped_kernel_stage1(
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     # Hoist loop-invariant base offsets
     base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
@@ -646,148 +644,171 @@ def _fwd_grouped_kernel_stage1(
     if not HAS_MLA:
         base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
 
-    if split_kv_end > split_kv_start:
-        q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
-        # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
-        # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
-        # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
-        # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
-        # On all other platforms keep the original downcast of q to the KV dtype.
-        # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-        if IS_GFX1250:
-            q_k = q
-        else:
-            q_k = q.to(K_Buffer.dtype.element_ty)
-        if BLOCK_DPE > 0:
-            qpe = tl.load(
-                Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+    # With SPLIT_STRIDE > 0 the grid has SPLIT_STRIDE programs per (request, head
+    # tile) instead of one per split, and each takes the splits split_kv_id,
+    # split_kv_id + SPLIT_STRIDE, ... up to the request's own count. Every split is
+    # computed and stored exactly as with one program per split.
+    if SPLIT_STRIDE > 0:
+        split_last = kv_splits
+        split_step: tl.constexpr = SPLIT_STRIDE
+    else:
+        split_last = split_kv_id + 1
+        split_step: tl.constexpr = 1
+    split_first = split_kv_id
+    for split_kv_id in tl.range(split_first, split_last, split_step):
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
+        e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+        if split_kv_end > split_kv_start:
+            q = tl.load(
+                Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0
             )
-        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
-                other=0,
-            )
-            # Page-aware KV address math (see _fwd_kernel_stage1).
-            if PAGE_SIZE == 1:
-                offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            else:
-                page_id = kv_loc // PAGE_SIZE
-                tok_in_p = kv_loc % PAGE_SIZE
-                offs_buf_k = (
-                    page_id[None, :] * stride_buf_kpage
-                    + tok_in_p[None, :] * stride_buf_ktok
-                    + base_offs_k
-                )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
+            # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+            # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
+            # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
+            # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
+            # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
+            # On all other platforms keep the original downcast of q to the KV dtype.
+            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
             if IS_GFX1250:
-                qk = tl.dot(q_k, k.to(q_k.dtype))
+                q_k = q
             else:
-                qk = tl.dot(q_k, k)
+                q_k = q.to(K_Buffer.dtype.element_ty)
             if BLOCK_DPE > 0:
+                qpe = tl.load(
+                    Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+                )
+            for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+                offs_n = start_n + tl.arange(0, BLOCK_N)
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+                # Page-aware KV address math (see _fwd_kernel_stage1).
                 if PAGE_SIZE == 1:
-                    offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
                 else:
-                    offs_buf_kpe = (
+                    page_id = kv_loc // PAGE_SIZE
+                    tok_in_p = kv_loc % PAGE_SIZE
+                    offs_buf_k = (
                         page_id[None, :] * stride_buf_kpage
                         + tok_in_p[None, :] * stride_buf_ktok
-                        + base_offs_kpe
+                        + base_offs_k
                     )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale_withk
-
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
-
-            if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
-
-            if SCORE_MOD is not None:
-                qk = SCORE_MOD(
-                    qk,
-                    cur_batch_seq_len - 1,
-                    offs_n[None, :],
-                    cur_batch,
-                    cur_head[:, None],
-                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                    Aux0,
-                    aux0_stride_t,
-                    aux0_stride_h,
-                    aux0_len,
-                )
-
-            qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            )
-            if HAS_MLA:
-                v = tl.trans(k)
-            else:
-                if PAGE_SIZE == 1:
-                    offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                if IS_GFX1250:
+                    qk = tl.dot(q_k, k.to(q_k.dtype))
                 else:
-                    offs_buf_v = (
-                        page_id[:, None] * stride_buf_vpage
-                        + tok_in_p[:, None] * stride_buf_vtok
-                        + base_offs_v
+                    qk = tl.dot(q_k, k)
+                if BLOCK_DPE > 0:
+                    if PAGE_SIZE == 1:
+                        offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                    else:
+                        offs_buf_kpe = (
+                            page_id[None, :] * stride_buf_kpage
+                            + tok_in_p[None, :] * stride_buf_ktok
+                            + base_offs_kpe
+                        )
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
                     )
-                v = tl.load(
-                    V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=0.0,
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale_withk
+
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
+
+                if xai_temperature_len > 0:
+                    qk *= xai_temperature_reg[:, None]
+
+                if SCORE_MOD is not None:
+                    qk = SCORE_MOD(
+                        qk,
+                        cur_batch_seq_len - 1,
+                        offs_n[None, :],
+                        cur_batch,
+                        cur_head[:, None],
+                        mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        Aux0,
+                        aux0_stride_t,
+                        aux0_stride_h,
+                        aux0_len,
+                    )
+
+                qk = tl.where(
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                    qk,
+                    float("-inf"),
                 )
+                if HAS_MLA:
+                    v = tl.trans(k)
+                else:
+                    if PAGE_SIZE == 1:
+                        offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                    else:
+                        offs_buf_v = (
+                            page_id[:, None] * stride_buf_vpage
+                            + tok_in_p[:, None] * stride_buf_vtok
+                            + base_offs_v
+                        )
+                    v = tl.load(
+                        V_Buffer + offs_buf_v,
+                        mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                        other=0.0,
+                    )
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
-            # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
-            # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
-            # attention idealized). On other platforms restore the p.to(v.dtype) cast.
-            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
-            if IS_GFX1250:
-                acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
-            else:
-                acc += tl.dot(p.to(v.dtype), v)
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+                # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+                # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+                # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+                # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+                if IS_GFX1250:
+                    acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                else:
+                    acc += tl.dot(p.to(v.dtype), v)
 
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
 
-        offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head[:, None] * stride_mid_oh
-            + split_kv_id * stride_mid_os
-            + offs_dv[None, :]
-        )
+            offs_mid_o = (
+                cur_batch * stride_mid_ob
+                + cur_head[:, None] * stride_mid_oh
+                + split_kv_id * stride_mid_os
+                + offs_dv[None, :]
+            )
 
-        tl.store(
-            Att_Out + offs_mid_o,
-            acc / e_sum[:, None],
-            mask=(mask_h[:, None]) & (mask_dv[None, :]),
-        )
+            tl.store(
+                Att_Out + offs_mid_o,
+                acc / e_sum[:, None],
+                mask=(mask_h[:, None]) & (mask_dv[None, :]),
+            )
 
-        offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+            offs_mid_o_1 = (
+                cur_batch * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // Lv
 
-        tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
-            mask=mask_h,
-        )
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -864,7 +885,12 @@ def _decode_grouped_att_m_fwd(
         )
 
     # Blocks at or above the split count return immediately, so the grid shrinks too.
-    grid = (batch, head_tiles, forced_kv_splits or MAX_KV_SPLITS)
+    # A large split budget (deterministic mode sizes it by the context length) would
+    # launch mostly empty blocks; a fixed number of blocks then loops over the splits.
+    split_stride = 0
+    if not forced_kv_splits and MAX_KV_SPLITS > _MAX_SPLIT_PROGRAMS:
+        split_stride = _MAX_SPLIT_PROGRAMS
+    grid = (batch, head_tiles, forced_kv_splits or split_stride or MAX_KV_SPLITS)
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
@@ -927,6 +953,7 @@ def _decode_grouped_att_m_fwd(
         USE_FORCED=forced_kv_splits > 0,
         uneven_batch=uneven_batch,
         ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
+        SPLIT_STRIDE=split_stride,
         **extra_kargs,
     )
 
@@ -952,6 +979,7 @@ def _fwd_kernel_stage2(
     HAS_SINK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
     FORCED_KV_SPLITS: tl.constexpr = 0,
+    DYNAMIC_SPLIT_END: tl.constexpr = False,
 ):
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
@@ -974,6 +1002,12 @@ def _fwd_kernel_stage2(
     else:
         kv_splits = tl.load(num_kv_splits + cur_batch)
         SPLIT_END: tl.constexpr = MAX_KV_SPLITS
+    # With a large split budget, stop at the request's own split count instead of
+    # walking the empty tail; the splits are merged in the same order either way.
+    if DYNAMIC_SPLIT_END:
+        split_end = kv_splits
+    else:
+        split_end = SPLIT_END
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -988,7 +1022,7 @@ def _fwd_kernel_stage2(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in tl.range(0, SPLIT_END, num_stages=2):
+    for split_kv_id in tl.range(0, split_end, num_stages=2):
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -1066,6 +1100,7 @@ def _decode_softmax_reducev_fwd(
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
+        DYNAMIC_SPLIT_END=not forced_kv_splits and MAX_KV_SPLITS > _MAX_SPLIT_PROGRAMS,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
