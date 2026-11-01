@@ -5678,7 +5678,7 @@ class MHATokenToKOnlyPool(KVCache):
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
             IndexKeyBufferInfo,
-            IndexKeyFormat,
+            IndexKeyLayout,
         )
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
@@ -5690,7 +5690,7 @@ class MHATokenToKOnlyPool(KVCache):
                 buffer_info=IndexKeyBufferInfo(
                     page_size=self.page_size,
                     compress_ratio=1,
-                    key_format=IndexKeyFormat.KEY_ROWS,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
                     # NPU stores these rows with an explicit physical page axis.
                     buffers=tuple(
                         buffer.view(-1, self.head_num, self.head_dim)

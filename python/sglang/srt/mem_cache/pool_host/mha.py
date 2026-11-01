@@ -36,7 +36,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyBufferInfo,
-    IndexKeyFormat,
+    IndexKeyLayout,
     KVScaleLayout,
     MHABufferInfo,
 )
@@ -957,14 +957,14 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     ):
         buffer_info.validate()
         if (
-            buffer_info.key_format is not IndexKeyFormat.KEY_ROWS
+            buffer_info.key_layout is not IndexKeyLayout.KEY_ROWS
             or buffer_info.compress_ratio != 1
             or buffer_info.page_size != anchor_host.page_size
         ):
             raise ValueError(
                 "K-only host requires uncompressed key-row index keys with "
                 f"page_size={anchor_host.page_size}, got "
-                f"key_format={buffer_info.key_format}, "
+                f"key_layout={buffer_info.key_layout}, "
                 f"compress_ratio={buffer_info.compress_ratio}, "
                 f"page_size={buffer_info.page_size}"
             )
