@@ -5,6 +5,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the patch.dict stub below, which unloads every module first
+# imported inside it while their torch op registrations stay.
+import sglang.srt.model_executor.forward_batch_info  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
 
 with patch.dict(
