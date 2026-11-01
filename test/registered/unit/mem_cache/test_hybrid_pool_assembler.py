@@ -421,7 +421,6 @@ class TestMambaInfoRouting(CustomTestCase):
                                     hybrid_pool_assembler.build_hybrid_mamba_stack(
                                         **common,
                                         kv_pool=kv,
-                                        use_mla=False,
                                     )
                                 )
                         entry = group.entry_map[PoolName.MAMBA]
@@ -1259,7 +1258,6 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                 start_layer=0,
                 load_cache_event=None,
                 storage_backend=None,
-                use_mla=True,
             )
 
         self.addCleanup(group.get_pool(PoolName.INDEXER).destroy)
@@ -1465,7 +1463,6 @@ class TestTransferLayerSpan(CustomTestCase):
                 swa_kv_pool=MagicMock(),
                 full_layer_mapping=full_layer_mapping,
                 swa_layer_mapping=swa_layer_mapping,
-                use_mla=False,
             )
 
         self.assertEqual(
@@ -1895,7 +1892,6 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
                             swa_kv_pool=swa,
                             full_layer_mapping={0: 0, 2: 1},
                             swa_layer_mapping={1: 0},
-                            use_mla=False,
                             mtp_swa_full_device_pools=(first, second),
                             transfer_layer_id_max=3,
                         )

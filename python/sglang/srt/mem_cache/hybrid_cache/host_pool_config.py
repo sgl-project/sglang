@@ -6,7 +6,7 @@ buffer information and never ask a device pool to describe host construction.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import msgspec
 
@@ -204,7 +204,6 @@ def prepare_host_pool_config(
             raise ValueError(
                 f"packed draft requires exactly one KV layer per draft pool, got {pool.layer_num}"
             )
-    check_packed_kv_rows(kv_pool=root, drafts=packed_draft_device_pools)
     mapping = with_packed_draft_layer_mapping(
         full_layer_mapping,
         transfer_layer_start=transfer_layer_id_max,
@@ -236,31 +235,3 @@ def prepare_host_pool_config(
         packed_draft_device_pools=packed_draft_device_pools,
         sidecars=sidecars,
     )
-
-
-def is_mla_pool(pool: Any) -> bool:
-    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
-
-    return isinstance(pool, MLAKVView)
-
-
-def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
-    if use_mla:
-        return (pool.kv_cache_dim, pool.store_dtype)
-    return (pool.head_num, pool.head_dim, pool.v_head_dim, pool.store_dtype)
-
-
-def check_packed_kv_rows(
-    *, kv_pool: Any, drafts: tuple[Any, ...], use_mla: Optional[bool] = None
-):
-    if not drafts:
-        return
-    if use_mla is None:
-        use_mla = is_mla_pool(kv_pool)
-    target = _kv_row_signature(kv_pool, use_mla=use_mla)
-    for draft in drafts:
-        row = _kv_row_signature(draft, use_mla=use_mla)
-        if row != target:
-            raise ValueError(
-                f"packed draft KV row {row} differs from target KV row {target}"
-            )
