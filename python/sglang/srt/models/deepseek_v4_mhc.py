@@ -301,6 +301,56 @@ def make_boundary(
 # ---------------------------------------------------------------------------
 
 
+def use_prefill_stats_overlap(
+    cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
+) -> bool:
+    """Wide target prefill runs each triplet on the stats stream beside its
+    sublayer's TP all-reduce. The boundary transport forks the stream right
+    before that collective rather than before the combine, so the mix GEMM and
+    Sinkhorn overlap the reduction instead of competing with the sublayer itself
+    (see `issue_prefill_stats`)."""
+    if not (
+        cfg.pre_from_prev
+        and not cfg.cp_prefill
+        and x.is_cuda
+        and 4096 <= x.shape[0] <= 65536
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and get_platform().is_blackwell
+        and get_parallel().attn_dp_size == 1
+        and not get_forward().sp_active
+    ):
+        return False
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return not is_batch_invariant_mode_enabled()
+
+
+def issue_prefill_stats(
+    hc: HcSubLayer, residual: torch.Tensor, stats_stream: torch.cuda.Stream
+) -> HcTriplet:
+    """Fork the stats stream here, right before the sublayer's TP all-reduce, and
+    issue the triplet on it. The caller joins the stream before the post reads
+    the triplet.
+
+    The residual is not recorded on the stats stream. The caller must keep it
+    alive until the main stream has joined the stats stream: the read state holds
+    it, ``HcUpdate.post`` joins before it reads the residual, and the boundary
+    releases the residual only after the post. The caching allocator reuses a
+    freed block only for allocations on the stream that allocated it (the main
+    stream) until it returns the block to the driver, which synchronizes the
+    device, so every reuse is ordered after the mix GEMM. Recording the residual
+    would instead hold each freed residual until the GPU caught up with the CPU,
+    which in a prefill forward is most of the layers: an 8K chunk would keep about
+    twenty 320 MiB residuals alive at once."""
+    fork_stats_stream(stats_stream)
+    main_stream = torch.cuda.current_stream()
+    with torch.cuda.stream(stats_stream):
+        coefficients = _mix_stats_impl(hc, residual)
+    for coefficient in coefficients:
+        coefficient.record_stream(main_stream)
+    return coefficients
+
+
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
     if not cfg.pre_from_prev:
         return False
