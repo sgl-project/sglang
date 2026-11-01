@@ -20,6 +20,7 @@ from math import sqrt
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import msgspec
 import torch
 import torch.fx
 import torch.nn.functional as F
@@ -55,12 +56,32 @@ _NN_LINEAR = _torch_entry_point("_C._nn.linear")
 _NN_SDPA = _torch_entry_point("_C._nn.scaled_dot_product_attention")
 
 
+class MlxLowering(msgspec.Struct, frozen=True):
+    """One MLX lowering: its implementation and the FX targets that select it.
+
+    ``fn(mx, args, kwargs)`` runs inside the MLX graph on resolved values.
+    ``admit(args, kwargs)``, when given, runs at plan time on the node's
+    literal arguments (tensors appear as ``torch.fx.Node``) and returns why
+    the node cannot be lowered, or None; that routes inadmissible graphs to
+    the Torch fallback before any executor exists.
+    """
+
+    name: str
+    fn: Any
+    aten: tuple = ()
+    functions: tuple = ()
+    methods: tuple = ()
+    admit: Any = None
+
+
 @dataclass(frozen=True)
 class MlxFxNodePlan:
     node_name: str
     node_op: str
     target: Any
     lowering: Optional[str]
+    implementation: Any = None
+    reason: Optional[str] = None
 
     @property
     def supported(self) -> bool:
@@ -83,7 +104,11 @@ class MlxFxGraphPlan:
         return not self.unsupported
 
     def describe_unsupported(self) -> str:
-        return ", ".join(f"{node.node_op}:{node.target}" for node in self.unsupported)
+        return ", ".join(
+            f"{node.node_op}:{node.target}"
+            + (f" ({node.reason})" if node.reason else "")
+            for node in self.unsupported
+        )
 
     def require_fully_supported(self) -> None:
         if self.fully_supported:
@@ -95,32 +120,49 @@ class MlxFxGraphPlan:
 
 
 class MlxFxLoweringRegistry:
-    """Maps FX operations to reusable MLX lowering names.
+    """Maps FX targets to MLX lowerings, implementation included.
 
-    The standard tables are derived from the ``@_lowering`` registrations
+    The standard tables are derived from the ``@mlx_lowering`` registrations
     below: each lowering function declares the ATen overloads, Torch
     functions, and tensor methods it implements, so adding an op is one
-    self-contained function and never a second table edit.
+    self-contained function and never a second table edit. Every entry binds
+    an implementation, so a target the plan admits always has code behind it.
     """
 
     def __init__(self) -> None:
-        self._functions: dict[Any, str] = {}
-        self._methods: dict[str, str] = {}
+        self._functions: dict[Any, MlxLowering] = {}
+        self._functionalized: dict[Any, MlxLowering] = {}
+        self._methods: dict[str, MlxLowering] = {}
 
-    def register_function(self, target: Any, lowering: str) -> None:
-        self._functions[target] = lowering
+    def register_function(self, target: Any, lowering: Any) -> None:
+        """Bind a ``call_function`` target to a lowering.
 
-    def register_method(self, target: str, lowering: str) -> None:
-        self._methods[target] = lowering
+        ``lowering`` is a :class:`MlxLowering`, a callable ``fn(mx, args,
+        kwargs)``, or the name of a built-in lowering; a name that has no
+        implementation is rejected here rather than at first execution.
+        """
+        self._functions[target] = _as_lowering(lowering, target)
 
-    def resolve(self, node: torch.fx.Node) -> Optional[str]:
-        if node.op in {"placeholder", "get_attr", "output"}:
-            return node.op
+    def register_functionalized(self, custom_target: Any, lowering: Any) -> None:
+        """Bind the ``auto_functionalized`` spelling of a mutating custom op.
+
+        ``torch.export`` wraps a custom op that mutates an input in
+        ``auto_functionalized_v2(op, ...)``; the lowering receives that
+        wrapper's arguments, with the op as ``args[0]``, and must return the
+        functional outputs the wrapper declares.
+        """
+        bound = _as_lowering(lowering, custom_target)
+        self._functionalized[custom_target] = msgspec.structs.replace(
+            bound, name=f"functionalized_{bound.name}"
+        )
+
+    def register_method(self, target: str, lowering: Any) -> None:
+        self._methods[target] = _as_lowering(lowering, target)
+
+    def resolve(self, node: torch.fx.Node) -> Optional[MlxLowering]:
         if node.op == "call_function":
             if node.target is _AUTO_FUNCTIONALIZED:
-                custom_target = node.args[0]
-                lowering = self._functions.get(custom_target)
-                return None if lowering is None else f"functionalized_{lowering}"
+                return self._functionalized.get(node.args[0])
             return self._functions.get(node.target)
         if node.op == "call_method":
             return self._methods.get(str(node.target))
@@ -130,21 +172,48 @@ class MlxFxLoweringRegistry:
     def standard_decoder(cls) -> MlxFxLoweringRegistry:
         """Return lowerings used by ordinary dense decoder graphs."""
         registry = cls()
-        for name, spec in _LOWERINGS.items():
-            for target in spec.functions:
-                registry.register_function(target, name)
-            for target in spec.methods:
-                registry.register_method(target, name)
+        for lowering in _unique_lowerings():
+            for target in lowering.functions:
+                registry.register_function(target, lowering)
+            for target in lowering.methods:
+                registry.register_method(target, lowering)
         return registry
 
     @classmethod
     def standard_export_decoder(cls) -> MlxFxLoweringRegistry:
         """Return canonical ATen lowerings produced by ``torch.export``."""
         registry = cls()
-        for name, spec in _LOWERINGS.items():
-            for target in spec.aten:
-                registry.register_function(target, name)
+        for lowering in _unique_lowerings():
+            for target in lowering.aten:
+                registry.register_function(target, lowering)
         return registry
+
+
+def _as_lowering(lowering: Any, target: Any) -> MlxLowering:
+    if isinstance(lowering, MlxLowering):
+        return lowering
+    if isinstance(lowering, str):
+        built_in = _LOWERINGS.get(lowering)
+        if built_in is None:
+            raise ValueError(
+                f"no built-in MLX lowering named {lowering!r} to bind to {target}; "
+                "pass the implementation itself"
+            )
+        return built_in
+    if callable(lowering):
+        return MlxLowering(
+            name=getattr(lowering, "__name__", repr(lowering)), fn=lowering
+        )
+    raise TypeError(f"cannot bind {lowering!r} as an MLX lowering for {target}")
+
+
+def _unique_lowerings() -> tuple[MlxLowering, ...]:
+    # Aliases ("view" -> the reshape lowering) map to one object; register
+    # each implementation once.
+    seen: dict[int, MlxLowering] = {}
+    for lowering in _LOWERINGS.values():
+        seen.setdefault(id(lowering), lowering)
+    return tuple(seen.values())
 
 
 def build_mlx_fx_plan(
@@ -154,15 +223,29 @@ def build_mlx_fx_plan(
     """Classify a captured forward without inspecting its model architecture."""
     return MlxFxGraphPlan(
         graph_module=graph_module,
-        nodes=tuple(
-            MlxFxNodePlan(
-                node_name=node.name,
-                node_op=node.op,
-                target=node.target,
-                lowering=registry.resolve(node),
-            )
-            for node in graph_module.graph.nodes
-        ),
+        nodes=tuple(_plan_node(node, registry) for node in graph_module.graph.nodes),
+    )
+
+
+def _plan_node(node: torch.fx.Node, registry: MlxFxLoweringRegistry) -> MlxFxNodePlan:
+    if node.op in {"placeholder", "get_attr", "output"}:
+        return MlxFxNodePlan(node.name, node.op, node.target, lowering=node.op)
+    lowering = registry.resolve(node)
+    if lowering is None:
+        return MlxFxNodePlan(
+            node.name, node.op, node.target, lowering=None, reason="no MLX lowering"
+        )
+    reason = lowering.admit(node.args, node.kwargs) if lowering.admit else None
+    if reason is not None:
+        return MlxFxNodePlan(
+            node.name, node.op, node.target, lowering=None, reason=reason
+        )
+    return MlxFxNodePlan(
+        node.name,
+        node.op,
+        node.target,
+        lowering=lowering.name,
+        implementation=lowering.fn,
     )
 
 
@@ -178,40 +261,39 @@ def _resolve_fx_value(value: Any, values: dict[torch.fx.Node, Any]) -> Any:
     return value
 
 
-@dataclass(frozen=True)
-class _LoweringSpec:
-    """One MLX lowering and the FX targets that select it."""
-
-    fn: Callable[..., Any]
-    aten: tuple[Any, ...]
-    functions: tuple[Any, ...]
-    methods: tuple[str, ...]
+_LOWERINGS: dict[str, MlxLowering] = {}
 
 
-_LOWERINGS: dict[str, _LoweringSpec] = {}
-
-
-def _lowering(
+def mlx_lowering(
     name: str,
     *,
     aten: Sequence[Any] = (),
     functions: Sequence[Any] = (),
     methods: Sequence[str] = (),
     aliases: Sequence[str] = (),
+    admit: Optional[Callable[..., Optional[str]]] = None,
 ):
-    """Register ``fn`` as MLX lowering ``name`` for the given FX targets.
+    """Register ``fn`` as the built-in MLX lowering ``name`` for its FX targets.
 
     ``aten`` are the canonical overloads ``torch.export`` emits, ``functions``
     and ``methods`` the eager-FX spellings; ``aliases`` register the same
-    function under additional lowering names (``reshape``/``view``).
+    lowering under additional names (``reshape``/``view``); ``admit`` is the
+    plan-time admissibility predicate (see :class:`MlxLowering`).
     """
 
     def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-        spec = _LoweringSpec(fn, tuple(aten), tuple(functions), tuple(methods))
+        lowering = MlxLowering(
+            name=name,
+            fn=fn,
+            aten=tuple(aten),
+            functions=tuple(functions),
+            methods=tuple(methods),
+            admit=admit,
+        )
         for key in (name, *aliases):
             if key in _LOWERINGS:
                 raise ValueError(f"duplicate MLX lowering: {key}")
-            _LOWERINGS[key] = spec
+            _LOWERINGS[key] = lowering
         return fn
 
     return register
@@ -222,6 +304,7 @@ def _lower_mlx_node(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    """Run one built-in lowering by name; the catalogue entry for tests."""
     import mlx.core as mx
 
     spec = _LOWERINGS.get(lowering)
@@ -234,43 +317,58 @@ def _arg(args, kwargs, index, name, default=None):
     return args[index] if len(args) > index else kwargs.get(name, default)
 
 
-@_lowering("assert_metadata", aten=(torch.ops.aten._assert_tensor_metadata.default,))
+@mlx_lowering("assert_metadata", aten=(torch.ops.aten._assert_tensor_metadata.default,))
 def _lower_assert_metadata(mx, args, kwargs):
     return None
 
 
-@_lowering("alias", aten=(torch.ops.aten.alias.default,))
+@mlx_lowering("alias", aten=(torch.ops.aten.alias.default,))
 def _lower_alias(mx, args, kwargs):
     return args[0]
 
 
-@_lowering("concatenate", aten=(torch.ops.aten.cat.default,))
+@mlx_lowering("concatenate", aten=(torch.ops.aten.cat.default,))
 def _lower_concatenate(mx, args, kwargs):
     return mx.concatenate(tuple(args[0]), axis=_arg(args, kwargs, 1, "dim", 0))
 
 
 # aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse): the
 # trailing flags only affect backward, so every forward is admissible.
-@_lowering("embedding", aten=(torch.ops.aten.embedding.default,))
+@mlx_lowering("embedding", aten=(torch.ops.aten.embedding.default,))
 def _lower_embedding(mx, args, kwargs):
     weight, input_ids = args[:2]
     return mx.take(weight, input_ids, axis=0)
 
 
+def _admit_functional_embedding(args, kwargs) -> Optional[str]:
+    if _arg(args, kwargs, 3, "max_norm") is not None:
+        return "embedding max_norm renormalizes the weight in place"
+    return None
+
+
 # F.embedding(input, weight, padding_idx, max_norm, ...): the eager spelling
 # takes ids first, so it is its own lowering rather than a shape guess.
-@_lowering("embedding_functional", functions=(F.embedding,))
+@mlx_lowering(
+    "embedding_functional",
+    functions=(F.embedding,),
+    admit=_admit_functional_embedding,
+)
 def _lower_functional_embedding(mx, args, kwargs):
     input_ids, weight = args[:2]
-    if _arg(args, kwargs, 3, "max_norm") is not None:
-        raise UnsupportedMlxFxGraphError(
-            "embedding max_norm renormalizes the weight in place"
-        )
     return mx.take(weight, input_ids, axis=0)
 
 
-@_lowering(
-    "rms_norm", aten=(torch.ops.aten.rms_norm.default,), functions=(torch.rms_norm,)
+def _admit_rms_norm(args, kwargs) -> Optional[str]:
+    if _arg(args, kwargs, 2, "weight") is None:
+        return "MLX RMSNorm requires an explicit weight"
+    return None
+
+
+@mlx_lowering(
+    "rms_norm",
+    aten=(torch.ops.aten.rms_norm.default,),
+    functions=(torch.rms_norm,),
+    admit=_admit_rms_norm,
 )
 def _lower_rms_norm(mx, args, kwargs):
     value = args[0]
@@ -283,7 +381,19 @@ def _lower_rms_norm(mx, args, kwargs):
     return mx.fast.rms_norm(value, weight, float(epsilon))
 
 
-@_lowering("layer_norm", aten=(torch.ops.aten.layer_norm.default,))
+def _admit_layer_norm(args, kwargs) -> Optional[str]:
+    normalized_shape = _arg(args, kwargs, 1, "normalized_shape")
+    if isinstance(normalized_shape, Sequence) and len(normalized_shape) != 1:
+        return (
+            "MLX layer_norm only normalizes the last axis, found "
+            f"normalized_shape={tuple(normalized_shape)}"
+        )
+    return None
+
+
+@mlx_lowering(
+    "layer_norm", aten=(torch.ops.aten.layer_norm.default,), admit=_admit_layer_norm
+)
 def _lower_layer_norm(mx, args, kwargs):
     value, normalized_shape = args[:2]
     weight = _arg(args, kwargs, 2, "weight")
@@ -297,7 +407,7 @@ def _lower_layer_norm(mx, args, kwargs):
     return mx.fast.layer_norm(value, weight, bias, float(epsilon))
 
 
-@_lowering(
+@mlx_lowering(
     "linear",
     aten=(torch.ops.aten.linear.default,),
     functions=(_NN_LINEAR,),
@@ -309,12 +419,19 @@ def _lower_linear(mx, args, kwargs):
     return output if bias is None else output + bias
 
 
-@_lowering("matmul", aten=(torch.ops.aten.matmul.default, torch.ops.aten.mm.default))
+@mlx_lowering("matmul", aten=(torch.ops.aten.matmul.default, torch.ops.aten.mm.default))
 def _lower_matmul(mx, args, kwargs):
     return args[0] @ args[1]
 
 
-@_lowering("mean", aten=(torch.ops.aten.mean.dim,))
+def _admit_dtype_kwarg(args, kwargs) -> Optional[str]:
+    dtype = kwargs.get("dtype")
+    if dtype is not None and dtype not in _MLX_DTYPES:
+        return f"Torch dtype has no MLX Metal lowering: {dtype}"
+    return None
+
+
+@mlx_lowering("mean", aten=(torch.ops.aten.mean.dim,), admit=_admit_dtype_kwarg)
 def _lower_mean(mx, args, kwargs):
     axis = _arg(args, kwargs, 1, "dim")
     keepdims = _arg(args, kwargs, 2, "keepdim", False)
@@ -323,10 +440,17 @@ def _lower_mean(mx, args, kwargs):
     return mx.mean(value, axis=axis, keepdims=keepdims)
 
 
-@_lowering(
+def _admit_sdpa(args, kwargs) -> Optional[str]:
+    if _arg(args, kwargs, 4, "dropout_p", 0.0) not in (None, 0, 0.0):
+        return "SDPA dropout is unsupported"
+    return None
+
+
+@mlx_lowering(
     "sdpa",
     aten=(torch.ops.aten.scaled_dot_product_attention.default,),
     functions=(_NN_SDPA,),
+    admit=_admit_sdpa,
 )
 def _lower_sdpa(mx, args, kwargs):
     query, key, value = args[:3]
@@ -380,22 +504,29 @@ def _lower_sdpa(mx, args, kwargs):
     return probabilities @ value
 
 
-@_lowering("silu", aten=(torch.ops.aten.silu.default,), functions=(F.silu,))
+@mlx_lowering("silu", aten=(torch.ops.aten.silu.default,), functions=(F.silu,))
 def _lower_silu(mx, args, kwargs):
     return mx.sigmoid(args[0]) * args[0]
 
 
-@_lowering("sigmoid", aten=(torch.ops.aten.sigmoid.default,))
+@mlx_lowering("sigmoid", aten=(torch.ops.aten.sigmoid.default,))
 def _lower_sigmoid(mx, args, kwargs):
     return mx.sigmoid(args[0])
 
 
-@_lowering("relu", aten=(torch.ops.aten.relu.default,))
+@mlx_lowering("relu", aten=(torch.ops.aten.relu.default,))
 def _lower_relu(mx, args, kwargs):
     return mx.maximum(args[0], 0)
 
 
-@_lowering("gelu", aten=(torch.ops.aten.gelu.default,))
+def _admit_gelu(args, kwargs) -> Optional[str]:
+    approximate = kwargs.get("approximate", "none")
+    if approximate not in ("none", "tanh"):
+        return f"unsupported GELU approximation: {approximate}"
+    return None
+
+
+@mlx_lowering("gelu", aten=(torch.ops.aten.gelu.default,), admit=_admit_gelu)
 def _lower_gelu(mx, args, kwargs):
     value = args[0]
     approximate = kwargs.get("approximate", "none")
@@ -412,22 +543,22 @@ def _lower_gelu(mx, args, kwargs):
     return value * 0.5 * (1 + mx.erf(value / sqrt(2)))
 
 
-@_lowering("tanh", aten=(torch.ops.aten.tanh.default,))
+@mlx_lowering("tanh", aten=(torch.ops.aten.tanh.default,))
 def _lower_tanh(mx, args, kwargs):
     return mx.tanh(args[0])
 
 
-@_lowering("stack", aten=(torch.ops.aten.stack.default,))
+@mlx_lowering("stack", aten=(torch.ops.aten.stack.default,))
 def _lower_stack(mx, args, kwargs):
     return mx.stack(tuple(args[0]), axis=_arg(args, kwargs, 1, "dim", 0))
 
 
-@_lowering("getitem", aten=(operator.getitem,), functions=(operator.getitem,))
+@mlx_lowering("getitem", aten=(operator.getitem,), functions=(operator.getitem,))
 def _lower_getitem(mx, args, kwargs):
     return args[0][args[1]]
 
 
-@_lowering(
+@mlx_lowering(
     "add", aten=(torch.ops.aten.add.Tensor,), functions=(operator.add, torch.add)
 )
 def _lower_add(mx, args, kwargs):
@@ -437,14 +568,14 @@ def _lower_add(mx, args, kwargs):
     return args[0] + args[1] * alpha
 
 
-@_lowering(
+@mlx_lowering(
     "multiply", aten=(torch.ops.aten.mul.Tensor,), functions=(operator.mul, torch.mul)
 )
 def _lower_multiply(mx, args, kwargs):
     return args[0] * args[1]
 
 
-@_lowering(
+@mlx_lowering(
     "subtract", aten=(torch.ops.aten.sub.Tensor,), functions=(operator.sub, torch.sub)
 )
 def _lower_subtract(mx, args, kwargs):
@@ -454,7 +585,7 @@ def _lower_subtract(mx, args, kwargs):
     return args[0] - args[1] * alpha
 
 
-@_lowering("chunk", aten=(torch.ops.aten.chunk.default,), methods=("chunk",))
+@mlx_lowering("chunk", aten=(torch.ops.aten.chunk.default,), methods=("chunk",))
 def _lower_chunk(mx, args, kwargs):
     value, chunks = args[:2]
     axis = _arg(args, kwargs, 2, "dim", 0)
@@ -464,7 +595,7 @@ def _lower_chunk(mx, args, kwargs):
     return tuple(mx.split(value, indices, axis=axis))
 
 
-@_lowering("split", aten=(torch.ops.aten.split.Tensor,))
+@mlx_lowering("split", aten=(torch.ops.aten.split.Tensor,))
 def _lower_split(mx, args, kwargs):
     value, split_size = args[:2]
     axis = _arg(args, kwargs, 2, "dim", 0)
@@ -473,7 +604,7 @@ def _lower_split(mx, args, kwargs):
     return tuple(mx.split(value, indices, axis=axis))
 
 
-@_lowering("split_with_sizes", aten=(torch.ops.aten.split_with_sizes.default,))
+@mlx_lowering("split_with_sizes", aten=(torch.ops.aten.split_with_sizes.default,))
 def _lower_split_with_sizes(mx, args, kwargs):
     value, sizes = args[:2]
     axis = _arg(args, kwargs, 2, "dim", 0)
@@ -485,7 +616,7 @@ def _lower_split_with_sizes(mx, args, kwargs):
     return tuple(mx.split(value, tuple(indices), axis=axis))
 
 
-@_lowering(
+@mlx_lowering(
     "reshape",
     aten=(torch.ops.aten.reshape.default, torch.ops.aten.view.default),
     methods=("reshape",),
@@ -496,7 +627,7 @@ def _lower_reshape(mx, args, kwargs):
     return mx.reshape(args[0], tuple(shape))
 
 
-@_lowering("flatten", aten=(torch.ops.aten.flatten.using_ints,))
+@mlx_lowering("flatten", aten=(torch.ops.aten.flatten.using_ints,))
 def _lower_flatten(mx, args, kwargs):
     value = args[0]
     start = _arg(args, kwargs, 1, "start_dim", 0)
@@ -510,37 +641,46 @@ def _lower_flatten(mx, args, kwargs):
     return mx.reshape(value, shape)
 
 
-@_lowering("index_select", aten=(torch.ops.aten.index_select.default,))
+@mlx_lowering("index_select", aten=(torch.ops.aten.index_select.default,))
 def _lower_index_select(mx, args, kwargs):
     return mx.take(args[0], args[2], axis=args[1])
 
 
-@_lowering("numpy_transpose", aten=(torch.ops.aten.numpy_T.default,))
+@mlx_lowering("numpy_transpose", aten=(torch.ops.aten.numpy_T.default,))
 def _lower_numpy_transpose(mx, args, kwargs):
     return mx.transpose(args[0], axes=tuple(reversed(range(args[0].ndim))))
 
 
-@_lowering("power", aten=(torch.ops.aten.pow.Tensor_Scalar,))
+@mlx_lowering("power", aten=(torch.ops.aten.pow.Tensor_Scalar,))
 def _lower_power(mx, args, kwargs):
     return mx.power(args[0], args[1])
 
 
-@_lowering("rsqrt", aten=(torch.ops.aten.rsqrt.default,))
+@mlx_lowering("rsqrt", aten=(torch.ops.aten.rsqrt.default,))
 def _lower_rsqrt(mx, args, kwargs):
     return mx.rsqrt(args[0])
 
 
-@_lowering("to_dtype", aten=(torch.ops.aten.to.dtype,))
+def _admit_to_dtype(args, kwargs) -> Optional[str]:
+    dtype = _arg(args, kwargs, 1, "dtype")
+    if isinstance(dtype, torch.dtype) and dtype not in _MLX_DTYPES:
+        return f"Torch dtype has no MLX Metal lowering: {dtype}"
+    return None
+
+
+@mlx_lowering("to_dtype", aten=(torch.ops.aten.to.dtype,), admit=_admit_to_dtype)
 def _lower_to_dtype(mx, args, kwargs):
     return args[0].astype(_mlx_dtype(args[1], mx))
 
 
-@_lowering("unsqueeze", aten=(torch.ops.aten.unsqueeze.default,))
+@mlx_lowering("unsqueeze", aten=(torch.ops.aten.unsqueeze.default,))
 def _lower_unsqueeze(mx, args, kwargs):
     return mx.expand_dims(args[0], axis=args[1])
 
 
-@_lowering("empty_like", aten=(torch.ops.aten.empty_like.default,))
+@mlx_lowering(
+    "empty_like", aten=(torch.ops.aten.empty_like.default,), admit=_admit_dtype_kwarg
+)
 def _lower_empty_like(mx, args, kwargs):
     dtype = kwargs.get("dtype")
     if dtype is None:
@@ -548,7 +688,7 @@ def _lower_empty_like(mx, args, kwargs):
     return mx.empty(args[0].shape, dtype=_mlx_dtype(dtype, mx))
 
 
-@_lowering("slice", aten=(torch.ops.aten.slice.Tensor,))
+@mlx_lowering("slice", aten=(torch.ops.aten.slice.Tensor,))
 def _lower_slice(mx, args, kwargs):
     value = args[0]
     axis = _arg(args, kwargs, 1, "dim", 0)
@@ -569,14 +709,28 @@ def _lower_slice(mx, args, kwargs):
     return value[tuple(slices)]
 
 
-@_lowering("transpose", methods=("transpose",))
+@mlx_lowering("transpose", methods=("transpose",))
 def _lower_transpose(mx, args, kwargs):
     return mx.swapaxes(args[0], args[1], args[2])
 
 
-@_lowering("contiguous", methods=("contiguous",))
+@mlx_lowering("contiguous", methods=("contiguous",))
 def _lower_contiguous(mx, args, kwargs):
     return mx.contiguous(args[0])
+
+
+_MLX_DTYPES = frozenset(
+    {
+        torch.bool,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    }
+)
 
 
 def _mlx_dtype(dtype: torch.dtype, mx: Any) -> Any:
@@ -652,7 +806,6 @@ def make_mlx_fx_executor(
         for node, (owner, attr_name, value) in zip(attr_nodes, attrs)
         if isinstance(value, torch.Tensor)
     )
-    tensor_attr_nodes = tuple(node for node, _, _ in tensor_attrs)
     constant_attr_values = {
         node: value
         for node, (_, _, value) in zip(attr_nodes, attrs)
@@ -690,6 +843,7 @@ def make_mlx_fx_executor(
     tensor_placeholder_nodes = tuple(
         placeholder_nodes[index] for index in tensor_positions
     )
+    tensor_attr_nodes = tuple(node for node, _, _ in tensor_attrs)
 
     def mlx_graph(*arrays):
         runtime_arrays = arrays[: len(tensor_placeholder_nodes)]
@@ -707,11 +861,7 @@ def make_mlx_fx_executor(
             if node.op == "output":
                 result = args[0]
                 return tuple(result) if isinstance(result, (tuple, list)) else (result,)
-            if node_plan.lowering is None:
-                raise UnsupportedMlxFxGraphError(
-                    f"missing lowering for admitted node {node.target}"
-                )
-            values[node] = _lower_mlx_node(node_plan.lowering, args, kwargs)
+            values[node] = node_plan.implementation(mx, args, kwargs)
         raise UnsupportedMlxFxGraphError("FX graph has no output node")
 
     compiled_graph = mx.compile(mlx_graph, shapeless=False)
@@ -830,6 +980,7 @@ class MlxFxCaptureBackend:
                                 "op": node.node_op,
                                 "target": str(node.target),
                                 "lowering": node.lowering,
+                                "reason": node.reason,
                             }
                             for node in plan.nodes
                         ],
@@ -854,13 +1005,15 @@ class MlxFxCaptureBackend:
 
 
 __all__ = [
+    "MlxExportPlan",
     "MlxFxCaptureBackend",
     "MlxFxGraphPlan",
     "MlxFxLoweringRegistry",
     "MlxFxNodePlan",
-    "MlxExportPlan",
+    "MlxLowering",
     "UnsupportedMlxFxGraphError",
     "build_mlx_fx_plan",
     "export_mlx_plan",
     "make_mlx_fx_executor",
+    "mlx_lowering",
 ]

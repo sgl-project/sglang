@@ -14,6 +14,7 @@ import sglang.srt.hardware_backend.mlx.fx_lowering as fx_lowering
 from sglang.srt.hardware_backend.mlx.fx_lowering import (
     MlxFxCaptureBackend,
     MlxFxLoweringRegistry,
+    MlxLowering,
     UnsupportedMlxFxGraphError,
     build_mlx_fx_plan,
     export_mlx_plan,
@@ -81,12 +82,55 @@ class _TinyMlp(torch.nn.Module):
         return self.down(torch.nn.functional.silu(gate) * up)
 
 
+def _lower_kv_commit(mx, args, kwargs):
+    # The functional form of ``cache.copy_(value)``: the committed cache is
+    # the value itself.
+    return args[1]
+
+
+_KV_COMMIT_LOWERING = MlxLowering(name="kv_commit", fn=_lower_kv_commit)
+
+
 def _decoder_registry() -> MlxFxLoweringRegistry:
     registry = MlxFxLoweringRegistry.standard_decoder()
     registry.register_function(
-        torch.ops.sglang_mlx_fx_test.kv_commit.default, "kv_commit"
+        torch.ops.sglang_mlx_fx_test.kv_commit.default, _KV_COMMIT_LOWERING
     )
     return registry
+
+
+def test_registry_binds_implementations_not_names():
+    # A target the plan admits must have code behind it: a built-in name
+    # resolves to its implementation at registration, an unknown name is
+    # rejected there, and a callable is bound as given.
+    registry = MlxFxLoweringRegistry()
+    registry.register_function(torch.sin, "silu")
+    registry.register_function(torch.cos, _lower_kv_commit)
+    with pytest.raises(ValueError, match="no built-in MLX lowering"):
+        registry.register_function(torch.tan, "no_such_lowering")
+
+    graph = torch.fx.symbolic_trace(
+        type("Model", (torch.nn.Module,), {"forward": lambda self, x: torch.cos(x)})()
+    )
+    plan = build_mlx_fx_plan(graph, registry)
+    (node,) = (n for n in plan.nodes if n.node_op == "call_function")
+    assert node.lowering == "_lower_kv_commit"
+    assert node.implementation is _lower_kv_commit
+
+
+def test_plan_names_why_a_node_is_unsupported():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return torch.nn.functional.gelu(value, approximate="quick")
+
+    graph = torch.fx.symbolic_trace(Model())
+    registry = MlxFxLoweringRegistry.standard_decoder()
+    registry.register_function(torch.nn.functional.gelu, fx_lowering._LOWERINGS["gelu"])
+    plan = build_mlx_fx_plan(graph, registry)
+    (node,) = plan.unsupported
+    assert "GELU approximation" in node.reason
+    with pytest.raises(UnsupportedMlxFxGraphError, match="GELU approximation"):
+        plan.require_fully_supported()
 
 
 def test_all_names_are_importable():
@@ -189,6 +233,10 @@ def test_generic_mlx_executor_reuses_one_torch_graph_across_token_counts():
     assert len(backend.plans) == 1
 
 
+@pytest.mark.skipif(
+    not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
+    reason="requires Torch 2.13 and MLX on MPS",
+)
 def _exported_executor(model, args):
     """The executor over a non-strict export, the way serving builds it."""
     graph_module = torch.export.export(model, args, strict=False).module()
@@ -338,8 +386,8 @@ def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
 
 def test_export_functionalizes_kv_mutation_into_explicit_graph_output():
     registry = MlxFxLoweringRegistry.standard_export_decoder()
-    registry.register_function(
-        torch.ops.sglang_mlx_fx_test.kv_commit.default, "kv_commit"
+    registry.register_functionalized(
+        torch.ops.sglang_mlx_fx_test.kv_commit.default, _KV_COMMIT_LOWERING
     )
     model = _TinyDecoder().eval()
     plan = export_mlx_plan(
@@ -515,19 +563,7 @@ def test_review_flagged_ops_match_eager_through_the_export_path():
     w = torch.randn(8, 4, device="mps", dtype=torch.bfloat16)
     expected = model(x, w)
 
-    graph_module = torch.export.export(model, (x, w), strict=False).module()
-    # The export guard submodule is dead weight the consumer erases before
-    # planning; do the same here.
-    for node in tuple(graph_module.graph.nodes):
-        if node.op == "call_module" and str(node.target) == "_guards_fn":
-            assert not node.users
-            graph_module.graph.erase_node(node)
-    graph_module.recompile()
-    plan = build_mlx_fx_plan(
-        graph_module, MlxFxLoweringRegistry.standard_export_decoder()
-    )
-    plan.require_fully_supported()
-    executor = make_mlx_fx_executor(plan, [x, w])
+    _, executor = _exported_executor(model, (x, w))
     actual = executor(x, w)
 
     torch.mps.synchronize()
@@ -558,7 +594,7 @@ def test_eager_spellings_lower_through_the_dynamo_path():
         def forward(self, ids, x, y):
             rows = torch.nn.functional.embedding(ids, self.table.weight)
             return (
-                rows - x,
+                rows.sum(dim=1) - x,
                 torch.sub(x, y, alpha=2),
                 torch.add(x, y, alpha=0.5),
                 torch.mul(x, y),
@@ -568,11 +604,13 @@ def test_eager_spellings_lower_through_the_dynamo_path():
     torch.manual_seed(0)
     model = EagerOps().to(device="mps", dtype=torch.bfloat16).eval()
     ids = torch.randint(0, 16, (2, 3), device="mps")
-    x = torch.randn(2, 3, 8, device="mps", dtype=torch.bfloat16)
-    y = torch.randn(2, 3, 8, device="mps", dtype=torch.bfloat16)
+    x = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
+    y = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
     expected = model(ids, x, y)
 
-    backend = MlxFxCaptureBackend(executor_factory=make_mlx_fx_executor)
+    registry = MlxFxLoweringRegistry.standard_decoder()
+    registry.register_method("sum", _sum_rows)
+    backend = MlxFxCaptureBackend(registry, executor_factory=make_mlx_fx_executor)
     actual = torch.compile(model, backend=backend, fullgraph=True)(ids, x, y)
 
     torch.mps.synchronize()
@@ -584,6 +622,14 @@ def test_eager_spellings_lower_through_the_dynamo_path():
         torch.testing.assert_close(
             actual_item.cpu(), expected_item.cpu(), atol=0.03, rtol=0.03
         )
+
+
+def _sum_rows(mx, args, kwargs):
+    return mx.sum(args[0], axis=_arg(args, kwargs, 1, "dim"))
+
+
+def _arg(args, kwargs, index, name, default=None):
+    return args[index] if len(args) > index else kwargs.get(name, default)
 
 
 if __name__ == "__main__":
