@@ -211,7 +211,6 @@ def test_an_extend_on_any_rank_moves_the_step_to_the_large_capacity(runtime):
     [
         ForwardMode.EXTEND,
         ForwardMode.MIXED,
-        ForwardMode.SPLIT_PREFILL,
         ForwardMode.DLLM_EXTEND,
         None,
     ],

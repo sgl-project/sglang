@@ -28,9 +28,11 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
+    get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_unlimited_ocr_v2,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -76,6 +78,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    UnlimitedOCRV2KVPool,
     get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.page_interleave import (
@@ -163,6 +166,25 @@ _KV_POOL_BASE_FOR_KIND: dict[str, type] = {
     "mla": MLATokenToKVPool,
     "dsa": DSATokenToKVPool,
 }
+
+
+def replayssm_ring_memory_charge(
+    per_req_bytes: int,
+    *,
+    request_scoped: bool,
+    max_running_requests: int,
+    attn_dp_size: int,
+) -> tuple[int, int]:
+    """Return ``(fixed_bytes, per_slot_bytes)`` for the ReplaySSM ring.
+
+    GDN replay is request scratch. KDA replay stays on every mamba slot unless
+    host-only checkpoints are on, in which case the ring follows live requests:
+    ``max(1, max_running_requests // attn_dp_size) + 1`` (the pool's padding slot).
+    """
+    if request_scoped and per_req_bytes:
+        slots = max(1, max_running_requests // attn_dp_size) + 1
+        return per_req_bytes * slots, 0
+    return 0, per_req_bytes
 
 
 def _pd_prefill_skips_mamba_spec_state() -> bool:
@@ -324,6 +346,28 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_dtype: Optional[torch.dtype]
     unified_memory_pool_bytes: Optional[int] = None
     unified_total_bytes: Optional[int] = None
+
+
+def host_only_mamba_checkpoint() -> bool:
+    """Radix mamba checkpoints stay in the hicache host pool.
+
+    Set ``SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT``. Off keeps the donated GPU slot.
+    """
+    enabled = envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
+    if not enabled:
+        return False
+    if not get_memory().enable_hierarchical_cache:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires "
+            "--enable-hierarchical-cache: the checkpoint is stored in the "
+            "host mamba pool."
+        )
+    if get_exec().mamba.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported together "
+            "with --enable-int8-mamba-checkpoint."
+        )
+    return True
 
 
 @dataclass(slots=True, kw_only=True)
@@ -733,7 +777,7 @@ class KVCacheConfigurator:
         draft_owns_state = False
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
-                max_num_reqs=sizes.max_running_requests
+                max_num_reqs=self._req_pool_rows(sizes.max_running_requests)
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -1379,6 +1423,12 @@ class KVCacheConfigurator:
                 "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
+    def _req_pool_rows(self, max_running_requests: int) -> int:
+        """Request rows; v2 doc split keeps one more per request for a retained window."""
+        if is_unlimited_ocr_v2(self.model_config.hf_config) and get_mm().uocr_doc_split:
+            return 2 * max_running_requests
+        return max_running_requests
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
@@ -1482,6 +1532,9 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            replayssm_request_ring=(
+                host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
+            ),
         )
         return req_to_token_pool
 
@@ -1559,6 +1612,9 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+            ),
+            replayssm_request_ring=(
+                host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
         )
         return req_to_token_pool
@@ -1704,6 +1760,10 @@ class KVCacheConfigurator:
                     current_platform, subsystem="the MiniMax sparse-index KV pool"
                 )
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            elif is_unlimited_ocr_v2(self.model_config.hf_config):
+                token_to_kv_pool = self._build_unlimited_ocr_v2_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.mambaish_config:
@@ -1861,7 +1921,6 @@ class KVCacheConfigurator:
             head_num=target_pool.head_num,
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            enable_alt_stream=not get_disagg().enable_pdmux,
         )
 
     def _build_dsv4_kv_pool(
@@ -2415,6 +2474,30 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_unlimited_ocr_v2_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        """Build main K/V plus single-head index K for DASH routing."""
+        sparse_cfg = get_unlimited_ocr_v2_sparse_config(self.model_config.hf_config)
+        num_layers = int(self.model_config.num_hidden_layers)
+        sparse_layer_ids = list(range(num_layers))
+        return UnlimitedOCRV2KVPool(
+            size=max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            index_dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            idx_head_dim=int(sparse_cfg["sparse_index_dim"]),
+            dense_layer_ids=[],
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=sparse_layer_ids,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+        )
+
     def _build_hybrid_linear_kv_pool(
         self,
         *,
@@ -2600,7 +2683,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not get_disagg().enable_pdmux,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **pool_kwargs,
         )
@@ -2875,6 +2957,17 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # Host-only checkpoints keep the live slot plus the ping-pong slots
+        # the extra-buffer kernel writes. They do not keep a donate slot.
+        if host_only_mamba_checkpoint():
+            if not get_exec().mamba.enable_mamba_extra_buffer:
+                return 1
+            return 1 + get_mamba_tracking_slots(
+                extra_buffer=True,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            )
+
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
@@ -3077,7 +3170,8 @@ class KVCacheConfigurator:
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
-        # request scratch; KDA replay remains attached to each mamba slot.
+        # request scratch. KDA replay stays on each mamba slot unless host-only
+        # checkpoints are on, in which case it follows live requests too.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
@@ -3091,15 +3185,15 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and self.hybrid_kda_config is None:
-            replay_req_slots = (
-                max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
-            )
-            replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
-            replayssm_ring_per_slot = 0
-        else:
-            replayssm_fixed_bytes = 0
-            replayssm_ring_per_slot = replayssm_ring_per_req
+        request_scoped = replayssm_active and (
+            self.hybrid_kda_config is None or host_only_mamba_checkpoint()
+        )
+        replayssm_fixed_bytes, replayssm_ring_per_slot = replayssm_ring_memory_charge(
+            replayssm_ring_per_req,
+            request_scoped=request_scoped,
+            max_running_requests=get_schedule().max_running_requests,
+            attn_dp_size=self.attn_dp_size,
+        )
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )

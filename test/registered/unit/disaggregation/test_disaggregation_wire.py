@@ -1,4 +1,7 @@
 import concurrent.futures
+import ctypes
+import dataclasses
+import os
 import threading
 import unittest
 from collections import defaultdict
@@ -49,6 +52,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -143,6 +149,7 @@ class TestDisaggregationWire(unittest.TestCase):
             for outcome in ("mismatch", "cleared", "transport_failure"):
                 with self.subTest(layer_ids=layer_ids, outcome=outcome):
                     manager = object.__new__(MooncakeKVManager)
+                    manager.customized_info_enabled = False
                     manager.kv_args = SimpleNamespace(
                         kv_data_ptrs=[],
                         state_types=[StateType.SWA, StateType.DSA],
@@ -207,6 +214,7 @@ class TestDisaggregationWire(unittest.TestCase):
                                 dst_state_layer_ids=[layer_ids, layer_ids],
                                 dst_attn_tp_size=1,
                                 dst_aux_ptrs=[0x6000],
+                                dst_aux_item_lens=None,
                             )
                         )
                         queue.put(
@@ -628,6 +636,203 @@ class TestDisaggregationWire(unittest.TestCase):
                     ack.assert_called_once_with(42, target)
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
+
+    def test_aux_buffer_validation_allows_decode_only_speculation(self):
+        config = get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        )
+        config.install()
+        self.addCleanup(config.restore)
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            prefill = MetadataBuffers(1, 16, torch.float32, 0)
+            decode = MetadataBuffers(1, 128, torch.float16, 0)
+        src_ptrs, _, src_lens = prefill.get_buf_infos()
+        dst_ptrs, _, dst_lens = decode.get_buf_infos()
+        manager = object.__new__(CommonKVManager)
+        manager.customized_info_enabled = True
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+        )
+        self.assertNotEqual(src_lens, dst_lens)
+        manager.validate_aux_buffers(dst_ptrs, dst_lens)
+        for local_lens, peer_ptrs, peer_lens in (
+            (dst_lens, src_ptrs, src_lens),
+            (src_lens, dst_ptrs, dst_lens[:4] + [128] + dst_lens[5:]),
+            (src_lens, dst_ptrs, dst_lens[:6] + [2048] + dst_lens[7:]),
+            (src_lens, dst_ptrs, dst_lens[:6] + [8192] + dst_lens[7:]),
+            (src_lens, dst_ptrs, dst_lens[:7] + [32] + dst_lens[8:]),
+            (src_lens, dst_ptrs[:-1], dst_lens[:-1]),
+            (src_lens, dst_ptrs, dst_lens[:-1]),
+            (src_lens, dst_ptrs, []),
+            (src_lens[:-1], dst_ptrs, dst_lens),
+            (src_lens, dst_ptrs, None),
+        ):
+            with self.subTest(local_lens=local_lens, peer_lens=peer_lens):
+                manager.kv_args.aux_item_lens = local_lens
+                with self.assertRaisesRegex(
+                    ValueError, "metadata buffer layout mismatch"
+                ):
+                    manager.validate_aux_buffers(peer_ptrs, peer_lens)
+
+    def test_aux_buffer_validation_preserves_optional_checksum_and_legacy_peers(self):
+        for prefill_enabled, decode_enabled in (
+            (False, False),
+            (True, True),
+            (False, True),
+            (True, False),
+        ):
+            for prefill_checksum in (False, True):
+                with (
+                    self.subTest(
+                        prefill=prefill_enabled,
+                        decode=decode_enabled,
+                        prefill_checksum=prefill_checksum,
+                    ),
+                    get_context().override_server_args(
+                        disaggregation_enable_kv_checksum=prefill_checksum
+                    ),
+                ):
+                    layouts = []
+                    for enabled, checksum in (
+                        (prefill_enabled, prefill_checksum),
+                        (decode_enabled, not prefill_checksum),
+                    ):
+                        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(
+                            4096 if enabled else 0
+                        ):
+                            layouts.append(
+                                MetadataBuffers(
+                                    1,
+                                    16,
+                                    torch.float32,
+                                    0,
+                                    kv_checksum_enabled=checksum,
+                                ).get_buf_infos()
+                            )
+                    (src_ptrs, _, src_lens), (dst_ptrs, _, dst_lens) = layouts
+                    manager = object.__new__(CommonKVManager)
+                    manager.customized_info_enabled = prefill_enabled
+                    manager.kv_args = SimpleNamespace(
+                        aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+                    )
+                    peer_lens = dst_lens if decode_enabled else None
+                    if prefill_enabled == decode_enabled:
+                        manager.validate_aux_buffers(dst_ptrs, peer_lens)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "metadata buffer layout mismatch"
+                        ):
+                            manager.validate_aux_buffers(dst_ptrs, peer_lens)
+
+    def test_mooncake_aux_transfer_uses_destination_row_stride(self):
+        source = np.arange(192, dtype=np.uint8).reshape(3, 64)
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_custom_mem_pool = False
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[source.ctypes.data], aux_item_lens=[64]
+        )
+
+        def copy_aux(_session: str, blocks: list[tuple[int, int, int]]) -> int:
+            for src, dst, length in blocks:
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        manager._transfer_data = copy_aux
+        req = SimpleNamespace(mooncake_session_id="peer", dst_aux_index=1)
+        for peer_lens, stride in ((None, 64), ([128], 128)):
+            with self.subTest(peer_lens=peer_lens):
+                destination = np.full((3, stride), 255, dtype=np.uint8)
+                with patch.object(
+                    envs.SGLANG_MOONCAKE_SEND_AUX_TCP, "get", return_value=False
+                ):
+                    self.assertEqual(
+                        manager.send_aux(req, 2, [destination.ctypes.data], peer_lens),
+                        0,
+                    )
+
+                expected = np.full_like(destination, 255)
+                expected[1, :64] = source[2]
+                np.testing.assert_array_equal(destination, expected)
+
+    def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.customized_info_enabled = True
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0x1000] * 8,
+            aux_item_lens=[64] * 6 + [4096, 64],
+            kv_data_ptrs=[0x2000],
+        )
+        manager.enable_trace = manager.enable_staging = False
+        manager.enable_deferred_decode_kv_release = False
+        manager.bootstrap_port = 1234
+        manager.failure_lock = manager.session_lock = threading.Lock()
+        manager.failure_records = {}
+        manager.failed_sessions = set()
+        manager.state_layout_rejections = {}
+        manager._deferred_ack_targets = {}
+        manager._staging_outstanding = defaultdict(int)
+        manager.req_to_decode_prefix_len = {}
+        manager.request_status = {room: KVPoll.WaitingForInput for room in (21, 22)}
+        manager.transfer_infos = {
+            room: {
+                str(room): TransferInfo(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=5555,
+                    mooncake_session_id=str(room),
+                    dst_kv_indices=np.array([], dtype=np.int32),
+                    dst_aux_index=0,
+                    dst_state_indices=[],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+            for room in (21, 22)
+        }
+        manager.decode_kv_args_table = {
+            str(room): SimpleNamespace(
+                dst_aux_ptrs=[0x3000] * 8,
+                dst_aux_item_lens=[64] * 6 + [2048 if room == 21 else 4096, 64],
+                requires_dcp_relayout=False,
+            )
+            for room in (21, 22)
+        }
+        manager._prefill_unique_rank = Mock(return_value=0)
+        manager._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
+        manager.send_kv_status_message = Mock()
+        manager.send_aux = Mock(return_value=0)
+        chunks = [
+            TransferKVChunk(
+                room=room,
+                prefill_kv_indices=np.array([], dtype=np.int32),
+                index_slice=slice(0, 0),
+                is_last_chunk=True,
+                prefill_aux_index=0,
+                state_indices=None,
+            )
+            for room in (21, 22)
+        ]
+
+        with get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        ):
+            manager.transfer_worker(
+                SimpleNamespace(get=Mock(side_effect=[*chunks, None])), None
+            )
+
+        self.assertEqual(manager.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", manager.failure_records[21])
+        self.assertEqual(manager.request_status[22], KVPoll.Success)
+        manager.send_aux.assert_called_once()
+        self.assertEqual(manager.send_aux.call_args.args[0].room, 22)
+        self.assertEqual(
+            [
+                call.kwargs["status"]
+                for call in manager.send_kv_status_message.call_args_list
+            ],
+            [KVPoll.Failed, KVPoll.Success],
+        )
+        self.assertEqual(dict(manager._staging_outstanding), {})
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
@@ -1467,6 +1672,45 @@ class TestStagingWatermark(unittest.TestCase):
 
 class TestStagingScatterLifecycle(CustomTestCase):
     @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_late_staging_req_after_scatter_does_not_reallocate(self, _make_event):
+        """A STAGING_REQ that arrives after its chunk scattered must not allocate."""
+        room = 7
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[(5, 4096, 0, 8192, 3)],
+            _connect_to_bootstrap_server=Mock(),
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._room_to_decode_req = {room: SimpleNamespace(_chunk_events=[])}
+        handler._room_to_receiver = {room: receiver}
+        handler._staging_lifecycle = threading.Condition()
+        handler._room_tokens = {room: object()}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._scatter_region = Mock(return_value=True)
+        self.assertTrue(handler.submit_chunk_scatter(room, 0, 0, 3))
+
+        allocator = SimpleNamespace(assign=Mock(return_value=(6, 0, 1)))
+        kv_args = SimpleNamespace(
+            page_size=64, kv_item_lens=[4096, 4096], total_kv_head_num=4, engine_rank=0
+        )
+        handle_staging_req(
+            [b"STAGING_REQ", str(room).encode(), b"0", b"3", b"peer"],
+            allocator,
+            kv_args,
+            attn_tp_size=2,
+            prefill_attn_tp_size=4,
+            kv_buffer_tensors=None,
+            room_receivers={room: receiver},
+            room_bootstrap={room: [{"pp_rank": 0}]},
+        )
+
+        allocator.assign.assert_not_called()
+        self.assertFalse(any(info[0] >= 0 for info in receiver.chunk_staging_infos))
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
     def test_unregister_waits_for_submit_to_publish_its_event(self, make_event):
         """Room teardown must not release a slot before its scatter is enqueued."""
         room = 7
@@ -1719,6 +1963,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
+            customized_info=None,
             cached_tokens=0,
             cached_tokens_device=0,
             cached_tokens_host=0,
@@ -1736,14 +1981,18 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             bootstrap_room=9,
         )
 
-    def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
-        buffers = MetadataBuffers(
+    @staticmethod
+    def _make_buffers():
+        return MetadataBuffers(
             size=2,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
             max_sampling_mask_tokens=16,
             output_dsa_topk_indices_dim=3,
         )
+
+    def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
+        buffers = self._make_buffers()
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
@@ -1759,6 +2008,88 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            buffers = self._make_buffers()
+        req = self._make_req(None)
+        for value in (None, {}):
+            with self.subTest(customized_info=value):
+                req.customized_info = {"scores": [0.25]}
+                buffers.set_buf(req)
+                req.customized_info = value
+                buffers.set_buf(req)
+                self.assertEqual(buffers.get_customized_info(0), value)
+
+    def test_customized_info_buffers_are_opt_in(self):
+        for capacity in (None, 0, 4096):
+            with (
+                self.subTest(capacity=capacity),
+                patch.dict(os.environ),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(False),
+            ):
+                envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.clear()
+                if capacity is not None:
+                    envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.set(capacity)
+                buffers = self._make_buffers()
+                ptrs, _, item_lens = buffers.get_buf_infos()
+                if capacity:
+                    self.assertEqual(item_lens[6:8], [4096, 64])
+                    self.assertEqual(buffers.output_customized_info.shape, (2, 4096))
+                    self.assertEqual(buffers.output_customized_info_len.shape, (2, 16))
+                else:
+                    self.assertIsNone(buffers.output_customized_info)
+                    self.assertIsNone(buffers.output_customized_info_len)
+                    self.assertEqual(
+                        ptrs[6:],
+                        [
+                            buf.data_ptr()
+                            for buf in (
+                                buffers.output_topk_p,
+                                buffers.output_topk_index,
+                                buffers.output_hidden_states,
+                                buffers.output_dsa_topk_indices,
+                                buffers.bootstrap_room,
+                            )
+                        ],
+                    )
+                    req = self._make_req(None)
+                    for value in (None, {}):
+                        req.customized_info = value
+                        buffers.set_buf(req)
+                        self.assertIsNone(buffers.get_customized_info(0))
+
+    def test_customized_info_capacity_override_and_overflow(self):
+        with patch.dict(os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES="8192"):
+            buffers = self._make_buffers()
+        req = self._make_req(None)
+        req.customized_info = {"payload": ["x" * 5000]}
+        buffers.set_buf(req)
+        self.assertEqual(buffers.get_customized_info(0), req.customized_info)
+        req.customized_info = {"payload": ["x" * 8192]}
+        with self.assertRaisesRegex(ValueError, "exceeds disaggregation"):
+            buffers.set_buf(req)
+
+    def test_customized_info_tensor_roundtrip(self):
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            buffers = self._make_buffers()
+        req = self._make_req(None)
+        tensor = torch.tensor([0.25, 0.5], dtype=torch.bfloat16, requires_grad=True)
+        req.customized_info = {"tensor": [tensor]}
+        buffers.set_buf(req)
+        restored = buffers.get_customized_info(0)["tensor"][0]
+        torch.testing.assert_close(restored, tensor.detach())
+        self.assertEqual(restored.device.type, "cpu")
+
+    def test_customized_info_capacity_rejects_invalid_values(self):
+        for capacity in ("-1", "many"):
+            with (
+                self.subTest(capacity=capacity),
+                patch.dict(
+                    os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES=capacity
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    self._make_buffers()
 
     def test_sampling_mask_metadata_is_opt_in(self):
         """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
@@ -1845,12 +2176,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         sampling_logprobs_mode=mode,
                     )
                 )
+                fields = dict.fromkeys(
+                    f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                )
+                fields["model_config"] = SimpleNamespace(
+                    self_opened_think_start_ids=None
+                )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
+                    batch_result_processor=SchedulerBatchResultProcessor(**fields),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -1859,6 +2194,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
                     output_ids=[],
+                    require_reasoning=False,
                     return_logprob=False,
                     return_sampling_mask=True,
                     sampling_logprobs_mode=mode,
@@ -1885,20 +2221,23 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
     def test_rebootstrap_commit_keeps_emitted_output(self):
         """A PD rebootstrap with output keeps its output ids and their sampling-mask
         rows; the prefill worker's fresh token and row are dropped."""
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+        with (
+            envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096),
+        ):
             buffers = MetadataBuffers(
                 size=1,
                 hidden_size=2,
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=4,
             )
-            buffers.set_buf(
-                self._make_req(
-                    None,
-                    sampling_mask=[7, 8, 9],
-                    sampling_logprobs=[-1.25, -1.5, -2.0],
-                )
+            prefill_req = self._make_req(
+                None,
+                sampling_mask=[7, 8, 9],
+                sampling_logprobs=[-1.25, -1.5, -2.0],
             )
+            prefill_req.customized_info = {"token_ids": [101]}
+            buffers.set_buf(prefill_req)
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.scheduler = SimpleNamespace(
                 kv_checksum_computer=None,
@@ -1920,6 +2259,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
                 output_ids=[5, 6],
+                customized_info={"token_ids": [5, 6]},
                 return_logprob=False,
                 return_sampling_mask=True,
                 sampling_logprobs_mode="support",
@@ -1937,6 +2277,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
 
             self.assertEqual(req.output_ids, [5, 6])
+            self.assertEqual(req.customized_info, {"token_ids": [5, 6]})
             self.assertEqual(
                 req.sampling_mask_rows.take().to_lists(support_logprobs=True),
                 ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
