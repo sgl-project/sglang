@@ -74,7 +74,7 @@ struct QuickAllReduce {
     using namespace host;
     RuntimeCheck(
         (quant_level == kInt4 || quant_level == kInt8) && cast_bf2half,
-        "the JIT quick all-reduce runs INT4 or INT8 on bf16 cast to fp16 only; unset SGLANG_ROCM_QUICK_ALL_REDUCE_JIT");
+        "the JIT quick all-reduce runs INT4 or INT8 on bf16 cast to fp16 only");
     auto N = SymbolicSize{"num_elements"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
