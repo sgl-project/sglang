@@ -4267,6 +4267,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def _raise_if_storage_workers_died(self) -> None:
+        """A storage worker that raised out of its loop no longer drains or
+        acks, and the counts the tick reduces below would wait on it forever.
+        The rank that lost one exits loudly in its own tick; the peers follow
+        through the engine teardown (the parent's SIGQUIT on this host, the
+        NCCL watchdog elsewhere), so the check stays rank-local: no agreed
+        word, no row change, no PP caveat."""
+        dead = self.cache_controller.dead_storage_workers()
+        if dead:
+            raise RuntimeError(
+                "HiCache storage worker thread(s) exited on this rank: "
+                + ", ".join(dead)
+            )
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -4287,6 +4301,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.check_prefetch_events()
             return
 
+        if self.enable_storage:
+            self._raise_if_storage_workers_died()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
