@@ -64,6 +64,8 @@ The container shell is ready for `sglang serve`.
 
 Use Python 3.11 or higher and a compatible CUDA 13 environment.
 
+On Python 3.13, SGLang 0.5.22's pinned Outlines dependency requires a Rust source build. Use the Python 3.12 environment below to avoid building that dependency, or see [Python 3.13 installation errors](#python-313-outlines) before installing.
+
 <Accordion title="CUDA version compatibility">
 
 SGLang requires CUDA 13. CUDA 12 (`cu129`) wheels and images were retired with the upgrade to PyTorch 2.14, which publishes no CUDA 12.9 builds. SGLang 0.5.19 is the last release with a CUDA 12 lane (PyTorch 2.13).
@@ -291,6 +293,28 @@ echo "Build and push completed successfully!"
 <a id="common-notes" />
 
 ## Troubleshooting
+
+<a id="python-313-outlines" />
+
+### Rust compiler not found on Python 3.13
+
+If installation fails while building `outlines_core` with `error: can't find Rust compiler`, check your Python version:
+
+```bash
+python --version
+```
+
+SGLang 0.5.22 pins `outlines==0.1.11`, which in turn pins `outlines_core==0.1.26`. That version has a prebuilt Linux x86_64 wheel for CPython 3.12, but none for CPython 3.13. On Python 3.13, pip and uv therefore build this Rust extension from source. Upgrading pip does not provide the missing wheel.
+
+To avoid that source build, create a separate Python 3.12 environment and retry the installation:
+
+```bash
+uv venv --python 3.12 .venv-sglang
+source .venv-sglang/bin/activate
+uv pip install --prerelease=allow sglang
+```
+
+If you need Python 3.13, install a Rust toolchain using the [official Rust installation guide](https://rust-lang.org/tools/install/), ensure `rustc` and `cargo` are on your `PATH`, and retry the installation. The same prerequisite applies when installing from a source revision with these Outlines pins. Do not override the pinned Outlines packages without checking compatibility with SGLang's grammar backend.
 
 ### CUDA_HOME
 
