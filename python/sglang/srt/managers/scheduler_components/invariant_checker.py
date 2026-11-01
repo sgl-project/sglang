@@ -504,8 +504,8 @@ class SchedulerInvariantChecker:
         )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed with the
-        requests it was launched with, each counted in flight."""
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
+        the requests it was launched with."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
         launched = batch.launched_reqs or ()

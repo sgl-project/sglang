@@ -2653,8 +2653,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
-    # The requests this batch carried at its launch. A launched step's requests
-    # do not change, so its processing sees the same ones.
+    # The requests this batch was launched with; the in-flight counts are kept
+    # over these.
     launched_reqs: Optional[Tuple[Req, ...]] = None
 
     # For DP attention

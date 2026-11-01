@@ -90,7 +90,7 @@ def _scheduler():
     s.profiler_manager = MagicMock()
     s.forward_sleep_time = None
     s.enable_staging = False
-    # process_batch_result around the mode-specific processing
+    # process_batch_result, with the mode-specific processing mocked
     s._deferred_responses = None
     s.publish_load_snapshot = Mock()
     s.load_publisher = MagicMock()
