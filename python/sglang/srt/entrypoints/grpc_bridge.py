@@ -12,15 +12,14 @@ import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
-    get_lora,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -56,6 +55,21 @@ class _GrpcRequest:
         if self._is_disconnected_fn is None:
             return False
         return bool(self._is_disconnected_fn())
+
+
+def _media_input_features(mm_processor) -> List[str]:
+    if mm_processor is None or mm_processor.mm_tokens is None:
+        return []
+    tokens = mm_processor.mm_tokens
+    return [
+        feature
+        for feature, token in (
+            ("image_inputs", tokens.image_token),
+            ("video_inputs", tokens.video_token),
+            ("audio_inputs", tokens.audio_token),
+        )
+        if token
+    ]
 
 
 class RuntimeHandle:
@@ -238,9 +252,7 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import (
-            OpenAIServingClassify,
-        )
+        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -430,27 +442,26 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
-        # `resolved_dict` answers with what resolution decided; the launch
-        # command answers with what was asked for, and the two are not
-        # derivable from each other. The HTTP and in-process readbacks both
-        # carry it, so this one does too.
-        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
-        result.update(self.scheduler_info)
-        result["kv_events"] = describe_kv_events_publisher(
-            self.tokenizer_manager.server_args
+        return json.dumps(
+            msgspec_to_builtins(
+                {
+                    **redact_watermark_secrets(
+                        build_server_info(
+                            self.tokenizer_manager.server_args, self.scheduler_info
+                        )
+                    ),
+                    # Older servers and processors without a modality's placeholder
+                    # drop that media silently, so clients check this list first.
+                    "grpc_features": _media_input_features(
+                        self.tokenizer_manager.mm_processor
+                    ),
+                }
+            ),
+            default=str,
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
-        from sglang.srt.managers.tokenizer_manager import ServerStatus
-
-        if self.tokenizer_manager.gracefully_exit:
-            return False
-        return self.tokenizer_manager.server_status not in (
-            ServerStatus.Starting,
-            ServerStatus.UnHealthy,
-        )
+        return self.tokenizer_manager.is_healthy()
 
     def is_pause(self) -> bool:
         """Return the tokenizer manager's authoritative generation pause state."""
@@ -803,7 +814,8 @@ class RuntimeHandle:
                 elif hasattr(result, "body"):
                     resp_bytes = result.body
                 elif isinstance(result, (dict, list)):
-                    resp_bytes = json.dumps(result).encode("utf-8")
+                    # As FastAPI encodes it over HTTP; rerank returns a list of models.
+                    resp_bytes = json.dumps(jsonable_encoder(result)).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
                 status_code = int(

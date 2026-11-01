@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path, PurePosixPath
+from stat import S_ISDIR
 
 import psutil
 
@@ -18,6 +19,29 @@ def _unescape_mount_path(value: str) -> str:
 def _memory_stat(directory: Path) -> dict[str, int]:
     lines = (directory / "memory.stat").read_text().splitlines()
     return {key: int(value) for key, value in map(str.split, lines)}
+
+
+def _protected_children_bytes(directory: Path) -> int | None:
+    """Usage that reclaim at ``directory`` must leave to its children's memory.min.
+
+    The kernel caps a child's protection at its usage, and a deeper cgroup's at
+    its ancestors', so only direct children count. A child without memory.min
+    has no memory controller and no protection. None when a value is unreadable.
+    """
+    protected = 0
+    try:
+        for child in directory.iterdir():
+            if not S_ISDIR(child.stat().st_mode):
+                continue
+            try:
+                minimum = (child / "memory.min").read_text().strip()
+            except FileNotFoundError:
+                continue
+            usage = int((child / "memory.current").read_text())
+            protected += usage if minimum == "max" else min(int(minimum), usage)
+    except (OSError, ValueError):
+        return None
+    return protected
 
 
 def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
@@ -78,6 +102,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
             else ("total_active_file", "total_inactive_file")
         )
         while True:
+            usage = None
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
@@ -89,11 +114,20 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 limit = int(value)
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
-                usage = int((directory / usage_name).read_text())
-                stat = _memory_stat(directory)
-                page_cache = sum(stat[key] for key in page_cache_keys)
-                # Charged page cache is reclaimed under the limit, not used.
-                remaining = max(0, limit - max(0, usage - page_cache))
+                if usage is None:
+                    usage = int((directory / usage_name).read_text())
+                    stat = _memory_stat(directory)
+                    page_cache = sum(stat[key] for key in page_cache_keys)
+                    # Protection is relative to the reclaim target: its own min
+                    # does not prevent reclaim, but its children's min can.
+                    # Unknown protection only disables cache credit.
+                    if filesystem == "cgroup2" and page_cache > 0:
+                        protected = _protected_children_bytes(directory)
+                        page_cache = (
+                            0 if protected is None else max(0, page_cache - protected)
+                        )
+                    usage = max(0, usage - page_cache)
+                remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
                 break

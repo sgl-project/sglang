@@ -12,6 +12,7 @@ from sglang.srt.layers.layer_boundary import StageKind
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.ops import keep_output
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.models.bailing_moe import BailingMoEModel
@@ -34,7 +35,7 @@ from sglang.test.boundary_fixtures import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NUM_LAYERS = 4
 MODELS = (
@@ -209,6 +210,22 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
         self.assertIsNone(captured)
         reduce.assert_not_called()
 
+    def test_an_empty_final_norm_still_captures(self):
+        # A rank without rows takes the same number of captures as the others.
+        stream = ResidualStream(torch.empty(0, 4))
+        hidden = stream.record(torch.empty(0, 4), comm.PLAIN_ADD)
+        batch = SimpleNamespace(residual_stream=stream)
+        captured = AuxHiddenStateList()
+        hidden = residual_batch.final_norm(
+            hidden,
+            batch,
+            SumNorm(),
+            capture=captured.capture,
+            skip_empty=True,
+        )
+        self.assertEqual(tuple(hidden.shape), (0, 4))
+        self.assertEqual([tuple(c.shape) for c in captured], [(0, 4)])
+
     def test_snapshot_without_a_residual_does_not_alias_the_main_output(self):
         hidden = torch.ones(2, 4)
         captured = ResidualStream().snapshot(hidden)
@@ -315,28 +332,6 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                 torch.testing.assert_close(snapshots[0], inputs + NUM_LAYERS)
                 torch.testing.assert_close(result, inputs + NUM_LAYERS)
 
-    def test_llama4_split_prefill_preserves_the_stream_between_segments(self):
-        from sglang.srt.models.llama4 import Llama4ForCausalLM, Llama4Model
-
-        model = build_model(Llama4Model, defer=True, capture=False)
-        lm = SimpleNamespace(
-            model=model,
-            lm_head=None,
-            logits_processor=lambda ids, hidden, head, fb: hidden,
-        )
-        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-        inputs = torch.ones(2, 4)
-        result = Llama4ForCausalLM.forward_split_prefill(
-            lm, None, None, fb, (0, 2), inputs.clone()
-        )
-        self.assertIsNone(result)
-        self.assertIsNotNone(fb.residual_stream)
-        result = Llama4ForCausalLM.forward_split_prefill(
-            lm, None, None, fb, (2, NUM_LAYERS)
-        )
-        torch.testing.assert_close(result, inputs + NUM_LAYERS)
-        self.assertIsNone(fb.residual_stream)
-
 
 class TestPipelineResidualReception(CustomTestCase):
     def test_models_keep_the_received_residual_contribution(self):
@@ -400,11 +395,14 @@ class TestPipelineResidualReception(CustomTestCase):
         from dataclasses import replace
 
         from sglang.srt.layers.layer_boundary import declare_ffn
+        from sglang.srt.layers.layer_boundary.residual.add_norm import (
+            REPLACE_AT_EXIT,
+        )
 
         stage = stub_stage(comm_instance, StageKind.ATTENTION)
         stage.declaration = replace(
             stage.declaration,
-            previous=declare_ffn(update=SimpleNamespace(applied_at_exit=True)),
+            previous=declare_ffn(update=REPLACE_AT_EXIT),
         )
         hidden = stage.from_pp(PPProxyTensors({"hidden_states": streams}), batch)
         residual = batch.residual_stream
@@ -412,12 +410,9 @@ class TestPipelineResidualReception(CustomTestCase):
         self.assertIsNone(residual.pending)
         self.assertIs(residual.residual, hidden)
 
-    def test_optional_residual_and_declared_partial_keep_the_wire_values(self):
+    def test_optional_residual_keeps_the_wire_values(self):
         comm_instance = stub_plan()
         comm_instance.norm = None
-        comm_instance.path_for = lambda batch: SimpleNamespace(
-            entry=SimpleNamespace(declared_sum=None)
-        )
         batch = SimpleNamespace(residual_stream=None)
         partial = torch.randn(2, 4)
         prior = torch.randn_like(partial)

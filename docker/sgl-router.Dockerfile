@@ -12,7 +12,7 @@
 # manifests → cargo fetch → copy src" approach caches only the fetched
 # registry; every source change still recompiles every dep.
 #
-# `experimental/sgl-router/Cargo.lock` is committed, and every cargo step
+# `sgl-router/Cargo.lock` is committed, and every cargo step
 # below runs with `--locked`, so the image ships exactly the dependency
 # graph CI checked, tested, and license-audited.
 #
@@ -33,11 +33,16 @@ ARG DEBIAN_VERSION=bookworm
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work/sgl-router
-COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY sgl-router/Cargo.toml sgl-router/Cargo.lock ./
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+# sglang-processor is a path dependency that inherits from the rust/ workspace manifest.
+COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
 # Stub a minimal src tree so cargo can see the workspace targets, then
 # prepare the chef recipe.
-RUN mkdir -p src sgl-kv-indexer/src/bin \
+RUN mkdir -p src sgl-kv-indexer/src/bin /work/rust/sglang-processor/src \
+    && touch /work/rust/sglang-processor/src/lib.rs \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "" > sgl-kv-indexer/src/lib.rs \
@@ -63,7 +68,13 @@ WORKDIR /work/sgl-router
 ENV PCRE2_SYS_STATIC=1
 
 COPY --from=chef /work/sgl-router/recipe.json ./recipe.json
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+# The recipe omits path dependencies outside this workspace, so cook against a
+# stub of sglang-processor; its real sources arrive with the router's below.
+COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
+RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processor/src/lib.rs
 
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
 # workspace member's manifest and the lockfile, so chef recreates the Indexer's
@@ -71,14 +82,15 @@ COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 RUN cargo chef cook --locked --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifests they need.
-COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
-COPY experimental/sgl-router/src ./src
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
-COPY experimental/sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
-COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
-COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
+COPY sgl-router/Cargo.toml sgl-router/Cargo.lock ./
+COPY sgl-router/src ./src
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
+COPY sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
+COPY sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
+COPY rust/sglang-processor/src /work/rust/sglang-processor/src
 
-RUN touch sgl-kv-indexer/build.rs \
+RUN touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
     && cargo build --locked --release --bin sgl-router \
     && strip target/release/sgl-router
 

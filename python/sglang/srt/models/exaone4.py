@@ -112,9 +112,6 @@ class Exaone4Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_parallel().tp_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -144,8 +141,7 @@ class Exaone4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -155,8 +151,7 @@ class Exaone4Attention(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         is_neox_style = True
@@ -272,25 +267,38 @@ class Exaone4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            post_attention_layernorm=self.post_attention_layernorm,
+            post_feedforward_layernorm=self.post_feedforward_layernorm,
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages((attn, None), (ffn, None))
+
+    @staticmethod
+    def stage_facts(
+        config: Exaone4Config,
+        layer_id: int,
+        *,
+        post_attention_layernorm=None,
+        post_feedforward_layernorm=None,
+    ):
+        """The stages an EXAONE 4.0 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). The output norms are what the updates add."""
         # Post-LN: each stage reads the residual as it is, and its output is
         # normalized before it is added. The layer writes the FFN's itself.
-        ffn_update = PostNormAdd(self.post_feedforward_layernorm, applied_at_exit=True)
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    read=PLAIN_READOUT,
-                    update=PostNormAdd(self.post_attention_layernorm),
-                ),
-                None,
+        ffn_update = PostNormAdd(post_feedforward_layernorm, applied_at_exit=True)
+        return (
+            declare_attn(
+                read=PLAIN_READOUT,
+                update=PostNormAdd(post_attention_layernorm),
             ),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                    read=PLAIN_READOUT,
-                    update=ffn_update,
-                ),
-                None,
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
+                read=PLAIN_READOUT,
+                update=ffn_update,
             ),
         )
 
@@ -346,6 +354,7 @@ class Exaone4Model(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Exaone4DecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -487,46 +496,6 @@ class Exaone4ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

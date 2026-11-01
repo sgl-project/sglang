@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union
 
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
+    get_forward_arch,
+    resolve_runtime_policy,
+    try_cached_paged_decode,
+)
 from sglang.kernels.ops.attention.flash_attention_v4 import (
     _flash_attn_import_error,
     _flash_attn_varlen_func,
@@ -17,18 +21,6 @@ from sglang.kernels.ops.attention.flash_attention_v4 import (
     _pad_mla_q_heads,
     _unpad_mla_result,
 )
-
-if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
-    # The pip escape hatch deliberately bypasses SGLang-owned SM12x kernels.
-    get_forward_arch = None
-    resolve_runtime_policy = None
-    try_cached_paged_decode = None
-else:
-    from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
-        get_forward_arch,
-        resolve_runtime_policy,
-        try_cached_paged_decode,
-    )
 
 
 @dataclass(frozen=True)
@@ -44,13 +36,6 @@ def get_flash_attention_v4_sm120_runtime_policy(
     deterministic: bool,
 ) -> FlashAttentionV4SM120RuntimePolicy:
     """Resolve the SM12x FA4 launch policy exposed to SGLang."""
-    if resolve_runtime_policy is None:
-        num_splits = 1 if deterministic or device_capability < (9, 0) else 0
-        return FlashAttentionV4SM120RuntimePolicy(
-            num_splits=num_splits,
-            decode_num_splits=num_splits,
-            decode_uses_static_max_seqlen_k=False,
-        )
     num_splits, decode_num_splits, decode_uses_static_max_seqlen_k = (
         resolve_runtime_policy(
             device_capability=device_capability,
@@ -95,6 +80,7 @@ def flash_attn_varlen_func(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     score_mod: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -177,6 +163,7 @@ def flash_attn_varlen_func(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         score_mod=score_mod,
+        mask_mod=mask_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
         out=out,
@@ -226,6 +213,7 @@ def flash_attn_with_kvcache(
     sm_margin: int = 0,
     sinks: Optional[torch.Tensor] = None,
     score_mod: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     sfq: Optional[torch.Tensor] = None,
     sfk: Optional[torch.Tensor] = None,
@@ -251,7 +239,7 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
 
-    forward_arch = get_forward_arch(q.device) if get_forward_arch is not None else None
+    forward_arch = get_forward_arch(q.device)
     if (
         forward_arch is not None
         and not return_softmax_lse
@@ -261,6 +249,7 @@ def flash_attn_with_kvcache(
             for value in (
                 qv,
                 score_mod,
+                mask_mod,
                 aux_tensors,
                 q_descale,
                 k_descale,
@@ -319,6 +308,7 @@ def flash_attn_with_kvcache(
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
         score_mod=score_mod,
+        mask_mod=mask_mod,
         aux_tensors=aux_tensors,
         q_descale=q_descale,
         k_descale=k_descale,

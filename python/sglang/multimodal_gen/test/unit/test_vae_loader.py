@@ -10,6 +10,8 @@ from safetensors.torch import save_file as safetensors_save_file
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
     MiniMaxH3AudioVAEConfig,
 )
+from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -29,7 +31,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _assign_direct_gpu_vae_state,
     _backfill_ltx2_audio_vae_latent_stats,
+    _channels_last_3d_prefix,
     _consume_vae_checkpoint_arch_metadata,
+    _convert_conv3d_weights_to_channels_last_3d,
     _direct_gpu_vae_state_slots,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
@@ -43,6 +47,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import AutoencoderDC
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
@@ -64,6 +69,9 @@ class _FakeServerArgs:
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
+
+    def resolve_component_backend_by_role(self, *_component_names):
+        return {}
 
     def requested_component_attention_backend(self, _component_name):
         return None
@@ -177,6 +185,31 @@ class TestPlainWeightNormCheckpoint(CustomTestCase):
         load_model_state_dict(module, loaded)
 
         self.assertIn("0.parametrizations.weight.original0", module.state_dict())
+
+    def test_lazy_dc_ae_keeps_the_checkpoint_after_state_dict_builds_it(self):
+        """SANA's DC-AE must load its checkpoint even though the loader reads
+        ``state_dict()`` (which builds the lazy inner model) first."""
+        config = SanaVAEConfig()
+        for key, value in dict(
+            latent_channels=4,
+            attention_head_dim=4,
+            encoder_block_types=("ResBlock", "EfficientViTBlock"),
+            decoder_block_types=("ResBlock", "EfficientViTBlock"),
+            encoder_block_out_channels=(8, 16),
+            decoder_block_out_channels=(8, 16),
+            encoder_layers_per_block=(1, 1),
+            decoder_layers_per_block=(1, 1),
+            encoder_qkv_multiscales=((), (5,)),
+            decoder_qkv_multiscales=((), (5,)),
+        ).items():
+            setattr(config.arch_config, key, value)
+        vae = AutoencoderDC(config)
+        checkpoint = {k: torch.randn_like(v) for k, v in vae.state_dict().items()}
+
+        load_model_state_dict(vae, dict(checkpoint), strict=False)
+
+        state = vae.state_dict()
+        self.assertTrue(all(torch.equal(state[k], v) for k, v in checkpoint.items()))
 
     def test_moves_checkpoint_latent_stats_into_arch_config(self):
         config = MiniMaxH3AudioVAEConfig()
@@ -652,9 +685,15 @@ class TestVAELoader(unittest.TestCase):
             (QwenImagePipelineConfig, 1, "vae", True),
             (WanT2V480PConfig, 1, "video_vae", True),
             (FastWan2_2_TI2V_5B_Config, 1, "video_vae", True),
-            (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
+            # Wan's spatial-parallel decode runs channels_last too
+            (Wan2_2_I2V_A14B_Config, 2, "video_vae", True),
+            (WanT2V480PConfig, 4, "video_vae", True),
             (LTX2PipelineConfig, 1, "video_vae", True),
             (LTX2PipelineConfig, 2, "video_vae", False),
+            (Cosmos3Config, 1, "vae", True),
+            (Cosmos3Config, 1, "video_vae", True),
+            (Cosmos3Config, 2, "video_vae", True),
+            (Cosmos3Config, 4, "vae", True),
         ]
         with (
             patch.dict("os.environ", {}, clear=True),
@@ -667,6 +706,46 @@ class TestVAELoader(unittest.TestCase):
                     self.assertEqual(
                         _should_use_channels_last_3d(server_args, component), expected
                     )
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_channels_last_3d_multi_gpu_wan_keeps_encoder_layout(self):
+        cases = [
+            (WanT2V480PConfig, 1, {"encoder", "quant_conv", "decoder.0"}),
+            (Wan2_2_I2V_A14B_Config, 2, {"decoder.0"}),
+            (Cosmos3Config, 4, {"decoder.0"}),
+            (QwenImagePipelineConfig, 2, {"encoder", "quant_conv", "decoder.0"}),
+        ]
+        for config_cls, num_gpus, expected in cases:
+            with (
+                self.subTest(config=config_cls.__name__, num_gpus=num_gpus),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                vae = nn.Module()
+                vae.encoder = nn.Conv3d(2, 2, 3)
+                vae.quant_conv = nn.Conv3d(2, 2, 3)
+                vae.decoder = nn.Sequential(nn.Conv3d(2, 2, 3))
+                prefix = _channels_last_3d_prefix(
+                    _FakeServerArgs(config_cls(), num_gpus=num_gpus)
+                )
+                _convert_conv3d_weights_to_channels_last_3d(vae, prefix)
+                converted = {
+                    name
+                    for name, m in vae.named_modules()
+                    if isinstance(m, nn.Conv3d)
+                    and m.weight.is_contiguous(memory_format=torch.channels_last_3d)
+                }
+                self.assertEqual(converted, expected)
+
+    def test_channels_last_3d_env_override_converts_whole_multi_gpu_wan_vae(self):
+        server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
+        with patch.dict("os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "1"}):
+            self.assertEqual(_channels_last_3d_prefix(server_args), "")
+        with patch.dict(
+            "os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "auto"}
+        ):
+            self.assertEqual(_channels_last_3d_prefix(server_args), "decoder.")
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (

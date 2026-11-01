@@ -10,7 +10,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
@@ -40,6 +40,20 @@ class TestDefaultModelLoader(CustomTestCase):
             )
 
         self.assertEqual(events, ["load", "postprocess"])
+
+    def test_reload_requires_explicit_initial_load_marker(self):
+        self.assertFalse(loader_mod.QuantizedRLModelLoader.is_reload_scenario(Mock()))
+        model = torch.nn.Module()
+        model.original_weights_rebuild_keys = set()
+        model.recorded_loader = {}
+        for marker in (None, False, 1, Mock()):
+            with self.subTest(marker=marker):
+                model.flash_rl_initial_load_complete = marker
+                self.assertFalse(
+                    loader_mod.QuantizedRLModelLoader.is_reload_scenario(model)
+                )
+        model.flash_rl_initial_load_complete = True
+        self.assertTrue(loader_mod.QuantizedRLModelLoader.is_reload_scenario(model))
 
     def test_boot_paths_preserve_load_order_and_custom_override(self):
         class CustomModelLoader(DefaultModelLoader):

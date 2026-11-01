@@ -12,6 +12,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _capture_qsa_index_buffers,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
@@ -50,8 +53,26 @@ def pools(request):
     layout, backend = request.param
     publish(ServerArgs(model_path="dummy"), role="test")
     device = make_device_pool([7, 11], start_layer=4)
-    anchor = MHATokenToKVPoolHost(device.full_kv_pool, 2, 0, PAGE, layout)
-    host = QSAIndexerPoolHost(device, anchor)
+    anchor = MHATokenToKVPoolHost(
+        device.full_kv_pool.get_device_pool_infos()[0].buffer_info,
+        2,
+        0,
+        PAGE,
+        layout,
+        device_capacity_tokens=device.full_kv_pool.size
+        if device.full_kv_pool.host_capacity_tokens is None
+        else device.full_kv_pool.host_capacity_tokens,
+        start_layer=device.full_kv_pool.start_layer,
+        end_layer=device.full_kv_pool.end_layer,
+        write_back_staging=device.full_kv_pool.hicache_write_back_staging,
+    )
+    host = QSAIndexerPoolHost(
+        _capture_qsa_index_buffers(device, page_size=anchor.page_size),
+        num_host_pages=anchor.page_num,
+        layout=anchor.layout,
+        device=anchor.device,
+        pin_memory=anchor.pin_memory,
+    )
     try:
         yield device, anchor, host, backend
     finally:
@@ -195,7 +216,13 @@ def test_qsa_file_restart_and_missing_sidecar(pools):
 def test_packed_mtp_indexer_roundtrip(pools):
     device, anchor, _, backend = pools
     draft = make_device_pool([0])
-    host = QSAIndexerPoolHost(device, anchor, mtp_draft_device_pools=(draft,))
+    host = QSAIndexerPoolHost(
+        _capture_qsa_index_buffers(device, (draft,), page_size=anchor.page_size),
+        num_host_pages=anchor.page_num,
+        layout=anchor.layout,
+        device=anchor.device,
+        pin_memory=anchor.pin_memory,
+    )
     try:
         source, destination, host_indices = slots([3, 1]), slots([4, 2]), slots([0, 2])
         all_buffers = [
