@@ -121,21 +121,6 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
-  sgl-kernel-build-wheels-arm:
-    needs: [check-changes, call-gate]
-    if: |
-      needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
-    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
-    with:
-      runs_on: arm-kernel-build-node
-      job_display_name: Build Wheel Arm
-      arch_suffix: '-aarch64'
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
-    secrets: inherit
-
   # =============================================== Rust extensions ====================================================
 
   # Own build job because artifacts are per-run: a standalone `run-ci-nv-extra` run
@@ -151,25 +136,6 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       artifact_name: rust-ext-x86_64-extra
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
-    secrets: inherit
-
-  # gb300 is Grace: PyO3 modules are portable across neither arch nor
-  # interpreter. The cache prefix matches pr-test.yml's aarch64 build so the
-  # two workflows share one cache entry.
-  rust-ext-build-aarch64:
-    needs: [check-changes, call-gate]
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
-    with:
-      runs_on: ubuntu-22.04-arm
-      collect_runs_on: ubuntu-22.04-arm
-      artifact_name: rust-ext-aarch64-extra
-      cache_key_prefix: rust-ext-aarch64-cp312
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -223,6 +189,7 @@ jobs:
             }
           - { stage: extra-b, runner_config: 8-gpu-h20, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
+          - { stage: extra-b, runner_config: 2-gpu-gb300, timeout_per_file: '1800', arch: aarch64 }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
@@ -235,30 +202,9 @@ jobs:
       warmup_deep_gemm_models: ${{ matrix.warmup_deep_gemm_models || '' }}
       warmup_server_models: ${{ matrix.warmup_server_models || '' }}
       warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-    secrets: inherit
-
-  # Separate only because `needs` cannot vary per matrix row: this stage takes
-  # the aarch64 builds.
-  extra-test-aarch64:
-    name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels-arm, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { stage: extra-b, runner_config: 2-gpu-gb300, timeout_per_file: '1800' }
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
-      runner_config: ${{ matrix.runner_config }}
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '60'
-      timeout_per_file: ${{ matrix.timeout_per_file }}
-      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
+      # The artifact is built for x86_64. An aarch64 row passes none, so it
+      # restores the aarch64 cache that pr-test.yml's aarch64 build seeds.
+      rust_ext_artifact: ${{ matrix.arch != 'aarch64' && needs.rust-ext-build.outputs.artifact_name || '' }}
     secrets: inherit
 
   xeon-extra:
@@ -281,13 +227,10 @@ jobs:
         check-changes,
         call-gate,
         sgl-kernel-build-wheels,
-        sgl-kernel-build-wheels-arm,
         rust-ext-build,
-        rust-ext-build-aarch64,
         simulator-test-cpu,
         simulator-test-gpu,
         extra-test,
-        extra-test-aarch64,
         xeon-extra,
       ]
     if: always()
