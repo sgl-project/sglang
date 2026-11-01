@@ -1101,7 +1101,9 @@ class HiCacheController:
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
-        prefix_keys = operation.prefix_keys
+        prefix_keys = (
+            list(operation.prefix_keys) if operation.prefix_keys is not None else None
+        )
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
@@ -1142,7 +1144,7 @@ class HiCacheController:
                 if hit_pages != len(batch_hashes):
                     all_success = False
                 if prefix_keys is not None:
-                    prefix_keys = prefix_keys + batch_hashes
+                    prefix_keys.extend(batch_hashes)
                 completed_pages += hit_pages
             ack = PrefetchAck(
                 rid=operation.request_id,
@@ -1254,7 +1256,9 @@ class HiCacheController:
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
-        prefix_keys = operation.prefix_keys
+        prefix_keys = (
+            list(operation.prefix_keys) if operation.prefix_keys is not None else None
+        )
 
         storage_query_count = 0
         hash_value = []
@@ -1272,7 +1276,7 @@ class HiCacheController:
             if hit_page_num < len(batch_hashes):
                 break
             if prefix_keys is not None:
-                prefix_keys = prefix_keys + batch_hashes
+                prefix_keys.extend(batch_hashes)
 
         return hash_value, storage_query_count
 
@@ -1361,7 +1365,9 @@ class HiCacheController:
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
-        prefix_keys = operation.prefix_keys
+        prefix_keys = (
+            list(operation.prefix_keys) if operation.prefix_keys is not None else None
+        )
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1378,7 +1384,7 @@ class HiCacheController:
                 break
 
             if prefix_keys is not None:
-                prefix_keys = prefix_keys + batch_hashes
+                prefix_keys.extend(batch_hashes)
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def _page_backup_or_log(self, operation):
