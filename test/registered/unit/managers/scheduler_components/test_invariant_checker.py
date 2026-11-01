@@ -144,7 +144,7 @@ class TestPrivateSwaTokens(CustomTestCase):
         kv = ReqKvInfo(
             req_pool_idx=0,
             kv_allocated_len=280,
-            swa_evict_floor=278,
+            window_evict_floor=278,
             component_evicted_seqlens={ComponentType.SWA: 278},
         )
         self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 280)

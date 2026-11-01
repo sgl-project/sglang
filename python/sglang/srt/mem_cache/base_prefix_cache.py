@@ -543,8 +543,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
-            swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            window_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
+            window_dead_lo=kv.window_dead_lo(allocator.page_size),
         )
 
     @abstractmethod
@@ -771,10 +771,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
+    def window_lengths(self) -> tuple[tuple[ComponentType, int], ...]:
+        """Each window slot's id and the history a running request keeps
+        behind its frontier in it."""
+        return ((ComponentType.SWA, self.swa_retain_window),)
+
     def window_retention(self, req):
         """Running-request window components, retention lengths and prefix floors."""
-        return (
-            (ComponentType.SWA, self.swa_retain_window, self.swa_retain_floor(req)),
+        return tuple(
+            (component, window, self.swa_retain_floor(req))
+            for component, window in self.window_lengths()
         )
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:

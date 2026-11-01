@@ -512,9 +512,11 @@ class RadixCache(BasePrefixCache):
             return
         token_ids = req.full_untruncated_fill_ids[:up_to]
         # Pure-SWA trees never cache what the window already evicted.
-        swa_evict_floor = req.kv.swa_evict_floor
+        window_evict_floor = req.kv.window_evict_floor
         key_limit = (
-            ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
+            ceil_align(window_evict_floor, self.page_size)
+            if window_evict_floor > 0
+            else None
         )
         radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True

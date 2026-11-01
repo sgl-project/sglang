@@ -3934,15 +3934,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def window_slots(self) -> tuple[ComponentType, ...]:
         return self._window_slots
 
-    def window_retention(self, req):
+    def window_lengths(self) -> tuple[tuple[ComponentType, int], ...]:
         return tuple(
-            (
-                slot,
-                component.sliding_window_size,
-                self.swa_retain_floor(req, window=component.sliding_window_size),
-            )
+            (slot, component.sliding_window_size)
             for slot, component in self.components.items()
             if isinstance(component, SWAComponent)
+        )
+
+    def window_retention(self, req):
+        return tuple(
+            (slot, window, self.swa_retain_floor(req, window=window))
+            for slot, window in self.window_lengths()
         )
 
     def supports_mamba(self) -> bool:

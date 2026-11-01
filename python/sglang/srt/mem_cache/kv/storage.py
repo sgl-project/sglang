@@ -427,20 +427,15 @@ class KVStorage:
 
     def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
         from sglang.srt.mem_cache.common import coalesce_ranges
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
         slot_ids = self._tree_slot_ids
+        dead_lo = kv.window_dead_lo(self._allocator.page_size)
         for sub_pool in self._sub_pools:
             if sub_pool.name not in self._allocator.window_allocators:
                 continue
             component = slot_ids[sub_pool.external.tree_component]
-            dead_lo = (
-                kv.swa_dead_lo(self._allocator.page_size)
-                if component == ComponentType.SWA
-                else kv.cache_protected_len
-            )
             dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
             for start, end in ranges:
                 lo = min(max(dead_lo, start), end)

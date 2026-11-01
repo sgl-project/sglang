@@ -98,12 +98,7 @@ def free_swa_out_of_window_slots(
     evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
     if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
         return
-    dead_lo = (
-        req.kv.swa_dead_lo(page_size)
-        if component_type == ComponentType.SWA
-        else req.kv.cache_protected_len
-    )
-    evicted_seqlen = max(evicted_seqlen, dead_lo)
+    evicted_seqlen = max(evicted_seqlen, req.kv.window_dead_lo(page_size))
     req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
     if not supports_prefix_sharing:
@@ -154,12 +149,12 @@ def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],
     *,
-    swa_evicted_seqlen: int,
-    swa_dead_lo: int = 0,
+    window_evicted_seqlen: int,
+    window_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
-    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
+    request's kv row; ``[window_dead_lo, window_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = window_dead_lo, max(window_evicted_seqlen, window_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
@@ -181,8 +176,8 @@ def free_kv_row_segments(
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
         # check sees a boundary that splits a page between them.
-        assert swa_evicted_seqlen % allocator.page_size == 0, (
-            f"SWA eviction cursor {swa_evicted_seqlen} splits a page "
+        assert window_evicted_seqlen % allocator.page_size == 0, (
+            f"SWA eviction cursor {window_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
     if swa_dead:

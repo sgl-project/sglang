@@ -403,7 +403,7 @@ class _RowCache:
 
 
 class TestFreeKvRow(CustomTestCase):
-    """A kv row is given back split at `swa_evicted_seqlen`: the full side
+    """A kv row is given back split at `window_evicted_seqlen`: the full side
     whole, the SWA side only from the floor up."""
 
     def setUp(self):
@@ -439,7 +439,7 @@ class TestFreeKvRow(CustomTestCase):
                     ),
                 )
                 free_kv_row_segments(
-                    self.allocator, [(indices, start_pos)], swa_evicted_seqlen=floor
+                    self.allocator, [(indices, start_pos)], window_evicted_seqlen=floor
                 )
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
@@ -458,7 +458,7 @@ class TestFreeKvRow(CustomTestCase):
             free_kv_row_segments(
                 allocator,
                 [(indices[:4], 0), (indices[4:], 4)],
-                swa_evicted_seqlen=8,
+                window_evicted_seqlen=8,
             )
 
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
@@ -476,7 +476,7 @@ class TestFreeKvRow(CustomTestCase):
         ):
             allocator.free_group_begin()
             # dead rows [0, 8) and the alive row [8, 12) from one request
-            free_kv_row_segments(allocator, [(indices, 0)], swa_evicted_seqlen=8)
+            free_kv_row_segments(allocator, [(indices, 0)], window_evicted_seqlen=8)
             self.assertEqual(allocator.full_available_size(), after_alloc)
             allocator.free_group_end()
 
@@ -509,7 +509,7 @@ class TestFreeKvRow(CustomTestCase):
         self.assertEqual(len(allocator.freed), 2)
 
     def test_rows_below_the_dead_floor_are_still_alive(self):
-        # all-SWA: only [swa_dead_lo, cursor) is dead; [start, swa_dead_lo) is alive
+        # all-SWA: only [window_dead_lo, cursor) is dead; [start, window_dead_lo) is alive
         allocator = _build_pure_swa_allocator(size_swa=16)
         baseline = allocator.swa_available_size()
         indices = _swa_alloc(allocator, 8)
@@ -520,7 +520,7 @@ class TestFreeKvRow(CustomTestCase):
         kv = ReqKvInfo(
             req_pool_idx=0,
             component_evicted_seqlens={ComponentType.SWA: 6},
-            swa_evict_floor=4,
+            window_evict_floor=4,
         )
         cache.free_kv_row(kv, [(2, 8)])
 
