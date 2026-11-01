@@ -35,10 +35,10 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# base-b, not the kernel stage: its path filter misses srt/ changes, so an srt-only PR
-# still runs this on H100 (a Hopper GPU without tuned tables) and on H20 (base-c).
+# base-b and base-c, not the kernel stage, whose path filter misses srt/ changes;
+# H100 runs the path of a Hopper GPU without tuned tables.
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h200")
 register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h20")
 
 HIDDEN, HEADS, HEAD_DIM = 4096, 64, 128
@@ -261,6 +261,22 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                 )
         finally:
             set_fused_op_backend(previous)
+
+        # An out-of-tree platform may replace the kernel fp8_scaled_mm picks, so the
+        # projection must hand the GEMM to fp8_scaled_mm instead of calling sgl_kernel.
+        with (
+            patch.object(
+                glm5_next.current_platform, "is_out_of_tree", return_value=True
+            ),
+            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(False),
+        ):
+            oot_method, oot_layer, _ = make_layer(n, k)
+        with (
+            self.subTest(case="out-of-tree platform"),
+            patch.object(glm5_next, "fp8_scaled_mm", wraps=fp8_scaled_mm) as spy,
+        ):
+            check(oot_method, oot_layer, 16, generic, tune=False)
+            self.assertTrue(spy.called)
 
         with (
             self.subTest(case="USE_TRITON_W8A8_FP8_KERNEL"),

@@ -218,12 +218,18 @@ def _kda_fp8_modules() -> frozenset:
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
             "--elastic-ep-backend: the KDA projections are quantized at load"
         )
+    # The FP8 path picks its kernel by token count, so outputs change with the batch.
+    if modules and get_exec().deterministic.enable_deterministic_inference:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--enable-deterministic-inference: the FP8 kernel depends on the batch size"
+        )
     if modules:
         _warn_kda_fp8_experimental()
     return modules
 
 
-@functools.cache  # once per process; the check runs for every KDA layer
+@functools.cache  # once per process (each rank logs it); the check runs for every KDA layer
 def _warn_kda_fp8_experimental() -> None:
     logger.warning(
         "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is experimental: "
