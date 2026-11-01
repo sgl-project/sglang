@@ -55,6 +55,7 @@ def can_argmax(logits: torch.Tensor) -> bool:
         logits.size(1) % vec_size == 0
         and logits.stride(1) == 1
         and logits.stride(0) % vec_size == 0
+        and logits.data_ptr() % vec_bytes == 0
     )
 
 

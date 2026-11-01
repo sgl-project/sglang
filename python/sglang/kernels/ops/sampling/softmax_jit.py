@@ -102,6 +102,7 @@ def can_softmax(logits: torch.Tensor, out: Optional[torch.Tensor] = None) -> boo
         and vocab_size % vec_size == 0
         and logits.stride(0) % vec_size == 0
         and logits.stride(1) == 1
+        and logits.data_ptr() % (vec_size * logits.element_size()) == 0
     )
 
 

@@ -70,6 +70,19 @@ def test_argmax_ties_take_lowest_index(dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+def test_argmax_signed_zero_ties_across_splits(dtype) -> None:
+    # -0.0 and +0.0 tie; the row is long enough to be split across CTAs.
+    logits = torch.full((1, 262144), -1.0, dtype=dtype, device="cuda")
+    logits[0, 0] = -0.0
+    logits[0, 131072] = 0.0
+    _check(logits)
+
+
+def test_argmax_misaligned_view_falls_back() -> None:
+    _check(torch.randn(2, 1032, device="cuda")[:, 1:1025])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
 def test_argmax_all_equal(dtype) -> None:
     got = argmax(torch.full((8, 8192), -2.5, dtype=dtype, device="cuda"))
     assert torch.all(got == 0)

@@ -110,7 +110,10 @@ __global__ void argmax_kernel(const ArgMaxParams params) {
       if (gridDim.x == 1) {
         static_cast<IdxType*>(params.output)[token_id] = static_cast<IdxType>(max_idx);
       } else {
-        const auto payload = static_cast<ArgMaxHandle>(to_ordered(max_val)) << 32 | ~max_idx;
+        // -0.0 and +0.0 tie under `>` but not under `to_ordered`; key both as +0.0 so the
+        // lowest-index rule also holds across CTAs.
+        const auto key_val = (__float_as_uint(max_val) << 1) == 0 ? 0.0f : max_val;
+        const auto payload = static_cast<ArgMaxHandle>(to_ordered(key_val)) << 32 | ~max_idx;
         atomicMax(params.handle + token_id, payload);
       }
     }

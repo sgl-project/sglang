@@ -216,18 +216,20 @@ __global__ __launch_bounds__(kSoftmaxThreads, kSoftmaxBlocksPerSM<kSoftmaxThread
       thr_max = fmaxf(thr_max, fmaxf(vecs[n][i].x, vecs[n][i].y));
     }
   }
-  // Max on raw logits (scaling by T > 0 is monotone), then one FMA per exponent; NaN only if |logit/T| > ~1e9.
+  // Max on raw logits (scaling by T > 0 is monotone). Exponents subtract the raw max before scaling, so
+  // the max element is exactly ex2(0) even for huge finite logits (the NaN sanitizer's +-1e30).
   const auto raw_max = warp::reduce_max(thr_max);
   const bool empty = raw_max == kNegInf;
-  const auto base = empty ? 0.0f : raw_max * log2_scale;
+  const auto shift = empty ? 0.0f : raw_max;
+  const auto base = shift * log2_scale;
   float thr_sum = 0.0f;
 #pragma unroll
   for (uint32_t n = 0; n < kVecsPerThread; ++n) {
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
       auto& [x, y] = vecs[n][i];
-      x = ptx::ex2_approx(fmaf(x, log2_scale, -base));
-      y = ptx::ex2_approx(fmaf(y, log2_scale, -base));
+      x = ptx::ex2_approx((x - shift) * log2_scale);
+      y = ptx::ex2_approx((y - shift) * log2_scale);
       thr_sum += x + y;
     }
   }
