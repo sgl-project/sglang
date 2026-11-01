@@ -167,12 +167,17 @@ def _router_lds(m: int) -> int:
 def _router_launch(x, gate_weight, bias, routed_scaling_factor):
     """(Args, outputs) of one router launch, or None while the build or workspace is
     missing under graph capture."""
-    ws = _ws.get(x.device)
-    if ws is None:
-        if torch.cuda.is_current_stream_capturing():
+    # one per stream, so launches on two streams never share the ticket counter; a
+    # capture that skipped warm-up on its own stream takes another stream's
+    key = (x.device, torch.cuda.current_stream(x.device).cuda_stream)
+    ws = _ws.get(key)
+    if ws is None and torch.cuda.is_current_stream_capturing():
+        ws = next((v for k, v in _ws.items() if k[0] == x.device), None)
+        if ws is None:
             return None
+    if ws is None:
         # split partials (always fully overwritten) and the self-resetting ticket counter
-        ws = _ws[x.device] = (
+        ws = _ws[key] = (
             torch.empty(
                 _MAX_SPLIT * BLOCK_M * NUM_EXPERTS, dtype=torch.float32, device=x.device
             ),

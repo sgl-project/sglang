@@ -271,7 +271,7 @@ def _router_gemv_reduce_kernel(
 
 
 _scratch: Dict[
-    Tuple[torch.device, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+    Tuple[torch.device, int, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
 ] = {}
 
 
@@ -279,7 +279,15 @@ def _get_scratch(
     device: torch.device, n: int, w_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Sized for the weight dtype's own tiles, so the CUDA FP32 path keeps a small buffer.
-    key = (device, n, w_dtype)
+    # One per stream: launches on two streams could interleave on a shared ticket
+    # counter, and a caller's partials must survive another stream's router call. A
+    # capture that skipped warm-up on its own stream takes another stream's.
+    stream = torch.cuda.current_stream(device).cuda_stream
+    key = (device, stream, n, w_dtype)
+    if key not in _scratch and torch.cuda.is_current_stream_capturing():
+        for (dev, _, n_, dtype), bufs in _scratch.items():
+            if (dev, n_, dtype) == (device, n, w_dtype):
+                return bufs
     if key not in _scratch:
         configs = _configs(w_dtype)
         max_split_k = max(cfg[3] for _, cfg in configs)
@@ -349,7 +357,7 @@ def router_gemv_partials_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
 def router_gemv_partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Tensor]:
     """The [SPLIT_K, M, N] fp32 split-K partials router_gemv sums over dim 0 in order.
 
-    None up to _FIXUP_MAX_M rows; valid until the next router_gemv call on the device.
+    None up to _FIXUP_MAX_M rows; valid until the next router_gemv call on the stream.
     Caller guards with router_gemv_supported().
     """
     m = x.shape[0]
