@@ -1291,6 +1291,11 @@ def _prepare_llada2_language_weights(
             name = "lm_head." + name.removeprefix("model.lm_head.")
 
         expert_prefix, separator, projection_name = name.rpartition(".")
+        parameter_name = "weight"
+        # Fused FP8 block scales multiply the codes, as weight_scale_inv does.
+        if projection_name.endswith("_scale"):
+            projection_name = projection_name.removesuffix("_scale")
+            parameter_name = "weight_scale_inv"
         is_fused_expert = (
             separator
             and expert_prefix.endswith(".mlp.experts")
@@ -1307,7 +1312,7 @@ def _prepare_llada2_language_weights(
             )
         for expert_id in range(num_experts):
             yield (
-                f"{expert_prefix}.{expert_id}.{projection_name}.weight",
+                f"{expert_prefix}.{expert_id}.{projection_name}.{parameter_name}",
                 loaded_weight[expert_id],
             )
 

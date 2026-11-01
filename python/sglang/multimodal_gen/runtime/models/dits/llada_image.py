@@ -1376,6 +1376,29 @@ class LLaDAImageSigVQModel(ModelMixin, ConfigMixin):
         return self.prior_projector(self.prior_token_embedding(token_ids))
 
 
+def _require_supported_quantization(hf_config: dict, quant_config) -> None:
+    from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+    from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+        ComponentCheckpointUnsupportedError,
+    )
+
+    if quant_config is None and "quantization_config" not in hf_config:
+        return
+    if not (
+        isinstance(quant_config, Fp8Config)
+        and quant_config.is_checkpoint_fp8_serialized
+        and quant_config.activation_scheme == "dynamic"
+        and list(quant_config.weight_block_size or ()) == [128, 128]
+    ):
+        declared = hf_config.get("quantization_config") or type(quant_config).__name__
+        raise ComponentCheckpointUnsupportedError(
+            "LLaDA-Image serves its BF16 checkpoints and the FP8 checkpoint "
+            "inclusionAI/LLaDA-Image-Turbo-FP8, whose transformer stores FP8 "
+            "weights in 128x128 blocks with dynamic activation scales. This "
+            f"transformer declares {declared}."
+        )
+
+
 class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
     """SGLang diffusion adapter that preserves the converted checkpoint layout."""
 
@@ -1389,13 +1412,11 @@ class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
     reverse_param_names_mapping: ClassVar[dict] = {}
 
     def __init__(self, config, hf_config: dict, quant_config=None):
-        if quant_config is not None or "quantization_config" in hf_config:
-            raise ValueError(
-                "LLaDA-Image serves only the BF16 checkpoints, such as "
-                "inclusionAI/LLaDA-Image, and this transformer is quantized"
-            )
+        _require_supported_quantization(hf_config, quant_config)
         init_kwargs = {
-            key: value for key, value in hf_config.items() if not key.startswith("_")
+            key: value
+            for key, value in hf_config.items()
+            if not key.startswith("_") and key != "quantization_config"
         }
         super().__init__(quant_config=quant_config, **init_kwargs)
         self.sgl_config = config
