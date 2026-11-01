@@ -311,7 +311,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and self.runner.runner_backend.is_aiter()
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
