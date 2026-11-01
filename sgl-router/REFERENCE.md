@@ -400,8 +400,8 @@ fixture-verified against SGLang's request normalization, so they forward every
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
-kwargs or reasoning controls or historical `reasoning_content`, no assistant
-continuation, no consecutive users or non-leading system turns) and warn
+kwargs or reasoning controls or historical `reasoning_content` or `reasoning`, no
+assistant continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
 only.
 

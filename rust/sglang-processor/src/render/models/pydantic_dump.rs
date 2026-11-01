@@ -30,6 +30,16 @@ pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) ->
     String::new()
 }
 
+/// `ChatCompletionMessageGenericParam._accept_reasoning_alias`: a string
+/// `reasoning` fills a missing or null `reasoning_content`.
+pub(super) fn accept_reasoning_alias(message: &mut Map<String, Value>) {
+    if message.get("reasoning_content").is_none_or(Value::is_null)
+        && let Some(reasoning) = message.get("reasoning").filter(|r| r.is_string()).cloned()
+    {
+        message.insert("reasoning_content".into(), reasoning);
+    }
+}
+
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
 pub(super) fn engine_message(message: Value) -> Value {
@@ -37,6 +47,7 @@ pub(super) fn engine_message(message: Value) -> Value {
         Value::Object(message) => message,
         _ => Map::new(),
     };
+    accept_reasoning_alias(&mut message);
     let role = message
         .get("role")
         .and_then(Value::as_str)
