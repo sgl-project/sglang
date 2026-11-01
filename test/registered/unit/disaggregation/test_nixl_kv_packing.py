@@ -6,7 +6,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.nixl.packed import (
     PackedKVSender,
-    packed_page_descriptors,
+    packed_page_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,8 +24,16 @@ def _gather(src_pools, pages, page_size, src_token_bytes, dst_token_bytes, head_
     return np.concatenate(out)
 
 
-class TestPackedPageDescriptors(CustomTestCase):
-    def test_descriptors_write_each_decode_rank_its_head_slice(self):
+def _slot_addrs(runs, indices):
+    """Addresses NIXL resolves for `indices` of a dlist prepped from Nx5 (addr, len, dev, stride, count) runs."""
+    addrs = np.concatenate(
+        [addr + np.arange(count) * stride for addr, _, _, stride, count in runs]
+    )
+    return addrs[np.asarray(indices)]
+
+
+class TestPackedPageIndices(CustomTestCase):
+    def test_indices_write_each_decode_rank_its_head_slice(self):
         """Prefill TP2 -> decode TP4: each decode rank receives its half of the prefill heads."""
         num_tensors, num_pages, page_size = 3, 8, 4
         src_heads, head_bytes = 4, 8
@@ -40,7 +48,7 @@ class TestPackedPageDescriptors(CustomTestCase):
         for head_start in (0, 2):
             heads = 2
             dst_token_bytes = heads * head_bytes
-            dst_page_bytes = page_size * dst_token_bytes
+            page_bytes = page_size * dst_token_bytes
             staging = _gather(
                 src_pools,
                 src_pages,
@@ -49,23 +57,23 @@ class TestPackedPageDescriptors(CustomTestCase):
                 dst_token_bytes,
                 head_start * head_bytes,
             )
-            # Decode pools live back to back in one fake address space.
-            pool_bytes = num_pages * dst_page_bytes
-            dst = np.zeros(num_tensors * pool_bytes, dtype=np.uint8)
-            src_desc, dst_desc = packed_page_descriptors(
-                base_ptr=0,
-                dst_ptrs=[t * pool_bytes for t in range(num_tensors)],
-                dst_pages=dst_pages,
-                page_bytes=dst_page_bytes,
-                src_gpu_id=0,
-                dst_gpu_id=1,
+            # The buffer's prepped dlist: page-sized slots from address 0. Decode pools live back
+            # to back in one fake address space, one strided run per tensor.
+            pool_bytes = num_pages * page_bytes
+            src_runs = [(0, page_bytes, 0, page_bytes, len(staging) // page_bytes)]
+            dst_runs = [
+                (t * pool_bytes, page_bytes, 1, page_bytes, num_pages)
+                for t in range(num_tensors)
+            ]
+            src_idx, dst_idx = packed_page_indices(
+                num_tensors=num_tensors, dst_pages=dst_pages, dst_num_slots=num_pages
             )
-            self.assertEqual(len(src_desc), num_tensors * len(dst_pages))
-            for (s_addr, s_len, s_dev), (d_addr, d_len, d_dev) in zip(
-                src_desc.tolist(), dst_desc.tolist()
+            self.assertEqual(len(src_idx), num_tensors * len(dst_pages))
+            dst = np.zeros(num_tensors * pool_bytes, dtype=np.uint8)
+            for s_addr, d_addr in zip(
+                _slot_addrs(src_runs, src_idx), _slot_addrs(dst_runs, dst_idx)
             ):
-                self.assertEqual((s_len, s_dev, d_len, d_dev), (dst_page_bytes, 0, dst_page_bytes, 1))
-                dst[d_addr : d_addr + d_len] = staging[s_addr : s_addr + s_len]
+                dst[d_addr : d_addr + page_bytes] = staging[s_addr : s_addr + page_bytes]
 
             for t in range(num_tensors):
                 got = dst[t * pool_bytes : (t + 1) * pool_bytes].reshape(
@@ -87,17 +95,18 @@ def _packer(buffer_bytes, transfer_results, failed_handles=()):
     packer.inflight = None
     packer.buffer = SimpleNamespace(get_size=lambda: buffer_bytes, get_ptr=lambda: 0x1000)
     packer._gather = Mock()
+    packer._src_handles, packer._dst_handles = {}, {}
+    packer.prep_dlist = Mock(side_effect=lambda peer, runs, mem: f"dlist-{peer or 'local'}")
     posted = []
     results = iter(transfer_results)
 
-    def initialize_xfer(op, src, dst, peer, notif):
+    def make_prepped_xfer(op, src_handle, src_idx, dst_handle, dst_idx):
         handle = f"h{len(posted)}"
-        posted.append((handle, len(src), notif))
+        posted.append((handle, len(src_idx)))
         return handle
 
     packer.agent = SimpleNamespace(
-        initialize_xfer=initialize_xfer,
-        get_xfer_descs=lambda descs, mem: descs,
+        make_prepped_xfer=make_prepped_xfer,
         transfer=lambda handle: next(results),
     )
     packer.await_handles = Mock(
@@ -119,6 +128,7 @@ def _send(packer, *, num_pages, handles=None):
         page_size=4,
         head_offset_bytes=0,
         dst_gpu_id=1,
+        dst_num_slots=64,
         handles=[] if handles is None else handles,
     )
 
@@ -129,10 +139,17 @@ class TestPackedKVSender(CustomTestCase):
         packer, posted = _packer(1024, ["DONE"] * 3)
         handles = []
         _send(packer, num_pages=10, handles=handles)
-        self.assertEqual([n for _, n, _ in posted], [8, 8, 4])
+        self.assertEqual([n for _, n in posted], [8, 8, 4])
         self.assertEqual(handles, ["h0", "h1", "h2"])
         self.assertEqual(packer._gather.call_count, 3)
         self.assertIsNone(packer.inflight)
+
+    def test_dlists_are_prepped_once_per_buffer_and_peer(self):
+        """Transfers are built by index from cached dlists, not from raw descriptors per batch."""
+        packer, _ = _packer(1024, ["DONE"] * 6)
+        _send(packer, num_pages=10)
+        _send(packer, num_pages=10)
+        self.assertEqual(packer.prep_dlist.call_count, 2)
 
     def test_a_failed_post_does_not_fail_the_next_room(self):
         packer, posted = _packer(1024, ["ERR", "DONE"], failed_handles={"h0"})

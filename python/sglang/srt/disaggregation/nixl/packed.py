@@ -10,26 +10,31 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 
 
-def packed_page_descriptors(
-    *, base_ptr, dst_ptrs, dst_pages, page_bytes, src_gpu_id, dst_gpu_id
-):
-    offsets = np.arange(len(dst_ptrs) * len(dst_pages), dtype=np.uint64)
-    src_addrs = base_ptr + offsets * np.uint64(page_bytes)
-    dst_addrs = (
-        np.asarray(dst_ptrs, dtype=np.uint64)[:, None]
-        + np.asarray(dst_pages, dtype=np.uint64)[None, :] * np.uint64(page_bytes)
+def packed_page_indices(*, num_tensors, dst_pages, dst_num_slots):
+    """Prepped-dlist indices of one batch: the gather leaves tensor t's j-th page in
+    buffer slot t * len(dst_pages) + j; decode slot = tensor * dst_num_slots + page."""
+    num_pages = len(dst_pages)
+    src = np.arange(num_tensors * num_pages, dtype=np.int64)
+    dst = (
+        np.arange(num_tensors, dtype=np.int64)[:, None] * dst_num_slots
+        + np.asarray(dst_pages, dtype=np.int64)[None, :]
     ).ravel()
-    sizes = np.full(len(src_addrs), page_bytes, dtype=np.uint64)
-    src = np.column_stack((src_addrs, sizes, np.full_like(sizes, src_gpu_id)))
-    dst = np.column_stack((dst_addrs, sizes, np.full_like(sizes, dst_gpu_id)))
     return src, dst
 
 
 class PackedKVSender:
-    def __init__(self, *, agent, gpu_id, size_bytes, register_memory, await_handles):
+    def __init__(
+        self, *, agent, gpu_id, size_bytes, register_memory, await_handles, prep_dlist
+    ):
         self.agent = agent
         self.gpu_id = gpu_id
         self.await_handles = await_handles
+        # prep_dlist(peer_name, Nx5 strided runs, mem_kind) -> prepped dlist handle.
+        # Transfers are built from cached dlists by index, as the unpacked path does:
+        # initialize_xfer over raw descriptors costs tens of ms of CPU per batch.
+        self.prep_dlist = prep_dlist
+        self._src_handles: dict[int, object] = {}
+        self._dst_handles: dict[tuple, object] = {}
         self.buffer = StagingBuffer(
             size_bytes=size_bytes, device=f"cuda:{gpu_id}", gpu_id=gpu_id
         )
@@ -77,6 +82,28 @@ class PackedKVSender:
             )
         stream.synchronize()
 
+    def _src_handle(self, page_bytes):
+        handle = self._src_handles.get(page_bytes)
+        if handle is None:
+            slots = self.buffer.get_size() // page_bytes
+            runs = np.array(
+                [(self.buffer.get_ptr(), page_bytes, self.gpu_id, page_bytes, slots)],
+                dtype=np.uint64,
+            )
+            handle = self._src_handles[page_bytes] = self.prep_dlist("", runs, "VRAM")
+        return handle
+
+    def _dst_handle(self, peer_name, dst_ptrs, page_bytes, dst_num_slots, dst_gpu_id):
+        key = (peer_name, tuple(dst_ptrs), page_bytes, dst_num_slots)
+        handle = self._dst_handles.get(key)
+        if handle is None:
+            runs = np.array(
+                [(p, page_bytes, dst_gpu_id, page_bytes, dst_num_slots) for p in dst_ptrs],
+                dtype=np.uint64,
+            )
+            handle = self._dst_handles[key] = self.prep_dlist(peer_name, runs, "VRAM")
+        return handle
+
     def _wait(self, *, raise_on_failure=True):
         if self.inflight is None:
             return
@@ -101,6 +128,7 @@ class PackedKVSender:
         page_size,
         head_offset_bytes,
         dst_gpu_id,
+        dst_num_slots,
         handles,
     ):
         # The gather fills src-shaped bytes; the descriptors address dst-shaped ones.
@@ -115,6 +143,10 @@ class PackedKVSender:
                 "increase SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB"
             )
 
+        src_handle = self._src_handle(dst_page_bytes)
+        dst_handle = self._dst_handle(
+            peer_name, dst_ptrs, dst_page_bytes, dst_num_slots, dst_gpu_id
+        )
         # A handle left by an earlier send that failed belongs to that room: wait
         # until it no longer reads the buffer, but do not fail this room for it.
         self._wait(raise_on_failure=False)
@@ -129,21 +161,14 @@ class PackedKVSender:
                 dst_token_bytes=dst_page_bytes // page_size,
                 head_offset_bytes=head_offset_bytes,
             )
-            src, dst = packed_page_descriptors(
-                base_ptr=self.buffer.get_ptr(),
-                dst_ptrs=dst_ptrs,
+            src_indices, dst_indices = packed_page_indices(
+                num_tensors=len(dst_ptrs),
                 dst_pages=dst_pages[start:end],
-                page_bytes=dst_page_bytes,
-                src_gpu_id=self.gpu_id,
-                dst_gpu_id=dst_gpu_id,
+                dst_num_slots=dst_num_slots,
             )
-            handle = self.agent.initialize_xfer(
-                "WRITE",
-                self.agent.get_xfer_descs(src, "VRAM"),
-                self.agent.get_xfer_descs(dst, "VRAM"),
-                peer_name,
-                # No notification: the transfer worker announces the chunk once its handles settle.
-                b"",
+            # No notification: the transfer worker announces the chunk once its handles settle.
+            handle = self.agent.make_prepped_xfer(
+                "WRITE", src_handle, src_indices, dst_handle, dst_indices
             )
             if not handle:
                 raise RuntimeError("Failed to create NIXL packed transfer")

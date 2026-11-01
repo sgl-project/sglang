@@ -685,6 +685,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         * 1024**2,
                         register_memory=self._register_staging_memory,
                         await_handles=self._await_handles,
+                        prep_dlist=self._prep_xfer_dlist,
                     )
                     for _ in self.transfer_queues
                 ]
@@ -2581,11 +2582,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if state_index is None:
             src_ptrs, src_lens = self.kv_args.kv_data_ptrs, self.kv_args.kv_item_lens
             dst_ptrs, dst_lens = peer.dst_kv_ptrs, peer.dst_kv_item_lens
+            dst_num_slots = (
+                peer.dst_num_slots
+                if peer.dst_num_slots is not None
+                else self._num_slots_src
+            )
         else:
             src_ptrs = self.kv_args.state_data_ptrs[state_index]
             src_lens = self.kv_args.state_item_lens[state_index]
             dst_ptrs = peer.dst_state_data_ptrs[state_index]
             dst_lens = peer.dst_state_item_lens[state_index]
+            dst_num_slots = min(
+                data_len // item_len
+                for data_len, item_len in zip(
+                    peer.dst_state_data_lens[state_index], dst_lens
+                )
+            )
         # SWA layers share the full-attention KV head count, as in _send_swa_state_slice.
         total_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
         head_start, heads, dst_head_start, _ = compute_head_slice_params(
@@ -2618,6 +2630,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             page_size=page_size,
             head_offset_bytes=head_start * head_bytes,
             dst_gpu_id=peer.gpu_id,
+            dst_num_slots=dst_num_slots,
             handles=handles,
         )
 
