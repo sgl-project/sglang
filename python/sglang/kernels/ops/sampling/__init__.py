@@ -9,8 +9,18 @@ from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
     CapabilityRequirement,
+    DeviceType,
     KernelBackend,
     KernelSpec,
+)
+
+register_kernel(
+    KernelSpec(
+        op="sampling.mps_greedy_argmax",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.sampling.mps:greedy_argmax",
+        capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
+    )
 )
 
 if TYPE_CHECKING:

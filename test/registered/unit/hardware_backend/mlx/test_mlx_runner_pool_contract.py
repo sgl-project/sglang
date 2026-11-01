@@ -28,6 +28,8 @@ import inspect
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,12 +44,28 @@ if _HAS_MLX:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+    from sglang.srt.model_executor.runner.eager_runner import BaseRunner, EagerRunner
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxRunnerPoolContract(CustomTestCase):
     """Guard the stub's scheduler-facing ``ModelRunner`` contracts."""
+
+    def test_stub_supports_eager_runner_warmup(self):
+        """Native MLX startup must enter the runner's model-scoped context."""
+        runner = object.__new__(MlxModelRunnerStub)
+        runner.model_config = SimpleNamespace(
+            is_hybrid_swa=False, attention_chunk_size=None, dtype=torch.float32
+        )
+        runner.device = "mps"
+        runner.load_model()
+        eager = object.__new__(EagerRunner)
+        eager.model_runner = runner
+
+        with get_context().override_server_args(disable_shared_experts_fusion=False):
+            eager.warmup()
+
+        self.assertTrue(runner._kernel_warmed_up)
 
     def test_worker_startup_uses_mlx_token_capacity(self):
         """MLX startup must report its own pool capacity without a Torch configurator."""
