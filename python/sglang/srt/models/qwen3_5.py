@@ -547,7 +547,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     and proj.weight.dtype == torch.bfloat16
                     and all(d % 256 == 0 for d in proj.weight.shape)
                 ):
-                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod(
+                        envs.SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD.get()
+                    )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1900,12 +1902,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
             mxfp4 = 0
+            hadamard = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
-                    mxfp4 += sum(
-                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
-                        for name in _gdn_online_mxfp4
-                    )
+                    for name in _gdn_online_mxfp4:
+                        proj = getattr(module, name, None)
+                        mxfp4 += hasattr(proj, "mxfp4_preshuffle_tuned")
+                        hadamard += getattr(
+                            getattr(proj, "quant_method", None), "hadamard", False
+                        )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
@@ -1913,9 +1918,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
             if _gdn_online_mxfp4:
                 logger.info(
-                    "Online MXFP4 GDN %s: %d projections",
+                    "Online MXFP4 GDN %s: %d projections, %d with Hadamard-32",
                     ",".join(_gdn_online_mxfp4),
                     mxfp4,
+                    hadamard,
                 )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
