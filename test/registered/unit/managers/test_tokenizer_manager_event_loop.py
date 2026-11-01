@@ -5,6 +5,12 @@ import threading
 import types
 import unittest
 from contextvars import ContextVar
+from unittest.mock import patch
+
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -16,10 +22,13 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class _BlockingFastTokenizer:
-    is_fast = True
-
+class _BlockingFastTokenizer(PreTrainedTokenizerFast):
     def __init__(self, tokenization_started, release_tokenization):
+        backend = Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1, "[PAD]": 2}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = Whitespace()
+        super().__init__(tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]")
         self.tokenization_started = tokenization_started
         self.release_tokenization = release_tokenization
 
@@ -27,20 +36,11 @@ class _BlockingFastTokenizer:
         self.tokenization_started.set()
         if not self.release_tokenization.wait(timeout=5):
             raise TimeoutError("test did not release tokenization")
-        return {"input_ids": [[1] for _ in texts]}
-
-    def encode(self, text):
-        return self([text])["input_ids"][0]
+        return super().__call__(texts, **kwargs)
 
 
 class TestTokenizerManagerEventLoop(CustomTestCase):
     def test_regular_tokenizer_does_not_block_event_loop(self):
-        self._assert_tokenizer_does_not_block_event_loop(is_fast=True)
-
-    def test_slow_tokenizer_does_not_block_event_loop(self):
-        self._assert_tokenizer_does_not_block_event_loop(is_fast=False)
-
-    def _assert_tokenizer_does_not_block_event_loop(self, *, is_fast):
         tokenization_started = threading.Event()
         loop_progressed = threading.Event()
         release_tokenization = threading.Event()
@@ -51,7 +51,6 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         manager.tokenizer = _BlockingFastTokenizer(
             tokenization_started, release_tokenization
         )
-        manager.tokenizer.is_fast = is_fast
         manager.async_dynamic_batch_tokenizer = None
         # `_tokenize_texts` consults model_config for the EmbeddingGemma EOS
         # fix-up; this test builds a bare manager, so stub the flag it reads.
@@ -96,6 +95,75 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         )
 
     @unittest.skipUnless(
+        hasattr(TokenizerManager, "_regular_tokenizer_for_worker"),
+        "requires isolated regular tokenization",
+    )
+    def test_worker_backend_is_isolated_and_wrapper_settings_are_current(self):
+        started, release = threading.Event(), threading.Event()
+        release.set()
+        tokenizer = _BlockingFastTokenizer(started, release)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.tokenizer = tokenizer
+        manager.async_dynamic_batch_tokenizer = None
+        manager.model_config = types.SimpleNamespace(is_embedding_gemma=False)
+        manager.init_tokenizer_executor()
+        self.addCleanup(manager._tokenizer_executor.shutdown, wait=True)
+        # Configuration applied after manager startup must reach the worker.
+        tokenizer.padding_side = "left"
+        with patch("copy.deepcopy", side_effect=AssertionError("request-time copy")):
+            worker = manager._regular_tokenizer_for_worker()
+            self.assertIsNot(worker.backend_tokenizer, tokenizer.backend_tokenizer)
+            self.assertEqual(worker.padding_side, "left")
+            worker(["hello", "hello hello"], padding=True)
+            self.assertIsNone(tokenizer.backend_tokenizer.padding)
+            self.assertEqual(
+                asyncio.run(manager._tokenize_texts(["hello", "hello hello"])),
+                ([[1], [1, 1]], None),
+            )
+        self.assertIs(manager.tokenizer, tokenizer)
+        # A replacement must not keep using the old vocabulary.
+        replacement = Tokenizer(WordLevel({"[UNK]": 0, "hello": 3}, unk_token="[UNK]"))
+        manager.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=replacement, unk_token="[UNK]"
+        )
+        self.assertIsNone(manager._regular_tokenizer_for_worker())
+        self.assertEqual(asyncio.run(manager._tokenize_texts("hello")), ([3], None))
+
+    def test_custom_tokenizers_keep_the_synchronous_path(self):
+        loop_thread = threading.get_ident()
+        calls = []
+
+        def encode(text):
+            calls.append(threading.get_ident())
+            return [1]
+
+        def batch_encode(texts, **kwargs):
+            calls.append(threading.get_ident())
+            return {"input_ids": [[1] for _ in texts]}
+
+        for is_fast in (False, True):
+            with self.subTest(is_fast=is_fast):
+
+                class CustomTokenizer:
+                    def __call__(self, texts, **kwargs):
+                        return batch_encode(texts, **kwargs)
+
+                tokenizer = CustomTokenizer()
+                tokenizer.is_fast = is_fast
+                tokenizer.encode = encode
+                manager = TokenizerManager.__new__(TokenizerManager)
+                manager.tokenizer = tokenizer
+                manager.async_dynamic_batch_tokenizer = None
+                manager.model_config = types.SimpleNamespace(is_embedding_gemma=False)
+                if hasattr(manager, "init_tokenizer_executor"):
+                    manager.init_tokenizer_executor()
+                    self.addCleanup(manager._tokenizer_executor.shutdown, wait=True)
+                self.assertEqual(
+                    asyncio.run(manager._tokenize_texts("hello")), ([1], None)
+                )
+        self.assertEqual(calls, [loop_thread, loop_thread])
+
+    @unittest.skipUnless(
         hasattr(TokenizerManager, "init_tokenizer_executor"),
         "requires the tokenizer executor",
     )
@@ -104,6 +172,7 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         release_first = threading.Event()
         second_started = threading.Event()
         manager = TokenizerManager.__new__(TokenizerManager)
+        manager.tokenizer = None
         manager.init_tokenizer_executor()
 
         def first_call():
@@ -145,6 +214,7 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
     def test_request_preprocessing_preserves_context(self):
         request_context = ContextVar("request_context")
         manager = TokenizerManager.__new__(TokenizerManager)
+        manager.tokenizer = None
         manager.init_tokenizer_executor()
 
         async def read_context_from_preprocessor():
