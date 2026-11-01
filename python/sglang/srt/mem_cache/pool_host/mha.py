@@ -957,12 +957,12 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
     ):
         buffer_info.validate()
         if (
-            buffer_info.key_format is not IndexKeyFormat.DENSE
+            buffer_info.key_format is not IndexKeyFormat.KEY_ROWS
             or buffer_info.compress_ratio != 1
             or buffer_info.page_size != anchor_host.page_size
         ):
             raise ValueError(
-                "K-only host requires uncompressed dense index keys with "
+                "K-only host requires uncompressed key-row index keys with "
                 f"page_size={anchor_host.page_size}, got "
                 f"key_format={buffer_info.key_format}, "
                 f"compress_ratio={buffer_info.compress_ratio}, "

@@ -5690,7 +5690,7 @@ class MHATokenToKOnlyPool(KVCache):
                 buffer_info=IndexKeyBufferInfo(
                     page_size=self.page_size,
                     compress_ratio=1,
-                    key_format=IndexKeyFormat.DENSE,
+                    key_format=IndexKeyFormat.KEY_ROWS,
                     # NPU stores these rows with an explicit physical page axis.
                     buffers=tuple(
                         buffer.view(-1, self.head_num, self.head_dim)

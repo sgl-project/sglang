@@ -1147,9 +1147,9 @@ def _capture_qsa_index_buffers(
         buffer_info = info.buffer_info
         if (
             not isinstance(buffer_info, IndexKeyBufferInfo)
-            or buffer_info.key_format is not IndexKeyFormat.DENSE
+            or buffer_info.key_format is not IndexKeyFormat.KEY_ROWS
         ):
-            raise TypeError("QSA host requires dense index key buffers")
+            raise TypeError("QSA host requires key-row index buffers")
         buffer_info = IndexKeyBufferInfo(
             page_size=page_size,
             compress_ratio=buffer_info.compress_ratio,
