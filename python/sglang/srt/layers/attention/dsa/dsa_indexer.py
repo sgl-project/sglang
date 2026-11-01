@@ -1912,6 +1912,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             index_k_scale=k_scale,
         )
 
+    def forward_k_only(
+        self,
+        *,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> None:
+        """Write the indexer K cache for the batch's tokens without a top-k."""
+        # Only CUDA runs the KV-only draft pass (EagleDraftWorker), where
+        # forward_cuda quantizes with the Triton kernel.
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return
+        self._forward_cuda_k_only(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            act_quant,
+            metadata,
+            return_indices=False,
+        )
+
     def forward_native(self, *args, **kwargs):
         # The indexer has no pure-torch reference path; it only runs on
         # platforms with a dedicated forward below.

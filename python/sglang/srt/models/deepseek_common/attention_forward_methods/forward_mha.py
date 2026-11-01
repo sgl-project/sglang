@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -179,6 +179,45 @@ class DeepseekMHAForwardMixin:
             envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.get()
         )
 
+    def _split_latent_cache(
+        self: DeepseekV2AttentionMLA, latent_cache: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        return (
+            latent_cache,
+            self.kv_a_layernorm(kv_a),
+            latent_cache[:, :, self.kv_lora_rank :],
+        )
+
+    def forward_kv_only(
+        self: DeepseekV2AttentionMLA,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write the latent KV and DSA indexer keys that forward_normal_prepare writes,
+        without the query path or attention; the draft's decode reads these bytes."""
+        if self.q_lora_rank is not None:
+            latent_cache = get_attn_tp_context().fetch_qkv_latent()[
+                ..., self.q_lora_rank :
+            ]
+        else:
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        latent_cache, kv_a, k_pe = self._split_latent_cache(latent_cache)
+        if self.rotary_emb is not None:
+            # The rope op also rotates a query; give it scratch rows.
+            _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if self.use_dsa and self.should_run_indexer():
+            self.indexer.forward_k_only(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+
     def forward_normal_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -223,12 +262,7 @@ class DeepseekMHAForwardMixin:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
 
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-
-        kv_a = self.kv_a_layernorm(kv_a)
-
-        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        latent_cache, kv_a, k_pe = self._split_latent_cache(latent_cache)
 
         # Backend prefill hook: the backend owns the BF16->FP8 transition
         # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
