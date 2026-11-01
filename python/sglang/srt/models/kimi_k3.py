@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.moe import moe_route_quant_fused
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -1319,11 +1320,26 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
-    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+    def _route_staged(self, hidden_states, router_logits, routed_input):
+        """Stage the fused route preparation and route; returns the topk output
+        and the routed input to feed the experts. Caller clears the handoff."""
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
+        fuse_nvfp4 = self._nvfp4_preparation_covered(router_logits, routed_input)
+        if fuse_nvfp4:
+            route_quant_handoff.stage(routed_input, self.experts.w13_input_scale_quant)
+        topk_output = self.topk(hidden_states, router_logits)
+        if fuse_nvfp4 and not route_quant_handoff.ready(
+            routed_input, self.experts.w13_input_scale_quant
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        return topk_output, routed_input
+
+    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1331,15 +1347,37 @@ class KimiK3MoE(nn.Module):
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
+    def _nvfp4_preparation_covered(self, router_logits, routed_input):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        if not (
+            self._defer_moe_finalize
+            and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and self.alt_stream is not None
+            and self.fuse_ar_norm
+            and k3_ar_fusion.enabled()
+            and self.gate.e_score_correction_bias is not None
+        ):
+            return False
+        return moe_route_quant_fused.nvfp4_covered(
+            router_logits,
+            self.gate.e_score_correction_bias,
+            self.experts.top_k,
+            routed_input,
+            self.experts.w13_input_scale_quant,
+        )
+
     def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
         """Routed experts with the in-op finalize skipped: returns the
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1393,7 +1431,9 @@ class KimiK3MoE(nn.Module):
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        if self._moe_front_needs_dense_bf16 and not self._nvfp4_preparation_covered(
+            router_logits, routed_input
+        ):
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
