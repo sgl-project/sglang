@@ -15,7 +15,7 @@ from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.algorithm.joint_threshold_indel import JointThresholdInDel
 from sglang.srt.dllm.config import DllmConfig
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 MASK = 0

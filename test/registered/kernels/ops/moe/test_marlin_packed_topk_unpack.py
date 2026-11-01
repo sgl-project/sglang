@@ -10,12 +10,14 @@ distributions.
 """
 
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from sglang.srt.layers.moe.moe_runner.marlin import _fused_unpack_packed_topk
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -84,6 +86,85 @@ def test_unpack_empty():
     ids, w = _fused_unpack_packed_topk(packed)
     assert ids.shape == (0, 2) and w.shape == (0, 2)
     assert ids.dtype == torch.int32 and w.dtype == torch.float32
+
+
+class TestPackedTopKRowCount(CustomTestCase):
+    def test_scalar_and_vector_count_share_storage_and_replay_mask(self):
+        """A captured packed router reads scalar/vector live counts as they change."""
+        from sglang.kernels.ops.lora.moe.trtllm_lora_temp import topk_softmax_pack
+
+        num_tokens, num_experts, top_k = 7, 8, 2
+        scores = torch.arange(num_experts, device="cuda", dtype=torch.float32)
+        scores = scores.repeat(num_tokens, 1) * 0.125
+        probs = scores.softmax(dim=-1)
+        ref_weights, ref_ids = probs.topk(top_k, dim=-1)
+        real_op = topk_softmax_pack._jit_topk_softmax_pack_op
+        for shape in ((), (1,)):
+            for renormalize in (False, True):
+                with self.subTest(shape=shape, renormalize=renormalize):
+                    count = torch.full(shape, 3, dtype=torch.int32, device="cuda")
+                    weights = torch.empty(
+                        (num_tokens, top_k), dtype=torch.float32, device="cuda"
+                    )
+                    ids = torch.empty_like(weights, dtype=torch.int32)
+                    packed = torch.empty_like(ids)
+                    observed = []
+
+                    def observed_op(*args):
+                        bound = args[4]
+                        result = real_op(*args)
+                        self.assertEqual(bound.shape, (1,))
+                        self.assertEqual(bound.data_ptr(), count.data_ptr())
+                        self.assertEqual(
+                            bound.untyped_storage().data_ptr(),
+                            count.untyped_storage().data_ptr(),
+                        )
+                        if shape == (1,):
+                            self.assertIs(bound, count)
+                        observed.append(bound.data_ptr())
+                        return result
+
+                    def run():
+                        topk_softmax_pack.topk_softmax_pack(
+                            weights,
+                            ids,
+                            packed,
+                            scores,
+                            renormalize=renormalize,
+                            num_token_non_padded=count,
+                        )
+
+                    def check(live):
+                        expected_weights = ref_weights
+                        if renormalize:
+                            expected_weights = ref_weights / ref_weights.sum(
+                                dim=-1, keepdim=True
+                            )
+                        torch.testing.assert_close(
+                            weights, expected_weights, rtol=1e-5, atol=1e-7
+                        )
+                        self.assertTrue(torch.equal(ids, ref_ids.to(torch.int32)))
+                        expected_ids = ref_ids.to(torch.int32).clone()
+                        expected_ids[live:] = -1
+                        self.assertTrue(
+                            torch.equal(packed, _torch_pack(expected_ids, weights))
+                        )
+                        self.assertEqual(count.item(), live)
+
+                    with patch.object(
+                        topk_softmax_pack, "_jit_topk_softmax_pack_op", observed_op
+                    ):
+                        run()
+                        check(3)
+                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            run()
+                    self.assertEqual(len(observed), 2)
+                    for live in (0, num_tokens, 3, 0):
+                        count.fill_(live)
+                        graph.replay()
+                        check(live)
 
 
 if __name__ == "__main__":

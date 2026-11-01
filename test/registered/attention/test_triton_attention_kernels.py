@@ -1,3 +1,4 @@
+import itertools
 import random
 import unittest
 
@@ -28,7 +29,7 @@ from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -681,6 +682,84 @@ class TestTritonAttention(CustomTestCase):
             self.assertTrue(cos_sim.item() > 1 - (1e-5))
             self.assertTrue(torch.allclose(o[start:end], o_torch, atol=1e-2))
 
+    def test_extend_attention_int32_kv_indices_above_2g(self):
+        """Regression for int32 KV offset overflow in the extend kernels.
+
+        With int32 kv_indices, slot * stride wraps once slot >= 2**31 / stride.
+        Slots sit just below 2**32 / stride so a wrapped offset lands on the
+        zero rows in front of the buffer and shows up as a mismatch, not a
+        fault. Needs ~8.6 GB.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, P, E, H_Q, D = 2, 64, 16, 8, 128
+        pad, num_slots = 256, 2**32 // D
+        big = torch.zeros(pad + num_slots, 1, D, dtype=dtype, device=device)
+        kv_buffer = big[pad:]
+
+        q = torch.randn(B * E, H_Q, D, dtype=dtype, device=device)
+        kv = torch.randn(B, P + E, 1, D, dtype=dtype, device=device)
+        k_ext = kv[:, P:].reshape(B * E, 1, D)
+        slots = torch.arange(B * (P + E), dtype=torch.int32, device=device)
+        high_slots = slots + (num_slots - pad)
+        kv_buffer[high_slots.long()] = kv.flatten(0, 1)
+        ref_buffer = kv.flatten(0, 1)
+
+        qo_indptr = torch.arange(0, (B + 1) * E, E, dtype=torch.int32, device=device)
+        prefix_indptr = torch.arange(
+            0, (B + 1) * P, P, dtype=torch.int32, device=device
+        )
+        unified_indptr = torch.arange(
+            0, (B + 1) * (P + E), P + E, dtype=torch.int32, device=device
+        )
+        prefix_lens = torch.full((B,), P, dtype=torch.int32, device=device)
+
+        def run(buf, idx, unified):
+            o = torch.empty_like(q)
+            if unified:
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    buf,
+                    buf,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    unified_indptr,
+                    idx,
+                    prefix_lens,
+                    max_len_extend=E,
+                )
+            else:
+                prefix_idx = idx.view(B, P + E)[:, :P].flatten()
+                extend_attention_fwd(
+                    q,
+                    k_ext,
+                    k_ext,
+                    o,
+                    buf,
+                    buf,
+                    qo_indptr,
+                    prefix_indptr,
+                    prefix_idx,
+                    None,
+                    True,
+                    None,
+                    E,
+                    1.0,
+                    1.0,
+                )
+            return o
+
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                torch.testing.assert_close(
+                    run(kv_buffer, high_slots, unified),
+                    run(ref_buffer, slots, unified),
+                    atol=1e-2,
+                    rtol=1e-2,
+                )
+
     def test_context_attention(self):
         head_dim = [128, 96, 80, 13]
 
@@ -1175,6 +1254,56 @@ class TestTritonAttention(CustomTestCase):
                 self._test_extend_attention_unified_vs_regular_once(
                     B, N_CTX, H_Q, H_KV, D
                 )
+
+    def test_extend_attention_unified_gfx950_tile_bitwise(self):
+        """Deterministic mode relies on the gfx950 unified-kernel tile keeping the reduction
+        order: its output must equal the default tile's output bit for bit."""
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not ea._is_gfx95:
+            self.skipTest("gfx950-only tile")
+        device = get_device()
+        torch.manual_seed(0)
+        prefix_lens, extend_lens = [0, 1500, 4096], [700, 2048, 333]
+        for H_Q, H_KV, D in ((32, 8, 128), (64, 8, 64)):
+            seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+            q = torch.randn(
+                sum(extend_lens), H_Q, D, dtype=torch.bfloat16, device=device
+            )
+            k = torch.randn(sum(seq_lens), H_KV, D, dtype=torch.bfloat16, device=device)
+            v = torch.randn_like(k)
+            qo_indptr = torch.tensor(
+                [0, *itertools.accumulate(extend_lens)],
+                dtype=torch.int32,
+                device=device,
+            )
+            kv_indptr = torch.tensor(
+                [0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device=device
+            )
+            kv_indices = torch.arange(sum(seq_lens), dtype=torch.int64, device=device)
+            prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+
+            def run():
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    prefix,
+                    max_len_extend=max(extend_lens),
+                )
+                return o
+
+            o_tuned = run()
+            with unittest.mock.patch.object(ea, "_is_gfx95", False):
+                o_default = run()
+            self.assertTrue(torch.equal(o_tuned, o_default), f"head_dim {D}")
 
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""

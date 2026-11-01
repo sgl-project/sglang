@@ -5,8 +5,12 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_agree,
+    megakernel_draft_sampler,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_draft_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -16,12 +20,17 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
 
 
 class DsparkDraftSampler:
     """The eager path's markov block, run as the draft cuda graph's tail."""
+
+    verify_ids = None
 
     def __init__(
         self,
@@ -33,6 +42,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        sharded_accept: bool = False,
         out=None,
         megakernel_sampler: Optional[Callable] = None,
     ):
@@ -50,6 +60,13 @@ class DsparkDraftSampler:
             self.out = torch.empty(
                 (self.max_bs * self.gamma,), dtype=torch.int64, device=device
             )
+        # [max_bs, gamma + 1] verify ids ([anchor | draft tokens]) written by the
+        # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
+        self.verify_ids: Optional[torch.Tensor] = None
+        if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
+            self.verify_ids = torch.empty(
+                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
+            )
         confidence_head = model.confidence_head
         if confidence_head is None:
             self.confidence_out = self.confidence_raw_out = None
@@ -63,6 +80,7 @@ class DsparkDraftSampler:
                 device=device,
             )
         self.greedy_draft = greedy_draft
+        self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay.
@@ -84,8 +102,9 @@ class DsparkDraftSampler:
         if not self.greedy_draft:
             # The megakernel leaves temperature-0 rows' logits unwritten; a mixed accept
             # still reads them.
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.zeros(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             )
@@ -109,9 +128,16 @@ class DsparkDraftSampler:
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
-            assert not torch.cuda.is_current_stream_capturing()
+            # torch.cuda's capture query raises on XPU builds.
+            capturing = (
+                torch.xpu.is_current_stream_capturing()
+                if _is_xpu
+                else torch.cuda.is_current_stream_capturing()
+            )
+            assert not capturing
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
@@ -148,6 +174,12 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
+        if self.verify_ids is not None:
+            torch.cat(
+                [anchor.view(bs, 1), self.out[: bs * self.gamma].view(bs, self.gamma)],
+                dim=1,
+                out=self.verify_ids[:bs],
+            )
 
     def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
@@ -164,12 +196,15 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            sharded_accept=self.sharded_accept,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features
 
 
-def _step_logits_width(model) -> int:
+def _step_logits_width(model, sharded_accept: bool) -> int:
+    if sharded_accept:
+        return int(model.lm_head.num_embeddings_per_partition)
     # Unsharded base logits span the cropped vocab.
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
@@ -184,6 +219,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    sharded_accept: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -213,6 +249,7 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        sharded_accept=sharded_accept,
         out=out,
         megakernel_sampler=megakernel_sampler,
     )

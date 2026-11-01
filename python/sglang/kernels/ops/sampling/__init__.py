@@ -19,10 +19,11 @@ if TYPE_CHECKING:
 register_kernel(
     KernelSpec(
         op="sampling.softmax",
-        backend=KernelBackend.FLASHINFER,
+        backend=KernelBackend.CAKE,
         target="sglang.kernels.cake_kernels.sampling:softmax",
         capabilities=frozenset(
             {
+                CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0)),
                 CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
             }
         ),
@@ -32,7 +33,7 @@ register_kernel(
 
 def cake_softmax(logits: torch.Tensor) -> torch.Tensor:
     """Explicit Cake softmax entry point for Blackwell qualification."""
-    return get_kernel("sampling.softmax", KernelBackend.FLASHINFER)(logits)
+    return get_kernel("sampling.softmax", KernelBackend.CAKE)(logits)
 
 
 def softmax(
