@@ -1949,6 +1949,19 @@ class EnginePassthroughTestCase(CustomTestCase):
 
         self.assertEqual(captured["adapted_request"].lora_path, "adapter1")
 
+    def test_lora_adapter_from_registered_name_forwarded_to_engine(self):
+        serving = make_serving()
+        serving.tokenizer_manager.lora_registry = Mock()
+        serving.tokenizer_manager.lora_registry.get_all_adapters.return_value = {
+            "adapter1": Mock()
+        }
+        captured = self._capture(
+            serving,
+            ResponsesRequest(model="adapter1", input="hi", store=False),
+        )
+
+        self.assertEqual(captured["adapted_request"].lora_path, "adapter1")
+
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
