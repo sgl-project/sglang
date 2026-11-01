@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
@@ -492,6 +492,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
             dst_attn_tp_size=1,
+            dst_aux_ptrs=[2000],
+            dst_aux_item_lens=[16],
         )
         manager = SimpleNamespace(
             enable_trace=False,
@@ -513,6 +515,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
+            validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
@@ -578,6 +581,26 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+
+    def test_worker_waits_before_the_staging_gather(self):
+        """The staged path gathers the pages into the staging buffer before the
+        RDMA post, so a wait covering only the post ships partially written KV."""
+        order = []
+        manager, queue = self._worker(
+            SimpleNamespace(synchronize=lambda: order.append("wait"))
+        )
+        manager.enable_staging = True
+
+        def stop_at_strategy(_staging_buffer):
+            order.append("gather")
+            raise SystemExit
+
+        manager._try_create_staging_strategy = stop_at_strategy
+        with self.assertRaises(SystemExit):
+            MooncakeKVManager.transfer_worker(
+                manager, queue, MagicMock(), staging_buffer=object()
+            )
+        self.assertEqual(order, ["wait", "gather"])
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):

@@ -19,6 +19,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
 )
+from sglang.srt.managers.schedule_policy import PrefillAdder, mamba_prefill_chunk_grid
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -129,6 +131,104 @@ class TestMambaCheckpointDepth(unittest.TestCase):
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
         )
+
+
+class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
+    """The scheduler side of the same constraint.
+
+    `test_dcp_depth_satisfies_tree_page_and_snapshot_grids` shows a prefix of
+    37 donates nothing. A prefix only reaches 37 because a prefill chunk was
+    cut there, and every later chunk of that request inherits the offset, so
+    one unaligned cut costs the request every checkpoint it would ever donate.
+    """
+
+    def _floor(self, trunc_len: int, remaining: int, grid: int = CHUNK) -> int:
+        adder = object.__new__(PrefillAdder)
+        adder.mamba_chunk_grid = grid
+        return adder.floor_chunked_tokens(trunc_len, remaining)
+
+    def test_a_cut_is_rounded_down_onto_the_grid(self):
+        self.assertEqual(self._floor(100, 8192), 64)
+        self.assertEqual(self._floor(8010, 100000), 8000)
+
+    def test_a_cut_already_on_the_grid_is_untouched(self):
+        self.assertEqual(self._floor(8192, 100000), 8192)
+
+    def test_the_chunk_that_finishes_the_request_may_stop_anywhere(self):
+        self.assertEqual(self._floor(37, 37), 37)
+
+    def test_a_cut_shorter_than_the_grid_still_makes_progress(self):
+        # Rounding to zero would stall the request forever; the donation is
+        # the cheaper thing to lose.
+        self.assertEqual(self._floor(40, 8192), 40)
+
+    def test_no_rounding_without_the_mamba_extra_buffer(self):
+        self.assertEqual(self._floor(100, 8192, grid=1), 100)
+
+    def _published_grid(self, *, dcp_size: int, strategy: str = "extra_buffer") -> int:
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy=strategy,
+            dcp_size=dcp_size,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            return mamba_prefill_chunk_grid()
+
+    def test_dcp_extra_buffer_uses_the_chunk_grid(self):
+        self.assertEqual(self._published_grid(dcp_size=2), CHUNK)
+        self.assertEqual(
+            self._floor(100, 8192, grid=self._published_grid(dcp_size=2)), 64
+        )
+
+    def test_non_dcp_extra_buffer_leaves_the_cut(self):
+        # #40907 already donates from a prefix-relative snapshot here, so the
+        # cut must stay where the prefill budget put it.
+        self.assertEqual(self._published_grid(dcp_size=1), 1)
+        self.assertEqual(
+            self._floor(100, 8192, grid=self._published_grid(dcp_size=1)), 100
+        )
+
+    def test_non_dcp_does_not_change_truncation_alignment(self):
+        # The old gate would write the chunk size into a still-empty alignment.
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+        self.assertIsNone(scheduler.truncation_align_size)
+
+    def test_dcp_folds_the_chunk_into_truncation_alignment(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = 48
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=2,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+        self.assertEqual(scheduler.truncation_align_size, 192)
+
+    def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
+        # Walk a 100k prompt through chunks the scheduler cut to whatever the
+        # shared prefill budget had left, and check each one donates.
+        prefix_len, total = 0, 100_000
+        for budget in (8192, 5000, 8192, 3333, 8192, 777):
+            trunc_len = self._floor(budget, total - prefix_len)
+            self.assertIsNotNone(
+                _track_seqlen(
+                    tree_page=256,
+                    prefix_len=prefix_len,
+                    extend_len=trunc_len,
+                    dcp_enabled=True,
+                ),
+                f"no donation at {prefix_len=} {trunc_len=}",
+            )
+            prefix_len += trunc_len
 
 
 class TestMambaTrackPosition(unittest.TestCase):
