@@ -9,6 +9,7 @@ then taking the request's state slots and tokens must succeed.
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 from test_unified_chain_realize import _allocator, _live_pages
@@ -116,6 +117,76 @@ class TestAdmissionIsATake(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda(self):
         self._check("cuda", seed=37, count=60)
+
+
+def _empty_tree():
+    """A prefix tree with nothing evictable."""
+    return SimpleNamespace(
+        full_evictable_size=lambda: 0,
+        swa_evictable_size=lambda: 0,
+        auxiliary_swa_evictable_size=lambda: 0,
+        mamba_evictable_size=lambda: 0,
+        supports_mamba=lambda: True,
+        window_retain_size=lambda component: 32,
+    )
+
+
+class TestDecodePreallocationTakesItsStateSlots(CustomTestCase):
+    """A decode node's preallocation takes a request's state slot and then its
+    tokens from the same bytes. Admission must price them together: checking
+    the slot alone and the tokens alone admits requests whose tokens no longer
+    fit once the slot is taken."""
+
+    def _queue(self, allocator):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        queue = object.__new__(DecodePreallocQueue)
+        queue.tree_cache = _empty_tree()
+        queue.token_to_kv_pool_allocator = allocator
+        queue.req_to_token_pool = SimpleNamespace(
+            holds_state_slots=True,
+            enable_mamba_extra_buffer=False,
+            mamba_initial_tracking_slots=0,
+        )
+        return queue
+
+    def _check(self, device):
+        req = SimpleNamespace(kv=SimpleNamespace(holds_mamba=False))
+        split_admits = 0
+        for lazy in (False, True):
+            for held_slots in range(8):
+                for held_tokens in (0, 4, 8, 16):
+                    for tokens in range(8, 80, 4):
+                        setup_allocator_context()
+                        allocator = _allocator(device, "tri", lazy=lazy)
+                        if held_slots:
+                            self.assertIsNotNone(
+                                allocator.alloc_state_slots(held_slots)
+                            )
+                        if held_tokens:
+                            self.assertIsNotNone(allocator.alloc(held_tokens))
+                        queue = self._queue(allocator)
+                        slots = queue._pending_state_slots(req)
+                        self.assertEqual(slots, 1)
+                        budgets = dict(
+                            full_allocatable_tokens=10**9,
+                            swa_allocatable_tokens=10**9,
+                        )
+                        alone = queue._prealloc_reservation_fits(
+                            tokens, tokens, **budgets
+                        )
+                        if not queue._prealloc_reservation_fits(
+                            tokens, tokens, **budgets, state_slots=slots
+                        ):
+                            split_admits += alone
+                            continue
+                        self.assertIsNotNone(allocator.alloc_state_slots(slots))
+                        self.assertIsNotNone(allocator.alloc(tokens))
+        # Requests the slot-alone and tokens-alone checks admitted, refused now.
+        self.assertGreater(split_admits, 0)
+
+    def test_cpu(self):
+        self._check("cpu")
 
 
 if __name__ == "__main__":
