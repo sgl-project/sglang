@@ -147,6 +147,25 @@ multiple-of-8 floor already keeps half of them. 4096 sits well below any real
 video sequence and well above where either effect bites; it was chosen on that
 reasoning rather than from a measured threshold sweep.
 
+## Optional plane-major Ulysses QKV layout
+
+`_usp_input_all_to_all_packed_qkv(q, k, v, plane_major=True)` packs each
+all-to-all destination as `[S_local, 3, H_local, D]` instead of the default
+`[S_local, H_local, 3*D]`. The returned Q/K/V views still have shape
+`[S_global, H_local, D]`, with strides `(3*H_local*D, D, 1)`.
+This lets a consumer read packed head/channel dimensions without first
+materializing each tensor. The transport and number of collectives are unchanged.
+
+The option defaults to false, and no model caller is changed here. Both the
+Triton packer and its fallback accept the layout; a single-rank call returns
+its original input views. Layout/collective tests cover the default and opt-in
+paths. For real NCCL, run on two or four GPUs:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  python/sglang/multimodal_gen/test/single_test_file/test_usp_plane_major_nccl.py
+```
+
 ## Measured
 
 MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16, at the
@@ -206,3 +225,24 @@ Run the SM120 Sage numerical test with:
 ```bash
 python test/manual/attention/test_subblock_sage_fp8_sm120.py
 ```
+
+### SM100 sparse Sage FP8 for MiniMax-H3
+
+Select `--attention-backend transformer=subblock_sparse_attn_fp8` on SM100
+(B200/GB200). This backend requires FlashInfer's blk64 Sage FP8 kernel
+(PR #5241), opt-in strided TRT-LLM Sage quantization, and direct BSHD output
+support. It also uses the plane-major Ulysses option described above.
+
+Routing uses BF16 Q/K and Q64 x K64 blocks (`n_q=4`, `n_k=4`), with the
+existing sparsity and denoising-step schedule. Quantization uses E4M3 for
+Q/K/V: Q scales per token/head, K scales per 16 tokens/head, and V scales
+per head/channel across the sequence. K smoothing is disabled. Sequence
+lengths remain unpadded; the attention kernel handles partial tail blocks.
+
+The single-document path preserves strided Q/K/V views and writes attention
+directly into BSHD output. This avoids input materialization, output reordering,
+and segment assembly kernels when the kernel uses one KV split. Multiple KV
+splits retain FlashInfer's merge path. Multiple documents may require dense
+segment writes or alignment-tail zeroing. Batched and grouped-query inputs
+use dense attention; the sparse FP8 path supports a batch of one with equal
+Q/K/V head counts and head dimension 128.

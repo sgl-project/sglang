@@ -504,6 +504,22 @@ class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
+class _SubBlockSparseAttentionFP8BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_FP8
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability is None or capability.to_int() != 100:
+            raise ValueError("SubBlock Sage FP8 requires SM100 (B200/GB200).")
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn_fp8 import (
+            load_sage_attention,
+        )
+
+        load_sage_attention()
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn_fp8.SubBlockSparseAttentionFP8Backend"
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -580,6 +596,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
+        _SubBlockSparseAttentionFP8BackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
