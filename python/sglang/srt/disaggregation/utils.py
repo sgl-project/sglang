@@ -344,7 +344,7 @@ def state_indices_per_entry(
     return [
         (
             window_payload(sub_pool)
-            if sub_pool is not None and st in (StateType.SWA, StateType.AUXILIARY_SWA)
+            if sub_pool is not None and st == StateType.SWA
             else payloads[st]()
             if st in payloads
             else None

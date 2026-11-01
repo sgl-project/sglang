@@ -18,8 +18,9 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
+    # A window sub-pool's trailing pages; a unified pool registers one entry
+    # per window, told apart by its sub-pool.
     SWA = "swa"
-    AUXILIARY_SWA = "auxiliary_swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
     # only the live subrange of that row for the current open pool.
