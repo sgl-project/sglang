@@ -520,8 +520,10 @@ class TestIndependentWindowFree(unittest.TestCase):
             cache.evict(
                 EvictParams(
                     num_tokens=64,
-                    swa_num_tokens=64,
-                    window_num_tokens={ComponentType.of("DRAFT_SWA"): 64},
+                    window_num_tokens={
+                        ComponentType.SWA: 64,
+                        ComponentType.of("DRAFT_SWA"): 64,
+                    },
                 )
             )
         self.assertEqual(recorder.hits, [])

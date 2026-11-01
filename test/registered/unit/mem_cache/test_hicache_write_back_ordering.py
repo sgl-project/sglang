@@ -56,8 +56,12 @@ class TestHiCacheWriteBackOrdering(UnifiedRadixCacheFixtures, unittest.TestCase)
         controller.write_fence_stream = forward
         warm = self._request(cache, allocator, req_pool, 100, length=12)
         cache.checkpoint(warm, up_to=12)
-        warm_eviction = cache.evict(EvictParams(swa_num_tokens=1))
-        self.assertGreaterEqual(warm_eviction.swa_num_tokens_evicted, 1)
+        warm_eviction = cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: 1})
+        )
+        self.assertGreaterEqual(
+            warm_eviction.window_num_tokens_evicted.get(ComponentType.SWA, 0), 1
+        )
         req = self._request(cache, allocator, req_pool, 0, length=12)
         kv = allocator.get_kvcache()
         buffers = [
@@ -98,8 +102,12 @@ class TestHiCacheWriteBackOrdering(UnifiedRadixCacheFixtures, unittest.TestCase)
                 self.assertEqual(controller.write_queue, [])
                 # The active request pins Full and its final SWA window. An
                 # older window from this same forward is still evictable.
-                evicted = cache.evict(EvictParams(swa_num_tokens=1))
-            self.assertGreaterEqual(evicted.swa_num_tokens_evicted, 1)
+                evicted = cache.evict(
+                    EvictParams(window_num_tokens={ComponentType.SWA: 1})
+                )
+            self.assertGreaterEqual(
+                evicted.window_num_tokens_evicted.get(ComponentType.SWA, 0), 1
+            )
             self.assertTrue(snapshots)
             for snapshot in snapshots:
                 self.assertTrue(

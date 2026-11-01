@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator, Optional
 import mlx.core as mx
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import AllocDemand, InsertResult
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
@@ -377,7 +377,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 source_value
             )
             if forked_value is None:
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(AllocDemand(mamba_num=1))
                 forked_value = (
                     self.cache.req_to_token_pool.auxiliary_state_pool.fork_from(
                         source_value
