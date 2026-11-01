@@ -238,7 +238,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 55
+    max_concurrency = 54
     num_prompts = 90
     input_len = 131072
     output_len = 1024
@@ -258,40 +258,25 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
         self.run_throughput()
 
 
-class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
+class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Pure decode low latency: 128k shared prefix in / 1024 out, C12,
-    mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
-
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
-    # AISBENCH RETRY of the pure-decode case (user-requested): identical
-    # GSM8K natural-text rows through the PLAIN aisbench perf path - no
-    # prefix-tool chain involved. Proven fallback if this fails: revert to
-    # benchmark_tool = BENCHSERVING + dataset_name = "gsm8k-shared-prefix"
-    # (run 41001026946, Mean TPOT 22.10 ms SUCCESS).
     benchmark_tool = AISBENCHMARK
     dataset_type = "gsm8k-shared-prefix"
     dataset_path = None
     input_len = 131072
     output_len = 1024
     num_prompts = 90
-    max_concurrency = 60
+    max_concurrency = 54
     random_range_ratio = 1
-    request_rate = 0.9
+    request_rate = 3
+    repeat_rate = 0.9
     dp = 16
-    # repeat_rate is GSP-only; the gsm8k-shared-prefix generator fixes the
-    # prefix at ~99% of input_len and gives each row its own short question.
-    repeat_rate = None
-    # One warmup request per DP rank primes the shared prefix everywhere
-    # before the measured pass (bench_serving caps warmup output at 32).
     pop_sglang_is_in_ci_for_gsp = True
-    # Greedy decoding: with the default temperature 1.0 the DSPARK draft
-    # accept length collapsed to ~1.6 tokens (dev measured 3.94) and TPOT
-    # landed at 63.7 ms vs the dev 25.9 ms. Dev's perf passes always pin
-    # temperature to 0.
-    temperature = 0
-    tpot = 30.0
+    tpot = 20
+    output_token_throughput = 964.864
+    ttft = 7000
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):
         """Run the 128k pure-decode low-latency TPOT acceptance test."""
