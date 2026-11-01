@@ -667,6 +667,7 @@ class SchedulerOutputTimeStats(
     forward_entry_time: Optional[float] = None
     prefill_finished_time: Optional[float] = None
     queue_time: float = 0.0
+    decode_first_token_time: Optional[float] = None
 
     def to_meta_info(self) -> Dict[str, float]:
         return {
@@ -717,6 +718,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
+    # Decode-local receipt of the first sampled prefill token, not P's forward end.
+    decode_first_token_time: float = 0.0
 
     # bootstrap sub-phase tracking (PD disagg)
     bootstrap_done_time: float = 0.0
@@ -757,6 +760,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             queue_time=self.get_queueing_time(),
             forward_entry_time=_stamped_realtime(self.forward_entry_time),
             prefill_finished_time=_stamped_realtime(self.prefill_finished_time),
+            decode_first_token_time=_stamped_realtime(self.decode_first_token_time),
             storage_prefetch_wait=_finished_wait(
                 self.storage_prefetch_wait_s, self._storage_prefetch_wait
             ),
@@ -911,6 +915,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         stage = RequestStage.PREFILL_CHUNKED_FORWARD
         self.observe_per_stage_req_latency(stage, ts - last_time)
         self.trace_slice(stage, last_time, ts)
+
+    def set_decode_first_token_time(self, ts=None):
+        if self.decode_first_token_time == 0.0:
+            self.decode_first_token_time = ts or time.perf_counter()
 
     def set_prefill_finished_time(self, ts=None):
         ts = ts or time.perf_counter()
