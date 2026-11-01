@@ -20,6 +20,8 @@ it; the recorder owns the queue and needs nothing back from its owner.
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
@@ -38,6 +40,8 @@ from sglang.srt.mem_cache.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
+
+logger = logging.getLogger(__name__)
 
 # Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
 # end of extra_key, so the last 32 characters of extra_key are the id.
@@ -116,6 +120,143 @@ class KvEventLoraNames(LoRANameTable):
         )
 
 
+# schedule_batch.MM_PAD_SHIFT_VALUE; schedule_batch imports this module
+# (through base_prefix_cache), so it cannot be imported here.
+_MM_PAD_SHIFT_VALUE = 1_000_000
+
+
+class MmRoutingLabels:
+    """Pad value -> caller routing label, first label wins, LRU-bounded.
+
+    Pad values derive from SGLang's own item identity, so every token of an
+    item maps to the label of the first labeled request that brought it in.
+    Entries can expire while blocks stay cached; their later events then carry
+    no span and the router treats those tokens as unmapped (fail closed).
+
+    Known limitation: once an entry is evicted, a later request can register
+    the same pad value under a different label. Dynamo's id map already keeps
+    the first label for any block it has indexed, so a relabeled re-store is
+    counted as a conflict and dropped; the original routing continues to work.
+    The only gap is an *unindexed* block that is re-stored after eviction:
+    it is indexed under the new label. Both labels identify the same image, so
+    routing to either worker yields a cache hit.
+
+    Only the "dynamo" KV event format reports labels, so registration is a
+    no-op until an enabled recorder using that format turns it on.
+    Tensor-parallel ranks that do not publish events, and the default format,
+    never fill it.
+
+    Memory: the default capacity of 2**20 entries uses roughly 100–150 MiB RSS
+    in CPython (key int objects + OrderedDict overhead + label strings).  With
+    Dynamo's 16-character hex labels the measured cost is ~104 MiB; with the
+    128-byte maximum it is ~180 MiB.
+    """
+
+    def __init__(self, capacity: int = 1 << 20):
+        self._labels: OrderedDict[int, str] = OrderedDict()
+        self._capacity = capacity
+        self.enabled = False
+
+    def register(self, pad_values, label: str) -> None:
+        for value in pad_values:
+            if value in self._labels:
+                self._labels.move_to_end(value)
+                continue
+            self._labels[value] = label
+            if len(self._labels) > self._capacity:
+                self._labels.popitem(last=False)
+
+    def get(self, value: int) -> Optional[str]:
+        return self._labels.get(value)
+
+    def __bool__(self) -> bool:
+        return bool(self._labels)
+
+
+MM_ROUTING_LABELS = MmRoutingLabels()
+
+
+def enable_mm_routing_labels() -> None:
+    """Record routing labels: this process records dynamo-format KV events."""
+    MM_ROUTING_LABELS.enabled = True
+
+
+def attach_mm_routing_labels(mm_items, labels_by_modality) -> None:
+    """Attach caller routing labels to processed items, per media type.
+
+    Each type's inputs fill that type's placeholders in order, so the k-th
+    image item is the k-th image input however images and videos interleave
+    in the prompt. A type whose item count differs from its labels, such as
+    an unsplit bundle, stays unlabeled and its tokens are reported without
+    spans.
+    """
+    if not labels_by_modality or not mm_items:
+        return
+    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+
+    items_by_modality = {}
+    for item in mm_items:
+        if isinstance(item, MultimodalDataItem):
+            items_by_modality.setdefault(item.modality.name.lower(), []).append(item)
+    for modality, labels in labels_by_modality.items():
+        items = items_by_modality.get(modality, [])
+        if len(items) != len(labels):
+            logger.warning(
+                "mm_routing_labels has %d %s labels for %d %s items; "
+                "leaving those items unlabeled.",
+                len(labels),
+                modality,
+                len(items),
+                modality,
+            )
+            continue
+        for item, label in zip(items, labels):
+            item.routing_label = label or None
+
+
+def register_mm_routing_labels(mm_items) -> None:
+    if not MM_ROUTING_LABELS.enabled:
+        return
+    for item in mm_items or ():
+        label = item.routing_label
+        if label:
+            MM_ROUTING_LABELS.register(item.padding_values(), label)
+
+
+def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
+    """Per-block [start, length, label] runs of labeled multimodal tokens."""
+    if not MM_ROUTING_LABELS or block_size <= 0 or not token_ids:
+        return None
+    if isinstance(token_ids[0], tuple):
+        return None  # bigram (Eagle) keys are not labeled
+    # Text holds no value at or above the pad shift, and max() runs in C, so
+    # text skips the per-token loop: whole events here, blocks of mixed
+    # events below.
+    if max(token_ids) < _MM_PAD_SHIFT_VALUE:
+        return None
+    per_block = []
+    any_span = False
+    for block_index in range(num_blocks):
+        block = token_ids[block_index * block_size : (block_index + 1) * block_size]
+        spans = []
+        per_block.append(spans)
+        if not block or max(block) < _MM_PAD_SHIFT_VALUE:
+            continue
+        run_start, run_label = 0, None
+        for position, token in enumerate(block):
+            label = (
+                MM_ROUTING_LABELS.get(token) if token >= _MM_PAD_SHIFT_VALUE else None
+            )
+            if label != run_label:
+                if run_label is not None:
+                    spans.append((run_start, position - run_start, run_label))
+                run_start, run_label = position, label
+        if run_label is not None:
+            spans.append((run_start, len(block) - run_start, run_label))
+        any_span = any_span or bool(spans)
+    return per_block if any_span else None
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -132,6 +273,8 @@ class KVCacheEventRecorder:
         lora_names: Optional[KvEventLoraNames] = None,
     ):
         self.enabled = enabled
+        if enabled and dynamo_format:
+            enable_mm_routing_labels()
         self.page_size = page_size
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
@@ -163,6 +306,14 @@ class KVCacheEventRecorder:
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
+                    if tail.mm_routing_spans or event.mm_routing_spans:
+                        # Extend in place: a chain coalesces one page at a time,
+                        # so rebuilding the list would be quadratic in its length.
+                        if not tail.mm_routing_spans:
+                            tail.mm_routing_spans = [[] for _ in tail.block_hashes]
+                        tail.mm_routing_spans.extend(
+                            event.mm_routing_spans or [[] for _ in event.block_hashes]
+                        )
                     tail.block_hashes.extend(event.block_hashes)
                     tail.token_ids.extend(event.token_ids)
                     return
@@ -264,6 +415,11 @@ class KVCacheEventRecorder:
                     cache_salt=node.key.cache_salt,
                     session_id=session_id,
                     lora_name=lora_name,
+                    mm_routing_spans=(
+                        mm_routing_spans(page_tokens, len(page_tokens), 1)
+                        if self.dynamo_format and not is_bigram
+                        else None
+                    ),
                 )
             )
 

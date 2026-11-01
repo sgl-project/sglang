@@ -27,7 +27,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.events import (
+    KvEventLoraNames,
+    enable_mm_routing_labels,
+    mm_routing_spans,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -141,6 +145,11 @@ def _kv_event_from_tagged(
             cache_salt=event[6],
             session_id=event[7],
             lora_name=lora_name,
+            mm_routing_spans=(
+                mm_routing_spans(event[3], event[4], len(event[1]))
+                if dynamo_format
+                else None
+            ),
         )
     if tag == "block_removed":
         seed = (
@@ -297,6 +306,8 @@ class _RustKVCacheEventRecorder:
     ):
         self._binding = binding
         self.enabled = enabled
+        if enabled and dynamo_format:
+            enable_mm_routing_labels()
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
 
