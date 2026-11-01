@@ -409,14 +409,15 @@ class TestIndependentWindowFree(unittest.TestCase):
                         )
                     )
                     ids = a.alloc(32)
-                    kv = ReqKvInfo(req_pool_idx=0, swa_evict_floor=8)
+                    kv = ReqKvInfo(req_pool_idx=0, window_evict_floor=8)
                     storage.requests.req_to_token[0, :32] = ids
                     for name, ct, end in zip(
                         ("window_16", "draft_swa"),
                         (ComponentType.SWA, ComponentType.of("DRAFT_SWA")),
                         cursors,
                     ):
-                        start = 8 if ct == ComponentType.SWA and end else 0
+                        # Every window frees from the request's shield up.
+                        start = 8 if end else 0
                         a.free_window_segment(name, ids[start:end], start_pos=start)
                         kv.set_evicted_seqlen(ct, end)
                     recorder = _ShapeSyncRecorder()

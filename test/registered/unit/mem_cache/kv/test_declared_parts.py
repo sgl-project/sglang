@@ -484,6 +484,92 @@ class TestDeclaredParts(CustomTestCase):
                     a.free(torch.cat(chunks))
                     self.assertEqual(storage.accounting_violations(), [])
 
+    def test_each_window_retires_by_its_own_cursor(self):
+        """A shorter further window frees by its own cursor before the target's
+        window is due, and the prefill shield holds every window's rows below
+        it, not only the first window's."""
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        for floor in (0, 32):
+            with (
+                self.subTest(floor=floor),
+                envs.SGLANG_SWA_EVICTION_INTERVAL.override(8),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            ):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"draft_swa": [1, 1]},
+                    regions={
+                        "draft_swa": DenseDraftRegion(
+                            lane_num=2,
+                            head_num=1,
+                            head_dim=8,
+                            store_dtype=torch.bfloat16,
+                        )
+                    },
+                    new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+                )
+                storage, _, _ = _build(fused_draft=placement)
+                a = storage.allocator
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=storage.tree_slots(),
+                        tree_core_backend="python",
+                    )
+                )
+                first, further = cache.window_slots()
+                req = SimpleNamespace(
+                    seqlen=1,
+                    decode_batch_idx=1,
+                    kv=ReqKvInfo(req_pool_idx=1, window_evict_floor=floor),
+                )
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=storage.requests,
+                    token_to_kv_pool_allocator=a,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                draft_band = next(
+                    b for b in a.members if b.sub_pool_name == "draft_swa"
+                )
+                chunks = []
+                for frontier in range(4, 65, 4):
+                    ids = a.alloc(4)
+                    self.assertIsNotNone(ids)
+                    chunks.append(ids)
+                    storage.requests.req_to_token[1, frontier - 4 : frontier] = ids
+                    req.seqlen = frontier + 1
+                    batch.maybe_evict_swa()
+                    if frontier == 20 and floor == 0:
+                        # The 8-token window is 8 tokens past due; the
+                        # 16-token window is not due yet.
+                        self.assertGreater(req.kv.get_evicted_seqlen(further), 0)
+                        self.assertEqual(req.kv.get_evicted_seqlen(first), 0)
+                for component in (first, further):
+                    self.assertGreaterEqual(req.kv.get_evicted_seqlen(component), floor)
+                # Rows below the shield stay held in the further window too.
+                self.assertGreaterEqual(draft_band.allocated_count(), floor)
+                if floor:
+                    self.assertLessEqual(
+                        draft_band.allocated_count(), floor + 8 + 8 + 4
+                    )
+                a.free(torch.cat(chunks))
+                self.assertEqual(storage.accounting_violations(), [])
+
     def test_unified_sizing_rejects_an_unbudgeted_private_draft(self):
         from unittest.mock import patch
 

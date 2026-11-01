@@ -1,5 +1,4 @@
 import unittest
-from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -16,7 +15,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class _SwaCache(RadixCache):
-    def __init__(self, *, auxiliary=False):
+    def __init__(self):
         self.disable = False
         self.sliding_window_size = 128
         self.page_size = 16
@@ -35,15 +34,12 @@ class _SwaCache(RadixCache):
         self.token_to_kv_pool_allocator.page_size = 16
         self.token_to_kv_pool_allocator.storage = None
         self.trim_calls = 0
-        self.auxiliary = auxiliary
 
     def supports_swa(self):
         return True
 
     def window_slots(self):
-        if not self.auxiliary:
-            return (ComponentType.SWA,)
-        return (ComponentType.SWA, ComponentType.of("WINDOW_64"))
+        return (ComponentType.SWA,)
 
     def swa_retain_floor(self, req):
         # Read once per window retirement the scheduler runs.
@@ -53,22 +49,20 @@ class _SwaCache(RadixCache):
 
 class TestSWAEvictionInterval(unittest.TestCase):
     def test_scheduler_gates_on_request_cursor_before_protected_prefix(self):
-        for (protected, shield), auxiliary in product(
-            [(256, 0), (0, 249)], [False, True]
-        ):
+        for protected, shield in [(256, 0), (0, 249)]:
             with (
-                self.subTest(protected=protected, shield=shield, auxiliary=auxiliary),
+                self.subTest(protected=protected, shield=shield),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
                 envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
             ):
-                cache = _SwaCache(auxiliary=auxiliary)
+                cache = _SwaCache()
                 req = SimpleNamespace(
                     seqlen=401,
                     decode_batch_idx=1,
                     kv=ReqKvInfo(
                         req_pool_idx=0,
                         cache_protected_len=protected,
-                        swa_evict_floor=shield,
+                        window_evict_floor=shield,
                     ),
                 )
                 batch = ScheduleBatch(
@@ -92,14 +86,15 @@ class TestSWAEvictionInterval(unittest.TestCase):
                 self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 272)
                 free.reset_mock()
 
+                # Not due: the window's own cursor gates the retirement.
                 req.seqlen = 528
                 batch.maybe_evict_swa()
-                self.assertEqual(cache.trim_calls, 1 + auxiliary)
+                self.assertEqual(cache.trim_calls, 1)
                 free.assert_not_called()
 
                 req.seqlen += 1
                 batch.maybe_evict_swa()
-                self.assertEqual(cache.trim_calls, 2 + auxiliary)
+                self.assertEqual(cache.trim_calls, 2)
                 free.assert_called_once()
                 self.assertTrue(
                     torch.equal(free.call_args.args[0], torch.arange(272, 400))
