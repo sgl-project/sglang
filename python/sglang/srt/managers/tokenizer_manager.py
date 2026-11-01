@@ -743,6 +743,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Aborts for rids not registered yet (single-tokenizer mode): rid ->
+        # monotonic deadline. Consumed when the rid registers; see abort_request.
+        self._pending_abort_deadlines: Dict[str, float] = {}
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -966,6 +969,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rid: self.rid_to_state[rid]
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         }
+        for rid, state in request_states.items():
+            if self._consume_pending_abort(rid):
+                # Aborted before it registered: never dispatched (the
+                # skip-dispatch path), and the waiter finishes it as aborted.
+                state.abort_sent = True
         for state in request_states.values():
             state.waiting_at_pause_gate = True
         try:
@@ -2365,6 +2373,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
+    # Must outlive abort -> registration under a congested event loop;
+    # measured seconds-scale on a loaded server. Expiry falls back to today's
+    # behavior (the abort is lost), so this is a benefit knob.
+    PENDING_ABORT_TTL = 30.0
+
+    def _record_pending_abort(self, rid: str) -> None:
+        self._prune_pending_aborts()
+        self._pending_abort_deadlines[rid] = time.monotonic() + self.PENDING_ABORT_TTL
+
+    def _consume_pending_abort(self, rid: str) -> bool:
+        """One-shot take at registration; True when an abort preceded the rid."""
+        self._prune_pending_aborts()
+        return self._pending_abort_deadlines.pop(rid, None) is not None
+
+    def _prune_pending_aborts(self) -> None:
+        if not self._pending_abort_deadlines:
+            return
+        now = time.monotonic()
+        for rid in [
+            rid
+            for rid, deadline in self._pending_abort_deadlines.items()
+            if deadline <= now
+        ]:
+            del self._pending_abort_deadlines[rid]
+
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
@@ -2377,8 +2410,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
+                # The rid is not registered yet (the request can still be in
+                # the HTTP handler backlog). Remember the abort so registration
+                # consumes it; dropping it would let the request run unaborted.
+                self._record_pending_abort(rid)
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            # A rid another worker holds: the router forwards this abort to the
+            # scheduler and broadcasts it so the owning worker aborts locally.
+            forward=not abort_all and state is None,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:

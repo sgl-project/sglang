@@ -27,7 +27,9 @@ import pickle
 import signal
 import sys
 import threading
+import time
 import zlib
+from collections import defaultdict
 from functools import lru_cache
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
@@ -42,16 +44,20 @@ from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
+    AbortBroadcastReq,
+    AbortReq,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    TokenizedGenerateReqInput,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -587,6 +593,76 @@ class MultiHttpWorkerDetokenizerMixin:
             self.soft_watchdog.feed()
 
 
+class PendingAbortTable:
+    """Aborts the router forwarded for rids no worker held yet.
+
+    An abort can reach every worker before the owner registers the rid (the
+    request still sits ahead of generate_request in the owner's backlog), so
+    the broadcast finds no owner and the scheduler drops the forwarded abort.
+    The router records such a rid, rebroadcasts while it stays unclaimed, and
+    answers the rid's generate with a follow-up abort when it finally passes
+    (refire). Entries are one-shot; losing one falls back to today's behavior
+    (the abort is lost and the PD transfer timeout reclaims the KV).
+    """
+
+    # Cover the owner's registration lag: it registers on entering
+    # generate_request, well before its dispatch (which refire needs).
+    REBROADCAST_DELAYS = (1.0, 3.0, 8.0)
+    # Must outlive abort -> generate-passes-router; measured up to 26 s under
+    # an abort storm with congested workers. Expiry is a benefit loss, not a
+    # correctness problem.
+    TTL = 30.0
+
+    def __init__(self) -> None:
+        self._recorded_at: Dict[str, float] = {}
+        self.counters: Dict[str, int] = defaultdict(int)
+        # State of the periodic counters log (owned by the router's loop).
+        self.summary_armed = False
+        self.counters_logged: Dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._recorded_at)
+
+    def __contains__(self, rid: str) -> bool:
+        return rid in self._recorded_at
+
+    def record(self, rid: str) -> bool:
+        """Record a forwarded abort; True when the rid was not pending yet."""
+        new = rid not in self._recorded_at
+        self._recorded_at[rid] = time.monotonic()
+        self.counters["recorded" if new else "refreshed"] += 1
+        return new
+
+    def claim(self, rid: str) -> None:
+        """A worker holds the rid after all; its own abort supersedes this."""
+        if self._recorded_at.pop(rid, None) is not None:
+            self.counters["claimed"] += 1
+
+    def discard_on_output(self, rid: Optional[str]) -> None:
+        """Any output for the rid: the scheduler knows it, aborts are not lost."""
+        if rid is not None and self._recorded_at.pop(rid, None) is not None:
+            self.counters["output_cleared"] += 1
+
+    def pop_refire(self, rid: str) -> bool:
+        """One-shot take: the rid's generate is passing the router now."""
+        if self._recorded_at.pop(rid, None) is None:
+            return False
+        self.counters["refired"] += 1
+        return True
+
+    def expire_due(self, rid: str) -> Optional[float]:
+        """Pop the rid once its TTL elapsed; else return the remaining time."""
+        recorded_at = self._recorded_at.get(rid)
+        if recorded_at is None:
+            return None
+        remaining = recorded_at + self.TTL - time.monotonic()
+        if remaining > 0:
+            return remaining
+        del self._recorded_at[rid]
+        self.counters["expired"] += 1
+        return None
+
+
 class MultiTokenizerRouter:
     """A router between tokenizer managers and the scheduler/detokenizer manager.
 
@@ -645,6 +721,8 @@ class MultiTokenizerRouter:
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
+        # Aborts forwarded for rids no worker held yet; see PendingAbortTable.
+        self.pending_aborts = PendingAbortTable()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
@@ -672,34 +750,127 @@ class MultiTokenizerRouter:
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
             recv_obj = await async_sock_recv(self.receive_from_worker)
+            await self._route_worker_obj(recv_obj)
 
-            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
-                if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
-                    self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
-                    logger.info(
-                        f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
-                        f"(total: {len(self.all_worker_ipcs)})"
-                    )
-                continue
+    async def _route_worker_obj(self, recv_obj):
+        if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
+            if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
+                self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
+                logger.info(
+                    f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
+                    f"(total: {len(self.all_worker_ipcs)})"
+                )
+            return
 
-            if isinstance(
-                recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)
+        if isinstance(recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)):
+            # Broadcast to ALL workers so every worker's is_pause is set
+            is_pause = isinstance(recv_obj, PauseGenerationReqInput)
+            broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
+            for ipc_name in self.all_worker_ipcs:
+                self.socket_mapping.send_output(ipc_name, broadcast)
+            # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
+            # ranks internally). Skip for abort mode which drains via polling.
+            if not (
+                isinstance(recv_obj, PauseGenerationReqInput)
+                and recv_obj.mode == "abort"
             ):
-                # Broadcast to ALL workers so every worker's is_pause is set
-                is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
-                for ipc_name in self.all_worker_ipcs:
-                    self.socket_mapping.send_output(ipc_name, broadcast)
-                # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
-                # ranks internally). Skip for abort mode which drains via polling.
-                if not (
-                    isinstance(recv_obj, PauseGenerationReqInput)
-                    and recv_obj.mode == "abort"
-                ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
-                continue
+                await async_sock_send(self.send_to_scheduler, recv_obj)
+            return
 
+        if isinstance(recv_obj, AbortReq):
+            if recv_obj.forward:
+                # The sender does not hold this rid, and the scheduler drops an
+                # abort for a rid it has not received. Forward it anyway (the
+                # request may already be there), then broadcast so the owning
+                # worker aborts it locally while it is still preprocessing.
+                # Record before broadcasting: a claim racing straight back must
+                # find the entry.
+                self._record_pending_abort(recv_obj.rid)
+                await async_sock_send(self.send_to_scheduler, recv_obj)
+                self._broadcast_abort(recv_obj.rid)
+                return
+            if not recv_obj.abort_all:
+                # The sender holds the rid (its own abort, or the claim for a
+                # broadcast): its abort supersedes any pending entry.
+                self.pending_aborts.claim(recv_obj.rid)
             await async_sock_send(self.send_to_scheduler, recv_obj)
+            return
+
+        refire_rids = self._pending_refire_rids(recv_obj)
+        await async_sock_send(self.send_to_scheduler, recv_obj)
+        for rid in refire_rids:
+            # The generate of a rid aborted before any worker held it just went
+            # through. Same socket, so the scheduler sees the abort after the
+            # generate and removes it from its queues.
+            logger.info(f"Refiring a pending abort behind its late generate. {rid=}")
+            await async_sock_send(self.send_to_scheduler, AbortReq(rid=rid))
+
+    def _broadcast_abort(self, rid: str) -> None:
+        broadcast = AbortBroadcastReq(rid=rid)
+        for ipc_name in self.all_worker_ipcs:
+            self.socket_mapping.send_output(ipc_name, broadcast)
+
+    def _record_pending_abort(self, rid: str) -> None:
+        # Empty rids never match a generate; the scheduler also rejects them.
+        if not rid:
+            return
+        if not self.pending_aborts.record(rid):
+            return  # Already armed; its rebroadcast and expiry timers run.
+        loop = asyncio.get_running_loop()
+        for delay in self.pending_aborts.REBROADCAST_DELAYS:
+            loop.call_later(delay, self._rebroadcast_pending_abort, rid)
+        loop.call_later(self.pending_aborts.TTL, self._expire_pending_abort, rid)
+        self._arm_pending_abort_summary(loop)
+
+    # The counters' outlet: one periodic line instead of per-event logs, which
+    # an abort storm would turn into thousands per second.
+    PENDING_ABORT_SUMMARY_INTERVAL = 30.0
+
+    def _arm_pending_abort_summary(self, loop) -> None:
+        if self.pending_aborts.summary_armed:
+            return
+        self.pending_aborts.summary_armed = True
+        loop.call_later(
+            self.PENDING_ABORT_SUMMARY_INTERVAL, self._log_pending_abort_summary
+        )
+
+    def _log_pending_abort_summary(self) -> None:
+        self.pending_aborts.summary_armed = False
+        counters = dict(self.pending_aborts.counters)
+        if counters != self.pending_aborts.counters_logged:
+            self.pending_aborts.counters_logged = counters
+            logger.info(
+                f"Pending aborts: pending={len(self.pending_aborts)} {counters}"
+            )
+        # Entries can still expire; stay armed until the table drains. Any
+        # later record re-arms, so counters are never left unlogged.
+        if self.pending_aborts:
+            self._arm_pending_abort_summary(asyncio.get_running_loop())
+
+    def _rebroadcast_pending_abort(self, rid: str) -> None:
+        # A deleted entry's timer is a no-op (simpler than timer bookkeeping).
+        if rid in self.pending_aborts:
+            self.pending_aborts.counters["rebroadcast"] += 1
+            self._broadcast_abort(rid)
+
+    def _expire_pending_abort(self, rid: str) -> None:
+        # A refreshed entry still has time left; re-arm for the remainder.
+        remaining = self.pending_aborts.expire_due(rid)
+        if remaining is not None:
+            asyncio.get_running_loop().call_later(
+                remaining, self._expire_pending_abort, rid
+            )
+
+    def _pending_refire_rids(self, recv_obj) -> List[str]:
+        if not self.pending_aborts:
+            return []
+        if isinstance(recv_obj, TokenizedGenerateReqInput):
+            rids = [recv_obj.rid]
+        elif isinstance(recv_obj, BatchTokenizedGenerateReqInput):
+            rids = [tokenized.rid for tokenized in recv_obj.batch]
+        else:
+            return []
+        return [rid for rid in rids if rid and self.pending_aborts.pop_refire(rid)]
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
@@ -709,8 +880,13 @@ class MultiTokenizerRouter:
 
     async def _distribute_result_to_workers(self, recv_obj):
         if isinstance(recv_obj, BaseReq):
+            # Any output (a streamed chunk included) proves the scheduler knows
+            # the rid, so a forwarded abort for it is not lost.
+            self.pending_aborts.discard_on_output(recv_obj.rid)
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
+            for rid in recv_obj.rids or []:
+                self.pending_aborts.discard_on_output(rid)
             ipc_names = recv_obj.http_worker_ipcs
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")
@@ -854,12 +1030,15 @@ class TokenizerWorker(TokenizerManager):
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
 
-        # Register PauseContinueBroadcastReq in the result dispatcher so
-        # handle_loop routes it to _handle_pause_continue_broadcast
+        # Register the router's broadcasts in the result dispatcher so
+        # handle_loop routes them to their handlers.
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
+            [
+                (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (AbortBroadcastReq, self._handle_abort_broadcast),
+            ]
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -884,6 +1063,20 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
+
+    def _handle_abort_broadcast(self, obj: AbortBroadcastReq):
+        """Abort a broadcast rid this worker holds; an unknown rid is a no-op
+        (re-forwarding it here would loop the abort through the router)."""
+        state = self.rid_to_state.get(obj.rid)
+        if state is None:
+            return
+        logger.debug(f"Abort broadcast hit. {obj.rid=} {state.dispatched=}")
+        if state.abort_sent:
+            # abort_request deduplicates, but the router's pending entry still
+            # needs a visible claim to be cleared.
+            self._dispatch_to_scheduler(AbortReq(rid=obj.rid))
+            return
+        self.abort_request(rid=obj.rid)
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""

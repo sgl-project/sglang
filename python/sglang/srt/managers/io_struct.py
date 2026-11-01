@@ -2024,6 +2024,15 @@ class PauseContinueBroadcastReq(BaseReq, kw_only=True):
     is_pause: bool
 
 
+class AbortBroadcastReq(BaseReq, kw_only=True):
+    """Broadcast from router to all workers so the rid's owner aborts it locally.
+
+    A distinct type on purpose: on the worker result channel a plain AbortReq is
+    consumed by _handle_abort_req as the scheduler's abort echo, which would
+    finish the caller without the dispatched request ever being aborted.
+    """
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
@@ -2348,6 +2357,10 @@ class AbortReq(BaseReq, kw_only=True):
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
     prefill_weight_versions: Optional[WeightVersionSpans] = None
+    # Set by a tokenizer worker that does not hold this rid; the multi-tokenizer
+    # router broadcasts such an abort so the owning worker aborts it locally.
+    # The scheduler does not read it.
+    forward: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
