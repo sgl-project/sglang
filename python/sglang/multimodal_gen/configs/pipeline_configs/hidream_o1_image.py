@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
+from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
+    HiDreamO1ImageDitConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ImagePipelineConfig,
+    ModelTaskType,
+)
+
+# Key under which the before-denoising stage stashes the per-branch backbone
+# inputs, since HiDream-O1 conditions on token ids rather than text embeddings.
+HIDREAM_O1_COND_KEY = "hidream_o1_pos_cond"
+HIDREAM_O1_NEG_COND_KEY = "hidream_o1_neg_cond"
+# ServerArgs fields the pipeline's own loader does not read.
+_UNSUPPORTED_WEIGHT_OVERRIDES = (
+    "transformer_weights_path",
+    "quantization",
+    "quantization_ignored_layers",
+    "component_paths",
+    "component_weights_paths",
+    "component_quantizations",
+)
+
+
+@dataclass
+class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.T2I
+
+    dit_config: DiTConfig = field(default_factory=HiDreamO1ImageDitConfig)
+    dit_precision: str = "bf16"
+
+    # No VAE and no separate text encoder: the backbone embeds the prompt and
+    # the "latents" are raw 32x32 pixel patches.
+    vae_tiling: bool = False
+    vae_sp: bool = False
+
+    # The DiT takes no distilled-guidance embedding; classifier-free guidance is
+    # the only guidance mechanism.
+    should_use_guidance: bool = False
+
+    # Noise is drawn on the host so a seed reproduces the same image on any
+    # accelerator, matching the reference implementation.
+    generator_device: str = "cpu"
+
+    def validate_server_args(self, server_args: Any) -> None:
+        if server_args.sp_degree > 1:
+            raise ValueError(
+                "HiDream-O1-Image mixes causal text spans with a bidirectional "
+                "image span, which requires a dense [B, 1, S, S] attention mask "
+                "that cannot be sharded along the sequence. Run with "
+                "--ulysses-degree 1 --ring-degree 1 and use --tp-size or "
+                "--cfg-parallel-size for multi-GPU instead."
+            )
+        if server_args.enable_breakable_cuda_graph:
+            # The denoising stage's prompt_embeds are token ids, which the BCG
+            # text-bucket padder would treat as length-1 embeddings and pad the
+            # [B, 1, S, S] mask into a shape the transformer rejects.
+            raise ValueError(
+                "HiDream-O1-Image conditions on token ids rather than text "
+                "embeddings, which the breakable CUDA graph prompt padding does "
+                "not support yet. Drop --enable-breakable-cuda-graph."
+            )
+        # The pipeline builds the transformer straight from the base checkpoint
+        # with no quant config, so these would otherwise be silently ignored.
+        # --enable-svdquant is covered: it requires --transformer-weights-path.
+        unsupported_overrides = [
+            f"--{option.replace('_', '-')}"
+            for option in _UNSUPPORTED_WEIGHT_OVERRIDES
+            if getattr(server_args, option)
+        ]
+        if unsupported_overrides:
+            raise ValueError(
+                "HiDream-O1-Image loads only its released bfloat16 checkpoint and "
+                "does not support weight or quantization overrides yet. Drop "
+                f"{', '.join(unsupported_overrides)}."
+            )
+        super().validate_server_args(server_args)
+
+    def supports_dynamic_batching(self):
+        # The before-denoising stage builds one prompt's token sequence and
+        # mask per request, so a merged multi-prompt batch would fail as a whole.
+        return False
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        del device, rotary_emb, dtype
+        return batch.extra[HIDREAM_O1_COND_KEY]
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        del device, rotary_emb, dtype
+        return batch.extra[HIDREAM_O1_NEG_COND_KEY]
+
+    def post_denoising_loop(self, latents: torch.Tensor, batch) -> torch.Tensor:
+        # Patch tokens are never padded, so the base unpad would be a no-op that
+        # only risks truncating against a stale raw_latent_shape.
+        del batch
+        return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
+        HiDreamO1ImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=HiDreamO1ImageSamplingParams,
+        pipeline_config_cls=HiDreamO1ImagePipelineConfig,
+        hf_model_paths=["HiDream-ai/HiDream-O1-Image"],
+        model_detectors=[lambda hf_id: "hidream-o1-image" in hf_id.lower()],
+    )
