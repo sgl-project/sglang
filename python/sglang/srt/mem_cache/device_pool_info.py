@@ -64,40 +64,40 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
 
-class IndexKeyFormat(Enum):
-    # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
-    DSA_FP8 = "dsa_fp8"
+class IndexKeyLayout(Enum):
+    # Each buffer row is one page, [P x 128 fp8 keys][P x fp32 scales].
+    PAGED_FP8_KEYS_WITH_SCALES = "paged_fp8_keys_with_scales"
     # Each buffer row is one key, [num_keys, head_num, head_dim] in the buffer dtype.
     KEY_ROWS = "key_rows"
 
     def page_bytes(self, key_count: int) -> int:
-        # Each physical format owns its sizing, including scales and padding.
-        if self is IndexKeyFormat.DSA_FP8:
+        # Each layout owns its sizing, including scales and padding.
+        if self is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES:
             key_data_bytes = key_count * 128
             scale_bytes = key_count * 4
             return key_data_bytes + scale_bytes
-        raise ValueError(f"unsupported index key format {self}")
+        raise ValueError(f"unsupported index key layout {self}")
 
 
 class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     page_size: int
     buffers: tuple[torch.Tensor, ...]
     compress_ratio: int
-    key_format: IndexKeyFormat
+    key_layout: IndexKeyLayout
     # Replicated DCP stores multiple kernel pages in each allocation row.
     kernel_page_size: int | None = None
 
     @property
     def page_bytes(self) -> int:
-        if self.key_format is IndexKeyFormat.KEY_ROWS:
+        if self.key_layout is IndexKeyLayout.KEY_ROWS:
             return self.buffers[0][0].nbytes * (self.page_size // self.compress_ratio)
-        return self.key_format.page_bytes(self.page_size // self.compress_ratio)
+        return self.key_layout.page_bytes(self.page_size // self.compress_ratio)
 
     @property
     def kernel_page_bytes(self) -> int:
-        if self.key_format is IndexKeyFormat.KEY_ROWS:
+        if self.key_layout is IndexKeyLayout.KEY_ROWS:
             return self.page_bytes
-        return self.key_format.page_bytes(
+        return self.key_layout.page_bytes(
             self.page_size // self.compress_ratio
             if self.kernel_page_size is None
             else self.kernel_page_size
@@ -118,11 +118,11 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 f"page coverage {self.page_size} must be divisible by "
                 f"compression ratio {self.compress_ratio}"
             )
-        if not isinstance(self.key_format, IndexKeyFormat):
-            raise ValueError(f"unsupported index key format {self.key_format}")
+        if not isinstance(self.key_layout, IndexKeyLayout):
+            raise ValueError(f"unsupported index key layout {self.key_layout}")
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
-        if self.key_format is IndexKeyFormat.KEY_ROWS:
+        if self.key_layout is IndexKeyLayout.KEY_ROWS:
             if self.kernel_page_size is not None:
                 raise ValueError("key-row index keys use full-KV page coverage")
             key_rows = self.page_size // self.compress_ratio
@@ -162,7 +162,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
     def page_views(self) -> tuple[torch.Tensor, ...]:
-        if self.key_format is IndexKeyFormat.DSA_FP8:
+        if self.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES:
             return self.buffers
         return tuple(
             buffer.view(torch.uint8).reshape(-1, self.page_bytes)

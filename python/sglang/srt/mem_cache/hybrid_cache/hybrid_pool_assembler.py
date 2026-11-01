@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyFormat
+from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyLayout
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1147,13 +1147,13 @@ def _capture_qsa_index_buffers(
         buffer_info = info.buffer_info
         if (
             not isinstance(buffer_info, IndexKeyBufferInfo)
-            or buffer_info.key_format is not IndexKeyFormat.KEY_ROWS
+            or buffer_info.key_layout is not IndexKeyLayout.KEY_ROWS
         ):
             raise TypeError("QSA host requires key-row index buffers")
         buffer_info = IndexKeyBufferInfo(
             page_size=page_size,
             compress_ratio=buffer_info.compress_ratio,
-            key_format=buffer_info.key_format,
+            key_layout=buffer_info.key_layout,
             buffers=buffer_info.buffers,
         )
         buffer_info.validate(layer_ids=info.layer_ids)
@@ -1170,7 +1170,7 @@ def _capture_qsa_index_buffers(
     packed = IndexKeyBufferInfo(
         page_size=target.page_size,
         compress_ratio=target.compress_ratio,
-        key_format=target.key_format,
+        key_layout=target.key_layout,
         buffers=tuple(buffer for info in captured for buffer in info.buffers),
     )
     packed.validate()

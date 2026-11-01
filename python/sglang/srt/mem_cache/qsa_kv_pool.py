@@ -18,7 +18,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
     IndexKeyBufferInfo,
-    IndexKeyFormat,
+    IndexKeyLayout,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
@@ -64,7 +64,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 buffer_info=IndexKeyBufferInfo(
                     page_size=self.page_size,
                     compress_ratio=self.qsa_compress_ratio,
-                    key_format=IndexKeyFormat.KEY_ROWS,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
                     buffers=tuple(self.qsa_compressed_k_buffer_pool),
                 ),
             ),
