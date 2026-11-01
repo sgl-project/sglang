@@ -11,25 +11,32 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
+from array import array
 from types import MethodType, SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
 import torch
-
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
     InsertParams,
+    MatchPrefixParams,
     TreeLock,
 )
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
-from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
+from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -360,6 +367,87 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         self.assertEqual(
             cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
         )
+
+
+class TestMambaDonationCheckpointIntegration(CustomTestCase):
+    """Exercise the scheduler's checkpoint entry point with real cache pools."""
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+        mamba_cache_size=8,
+    )
+
+    @staticmethod
+    def _req(rid: str, tokens: list[int]) -> Req:
+        return Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+
+    def test_locked_pool_skips_checkpoint_then_recovers(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+
+        prefix = list(range(100, 108))
+        seed = self._req("seed", [])
+        acquire_rows(pool, pool.state, [seed])
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=allocator.alloc(len(prefix)),
+                mamba_value=seed.kv.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        prefix_node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+        prefix_lock = cache.lock(prefix_node)
+
+        tokens = list(range(1, 9))
+        req = self._req("running", tokens)
+        acquire_rows(pool, pool.state, [req])
+        req.output_ids = array("q")
+        req.refresh_fill_ids()
+        req.kv.kv_committed_len = len(tokens)
+        req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))),
+            allocator.alloc(len(tokens)),
+        )
+        req.last_node = cache.root_node_handle()
+        req.lock = None
+        req.extend_end = len(tokens)
+
+        held = []
+        while (slot := pool.mamba_allocator.alloc(1)) is not None:
+            held.append(slot)
+        ping_pong = req.kv.mamba_ping_pong_track_buffer.clone()
+
+        checkpoint_kv_cache(req, cache)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(match.device_prefix_len, 0)
+        self.assertEqual(req.prefix_len, len(tokens))
+        self.assertTrue(torch.equal(req.kv.mamba_ping_pong_track_buffer, ping_pong))
+        self.assertIsNone(pool.mamba_allocator.alloc(1))
+        cache.sanity_check()
+
+        pool.mamba_allocator.free(held.pop())
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        cache.checkpoint(req, up_to=len(tokens))
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(match.device_prefix_len, len(tokens))
+        cache.unlock(req.lock)
+        cache.unlock(prefix_lock)
+        cache.sanity_check()
 
 
 class TestPPMambaPoolSizing(CustomTestCase):
