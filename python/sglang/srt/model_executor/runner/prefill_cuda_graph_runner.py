@@ -307,6 +307,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # Preserve the default for runner fixtures that bypass __init__.
+    # Normal initialization assigns the architecture-specific eligibility below.
+    _eager_mm_prefill = False
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None

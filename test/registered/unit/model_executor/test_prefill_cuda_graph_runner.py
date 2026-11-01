@@ -700,6 +700,25 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                         ),
                         expected,
                     )
+                    if backend == Backend.BREAKABLE and mm_inputs is not None:
+                        # Unsupported architectures must reject image/audio/video
+                        # in both forward dispatch and the schedule-time DP vote.
+                        runner._eager_mm_prefill = True
+                        try:
+                            self.assertFalse(runner.can_run_graph(batch))
+                            self.assertFalse(
+                                _local_prefill_cuda_graph_vote(
+                                    local_batch=schedule_batch,
+                                    num_tokens=4,
+                                    prefill_graph_runner=runner,
+                                    coordinated_prefill=True,
+                                    breakable_prefill=True,
+                                    spec_algorithm=None,
+                                    model_config=None,
+                                )
+                            )
+                        finally:
+                            del runner._eager_mm_prefill
 
     def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
