@@ -27,7 +27,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_padding_size,
+    get_moe_runner_backend,
+    route_dropped_experts_to_local,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -1255,6 +1259,9 @@ def fused_moe(
     """
     if _is_xpu and not get_moe_runner_backend().is_triton():
         topk_weight, topk_ids, _ = topk_output
+        topk_weight, topk_ids = route_dropped_experts_to_local(
+            topk_weights=topk_weight, topk_ids=topk_ids
+        )
         from sgl_kernel import fused_experts as sgl_fused_experts
 
         return sgl_fused_experts(

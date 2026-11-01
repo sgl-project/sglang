@@ -25,7 +25,10 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
+from sglang.srt.layers.moe.utils import (
+    route_dropped_experts_to_local,
+    xpu_moe_ld_padding_elems,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -1472,6 +1475,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if moe_runner_config.apply_router_weight_on_input:
                 x = x * topk_weights.to(x.dtype)
                 topk_weights = torch.ones_like(topk_weights)
+            # after the reset to 1, so dropped slots still end at weight 0
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             output = fused_experts(
                 x,
                 layer.w13_weight,
