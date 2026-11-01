@@ -1687,15 +1687,16 @@ def build_unified_host_stack(
         device_translate=storage.host_ids(owner),
     )
     component_host_pools = {owner_component: host_pools[owner]}
+    draft_window_entry = False
     for s in sub_pools:
         if s.name == owner:
             continue
         view = storage.view(s.name)
         component = slot_ids[s.external.tree_component]
-        if s.external.host_pool not in PoolName._value2member_map_:
+        if not s.holds_state and s.external.host_pool in PoolName._value2member_map_:
             raise ValueError(
-                f"host pools keep at most two window sub-pools; sub-pool "
-                f"{s.name!r} has no host pool"
+                f"window sub-pool {s.name!r} would share a host pool name with a "
+                "well-known host pool"
             )
         drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
         if s.name not in host_pools:
@@ -1704,7 +1705,7 @@ def build_unified_host_stack(
         alloc = storage.host_load_alloc(s.name)
         entries.append(
             build_pool_entry(
-                name=PoolName(s.external.host_pool),
+                name=s.external.host_pool,
                 host_pool=host_pools[s.name],
                 device_pool=view,
                 layer_mapping=with_packed_draft_layer_mapping(
@@ -1728,7 +1729,10 @@ def build_unified_host_stack(
                 device_translate=storage.host_ids(s.name),
             )
         )
-        if owner_id_drafts and not s.holds_state:
+        if owner_id_drafts and not s.holds_state and not draft_window_entry:
+            # One sidecar for every draft window that addresses the owner's
+            # ids, whichever of the target's windows it reads beside.
+            draft_window_entry = True
             entries.append(
                 _draft_swa_entry(
                     drafts=owner_id_drafts,
@@ -1772,7 +1776,7 @@ def build_unified_host_stack(
         ]
         + _mtp_swa_sidecar_specs(host_pool_group),
         loads_state_layer_wise=any(s.holds_state for s in sub_pools),
-        pools_desc=" + ".join(e.name.value.upper() for e in entries),
+        pools_desc=" + ".join(str(e.name).upper() for e in entries),
         pool_declarations=tuple(c.decl for c in owner_config.pools),
     )
 
@@ -2054,7 +2058,7 @@ def validate_fused_hicache_draft(
     for sub_pool in storage.plan.sub_pools:
         if sub_pool.spec.draft_region is None:
             continue
-        entry = entries[PoolName(sub_pool.external.host_pool)]
+        entry = entries[sub_pool.external.host_pool]
         if not isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool):
             raise ValueError(
                 f"host pool {sub_pool.name!r} must preserve the complete declared entry"

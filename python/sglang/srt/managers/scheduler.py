@@ -5678,7 +5678,6 @@ class Scheduler(
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         tree_cache = self.tree_cache
@@ -5696,13 +5695,18 @@ class Scheduler(
             )
 
         sidecar_pool_specs = ()
-        swa = None
+        window_trailing_pages = {}
         if isinstance(tree_cache, UnifiedRadixCache):
             sidecar_pool_specs = tree_cache.sidecar_pool_specs
-            swa = tree_cache.components.get(ComponentType.SWA)
+            window_trailing_pages = {
+                str(window.pool_name): window.full_window_pages
+                for window in (
+                    tree_cache.components[ct] for ct in tree_cache.window_slots()
+                )
+            }
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
-            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,
         )
 

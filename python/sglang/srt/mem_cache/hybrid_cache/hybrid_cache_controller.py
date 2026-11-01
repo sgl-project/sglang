@@ -960,11 +960,11 @@ class HybridCacheController(BaseHiCacheController):
         """Per-pool token counts for a merged transfer op (anchor + extra
         pools), shared by D->H write and H->D load acks; sidecar transfers
         reusing another pool's indices are excluded."""
-        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
+        counts = {str(self.mem_pool_host.anchor_entry.name): len(op.device_indices)}
         for transfer in op.pool_transfers or []:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
                 continue
-            name = transfer.name.value
+            name = str(transfer.name)
             counts[name] = counts.get(name, 0) + len(transfer.host_indices)
         return counts
 
@@ -1726,8 +1726,6 @@ class HybridCacheController(BaseHiCacheController):
             if sidecar_ok:
                 for transfer in backup_transfers:
                     result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
                     expected = len(transfer.keys or [])
                     if expected == 0 and transfer.host_indices is not None:
                         expected = int(transfer.host_indices.numel())
@@ -1929,10 +1927,16 @@ class HybridCacheController(BaseHiCacheController):
 
         # Handle other sidecar pools, e.g. SWA, Mamba.
         if ack.pool_hits is not None:
-            # "for ... in PoolName" ensures the same order across all ranks.
-            # On prefetch failure, pool_hits may be empty dict.
+            # Every rank registers the same host pools, so the sorted names
+            # are one order across ranks; window pools go by their sub-pool's
+            # name, outside `PoolName`. On prefetch failure, pool_hits may be
+            # an empty dict.
+            names = sorted(
+                {str(pool) for pool in PoolName}
+                | {str(name) for name in self.mem_pool_host.entry_map}
+            )
             packed = torch.tensor(
-                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                [ack.pool_hits.get(name, 0) for name in names],
                 dtype=torch.int,
             )
             self._all_reduce(
@@ -1940,8 +1944,8 @@ class HybridCacheController(BaseHiCacheController):
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
             )
-            for i, pool in enumerate(PoolName):
-                ack.pool_hits[pool.value] = packed[i].item()
+            for i, name in enumerate(names):
+                ack.pool_hits[name] = packed[i].item()
 
     def prefetch_sync_thread_func(self) -> None:
         """Synchronize progressive ACKs and publish PP ticket completion."""

@@ -432,6 +432,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.tree_cache = tree_cache
         self.host_pool = None
         self.host_reserved_tokens = 0
+        self.host_window_entries = []
         self.gloo_group = parallel.attn_tp_group.cpu_group
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
@@ -725,13 +726,39 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
-            if (kv_args.state_types and kv_args.state_types != [StateType.SWA]) or any(
-                spec.indices_from_pool not in (PoolName.KV, PoolName.SWA)
+            # Each window state entry lands in its window's host pool, named by
+            # the entry's sub-pool.
+            entry_sub_pools = list(
+                getattr(kv_args, "state_sub_pools", None)
+                or [None] * len(kv_args.state_types or [])
+            )
+            if kv_args.state_types and (
+                storage is None
+                or any(
+                    state_type != StateType.SWA for state_type in kv_args.state_types
+                )
+            ):
+                raise ValueError("Host receive supports full KV and paged window pools")
+            # A unified pool's window entry names its sub-pool, whose host pool
+            # goes by the same name; a static pool's one window entry names
+            # none and lands in the window host pool.
+            window_sub_pools = [
+                storage.wire_entries()[i].sub_pool if sub_pool is None else sub_pool
+                for i, sub_pool in enumerate(entry_sub_pools)
+            ]
+            window_host_pools = [
+                (
+                    PoolName.SWA
+                    if sub_pool is None
+                    else storage.plan.sub_pool(sub_pool).external.host_pool
+                )
+                for sub_pool in entry_sub_pools
+            ]
+            if any(
+                spec.indices_from_pool not in (PoolName.KV, *window_host_pools)
                 for spec in self.tree_cache.sidecar_pool_specs
             ):
-                raise ValueError(
-                    "Host receive supports full KV and separate paged SWA pools"
-                )
+                raise ValueError("Host receive supports full KV and paged window pools")
             self.host_pool = group.get_pool(PoolName.KV)
             self.host_reserved_tokens = decode_retraction_max_tokens(
                 self.req_to_token_pool, pool
@@ -765,44 +792,48 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_args.host_kv_data_lens,
                 kv_args.host_kv_item_lens,
             ) = host_buffers
-            self.host_swa_pool = None
-            self.host_swa_reserved_tokens = 0
-            if kv_args.state_types:
-                self.host_swa_pool = group.get_pool(PoolName.SWA)
-                self.host_swa_reserved_tokens = min(
+            # (host pool name, host pool, tokens reserved for a retraction),
+            # one per window state entry, in state entry order.
+            self.host_window_entries = []
+            host_state = ([], [], [])
+            for i, (sub_pool, name) in enumerate(
+                zip(window_sub_pools, window_host_pools)
+            ):
+                host_pool = group.get_pool(name)
+                reserved = min(
                     decode_retraction_max_tokens(
-                        self.req_to_token_pool,
-                        # The one state entry here is the window's.
-                        storage.view(storage.wire_entries()[0].sub_pool),
+                        self.req_to_token_pool, storage.view(sub_pool)
                     ),
                     ceil_align(
                         self.scheduler.sliding_window_size + pool.page_size - 1,
                         pool.page_size,
                     ),
                 )
-                if self.host_swa_pool.logical_size < (
-                    self.host_swa_reserved_tokens + pool.page_size
-                ):
+                if host_pool.logical_size < reserved + pool.page_size:
                     raise ValueError(
-                        "SWA host pool must hold a retraction and a receive page; "
-                        "increase --hicache-size or --hicache-ratio"
+                        f"Window host pool {name!r} must hold a retraction and a "
+                        "receive page; increase --hicache-size or --hicache-ratio"
                     )
-                device_state, host_state = group.get_contiguous_buf_infos(
-                    pool_names(PoolName.SWA)
+                device_state, entry_host_state = group.get_contiguous_buf_infos(
+                    pool_names(name)
                 )
                 if device_state != (
-                    kv_args.state_data_ptrs[0],
-                    kv_args.state_data_lens[0],
-                    kv_args.state_item_lens[0],
+                    kv_args.state_data_ptrs[i],
+                    kv_args.state_data_lens[i],
+                    kv_args.state_item_lens[i],
                 ):
                     raise ValueError(
-                        "Host receive buffers must match the SWA transfer layout"
+                        f"Host receive buffers must match the {name!r} transfer layout"
                     )
+                for values, entry_values in zip(host_state, entry_host_state):
+                    values.append(entry_values)
+                self.host_window_entries.append((name, host_pool, reserved))
+            if self.host_window_entries:
                 (
                     kv_args.host_state_data_ptrs,
                     kv_args.host_state_data_lens,
                     kv_args.host_state_item_lens,
-                ) = ([values] for values in host_state)
+                ) = host_state
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
@@ -1965,35 +1996,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache.evict_host(required_tokens)
         if self.host_pool.available_size() < required_tokens:
             return False
-        swa_num_tokens = 0
-        if self.host_swa_pool is not None:
+        window_entries = self.host_window_entries
+        window_num_tokens = 0
+        if window_entries:
             window_start = page_align_floor(
                 max(0, seq_len - self.scheduler.sliding_window_size), page_size
             )
-            swa_num_tokens = num_tokens - window_start
-            required_swa_tokens = swa_num_tokens + self.host_swa_reserved_tokens
-            if self.host_swa_pool.available_size() < required_swa_tokens:
-                entry = self.tree_cache.host_pool_group.get_entry(PoolName.SWA)
-                if entry.host_evict_fn is not None:
-                    entry.host_evict_fn(required_swa_tokens)
-            if self.host_swa_pool.available_size() < required_swa_tokens:
-                return False
+            window_num_tokens = num_tokens - window_start
+            for name, host_pool, reserved in window_entries:
+                required = window_num_tokens + reserved
+                if host_pool.available_size() < required:
+                    entry = self.tree_cache.host_pool_group.get_entry(name)
+                    if entry.host_evict_fn is not None:
+                        entry.host_evict_fn(required)
+                if host_pool.available_size() < required:
+                    return False
         host_indices = self.host_pool.alloc(num_tokens)
         if host_indices is None:
             return False
         indices_by_pool = {PoolName.KV: host_indices}
         transfers = []
         state_indices = None
-        if self.host_swa_pool is not None:
-            swa_host_indices = self.host_swa_pool.alloc(swa_num_tokens)
-            if swa_host_indices is None:
+        for name, host_pool, _ in window_entries:
+            window_host_indices = host_pool.alloc(window_num_tokens)
+            if window_host_indices is None:
                 self.host_pool.free(host_indices)
+                for transfer in transfers:
+                    self.tree_cache.host_pool_group.free(
+                        transfer.host_indices, pool=transfer.name
+                    )
                 return False
-            indices_by_pool[PoolName.SWA] = swa_host_indices
-            transfers.append(
-                PoolTransfer(name=PoolName.SWA, host_indices=swa_host_indices)
-            )
-            state_indices = [kv_to_page_indices(swa_host_indices, page_size)]
+            indices_by_pool[name] = window_host_indices
+            transfers.append(PoolTransfer(name=name, host_indices=window_host_indices))
+        if window_entries:
+            state_indices = [
+                kv_to_page_indices(transfer.host_indices, page_size)
+                for transfer in transfers
+            ]
         assert decode_req.req.kv.retraction_backup is None
         decode_req.req.kv.retraction_backup = RetractionBackup(
             host_indices=host_indices,

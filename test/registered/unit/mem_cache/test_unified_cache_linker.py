@@ -1415,7 +1415,7 @@ def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
     linker = _FakeLinker()
     if swa_stored:
         linker.pools[PoolName.SWA] = object()
-    swa = object()
+    swa = SimpleNamespace(pool_name=PoolName.SWA)
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),

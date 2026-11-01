@@ -9,7 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set, Union
 
 import torch
 
@@ -109,7 +109,6 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     SWA = "swa"
-    AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
@@ -142,6 +141,13 @@ class PoolName(str, Enum):
         return self.value
 
 
+# A host pool's name: a well-known `PoolName`, or, for a window sub-pool of a
+# unified pool, the sub-pool's own name (one host pool per window, so their
+# number is the model's). `PoolName` members are strings, so both compare,
+# hash and print alike; read a name with `str()`, never `.value`.
+HostPoolName = Union[PoolName, str]
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -167,13 +173,13 @@ class PoolTransfer:
     nodes_to_load      : evicted nodes this transfer covers
     """
 
-    name: PoolName
+    name: HostPoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
-    indices_from_pool: Optional[PoolName] = None
+    indices_from_pool: Optional[HostPoolName] = None
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0

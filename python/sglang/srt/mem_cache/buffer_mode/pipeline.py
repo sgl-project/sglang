@@ -616,7 +616,7 @@ class BufferModePipeline:
     @staticmethod
     def _pool_order(pool: PoolName) -> tuple[bool, str]:
         # KV first, then a fixed order: every rank must admit identically.
-        return (pool != PoolName.KV, pool.value)
+        return (pool != PoolName.KV, str(pool))
 
     def _write_intents(
         self, snapshot: BufferBackupSnapshot

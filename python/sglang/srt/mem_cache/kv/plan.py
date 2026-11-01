@@ -71,10 +71,7 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
     ),
 }
 
-# A window's prefix tree component is named by its sub-pool. Host pools name
-# window entries by window slot, the plan's windows in `windows` order, and have
-# two window entries so far: a third window has none.
-_WINDOW_SLOT_HOST_POOLS = ("swa", "auxiliary_swa")
+# A window's prefix tree component and host pool are named by its sub-pool.
 
 # The PD state type every window travels as: its trailing pages. A peer tells
 # one window's entry from another's by the entry's sub-pool.
@@ -86,13 +83,9 @@ def window_tree_component(name: str) -> str:
     return name.upper()
 
 
-def _window_external(slot: int, name: str) -> SubPoolExternal:
+def _window_external(name: str) -> SubPoolExternal:
     return SubPoolExternal(
-        host_pool=(
-            _WINDOW_SLOT_HOST_POOLS[slot]
-            if slot < len(_WINDOW_SLOT_HOST_POOLS)
-            else name
-        ),
+        host_pool=name,
         tree_component=window_tree_component(name),
         metrics="swa",
         wire=WINDOW_WIRE,
@@ -471,7 +464,6 @@ def plan_kv_storage(
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
     names_by_key = {key: _sub_pool_name(key[0]) for key in groups}
-    target_window_keys = [key for key in groups if isinstance(key[0], WindowLifetime)]
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():
             region = fused_draft.region(name)
@@ -510,21 +502,6 @@ def plan_kv_storage(
             names_by_key[key] = name
     chain = sorted(groups, key=lambda key: (*_chain_key(key), names_by_key[key]))
 
-    def drive_key(key):
-        return (tuple(-r for r in key[0].retention()), key[1], names_by_key[key])
-
-    # Slot 0 is the longest window the target's layers declare (else the
-    # longest window): the window single-window readers size and retain by.
-    windows = sorted(
-        (key for key in groups if isinstance(key[0], WindowLifetime)), key=drive_key
-    )
-    primary = min(target_window_keys or windows, key=drive_key, default=None)
-    window_slots = {
-        key: slot
-        for slot, key in enumerate(
-            [primary] * (primary is not None) + [k for k in windows if k != primary]
-        )
-    }
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
@@ -546,8 +523,8 @@ def plan_kv_storage(
                     fused_draft=fused_draft,
                 ),
                 external=(
-                    _window_external(window_slots[key], name)
-                    if key in window_slots
+                    _window_external(name)
+                    if isinstance(lifetime, WindowLifetime)
                     else _EXTERNAL[type(lifetime)]
                 ),
             )

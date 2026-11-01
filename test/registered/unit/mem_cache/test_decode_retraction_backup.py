@@ -436,7 +436,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         queue, _ = self._receive_queue(env)
         group = env.cache.host_pool_group
         full_host = group.get_pool(PoolName.KV)
-        swa_host = group.get_pool(PoolName.SWA)
+        # The window's state entry lands in its own host pool.
+        ((window_pool, swa_host, window_reserved),) = queue.host_window_entries
+        self.assertIs(group.get_pool(window_pool), swa_host)
         capacities = (full_host.available_size(), swa_host.available_size())
         req = Req(
             rid="swa-host-receive",
@@ -447,9 +449,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
         receiver = Mock()
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-        blocker = swa_host.alloc(
-            swa_host.available_size() - queue.host_swa_reserved_tokens
-        )
+        blocker = swa_host.alloc(swa_host.available_size() - window_reserved)
         self.assertFalse(queue._pre_alloc_host(decode_req))
         self.assertEqual(full_host.available_size(), capacities[0])
         receiver.send_metadata.assert_not_called()
@@ -470,7 +470,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         expected = []
         for pool_name, host_indices, num_tokens in (
             (PoolName.KV, backup.host_indices, 23),
-            (PoolName.SWA, backup.pool_transfers[0].host_indices, 11),
+            (window_pool, backup.pool_transfers[0].host_indices, 11),
         ):
             entry = group.get_entry(pool_name)
             pool = entry.device_pool

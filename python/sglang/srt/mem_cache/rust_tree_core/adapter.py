@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 from array import array
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
 import torch
 
@@ -236,11 +236,14 @@ def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
     )
 
 
-def _transfer_to_binding(transfer: PoolTransfer) -> tuple:
+def _transfer_to_binding(
+    transfer: PoolTransfer, names: Mapping[str, str] = {}
+) -> tuple:
     """The binding's (name, host_indices, device_indices, nodes_to_load, keys,
-    hit_policy) tuple."""
+    hit_policy) tuple; ``names`` renames host pools to the core's names."""
+    name = str(transfer.name)
     return (
-        transfer.name.value,
+        names.get(name, name),
         transfer.host_indices,
         transfer.device_indices,
         transfer.nodes_to_load,
@@ -249,11 +252,14 @@ def _transfer_to_binding(transfer: PoolTransfer) -> tuple:
     )
 
 
-def _transfer_from_binding(transfer: tuple) -> PoolTransfer:
-    """Build the Python PoolTransfer for one of the binding's transfer tuples."""
+def _transfer_from_binding(
+    transfer: tuple, names: Mapping[str, str] = {}
+) -> PoolTransfer:
+    """Build the Python PoolTransfer for one of the binding's transfer tuples;
+    ``names`` renames the core's host pools to the cache's."""
     name, host_indices, device_indices, nodes_to_load, keys, hit_policy = transfer
     return PoolTransfer(
-        name=PoolName(name),
+        name=names.get(name) or PoolName(name),
         host_indices=host_indices,
         device_indices=device_indices,
         keys=keys,
@@ -264,20 +270,21 @@ def _transfer_from_binding(transfer: tuple) -> PoolTransfer:
 
 def _comp_xfers_to_binding(
     comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    names: Mapping[str, str] = {},
 ) -> dict[int, list[tuple]]:
     """Rekey per-component transfers by the binding's component values."""
     return {
-        int(ct): [_transfer_to_binding(x) for x in xfers]
+        int(ct): [_transfer_to_binding(x, names) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
 
 def _comp_xfers_from_binding(
-    comp_xfers: dict[int, list[tuple]],
+    comp_xfers: dict[int, list[tuple]], names: Mapping[str, str] = {}
 ) -> dict[ComponentType, list[PoolTransfer]]:
     """Rekey the binding's per-component transfer tuples by ComponentType."""
     return {
-        ComponentType(ct): [_transfer_from_binding(x) for x in xfers]
+        ComponentType(ct): [_transfer_from_binding(x, names) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
@@ -443,6 +450,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
         numbers = {slot.family: slot for slot in params.tree_slots}
         window = numbers[TREE_WINDOW].window if TREE_WINDOW in families else None
+        # The core names its window host pool `swa`; the cache's may go by the
+        # window sub-pool's name.
+        window_pool = (
+            numbers[TREE_WINDOW].host_pool if TREE_WINDOW in families else None
+        )
+        self._pool_names_to_core: dict[str, str] = (
+            {window_pool: str(PoolName.SWA)}
+            if window_pool is not None and window_pool != PoolName.SWA
+            else {}
+        )
+        self._pool_names_from_core = {
+            core: name for name, core in self._pool_names_to_core.items()
+        }
         if TREE_WINDOW in families and (window is None or window <= 0):
             raise ValueError("the SWA tree component requires a positive window")
 
@@ -988,7 +1008,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._pool_names_from_core)
         self._refresh_swa_backup_indices(comp_xfers.get(self.slot_id(TREE_WINDOW), ()))
         return device_value, comp_xfers
 
@@ -998,7 +1018,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         if self._swa_backup_index_mapper is None:
             return
         for transfer in transfers:
-            if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
+            if (
+                self._pool_names_to_core.get(str(transfer.name), transfer.name)
+                != PoolName.SWA
+                or not transfer.nodes_to_load
+            ):
                 continue
             # Compaction can relocate SWA rows after the tree records them.
             # FULL virtual IDs retain their meaning across that relocation.
@@ -1024,7 +1048,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             token_ids=token_ids,
             hash_value=spec.hash_value,
             prefix_keys=spec.prefix_keys,
-            comp_xfers=_comp_xfers_from_binding(spec.comp_xfers),
+            comp_xfers=_comp_xfers_from_binding(
+                spec.comp_xfers, self._pool_names_from_core
+            ),
         )
 
     def build_hicache_transfers(
@@ -1052,7 +1078,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         if transfers is None:
             return None
-        transfers = [_transfer_from_binding(transfer) for transfer in transfers]
+        transfers = [
+            _transfer_from_binding(transfer, self._pool_names_from_core)
+            for transfer in transfers
+        ]
         if phase == CacheTransferPhase.BACKUP_HOST:
             self._refresh_swa_backup_indices(transfers)
         return transfers
@@ -1065,8 +1094,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )
-        kv_xfer = _transfer_from_binding(kv_xfer)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        kv_xfer = _transfer_from_binding(kv_xfer, self._pool_names_from_core)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._pool_names_from_core)
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -1152,7 +1181,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         actions, mamba_exist = self._binding.commit_hicache_transfers(
             node_id,
             phase.value,
-            _comp_xfers_to_binding(comp_xfers),
+            _comp_xfers_to_binding(comp_xfers, self._pool_names_to_core),
             (
                 None
                 if insert_result is None
@@ -1167,7 +1196,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 if pool_storage_result is None
                 else (
                     pool_storage_result.kv_hit_pages,
-                    dict(pool_storage_result.extra_pool_hit_pages),
+                    {
+                        self._pool_names_to_core.get(str(name), str(name)): pages
+                        for name, pages in pool_storage_result.extra_pool_hit_pages.items()
+                    },
                 )
             ),
         )
@@ -1182,7 +1214,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> None:
         self._binding.commit_backup(
-            node_id, host_indices, _comp_xfers_to_binding(comp_xfers)
+            node_id,
+            host_indices,
+            _comp_xfers_to_binding(comp_xfers, self._pool_names_to_core),
         )
 
     def commit_load_back(
@@ -1195,8 +1229,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         actions = self._binding.commit_load_back(
             node_id,
             device_indices,
-            _transfer_to_binding(kv_xfer),
-            _comp_xfers_to_binding(comp_xfers),
+            _transfer_to_binding(kv_xfer, self._pool_names_to_core),
+            _comp_xfers_to_binding(comp_xfers, self._pool_names_to_core),
         )
         return self._cache_actions_from_tagged(actions)
 
@@ -1222,7 +1256,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         transfers = self._binding.build_external_linker_offload_transfers(node_id)
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        return [
+            _transfer_from_binding(transfer, self._pool_names_from_core)
+            for transfer in transfers
+        ]
 
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId
