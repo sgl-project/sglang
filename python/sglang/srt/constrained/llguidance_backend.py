@@ -141,6 +141,7 @@ class GuidanceGrammar(BaseGrammarObject):
     def accept_token(self, token: int):
         if self.finished:
             return
+        self.current_token = token
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
             return
