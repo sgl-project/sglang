@@ -177,19 +177,22 @@ def wrap_moe_reduction(orig_reduction) -> Optional[Callable]:
 
 
 @functools.cache
-def apply_aiter_moe_addend_patch() -> None:
-    """Let aiter's stage2 top-k reduction consume a pending addend."""
+def apply_aiter_moe_addend_patch() -> bool:
+    """Let aiter's stage2 top-k reduction consume a pending addend.
+
+    True once aiter is patched; False where it keeps its own reduction."""
     if not is_gfx95_supported():
-        return
+        return False
     try:
         import aiter.ops.flydsl.moe_kernels as moe_kernels
 
         orig_reduction = moe_kernels._run_moe_reduction
     except (ImportError, AttributeError) as exc:
         logger.info("aiter MoE addend patch not applied: %s", exc)
-        return
+        return False
     reduction_wrapper = wrap_moe_reduction(orig_reduction)
     if reduction_wrapper is None:
-        return
+        return False
     moe_kernels._run_moe_reduction = reduction_wrapper
     logger.info("aiter MoE addend patch applied")
+    return True
