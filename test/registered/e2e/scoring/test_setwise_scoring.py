@@ -64,11 +64,15 @@ class TestSetwiseScoringHFParity(CustomTestCase):
             dtype=_DTYPE,
             mem_fraction_static=0.15,
         )
+        cls.hf_reference_model = AutoModelForSequenceClassification.from_pretrained(
+            _SEQCLS_MODEL, torch_dtype=torch.float32
+        ).eval()
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
+        cls.hf_reference_model = None
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -86,9 +90,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            _SEQCLS_MODEL, torch_dtype=torch.float32
-        ).eval()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
@@ -102,7 +104,6 @@ class TestSetwiseScoringHFParity(CustomTestCase):
             return ref.tolist(), anchor_positions
         finally:
             model.cpu()
-            del model
             torch.cuda.empty_cache()
 
     def _hf_anchor_hidden_states(self, prompt: str):
@@ -114,9 +115,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            _SEQCLS_MODEL, torch_dtype=torch.float32
-        ).eval()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
@@ -125,7 +124,6 @@ class TestSetwiseScoringHFParity(CustomTestCase):
             return last_hidden[anchor_positions].tolist(), anchor_positions
         finally:
             model.cpu()
-            del model
             torch.cuda.empty_cache()
 
     def _assert_close(self, ref, sgl, atol=_ATOL, rtol=_RTOL):
@@ -332,11 +330,15 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
             dtype=_DTYPE,
             mem_fraction_static=0.15,
         )
+        cls.hf_reference_model = AutoModelForCausalLM.from_pretrained(
+            _CAUSAL_MODEL, torch_dtype=torch.float32
+        ).eval()
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
+        cls.hf_reference_model = None
         torch.cuda.empty_cache()
 
     def _build_prompt(self, n_anchors: int) -> str:
@@ -351,9 +353,7 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            _CAUSAL_MODEL, torch_dtype=torch.float32
-        ).eval()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
@@ -366,7 +366,6 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
             return ref, anchor_positions
         finally:
             model.cpu()
-            del model
             torch.cuda.empty_cache()
 
     def _assert_close(self, ref, sgl, atol=_ATOL, rtol=_RTOL):
