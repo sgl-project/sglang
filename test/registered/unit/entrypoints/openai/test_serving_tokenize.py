@@ -10,8 +10,15 @@ from unittest.mock import Mock
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
-from sglang.srt.entrypoints.openai.protocol import TokenizeRequest, TokenizeResponse
-from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
+from sglang.srt.entrypoints.openai.protocol import (
+    DetokenizeRequest,
+    TokenizeRequest,
+    TokenizeResponse,
+)
+from sglang.srt.entrypoints.openai.serving_tokenize import (
+    OpenAIServingDetokenize,
+    OpenAIServingTokenize,
+)
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -121,6 +128,26 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("continue_final_message", message)
+
+
+class TestDetokenize(CustomTestCase):
+    def test_out_of_vocab_ids_are_rejected(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = Mock(tokenizer=_tokenizer(), model_config=Mock(vocab_size=len(WORDS)))
+        serving = OpenAIServingDetokenize(tm)
+
+        def detokenize(tokens):
+            request = DetokenizeRequest(tokens=tokens)
+            return asyncio.run(
+                serving._handle_non_streaming_request(request, request, None)
+            )
+
+        self.assertEqual(detokenize(_ids("hi hello")).text, "hi hello")
+        for tokens in ([len(WORDS)], [[8], [2**40]]):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(detokenize(tokens).status_code, 400)
 
 
 if __name__ == "__main__":

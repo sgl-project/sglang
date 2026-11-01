@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
+from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
@@ -22,13 +24,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _scheduler_for_typed_config():
+def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
         server_args=SimpleNamespace(enable_return_hidden_states=False),
         model_config=SimpleNamespace(
             context_len=2048,
             vocab_size=1000,
             is_multimodal=False,
+            is_image_understandable_model=False,
+            is_audio_understandable_model=False,
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
@@ -44,7 +48,7 @@ def _scheduler_for_typed_config():
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
-        load_snapshot_writer=None,
+        load_snapshot_writer=load_snapshot_writer,
         rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )
 
@@ -361,6 +365,59 @@ def test_scale_joiner_hosts_listener():
         assert node_hosts_rust_server()
 
 
+@pytest.mark.parametrize(
+    "nnodes,ranks,force_zmq",
+    [(1, (0, 1), False), (2, (2, 3), False), (2, (2, 3), True)],
+    ids=["single-node", "multi-node", "forced-zmq"],
+)
+def test_each_listener_reads_its_own_slot_of_a_node_local_file(
+    nnodes, ranks, force_zmq
+):
+    # The two DP leaders on the last node. Under multi-node DP they create the
+    # node's snapshot file themselves; no node-0 collector gathers them.
+    dp_size = 2 * nnodes
+    port_args = SimpleNamespace(instance_id=f"test_rust_loads_{nnodes}")
+    path = shm_path_for(port_args.instance_id)
+    extension = MagicMock()
+    writers, listeners = [], []
+    with (
+        get_context().override_server_args(
+            nnodes=nnodes, node_rank=nnodes - 1, tp_size=dp_size, attn_dp_size=dp_size
+        ),
+        envs.SGLANG_RUST_SERVER.override(True),
+        envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(force_zmq),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        try:
+            for dp_rank in ranks:
+                writers.append(create_load_snapshot_writer(port_args, dp_size, dp_rank))
+                with get_parallel().override(attn_dp_rank=dp_rank, dp_rank=None):
+                    rust_config._build_server_args(
+                        _scheduler_for_typed_config(writers[-1]),
+                        default_max_new_tokens=None,
+                    )
+                kwargs = extension.ServerArgs.call_args.kwargs
+                listeners.append(
+                    tuple(
+                        kwargs[f"load_snapshot_{key}"]
+                        for key in ("path", "dp_size", "dp_rank")
+                    )
+                )
+        finally:
+            for writer in writers:
+                writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    if force_zmq:
+        # Snapshots leave the process, so `/v1/loads` has no file to read.
+        assert listeners == [(None, 0, 0)] * len(ranks)
+    else:
+        assert listeners == [(path, dp_size, dp_rank) for dp_rank in ranks]
+
+
 class _HttpRegistry(CommonKVBootstrapServer):
     def __init__(self, host, port):
         raise AssertionError("the Rust server serves this registry")
@@ -434,6 +491,41 @@ def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
         assert server.address == ("127.0.0.1", 33000)
     else:
         assert server is None
+
+
+@pytest.mark.parametrize("hosts", [True, False], ids=["host", "non-host"])
+def test_listener_rank_installs_the_sigterm_drain(hosts):
+    # Every rank joins the endpoint gather; only a listener rank launches the
+    # server, and it drains on SIGTERM, reporting to the launcher's socket.
+    from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+    maybe_stub_sgl_kernel()
+    from sglang.srt.managers import scheduler as scheduler_module
+
+    server = MagicMock()
+    server_class = MagicMock()
+    server_class.launch.return_value = server
+    server_class.gather_server_endpoints.return_value = []
+    scheduler = SimpleNamespace(
+        _hosts_rust_server=lambda: hosts,
+        get_rust_server_class=lambda: server_class,
+        _engine_paused=False,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(scheduler_module, "RustServerIdleSleeper"),
+    ):
+        scheduler_module.Scheduler.maybe_init_rust_server(
+            scheduler, SimpleNamespace(instance_id="dp-ports-test")
+        )
+
+    server_class.gather_server_endpoints.assert_called_once_with(hosts)
+    assert server_class.launch.called == hosts
+    if hosts:
+        server.install_sigterm_drain.assert_called_once_with(
+            notify=rust_server.drain_notify_name("dp-ports-test")
+        )
+    assert scheduler.rust_server is (server if hosts else None)
 
 
 if __name__ == "__main__":

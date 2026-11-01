@@ -226,6 +226,13 @@ jobs:
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
               `Latest PR Test (AMD ROCm 10): ${amdStart}${amdText}${amdEnd}`,
+              '',
+              '> [!TIP]',
+              '> Base CI only covers the core cases, and its workload may not exercise your change. Use `/rerun-test` to run the tests your change touches, or copy this prompt for an agent:',
+              '>',
+              '> ```text',
+              '> Find the registered tests this PR affects and run them with /rerun-test, following https://github.com/sgl-project/sglang/blob/main/.agents/skills/rerun-test/SKILL.md',
+              '> ```',
               outerEnd,
             ].join('\n');
 
