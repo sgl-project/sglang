@@ -649,7 +649,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.swa_host_hit_length, 2)
+        self.assertEqual(match.window_host_hit_lengths.get(ComponentType.SWA, 0), 2)
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])

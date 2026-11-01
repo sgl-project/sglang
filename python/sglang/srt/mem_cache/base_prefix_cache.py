@@ -325,8 +325,6 @@ class MatchResult(NamedTuple):
                             equal to `last_host_node`.
         host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
                             loaded back to device. Pure-KV cache semantics;
-        swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
-                            window) and will be load-back into the SWA device pool.
         swa_branching_seqlen: The SWA radix cache branching point, which is the longest
                               page-aligned position that could've been cache hit if there
                               exists an SWA window.
@@ -344,7 +342,6 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0
-    swa_host_hit_length: int = 0
     swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
@@ -357,8 +354,8 @@ class MatchResult(NamedTuple):
     # Reusable prefix length in FULL's device-value scan, before node-boundary
     # or auxiliary constraints. None means no shorter prefix was reported.
     full_device_match_len: Optional[int] = None
-    # Host hit tokens per further window slot (the first window's are
-    # ``swa_host_hit_length``), by component id.
+    # Host hit tokens per window slot (within that slot's window), to be
+    # loaded back into its device pool, by component id.
     window_host_hit_lengths: Mapping[ComponentType, int] = MappingProxyType({})
 
 
@@ -375,7 +372,6 @@ def zero_match_result(
         last_host_node=root,
         best_match_node=root,
         host_hit_length=0,
-        swa_host_hit_length=0,
         window_host_hit_lengths=MappingProxyType({}),
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,

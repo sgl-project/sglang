@@ -345,15 +345,11 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
 
+        window_host_hit_lengths = {**result.window_host_hit_lengths, ct: swa_host_hit}
         if ct != ComponentType.SWA:
-            return result._replace(
-                window_host_hit_lengths={
-                    **result.window_host_hit_lengths,
-                    ct: swa_host_hit,
-                }
-            )
+            return result._replace(window_host_hit_lengths=window_host_hit_lengths)
         return result._replace(
-            swa_host_hit_length=swa_host_hit,
+            window_host_hit_lengths=window_host_hit_lengths,
             swa_branching_seqlen=branching_seqlen,
         )
 

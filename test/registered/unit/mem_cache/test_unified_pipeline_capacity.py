@@ -181,7 +181,6 @@ def _admission(allocator, input_tokens, max_requests):
             total_tokens=input_tokens + 1,
             max_new_tokens=1,
             input_tokens=input_tokens,
-            swa_host_hit_length=0,
             chunk_limit=None,
             state_slots=1,
         )

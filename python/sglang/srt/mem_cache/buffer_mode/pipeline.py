@@ -1513,8 +1513,8 @@ class BufferModePipeline:
         if plan is None:
             self._resolve_device_covered(req)
             return True
+        # Each window's host hit is read off the plan (`window_host_hit_lengths`).
         req.host_hit_length = plan.full_tokens
-        req.swa_host_hit_length = plan.window_tokens(ComponentType.SWA)
         req.mamba_host_hit_length = plan.mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
@@ -1579,7 +1579,6 @@ class BufferModePipeline:
 
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
         req.matched_window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
@@ -1756,13 +1755,8 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (
-            req.host_hit_length,
-            req.swa_host_hit_length,
-            req.mamba_host_hit_length,
-        ) == (
+        assert (req.host_hit_length, req.mamba_host_hit_length) == (
             plan.full_tokens,
-            plan.window_tokens(ComponentType.SWA),
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 

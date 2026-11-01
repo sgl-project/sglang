@@ -65,7 +65,7 @@ class UnifiedRadixCacheFixtures:
         req.last_host_node = match.last_host_node
         req.best_match_node = match.best_match_node
         req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
+        req.matched_window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.mamba_host_hit_length = match.mamba_host_hit_length
 
     def _make_seq(self, start: int, num_pages: int) -> list[int]:

@@ -1238,9 +1238,7 @@ class Req(ReqDllmMixin):
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
-        self.swa_host_hit_length = 0
-        # Host hit tokens per further window slot (beyond the first, whose
-        # hit is swa_host_hit_length), by tree component.
+        # Host hit tokens per window slot, by tree component.
         self.matched_window_host_hit_lengths: Mapping[ComponentType, int] = {}
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
@@ -1531,19 +1529,16 @@ class Req(ReqDllmMixin):
 
     @property
     def window_host_hit_lengths(self) -> Mapping[ComponentType, int]:
-        """Host hit tokens per further window slot, by tree component."""
+        """Host hit tokens per window slot, by tree component."""
         plan = self.staged_prefetch_plan
         if plan is None:
             return self.matched_window_host_hit_lengths
-        return {
-            ct: plan.window_tokens(ct) for ct in plan.windows if ct != ComponentType.SWA
-        }
+        return {ct: plan.window_tokens(ct) for ct in plan.windows}
 
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
             self.host_hit_length > 0
-            or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
             or any(self.window_host_hit_lengths.values())
         )

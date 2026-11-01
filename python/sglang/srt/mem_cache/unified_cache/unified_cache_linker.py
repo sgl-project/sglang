@@ -341,7 +341,13 @@ class UnifiedCacheLinkerWrapper:
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            window_host_hit_lengths={
+                **result.window_host_hit_lengths,
+                ComponentType.SWA: max(
+                    result.window_host_hit_lengths.get(ComponentType.SWA, 0),
+                    swa_host_hit_length,
+                ),
+            },
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),

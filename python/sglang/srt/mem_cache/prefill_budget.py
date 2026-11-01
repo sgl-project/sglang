@@ -26,13 +26,12 @@ from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 
-def _host_hits(
-    swa_host_hit_length: int,
+def _single_window_hit(
     window_host_hit_lengths: Optional[Mapping[ComponentType, int]],
-) -> dict[ComponentType, int]:
-    """Host hit tokens per tree window slot: the first window's, then each
-    further window's."""
-    return {ComponentType.SWA: swa_host_hit_length, **(window_host_hit_lengths or {})}
+) -> int:
+    """Host hit tokens of a pool keeping one window, whichever slot id the
+    tree gives it."""
+    return max((window_host_hit_lengths or {}).values(), default=0)
 
 
 def estimate_swa_kv_tokens(
@@ -98,7 +97,6 @@ class PrefillBudget:
         full_tokens: int,
         extend_input_len: int,
         max_new_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
@@ -148,7 +146,6 @@ class PrefillBudget:
         total_tokens: int,
         max_new_tokens: int,
         input_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
@@ -168,7 +165,6 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        swa_host_hit_length: int = 0,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return paged_input + state_slots * self.state_slot_cost <= min(
@@ -240,7 +236,7 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        swa_host_hit_length=0,
+        window_host_hit_lengths=None,
     ):
         if self.req_ring:
             return self.allocator.swa_ring_cost_tokens
@@ -250,7 +246,7 @@ class SWAPrefillBudget(PrefillBudget):
             sliding_window_size=self.tree_cache.sliding_window_size,
             page_size=self.page_size,
             allocation_limit=chunk_limit,
-            host_hit_length=swa_host_hit_length,
+            host_hit_length=_single_window_hit(window_host_hit_lengths),
         )
 
     def swa_never_fits(self, extend_input_len, max_new_tokens, **kwargs):
@@ -261,11 +257,11 @@ class SWAPrefillBudget(PrefillBudget):
             else needed >= self.allocator.size_swa
         )
 
-    def _chunk_cap(self, max_new_tokens, swa_host_hit_length=0):
+    def _chunk_cap(self, max_new_tokens, window_host_hit_lengths=None):
         # Only the sliding window stays locked between chunks, so a smaller
         # chunk can bound the transient SWA footprint of a longer prompt.
         headroom = self.swa_tokens(
-            0, max_new_tokens, swa_host_hit_length=swa_host_hit_length
+            0, max_new_tokens, window_host_hit_lengths=window_host_hit_lengths
         )
         cap = int(self.remaining_swa) - headroom
         return max(0, cap // self.page_size * self.page_size)
@@ -277,7 +273,6 @@ class SWAPrefillBudget(PrefillBudget):
         total_tokens: int,
         max_new_tokens: int,
         input_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
@@ -289,7 +284,7 @@ class SWAPrefillBudget(PrefillBudget):
             extend_input_len,
             max_new_tokens,
             chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         )
         fits = (
             needed <= self.remaining_swa
@@ -305,9 +300,9 @@ class SWAPrefillBudget(PrefillBudget):
             extend_input_len,
             max_new_tokens,
             chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         ):
-            cap = self._chunk_cap(max_new_tokens, swa_host_hit_length)
+            cap = self._chunk_cap(max_new_tokens, window_host_hit_lengths)
         if chunk_limit is None or cap <= 0:
             return False, None
         return True, min(chunk_limit, cap)
@@ -329,7 +324,6 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        swa_host_hit_length: int = 0,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return (
@@ -344,7 +338,7 @@ class SWAPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                swa_host_hit_length=swa_host_hit_length,
+                window_host_hit_lengths=window_host_hit_lengths,
             )
             <= self.remaining_swa
         )
@@ -479,14 +473,13 @@ class ChainPrefillBudget(PrefillBudget):
         total_tokens: int,
         max_new_tokens: int,
         input_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         """Admit the whole request if it fits; otherwise, with chunking, the
         largest page-aligned chunk that fits now."""
-        host_hits = _host_hits(swa_host_hit_length, window_host_hit_lengths)
+        host_hits = dict(window_host_hit_lengths or {})
         if self._fits(
             total_tokens,
             self.window_tokens(
@@ -576,7 +569,6 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        swa_host_hit_length: int = 0,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return self._fits(
@@ -585,9 +577,7 @@ class ChainPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                host_hit_lengths=_host_hits(
-                    swa_host_hit_length, window_host_hit_lengths
-                ),
+                host_hit_lengths=dict(window_host_hit_lengths or {}),
             ),
             state_slots,
         )
@@ -621,7 +611,6 @@ class ChainPrefillBudget(PrefillBudget):
         full_tokens: int,
         extend_input_len: int,
         max_new_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
@@ -635,9 +624,7 @@ class ChainPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                host_hit_lengths=_host_hits(
-                    swa_host_hit_length, window_host_hit_lengths
-                ),
+                host_hit_lengths=dict(window_host_hit_lengths or {}),
             ).items()
         }
         demand = {"window_tokens": windows}

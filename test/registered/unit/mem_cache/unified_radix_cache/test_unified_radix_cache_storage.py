@@ -84,6 +84,14 @@ from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import FAMILY_OF
 
+
+def _window_hit(req, component=ComponentType.SWA):
+    """``Req.window_host_hit_lengths`` read off a stand-in request."""
+    from sglang.srt.managers.schedule_batch import Req
+
+    return Req.window_host_hit_lengths.fget(req).get(component, 0)
+
+
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
 
@@ -1659,7 +1667,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             kv=SimpleNamespace(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        surfaced_swa_hit = req.swa_host_hit_length
+        surfaced_swa_hit = _window_hit(req)
         reserved = (
             max(extend_need - window, 0)
             + min(extend_need + max_new, window)
@@ -2049,7 +2057,13 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         req.prefix_len = live.device_prefix_len
         req.last_node = live.last_device_node
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (0, 0),
+        )
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)

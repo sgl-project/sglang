@@ -248,14 +248,12 @@ def match_kv_cache(
         req.last_host_node,
         req.best_match_node,
         req.host_hit_length,
-        req.swa_host_hit_length,
         req.mamba_host_hit_length,
     ) = (
         match_result.last_device_node,
         match_result.last_host_node,
         match_result.best_match_node,
         match_result.host_hit_length,
-        match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
     req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)

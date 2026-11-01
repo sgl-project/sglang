@@ -36,6 +36,14 @@ from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.tree_slots import index_slots
 
+
+def _window_hit(req, component=ComponentType.SWA):
+    """``Req.window_host_hit_lengths`` read off a stand-in request."""
+    from sglang.srt.managers.schedule_batch import Req
+
+    return Req.window_host_hit_lengths.fget(req).get(component, 0)
+
+
 register_cpu_ci(est_time=46, suite="base-a-test-cpu")
 
 _REQ = CacheRequestHandle("r", 0)
@@ -131,7 +139,6 @@ def _staged_fixture(full_match=2):
         extra_key=None,
         cache_salt=None,
         host_hit_length=0,
-        swa_host_hit_length=0,
         host_hit_is_storage=False,
         host_loaded_length=0,
         storage_prefetch_last_match_len=4,
@@ -529,7 +536,13 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
     def test_next_pass_uses_fresh_joint_match(self):
         cache, pipeline, req = _staged_fixture(full_match=8)
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 4))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (0, 4),
+        )
         self.assertEqual(req.kv.cache_protected_len, 8)
         plan = req.staged_prefetch_plan
         self.assertIs(
@@ -546,7 +559,13 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         self.assertIsNone(req.staged_prefetch_plan)
         self.assertEqual(req.prefix_len, 12)
         self.assertEqual((req.last_node, req.kv.cache_protected_len), (9, 12))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (0, 0),
+        )
         self.assertFalse(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
         cache.cache_controller.mem_pool_host.free.assert_called_once()
@@ -610,13 +629,25 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
     def test_next_pass_replans_growth_and_refetches_anchor_loss_once(self):
         cache, pipeline, req = _staged_fixture()
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (6, 4))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (6, 4),
+        )
 
         # Tree changes occur while queued, before the next preparation pass.
         cache.tree_core.match_full_device_prefix.return_value = (6, 1, 6)
         req.prefix_len = 2
         self.assertTrue(cache.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (2, 4))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (2, 4),
+        )
         self.assertTrue(pipeline.has_staged(req.cache_request_handle))
         self.assertEqual(cache.storage_prefetch_retries.pop_ready([req], 0, 8), [])
 

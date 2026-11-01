@@ -370,7 +370,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             last_visited_node_id=result.last_visited_node_id,
             full_device_match_len=result.full_device_match_len,
             host_hit_length=result.host_hit_length,
-            swa_host_hit_length=result.swa_host_hit_length,
+            window_host_hit_lengths=(
+                {}
+                if self._window_slot_id is None
+                else {self._window_slot_id: result.swa_host_hit_length}
+            ),
             swa_branching_seqlen=result.swa_branching_seqlen,
             mamba_host_hit_length=result.mamba_host_hit_length,
             mamba_branching_seqlen=result.mamba_branching_seqlen,
@@ -465,6 +469,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         }
         if TREE_WINDOW in families and (window is None or window <= 0):
             raise ValueError("the SWA tree component requires a positive window")
+        # The tree's id of the one window slot the core keeps, if any.
+        self._window_slot_id: Optional[ComponentType] = (
+            tree_slot_ids(params.tree_slots)[numbers[TREE_WINDOW].component]
+            if TREE_WINDOW in families
+            else None
+        )
 
         self._page_size = params.page_size
         self._swa_backup_index_mapper: Optional[

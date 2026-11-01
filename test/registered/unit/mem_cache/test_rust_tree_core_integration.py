@@ -3171,7 +3171,7 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         assert matched.best_match_node == parent
         assert matched.device_prefix_len == 0
         assert matched.full_kv_hit_length == case.segment
-        assert matched.swa_host_hit_length == case.segment
+        assert matched.window_host_hit_lengths.get(ComponentType.SWA, 0) == case.segment
         assert matched.mamba_host_hit_length == int(with_mamba)
         (transfer,) = core.build_hicache_transfers(
             ComponentType.SWA, parent, CacheTransferPhase.LOAD_BACK

@@ -541,7 +541,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=PAGE, ignore_eos=False)
         req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
+        req.matched_window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None

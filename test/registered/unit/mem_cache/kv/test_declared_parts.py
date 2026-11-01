@@ -1018,7 +1018,6 @@ class TestDeclaredParts(CustomTestCase):
                     total_tokens=248,
                     max_new_tokens=0,
                     input_tokens=240,
-                    swa_host_hit_length=0,
                     chunk_limit=16,
                     state_slots=1,
                 )
@@ -2049,19 +2048,30 @@ class TestDeclaredParts(CustomTestCase):
                     result = component.finalize_match_result_in_tree_core(
                         result, None, [], 0
                     )
-                self.assertEqual(result.swa_host_hit_length, 4)
-                self.assertEqual(result.window_host_hit_lengths, {DRAFT_WINDOW: 32})
+                self.assertEqual(
+                    result.window_host_hit_lengths.get(ComponentType.SWA, 0), 4
+                )
+                self.assertEqual(
+                    result.window_host_hit_lengths,
+                    {ComponentType.SWA: 4, DRAFT_WINDOW: 32},
+                )
                 req = Req.__new__(Req)
                 req.matched_window_host_hit_lengths = dict(
                     result.window_host_hit_lengths
                 )
                 req.staged_prefetch_plan = None
-                self.assertEqual(req.window_host_hit_lengths, {DRAFT_WINDOW: 32})
+                self.assertEqual(
+                    req.window_host_hit_lengths,
+                    {ComponentType.SWA: 4, DRAFT_WINDOW: 32},
+                )
                 req.staged_prefetch_plan = SimpleNamespace(
                     windows={ComponentType.SWA: None, DRAFT_WINDOW: None},
                     window_tokens=lambda ct: 16,
                 )
-                self.assertEqual(req.window_host_hit_lengths, {DRAFT_WINDOW: 16})
+                self.assertEqual(
+                    req.window_host_hit_lengths,
+                    {ComponentType.SWA: 16, DRAFT_WINDOW: 16},
+                )
 
     def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -2139,8 +2149,7 @@ class TestDeclaredParts(CustomTestCase):
                     full_tokens=8,
                     extend_input_len=1,
                     max_new_tokens=400,
-                    swa_host_hit_length=5,
-                    window_host_hit_lengths={DRAFT_WINDOW: 9},
+                    window_host_hit_lengths={ComponentType.SWA: 5, DRAFT_WINDOW: 9},
                     chunk_limit=8,
                 )
                 self.assertEqual(full, 416)
@@ -2210,7 +2219,6 @@ class TestDeclaredParts(CustomTestCase):
             total_tokens=8,
             max_new_tokens=0,
             input_tokens=4,
-            swa_host_hit_length=0,
             chunk_limit=None,
         )
         self.assertEqual(budget.check_prefill(**kwargs), (True, None))
@@ -2224,7 +2232,6 @@ class TestDeclaredParts(CustomTestCase):
             full_tokens=8,
             extend_input_len=4,
             max_new_tokens=0,
-            swa_host_hit_length=0,
             chunk_limit=None,
         )
         self.assertFalse(
@@ -2348,7 +2355,6 @@ class TestDeclaredParts(CustomTestCase):
                 total_tokens=need,
                 max_new_tokens=0,
                 input_tokens=need - 4,
-                swa_host_hit_length=0,
                 chunk_limit=None,
             ),
             (True, None),

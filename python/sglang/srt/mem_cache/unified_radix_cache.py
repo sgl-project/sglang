@@ -638,7 +638,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(
         same_params=["params"],
-        same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+        same_results=[
+            "result.full_kv_hit_length",
+            "sorted(result.window_host_hit_lengths.items())",
+        ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -3718,8 +3721,7 @@ class UnifiedRadixCache(BasePrefixCache):
             or (
                 req is not None
                 and (
-                    req.swa_host_hit_length > 0
-                    or req.mamba_host_hit_length > 0
+                    req.mamba_host_hit_length > 0
                     or any(req.window_host_hit_lengths.values())
                 )
             )
