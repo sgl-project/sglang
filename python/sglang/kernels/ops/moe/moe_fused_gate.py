@@ -506,6 +506,7 @@ def moe_fused_gate(
             topk_group,
             scores.device.index,
         )
+        and moe_route_warp.bias_layout_ok(bias, bias_alt)
     ):
         return moe_route_warp.moe_route_warp(
             scores,

@@ -134,7 +134,11 @@ def _reference(
     weights = act.gather(1, ids)
     if renormalize:
         total = weights.sum(-1, keepdim=True)
-        weights = weights / (total + renormalize_epsilon)
+        if renormalize_epsilon > 0:
+            weights = weights / (total + renormalize_epsilon)
+        else:
+            # Zero-sum guard of the routers: an all-zero row stays zero.
+            weights = weights / torch.where(total > 0, total, torch.ones_like(total))
     if apply_routed_scaling_factor_on_output:
         weights = weights * routed_scaling_factor
     if num_fused_shared_experts:
@@ -245,6 +249,30 @@ def test_sqrtsoftplus_uniform_tail() -> None:
     torch.testing.assert_close(w, torch.full_like(w, 1 / 6))
 
 
+@pytest.mark.parametrize("renormalize_epsilon", [0.0, 1e-20])
+def test_sqrtsoftplus_underflow(renormalize_epsilon: float) -> None:
+    # exp(x / 2) underflows: the activation is 0, and an all-zero row stays zero.
+    scores = torch.full((6, 384), -1000.0, device=DEVICE)
+    scores[1, 7] = -50.0  # one live expert among underflowed ones
+    scores[2, [3, 90, 200]] = torch.tensor([-60.0, -20.0, 1.0], device=DEVICE)
+    scores[3] = torch.linspace(-300, -100, 384, device=DEVICE)  # partly underflowed
+    scores[4, ::2] = float("-inf")
+    scores[4, 1::2] = torch.randn(192, device=DEVICE)
+    bias = torch.zeros(384, device=DEVICE)
+    kwargs = dict(
+        topk=6,
+        scoring_func="sqrtsoftplus",
+        renormalize=True,
+        renormalize_epsilon=renormalize_epsilon,
+    )
+    w, i = moe_route_warp(scores, bias, **kwargs)
+    rw, ri, _, _ = _reference(scores, bias, **kwargs)
+    assert torch.equal(i.long(), ri)
+    torch.testing.assert_close(w.double(), rw, rtol=1e-5, atol=1e-6)
+    assert (w[0] == 0).all() and (w[5] == 0).all()
+    torch.testing.assert_close(w[1], torch.tensor([1.0, 0, 0, 0, 0, 0], device=DEVICE))
+
+
 def _softmax_bias(scores: torch.Tensor, dtype=torch.float32):
     g = torch.Generator(device=DEVICE).manual_seed(scores.shape[0] + 17)
     return (torch.randn(scores.shape[1], device=DEVICE, generator=g) * 2).to(dtype)
@@ -288,6 +316,21 @@ def test_softmax_bias_dispatch() -> None:
     w, i = moe_fused_gate(scores, bias, **kwargs)
     rw, ri = moe_route_warp(scores, bias, **kwargs)
     assert torch.equal(i, ri) and torch.equal(w, rw)
+
+
+@pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe"])
+def test_strided_bias_falls_back(config: str) -> None:
+    # A non-contiguous bias view is not loaded by the kernel: Triton serves it.
+    scores, _ = _inputs(config, 64, seed=12)
+    num_experts = scores.shape[1]
+    g = torch.Generator(device=DEVICE).manual_seed(12)
+    full = torch.randn(2 * num_experts, device=DEVICE, generator=g)
+    bias = full[::2]
+    assert not route_warp_module.bias_layout_ok(bias)
+    assert not route_warp_module.bias_layout_ok(full[1 : num_experts + 1])
+    kwargs = _kwargs(config)
+    w, i = moe_fused_gate(scores, bias, **kwargs)
+    _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
 
 
 def test_softmax_bias_grouped_falls_back() -> None:

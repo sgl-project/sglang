@@ -123,6 +123,14 @@ def covered(
     return True
 
 
+def bias_layout_ok(*biases: Optional[torch.Tensor]) -> bool:
+    """Whether every given bias has the layout the kernel loads: contiguous and
+    16-byte aligned (the widest bias vector). Other views stay on Triton."""
+    return all(
+        b is None or (b.is_contiguous() and b.data_ptr() % 16 == 0) for b in biases
+    )
+
+
 def moe_route_warp(
     scores: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -147,7 +155,7 @@ def moe_route_warp(
     device scalar. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
     bf16_bits(weight)``. Rows whose ``input_ids`` equal ``bias_alt_token_id``
     rank with ``bias_alt`` instead of ``bias``. Caller must have checked
-    :func:`covered`."""
+    :func:`covered` and :func:`bias_layout_ok`."""
     num_tokens, num_experts = scores.shape
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
