@@ -1601,6 +1601,7 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         """Commit the PD prefill worker's sampled token to a decode request."""
         req.output_ids.append(token_id)
+        req.time_stats.set_decode_first_token_time()
         self._maybe_update_reasoning_tokens(req, token_id)
         if req.return_logprob:
             # Prefill omits token-ids scores; reserve a row for the streaming offset.
