@@ -1394,6 +1394,10 @@ class Req(ReqDllmMixin):
         # processed.
         self.inflight_middle_chunks = 0
 
+        # The launched steps carrying this request whose results are not
+        # processed yet.
+        self.inflight_steps = 0
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
@@ -1528,6 +1532,8 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
+        self.linker_offload_skip_prefix_len = 0
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -2649,6 +2655,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
+    # The requests this batch was launched with; the in-flight counts are kept
+    # over these.
+    launched_reqs: Optional[Tuple[Req, ...]] = None
+
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
@@ -2867,13 +2877,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def add_inflight_step(self) -> None:
+        self.launched_reqs = tuple(self.reqs)
+        for req in self.launched_reqs:
+            req.inflight_steps += 1
+
+    def drop_inflight_step(self) -> None:
+        for req in self.launched_reqs:
+            req.inflight_steps -= 1
+
     def is_dllm(self):
         return self.dllm_config is not None
 
     def grammar_needs_sync(self) -> bool:
-        """Whether grammar forces this batch onto the synchronous path, i.e. the
-        previous batch's result is resolved before this forward."""
-        return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
+        """Whether a spec algorithm that cannot advance the grammar FSM inside
+        verify() needs this batch's result processed before the next schedule."""
+        return (
+            self.has_grammar
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.supports_grammar_overlap()
+        )
 
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
@@ -4147,6 +4170,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            launched_reqs=self.launched_reqs,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
