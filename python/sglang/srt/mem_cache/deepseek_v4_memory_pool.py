@@ -36,7 +36,15 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4CompressedBufferInfo,
+    DSV4IndexerBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
@@ -189,12 +197,10 @@ def resolve_compressed_kv_layout(
     if kv_layout is KVLayout.V4:
         assert option in (None, "fp8"), "the V4 main cache only pairs with V4 caches"
         return KVLayout.V4
-    assert kv_layout is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
-    if option == "fp8":
-        return KVLayout.V41
-    if option == "fp4":
-        return KVLayout.V41_FP4
-    return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
+    assert kv_layout.encoding is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
+    use_fp4 = option == "fp4" or (option is None and compress_ratio in (1, 2))
+    encoding = KVLayout.V41_FP4 if use_fp4 else KVLayout.V41
+    return encoding.with_interleaved(kv_layout.is_interleaved)
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
@@ -203,7 +209,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
-    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega" and mode != "v41_new":
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
@@ -212,7 +218,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
-    assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+    assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
     is_sm100 = (
         torch.cuda.is_available()
         and torch.version.cuda is not None
@@ -224,15 +230,16 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         )
         if mode == "auto" and not supported:
             return KVLayout.V4, None
-        if not supported:
+        if not supported or mode == "v41_new":
             raise ValueError(
-                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention, "
+                "which reads the block-split v41 layout"
             )
         return KVLayout.V41, option
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    return KVLayout.V41, option
+    return (KVLayout.V41_NEW if mode == "v41_new" else KVLayout.V41), option
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -276,6 +283,11 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
         self._create_buffers()
+
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.page_size, layout=self.kv_layout.value
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -387,6 +399,13 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
 
     def get_bytes_per_token(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        # kv_layout stays V4 for the attention backend, but the rows are
+        # 512-byte uniform FP8 that the V4 token-granular copy cannot split.
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.page_size, layout="uniform_fp8"
+        )
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
@@ -650,14 +669,41 @@ class DeepSeekV4IndexerPool(KVCache):
         return self.index_k_with_scale_buffer[layer_id]
 
     def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
-        """Every indexer buffer as 2D page rows for PD and HiCache: one fused key+scale
-        buffer per layer under FP8, separate payload and scale buffers under FP4."""
+        """2D page rows: fused key/scale for CUDA FP8 or FP4; separate payload
+        and scale for the HIP FP4 layout."""
         if self.index_k_with_scale_buffer is not None:
             return self.index_k_with_scale_buffer
         return [
             buf.view(torch.uint8).flatten(1)
             for buf in (*self.index_k_payload_buffer, *self.index_k_scale_buffer)
         ]
+
+    def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
+        if self.index_k_with_scale_buffer is not None:
+            return DSV4IndexerBufferInfo(
+                key=DSV4PagedBufferInfo.from_buffers(
+                    self.index_k_with_scale_buffer,
+                    page_slots=self.index_page_size,
+                    layout="index_fused",
+                )
+            )
+        page_slots = self.index_k_payload_buffer[0].shape[3]
+        scale_slots = self.index_k_scale_buffer[0].shape[3]
+        if scale_slots != page_slots:
+            raise ValueError(
+                "FP4 indexer payload and scale must agree on slots per page: "
+                f"payload={page_slots}, scale={scale_slots}"
+            )
+        rows = self.contiguous_page_row_buffers()
+        key_layers = len(self.index_k_payload_buffer)
+        return DSV4IndexerBufferInfo(
+            key=DSV4PagedBufferInfo.from_buffers(
+                rows[:key_layers], page_slots=page_slots, layout="index_fp4"
+            ),
+            scale=DSV4PagedBufferInfo.from_buffers(
+                rows[key_layers:], page_slots=page_slots, layout="index_fp4"
+            ),
+        )
 
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_payload_buffer[layer_id]
@@ -941,6 +987,30 @@ class DeepSeekV4UnifiedKVPool:
         return data_ptrs, data_lens, item_lens
 
 
+# Per compression ratio: KV, RoPE, indexer key and indexer scale region names.
+_DSV4_REGION_NAMES = {
+    1: (
+        PoolName.DEEPSEEK_V4_C1,
+        None,
+        PoolName.DEEPSEEK_V4_C1_INDEXER,
+        PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+    ),
+    2: (
+        PoolName.DEEPSEEK_V4_C2,
+        None,
+        PoolName.DEEPSEEK_V4_C2_INDEXER,
+        PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+    ),
+    4: (
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_ROPE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+    ),
+    128: (PoolName.DEEPSEEK_V4_C128, PoolName.DEEPSEEK_V4_C128_ROPE, None, None),
+}
+
+
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
@@ -995,6 +1065,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.kv_layout in (
             KVLayout.V4,
             KVLayout.V41,
+            KVLayout.V41_NEW,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
@@ -1091,6 +1162,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._stage_start = 0
             self._stage_end = len(compression_ratios)
+        self.stage_layer_ids = tuple(range(self._stage_start, self._stage_end))
         stage_ratios = compression_ratios[self._stage_start : self._stage_end]
 
         assert page_size % swa_page_size == 0
@@ -1432,6 +1504,124 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self._unified_kv_fp8:
             append_ring(self.unified_kv_pool.kv_buffer_rope)
         return data_ptrs, data_lens, item_lens
+
+    def _swa_buffer_info(self) -> DSV4PagedBufferInfo | None:
+        if self.swa_kv_pool is None:
+            return None
+        info = self.swa_kv_pool.paged_buffer_info()
+        if len(info.buffers) != len(self.stage_layer_ids):
+            raise ValueError(
+                "DeepSeek V4 SWA KV pool must be PP-stage-local: "
+                f"got {len(info.buffers)} buffers for "
+                f"{len(self.stage_layer_ids)} local layers"
+            )
+        return info
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Describe allocated owner stores without consumer transfer policy.
+
+        Empty PP-stage groups are absent even when an empty pool is retained for
+        PD wire alignment. Request-window SWA and request-private compressor
+        state are rebuilt after prefix restore and have no page description.
+        """
+        infos = []
+        swa = self._swa_buffer_info()
+        if swa is not None:
+            infos.append(
+                DevicePoolInfo(
+                    pool_name=PoolName.SWA,
+                    indices_from_pool=PoolName.SWA,
+                    layer_ids=self.stage_layer_ids,
+                    buffer_info=swa,
+                )
+            )
+        for ratio, sources in self.sources_by_ratio.items():
+            if sources:
+                infos.extend(self._compressed_pool_infos(ratio, tuple(sources)))
+        return tuple(infos)
+
+    def _compressed_pool_infos(
+        self, ratio: int, layer_ids: tuple[int, ...]
+    ) -> list[DevicePoolInfo]:
+        kv_name, rope_name, index_name, index_scale_name = _DSV4_REGION_NAMES[ratio]
+        kv = (
+            self.compressed_buffer_info(ratio)
+            if ratio in (4, 128)
+            else DSV4CompressedBufferInfo(kv=self.kv_pools[ratio].paged_buffer_info())
+        )
+        regions = [(kv_name, PoolName.KV, kv.kv), (rope_name, PoolName.KV, kv.rope)]
+        index_pool = self.index_pools.get(ratio)
+        if index_pool is not None:
+            indexer = index_pool.indexer_buffer_info()
+            regions.append((index_name, PoolName.KV, indexer.key))
+            regions.append((index_scale_name, PoolName.KV, indexer.scale))
+        if ratio == 4 and not self._unified_kv:
+            # Compressor rings advance with the SWA window, not with KV pages.
+            for name, state_pools in (
+                (PoolName.DEEPSEEK_V4_C4_STATE, self.compress_state_pools),
+                (
+                    PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                    self.indexer_compress_state_pools,
+                ),
+            ):
+                states = tuple(
+                    state_pools[layer].checkpoint_buffer_info() for layer in layer_ids
+                )
+                regions.append(
+                    (name, PoolName.SWA, DSV4CheckpointBufferInfo(states=states))
+                )
+        infos = []
+        for name, indices_from_pool, region in regions:
+            if region is None:
+                continue
+            if name is None:
+                raise ValueError(f"DeepSeek V4 C{ratio} has no pool name for a region")
+            count = (
+                len(region.states)
+                if isinstance(region, DSV4CheckpointBufferInfo)
+                else len(region.buffers)
+            )
+            if count != len(layer_ids):
+                raise ValueError(f"DeepSeek V4 C{ratio} owner and buffer counts differ")
+            infos.append(
+                DevicePoolInfo(
+                    pool_name=name,
+                    indices_from_pool=indices_from_pool,
+                    layer_ids=layer_ids,
+                    buffer_info=region,
+                )
+            )
+        return infos
+
+    def compressed_buffer_info(
+        self, ratio: Literal[4, 128]
+    ) -> DSV4CompressedBufferInfo:
+        if ratio not in (4, 128):
+            raise ValueError(f"Expected C4 or C128 compressed region, got {ratio}")
+        if not self._unified_kv:
+            pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
+            return DSV4CompressedBufferInfo(kv=pool.paged_buffer_info())
+        buffers, item_bytes = self.unified_region_buffers(ratio)
+        page_slots = self.page_size // ratio
+        rope_region = self.unified_rope_region_buffers(ratio)
+        rope = None
+        if rope_region is not None:
+            rope_buffers, rope_bytes = rope_region
+            rope = DSV4PagedBufferInfo(
+                buffers=tuple(rope_buffers),
+                page_bytes=rope_bytes,
+                page_slots=page_slots,
+                layout="unified",
+            )
+        return DSV4CompressedBufferInfo(
+            kv=DSV4PagedBufferInfo(
+                buffers=tuple(buffers),
+                page_bytes=item_bytes,
+                page_slots=page_slots,
+                layout="unified",
+            ),
+            rope=rope,
+        )
 
     def _unified_page_views(
         self, buffers: List[torch.Tensor], ratio: int
@@ -2265,7 +2455,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+            assert compress_kv_pool.kv_layout.is_fp4, (
                 "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
             )
         return compress_kv_pool.set_key_buffer_fused(
