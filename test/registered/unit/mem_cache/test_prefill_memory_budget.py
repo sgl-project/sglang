@@ -255,8 +255,8 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                         state_slots=slots,
                     )
                 )
-                self.assertIsNone(
-                    allocator.reclaim_plan(
+                self.assertFalse(
+                    allocator.can_reserve(
                         (admitted + 1) * reserved_tokens,
                         (admitted + 1) * reserved_tokens,
                         state_slots=slots + slots_per_request,

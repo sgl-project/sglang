@@ -586,7 +586,10 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
             self._insert(tokens, 300)
             self.cache.evict(EvictParams(num_tokens=len(tokens)))
             filler += 100
-        self._insert(list(range(5000, 5040)), 500)
+        # Reclaim prices the shared pool jointly: the window rows free a full
+        # request part of the way, so the victim must leave too little room for
+        # the load and its new tokens together, not just for the full rows.
+        self._insert(list(range(5000, 5048)), 500)
         return match_tokens + list(range(17, 25)), expected
 
     def test_host_match_stays_pinned_while_reclaim_evicts_host_leaves(self):

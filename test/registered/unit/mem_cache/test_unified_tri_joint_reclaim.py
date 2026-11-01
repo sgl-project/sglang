@@ -16,7 +16,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc import interim
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     FLUSH_ENDS,
     NO_MOVE,
@@ -711,12 +710,23 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                         // a.mamba_allocator.entry_bytes
                     )
+                    # The state the token record cascaded counts toward the
+                    # bytes the demand needs: the state walk evicts only the
+                    # rest, and never more than the bytes call for.
+                    evicted = sum(r.mamba_num_evicted for _, r in phases)
                     if group < quota:
-                        self.assertEqual(len(phases), 2)
-                        self.assertEqual(phases[1][0].mamba_num, quota - group)
-                        self.assertGreater(phases[1][1].mamba_num_evicted, 0)
+                        # One state goes with the token record and the state
+                        # walk evicts two more: the walk stops at the first
+                        # state after which the planner fits the demand, below
+                        # the byte quota.
+                        self.assertEqual(
+                            [r.mamba_num_evicted for _, r in phases], [group, 2]
+                        )
+                        self.assertEqual(evicted, 3)
+                        self.assertLess(evicted, quota)
                     else:
                         self.assertEqual(len(phases), 1)
+                        self.assertEqual(evicted, group)
                     for node, prior in records[1:]:
                         torch.testing.assert_close(
                             c.tree_core.get_component_device_value(
@@ -740,12 +750,13 @@ class TestTriJointReclaim(CustomTestCase):
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
-                query = interim.float_reclaim_satisfied
+                query = a._units_fit
                 checkpoints, results = [], []
 
-                def checked_query(snap, chain, n):
+                def checked_query(demands):
+                    # The walks' stop predicate is pure: it moves no page.
                     before = snapshot(a)
-                    ready = query(snap, chain, n)
+                    ready = query(demands)
                     self.assertEqual(snapshot(a), before)
                     if ready:
                         checkpoints.append(c.full_evictable_size())
@@ -767,10 +778,7 @@ class TestTriJointReclaim(CustomTestCase):
                 sa = a.swa_attn_allocator
 
                 with (
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.float_reclaim_satisfied",
-                        side_effect=checked_query,
-                    ),
+                    patch.object(a, "_units_fit", side_effect=checked_query),
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
                     patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
                     patch(
