@@ -27,7 +27,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=151, stage="extra-a", runner_config="1-gpu-large")
 
 # Missing adapters shift logprobs by 7-17.
 LOGPROB_THRESHOLD = 1.0

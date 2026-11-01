@@ -54,6 +54,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.mem_cache.hicache_storage import merge_l3_layouts
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -229,6 +230,8 @@ class DataParallelController:
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
+        self._scheduler_init_info_lock = threading.Lock()
+        self._scheduler_init_infos: list[dict] = []
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -275,21 +278,6 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if get_exec().moe.elastic_ep_backend is not None:
-            if len(ranks.status) != self.max_dp_size:
-                logger.warning(
-                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
-                    "ignoring update",
-                    len(ranks.status),
-                    self.max_dp_size,
-                )
-                return
-            self.status = [
-                self.dp_active[i] and bool(ranks.status[i])
-                for i in range(self.max_dp_size)
-            ]
-            self._refresh_active_workers()
-            return
         if len(ranks.status) != self.max_dp_size:
             logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
@@ -298,7 +286,11 @@ class DataParallelController:
                 self.max_dp_size,
             )
             return
-        self.status = list(ranks.status)
+
+        self.status = [
+            self.dp_active[i] and bool(ranks.status[i]) for i in range(self.max_dp_size)
+        ]
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -810,11 +802,34 @@ class DataParallelController:
                 for source in info.get("kv_event_sources", [])
             )
 
-        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.startup_time = aggregate_scheduler_startup_times(
-            info.get("startup_time") for info in scheduler_info
-        )
+        self._record_scheduler_init_infos(scheduler_info)
+
+    def _record_scheduler_init_infos(self, infos: list[dict]) -> None:
+        with self._scheduler_init_info_lock:
+            self._scheduler_init_infos.extend(infos)
+            self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
+            self.max_req_input_len = infos[0]["max_req_input_len"]
+            self.startup_time = aggregate_scheduler_startup_times(
+                info.get("startup_time") for info in self._scheduler_init_infos
+            )
+
+    def get_init_info(self) -> dict:
+        """Build the parent handshake without dropping or choosing a replica layout."""
+        with self._scheduler_init_info_lock:
+            init_info = {
+                "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_input_len": self.max_req_input_len,
+                "startup_time": self.startup_time,
+            }
+            layout = merge_l3_layouts(
+                [
+                    info.get("hicache_object_layout")
+                    for info in self._scheduler_init_infos
+                ]
+            )
+        if layout is not None:
+            init_info["hicache_object_layout"] = layout
+        return init_info
 
     def dispatch_health_check(self, req: Req) -> None:
         # This policy routes by request metadata, not shared load-balancing state.
@@ -858,19 +873,11 @@ class DataParallelController:
         active = self._active_workers
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
-        attempts = 0
-        while attempts < len(active):
-            slot = active[self.round_robin_counter % len(active)]
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
-            if self.status[slot]:
-                logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
-            attempts += 1
-        raise RuntimeError(
-            f"Cannot route request: all {len(active)} active DP workers "
-            "are unavailable."
-        )
+
+        slot = active[self.round_robin_counter % len(active)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+        logger.debug(f"Choose worker {slot}")
+        sock_send(self.workers[slot], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -959,9 +966,7 @@ def run_data_parallel_controller_process(
         )
         init_info = {
             "status": "ready",
-            "max_total_num_tokens": controller.max_total_num_tokens,
-            "max_req_input_len": controller.max_req_input_len,
-            "startup_time": controller.startup_time,
+            **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
         if get_serving().grpc_port is not None and not (
