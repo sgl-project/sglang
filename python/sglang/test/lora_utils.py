@@ -516,6 +516,11 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                # Its LoRA deltas are as large as the base q/v projections, so
+                # fp16 decode logprobs of tail tokens move with the execution
+                # path (GPU, TP, graph vs eager) by up to ~0.15 against an fp32
+                # reference; HF fp16 and SGLang measured 0.14 apart on 2x H100.
+                decode_tolerance=3e-1,
                 rouge_l_tolerance=0.9,
             ),
         ],
