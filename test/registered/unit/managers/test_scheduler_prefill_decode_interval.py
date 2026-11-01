@@ -10,9 +10,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.scheduler import DisaggregationMode, Scheduler
-from sglang.srt.runtime_context import get_device, publish, reset_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_schedule,
+    publish,
+    reset_context,
+)
+from sglang.srt.server_args import ServerArgs, prepare_server_args
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -164,17 +171,57 @@ class TestPrefillOverlapBudgets(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "attention DP size 1"):
                 Scheduler.init_overlap(Scheduler.__new__(Scheduler))
 
+    def test_startup_budget_guard_uses_current_server_args(self):
+        for token_budget, min_free_gb, disable_overlap in (
+            (0, 0, False),
+            (0, 0, True),
+            (128, 0, False),
+            (0, 2, False),
+        ):
+            with self.subTest(
+                token_budget=token_budget,
+                min_free_gb=min_free_gb,
+                disable_overlap=disable_overlap,
+            ):
+                argv = ["--model-path", "dummy", "--device", "cuda"]
+                if disable_overlap:
+                    argv.append("--disable-overlap-schedule")
+                publish(prepare_server_args(argv), role="scheduler")
+                scheduler = self._scheduler()
+                scheduler.enable_overlap = (
+                    not get_schedule().disable_overlap_schedule and not use_mlx()
+                )
+                scheduler.enable_overlap_mlx = (
+                    not get_schedule().disable_overlap_schedule and use_mlx()
+                )
+                scheduler.disaggregation_mode = DisaggregationMode(
+                    get_disagg().disaggregation_mode
+                )
+                self.assertFalse(hasattr(scheduler, "enable_pdmux"))
+                # Exercise the startup guard, stopping before device allocation.
+                with (
+                    envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(token_budget),
+                    envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(min_free_gb),
+                    patch(
+                        "sglang.srt.managers.scheduler.torch.get_device_module",
+                        side_effect=RuntimeError("device initialization reached"),
+                    ) as device_init,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "device initialization reached"
+                    ):
+                        Scheduler.init_overlap(scheduler)
+                    device_init.assert_called_once_with("cuda")
+
     def test_budget_rejects_unsupported_scheduler_loops(self):
         scheduler = self._scheduler()
         scheduler.enable_overlap = True
         scheduler.enable_overlap_mlx = False
-        scheduler.enable_pdmux = False
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         with envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(128):
             for attribute, value in (
                 ("enable_overlap", False),
                 ("enable_overlap_mlx", True),
-                ("enable_pdmux", True),
                 ("disaggregation_mode", DisaggregationMode.PREFILL),
             ):
                 with (

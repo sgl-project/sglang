@@ -1701,7 +1701,6 @@ class Scheduler(
             if (
                 not self.enable_overlap
                 or self.enable_overlap_mlx
-                or self.enable_pdmux
                 or get_parallel().pp_size > 1
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or get_disagg().enable_pd_role_switch
