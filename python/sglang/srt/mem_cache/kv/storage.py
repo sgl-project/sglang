@@ -703,7 +703,11 @@ class KVStorage:
         token_start: int,
         token_boundary: int,
         window: Optional[int] = None,
+        retain: Optional[int] = None,
     ) -> ResumeUnits:
+        """The units of ``sub_pool`` a peer continues ``req`` from. A window
+        keeps the tail its length states (``window`` when it states none),
+        widened to ``retain`` when a reader reaches further back."""
         if not 0 <= token_start <= token_boundary:
             raise ValueError("invalid continuation token span")
         planned = self._plan.sub_pool(sub_pool)
@@ -729,6 +733,7 @@ class KVStorage:
                 retained = window
             if retained is None:
                 raise ValueError("window handoff requires its retention length")
+            retained = max(retained, retain or 0)
             begin = max(begin, token_boundary - retained)
         begin = begin // planned.unit * planned.unit
         tokens = self.requests.req_to_token[req.kv.req_pool_idx, begin:token_boundary]

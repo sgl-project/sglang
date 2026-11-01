@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
     PrefillServerInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     check_state_wire,
     record_network_transfer,
     setup_state_kv_args,
@@ -173,8 +174,11 @@ class TestUnifiedWindowWire(CustomTestCase):
             check_state_wire(state_wire(prefill), state_wire(one_window))
 
 
-def _wire(sub_pools):
-    return [["swa", name] for name in sub_pools]
+def _wire(tails, *, sub_pools=True):
+    return [
+        ["swa", name if sub_pools else None] + ([tail] if sub_pools else [])
+        for name, tail in tails.items()
+    ]
 
 
 class _Request:
@@ -229,8 +233,38 @@ def _served_info(server):
 
 
 class TestStateEntryAgreement(CustomTestCase):
+    def test_a_prefill_keeping_more_of_a_window_pairs(self):
+        decode = _wire({"window_16": 16, "window_8": 8})
+        check_state_wire(_wire({"window_16": 16, "window_8": 13}), decode)
+        with self.assertRaisesRegex(RuntimeError, "shorter window tail"):
+            check_state_wire(decode, _wire({"window_16": 16, "window_8": 13}))
+
+    def test_unified_and_separate_pools_do_not_pair(self):
+        unified = _wire({"window_16": 16})
+        separate = _wire({"swa": None}, sub_pools=False)
+        for prefill, decode in ((unified, separate), (separate, unified)):
+            with self.assertRaisesRegex(RuntimeError, "mixed pool kinds"):
+                check_state_wire(prefill, decode)
+
+    def test_prefill_sends_the_tail_its_decode_keeps(self):
+        kv_args = SimpleNamespace(
+            state_types=[StateType.SWA, StateType.SWA, StateType.SWA],
+            state_sub_pools=["window_16", "window_8", None],
+        )
+        aligned = align_window_tails(
+            kv_args,
+            [[1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12]],
+            [[0, 0, 0, 0], [0, 0, 0], [0, 0]],
+        )
+        # The window carried by its sub-pool keeps its newest pages; an entry
+        # of a pool without sub-pools is left to the transfer as before.
+        self.assertEqual(aligned, [[1, 2, 3, 4], [7, 8, 9], [10, 11, 12]])
+
     def test_bootstrap_compares_each_pipeline_stage(self):
-        stage_wires = [_wire(["window_16", "window_8"]), _wire(["window_16"])]
+        stage_wires = [
+            _wire({"window_16": 16, "window_8": 8}),
+            _wire({"window_16": 16}),
+        ]
         server = CommonKVBootstrapServer("127.0.0.1", 0)
         for pp_rank, wire in enumerate(stage_wires):
             self.assertEqual(
@@ -245,8 +279,9 @@ class TestStateEntryAgreement(CustomTestCase):
                 pp_size=pp_size,
                 pp_rank=pp_rank,
                 kv_args=SimpleNamespace(
-                    state_types=[StateType.SWA] * len(wire),
+                    state_types=["swa"] * len(wire),
                     state_sub_pools=[entry[1] for entry in wire],
+                    state_window_tails=[entry[2] for entry in wire],
                 ),
             )
 
@@ -261,7 +296,7 @@ class TestStateEntryAgreement(CustomTestCase):
         server = CommonKVBootstrapServer("127.0.0.1", 0)
         self.assertEqual(
             _register(
-                server, pp_rank=0, pp_size=1, wire=_wire(["window_16"]), tp_size=2
+                server, pp_rank=0, pp_size=1, wire=_wire({"window_16": 16}), tp_size=2
             ).status,
             200,
         )
@@ -269,7 +304,7 @@ class TestStateEntryAgreement(CustomTestCase):
             server,
             pp_rank=0,
             pp_size=1,
-            wire=_wire(["window_8"]),
+            wire=_wire({"window_16": 13}),
             tp_rank=1,
             tp_size=2,
         )
