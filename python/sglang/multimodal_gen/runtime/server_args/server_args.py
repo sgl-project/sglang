@@ -616,7 +616,7 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_instance_id: int = 0
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
-    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_role_device: Literal["auto", "cpu", "cuda", "xpu"] = "auto"
     disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
