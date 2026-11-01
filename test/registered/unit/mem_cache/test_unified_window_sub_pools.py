@@ -1,9 +1,8 @@
 """Windows of different lengths are separate sub-pools named by their length.
 
-A plan may declare several windows. The longest keeps the name, and the
-external names, a single-window model has always used; every other window's
-prefix tree slot is named by its sub-pool. Storage, sizing, the allocator and
-the prefix tree hold any number of windows; host stores and PD peers carry one
+A plan may declare several windows, each a sub-pool named by its own length.
+Its prefix tree slot is named by its sub-pool. Storage, sizing, the allocator,
+the prefix tree and PD peers hold any number of windows; host stores carry one
 further window and refuse more where they read it.
 """
 
@@ -102,8 +101,9 @@ class TestWindowNames(CustomTestCase):
         self.assertEqual(_plan((16,)).primary_window().name, "window_16")
 
     def test_external_names_follow_sub_pools_and_window_slots(self):
-        # A window's prefix tree slot is named by its sub-pool. Host stores and
-        # PD peers name window entries by window slot and keep two.
+        # A window's prefix tree slot is named by its sub-pool. Host stores
+        # name window entries by window slot and keep two; PD peers carry every
+        # window as the window state type, told apart by sub-pool.
         first = SubPoolExternal(
             host_pool="swa", tree_component="WINDOW_16", metrics="swa", wire="swa"
         )
@@ -121,7 +121,7 @@ class TestWindowNames(CustomTestCase):
                 host_pool="auxiliary_swa",
                 tree_component="WINDOW_16",
                 metrics="swa",
-                wire="auxiliary_swa",
+                wire="swa",
             ),
         )
         slots = two.tree_slots()
@@ -138,17 +138,23 @@ class TestWindowNames(CustomTestCase):
             ["FULL", "SWA", "WINDOW_16"],
         )
         self.assertEqual(
-            [e.state_type for e in two.wire_entries()], ["swa", "auxiliary_swa"]
+            [(e.sub_pool, e.state_type) for e in two.wire_entries()],
+            [("window_16", "swa"), ("window_64", "swa")],
         )
-        # A prefix tree keeps every window; PD peers have no entry for a third.
+        # A prefix tree and PD peers keep every window.
         three = _plan((64, 16, 8))
         self.assertEqual(
             [(slot.component, slot.window) for slot in three.tree_slots()],
             [("FULL", None), ("WINDOW_64", 64), ("WINDOW_16", 16), ("WINDOW_8", 8)],
         )
         self.assertEqual(three.sub_pool("window_8").external.host_pool, "window_8")
-        with self.assertRaisesRegex(ValueError, "no state type"):
-            three.wire_entries()
+        # Peers list entries of one state type by sub-pool name, whatever order
+        # the plan holds the windows in.
+        self.assertEqual(
+            [(e.sub_pool, e.state_type) for e in three.wire_entries()],
+            [("window_16", "swa"), ("window_64", "swa"), ("window_8", "swa")],
+        )
+        self.assertEqual(_plan((8, 64, 16)).wire_entries(), three.wire_entries())
 
 
 class TestDraftWindowFusesByLifetime(CustomTestCase):

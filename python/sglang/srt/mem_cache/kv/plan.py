@@ -71,10 +71,14 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
     ),
 }
 
-# A window's prefix tree component is named by its sub-pool. Host pools and PD
-# peers name window entries by window slot, the plan's windows in `windows`
-# order, and have two window entries so far: a third window has none.
-_WINDOW_SLOT_HOST_AND_WIRE = ("swa", "auxiliary_swa")
+# A window's prefix tree component is named by its sub-pool. Host pools name
+# window entries by window slot, the plan's windows in `windows` order, and have
+# two window entries so far: a third window has none.
+_WINDOW_SLOT_HOST_POOLS = ("swa", "auxiliary_swa")
+
+# The PD state type every window travels as: its trailing pages. A peer tells
+# one window's entry from another's by the entry's sub-pool.
+WINDOW_WIRE = "swa"
 
 
 def window_tree_component(name: str) -> str:
@@ -83,16 +87,15 @@ def window_tree_component(name: str) -> str:
 
 
 def _window_external(slot: int, name: str) -> SubPoolExternal:
-    host_and_wire = (
-        _WINDOW_SLOT_HOST_AND_WIRE[slot]
-        if slot < len(_WINDOW_SLOT_HOST_AND_WIRE)
-        else name
-    )
     return SubPoolExternal(
-        host_pool=host_and_wire,
+        host_pool=(
+            _WINDOW_SLOT_HOST_POOLS[slot]
+            if slot < len(_WINDOW_SLOT_HOST_POOLS)
+            else name
+        ),
         tree_component=window_tree_component(name),
         metrics="swa",
-        wire=host_and_wire,
+        wire=WINDOW_WIRE,
     )
 
 
@@ -100,8 +103,7 @@ def _window_external(slot: int, name: str) -> SubPoolExternal:
 _WIRE_ORDER = (
     "minimax_index_k",
     "minimax_dense_kv",
-    "swa",
-    "auxiliary_swa",
+    WINDOW_WIRE,
     "block_scale",
     "block_scale_swa",
     "swa_ring",
@@ -318,8 +320,10 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
-        """The PD state entries, in the order peers list them. The owner's
-        token KV is the transfer's KV entries, not a state entry."""
+        """The PD state entries, in the order peers list them: by state type,
+        then by sub-pool name, so entries of one type (every window travels
+        as one) line up on both peers. The owner's token KV is the transfer's
+        KV entries, not a state entry."""
         entries = [
             WireEntry(
                 sub_pool=s.name,
@@ -356,7 +360,12 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         unknown = [e.state_type for e in entries if e.state_type not in _WIRE_ORDER]
         if unknown:
             raise ValueError(f"PD transfers have no state type for {unknown}")
-        return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
+        return tuple(
+            sorted(
+                entries,
+                key=lambda e: (_WIRE_ORDER.index(e.state_type), e.sub_pool),
+            )
+        )
 
 
 def _unit(lifetime: KVLifetime, page_size: int) -> int:
