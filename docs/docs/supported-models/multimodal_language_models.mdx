@@ -409,12 +409,25 @@ sglang serve \
 
 ### Performance Optimization
 
-For multimodal models, you can use `--mm-feature-transport=cuda_ipc` to optimize for latency at the cost of increased GPU memory usage:
+Multimodal feature transport defaults to CPU on every topology. GPU transports
+are opt-in and trade additional HBM usage for potentially lower transfer latency:
 
-- **Default behavior**: Multimodal feature tensors are moved to CPU after processing to save GPU memory
-- **With `--mm-feature-transport=cuda_ipc`**: Feature tensors stay in a bounded GPU pool shared over CUDA IPC, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
+- `--mm-feature-transport=cpu`: No GPU feature pool. Use this explicitly on older
+  builds or to override the legacy `SGLANG_USE_CUDA_IPC_TRANSPORT=1` opt-in.
+- `--mm-feature-transport=cuda_ipc`: A bounded GPU pool shared within one CUDA node.
+- `--mm-feature-transport=cuda_vmm`: A bounded GPU pool; cross-node sharing requires
+  configured MNNVL/IMEX and a supported model.
 
-Use this option when you have sufficient GPU memory and want to minimize latency for multimodal inference.
+`SGLANG_MM_FEATURE_CACHE_MB` limits the GPU transport pool (default 1024 MiB,
+shared across tokenizer workers on the base GPU), **not total GPU preprocessing
+memory**. GPU decode and preprocessing can allocate temporary tensors outside
+this pool; CPU transport does not force these stages onto CPU. A full GPU pool
+falls back to CPU transport per tensor. If you encounter pool-exhaustion hangs
+such as [#43402](https://github.com/sgl-project/sglang/issues/43402), use CPU
+transport; increasing the pool is not a fix for a leak or a blocked CUDA copy.
+
+Benchmark before opting into GPU transport. This flag does not control EPD
+encoder-output transfer or PD KV transfer.
 
 ### Multimodal Inputs Limitation
 

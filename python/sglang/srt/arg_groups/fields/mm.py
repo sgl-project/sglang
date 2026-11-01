@@ -147,11 +147,12 @@ class Mm(msgspec.Struct):
             help=(
                 "Transport multimodal features through CPU memory, a bounded CUDA IPC "
                 "pool, or a bounded CUDA VMM pool. "
-                "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
-                "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
-                "explicitly for single-node GPU transport. GPU transports reserve "
+                "Defaults to cpu on all topologies unless the legacy CUDA IPC "
+                "environment variable explicitly enables cuda_ipc. Select cuda_ipc "
+                "or cuda_vmm explicitly to use a GPU pool. GPU transports reserve "
                 "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
-                "back to CPU transport when the pool is full."
+                "back to CPU transport when the pool is full. This budget does not "
+                "limit GPU preprocessing peak memory."
             ),
             resolvable=True,
         ),

@@ -260,25 +260,10 @@ export const config = {
       options: [
         {
           id: "auto",
-          label: "Auto (topology-aware)",
-          hints: (s) => {
-            if (s.pdMode !== "unified") {
-              return [
-                "VLM transport: Auto -> CPU for PD; KV/KDA transfer is separate.",
-              ];
-            }
-            if (s.hw === "b300") {
-              return [
-                "VLM transport: Auto -> CUDA IPC (up to 1 GiB HBM; CPU fallback when full).",
-              ];
-            }
-            if (["gb200", "gb300"].includes(s.hw)) {
-              return [
-                "VLM transport: Auto -> CUDA VMM with IMEX, otherwise CPU (up to 1 GiB HBM).",
-              ];
-            }
-            return ["VLM transport: Auto -> CPU on this topology."];
-          },
+          label: "Default (CPU)",
+          hints: [
+            "VLM transport: CPU by default on all topologies; no GPU feature pool. Older builds or a legacy IPC override may differ; select CPU to enforce it.",
+          ],
         },
         {
           id: "cpu",

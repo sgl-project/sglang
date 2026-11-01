@@ -404,7 +404,7 @@ export const config = {
         "--enable-megamoe-for-layernorm-sp",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
-        // Multi-node MNNVL can auto-select CUDA VMM; keep CPU explicit here.
+        // Keep CPU explicit, including on older builds that auto-select VMM.
         "--mm-feature-transport cpu",
         "--enable-hierarchical-cache",
         "--hicache-size 200",
