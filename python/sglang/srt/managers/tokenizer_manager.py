@@ -1196,22 +1196,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "is set; the encoder is not loaded. Restart without the flag."
             )
 
-        # Reject audio input early for models that declare audio support
-        # (the processor exposes an audio token) but have no audio tower,
-        # e.g. gemma-4-31B-it, a non-audio variant of the Gemma 4 family
-        # whose config ships audio_config: null. Without this guard the
-        # audio items reach the scheduler, where get_audio_feature()
-        # raises inside model.forward and kills the scheduler process.
-        # Processors without an audio token never carry audio to the
-        # scheduler (the base processor drops it), so those models keep
-        # their existing behavior.
+        # Reject audio early when audio_config is explicitly None (audio
+        # tower disabled, e.g. gemma-4-31B-it); otherwise the audio items
+        # reach the scheduler and get_audio_feature() kills it. Models that
+        # cannot process audio (no audio token, e.g. GLM-5.3-Flash) or
+        # define their audio config differently (e.g. Phi-4 MM) are not
+        # affected.
+        hf_config = self.model_config.hf_config
         declares_audio = getattr(
             getattr(self.mm_processor, "mm_tokens", None), "audio_token", None
         )
         if (
             has_valid_data(obj.audio_data)
             and declares_audio
-            and not self.model_config.is_audio_understandable_model
+            and hasattr(hf_config, "audio_config")
+            and hf_config.audio_config is None
         ):
             raise ValueError(
                 f"Audio inputs are not supported by {self.served_model_name}"

@@ -1,20 +1,25 @@
 """
 Unit tests for early audio rejection in TokenizerManager._tokenize_one_request.
 
-A request carrying audio for a model that declares audio support but has no
-audio tower (e.g. a non-audio variant of a multimodal family such as
-gemma-4-31B-it) must be rejected with a per-request error at tokenization
-time. Without the guard, the audio items reach the scheduler, where
-get_audio_feature() raises inside model.forward and kills the scheduler
-process.
+A request carrying audio for a model whose config explicitly disables the
+audio tower (audio_config present but null, e.g. a non-audio variant of a
+multimodal family such as gemma-4-31B-it) must be rejected with a
+per-request error at tokenization time. Without the guard, the audio items
+reach the scheduler, where get_audio_feature() raises inside model.forward
+and kills the scheduler process.
 
 Covers:
-  - audio + audio-declaring model without an audio tower -> ValueError
-    naming the served model, raised before validation/dispatch
+  - audio + audio-declaring processor + explicit null audio_config
+    -> ValueError naming the served model, raised before validation/dispatch
   - empty audio payloads (None, [], [None], [[None]]) are not rejected
   - audio + audio-capable model proceeds
   - models whose processor does not declare audio (or have no processor)
     keep their existing behavior and are not rejected
+  - audio_config absent from the config (Phi-4 MM layout: the tower is
+    built from embd_layer) is not rejected - absence is not "disabled"
+  - audio_config living in other fields (MiDashengLM layout:
+    audio_encoder_config) is not rejected
+  - audio_config present as a plain dict (Dots3 layout) is allowed
   - the --language-model-only message takes precedence over the audio one
 """
 
@@ -33,6 +38,8 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_ABSENT = object()
+
 
 def _make_mm_processor(declares_audio: bool):
     return SimpleNamespace(
@@ -41,11 +48,21 @@ def _make_mm_processor(declares_audio: bool):
     )
 
 
-def _make_tm(declares_audio: bool = True) -> TokenizerManager:
+def _make_tm(
+    declares_audio: bool = True,
+    audio_config=None,
+    extra_config=None,
+) -> TokenizerManager:
+    # audio_config: None -> explicit null layout; _ABSENT -> attribute
+    # missing; any other value -> audio tower present.
+    hf_config = SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"])
+    if audio_config is not _ABSENT:
+        hf_config.audio_config = audio_config
+    for name, value in (extra_config or {}).items():
+        setattr(hf_config, name, value)
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.model_config = MagicMock()
-    tm.model_config.is_audio_understandable_model = False
-    tm.model_config.hf_config.architectures = ["Gemma4ForConditionalGeneration"]
+    tm.model_config.hf_config = hf_config
     tm.served_model_name = "test-model"
     tm.max_req_input_len = 8192
     tm.mm_processor = _make_mm_processor(declares_audio)
@@ -109,8 +126,7 @@ class TestAudioRejectionInTokenizeOneRequest(CustomTestCase):
                 self.assertIs(_run_tokenize(tm, _make_request(payload)), sentinel)
 
     def test_audio_allowed_for_audio_capable_model(self):
-        tm = _make_tm()
-        tm.model_config.is_audio_understandable_model = True
+        tm = _make_tm(audio_config={"num_mel_bins": 128})
         sentinel = object()
         _stub_pipeline_past_guard(tm, sentinel)
 
@@ -137,6 +153,37 @@ class TestAudioRejectionInTokenizeOneRequest(CustomTestCase):
                     tm._validate_mm_limits.assert_called_once()
                 else:
                     tm._validate_mm_limits.assert_not_called()
+
+    def test_audio_allowed_when_audio_config_absent(self):
+        """Phi-4 MM layout: the config has no audio_config attribute at all;
+        the audio tower is built from embd_layer. Absence must not be read
+        as 'disabled'."""
+        tm = _make_tm(audio_config=_ABSENT)
+        sentinel = object()
+        _stub_pipeline_past_guard(tm, sentinel)
+
+        self.assertIs(_run_tokenize(tm, _make_request(["x.wav"])), sentinel)
+
+    def test_audio_allowed_when_audio_config_lives_in_other_fields(self):
+        """MiDashengLM layout: the encoder config lives under
+        audio_encoder_config and there is no audio_config attribute."""
+        tm = _make_tm(
+            audio_config=_ABSENT,
+            extra_config={"audio_encoder_config": {"hidden_size": 896}},
+        )
+        sentinel = object()
+        _stub_pipeline_past_guard(tm, sentinel)
+
+        self.assertIs(_run_tokenize(tm, _make_request(["x.wav"])), sentinel)
+
+    def test_audio_allowed_when_audio_config_is_plain_dict(self):
+        """Dots3 layout: audio_config present as a plain dict (not a
+        PretrainedConfig) - the tower is built, so the request proceeds."""
+        tm = _make_tm(audio_config={"encoder_type": "dots", "whisper_config": {}})
+        sentinel = object()
+        _stub_pipeline_past_guard(tm, sentinel)
+
+        self.assertIs(_run_tokenize(tm, _make_request(["x.wav"])), sentinel)
 
     def test_language_model_only_message_takes_precedence(self):
         tm = _make_tm()

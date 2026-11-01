@@ -366,12 +366,11 @@ class TestDecisionCheckpointConfig(CustomTestCase):
 
 
 class TestAudioUnderstandableFlag(CustomTestCase):
-    """is_audio_understandable_model must key on the tower, not the attribute.
-
-    Non-audio variants of multimodal families ship a config.json entry with
-    audio_config: null. A presence check (hasattr) reads that as audio-capable
-    and lets audio requests reach a model with no audio tower, crashing the
-    scheduler. The flag must be True only when an audio config is present.
+    """is_audio_understandable_model must key on the value, not attribute
+    presence. Non-audio variants of multimodal families ship audio_config:
+    null in config.json; a presence check (hasattr) reads that as
+    audio-capable and /model_info misreports has_audio_understanding. The
+    flag must be True only when an audio config value is present.
     """
 
     def _build(self, **config_kwargs):
