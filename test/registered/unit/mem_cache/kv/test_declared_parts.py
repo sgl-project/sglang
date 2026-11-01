@@ -36,6 +36,8 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 # The tree slot of the fused draft's window sub-pool ("draft_swa") when the
 # target keeps a window of its own.
 DRAFT_WINDOW = ComponentType.of("DRAFT_SWA")
+# The target window's slot in a tree that also keeps the draft window.
+TARGET_WINDOW = ComponentType.of("WINDOW_16")
 
 
 class _RequestKV:
@@ -267,7 +269,6 @@ class TestDeclaredParts(CustomTestCase):
             FusedDraftPlacement,
         )
         from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -341,7 +342,7 @@ class TestDeclaredParts(CustomTestCase):
                         # after this window has left the current decode tail.
                         with patch.object(cache, "swa_retain_floor", return_value=0):
                             batch.maybe_evict_swa()
-                        for ct in (ComponentType.SWA, DRAFT_WINDOW):
+                        for ct in (TARGET_WINDOW, DRAFT_WINDOW):
                             self.assertEqual(node.component_data[ct].lock_ref, 1)
                     batch.maybe_evict_swa()
                     # Repeated scheduling must neither release twice nor drop
@@ -349,11 +350,11 @@ class TestDeclaredParts(CustomTestCase):
                     batch.maybe_evict_swa()
                     cache.evict(
                         EvictParams(
-                            window_num_tokens={ComponentType.SWA: 80, DRAFT_WINDOW: 80}
+                            window_num_tokens={TARGET_WINDOW: 80, DRAFT_WINDOW: 80}
                         )
                     )
                     for ct, window in (
-                        (ComponentType.SWA, 16),
+                        (TARGET_WINDOW, 16),
                         (DRAFT_WINDOW, draft_window),
                     ):
                         self.assertEqual(
@@ -372,7 +373,7 @@ class TestDeclaredParts(CustomTestCase):
                 cache.evict(
                     EvictParams(
                         num_tokens=80,
-                        window_num_tokens={ComponentType.SWA: 80, DRAFT_WINDOW: 80},
+                        window_num_tokens={TARGET_WINDOW: 80, DRAFT_WINDOW: 80},
                     )
                 )
                 self.assertEqual(storage.accounting_violations(), [])
@@ -1115,7 +1116,7 @@ class TestDeclaredParts(CustomTestCase):
                         node,
                         skip_lock_components=(
                             ComponentType.FULL,
-                            ComponentType.SWA,
+                            TARGET_WINDOW,
                             DRAFT_WINDOW,
                         ),
                     )
@@ -1876,13 +1877,10 @@ class TestDeclaredParts(CustomTestCase):
                             a.free(ids[16:])
                         else:
                             from sglang.srt.managers.schedule_batch import ReqKvInfo
-                            from sglang.srt.mem_cache.unified_cache.component_type import (
-                                ComponentType,
-                            )
 
                             storage.requests.req_to_token[0, :32] = ids
                             kv = ReqKvInfo(req_pool_idx=0)
-                            kv.set_evicted_seqlen(ComponentType.SWA, 16)
+                            kv.set_evicted_seqlen(TARGET_WINDOW, 16)
                             if window < 16:
                                 kv.set_evicted_seqlen(DRAFT_WINDOW, 24)
                             storage.free_row(kv, [(0, 32)])
@@ -2084,7 +2082,7 @@ class TestDeclaredParts(CustomTestCase):
                     def walk(params, **kwargs):
                         result = original(params, **kwargs)
                         evicted.append(
-                            result.window_num_tokens_evicted.get(ComponentType.SWA, 0)
+                            result.window_num_tokens_evicted.get(TARGET_WINDOW, 0)
                         )
                         return result
 
@@ -2107,39 +2105,40 @@ class TestDeclaredParts(CustomTestCase):
     def test_host_match_keeps_each_window_restore_length(self):
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
         root = object()
         node = SimpleNamespace(
             parent=root,
             component_data={
-                ComponentType.SWA: SimpleNamespace(
-                    value=None, host_value=torch.arange(4)
-                ),
+                TARGET_WINDOW: SimpleNamespace(value=None, host_value=torch.arange(4)),
                 DRAFT_WINDOW: SimpleNamespace(value=None, host_value=torch.arange(32)),
             },
         )
         for order in (
-            (ComponentType.SWA, DRAFT_WINDOW),
-            (DRAFT_WINDOW, ComponentType.SWA),
+            (TARGET_WINDOW, DRAFT_WINDOW),
+            (DRAFT_WINDOW, TARGET_WINDOW),
         ):
             with self.subTest(order=order):
                 result = MatchResult(64, node, node, node, full_kv_hit_length=64)
                 for ct in order:
                     component = SWAComponent.__new__(SWAComponent)
                     component.component_type = ct
-                    component.tree_core = SimpleNamespace(root_node=root, page_size=4)
-                    component.sliding_window_size = 4 if ct == ComponentType.SWA else 32
+                    component.tree_core = SimpleNamespace(
+                        root_node=root,
+                        page_size=4,
+                        slot_id=lambda family: TARGET_WINDOW,
+                    )
+                    component.sliding_window_size = 4 if ct == TARGET_WINDOW else 32
                     result = component.finalize_match_result_in_tree_core(
                         result, None, [], 0
                     )
                 self.assertEqual(
-                    result.window_host_hit_lengths.get(ComponentType.SWA, 0), 4
+                    result.window_host_hit_lengths.get(TARGET_WINDOW, 0), 4
                 )
                 self.assertEqual(
                     result.window_host_hit_lengths,
-                    {ComponentType.SWA: 4, DRAFT_WINDOW: 32},
+                    {TARGET_WINDOW: 4, DRAFT_WINDOW: 32},
                 )
                 req = Req.__new__(Req)
                 req.matched_window_host_hit_lengths = dict(
@@ -2148,15 +2147,15 @@ class TestDeclaredParts(CustomTestCase):
                 req.staged_prefetch_plan = None
                 self.assertEqual(
                     req.window_host_hit_lengths,
-                    {ComponentType.SWA: 4, DRAFT_WINDOW: 32},
+                    {TARGET_WINDOW: 4, DRAFT_WINDOW: 32},
                 )
                 req.staged_prefetch_plan = SimpleNamespace(
-                    windows={ComponentType.SWA: None, DRAFT_WINDOW: None},
+                    windows={TARGET_WINDOW: None, DRAFT_WINDOW: None},
                     window_tokens=lambda ct: 16,
                 )
                 self.assertEqual(
                     req.window_host_hit_lengths,
-                    {ComponentType.SWA: 16, DRAFT_WINDOW: 16},
+                    {TARGET_WINDOW: 16, DRAFT_WINDOW: 16},
                 )
 
     def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
@@ -2235,7 +2234,7 @@ class TestDeclaredParts(CustomTestCase):
                     full_tokens=8,
                     extend_input_len=1,
                     max_new_tokens=400,
-                    window_host_hit_lengths={ComponentType.SWA: 5, DRAFT_WINDOW: 9},
+                    window_host_hit_lengths={TARGET_WINDOW: 5, DRAFT_WINDOW: 9},
                     chunk_limit=8,
                 )
                 self.assertEqual(demand.full_tokens, 416)
@@ -2272,7 +2271,7 @@ class TestDeclaredParts(CustomTestCase):
             sliding_window_size=16,
             # The target's window slot retains its own window; the draft's more.
             window_retain_size=lambda component: (
-                16 if component == ComponentType.SWA else 32
+                16 if component == TARGET_WINDOW else 32
             ),
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
@@ -2545,7 +2544,7 @@ class TestDeclaredParts(CustomTestCase):
                     key=cache_key,
                     value=value.clone(),
                     component_evicted_seqlens={
-                        ComponentType.SWA: value.numel() - 8,
+                        ComponentType.of("WINDOW_8"): value.numel() - 8,
                         DRAFT_WINDOW: value.numel() - 4,
                     },
                 )
@@ -2570,7 +2569,8 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))
         cache.evict(
             EvictParams(
-                num_tokens=80, window_num_tokens={ComponentType.SWA: 8, DRAFT_WINDOW: 4}
+                num_tokens=80,
+                window_num_tokens={ComponentType.of("WINDOW_8"): 8, DRAFT_WINDOW: 4},
             )
         )
         # The evicted end holes are credited before any flush: the planned
@@ -2763,7 +2763,7 @@ class TestDeclaredParts(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=64,
-                window_num_tokens={ComponentType.SWA: 64, DRAFT_WINDOW: 64},
+                window_num_tokens={TARGET_WINDOW: 64, DRAFT_WINDOW: 64},
             )
         )
         self.assertEqual(
