@@ -2472,6 +2472,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state is None:
             return
         logger.debug(f"Abort broadcast hit. {obj.rid=} {state.dispatched=}")
+        if state.abort_sent:
+            # abort_request deduplicates, but the router's pending entry still
+            # needs a visible claim to be cleared.
+            self._dispatch_to_scheduler(AbortReq(rid=obj.rid))
+            return
         self.abort_request(rid=obj.rid)
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
