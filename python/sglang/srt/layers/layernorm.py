@@ -945,6 +945,31 @@ class RMSNorm(BaseFusedOp):
         else:
             return self.forward_native(x, residual, post_residual_addition)
 
+    def forward_mps(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        from sglang.kernels.ops.layernorm.rmsnorm_mps import (
+            rmsnorm_mps,
+            rmsnorm_mps_supported,
+        )
+
+        # The Metal kernel covers the plain variant; the rest stays native.
+        if (
+            post_residual_addition is None
+            and self.variance_size_override is None
+            and not self.cast_x_before_out_mul
+            and not self.fp32_residual
+            and self.override_orig_dtype is None
+            and x.shape[-1] == self.hidden_size
+            and rmsnorm_mps_supported(x, self.weight, residual)
+        ):
+            return rmsnorm_mps(x, self.weight, self.variance_epsilon, residual)
+        return self.forward_native(x, residual, post_residual_addition)
+
     def forward_xpu(
         self,
         x: torch.Tensor,
