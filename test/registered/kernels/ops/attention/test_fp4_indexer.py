@@ -461,6 +461,81 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
         )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
+def test_fp4_paged_logits_balanced_matches_per_row_random(seed, heads, ratio, masked):
+    """Unconstrained inputs: Gaussian queries and weights, every e2m1 code, e8m0
+    exponents from the extremes to the typical range, shuffled pages and ragged
+    lengths. The balanced split must reproduce the per-row kernel bit for bit."""
+    from sglang.srt.environ import envs
+
+    device = get_device()
+    gen = torch.Generator(device=device).manual_seed(seed)
+    cpu_gen = torch.Generator().manual_seed(seed)
+    batch, capacity, num_reqs = 77, 9000, 19
+    pages_per_req = (capacity + PAGE_SIZE - 1) // PAGE_SIZE
+    num_pages = num_reqs * pages_per_req
+    table = torch.randint(
+        0,
+        256,
+        (num_pages, PAGE_SIZE * 68),
+        device=device,
+        dtype=torch.uint8,
+        generator=gen,
+    )
+    scales = table[:, PAGE_SIZE * 64 :]
+    scales.copy_(
+        torch.randint(
+            110, 145, scales.shape, device=device, dtype=torch.uint8, generator=gen
+        )
+    )
+    # A few exponents at the e8m0 extremes (subnormal and very large scales).
+    extremes = torch.tensor([0, 1, 126, 127, 128, 200, 254], device=device)
+    pick = torch.rand(scales.shape, device=device, generator=gen) < 0.01
+    choice = torch.randint(
+        0, len(extremes), (int(pick.sum()),), device=device, generator=gen
+    )
+    scales[pick] = extremes[choice].to(torch.uint8)
+    pages = torch.randperm(num_pages, device=device, generator=gen)
+    slots = (
+        pages.view(num_reqs, pages_per_req, 1) * PAGE_SIZE
+        + torch.arange(PAGE_SIZE, device=device)
+    ).flatten(1)[:, :capacity]
+    req_table = torch.zeros(
+        (num_reqs, capacity * ratio), device=device, dtype=torch.int32
+    )
+    req_table[:, ::ratio] = (slots * ratio).int()
+    req = torch.randint(0, num_reqs, (batch,), device=device, generator=gen).int()
+    edges = torch.tensor([0, 1, 63, 64, 65, 127, 128, capacity, capacity + 9])
+    lens = torch.randint(0, capacity, (batch,), generator=cpu_gen)
+    lens[: len(edges)] = edges
+    lens = lens[torch.randperm(batch, generator=cpu_gen)].to(device, torch.int32)
+    q = (torch.randn(batch, heads, HEAD_DIM, device=device, generator=gen) * 3).to(
+        torch.bfloat16
+    )
+    weights = torch.randn(batch, heads, device=device, generator=gen).to(torch.bfloat16)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=device, generator=gen) > 0.5
+        if masked
+        else None
+    )
+    args = (q, weights, req, req_table, lens, table, PAGE_SIZE, capacity, ratio)
+
+    with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(False):
+        expected = fp4_index_logits_paged(*args, candidate_mask)
+    with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(True):
+        actual = fp4_index_logits_paged(*args, candidate_mask)
+    visible = (
+        torch.arange(capacity, device=device)[None, :]
+        < lens.clamp(max=capacity)[:, None]
+    )
+    assert torch.equal(
+        actual[visible].view(torch.int32), expected[visible].view(torch.int32)
+    )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
