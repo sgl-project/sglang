@@ -150,12 +150,34 @@ class XpuPlatform(Platform):
             logger.info("Using Torch SDPA backend for Intel XPU.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
+        if selected_backend == AttentionBackendEnum.VMOBA_ATTN:
+            # Raise rather than fall back: silently serving dense attention
+            # under an explicit --attention-backend vmoba_attn would report
+            # dense numbers as VMoBA's.
+            if dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"Video MoBA on Intel XPU requires float16 or bfloat16, got {dtype}."
+                )
+            try:
+                from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba.xpu_flash_attn import (  # noqa: F401
+                    flash_attn_varlen_forward,
+                )
+                from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
+                    VMOBAAttentionBackend,
+                )
+            except ImportError as e:
+                raise ImportError(
+                    "Video MoBA on Intel XPU needs sgl-kernel's XPU varlen "
+                    "attention; see csrc/attn/vmoba_attn/README.md."
+                ) from e
+            logger.info("Using Video MoBA attention backend for Intel XPU.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
+
         if selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.SAGE_ATTN_3,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-            AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.AITER,
         ):
             logger.warning(
