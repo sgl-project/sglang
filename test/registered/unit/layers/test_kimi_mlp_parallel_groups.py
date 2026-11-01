@@ -143,6 +143,8 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                 else (rank, 4)
                             )
                             self.assertEqual(module._dense_attn_tp, auto_attn)
+                            # A Kimi MLP built directly keeps the default.
+                            self.assertTrue(module.down_proj.symmetric_output)
                             for name in ("gate_up_proj", "down_proj"):
                                 layer = getattr(module, name)
                                 self.assertEqual(rank_size(layer), (r, s))
@@ -238,6 +240,12 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                             torch.testing.assert_close(layer.weight, expected)
                         self.assertFalse(module.down_proj.reduce_results)
                         self.assertFalse(module.down_proj.use_dp_attention_reduce)
+                        # tp1 shared experts never feed a collective, so their
+                        # output stays out of the symmetric pool.
+                        self.assertEqual(
+                            module.down_proj.symmetric_output,
+                            not owner._shared_experts_tp1,
+                        )
                 with parallel_scope(shared_experts_tp_size=2):
                     with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
                         build_shared_experts(ep_a2a=False)
