@@ -130,7 +130,11 @@ class MoeRunner:
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
         elif runner_backend.is_flashinfer_cutlass():
-            self.runner_core = None  # FlashInfer CUTLASS only supports fused path
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassRunnerCore,
+            )
+
+            self.runner_core = FlashInferCutlassRunnerCore(config)
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
             # Import flashinfer_cutlass here (not at module top, to avoid a circular

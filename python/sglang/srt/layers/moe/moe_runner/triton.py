@@ -19,6 +19,10 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+        MSCCLPPExpertMajorLatencyCombineInput,
+        MSCCLPPExpertMajorLatencyDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -337,4 +341,114 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_pre_permute("mscclpp_latency_expert_major", "triton")
+def pre_permute_mscclpp_latency_expert_major_to_triton(
+    dispatch_output: MSCCLPPExpertMajorLatencyDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """Use unit routing weights in GEMM; MSCCL++ combine applies the real weights."""
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
+
+    if hidden_states_scale is not None:
+        raise NotImplementedError(
+            "MSCCL++ latency fp8 dispatch (pre-quantized activations) is not yet "
+            "supported by the Triton runner; use BF16 latency dispatch."
+        )
+
+    num_local_experts, slots_per_expert, hidden_dim = hidden_states.shape
+    device = hidden_states.device
+
+    hidden_flat = hidden_states.reshape(
+        num_local_experts * slots_per_expert, hidden_dim
+    )
+
+    # Each dispatched slot already belongs to one expert.
+    # Alignment and activation kernels require int32 expert IDs.
+    slot_arange = torch.arange(slots_per_expert, device=device).unsqueeze(0)
+    valid = slot_arange < masked_m.to(torch.long).unsqueeze(1)
+    expert_col = torch.arange(
+        num_local_experts, device=device, dtype=torch.int32
+    ).unsqueeze(1)
+    # Build padding IDs on-device to avoid host copies during CUDA graph capture.
+    pad_id = expert_col.new_full((), -1)
+    triton_topk_ids = torch.where(valid, expert_col, pad_id).reshape(-1, 1)
+    triton_topk_weights = torch.ones(
+        (num_local_experts * slots_per_expert, 1),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        up_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_flat,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        triton_topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+    running_state["up_moe_use_tma"] = up_moe_use_tma
+    running_state["mscclpp_latency_shape"] = (
+        num_local_experts,
+        slots_per_expert,
+        hidden_dim,
+    )
+
+    return TritonRunnerInput(
+        hidden_states=hidden_flat,
+        topk_weights=triton_topk_weights,
+        topk_ids=triton_topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_post_permute("triton", "mscclpp_latency_expert_major")
+def post_permute_triton_to_mscclpp_latency_expert_major(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MSCCLPPExpertMajorLatencyCombineInput:
+    """Leave routing weights to MSCCL++ combine; routed scaling is already applied."""
+    from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+        MSCCLPPExpertMajorLatencyCombineInput,
+    )
+
+    num_local_experts, slots_per_expert, hidden_dim = running_state[
+        "mscclpp_latency_shape"
+    ]
+    masked_output = runner_output.hidden_states.reshape(
+        num_local_experts, slots_per_expert, hidden_dim
+    )
+
+    return MSCCLPPExpertMajorLatencyCombineInput(
+        hidden_states=masked_output,
     )
