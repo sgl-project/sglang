@@ -2,8 +2,8 @@
 
 A diffusion kernel is only as good as the wrapper that decides when to use it,
 and that decision is model-specific: FLUX.1 and GLM-Image feed different adaLN
-layouts to the same LayerNorm+modulate kernel, Sana only engages on non-default
-streams, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
+layouts to the same LayerNorm+modulate kernel, Sana gates on stream and model
+opt-in, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
 live in ``test_norm.py`` / ``test_modulate.py`` / ``test_rope.py``; this file
 covers the wiring: right kernel, right reference, gate ends in the right state.
 
@@ -793,6 +793,7 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
 
 
 @requires_inline_ptx
+@pytest.mark.parametrize("allow_eager", [False, True])
 @pytest.mark.parametrize(
     "shape,nmod,transposed",
     [
@@ -802,10 +803,15 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
         ((1, 37, 2240), 6, False),
     ],
 )
-def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
-    # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
-    # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
-    # chunk layouts, transposed the permuted layout the Sana DiT serves.
+def test_sana_fused_ln_modulate_is_bit_exact(
+    shape, nmod, transposed, allow_eager, monkeypatch
+):
+    gate = BitExactFusionGate("Sana test LN+modulate", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    # Width 2240 exercises a partial tail chunk; nmod mirrors the two adaLN
+    # layouts, and transposed covers the permuted layout the DiT serves.
     torch.manual_seed(0)
     batch, seq, hidden = shape
     norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
@@ -814,27 +820,36 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
         x = x.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
-    # default-stream eager serving must stay on the untouched eager chain
-    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    sana_ln_modulate(norm, x, scale, shift)
-    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
-    # The fusion engages on non-default streams (the BCG warmup/capture path).
-    # x/scale/shift were filled on the default stream, so the side stream must
-    # wait for that work before reading them -- without this the fused kernel
-    # can read a half-written tensor, the first-sight torch.equal check fails,
-    # and the gate disables itself *permanently*, which then breaks every later
-    # parametrization too. It only loses the race when the GPU is contended,
-    # which is why it shows up on shared CI runners and not on an idle box.
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
+
+    # Image inference still defaults to the eager chain.
+    with torch.no_grad():
         out = sana_ln_modulate(norm, x, scale, shift)
-        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
-    torch.cuda.current_stream().wait_stream(side)
+        assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    assert not gate.verified_sigs
+
+    # The video opt-in must preserve autograd on the default stream.
+    with torch.enable_grad():
+        grad_out = sana_ln_modulate(
+            norm, x.requires_grad_(), scale, shift, allow_eager=allow_eager
+        )
+    assert grad_out.requires_grad
+    assert torch.equal(grad_out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    x = x.detach()
+    assert not gate.verified_sigs
+
+    # The BCG side stream must wait for inputs filled on the default stream
+    # before first-use verification; otherwise a race permanently disables it.
+    current = torch.cuda.current_stream()
+    stream = current if allow_eager else torch.cuda.Stream()
+    stream.wait_stream(current)
+    with torch.no_grad(), torch.cuda.stream(stream):
+        out = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+        assert len(gate.verified_sigs) == 1
+        out2 = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+    current.wait_stream(stream)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
-    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
+    assert torch.equal(out2, out) and not gate.disabled
 
 
 # -------------------------------------------------------------------------
