@@ -1272,17 +1272,35 @@ class KimiK3MoE(nn.Module):
         takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
         kernels return from apply() before that quant, and precision="bf16"
         skips it as well, so those keep the bf16 contract even though the
-        runner backend is the same."""
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        runner backend is the same.
+
+        On aiter, the SiTUv2 A8W4 mxfp8 quant indexes rows by input.stride(-2);
+        every other aiter route still gets the dense bf16 buffer."""
+        from sglang.srt.layers.quantization.mxfp4 import (
+            Mxfp4MoEMethod,
+            _aiter_situ_uses_a8w4,
+        )
 
         method = self.experts.quant_method
+        runner = self.experts.runner
         return not (
             isinstance(method, Mxfp4MoEMethod)
-            and method.use_flashinfer
-            and not method.use_marlin
-            and method._fi_kernel == "trtllm_sm100"
-            and method.flashinfer_mxfp4_moe_precision == "default"
-            and method.hidden_size == self.moe_hidden_size
+            and (
+                (
+                    method.use_flashinfer
+                    and not method.use_marlin
+                    and method._fi_kernel == "trtllm_sm100"
+                    and method.flashinfer_mxfp4_moe_precision == "default"
+                    and method.hidden_size == self.moe_hidden_size
+                )
+                or (
+                    runner is not None
+                    and runner.runner_backend.is_aiter()
+                    and self.experts.moe_runner_config.activation == "situ"
+                    and _aiter_situ_uses_a8w4()
+                    and not self._front_fp32
+                )
+            )
         )
 
     @cached_property
@@ -1918,15 +1936,23 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+            from sglang.kernels.ops.attention import (
+                kda_fused_decode_aiter_hip,
+                kda_fused_decode_gfx950,
+            )
 
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
-            backend_available = (
-                backend == "aiter"
-                and kda_fused_decode_aiter_hip.available(f_b_weight.device)
+            backend = os.environ.get(
+                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
+            ).lower()
+            fused_ops = {
+                "aiter": kda_fused_decode_aiter_hip,
+                "gfx950": kda_fused_decode_gfx950,
+            }.get(backend)
+            backend_available = fused_ops is not None and fused_ops.available(
+                f_b_weight.device
             )
             if (
                 backend_available
@@ -1952,7 +1978,7 @@ class KimiK3DeltaAttention(nn.Module):
                     float(self.o_norm.eps),
                     a_log,
                 )
-                kda_fused_decode_aiter_hip.warmup(
+                fused_ops.warmup(
                     f_b_weight=f_b_weight,
                     conv_weight=w,
                     A_log=a_log,
@@ -1962,6 +1988,7 @@ class KimiK3DeltaAttention(nn.Module):
                     norm_eps=float(self.o_norm.eps),
                 )
                 layer._k3_hip_fused_decode_backend = backend
+                layer._k3_hip_fused_decode_ops = fused_ops
                 self._kda_hip_fused_decode_ready = True
             return
         layer = self.attn
@@ -2396,7 +2423,7 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
@@ -2404,12 +2431,12 @@ def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     neither a later pipeline rank nor a draft model's capture of the target's
     hidden states can take them; it is decided at construction. Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one. ``sp_collective``:
-    whether K3's SP collective is enabled on this rank."""
+    every layer from the first MoE layer on must be one. This layout also
+    works with NCCL: custom collective kernels only fuse the local bank
+    read with the gather, and are not required to keep the bank sharded."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -2454,9 +2481,7 @@ def _stage_facts(
     ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
     if config.attn_res_block_size is not None:
         if bank is None:
-            bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
-            )
+            bank = AttnBankState.facts(reads_slices=_carries_bank_slices(config))
         attn_ops = dict(
             read=bank.attn_readout,
             update=bank.attn_update,
@@ -2621,7 +2646,7 @@ class KimiK3DecoderLayer(nn.Module):
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2724,7 +2749,7 @@ class KimiK3LinearModel(nn.Module):
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
-        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
+        self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (

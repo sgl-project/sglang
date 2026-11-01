@@ -948,6 +948,7 @@ class QwenImageCrossAttention(nn.Module):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.AITER_SAGE,
+                AttentionBackendEnum.AITER_QUANT,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,

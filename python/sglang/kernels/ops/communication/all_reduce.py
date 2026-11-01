@@ -206,6 +206,10 @@ class IPCManager(tvm_ffi.Object):
         self.__ffi_init__()
 
 
+# The dtypes the kernels reduce: those `FloatTrait` covers in distributed/communicator.cuh.
+SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
 @cache_once
 def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())

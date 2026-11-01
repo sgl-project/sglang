@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_cache.linker_factory import (
     create_unified_cache_linker,
 )
@@ -94,6 +95,8 @@ class CacheLinkerAttachment:
             raise
         counter = linker.layer_done_counter
         self._kvcache.register_layer_transfer_counter(counter)
+        if PoolName.MAMBA in linker.pools:
+            self._kvcache.layer_router.load_parts_layer_wise()
         self._register_layer_transfer_counter(counter)
         self.linker_backend = linker_backend
         self.linker_config = deepcopy(linker_config)

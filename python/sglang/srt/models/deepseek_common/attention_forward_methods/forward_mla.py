@@ -47,6 +47,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _is_sail,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -59,6 +60,7 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
     is_in_prefill_graph_scope,
@@ -90,6 +92,38 @@ def _select_local_dcp_heads_for_autotune(
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+
+
+@eager_on_graph(True)
+def bcg_dcp_extend_kv_gather(
+    token_to_kv_pool,
+    attn_mqa,
+    forward_batch: ForwardBatch,
+    kv_lora_rank: int,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    """Assemble the DCP extend KV buffer; an eager break under breakable graphs.
+    Under a prefill graph, read the live batch: replay re-supplies the capture-time arg."""
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
+    metadata = forward_batch.attn_dcp_metadata
+    if metadata.dcp_extend_prefix_lens_sum == 0:
+        # No prefix KV on any DCP rank: skip the collective.
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        return
+    all_gather_kv_cache_for_mla_extend(
+        token_to_kv_pool,
+        attn_mqa,
+        forward_batch.extend_prefix_lens_cpu,
+        metadata.dcp_local_prefix_kv_indices,
+        metadata.dcp_extend_prefix_lens_sum,
+        metadata.dcp_kv_buffer,
+        kv_lora_rank,
+        k_nope,
+        k_pe,
+    )
 
 
 if _is_cuda:
@@ -127,7 +161,12 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
-            or (self.use_dsa and mode.is_extend())
+            or (
+                self.use_dsa
+                # ROCm only: the draft shards its KV like the target, so its
+                # extend merges per-rank partials the same way the target does.
+                and mode.is_extend(include_draft_extend_v2=_is_hip)
+            )
         )
 
     def is_dcp_q_replicate_phase(
@@ -324,12 +363,11 @@ class DeepseekMLAForwardMixin:
             and (cp_overlap is None or cp_overlap.can_fuse_bmm)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
-        # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
+        # weights and skip the per-layer Q all-gather.
         q_replicate_active = (
             self.is_dcp_q_replicate_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
-            and self.q_b_proj_qrep_weight is not None
         )
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
@@ -401,11 +439,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
-                        -1,
-                        self.num_local_heads * self.dcp_size,
-                        self.qk_head_dim,
-                    )
+                    q = self.q_b_proj_replicated_forward(q)
                 else:
                     q = self.q_b_proj_forward(q)
 
@@ -482,13 +516,7 @@ class DeepseekMLAForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * self.dcp_size,
-                    self.qk_head_dim,
-                )
+                q = self.q_b_proj_replicated_forward(hidden_states)
             else:
                 q = self.q_proj(hidden_states)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
@@ -512,10 +540,8 @@ class DeepseekMLAForwardMixin:
             )
         if q_replicate_active:
             # full-head absorb with the pre-gathered w_kc (q_nope already full-head)
-            q_nope_out = (
-                torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
-                .transpose(0, 1)
-                .contiguous()
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep).transpose(
+                0, 1
             )
         elif getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -572,7 +598,7 @@ class DeepseekMLAForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
+            elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_sail:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -684,13 +710,10 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
+                bcg_dcp_extend_kv_gather(
                     get_token_to_kv_pool(),
                     self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                    forward_batch,
                     self.kv_lora_rank,
                     k_nope,
                     k_pe,
@@ -746,6 +769,16 @@ class DeepseekMLAForwardMixin:
                     is_neox=self.rotary_emb.is_neox_style,
                     llama_4_scaling=llama_4_scaling,
                 )
+            # SailFlashMLABackend consumes the split q/k and has no
+            # llama_4_scaling argument of its own, so scale both halves before
+            # dispatch. The concat branch below scales the joined q instead.
+            if (
+                llama_4_scaling is not None
+                and self.current_attention_backend == "flashmla"
+            ):
+                q_nope_out *= llama_4_scaling
+                if q_pe is not None:
+                    q_pe *= llama_4_scaling
             if fusion_plan is not None:
                 self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
@@ -899,7 +932,7 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
