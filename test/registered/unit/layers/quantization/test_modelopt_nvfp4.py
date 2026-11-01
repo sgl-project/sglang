@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -151,6 +152,142 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertFalse(bf16_shared.can_fuse_shared_expert())
         # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
         self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
+    @staticmethod
+    def _make_apply_fixture(*, is_awq=False):
+        method = ModelOptFp4LinearMethod.__new__(ModelOptFp4LinearMethod)
+        method.quant_config = SimpleNamespace(is_awq=is_awq)
+        method.quant_mode = "w4a4"
+
+        layer = nn.Module()
+        layer.params_dtype = torch.bfloat16
+        layer.output_size_per_partition = 5
+        layer.input_size_per_partition = 64
+        layer.weight = torch.zeros((5, 32), dtype=torch.uint8)
+        layer.weight_scale_interleaved = torch.zeros((5, 4), dtype=torch.float8_e4m3fn)
+        layer.alpha = torch.ones(1, dtype=torch.float32)
+        layer.input_scale_inv = torch.ones(1, dtype=torch.float32)
+        layer.weights_padding_cols = 0
+        if is_awq:
+            layer.pre_quant_scale = torch.linspace(
+                0.5, 1.5, layer.input_size_per_partition
+            )
+        return method, layer
+
+    def test_w4a4_apply_preserves_leading_dimensions(self):
+        method, layer = self._make_apply_fixture()
+        quantized_inputs = []
+
+        def fake_quantize(x, _scale):
+            quantized_inputs.append(x.detach().clone())
+            return (
+                torch.zeros((x.shape[0], x.shape[1] // 2), dtype=torch.uint8),
+                torch.zeros((x.shape[0], 1), dtype=torch.float8_e4m3fn),
+            )
+
+        def fake_gemm(x_fp4, _weight, *_args):
+            return torch.zeros(
+                (x_fp4.shape[0], layer.output_size_per_partition),
+                dtype=torch.bfloat16,
+            )
+
+        inputs = {
+            "2d": torch.randn(6, 64, dtype=torch.bfloat16),
+            "3d": torch.randn(2, 3, 64, dtype=torch.bfloat16),
+            "4d_noncontiguous": torch.randn(
+                2, 4, 3, 64, dtype=torch.bfloat16
+            ).transpose(1, 2),
+        }
+        bias = torch.arange(5, dtype=torch.bfloat16)
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant."
+                "get_fp4_gemm_runner_backend",
+                return_value=Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_quantize",
+                side_effect=fake_quantize,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_gemm",
+                side_effect=fake_gemm,
+            ),
+        ):
+            for name, x in inputs.items():
+                with self.subTest(name=name):
+                    out = method.apply(layer, x, bias)
+
+                    self.assertEqual(
+                        tuple(quantized_inputs[-1].shape),
+                        (x.numel() // x.shape[-1], x.shape[-1]),
+                    )
+                    self.assertEqual(
+                        tuple(out.shape),
+                        (*x.shape[:-1], layer.output_size_per_partition),
+                    )
+                    torch.testing.assert_close(out.reshape(-1, out.shape[-1])[0], bias)
+
+    def test_w4a4_apply_flattens_before_awq_prescale(self):
+        method, layer = self._make_apply_fixture(is_awq=True)
+        x = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+        quantized_inputs = []
+
+        def fake_quantize(input_, _scale):
+            quantized_inputs.append(input_.detach().clone())
+            return (
+                torch.zeros((input_.shape[0], input_.shape[1] // 2), dtype=torch.uint8),
+                torch.zeros((input_.shape[0], 1), dtype=torch.float8_e4m3fn),
+            )
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant."
+                "get_fp4_gemm_runner_backend",
+                return_value=Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_quantize",
+                side_effect=fake_quantize,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_gemm",
+                return_value=torch.zeros((6, 5), dtype=torch.bfloat16),
+            ),
+        ):
+            out = method.apply(layer, x)
+
+        torch.testing.assert_close(
+            quantized_inputs[0],
+            x.reshape(-1, x.shape[-1]) * layer.pre_quant_scale,
+        )
+        self.assertEqual(tuple(out.shape), (2, 3, 5))
+
+    def test_w4a4_prequantized_tuple_keeps_flattened_contract(self):
+        method, layer = self._make_apply_fixture()
+        layer._accepts_prequantized_fp4 = True
+        x_fp4 = torch.zeros((6, 32), dtype=torch.uint8)
+        x_scale = torch.zeros((6, 1), dtype=torch.float8_e4m3fn)
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant."
+                "get_fp4_gemm_runner_backend",
+                return_value=Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_quantize"
+            ) as quantize,
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.fp4_gemm",
+                return_value=torch.zeros((6, 5), dtype=torch.bfloat16),
+            ),
+        ):
+            out = method.apply(layer, (x_fp4, x_scale))
+
+        quantize.assert_not_called()
+        self.assertEqual(tuple(out.shape), (6, 5))
 
 
 if __name__ == "__main__":
