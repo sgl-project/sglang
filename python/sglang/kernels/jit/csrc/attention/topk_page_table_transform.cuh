@@ -23,16 +23,18 @@ struct TopkPageTableTransformParams {
   const int32_t* __restrict__ row_batch;   // [rows]
   int64_t indices_stride;
   int64_t page_table_stride;
-  uint32_t num_quads;  // topk / 4
+  uint32_t num_quads;    // topk / 4
+  uint32_t total_quads;  // rows * num_quads
 };
 
 template <uint32_t kPageSize, bool kUsePDL>
 __global__ void topk_page_table_transform_kernel(const __grid_constant__ TopkPageTableTransformParams params) {
   using namespace device;
-  const auto q4 = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto row = blockIdx.y;
+  const uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto row = q / params.num_quads;
+  const auto q4 = q % params.num_quads;
   PDLWaitPrimary<kUsePDL>();
-  if (q4 < params.num_quads) {
+  if (q < params.total_quads) {
     const auto page_row = params.page_table + params.row_batch[row] * params.page_table_stride;
     const auto indices_row = params.indices + row * params.indices_stride;
     AlignedVector<int32_t, 4> pos;
@@ -75,6 +77,8 @@ struct TopkPageTableTransformKernel {
     const auto topk = static_cast<uint32_t>(indices.size(1));
     CHECK_HOST(topk % 4 == 0) << "topk " << topk << " is not a multiple of 4";
     if (num_rows == 0 || topk == 0) return;
+    const auto total_quads = static_cast<uint64_t>(num_rows) * (topk / 4);
+    CHECK_HOST(total_quads <= UINT32_MAX) << "too many indices: " << num_rows << " x " << topk;
     const auto params = TopkPageTableTransformParams{
         .indices = static_cast<int32_t*>(indices.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
@@ -82,8 +86,9 @@ struct TopkPageTableTransformKernel {
         .indices_stride = indices.stride(0),
         .page_table_stride = page_table.stride(0),
         .num_quads = topk / 4,
+        .total_quads = static_cast<uint32_t>(total_quads),
     };
-    const auto grid = dim3{div_ceil(params.num_quads, kBlockSize), num_rows};
+    const auto grid = div_ceil(params.total_quads, kBlockSize);
     LaunchKernel(grid, kBlockSize, device.unwrap()).config({.use_pdl = kUsePDL})(kernel, params);
   }
 };
