@@ -267,6 +267,20 @@ class TestInitializeDummyWeights(CustomTestCase):
         self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
         self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
 
+    def test_ue8m0_dummy_block_scales_are_neutral(self):
+        model = torch.nn.Linear(8, 4, bias=False)
+        model.register_buffer(
+            "w13_weight_scale_inv", torch.zeros(4, 2, dtype=torch.uint8)
+        )
+
+        initialize_dummy_weights(model, low=0.25, high=0.75)
+
+        self.assertTrue(
+            torch.equal(
+                model.w13_weight_scale_inv, torch.full((4, 2), 127, dtype=torch.uint8)
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

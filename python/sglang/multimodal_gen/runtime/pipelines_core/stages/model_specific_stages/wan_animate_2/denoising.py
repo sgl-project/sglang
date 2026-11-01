@@ -93,6 +93,22 @@ def _is_decoded_frames(value: object) -> bool:
     return isinstance(value, np.ndarray) and value.ndim == 4 and value.dtype == np.uint8
 
 
+def _clip_decoded_frames_to_uint8(decoded_frames: torch.Tensor) -> np.ndarray:
+    """``[1, C, T, H, W]`` fp32 VAE output in nominal ``[-1, 1]`` to ``[T, H, W, C]`` uint8.
+
+    ``decode_raw`` does not clamp, and values can land slightly outside ``[-1, 1]``;
+    without the clamp here ``* 127.5`` pushes them outside ``[0, 255]`` and the cast to
+    uint8 wraps around instead of saturating.
+    """
+    return (
+        rearrange(((decoded_frames.clamp(-1, 1) + 1) * 127.5), "1 c t h w -> t h w c")
+        .detach()
+        .to(torch.uint8)
+        .cpu()
+        .numpy()
+    )
+
+
 @dataclass(kw_only=True)
 class WanAnimate2DenoisingContext(DenoisingContext):
     clip_condition: WanAnimate2ClipConditioning
@@ -427,13 +443,7 @@ class WanAnimate2DenoisingStage(DenoisingStage):
                     )
 
                 # [T, H, W, C] uint8
-                output_frames_for_clip = (
-                    rearrange(((decoded_frames + 1) * 127.5), "1 c t h w -> t h w c")
-                    .detach()
-                    .to(torch.uint8)
-                    .cpu()
-                    .numpy()
-                )
+                output_frames_for_clip = _clip_decoded_frames_to_uint8(decoded_frames)
 
                 # Drop the overlap frames the previous clip already emitted; 0 for clip 0.
                 output_frames_for_clip = output_frames_for_clip[

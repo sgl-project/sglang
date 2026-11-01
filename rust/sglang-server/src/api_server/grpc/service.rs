@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::core::HealthStatus;
-use crate::api_server::handlers::{CoreHandle, HiCacheManager};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -151,6 +151,9 @@ impl SglangService for GrpcService {
             Ok(HealthStatus::Stalled) => Err(Status::unavailable(
                 "no scheduler output within the health-check timeout",
             )),
+            Ok(HealthStatus::Draining) => {
+                Err(Status::unavailable("server is draining before shutdown"))
+            }
             Err(error) => Err(native_api::status(error)),
         }
     }
@@ -257,9 +260,10 @@ impl SglangService for GrpcService {
             ));
         }
         Ok(Response::new(api::AbortResponse {
-            success: self
-                .core
-                .abort((!request.abort_all).then_some(request.rid.as_str())),
+            success: self.core.abort(
+                (!request.abort_all).then_some(request.rid.as_str()),
+                AbortEnding::CancelledError,
+            ),
         }))
     }
 }
@@ -319,6 +323,7 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(&ServerArgs {
                         served_model_name: "test-model".into(),
@@ -506,8 +511,12 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
     }
 
+    /// Incremental frames carry each delta with the cumulative completion
+    /// count and cached-token split, which a scheduler abort does not carry.
     #[tokio::test]
     async fn incremental_frames_carry_deltas_with_cumulative_count() {
+        use crate::message::response::{CachedTokensDetails, ChunkExtras};
+
         let harness = Harness::new(2, true, Duration::from_secs(1));
         let mut stream = harness
             .service
@@ -520,14 +529,23 @@ mod tests {
         assert!(intake.admission.try_accept());
         assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
         assert!(intake.request.text.is_none());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "A", 10, false)))
-            .unwrap();
-        intake
-            .sink
-            .try_send(ResponseItem::Done(chunk(&intake.rid, "B", 11, true)))
-            .unwrap();
+        let mut first = chunk(&intake.rid, "A", 10, false);
+        first.extras = Some(Box::new(ChunkExtras {
+            cached_tokens_details: Some(CachedTokensDetails {
+                device: 1,
+                host: 1,
+                storage: None,
+                storage_backend: None,
+            }),
+            ..Default::default()
+        }));
+        intake.sink.try_send(ResponseItem::Frame(first)).unwrap();
+        let mut aborted = chunk(&intake.rid, "B", 11, true);
+        aborted.extras = Some(Box::new(ChunkExtras {
+            abort_output: true,
+            ..Default::default()
+        }));
+        intake.sink.try_send(ResponseItem::Done(aborted)).unwrap();
 
         let first = frame(stream.next().await.unwrap().unwrap());
         let finished = frame(stream.next().await.unwrap().unwrap());
@@ -535,6 +553,14 @@ mod tests {
         assert_eq!(output_ids(&finished), [11]);
         assert_eq!(finished.text, "B");
         assert_eq!(meta(&finished).completion_tokens, 2);
+        let split = Some(api::CachedTokensDetails {
+            device: 1,
+            host: 1,
+            storage: None,
+            storage_backend: None,
+        });
+        assert_eq!(meta(&first).cached_tokens_details, split);
+        assert_eq!(meta(&finished).cached_tokens_details, split);
         assert!(stream.next().await.is_none());
     }
 
@@ -661,6 +687,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,

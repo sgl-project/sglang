@@ -11,10 +11,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 import torch
 import triton
 
-from sglang.kernels.ops.attention.flash_mla_interface import (
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
 from sglang.kernels.ops.attention.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
@@ -117,6 +113,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
 
+    # Kernel entry points. Hardware subclasses override these to route to
+    # their own FlashMLA build, so the interface is imported lazily.
+    def _call_get_mla_metadata(self, *args, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
+
+        return get_mla_metadata(*args, **kwargs)
+
+    def _call_flash_mla_with_kvcache(self, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_with_kvcache,
+        )
+
+        return flash_mla_with_kvcache(**kwargs)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -185,7 +195,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     self.req_to_token.stride(0),
                     block_kv_indices.stride(0),
                 )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
@@ -218,7 +228,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     self.req_to_token.stride(0),
                     block_kv_indices.stride(0),
                 )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
@@ -256,7 +266,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     self.req_to_token.stride(0),
                     block_kv_indices.stride(0),
                 )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_get_mla_metadata(
                 seq_lens_k,
                 window * self.num_q_heads,
                 1,
@@ -382,7 +392,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
                 else 1
             )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, num_splits = self._call_get_mla_metadata(
                 seq_lens.to(torch.int32),
                 q_head_mult * self.num_q_heads,
                 1,
@@ -475,7 +485,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
             reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
             reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-            o, _ = flash_mla_with_kvcache(
+            o, _ = self._call_flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=paged_view(k_cache, PAGE_SIZE),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -492,7 +502,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             # todo: need check all causal True or False?
-            o, lse = flash_mla_with_kvcache(
+            o, lse = self._call_flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=paged_view(k_cache, PAGE_SIZE),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -567,7 +577,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
                 reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
                 reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-                o, _ = flash_mla_with_kvcache(
+                o, _ = self._call_flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=paged_view(k_cache, PAGE_SIZE),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -581,7 +591,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     descale_k=descale_k,
                 )
             else:
-                o, _ = flash_mla_with_kvcache(
+                o, _ = self._call_flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=paged_view(k_cache, PAGE_SIZE),
                     block_table=self.forward_metadata.block_kv_indices[:bs],

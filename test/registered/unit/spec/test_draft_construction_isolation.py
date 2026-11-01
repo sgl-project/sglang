@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
     resolve_shared_experts_config,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,7 +87,7 @@ class TestSharedExpertsModelScope(CustomTestCase):
                 if config.fail:
                     raise RuntimeError("construction failed")
 
-            def forward_split_prefill(self, input_ids, positions, batch, layer_range):
+            def forward(self, input_ids, positions, batch):
                 # Reads both the current model view and the layout retained at build.
                 return (
                     input_ids
@@ -107,15 +108,29 @@ class TestSharedExpertsModelScope(CustomTestCase):
     def _runner(self, model):
         runner = ModelRunner.__new__(ModelRunner)
         runner.model = model
-        runner.model_config = SimpleNamespace(num_hidden_layers=2)
-        runner.device_timer = None
+        runner.device = "cpu"
+        runner.attn_backend = None
+        runner.decode_cuda_graph_runner = None
+        runner.prefill_cuda_graph_runner = None
+        runner.hisparse_coordinator = None
+        runner._prepare_eager_forward_batch = lambda batch: None
+        runner._maybe_execute_deferred_mamba_cow_and_clear = lambda batch: None
+        runner.eager_runner = SimpleNamespace(
+            execute=lambda batch, pp_proxy_tensors: runner.model.forward(
+                batch.input_ids, batch.positions, batch
+            )
+        )
         return runner
 
     def _run(self, runner):
         batch = SimpleNamespace(
-            split_index=1, input_ids=torch.tensor([3]), positions=None
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=torch.tensor([3]),
+            positions=None,
+            moe_num_token_non_padded=None,
+            global_num_tokens_cpu=None,
         )
-        return runner.forward_split_prefill(batch)
+        return runner._forward_raw(batch, None).logits_output
 
     def test_loader_and_alternating_runners_keep_their_own_layout(self):
         ambient = get_model().shared_experts
@@ -150,7 +165,7 @@ class TestSharedExpertsModelScope(CustomTestCase):
             runner = self._runner(draft)
             with mock.patch.object(
                 draft,
-                "forward_split_prefill",
+                "forward",
                 side_effect=RuntimeError("forward failed"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "forward failed"):
