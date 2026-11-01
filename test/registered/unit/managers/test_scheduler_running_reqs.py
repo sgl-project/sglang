@@ -351,6 +351,9 @@ class TestInflightSteps(CustomTestCase):
         s.enable_fpm = False
         s._maybe_clear_mm_inputs = Mock()
         s.maybe_send_health_check_signal = Mock()
+        s.invariant_checker = SchedulerInvariantChecker.__new__(
+            SchedulerInvariantChecker
+        )
         return s
 
     def test_launch_counts_and_processing_uncounts(self):
@@ -368,9 +371,12 @@ class TestInflightSteps(CustomTestCase):
         s.process_batch_result(second, MagicMock())
         self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
 
-    def test_processing_a_step_never_launched_asserts(self):
+    def test_check_rejects_processing_a_step_never_launched(self):
         s = self._scheduler()
-        with self.assertRaisesRegex(AssertionError, "not launched"):
+        with (
+            envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
+            self.assertRaisesRegex(RuntimeError, "not launched"),
+        ):
             s.process_batch_result(_batch([_req("a")], ForwardMode.DECODE), MagicMock())
 
 

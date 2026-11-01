@@ -503,6 +503,17 @@ class SchedulerInvariantChecker:
             chunked_req=self.get_chunked_req(),
         )
 
+    def maybe_check_inflight_steps(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, every request of a step being
+        processed was counted in flight when the step launched."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
+        if uncounted:
+            raise RuntimeError(
+                f"Requests processed by a step they were not launched in: {uncounted}"
+            )
+
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
             return

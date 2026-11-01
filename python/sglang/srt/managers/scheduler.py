@@ -4632,8 +4632,15 @@ class Scheduler(
         self._sched_idled = False
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
-        batch.mark_launched()
+        batch.add_inflight_step()
         self._join_launched_reqs(batch)
+
+    def _on_step_processed(self, batch: ScheduleBatch) -> None:
+        """The bookkeeping of every step once its result is processed."""
+        self.invariant_checker.maybe_check_inflight_steps(batch)
+        batch.drop_inflight_step()
+        # Running requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -5287,9 +5294,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-        batch.mark_processed()
-        # Running requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
+        self._on_step_processed(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()

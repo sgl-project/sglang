@@ -1384,7 +1384,7 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
 
         # The launched steps carrying this request whose results are not
-        # processed yet; their forwards may still use its KV.
+        # processed yet.
         self.inflight_steps = 0
 
         # For retraction
@@ -2860,15 +2860,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
-    def mark_launched(self) -> None:
+    def add_inflight_step(self) -> None:
         for req in self.reqs:
             req.inflight_steps += 1
 
-    def mark_processed(self) -> None:
+    def drop_inflight_step(self) -> None:
         for req in self.reqs:
-            assert req.inflight_steps > 0, (
-                f"request {req.rid} is processed by a step it was not launched in"
-            )
             req.inflight_steps -= 1
 
     def is_dllm(self):

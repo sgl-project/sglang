@@ -158,6 +158,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
         scheduler.running_reqs = RunningReqs()
+        scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
             device="cpu",
