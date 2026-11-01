@@ -25,6 +25,9 @@ def test_stage_entry_sync_excludes_previous_stage_tail(monkeypatch):
     logger = init_logger(__name__)
     metrics = RequestMetrics("stage-sync-test")
 
+    # warm the consumer kernels before measuring stage synchronization
+    torch.ones(8, device="cuda").sum().cpu()
+
     # Calibrate ~0.5 s of queued GPU work.
     torch.cuda.synchronize()
     t0 = time.perf_counter()

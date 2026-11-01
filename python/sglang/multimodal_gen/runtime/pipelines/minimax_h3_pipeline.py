@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -49,7 +51,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduler intentionally absent: model_index carries scheduler=null;
         # per-modality sigma schedules are generated in TimestepPreparation
         # from the task profile, and the loop scheduler math lives in
-        # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
+        # minimax_h3/denoise_loop.py (stages accept scheduler=None).
         "transformer",
     ]
 
@@ -131,7 +133,26 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 partition="hybrid",
                 tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
+        self._apply_release_lora_adapter()
         return model_index
+
+    def _apply_release_lora_adapter(self) -> None:
+        """Load a release's bundled LoRA adapter as the startup adapter."""
+        adapter = self.release_metadata.lora_adapter
+        if adapter is None:
+            return
+        adapter_path = os.path.join(self.model_path, adapter)
+        if not os.path.isfile(adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} release adapter not found: {adapter_path}"
+            )
+        if self.server_args.lora_path not in (None, adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} applies its own release adapter "
+                f"({adapter}); --lora-path cannot replace it"
+            )
+        # LoRAPipeline reads server_args.lora_path once the modules are loaded
+        self.server_args.lora_path = adapter_path
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role != RoleType.MONOLITHIC:
@@ -139,6 +160,25 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 "MiniMaxH3Pipeline only supports monolithic deployment; "
                 f"disaggregation role {role.value!r} is not supported"
             )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self.pdd_heads = self._resolve_pdd_heads()
+        transformer = self.get_module("transformer")
+        if (
+            self.pdd_heads
+            and transformer is not None
+            and transformer.final_layer._pdd_heads is None
+        ):
+            transformer.final_layer.load_pdd_fused_heads(self.pdd_heads)
+
+    def _resolve_pdd_heads(self) -> str | None:
+        """The env override, else a PDD release's own fused heads."""
+        if envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS:
+            return envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        release_metadata = getattr(self, "release_metadata", None)
+        if release_metadata is None or release_metadata.pdd_fused_heads is None:
+            return None
+        return os.path.join(self.model_path, release_metadata.pdd_fused_heads)
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
@@ -175,12 +215,22 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                dmd_denoising_steps=(
+                    release_metadata.dmd_denoising_steps
+                    if release_metadata is not None
+                    else None
+                ),
+                pdd_heads=getattr(self, "pdd_heads", None),
             )
         )
         self.add_stage(
             MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
+                stochastic_sampling=(
+                    release_metadata is not None
+                    and release_metadata.stochastic_sampling
+                ),
             )
         )
         self.add_stage(
@@ -190,12 +240,22 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         )
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+            MiniMaxH3ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3ComfyUIStepStage(transformer=self.get_module("transformer"))
+        )
+
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
+    FastH3 Omni Ref2VA PDD student.
 
     The flat single-partition repo is materialized into the base-H3 layout by
-    the bundled model overlay (see model_overlays/), so every stage, loader,
+    its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,
     and admission path below is exactly the MiniMax-H3 one. There is no
     FL2VA/Ref2VA partition layout to default into.
     """
@@ -204,4 +264,18 @@ class FastH3Pipeline(MiniMaxH3Pipeline):
     default_model_subfolder = None
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]
+class PikaH3FlexPipeline(MiniMaxH3Pipeline):
+    """Pika H3 Flex: MiniMax-H3 plus Pika's six-step LoRA adapters.
+
+    The release's model overlay links the pinned MiniMax-H3 base into the
+    base-H3 layout (root and ``FL2VA/`` for t2va/fl2va, ``Ref2VA/`` for
+    ref2va) with the matching adapter next to each partition. Its
+    ``_minimax_h3`` block carries the sampling contract (knots
+    1000/750/500/250/100/40, video shift 12, audio shift 3, re-noising) and
+    the adapter, which loads at startup.
+    """
+
+    pipeline_name = "PikaH3FlexPipeline"
+
+
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, PikaH3FlexPipeline]

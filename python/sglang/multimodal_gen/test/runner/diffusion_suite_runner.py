@@ -240,6 +240,7 @@ def _run_standalone_file(
     standalone_rel: str,
     target_dir: Path,
     extra_filter: str | None = None,
+    failure_summary: list[str] | None = None,
 ) -> tuple[int, list[str], dict[str, str], dict]:
     if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
         _maybe_pin_update_weights_model_pair([standalone_rel])
@@ -256,6 +257,7 @@ def _run_standalone_file(
         [standalone_file],
         filter_expr=extra_filter,
         junit_xml_path=junit_xml_path,
+        failure_summary=failure_summary,
     )
     measured_full_test_time_s = round(time.perf_counter() - start_time, 1)
     standalone_key = _normalize_standalone_key(standalone_rel)
@@ -449,8 +451,19 @@ def _run_file_suite(args, target_dir: Path) -> int:
         print(f"No valid test files found for suite '{args.suite}'.")
         return 1 if args.suite in STRICT_SUITES else 0
 
+    my_files = partition_items_by_index(
+        suite_files_abs, args.partition_id, args.total_partitions
+    )
+    print(
+        f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions} "
+        f"| Files: {len(my_files)}/{len(suite_files_abs)}",
+        flush=True,
+    )
+    if not my_files:
+        return 0
+
     exit_code, _, _ = run_pytest(
-        suite_files_abs,
+        my_files,
         filter_expr=args.filter,
         junit_xml_path=None,
     )
@@ -507,6 +520,7 @@ def _run_partition_assignment(
     missing_standalone_estimates: list[str] = []
     standalone_measurements: list[dict] = []
     overall_exit_code = 0
+    failure_summary: list[str] = []
 
     if assignment.case_ids:
         case_id_set = set(assignment.case_ids)
@@ -545,6 +559,7 @@ def _run_partition_assignment(
             suite_files,
             filter_expr=filter_expr,
             junit_xml_path=junit_xml_path,
+            failure_summary=failure_summary,
         )
         _merge_execution_results(
             executed_cases, case_results, new_executed_cases, new_case_results
@@ -586,6 +601,7 @@ def _run_partition_assignment(
                     standalone_file,
                     target_dir,
                     extra_filter=args.filter,
+                    failure_summary=failure_summary,
                 )
             )
             if measurement["used_fallback_estimate"]:
@@ -617,6 +633,10 @@ def _run_partition_assignment(
         missing_standalone_estimates=missing_standalone_estimates,
         standalone_measurements=standalone_measurements,
     )
+    if failure_summary:
+        print("\n" + "=" * 24 + " Failed cases and reasons " + "=" * 24, flush=True)
+        print("\n".join(failure_summary), flush=True)
+        print("=" * 74, flush=True)
     return overall_exit_code
 
 

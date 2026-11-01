@@ -3,7 +3,6 @@
 import ipaddress
 import logging
 import os
-import platform
 import socket
 from functools import lru_cache
 from typing import Any
@@ -27,6 +26,22 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def upload_without_sync(batch, device):
+    """Move a batch of host tensors to `device` without waiting for the GPU work already queued.
+
+    A pageable host-to-device copy synchronizes its stream first; a pinned one does not.
+    """
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        return batch.to(device)
+    pinned = type(batch)(
+        {
+            k: v.pin_memory() if torch.is_tensor(v) and v.device.type == "cpu" else v
+            for k, v in batch.items()
+        }
+    )
+    return pinned.to(device, non_blocking=True)
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -112,38 +127,6 @@ def format_tcp_endpoint(host: str, port: int, field_name: str) -> str:
     if port < 0 or port > 65535:
         raise ValueError(f"{field_name} port must be between 0 and 65535: {port}")
     return f"tcp://{host}:{port}"
-
-
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
 
 
 def is_port_available(port):
@@ -279,7 +262,7 @@ def get_zmq_socket(
                         # Last attempt failed
                         logger.error(
                             f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
-                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                            f"Original endpoint: {endpoint}, last tried: {current_endpoint}"
                         )
                         raise
                     else:
@@ -298,19 +281,6 @@ def get_zmq_socket(
         return socket, endpoint
 
     return socket, endpoint
-
-
-# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
-
-
-@lru_cache(maxsize=1)
-def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
 
 
 # cuda
@@ -347,11 +317,11 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = {"0", "false", "no", "n", "f", "off", ""}
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 

@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
-"""
-
 import copy
 import os
 import unittest
@@ -10,7 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -79,7 +74,7 @@ class TestCPUGraph(CustomTestCase):
                 num_threads=32,
             )
 
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             if is_in_ci():
                 self.assertGreater(metrics["score"], 0.45)
         finally:

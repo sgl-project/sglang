@@ -15,6 +15,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/encode`(embedding model)
 - `/v1/rerank`(cross encoder rerank model)
 - `/v1/score`(decoder-only scoring)
+- `/v1/decisions`(typed decisions on a chat model)
 - `/classify`(reward model)
 - `/start_expert_distribution_record`
 - `/stop_expert_distribution_record`
@@ -107,6 +108,8 @@ print_highlight(response.text)
 ## Health Check
 - `/health`: Check the health of the server.
 - `/health_generate`: Check the health of the server by generating one token.
+- `/ready`: Returns 200 when the server accepts new requests; 503 while starting, paused, unhealthy, or shutting down.
+- `/ping`: SageMaker health check. Returns 200 once the server is up; 503 while starting, unhealthy, or shutting down. Stays 200 while generation is paused. A failed `/health` or `/health_generate` probe marks the server unhealthy until a later probe succeeds.
 
 ```python Example
 url = f"http://localhost:{port}/health_generate"
@@ -256,6 +259,8 @@ Parameters:
 - `item_first`: Whether items come first in concatenation order (default: False)
 - `model`: Model name
 
+`query` and `items` also accept token ids, with `query` set to `[]` when each item is a complete prompt. `label_token_ids` can be one list per item. `temperature` divides the label logits before the softmax and needs `apply_softmax`, and `return_token_logprobs` adds `token_logprobs`, the full-vocabulary log-probabilities of the labels.
+
 The response contains `scores` - a list of probability lists, one per item, each in the order of `label_token_ids`.
 
 ```python Example
@@ -292,6 +297,20 @@ for item, scores in zip(items, response_json["scores"]):
 ```python Example
 terminate_process(score_process)
 ```
+
+## v1/decisions (typed decisions on a chat model)
+
+Answer typed questions about an input with per-option probabilities, without generating. The server renders each question with the model's chat template and thinking turned off, assigns one-token answer labels, and scores them through the same path as `v1/score`.
+
+Parameters:
+- `input`: Text, object, or array the questions are about
+- `questions`: List of questions, each with a unique `id` and a `type` of `choice` (with `options`), `score` (with `levels`), or `yes_no`
+- `temperature`: Divides the label logits before the softmax (default: 1)
+- `chat_template_kwargs`: Extra chat template arguments
+- `prompt_format_version`: Optional pin of the server-owned prompt wording
+- `return_prompt_token_ids`: Return the scored prompt and label token ids for replay through `v1/score` (default: False)
+
+The response contains `answers` keyed by question id, each with `type`, `probabilities`, and `label_mass`, plus `choice` for a choice question or `score` for a score question. A yes or no answer is read from `probabilities["yes"]`. See [Decision models](/docs/supported-models/decision_models) for examples, the full reference, and error cases.
 
 ## Classify (reward model)
 
@@ -448,3 +467,5 @@ except Exception as e:
 ```python Example
 terminate_process(tokenizer_free_server_process)
 ```
+
+`/tokenize` also accepts chat `messages` (with optional `tools` and `chat_template_kwargs`) in place of `prompt`. By default they are rendered as for a chat completion: a final assistant message becomes a user turn and the generation prompt is always added. To format messages exactly as given, pass `add_generation_prompt` (`true` or `false`); the request may then also set `add_special_tokens`, which defaults to `false` because the chat template writes its own special tokens. These options need a Jinja chat template; other templates return HTTP 400.

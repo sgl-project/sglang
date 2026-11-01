@@ -6,6 +6,7 @@ import asyncio
 import os
 import statistics
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,12 +17,7 @@ import numpy as np
 import pytest
 from openai import Client
 
-from sglang.multimodal_gen.runtime.realtime.video import (
-    RAW_RGB_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-    RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-    restore_delta_gzip_raw_rgb_payload,
-)
+from sglang.multimodal_gen.runtime.realtime.video import RAW_RGB_CONTENT_TYPE
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionSamplingParams
 from sglang.multimodal_gen.test.test_utils import is_image_url
 
@@ -50,9 +46,11 @@ class RealtimeChunkStats:
 class RealtimeCollectionResult:
     frames: list[np.ndarray]
     chunk_stats: list[RealtimeChunkStats]
+    e2e_ms: float
 
 
 _REALTIME_CHUNK_STATS_BY_CASE: dict[str, list[RealtimeChunkStats]] = {}
+_REALTIME_E2E_MS_BY_CASE: dict[str, float] = {}
 _REALTIME_KEY_FRAMES_BY_CASE: dict[str, list[np.ndarray]] = {}
 
 
@@ -217,13 +215,18 @@ def validate_realtime_perf_stats(
 
 
 def record_realtime_perf_stats(
-    case_id: str, chunk_stats: list[RealtimeChunkStats]
+    case_id: str, chunk_stats: list[RealtimeChunkStats], e2e_ms: float
 ) -> None:
     _REALTIME_CHUNK_STATS_BY_CASE[case_id] = list(chunk_stats)
+    _REALTIME_E2E_MS_BY_CASE[case_id] = e2e_ms
 
 
 def pop_realtime_perf_stats(case_id: str) -> list[RealtimeChunkStats]:
     return _REALTIME_CHUNK_STATS_BY_CASE.pop(case_id, [])
+
+
+def pop_realtime_e2e_ms(case_id: str) -> float | None:
+    return _REALTIME_E2E_MS_BY_CASE.pop(case_id, None)
 
 
 def select_realtime_key_frames(frames: list[np.ndarray]) -> list[np.ndarray]:
@@ -244,14 +247,9 @@ def pop_realtime_key_frames(case_id: str) -> list[np.ndarray] | None:
 def decode_realtime_raw_rgb_frames(
     header: dict[str, Any],
     payload: bytes,
-    previous_frame: bytes | None = None,
 ) -> list[np.ndarray]:
     content_type = header.get("content_type")
-    if content_type not in (
-        RAW_RGB_CONTENT_TYPE,
-        RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-        RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-    ):
+    if content_type != RAW_RGB_CONTENT_TYPE:
         raise ValueError(f"Unsupported realtime frame content type: {content_type}")
 
     width = int(header["width"])
@@ -260,18 +258,6 @@ def decode_realtime_raw_rgb_frames(
     num_frames = int(header["num_frames"])
     bytes_per_frame = int(header["bytes_per_frame"])
     expected_size = num_frames * bytes_per_frame
-    if content_type in (
-        RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-        RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-    ):
-        if header.get("delta_reference") != "previous-frame":
-            previous_frame = None
-        payload = restore_delta_gzip_raw_rgb_payload(
-            payload,
-            bytes_per_frame=bytes_per_frame,
-            num_frames=num_frames,
-            reference_frame=previous_frame,
-        )
     if len(payload) != expected_size:
         raise ValueError(
             f"Realtime payload size mismatch: expected {expected_size}, got {len(payload)}"
@@ -357,11 +343,12 @@ async def collect_realtime_output(
             sent_event_indices.add(event_idx)
 
     async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
+        # exclude server startup, warmup and the later mp4 consistency encoding
+        request_start = time.perf_counter()
         await ws.send(msgspec.msgpack.encode(init_payload))
         await send_events_for_boundary(ws, -1)
 
         received_chunks: set[int] = set()
-        previous_frame: bytes | None = None
         while len(received_chunks) < num_chunks or (
             require_chunk_stats and len(chunk_stats) < len(received_chunks)
         ):
@@ -387,17 +374,14 @@ async def collect_realtime_output(
             if not isinstance(raw_payload, bytes):
                 raise ValueError("Realtime frame payload must be bytes")
 
-            chunk_frames = decode_realtime_raw_rgb_frames(
-                header,
-                raw_payload,
-                previous_frame,
-            )
+            chunk_frames = decode_realtime_raw_rgb_frames(header, raw_payload)
             frames.extend(chunk_frames)
-            if chunk_frames:
-                previous_frame = chunk_frames[-1].tobytes()
             chunk_index = int(header["chunk_index"])
             if header.get("is_final_frame_batch", True):
                 received_chunks.add(chunk_index)
                 await send_events_for_boundary(ws, chunk_index)
+        e2e_ms = (time.perf_counter() - request_start) * 1000
 
-    return RealtimeCollectionResult(frames=frames, chunk_stats=chunk_stats)
+    return RealtimeCollectionResult(
+        frames=frames, chunk_stats=chunk_stats, e2e_ms=e2e_ms
+    )

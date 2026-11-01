@@ -119,6 +119,30 @@ def _minimax_h3_update_target_rows_(
     torch.add(state, velocity, out=state)
 
 
+@torch.inference_mode()
+def _minimax_h3_renoise_target_rows_(
+    state: torch.Tensor,
+    velocity: torch.Tensor,
+    *,
+    sigma: float,
+    sigma_next: float,
+    generator: torch.Generator,
+) -> None:
+    """Few-step re-noising update, in place and in fp32.
+
+    ``x0 = x + sigma * v`` from the grid sigma, then
+    ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
+    The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
+    """
+    state.add_(velocity, alpha=sigma)
+    if sigma_next == 0.0:
+        return
+    noise = torch.randn(
+        state.shape, generator=generator, device=state.device, dtype=torch.float32
+    )
+    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
+
+
 def _build_local_embedding_layout(
     *,
     seq_len: int,
@@ -462,6 +486,8 @@ def minimax_h3_denoise_loop(
     attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    rollout_ctx=None,
+    renoise_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -471,12 +497,16 @@ def minimax_h3_denoise_loop(
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
-    independently testable with a plain callable.
+    independently testable with a plain callable. ``renoise_generator``
+    switches both modalities from the Euler blend to the few-step re-noising
+    update, drawing each step's fresh noise from it, video rows first.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    if renoise_generator is not None and rollout_ctx is not None:
+        raise ValueError("re-noising sampling does not support rollout")
     n_cond = positive.video_target_start
     if keyframe_cond_rows is None:
         if n_cond != 0:
@@ -557,11 +587,22 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    if rollout_ctx is not None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+            minimax_h3_rollout_update_video_target,
+        )
+
+        rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
+        video_target = video_rows[video_target_slice]
+        rollout_ctx.collector.record_initial(video_target.detach().clone())
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]
             s_a = sigmas_audio[step]
+            s_n_v = sigmas_video[step + 1]
+            if rollout_ctx is not None:
+                rollout_ctx.batch._rollout_loop_step_index = step
 
             fk = positive.forward_kwargs(
                 video_rows=video_rows,
@@ -592,26 +633,66 @@ def minimax_h3_denoise_loop(
                 mv_audio_t = v_audio[audio_target_slice].float()
 
                 video_target = video_rows[video_target_slice]
-                _minimax_h3_update_target_rows_(
-                    video_target,
-                    mv_video_t,
-                    sigma_t=video_sigma_t[step],
-                    sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
-                )
+                if rollout_ctx is not None:
+                    (
+                        updated,
+                        log_sum,
+                        log_count,
+                        rollout_ctx.noise_buffer,
+                    ) = minimax_h3_rollout_update_video_target(
+                        video_target,
+                        mv_video_t,
+                        sigma_curr=s_v,
+                        sigma_next=s_n_v,
+                        batch=rollout_ctx.batch,
+                        generator=rollout_ctx.generator,
+                        loop_step_index=step,
+                        noise_buffer=rollout_ctx.noise_buffer,
+                    )
+                    video_target.copy_(updated)
+                    rollout_ctx.collector.record_step(
+                        video_target.detach().clone(),
+                        log_sum,
+                        log_count,
+                    )
+                elif renoise_generator is not None:
+                    _minimax_h3_renoise_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma=s_v,
+                        sigma_next=s_n_v,
+                        generator=renoise_generator,
+                    )
+                else:
+                    _minimax_h3_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma_t=video_sigma_t[step],
+                        sigma_curr=s_v,
+                        sigma_ratio=video_sigma_ratios[step],
+                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        denoised_scratch=video_denoised_scratch,
+                    )
 
                 audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
-                    mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
-                )
+                if renoise_generator is not None:
+                    _minimax_h3_renoise_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma=s_a,
+                        sigma_next=sigmas_audio[step + 1],
+                        generator=renoise_generator,
+                    )
+                else:
+                    _minimax_h3_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_curr=s_a,
+                        sigma_ratio=audio_sigma_ratios[step],
+                        one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 

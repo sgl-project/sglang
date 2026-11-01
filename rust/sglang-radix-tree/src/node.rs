@@ -112,6 +112,12 @@ impl KeyNamespace {
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
     }
+
+    pub fn extra_key_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.extra_key.clone())
+    }
 }
 
 impl PartialEq for KeyNamespace {
@@ -172,14 +178,19 @@ pub struct Node<K: ChildKeyType> {
     pub swa_uuid: Option<i64>,
     /// SWA lock-window uuid for host locks; stamped where a host lock walk fills the window.
     pub swa_host_uuid: Option<i64>,
+    /// Full host-lock segment boundary uuid. A split migrates it to the new prefix.
+    pub full_host_uuid: Option<i64>,
     /// Per-page hash chain; None when the node was never hashed.
     /// TODO: Store raw digests and hex-encode only at the Python or storage boundary.
     pub hash_value: Option<Vec<String>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
+    /// Chain-wide logical-page owner rotation, retained across node splits.
+    pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
-    /// Load-back anchor currently reading this node's host slots.
+    /// Load-back anchor currently reading this node's Full host slots.
+    /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
     /// Monotonic access tick for LRU ordering (exact; not wall-clock).
     pub last_access_counter: i64,
@@ -187,6 +198,10 @@ pub struct Node<K: ChildKeyType> {
     pub creation_counter: i64,
     /// Match hits accumulated for write-through and LFU decisions.
     pub hit_count: i64,
+    /// Logical root-path length; maintained only for T-LRU.
+    pub tlru_cached_prefix_len: usize,
+    /// Greatest subtree depth reached, retained when cached tails are evicted.
+    pub tlru_history_len: usize,
     /// Eviction priority; the root uses `i64::MIN` and is never a leaf.
     pub priority: i64,
     /// This node's external handle; minted once, never recycled.
@@ -249,9 +264,18 @@ impl<K: ChildKeyType> Node<K> {
         self.has_value_(ValueSlotIdx::device(component_type))
     }
 
-    /// The component's device value length, or 0 when value-less.
+    /// Logical length of the stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, component_type: ComponentType) -> usize {
         self.value_len_(ValueSlotIdx::device(component_type))
+    }
+
+    /// Allocator slots reclaimed on eviction; roots and absent device values contribute zero.
+    /// Ordinary backing uses logical length; released/shared backing needs its own accounting.
+    pub fn device_reclaimable_value_len(&self, component_type: ComponentType) -> usize {
+        if self.is_root() {
+            return 0;
+        }
+        self.device_value_len(component_type)
     }
 
     /// Set the component's device value; panics if already set.
@@ -380,7 +404,7 @@ impl<K: ChildKeyType> Node<K> {
             .any(|state| state.lock_ref > 0)
     }
 
-    /// Whether an in-flight load-back currently pins this node.
+    /// Whether an in-flight load-back currently pins this node's Full slots.
     pub fn is_load_back_pending(&self) -> bool {
         self.load_back_pending_id.is_some()
     }
@@ -397,13 +421,17 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority: i64::MIN,
             id,
             idx: NodeIdx_(id),
@@ -420,13 +448,17 @@ impl<K: ChildKeyType> Node<K> {
             values: Default::default(),
             swa_uuid: None,
             swa_host_uuid: None,
+            full_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority,
             id,
             idx: NodeIdx_(id),
@@ -713,12 +745,29 @@ pub enum TreeCoreRuntimeError {
     /// A public NodeId no longer names a live arena node.
     #[error(transparent)]
     NodeAccess(#[from] NodeAccessError),
+    /// The requested component is not configured for this core.
+    #[error("component {component_type:?} is not enabled")]
+    ComponentNotEnabled { component_type: ComponentType },
+    /// A signed adjustment would underflow or overflow the selected device ledger.
+    #[error(
+        "invalid size delta {delta} for node {node_id} component {component_type:?}: current={current}, protected={protected}"
+    )]
+    InvalidComponentSizeDelta {
+        node_id: NodeId,
+        component_type: ComponentType,
+        current: usize,
+        delta: i64,
+        protected: bool,
+    },
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
+    /// Overlap preparation must complete before incoming values can be consumed.
+    #[error("invalid insert overlap: {0}")]
+    InvalidInsertOverlap(&'static str),
     /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
@@ -757,9 +806,6 @@ pub enum TreeCoreRuntimeError {
     #[cfg(any(test, feature = "inspection"))]
     #[error("{0}")]
     InspectionAssertion(String),
-    /// Direct external-cache linking does not support this tree component.
-    #[error("external cache linker does not support component {component_type:?}")]
-    ExternalCacheLinkerUnsupportedComponent { component_type: ComponentType },
     /// The existing device anchor must be on the restored endpoint's root path.
     #[error("node {until_node_id} is not an ancestor of node {from_node_id}")]
     ExternalCachePathNotAncestor {
@@ -802,8 +848,8 @@ pub trait ChildKeyType:
     /// through, so the unigram key never copies.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self>;
 
-    /// The atom's token ids as u32 storage-hash words.
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32>;
+    /// The atom's token ids as non-negative storage-hash words.
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64>;
 
     /// The raw token ids spanned by `atoms`; the unigram view borrows, bigram
     /// atoms (overlapping by one) materialize.
@@ -881,9 +927,9 @@ pub trait ChildKeyType:
     }
 }
 
-/// A token id as a u32 storage-hash word; token ids beyond u32 are rejected.
-fn hash_word(token_id: i64) -> u32 {
-    u32::try_from(token_id).expect("token id does not fit in uint32")
+/// Wide multimodal sentinels use the same non-negative int64 domain as tree keys.
+fn hash_word(token_id: i64) -> u64 {
+    u64::try_from(token_id).expect("token id must be a non-negative int64")
 }
 
 impl ChildKeyType for Vec<i64> {
@@ -894,7 +940,7 @@ impl ChildKeyType for Vec<i64> {
         token_ids
     }
 
-    fn hash_words(atom: &i64) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &i64) -> impl Iterator<Item = u64> {
         std::iter::once(hash_word(*atom))
     }
 
@@ -912,7 +958,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
         Cow::Owned(token_ids.windows(2).map(|w| (w[0], w[1])).collect())
     }
 
-    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u32> {
+    fn hash_words(atom: &(i64, i64)) -> impl Iterator<Item = u64> {
         [hash_word(atom.0), hash_word(atom.1)].into_iter()
     }
 
@@ -933,7 +979,7 @@ impl ChildKeyType for Vec<(i64, i64)> {
 pub(crate) const DIGEST_LEN: usize = 32;
 pub(crate) type HashDigest = [u8; DIGEST_LEN];
 
-/// SHA256(prior_digest || page atom words as little-endian u32 bytes).
+/// Preserve u32 page hashes; wide pages use a 0xff tag and little-endian u64 words.
 pub(crate) fn hash_page<K: ChildKeyType>(
     page: &[K::Atom],
     prior: Option<&HashDigest>,
@@ -942,9 +988,21 @@ pub(crate) fn hash_page<K: ChildKeyType>(
     if let Some(prior) = prior {
         hasher.update(prior);
     }
+    let wide = page
+        .iter()
+        .flat_map(K::hash_words)
+        .any(|word| word > u32::MAX as u64);
+    if wide {
+        // match hash_binding.cpp; the tag makes the encoding length odd
+        hasher.update([0xff]);
+    }
     for atom in page {
         for word in K::hash_words(atom) {
-            hasher.update(word.to_le_bytes());
+            if wide {
+                hasher.update(word.to_le_bytes());
+            } else {
+                hasher.update((word as u32).to_le_bytes());
+            }
         }
     }
     hasher.finalize().into()
@@ -1443,7 +1501,7 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.node(id).has_device_value(component_type)
     }
 
-    /// The node's device value length for the component, or 0 when value-less.
+    /// Logical length of the node's stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, id: NodeIdx_, component_type: ComponentType) -> usize {
         self.node(id).device_value_len(component_type)
     }
@@ -1557,68 +1615,135 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 }
 
-// Eviction-eligible node set.
+// Shared node membership for eviction leaves and Full host duplicates.
 
-/// Set of `NodeIdx_`s with O(1) membership ops and dense iteration.
-#[derive(Default)]
-pub struct EvictableNodeSet {
-    /// Dense member list; order is unspecified (swap-remove).
-    nodes: Vec<NodeIdx_>,
-    /// Each member's position in `nodes`, indexed by `NodeIdx_`.
-    slots: Vec<Option<usize>>,
+/// An insertion-ordered set of arena slots. Full host duplicate reclamation
+/// consumes this order directly; leaf eviction ranks members in a policy heap.
+/// Links are indexed by arena slot: membership/removal are O(1), insertion is
+/// amortized O(1), and iteration visits only current members.
+pub struct NodeSet {
+    /// Per arena slot: `Some((previous, next))` in insertion order, or `None` if absent.
+    /// `END` marks a missing neighbor at either end.
+    links: Vec<Option<(NodeIdx_, NodeIdx_)>>,
+    /// First member in insertion order, or `END` when empty.
+    head: NodeIdx_,
+    /// Last member in insertion order; new members append here. `END` when empty.
+    tail: NodeIdx_,
+    /// Number of current members, excluding absent slots in `links`.
+    len: usize,
 }
 
-impl EvictableNodeSet {
+impl Default for NodeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeSet {
+    const END: NodeIdx_ = NodeIdx_(usize::MAX);
+
     pub fn new() -> Self {
-        Default::default()
-    }
-
-    /// Whether `node_id` is a member.
-    pub fn contains(&self, node_id: NodeIdx_) -> bool {
-        self.slots.get(node_id.0).copied().flatten().is_some()
-    }
-
-    /// Insert `node_id`; no-op when already a member.
-    pub fn add(&mut self, node_id: NodeIdx_) {
-        if node_id.0 >= self.slots.len() {
-            self.slots.resize(node_id.0 + 1, None);
+        Self {
+            links: Vec::new(),
+            head: Self::END,
+            tail: Self::END,
+            len: 0,
         }
-        if self.slots[node_id.0].is_some() {
+    }
+
+    pub fn contains(&self, node_id: NodeIdx_) -> bool {
+        self.links.get(node_id.0).is_some_and(Option::is_some)
+    }
+
+    /// Existing membership keeps its position; a removed/reinserted slot is
+    /// appended, matching assignment to Python's insertion-ordered dict.
+    pub fn add(&mut self, node_id: NodeIdx_) {
+        assert_ne!(
+            node_id,
+            Self::END,
+            "node slot is reserved for the set sentinel"
+        );
+        if node_id.0 >= self.links.len() {
+            self.links.resize(node_id.0 + 1, None);
+        }
+        if self.links[node_id.0].is_some() {
             return;
         }
-        self.slots[node_id.0] = Some(self.nodes.len());
-        self.nodes.push(node_id);
+        self.links[node_id.0] = Some((self.tail, Self::END));
+        if self.tail == Self::END {
+            self.head = node_id;
+        } else {
+            self.links[self.tail.0].as_mut().unwrap().1 = node_id;
+        }
+        self.tail = node_id;
+        self.len += 1;
     }
 
-    /// Remove `node_id`; no-op when not a member.
     pub fn discard(&mut self, node_id: NodeIdx_) {
-        let Some(slot) = self.slots.get(node_id.0).copied().flatten() else {
+        let Some((prev, next)) = self.links.get_mut(node_id.0).and_then(Option::take) else {
             return;
         };
-        self.slots[node_id.0] = None;
-        self.nodes.swap_remove(slot);
-        // The swapped-in tail member (if any) now lives at `slot`.
-        if let Some(&moved) = self.nodes.get(slot) {
-            self.slots[moved.0] = Some(slot);
+        if prev == Self::END {
+            self.head = next;
+        } else {
+            self.links[prev.0].as_mut().unwrap().1 = next;
         }
+        if next == Self::END {
+            self.tail = prev;
+        } else {
+            self.links[next.0].as_mut().unwrap().0 = prev;
+        }
+        self.len -= 1;
     }
 
-    /// The members, in unspecified order.
-    pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        self.nodes.iter().copied()
+    /// Visit members from `head` to `tail` by following each entry's `next` link.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeIdx_> + '_ {
+        // Keep an exact size hint so eviction heaps can reserve once.
+        NodeSetIter {
+            links: &self.links,
+            current: self.head,
+            remaining: self.len,
+        }
     }
 
     // Test-only conveniences: production callers use add/discard/contains/iter.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.len
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.head == Self::END
     }
 }
+
+struct NodeSetIter<'a> {
+    links: &'a [Option<(NodeIdx_, NodeIdx_)>],
+    current: NodeIdx_,
+    remaining: usize,
+}
+
+impl Iterator for NodeSetIter<'_> {
+    type Item = NodeIdx_;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let node_id = self.current;
+        self.current = self.links[node_id.0].unwrap().1;
+        self.remaining -= 1;
+        Some(node_id)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for NodeSetIter<'_> {}
+
 #[cfg(test)]
 #[path = "tests/node.rs"]
 mod tests;

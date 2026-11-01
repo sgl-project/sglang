@@ -11,7 +11,7 @@
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
 #include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::copy_bytes, elect_one_lane, inclusive_sum
+#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum, reduce_max
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
@@ -128,7 +128,7 @@ struct SituAndMulKernel {
     auto D_in = SymbolicSize{"input_width"};
     auto D_out = SymbolicSize{"output_width"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D_out})  //
         .with_dtype<TOut>()
@@ -247,7 +247,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = device::warp::inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = device::warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
@@ -389,7 +389,7 @@ struct SituAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()

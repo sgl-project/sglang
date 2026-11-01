@@ -22,6 +22,7 @@
 import copy
 import logging
 import math
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Type, TypeAlias, Union
 
@@ -31,11 +32,19 @@ import transformers
 from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.kernels.ops.elementwise.sam_rel_pos_bias import (
+    can_use_sam_rel_pos_bias,
+    sam_rel_pos_bias,
+)
+from sglang.kernels.ops.elementwise.window_unpartition_add import (
+    can_use_window_unpartition_add,
+    window_unpartition_add,
+)
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config, is_ocr2_config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -43,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cdiv, cpu_has_amx_support, get_compiler_backend, is_cpu
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -390,6 +399,24 @@ class MLPBlock(nn.Module):
         return self.lin2(self.act(self.lin1(x)))
 
 
+_REL_POS_CACHE: dict = {}
+
+
+def clear_sam_rel_pos_cache() -> None:
+    # sampled tables contain weight values, so in-place checkpoint reloads invalidate them
+    _REL_POS_CACHE.clear()
+
+
+def _cached_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
+    """Cache immutable relative-position tables by storage and geometry."""
+    key = (rel_pos.data_ptr(), tuple(rel_pos.shape), rel_pos.dtype, q_size, k_size)
+    hit = _REL_POS_CACHE.get(key)
+    if hit is None:
+        hit = get_rel_pos(q_size, k_size, rel_pos)
+        _REL_POS_CACHE[key] = hit
+    return hit
+
+
 def add_decomposed_rel_pos(
     q: torch.Tensor,
     rel_pos_h: torch.Tensor,
@@ -411,8 +438,8 @@ def add_decomposed_rel_pos(
     """
     q_h, q_w = q_size
     k_h, k_w = k_size
-    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+    Rh = _cached_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = _cached_rel_pos(q_w, k_w, rel_pos_w)
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
@@ -466,22 +493,22 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
-        # qkv with shape (3, B, nHead, H * W, C)
-        qkv = (
-            self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        )
-        # q, k, v with shape (B * nHead, H * W, C)
-        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+        # q, k, v with shape (B, nHead, H * W, C), views of the qkv output.
+        qkv = self.qkv(x).view(B, H * W, 3, self.num_heads, -1)
+        q, k, v = qkv.unbind(2)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
 
         rel_h, rel_w = None, None
         if self.use_rel_pos:
             rel_h, rel_w = add_decomposed_rel_pos(
-                q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W)
+                q.reshape(B * self.num_heads, H * W, -1),
+                self.rel_pos_h,
+                self.rel_pos_w,
+                (H, W),
+                (H, W),
             )
-
-        q = q.view(B, self.num_heads, H * W, -1)
-        k = k.view(B, self.num_heads, H * W, -1)
-        v = v.view(B, self.num_heads, H * W, -1)
 
         if self.use_rel_pos:
             rel_h = rel_h.view(
@@ -490,13 +517,7 @@ class Attention(nn.Module):
             rel_w = rel_w.view(
                 B, self.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3)
             )
-            attn_bias = (rel_h + rel_w).view(
-                B, self.num_heads, rel_h.size(2), rel_h.size(3) * rel_w.size(4)
-            )
-            x = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_bias
-            )
-            # x = _attention_rel_h_rel_w(q, k, v, rel_h, rel_w)
+            x = self._attend_with_rel_pos_bias(q, k, v, rel_h, rel_w)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
@@ -509,6 +530,40 @@ class Attention(nn.Module):
         x = self.proj(x)
 
         return x
+
+    # A batch-8 1024px bias is 3 GiB; past this cap the query axis is chunked.
+    # 64 MiB keeps the peak allocation low on long multi-page batches.
+    _REL_POS_BIAS_MAX_BYTES = 64 * 1024 * 1024
+    # Do not go below this many query rows per chunk; launch overhead dominates.
+    _REL_POS_MIN_Q_CHUNK = 256
+
+    def _attend_with_rel_pos_bias(self, q, k, v, rel_h, rel_w):
+        """Chunked SDPA over the query axis; every chunk attends to all keys."""
+        B, heads, q_len, _ = q.shape
+        k_h, k_w = rel_h.size(3), rel_w.size(4)
+        bias_bytes = B * heads * q_len * k_h * k_w * rel_h.element_size()
+
+        def bias_for(s: int, e: int) -> torch.Tensor:
+            rel_h_chunk = rel_h[:, :, s:e]
+            rel_w_chunk = rel_w[:, :, s:e]
+            if can_use_sam_rel_pos_bias(rel_h_chunk, rel_w_chunk):
+                return sam_rel_pos_bias(rel_h_chunk, rel_w_chunk)
+            return (rel_h_chunk + rel_w_chunk).view(B, heads, e - s, k_h * k_w)
+
+        if bias_bytes <= self._REL_POS_BIAS_MAX_BYTES:
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=bias_for(0, q_len)
+            )
+
+        n_chunks = cdiv(bias_bytes, self._REL_POS_BIAS_MAX_BYTES)
+        q_chunk = max(self._REL_POS_MIN_Q_CHUNK, cdiv(q_len, n_chunks))
+        out = torch.empty_like(q)
+        for s in range(0, q_len, q_chunk):
+            e = min(s + q_chunk, q_len)
+            out[:, :, s:e] = torch.nn.functional.scaled_dot_product_attention(
+                q[:, :, s:e], k, v, attn_mask=bias_for(s, e)
+            )
+        return out
 
 
 def window_partition(
@@ -619,17 +674,19 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
         x = self.norm1(x)
-        # Window partition
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
         x = self.attn(x)
-        # Reverse window partition
-        if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
-
-        x = shortcut + x
+        if self.window_size > 0 and can_use_window_unpartition_add(
+            x, shortcut, self.window_size
+        ):
+            x = window_unpartition_add(x, shortcut, self.window_size)
+        else:
+            if self.window_size > 0:
+                x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+            x = shortcut + x
         x = x + self.mlp(self.norm2(x))
 
         return x
@@ -831,7 +888,7 @@ def _build_sam(
     )
     image_encoder.eval()
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         image_encoder.load_state_dict(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
@@ -988,7 +1045,7 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
@@ -1415,31 +1472,37 @@ def build_qwen2_decoder_as_encoder(
         max_query=max_query,
     )
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         decoder_as_encoder.load_state_dict(state_dict, strict=True)
     return decoder_as_encoder
 
 
-def _is_ocr2(config: DeepseekVLV2Config) -> bool:
-    return (
-        str(getattr(config.vision_config, "model_name", "")).lower() == "deepencoderv2"
-        or getattr(config.projector_config, "input_dim", None) == 896
-    )
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    text_config = hf_config.text_config
+    if is_ocr2_config(hf_config) or not (
+        text_config.topk_method == "noaux_tc" or text_config.use_mla
+    ):
+        return None
+    return text_config
 
 
 class DeepseekOCRForCausalLM(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        text_config = hf_config.text_config
-        if _is_ocr2(hf_config) or not (
-            text_config.topk_method == "noaux_tc" or text_config.use_mla
-        ):
-            # Those branches build the dense DeepseekForCausalLM, which has no
-            # shared experts to fuse.
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
             text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self,
@@ -1455,7 +1518,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
-        self.is_ocr2 = _is_ocr2(config)
+        self.is_ocr2 = is_ocr2_config(config)
         n_embed = getattr(self.projector_config, "n_embed", 1280)
 
         self.tile_tag = config.tile_tag
@@ -1769,9 +1832,8 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vision_embeddings = self._process_image_input(items)
@@ -1795,6 +1857,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
