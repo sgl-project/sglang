@@ -177,6 +177,7 @@ class TestReceiverControlMessages(CustomTestCase):
             engine_rank=0,
             gpu_id=0,
             draft_rows_dcp_collapsed=True,
+            num_draft_entries=0,
         )
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
@@ -237,6 +238,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"",
                 struct.pack("Q", 16),
                 b"1",
+                b"0",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -315,6 +317,14 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
                 self.assertTrue(info.dst_draft_rows_dcp_collapsed)
+                if backend == "mooncake":
+                    self.assertEqual(info.num_draft_entries, 0)
+                    # A peer that predates the draft-count field parses None.
+                    legacy = registration_type.from_zmq(frames[:-1])
+                    self.assertIsNone(legacy.num_draft_entries)
+                    self.assertEqual(legacy.dst_kv_item_lens, [16])
+                    with_draft = registration_type.from_zmq(frames[:-1] + [b"1"])
+                    self.assertEqual(with_draft.num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
 
