@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.utils import (
+    ABORT_REASON_DECODE,
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
@@ -3347,10 +3348,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             and self.check_status(room_to_be_aborted) != KVPoll.Success
         )
         if room_active:
-            self.record_failure(
-                room_to_be_aborted,
-                "Aborted by decode-side abort notification.",
-            )
+            self.record_failure(room_to_be_aborted, ABORT_REASON_DECODE)
             self.update_status(room_to_be_aborted, KVPoll.Failed)
             logger.debug(
                 f"Received abort notification for room {room_to_be_aborted}, "
