@@ -1872,6 +1872,7 @@ class Envs:
     # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_NPU_DECODE_SWA_RING = EnvBool(False)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
