@@ -60,6 +60,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
     )
     config = SimpleNamespace(
         hidden_size=width,
+        num_hidden_layers=1,
         moe_intermediate_size=2 * width,
         moe_renormalize=True,
         routed_scaling_factor=1.0,

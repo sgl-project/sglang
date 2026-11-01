@@ -62,6 +62,15 @@ def clear() -> None:
     _handoff.x_s = None
 
 
+def publish(x, packed, x_q, x_s) -> None:
+    """Publish already prepared inputs for one experts call, paired with clear()."""
+    _handoff.request_x = None
+    _handoff.produced_x = x
+    _handoff.packed = packed
+    _handoff.x_q = x_q
+    _handoff.x_s = x_s
+
+
 def try_route_quant_fused(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -98,11 +107,7 @@ def try_route_quant_fused(
         ),
         apply_scale=apply_routed_scaling_factor_on_output,
     )
-    _handoff.request_x = None
-    _handoff.produced_x = x
-    _handoff.packed = packed
-    _handoff.x_q = x_q
-    _handoff.x_s = x_s
+    publish(x, packed, x_q, x_s)
     return weights, ids
 
 
