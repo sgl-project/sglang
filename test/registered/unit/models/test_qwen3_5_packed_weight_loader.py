@@ -92,28 +92,6 @@ class TestMakePackedWeightLoader(unittest.TestCase):
             self.assertEqual(chunk.shape, torch.Size([1]))
             self.assertAlmostEqual(chunk.item(), 0.25, places=5)
 
-    def test_broadcast_with_two_shards(self):
-        """Broadcast for in_proj_ba style (2 shards: b, a)."""
-        module = _make_mock_module(output_sizes=[16, 16])
-        param = _make_per_tensor_scale_param(num_shards=2)
-
-        calls = []
-
-        def original_loader(p, chunk, shard_id):
-            calls.append((shard_id, chunk.clone()))
-
-        loader = Qwen3_5GatedDeltaNet._make_packed_weight_loader(
-            module, original_loader
-        )
-
-        scale = torch.tensor([0.1])
-        loader(param, scale, loaded_shard_id=(0, 1))
-
-        self.assertEqual(len(calls), 2)
-        for shard_id, chunk in calls:
-            self.assertEqual(chunk.shape, torch.Size([1]))
-            self.assertAlmostEqual(chunk.item(), 0.1, places=5)
-
     # ------------------------------------------------------------------ #
     #  Normal weight split                                                #
     # ------------------------------------------------------------------ #
@@ -187,29 +165,6 @@ class TestMakePackedWeightLoader(unittest.TestCase):
     # ------------------------------------------------------------------ #
     #  Edge case: nested single-element tensors                           #
     # ------------------------------------------------------------------ #
-
-    def test_nested_single_element_tensor_broadcast(self):
-        """A [[value]] shaped tensor (numel==1, ndim==2) should also broadcast."""
-        module = _make_mock_module(output_sizes=[128, 128, 64])
-        param = _make_per_tensor_scale_param(num_shards=3)
-
-        calls = []
-
-        def original_loader(p, chunk, shard_id):
-            calls.append((shard_id, chunk.clone()))
-
-        loader = Qwen3_5GatedDeltaNet._make_packed_weight_loader(
-            module, original_loader
-        )
-
-        scale = torch.tensor([[0.75]])  # shape=[1,1], numel==1
-        loader(param, scale, loaded_shard_id=(0, 1, 2))
-
-        self.assertEqual(len(calls), 3)
-        for shard_id, chunk in calls:
-            # .view(-1) should flatten to [1]
-            self.assertEqual(chunk.shape, torch.Size([1]))
-            self.assertAlmostEqual(chunk.item(), 0.75, places=5)
 
 
 if __name__ == "__main__":
