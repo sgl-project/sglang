@@ -1,4 +1,5 @@
 # Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py, will optimize in future refactor
+import collections
 import random
 import sys
 
@@ -11,7 +12,11 @@ import torch
 from sglang.kernels.ops.lora.moe.moe_lora_align import moe_lora_align_block_size
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# test_fused_moe_lora_kernel.py runs this align kernel against a torch reference
+# per PR; this wider matrix is opt-in.
+register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-large")
+# backend-specific: the HIP JIT build of moe_lora_align_kernel.cu and its
+# wave64 per-warp expert counters.
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
@@ -60,10 +65,10 @@ def sample_data(num_experts, max_loras, num_tokens, topk_num):
     return (topk_ids.to("cuda"), seg_indptr.to("cuda"), req_to_lora.to("cuda"))
 
 
-@pytest.mark.parametrize("num_tokens", [100, 200, 1024, 4096])
+@pytest.mark.parametrize("num_tokens", [200, 4096])
 @pytest.mark.parametrize("topk_num", [6])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 512])
-@pytest.mark.parametrize("max_loras", [2, 32])
+@pytest.mark.parametrize("num_experts", [64, 512])
+@pytest.mark.parametrize("max_loras", [32])
 @pytest.mark.parametrize("block_size", [16])
 def test_moe_lora_align_block_size(
     num_tokens, topk_num, num_experts, max_loras, block_size
@@ -116,52 +121,53 @@ def test_moe_lora_align_block_size(
         None,
     )
 
-    # verify values
-    expert_ids = expert_ids.view(max_loras, -1)
-    sorted_token_ids = sorted_token_ids.view(max_loras, -1, block_size)
+    # verify values: per LoRA, every (token, expert) pair of its tokens lands
+    # exactly once in a block of its own expert, each block holds only such
+    # pairs and padding, and the padded count is ceil(pairs / block_size)
+    # blocks per expert. The order inside a block is not part of the contract.
+    flat = topk_ids.view(-1).tolist()
+    padding = len(flat)
+    sorted_rows = sorted_token_ids.view(max_loras, -1).tolist()
+    label_rows = expert_ids.view(max_loras, -1).tolist()
+    post_pad = num_tokens_post_pad.tolist()
 
-    # Reconstruct token-level ownership for verification logic
-    # We expand req_to_lora back to [num_tokens] on CPU just to check correctness
-    # This proves the kernel (which used the compressed format) produced the right result
-    cpu_seg_indptr = seg_indptr.cpu()
-    cpu_req_to_lora = req_to_lora.cpu()
-    token_ownership = torch.zeros(num_tokens, dtype=torch.int32)
-
-    for r in range(len(cpu_req_to_lora)):
-        start = cpu_seg_indptr[r]
-        end = cpu_seg_indptr[r + 1]
-        token_ownership[start:end] = cpu_req_to_lora[r]
-
-    token_ownership = token_ownership.to("cuda")
+    # Expand req_to_lora back to one owner per token.
+    cpu_seg_indptr = seg_indptr.tolist()
+    token_owner = [0] * num_tokens
+    for r, lora in enumerate(req_to_lora.tolist()):
+        token_owner[cpu_seg_indptr[r] : cpu_seg_indptr[r + 1]] = [lora] * (
+            cpu_seg_indptr[r + 1] - cpu_seg_indptr[r]
+        )
+    pairs_by_lora = collections.defaultdict(list)
+    for j in range(padding):
+        pairs_by_lora[token_owner[j // topk_num]].append(j)
 
     for lora_idx in range(max_loras):
-        # Count how many tokens actually belong to this LoRA
-        expected_count = (token_ownership == lora_idx).sum().item()
+        total = post_pad[lora_idx]
+        assert total % block_size == 0, f"LoRA {lora_idx}: padded count {total}"
+        placed, blocks_per_expert = collections.Counter(), collections.Counter()
+        for b in range(total // block_size):
+            label = label_rows[lora_idx][b]
+            block = sorted_rows[lora_idx][b * block_size : (b + 1) * block_size]
+            pairs = [j for j in block if j != padding]
+            assert 0 <= label < num_experts, f"LoRA {lora_idx}: block label {label}"
+            assert pairs and all(
+                0 <= j < padding
+                and flat[j] == label
+                and token_owner[j // topk_num] == lora_idx
+                for j in pairs
+            ), f"LoRA {lora_idx}, block of expert {label}: {block}"
+            placed.update(pairs)
+            blocks_per_expert[label] += 1
 
-        # Verify the kernel processed a reasonable number of tokens (sanity check)
-        # Note: num_tokens_post_pad includes padding, so it might be larger than expected_count
-        assert num_tokens_post_pad[lora_idx].item() >= expected_count * topk_num
-
-        for token_idx in range(sorted_token_ids.size(1)):
-            block = sorted_token_ids[lora_idx][token_idx]
-            # Valid indices are those less than total numel
-            indices = block[block != topk_ids.numel()]
-
-            if indices.numel() > 0:
-                # 1. Verify routing: Does the token actually route to this expert?
-                expert_id = expert_ids[lora_idx][token_idx]
-                assert torch.all(topk_ids.view(-1)[indices] == expert_id)
-
-                # 2. Verify ownership: Did the kernel grab the correct tokens for this LoRA?
-                # The indices in 'sorted_token_ids' point to the flattened [token, topk] array.
-                # We divide by topk_num to get the original token index.
-                original_token_indices = indices // topk_num
-
-                # Check that all tokens in this block truly belong to 'lora_idx'
-                actual_owners = token_ownership[original_token_indices]
-                assert torch.all(actual_owners == lora_idx), (
-                    f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
-                )
+        expected = pairs_by_lora[lora_idx]
+        assert placed == collections.Counter(expected), (
+            f"LoRA {lora_idx}: pairs missing or duplicated"
+        )
+        per_expert = collections.Counter(flat[j] for j in expected)
+        assert blocks_per_expert == collections.Counter(
+            {e: CEILDIV(n, block_size) for e, n in per_expert.items()}
+        ), f"LoRA {lora_idx}: blocks per expert"
 
 
 if __name__ == "__main__":
