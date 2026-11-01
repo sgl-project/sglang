@@ -1005,6 +1005,10 @@ class Envs:
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 INT4, where it was measured.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
+    # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
+    # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
+    # INT4 at every size.
+    SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB = EnvInt(64)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

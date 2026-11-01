@@ -155,12 +155,29 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
             pass
         else:
             raise AssertionError("the INT4 / INT8 JIT build ran INT6")
+        # a caller asks qr_supports() first, so a float16 model keeps another all-reduce
+        assert jit.qr_supports(jit_comm, torch.bfloat16)
+        assert not jit.qr_supports(jit_comm, torch.float16)
         try:
             jit.qr_all_reduce(jit_comm, inp.half(), out.half(), _INT8, True)
         except ValueError:
             pass
         else:
             raise AssertionError("the bf16-only JIT build took float16")
+        jit.qr_destroy(jit_comm)
+        aot.qr_destroy(aot_comm)
+
+        # with the INT8 threshold at 0, an INT4 request runs INT4 at decode sizes too
+        os.environ["SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB"] = "0"
+        aot_comm, jit_comm = _open_comms(rank, world_size)
+        inp = torch.randn(384 * 6144, device=device, generator=generator).bfloat16()
+        expected, out = torch.empty_like(inp), torch.empty_like(inp)
+        aot.qr_all_reduce(aot_comm, inp, expected, _INT4, True)
+        jit.qr_all_reduce(jit_comm, inp, out, _INT4, True)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), (
+            "with SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB=0 the JIT build did not run INT4"
+        )
         jit.qr_destroy(jit_comm)
         aot.qr_destroy(aot_comm)
     finally:
@@ -200,6 +217,9 @@ def _run_jit_fallback_test(rank: int, world_size: int, port: int) -> None:
             torch.cuda.synchronize()
             assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), (
                 f"{world_size=} {level_name=} {cast=}: the fallback is not sgl-kernel's"
+            )
+            assert jit.qr_supports(jit_comm, torch.float16), (
+                "sgl-kernel reduces float16"
             )
             jit.qr_destroy(jit_comm)
             aot.qr_destroy(aot_comm)
