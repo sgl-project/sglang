@@ -1682,6 +1682,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_lingbot_video_moe_sequence_parallel_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
@@ -1741,6 +1742,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
+        "../single_test_file/test_lingbot_video_moe_sequence_parallel_2_gpu.py": 300.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
