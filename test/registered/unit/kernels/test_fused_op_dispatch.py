@@ -81,9 +81,6 @@ class _OotTensorOp(BaseFusedOp):
     def forward_native(self, x, *, scale=1):
         return x * scale - self.offset
 
-    def forward_cuda(self, x, *, scale=1):
-        return x * scale - 2 * self.offset
-
 
 class _KeepOotDispatch(_OotTensorOp):
     def _torch_compile_forward(self, num_tokens):
