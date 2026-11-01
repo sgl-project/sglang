@@ -77,6 +77,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._session_semaphore = asyncio.Semaphore(
             get_serving().asr_max_concurrent_sessions
         )
+        # The event loop holds only a weak reference to tasks.
+        self._background_tasks: set[asyncio.Task] = set()
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -370,7 +372,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             await asyncio.sleep(2)
             abort_assigned_rids()
 
-        asyncio.create_task(abort_after_dispatch_window())
+        task = asyncio.create_task(abort_after_dispatch_window())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _handle_chunked_non_streaming_request(
         self,
