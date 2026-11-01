@@ -65,6 +65,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_npu = current_platform.is_npu()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -139,7 +140,46 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
+# cos/sin expanded from the current forward's rope slices; reset at forward start/end.
+_NPU_ROPE_COS_SIN_CACHE = {}
+
+
+def _reset_npu_rope_cos_sin_cache():
+    _NPU_ROPE_COS_SIN_CACHE.clear()
+
+
+def _npu_rope_cos_sin(rope, dtype):
+    key = (id(rope), dtype)
+    hit = _NPU_ROPE_COS_SIN_CACHE.get(key)
+    if hit is not None:
+        return hit[1], hit[2]
+    real = torch.view_as_real(rope)
+    c = (
+        real[..., 0]
+        .reshape(1, rope.shape[0], 1, -1)
+        .repeat_interleave(2, dim=-1)
+        .to(dtype)
+    )
+    s = (
+        real[..., 1]
+        .reshape(1, rope.shape[0], 1, -1)
+        .repeat_interleave(2, dim=-1)
+        .to(dtype)
+    )
+    _NPU_ROPE_COS_SIN_CACHE[key] = (rope, c, s)
+    return c, s
+
+
+def _npu_rotary_mul(x, rope):
+    import torch_npu
+
+    c, s = _npu_rope_cos_sin(rope, x.dtype)
+    return torch_npu.npu_rotary_mul(x, c, s, rotary_mode="interleave")
+
+
 def apply_rope(x, rope):
+    if _is_npu and x.is_npu and x.dim() == 4:
+        return _npu_rotary_mul(x, rope)
     fused = None
     if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
@@ -437,6 +477,7 @@ class QwenImage21FeedForward(nn.Module):
         fused = None
         if (
             _is_cuda
+            and gate.is_cuda
             and gate.dtype is torch.bfloat16
             and _SILU_MUL_FUSION.can_attempt_once()
         ):
@@ -476,10 +517,16 @@ class QwenImage21Attention(nn.Module):
             ]
         )
         self.norm_q = RMSNorm(
-            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
+            self.head_dim,
+            ac.eps,
+            cast_x_before_out_mul=True,
+            force_native=not current_platform.is_npu(),
         )
         self.norm_k = RMSNorm(
-            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
+            self.head_dim,
+            ac.eps,
+            cast_x_before_out_mul=True,
+            force_native=not current_platform.is_npu(),
         )
         backends = QwenImage21Transformer2DModel._supported_attention_backends
         self.local_attn = LocalAttention(
@@ -1088,6 +1135,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         if prefix_caches is None:
             prefix_caches = [[None] * self.num_layers for _ in layouts]
         prefix_states, ropes = [], []
+        _reset_npu_rope_cos_sin_cache()
         for sample, layout in enumerate(layouts):
             prefix = None
             if not prefix_caches[sample][0]:
@@ -1119,6 +1167,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 prefix_pad,
             )
         output = self.proj_out(self.norm_out(images, temb))
+        _reset_npu_rope_cos_sin_cache()
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)
         return output

@@ -14,10 +14,11 @@ import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
 Use a nightly Docker image containing this integration, or install from source,
 following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+For Ascend NPU, also follow the
+[NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation).
 Run the commands below inside that environment. Select **Checkpoint weights** for
 `Qwen/Qwen-Image-2.1` or `Qwen/Qwen-Image-2.1-Turbo`; you can also set a local
-checkpoint directory under **Variables**. The recipes
-target NVIDIA CUDA on Linux; the picker marks which workloads have
+checkpoint directory under **Variables**. The picker marks which workloads have
 been verified with the full checkpoint.
 
 <Deployment config={config} />
@@ -29,8 +30,10 @@ steps, and output count. Set reference PNG paths under **Variables**; edits
 upload files from the machine running cURL, so they need not exist on the server.
 
 Hardware selection applies the recommended placement for that GPU. H200,
-B200, RTX PRO 6000 96GB, and DGX Spark keep weights resident; RTX 5090 and RTX 4090
-offload selected components to fit the full pipeline.
+B200, RTX PRO 6000 96GB, DGX Spark, and Ascend NPU keep weights resident;
+RTX 5090 and RTX 4090 offload selected components to fit the full pipeline.
+On Ascend A3, the verified recipe uses one chip, keeps all components resident,
+and selects Torch SDPA; the picker adds `--warmup-mode request`.
 Untested topologies and feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
 currently uses the Python/source command; no published Docker image is verified.
@@ -56,18 +59,21 @@ execution, and full-image VAE decoding.
 Commands omit default values, including one GPU, encoder auto scheduling, and
 batch size one. Explicit placement and attention overrides preserve each recipe.
 
-| GPU | Placement / attention | Generation | Edit | Peak VRAM |
+| GPU/NPU | Placement / attention | Generation | Edit | Peak VRAM |
 | --- | --- | --- | --- | --- |
 | H200 141GB | Resident / FlashAttention | 4.48 s | 5.29 s | 38.4 GiB |
 | B200 192GB | Resident / FlashAttention | 2.46 s | 3.02 s | 38.5 GiB |
 | RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
 | DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
+| Ascend A3 64GB | Resident / Torch SDPA | 19.6 s | 23.1 s | 31.1 GiB |
 
 Measured with the original checkpoint on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
 request. Times are median HTTP latency after warmup, including PNG serialization
 and excluding startup; VRAM is the sampled request-phase peak. Prompts and
-software versions affect both latency and memory use.
+software versions affect both latency and memory use. The Ascend A3 row was
+measured on 2026-10-21 with CANN 9.1.0; its generation and edit times are single
+after-warmup runs of 40 steps at 1024×1024.
 
 On one RTX 5090, native-precision, eager text-to-image or single-reference edits
 with one output and batching off keep the DiT and VAE resident and stream the
@@ -187,6 +193,11 @@ Defaults are 1024×1024, CFG 1, and seed 42; output saving is enabled.
 The original checkpoint defaults to 40 steps; Turbo uses its preset 8-step grid.
 For GPUs that need offload, also pass the placement flags from the picker.
 
+On Ascend, pass `--generator-device cuda` for offline `sglang generate` runs:
+the CLI default resolves to the model-level `"cpu"` generator, while the HTTP
+API resolves `generator_device` to the accelerator's RNG (on Ascend the `cuda`
+value maps to the NPU device RNG).
+
 ### Text-to-image
 
 ```bash Command
@@ -206,9 +217,11 @@ sglang generate \
 
 Height and width must be positive multiples of 32. Reference images preserve
 their aspect ratio and are resized to approximately the requested output area;
-the same resized image feeds the VLM and VAE. Image labels are deterministic
-(`Picture 1`, `Picture 2`, and so on). Multiple outputs receive independent
-noise seeds and independent prefix caches.
+use `size=1536x1024` to keep a 3:2 reference's ratio. The same resized image
+feeds the VLM and VAE. Image labels are deterministic (`Picture 1`,
+`Picture 2`, and so on); pass multiple `--image-path` values (or repeat the
+`image` form field in the HTTP API) to edit with several references. Multiple
+outputs receive independent noise seeds and independent prefix caches.
 
 ## 5. Runtime features
 
