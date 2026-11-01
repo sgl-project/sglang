@@ -1,0 +1,288 @@
+{
+  "id": null,
+  "uid": null,
+  "title": "SGLang Tokenizer encode wall time - review",
+  "tags": [
+    "sglang",
+    "tokenizer",
+    "review"
+  ],
+  "editable": true,
+  "schemaVersion": 32,
+  "version": 1,
+  "timezone": "browser",
+  "refresh": "",
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "model_name",
+        "label": "Model regex",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        },
+        "options": []
+      },
+      {
+        "name": "source",
+        "label": "Call site",
+        "type": "custom",
+        "query": "chat,manager",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [
+          {
+            "text": "All",
+            "value": "$__all",
+            "selected": true
+          },
+          {
+            "text": "chat",
+            "value": "chat",
+            "selected": false
+          },
+          {
+            "text": "manager",
+            "value": "manager",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "input_type",
+        "label": "input_type",
+        "type": "custom",
+        "query": "single,batch",
+        "multi": false,
+        "includeAll": false,
+        "current": {
+          "text": "single",
+          "value": "single"
+        },
+        "options": [
+          {
+            "text": "single",
+            "value": "single",
+            "selected": true
+          },
+          {
+            "text": "batch",
+            "value": "batch",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "operation",
+        "label": "operation",
+        "type": "custom",
+        "query": "encode,chat_template",
+        "multi": false,
+        "includeAll": false,
+        "current": {
+          "text": "encode",
+          "value": "encode"
+        },
+        "options": [
+          {
+            "text": "encode",
+            "value": "encode",
+            "selected": true
+          },
+          {
+            "text": "chat_template",
+            "value": "chat_template",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Tokenizer $operation wall time ($input_type)",
+      "description": "One sample per measured encode operation; batch invocations are not divided by batch size. Source=chat or manager. encode excludes separate template rendering and executor waiting; chat_template includes fused rendering. Each series is a 5-minute call-weighted statistic. Empty data is not zero. No TTFT denominator.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_sum\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m])) / sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m]))) and on (model_name, source) (sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m])) > 0)",
+          "legendFormat": "Avg {{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.5, sum by (model_name, source, le) (rate({__name__=\"sglang:tokenizer_encode_seconds_bucket\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m]))) and on (model_name, source) (sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m])) > 0)",
+          "legendFormat": "P50 {{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.9, sum by (model_name, source, le) (rate({__name__=\"sglang:tokenizer_encode_seconds_bucket\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m]))) and on (model_name, source) (sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m])) > 0)",
+          "legendFormat": "P90 {{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        },
+        {
+          "refId": "D",
+          "expr": "histogram_quantile(0.99, sum by (model_name, source, le) (rate({__name__=\"sglang:tokenizer_encode_seconds_bucket\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m]))) and on (model_name, source) (sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m])) > 0)",
+          "legendFormat": "P99 {{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Measured successful encode calls / second",
+      "description": "Histogram count rate: encode operations, not HTTP requests, generated sequences or tokens.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"success\"}[5m]))",
+          "legendFormat": "{{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Failed encode calls / second",
+      "description": "Errors from the measured invocation only; input validation before encoding and downstream inference errors are outside this metric. Missing error series does not establish collector coverage.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (model_name, source) (rate({__name__=\"sglang:tokenizer_encode_seconds_count\",model_name=~\"$model_name\",source=~\"$source\",input_type=\"$input_type\",operation=\"$operation\",result=\"error\"}[5m]))",
+          "legendFormat": "{{source}} {{model_name}}",
+          "format": "time_series",
+          "instant": false
+        }
+      ]
+    }
+  ]
+}
