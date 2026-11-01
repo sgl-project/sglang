@@ -8,21 +8,17 @@ import torch
 
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
-)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
+from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 PHYSICAL = 690240
 CONTEXT = 1048576
@@ -32,6 +28,7 @@ def make_configurator(*, is_hybrid_swa=False, is_draft_worker=False):
     configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
     configurator.is_hybrid_swa = is_hybrid_swa
     configurator.is_draft_worker = is_draft_worker
+    configurator.model_config = NS(hf_config=NS(architectures=["LlamaForCausalLM"]))
     return configurator
 
 
@@ -53,7 +50,7 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
         temporal_dtype=torch.float32,
         grow_direction="up",
     )
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=full.entry_bytes() * n_full_tokens
         + mamba.entry_bytes() * n_mamba_slots,
         sub_pool_specs=[full, mamba],
@@ -62,11 +59,18 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
         page_size=1,
     )
     kvcache = NS(
-        full_kv_pool=NS(buf=torch.empty(pool.max_slots("full"))),
-        mamba_pool=NS(buf=torch.empty(pool.max_slots("mamba"))),
+        full_kv_pool=NS(buf=torch.empty(pool.num_entries("full"))),
+        mamba_pool=NS(buf=torch.empty(pool.num_entries("mamba"))),
     )
-    return UnifiedMambaTokenToKVPoolAllocator(
-        unified_buffer=pool, kvcache=kvcache, device="cpu", page_size=1
+    return ChainAllocator(
+        roles=ChainRoles(owner="full", state="mamba"),
+        arena=pool,
+        kvcache=kvcache,
+        views=stand_in_views(
+            ChainRoles(owner="full", state="mamba"), kvcache, kvcache.mamba_pool
+        ),
+        device="cpu",
+        page_size=1,
     )
 
 

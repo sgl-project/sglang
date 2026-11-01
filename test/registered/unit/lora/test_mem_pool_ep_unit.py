@@ -16,7 +16,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import ast
 import types
@@ -1029,6 +1029,9 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_model=base_model,
                 eviction_policy="lru",
                 lora_added_tokens_size=0,
+                lora_layer_ids=[0],
+                has_embed_tokens_lora=False,
+                has_lm_head_lora=False,
             )
 
     def test_no_ep(self):

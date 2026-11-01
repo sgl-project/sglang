@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -30,9 +30,29 @@ from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+
+
+class TestScheduleBatchCopy(CustomTestCase):
+    def test_the_copy_carries_the_token_allocator(self):
+        """Lazy Mamba tracking releases slots through the result batch's allocator;
+        the copy must retain it along with the request table."""
+        allocator = types.SimpleNamespace(state_slots=types.SimpleNamespace())
+        table = types.SimpleNamespace()
+        batch = ScheduleBatch(
+            reqs=[],
+            req_to_token_pool=table,
+            token_to_kv_pool_allocator=allocator,
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            req_pool_indices=torch.zeros(0, dtype=torch.int64),
+            req_pool_indices_cpu=torch.zeros(0, dtype=torch.int64),
+        )
+        copy = batch.copy()
+        self.assertIs(copy.token_to_kv_pool_allocator, allocator)
+        self.assertIs(copy.req_to_token_pool, table)
 
 
 class TestCachedPrefixTierAttribution(unittest.TestCase):
@@ -159,7 +179,7 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
             model_config=types.SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
-            kv_index_translator=MagicMock(),
+            runner_ids=MagicMock(),
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=types.SimpleNamespace(enabled=False),
             lora_manager=None,
