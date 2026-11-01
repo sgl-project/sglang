@@ -186,12 +186,13 @@ Notes:
 
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
-    On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
-    Usually we can get the SNC information (How many available) from the Operating System with e.g. `lscpu` command.
+    By default, each rank is bound to a group of physical CPU cores.
+    SGLang reads `lscpu -p=CPU,Core,Socket,Node,Cache` and groups cores by Compute Building Block (CBB), identified by L3 cache ID, when there are more L3 cache IDs than NUMA nodes. Otherwise, it groups cores by NUMA node, including sub-NUMA clusters (SNCs) exposed as NUMA nodes.
+    Each group is restricted to the process's allowed CPU affinity, and empty groups are excluded from rank assignment.
 
-    If the specified TP rank number differs from the total SNC count,
-    the system will automatically utilize the first `n` SNCs.
-    Note that `n` cannot exceed the total SNC number, doing so will result in an error.
+    Ranks use the first available groups in NUMA node or L3 cache ID order.
+    Without an explicit binding, the total rank count (`dp_size * tp_size * pp_size`) cannot exceed the available group count.
+    A CBB is a CPU binding group, not a separate NUMA memory node; multiple CBB groups can share one NUMA node.
 
     `SGLANG_CPU_OMP_THREADS_BIND` allows explicit control of CPU cores for each tensor parallel (TP) rank.
 
