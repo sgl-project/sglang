@@ -181,6 +181,7 @@ from sglang.srt.arg_groups.fields.serving import (
 from sglang.srt.arg_groups.fields.spec import (
     Spec,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
 from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
     CudaGraphConfig,
@@ -539,6 +540,7 @@ _INPUT_NAMESPACES = [
     Schedule,
     ExecFeatures,
     Mm,
+    UocrDocumentConfig,
     Serving,
 ]
 
