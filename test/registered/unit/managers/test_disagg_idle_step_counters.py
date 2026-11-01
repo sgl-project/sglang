@@ -228,6 +228,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                     )
                 scheduler = self.make_scheduler(schedule)
                 scheduler.scripted_scheduler_hook = None
+                scheduler.invariant_checker = SimpleNamespace(
+                    maybe_check_launched_reqs=Mock()
+                )
                 scheduler.future_map = None
                 scheduler.result_queue = deque()
                 scheduler._prepare_mlx_launch = MethodType(
@@ -596,7 +599,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.get_next_disagg_decode_batch_to_run = next_plan
         scheduler.get_next_batch_to_run = next_plan
         scheduler.get_new_batch_prefill = next_plan
-        scheduler.is_disable_overlap_for_batch = Mock(return_value=False)
+        scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
         scheduler.process_disagg_prefill_inflight_queue = Mock()
