@@ -4569,7 +4569,8 @@ class Scheduler(
         )
         evictable = self.tree_cache.mamba_evictable_size()
         # Remaining slot budget: the static pool's adder-level count; the
-        # shared pool budgets slots through the memory budget instead.
+        # shared pool budgets slots through the memory budget instead (its
+        # remaining count is not exposed as a simple counter on this main).
         rem_mamba_slots = adder.rem_mamba_slots
         logger.info(
             "[MambaAudit] size=%d free=%d allocated=%d | hold: running=%d "
@@ -4850,7 +4851,8 @@ class Scheduler(
             # request later -- so stop pulling new requests from the queue once
             # the remaining mamba slot budget can't cover a worst-case cold
             # request. No-op without a static mamba pool (the shared pool
-            # defers its COW slot to admission below).
+            # defers its COW slot to admission below, so its match never
+            # takes a slot the budget has not priced).
             if (
                 adder.rem_mamba_slots is not None
                 and adder.rem_mamba_slots < adder._mamba_match_headroom()
@@ -4866,7 +4868,7 @@ class Scheduler(
                     logger.info(
                         "[MambaAudit] match pre-check stopped pulling: "
                         "rem=%d headroom=%d free=%d queue=%d can_run=%d running=%d",
-                        adder.rem_mamba_slots,
+                        rem_mamba_slots,
                         adder._mamba_match_headroom(),
                         mamba_allocator.schedulable_available_size(),
                         len(self.waiting_queue),
