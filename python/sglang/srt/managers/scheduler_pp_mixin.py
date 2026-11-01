@@ -363,7 +363,7 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
+                if len(self.disagg_prefill.inflight_queue) == 0:
                     self.on_idle()
 
     @DynamicGradMode()
@@ -614,7 +614,7 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        reqs = self.disagg_prefill.bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
@@ -628,7 +628,7 @@ class SchedulerPPMixin:
         step with the others.
         """
         succeeded, failed = self.get_rids(
-            self.disagg_prefill_inflight_queue,
+            self.disagg_prefill.inflight_queue,
             True,
             [KVPoll.Success],
             [KVPoll.Failed],

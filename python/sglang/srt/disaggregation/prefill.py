@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import numpy as np
 import torch
@@ -576,6 +576,18 @@ class PrefillBootstrapQueue:
             self.kv_manager.register_buffer_to_engine()
 
 
+class DisaggPrefill:
+    """The requests PD prefill holds outside the scheduler's queues: those
+    bootstrapping, and those whose KV is being sent."""
+
+    def __init__(self, bootstrap_queue: PrefillBootstrapQueue):
+        self.bootstrap_queue = bootstrap_queue
+        # The prefill requests that are in the middle of kv sending
+        self.inflight_queue: List[Req] = []
+        # Requests with a sent chunk that are not yet on the inflight queue.
+        self.pending_chunk_rids: Set[str] = set()
+
+
 class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
@@ -583,7 +595,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
-        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        kv_mgr = self.disagg_prefill.bootstrap_queue.kv_manager
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
@@ -641,7 +653,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Optimistic requests reserved a metadata buffer when popped, so
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
-                self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+                self.disagg_prefill.bootstrap_queue.finalize_bootstrap(req)
         if failed:
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in failed
@@ -703,7 +715,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                self.disagg_prefill.bootstrap_queue.pop_bootstrapped()
             )
 
             # Get the next batch to run
@@ -827,7 +839,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._yield_gil_if_needed()
                 continue
             bootstrapped_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                self.disagg_prefill.bootstrap_queue.pop_bootstrapped()
                 if should_ingest_requests
                 else []
             )
@@ -880,7 +892,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Poll until the oldest result is ready on all TP ranks while there
                 # is input to take or a transfer to retire; otherwise block.
                 if self.enable_continuous_input_polling or (
-                    poll_transfers_while_waiting and self.disagg_prefill_inflight_queue
+                    poll_transfers_while_waiting and self.disagg_prefill.inflight_queue
                 ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (
@@ -951,7 +963,7 @@ class SchedulerDisaggregationPrefillMixin:
         result: GenerationBatchResult,
     ) -> None:
         """
-        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        Transfer kv for prefill completed requests and add it into disagg_prefill.inflight_queue
         Adapted from process_batch_result_prefill
         """
         (
@@ -998,7 +1010,7 @@ class SchedulerDisaggregationPrefillMixin:
                 draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
                     "cpu", non_blocking=False
                 )
-        # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        # Transfer kv for prefill completed requests and add it into disagg_prefill.inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
@@ -1084,7 +1096,7 @@ class SchedulerDisaggregationPrefillMixin:
                     i, req, logits_output
                 )
                 self.checkpoint_disagg_prefill(req)
-                self.disagg_prefill_inflight_queue.append(req)
+                self.disagg_prefill.inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
@@ -1210,20 +1222,20 @@ class SchedulerDisaggregationPrefillMixin:
         Only these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own sender reports.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
+        if len(self.disagg_prefill.inflight_queue) == 0:
             return []
 
         done_reqs = []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            [req.disagg_kv_sender for req in self.disagg_prefill.inflight_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
-        # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        # Check .poll() for the reqs in disagg_prefill.inflight_queue. If Success, respond to the client and remove it from the queue
+        for req, poll in zip(self.disagg_prefill.inflight_queue, polls):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1266,7 +1278,7 @@ class SchedulerDisaggregationPrefillMixin:
                     and (
                         self.waiting_queue
                         or (
-                            self.disagg_prefill_bootstrap_queue.queue
+                            self.disagg_prefill.bootstrap_queue.queue
                             and self.req_to_metadata_buffer_idx_allocator.available_size()
                             == 0
                         )
@@ -1339,7 +1351,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
 
-        self.disagg_prefill_inflight_queue = undone_reqs
+        self.disagg_prefill.inflight_queue = undone_reqs
 
         return done_reqs
 
@@ -1383,7 +1395,7 @@ class SchedulerDisaggregationPrefillMixin:
         call this: a stale entry holds the unified-memory compaction gate closed
         for the process lifetime.
         """
-        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        self.disagg_prefill.pending_chunk_rids.discard(req.rid)
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
@@ -1453,7 +1465,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return False
             # Metadata buffer was allocated in pop_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
-            finalized = self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+            finalized = self.disagg_prefill.bootstrap_queue.finalize_bootstrap(req)
             assert finalized
             self.checkpoint_disagg_prefill(req)
             return True
@@ -1586,7 +1598,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self, req, end_idx, start_idx=start_idx
                 )
                 digest = computer.compute(page_indices_gpu, state_indices)
-                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+                signature = self.disagg_prefill.bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
@@ -1781,7 +1793,7 @@ class SchedulerDisaggregationPrefillMixin:
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
             state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+                self.disagg_prefill.bootstrap_queue.kv_manager.kv_args.state_types
             )
             payloads = {
                 StateType.MAMBA: _mamba_payload,
@@ -1878,11 +1890,11 @@ class SchedulerDisaggregationPrefillMixin:
                 )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
-        # already put the request on `disagg_prefill_inflight_queue`.
+        # already put the request on `disagg_prefill.inflight_queue`.
         if last_chunk:
-            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            self.disagg_prefill.pending_chunk_rids.discard(req.rid)
         else:
-            self.disagg_prefill_pending_chunk_rids.add(req.rid)
+            self.disagg_prefill.pending_chunk_rids.add(req.rid)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
@@ -1937,7 +1949,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
-            self.disagg_prefill_bootstrap_queue.queue.append(req)
+            self.disagg_prefill.bootstrap_queue.queue.append(req)
         else:
             req.prefill_attempt_count += 1
             logger.info(
