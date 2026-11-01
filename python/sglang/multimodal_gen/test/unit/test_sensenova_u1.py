@@ -506,7 +506,9 @@ def test_sensenova_u1_think_mode_prefix_lengths_cover_think_tokens(monkeypatch):
             )
 
         def _think_prefix_forward(self, **_):
-            return SimpleNamespace(past_key_values=_Cache(), logits=torch.zeros(1, 1, 2))
+            return SimpleNamespace(
+                past_key_values=_Cache(), logits=torch.zeros(1, 1, 2)
+            )
 
         def _generate_think(self, _tok, _out, cache, t_idx, _img):
             return cache, t_idx + 7, "thought"
