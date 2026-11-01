@@ -312,7 +312,6 @@ class BuilderAdapter:
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
             out[f"{p}.available"] = m.available_size()
-            out[f"{p}.schedulable"] = m.schedulable_available_size()
         a = self.allocator
         out["available"] = a.available_size()
         if self.config.chain in WINDOW_CHAINS:

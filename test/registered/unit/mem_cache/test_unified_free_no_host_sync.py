@@ -685,10 +685,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
-                self.assertEqual(
-                    a1.swa_attn_allocator.schedulable_available_size(),
-                    a2.swa_attn_allocator.schedulable_available_size(),
-                )
+                self.assertEqual(a1.swa_available_size(), a2.swa_available_size())
 
     def test_segment_frees_dispatch_no_data_dependent_shape(self):
         """Bug regression: the ratchet, a request's release and a tree eviction

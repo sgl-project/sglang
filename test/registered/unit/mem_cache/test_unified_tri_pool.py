@@ -341,6 +341,8 @@ class TestUnifiedTriPool(_PoolTestCase):
         slot_alloc = UnifiedMambaSlotAllocator(
             allocator.mamba_allocator,
             device=_DEV,
+            take=allocator.alloc_state_slots,
+            capacity=allocator.state_slots_available,
         )
         v = slot_alloc.alloc(3)
         self.assertIsNotNone(v)
@@ -1538,75 +1540,6 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         for src in (settle, src):
             self.assertNotIn(".item()", src)
             self.assertNotIn("synchronize()", src)
-
-
-class TestFloatHoleCreditIsPerSide(_PoolTestCase):
-    """A float's schedulable credit must follow the side the holes are on.
-
-    REGRESSION: the base `_peer_drainable_hole_bytes` picks its neighbour from
-    `grow_direction`, which for a float is "float" -- it fell through to
-    `low_peer`, never saw the HIGH neighbour, and its single scalar was added
-    to `max(gap_low, gap_high)`, landing a LOW neighbour's holes on the HIGH
-    gap. Over-reporting `schedulable_available_size` admits work the shortfall
-    ladder cannot satisfy.
-    """
-
-    def _float(self):
-        full, swa, mamba = tri_sub_pool_specs(head_num=1, head_dim=8)
-        total = (
-            48 * full.entry_bytes() + 32 * swa.entry_bytes() + 8 * mamba.entry_bytes()
-        )
-        pool = arena_of(
-            total_bytes=total,
-            sub_pool_specs=[full, swa, mamba],
-            device=_DEV,
-            enable_memory_saver=False,
-        )
-        alloc = ChainAllocator(
-            roles=ChainRoles(owner="full", window="swa", state="mamba"),
-            arena=pool,
-            kvcache=FakeUnifiedSWAKVPool(pool),
-            views=stand_in_views(
-                ChainRoles(owner="full", window="swa", state="mamba"),
-                FakeUnifiedSWAKVPool(pool),
-                FakeKVCache(pool, "mamba"),
-            ),
-            device=_DEV,
-            full_max_total_num_tokens=48,
-            swa_max_total_num_tokens=32,
-            need_sort=False,
-            forward_stream=None,
-            lazy_compaction=True,
-        )
-        return alloc, alloc.swa_attn_allocator
-
-    def test_schedulable_never_exceeds_the_sum_of_the_two_sides(self):
-        """Upper bound that the undirected scalar could violate: no side may be
-        credited with the other side's holes on top of its own gap."""
-        alloc, flt = self._float()
-        v = alloc.alloc(10)
-        self.assertIsNotNone(v)
-        alloc.free(v[:3])
-        epp = flt.entry_bytes_per_page
-        gap_low, gap_high = flt._gap_pages()
-        c_low = flt._side_drainable_hole_bytes("low") // epp
-        c_high = flt._side_drainable_hole_bytes("high") // epp
-        bound = (
-            min(
-                max(gap_low + c_low, gap_high + c_high),
-                flt.num_pages - flt.min_page_index - flt._live_pages(),
-            )
-            + flt._hole_pages()
-        ) * flt.page_size
-        self.assertLessEqual(flt.schedulable_available_size(), bound)
-
-    def test_memo_verifier_agrees_with_the_per_side_formula(self):
-        """The staleness verifier recomputes through the same entry, so the
-        override must not make the memo look stale."""
-        _alloc, flt = self._float()
-        flt.available_size()
-        flt.schedulable_available_size()
-        self.assertEqual(flt._byte_accounting_violations(), [])
 
 
 class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):

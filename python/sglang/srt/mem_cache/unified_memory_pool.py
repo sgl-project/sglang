@@ -37,12 +37,14 @@ class UnifiedMambaSlotAllocator:
         self,
         mea,
         device: str,
-        take: Optional[Callable[[int], Optional[torch.Tensor]]] = None,
-        capacity: Optional[Callable[[], int]] = None,
+        *,
+        take: Callable[[int], Optional[torch.Tensor]],
+        capacity: Callable[[], int],
     ):
         self._multi_ended_allocator = mea
-        # Slots are taken through the chain allocator when one owns the band.
-        self._take = mea.alloc if take is None else take
+        # Slots are taken and priced through the chain allocator owning the
+        # band: the band's own reads cannot see room a relayout would make.
+        self._take = take
         self._capacity = capacity
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
@@ -64,16 +66,14 @@ class UnifiedMambaSlotAllocator:
         return self._multi_ended_allocator.max_slots - 1
 
     def available_size(self) -> int:
-        # Slot-conservation count (max - allocated): the leak-check view, NOT the
-        # planner value (use schedulable_available_size for that).
+        # Slot-conservation count (max - allocated): the leak-check view, not
+        # what a take can serve (`schedulable_available_size`).
         return self.size - self._multi_ended_allocator.allocated_count()
 
     def schedulable_available_size(self) -> int:
         # The slots a take can have now (>= N => alloc(N) succeeds): the chain's
-        # layout search when a chain owns the band.
-        if self._capacity is not None:
-            return self._capacity()
-        return self._multi_ended_allocator.schedulable_available_size()
+        # layout search.
+        return self._capacity()
 
     @property
     def free_slots(self) -> torch.Tensor:
@@ -137,7 +137,7 @@ def _wire_mamba_slot_allocator(
     take: Callable[[int], Optional[torch.Tensor]],
     state: StateStorage,
     device,
-    capacity: Optional[Callable[[], int]] = None,
+    capacity: Callable[[], int],
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation and host capacities."""
     state_pool = state.pool

@@ -156,16 +156,6 @@ class _CapacityField(Generic[_T]):
         obj._capacity_epoch += 1
 
 
-def _drains_on_urgent_flush(neighbor) -> bool:
-    """Whether an urgent flush of ``neighbor`` would release its holes; a blocked
-    neighbor cannot, so its holes earn no credit."""
-    return (
-        neighbor is not None
-        and neighbor.lazy_compaction
-        and not neighbor.moves_blocked()
-    )
-
-
 def flush_deferred_free_group(
     allocator,
     pending_groups: Sequence[Optional[Sequence[torch.Tensor]]],
@@ -337,13 +327,10 @@ class Band:
         )
         self._move_max_pages = min(max_pages_per_move, self.num_pages)
 
-        # Epoch-keyed memos for the capacity views: pure between mutations, but
-        # schedulers read them O(queue) times per step.
+        # Epoch-keyed memo for the capacity view: pure between mutations, but
+        # schedulers read it O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        self._sched_avail_memo_key: Optional[tuple] = None
-        self._sched_avail_memo_tokens: int = 0
-        self._credit_neighbors_memo: Optional[tuple] = None
 
         self.clear()
 
@@ -585,16 +572,6 @@ class Band:
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        if self._sched_avail_memo_key == self._schedulable_capacity_key():
-            actual = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            if self._sched_avail_memo_tokens != actual:
-                out.append(
-                    f"[{self.sub_pool_name}] stale schedulable_available_size "
-                    f"memo: cached={self._sched_avail_memo_tokens}, "
-                    f"actual={actual}"
-                )
         return out
 
     def _byte_low_frontier(self) -> int:
@@ -646,14 +623,6 @@ class Band:
             p = p.high_peer
         return total
 
-    def _growth_side_neighbor(self) -> Optional[Band]:
-        """Nearest NON-transparent chain member on this pool's GROWTH side -- the
-        one whose compaction releases bytes reachable at this pool's frontier."""
-        p = self.high_peer if self.grow_direction == "up" else self.low_peer
-        while p is not None and p._is_frontier_transparent():
-            p = p.high_peer if self.grow_direction == "up" else p.low_peer
-        return p
-
     def _current_gap_bytes(self) -> int:
         """Free byte band between this side's frontier and the nearest
         non-transparent chain frontier (2-pool: the peer's, byte-identical)."""
@@ -665,13 +634,9 @@ class Band:
             0, self._byte_low_frontier() - self._chain_high_frontier_below_bytes()
         )
 
-    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
-        """Tokens allocatable given `extra_gap_bytes` of ADDED gap room
-        (0 == current realizable; >0 == post-peer-compaction). Own index headroom
-        is unaffected by `extra_gap_bytes`: peer bytes add no page indices here.
-        """
-        gap_bytes = self._current_gap_bytes() + extra_gap_bytes
-        pages_by_bytes = gap_bytes // self.entry_bytes_per_page
+    def _available_tokens(self) -> int:
+        """Tokens this band alone can take in place, its neighbours unmoved."""
+        pages_by_bytes = self._current_gap_bytes() // self.entry_bytes_per_page
         pages_by_index_space = (
             self.num_pages - self.min_page_index - self._allocated_pages()
         )
@@ -681,26 +646,15 @@ class Band:
         return (pages_extend + pages_drain) * self.page_size
 
     def available_size(self) -> int:
-        """Tokens allocatable RIGHT NOW (no peer compaction).
-
-        Alloc shortfall gates consult this, so it MUST NOT fold in peer holes; use
-        `schedulable_available_size()` for that. Memoized on the chain epoch.
-        """
+        """Tokens this band alone can take in place now, nothing in the chain
+        moved. What a take can serve with the chain laid out for it is the
+        chain allocator's read (`units_available`). Memoized on the chain
+        epoch."""
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:
             self._avail_memo_tokens = self._available_tokens()
             self._avail_memo_epoch = epoch
         return self.cap_available(self._avail_memo_tokens)
-
-    def _peer_drainable_hole_bytes(self) -> int:
-        """Gap bytes an urgent flush of the growth-side chain neighbor would
-        release. Only `_free_phys_pages` counts -- NOT the pending pages, which
-        awaits an event -- so the credit is realizable.
-        """
-        neighbor = self._growth_side_neighbor()
-        if not _drains_on_urgent_flush(neighbor):
-            return 0
-        return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
     def moves_blocked(self) -> bool:
         """Whether a fixed page forbids relocating pages, for the paths that
@@ -730,38 +684,6 @@ class Band:
         """Pages ``[first, end)`` spanning every fixed page, or None."""
         pages = self.fixed_pages()
         return (min(pages), max(pages) + 1) if pages else None
-
-    def _credit_neighbors(self) -> tuple:
-        """Chain members whose holes `schedulable_available_size` credits. Which
-        members these are depends only on epoch-tracked state."""
-        return (self._growth_side_neighbor(),)
-
-    def _schedulable_capacity_key(self) -> tuple:
-        """Chain epoch plus each credited neighbor's drain state: gates flip with
-        no allocator write, so the epoch alone misses them."""
-        epoch = self._chain_capacity_epoch()
-        m = self._credit_neighbors_memo
-        if m is None or m[0] != epoch:
-            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
-        (neighbor,) = m[1]
-        return epoch, _drains_on_urgent_flush(neighbor)
-
-    def _schedulable_physical_tokens(self) -> int:
-        """Physical room after neighbor flush, before the owner token quota."""
-        key = self._schedulable_capacity_key()
-        if self._sched_avail_memo_key != key:
-            self._sched_avail_memo_tokens = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            self._sched_avail_memo_key = key
-        return self._sched_avail_memo_tokens
-
-    def schedulable_available_size(self) -> int:
-        """Tokens allocatable after flushing a neighbor, including reclaimable holes.
-
-        Allocation checks use available_size(). Cache by capacity and gate state.
-        """
-        return self.cap_available(self._schedulable_physical_tokens())
 
     # The chain allocator this band is a member of, set when it joins one.
     chain_allocator = None
@@ -2516,52 +2438,8 @@ class FloatBand(Band):
 
     # -- availability --
 
-    def _side_neighbor(self, side: str) -> Optional[Band]:
-        """Nearest non-transparent member on ``side``."""
-        p = self.low_peer if side == "low" else self.high_peer
-        while p is not None and p._is_frontier_transparent():
-            p = p.low_peer if side == "low" else p.high_peer
-        return p
-
-    def _side_drainable_hole_bytes(self, side: str) -> int:
-        """Realizable gap bytes an urgent flush of the neighbour on ``side``
-        would release, walking past transparent members like the frontier walk.
-        """
-        p = self._side_neighbor(side)
-        if not _drains_on_urgent_flush(p):
-            return 0
-        return len(p._free_phys_pages) * p.entry_bytes_per_page
-
-    def _peer_drainable_hole_bytes(self) -> int:
-        """The better of the two sides. `_growth_side_neighbor()` is undefined
-        for a float -- its `grow_direction` is "float", so the base answers
-        `low_peer` and never sees the high neighbour.
-        """
-        return max(
-            self._side_drainable_hole_bytes("low"),
-            self._side_drainable_hole_bytes("high"),
-        )
-
-    def _credit_neighbors(self) -> tuple:
-        return (self._side_neighbor("low"), self._side_neighbor("high"))
-
-    def _schedulable_capacity_key(self) -> tuple:
-        # One drain bit per side: `_available_tokens` credits each side on its own.
-        epoch = self._chain_capacity_epoch()
-        m = self._credit_neighbors_memo
-        if m is None or m[0] != epoch:
-            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
-        low, high = m[1]
-        return epoch, _drains_on_urgent_flush(low), _drains_on_urgent_flush(high)
-
-    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
+    def _available_tokens(self) -> int:
         gap_low, gap_high = self._gap_pages()
-        if extra_gap_bytes > 0:
-            # Per side: the base hands down one undirected scalar because an
-            # END pool grows one way, but a float grows both.
-            epp = self.entry_bytes_per_page
-            gap_low += self._side_drainable_hole_bytes("low") // epp
-            gap_high += self._side_drainable_hole_bytes("high") // epp
         gap_pages = max(gap_low, gap_high)  # a single alloc extends ONE side
         pages_by_index_space = self.num_pages - self.min_page_index - self._live_pages()
         pages_extend = min(gap_pages, pages_by_index_space)

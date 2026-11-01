@@ -2629,32 +2629,12 @@ class TestChainFrontierWalk(unittest.TestCase):
         t2.high_peer = ma
         ma.bind_low_peer(t2)
         self.assertEqual(fa._current_gap_bytes(), t2_lo - fa._byte_high_frontier())
-        self.assertIs(fa._growth_side_neighbor(), t2)
         self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - t2_hi)
-        self.assertIs(ma._growth_side_neighbor(), t2)
         t2.transparent = True
-        self.assertIs(fa._growth_side_neighbor(), ma)
         self.assertEqual(
             fa._current_gap_bytes(),
             ma._byte_low_frontier() - fa._byte_high_frontier(),
         )
-
-    def test_drainable_credit_reads_walked_neighbor(self):
-        _, fa, ma = self._build_pair()
-        stub = _ChainStub(low_byte=64, high_byte=128, transparent=True)
-        fa.bind_high_peer(stub)
-        stub.low_peer = fa
-        stub.high_peer = ma
-        ma.bind_low_peer(stub)
-
-        # Walked-through to the far end: its holes are credited iff lazy.
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)  # ma not lazy
-        ma.lazy_compaction = True
-        ma._free_phys_pages = torch.arange(3, dtype=torch.int64)
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 3 * ma.entry_bytes_per_page)
-        # Opaque non-lazy middle blocks the far end's credit.
-        stub.transparent = False
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
 
 
 class TestFloatBand(CustomTestCase):

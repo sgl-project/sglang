@@ -83,13 +83,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 band._available_tokens(),
                 msg=f"stale available_size memo on {band.sub_pool_name!r}",
             )
-            self.assertEqual(
-                band.schedulable_available_size(),
-                band._available_tokens(
-                    extra_gap_bytes=band._peer_drainable_hole_bytes()
-                ),
-                msg=f"stale schedulable memo on {band.sub_pool_name!r}",
-            )
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
     def test_memos_track_every_mutation_kind(self):
@@ -158,7 +151,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         # Prime every memo at the current epoch.
         allocator.available_size()
         fa.available_size()
-        fa.schedulable_available_size()
         # Mutate capacity state BYPASSING the _CapacityField descriptor -- the
         # epoch does not move, so the memos go stale undetectably for readers...
         fa.__dict__["watermark_physical"] = fa.watermark_physical + 2

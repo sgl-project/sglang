@@ -26,9 +26,7 @@ from sglang.srt.disaggregation.utils import (
     end_network_transfer,
     record_network_transfer,
 )
-from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -221,56 +219,6 @@ class TestNetworkTransfers(CustomTestCase):
         self.assertTrue(flag.query())
 
 
-class TestFixedPeerHolesAreNotSchedulable(CustomTestCase):
-    """`schedulable_available_size` credits holes a peer urgent-flush would
-    release. While a peer holds a fixed page that flush relocates nothing, so
-    crediting them lets the scheduler admit work the band's relief cannot
-    satisfy; the alloc then returns None and the decode prealloc path treats
-    that as a memory-estimation bug and aborts the scheduler.
-    """
-
-    class _Peer:
-        def __init__(self, holders):
-            self.lazy_compaction = True
-            self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
-            self.usage = PageUsage()
-            self.entry_bytes_per_page = 512
-            for key in holders:
-                self.usage.fix(key, [5])
-
-        def _is_frontier_transparent(self):
-            return False
-
-        # Exercise the production predicate when checking each holder.
-        moves_blocked = Band.moves_blocked
-
-    class _Owner:
-        """Stands in for a grow-up END pool: the credit walks the chain from
-        `_growth_side_neighbor()`, so the stub must expose what that walk reads,
-        not the pre-chain `_peer` slot it used to."""
-
-        def __init__(self, peer):
-            self.grow_direction = "up"
-            self.high_peer = peer
-            self.low_peer = None
-
-        _growth_side_neighbor = Band._growth_side_neighbor
-
-    def _credit(self, *holders):
-        peer = self._Peer(holders)
-        owner = self._Owner(peer)
-        return Band._peer_drainable_hole_bytes(owner)
-
-    def test_credit_follows_the_fixed_pages(self):
-        # Nothing fixed: holes are realizable.
-        self.assertEqual(self._credit(), 4 * 512)
-        # A fixed page: an urgent flush that cannot move around it moves
-        # nothing, so credit nothing.
-        self.assertEqual(self._credit("load"), 0)
-        # Any one holder blocks compaction.
-        self.assertEqual(self._credit("load", "other"), 0)
-
-
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     """The unified allocator must translate virtual IDs before PD transfer.
 
@@ -327,7 +275,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 owner = alloc.full_attn_allocator
 
                 def capacity_keys():
-                    return tuple(m._schedulable_capacity_key() for m in alloc.members)
+                    return alloc.pricing_snapshot()
 
                 ids = owner.alloc(alloc.page_size)
                 keys = capacity_keys()

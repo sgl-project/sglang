@@ -230,7 +230,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
                 storage = _build(window=window, lazy=True)
                 allocator = storage.allocator
                 budget = allocator.create_prefill_budget(_cache())
-                slots = allocator.mamba_allocator.schedulable_available_size() + 1
+                slots = allocator.state_slots_available() + 1
                 self.assertFalse(
                     budget.check_prefill(
                         extend_input_len=1,

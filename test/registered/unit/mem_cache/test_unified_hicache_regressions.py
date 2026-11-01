@@ -56,7 +56,7 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
 
 class TestHostGateCapacity(unittest.TestCase):
-    def test_schedulable_memo_tracks_holds(self):
+    def test_capacity_read_tracks_holds(self):
         from test_unified_capacity_memo import _build
 
         from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -65,16 +65,14 @@ class TestHostGateCapacity(unittest.TestCase):
         inst, allocator, kvcache = _build(lazy=True)
         ids = inst._alloc(allocator, kvcache, 8)
         allocator.free_swa(ids[2:6])
-        full = allocator.full_attn_allocator
-        before = full.schedulable_available_size()
+        before = allocator.full_available_size()
         hold_every_band(allocator)
-        self.assertEqual(full.schedulable_available_size(), full.available_size())
-        self.assertGreater(before, full.schedulable_available_size())
-        # A held band's holes are not credited: no compaction is planned.
+        # A held band's holes cannot be compacted away: the read drops.
+        self.assertGreater(before, allocator.full_available_size())
         self.assertTrue(any(band.blocked for band in chain_snapshot(allocator).bands))
         self.assertEqual(allocator.verify_byte_accounting(), [])
         release_every_band(allocator)
-        self.assertEqual(full.schedulable_available_size(), before)
+        self.assertEqual(allocator.full_available_size(), before)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
