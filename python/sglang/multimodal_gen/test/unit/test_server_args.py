@@ -3440,6 +3440,8 @@ class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
             model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
         )
         self.assertTrue(args.enable_breakable_cuda_graph)
+        # the two-stage request takes the output size, not LTX-2.5's 960x544 stage 1
+        self.assertEqual(args.warmup_resolutions, ["1920x1088"])
 
     def test_gates_keep_unset_bcg_off(self):
         cases = {

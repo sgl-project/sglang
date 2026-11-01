@@ -191,7 +191,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
 
             exported = []
             for bs in (4, 2, 1):
-                fake_self._set_profile_trace_tag(bs, None, None, None)
+                fake_self._set_profile_trace_tag(bs, None, None)
                 self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -215,7 +215,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             exported = []
             for bs in (2, 1):
                 for attention_variant in ("dense", "sparse"):
-                    fake_self._set_profile_trace_tag(bs, None, None, attention_variant)
+                    fake_self._set_profile_trace_tag(bs, None, attention_variant)
                     self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -236,7 +236,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             )
             exported = []
             for i in range(6):
-                fake_self._set_profile_trace_tag(2, None, None, f"v{i}")
+                fake_self._set_profile_trace_tag(2, None, f"v{i}")
                 self._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 6)
 
@@ -255,7 +255,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 capture_bs=[8], rank=3, tmp=tmp
             )
             runner = type(fake_self).__name__
-            fake_self._set_profile_trace_tag(8, None, None, None)
+            fake_self._set_profile_trace_tag(8, None, None)
             prof = mock.Mock()
             on_trace_ready(prof)
             prof.export_chrome_trace.assert_called_once_with(
@@ -270,18 +270,18 @@ class TestProfileTraceTag(CustomTestCase):
 
     def test_bs_only_when_no_variants(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(16, None, None, None)
+        fake_self._set_profile_trace_tag(16, None, None)
         self.assertEqual(fake_self._profile_trace_tag, "bs_16")
 
-    def test_appends_attention_lora_and_stream(self):
+    def test_appends_attention_and_lora(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(8, 1, "nolora", "sparse")
-        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream_1")
+        fake_self._set_profile_trace_tag(8, "nolora", "sparse")
+        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora")
 
     def test_noop_without_scheduled_profiler(self):
         fake_self = _make_fake_self([1])
         fake_self._profiler = None
-        fake_self._set_profile_trace_tag(8, None, None, "sparse")
+        fake_self._set_profile_trace_tag(8, None, "sparse")
         self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
 
 
@@ -317,7 +317,7 @@ class TestProfileRunnerName(CustomTestCase):
                     )
                 )
                 for bs in (2, 1):
-                    fake_self._set_profile_trace_tag(bs, None, None, None)
+                    fake_self._set_profile_trace_tag(bs, None, None)
                     TestOnTraceReadyNaming._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 4)
             self.assertEqual(len(set(exported)), len(exported))
@@ -409,7 +409,7 @@ class TestAttentionVariantSizes(CustomTestCase):
                 runner.attention_variant_sizes = sizes
                 captured = {}
 
-                def capture_one_shape(bs, forward, stream_idx, lora, label):
+                def capture_one_shape(bs, forward, lora, label):
                     # the label a capture runs under, and what the model reads
                     seen = (label, get_capture_attention_variant())
                     captured.setdefault(bs, []).append(seen)
@@ -485,7 +485,6 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner.dllm_uses_input_embeds = False
         runner.dllm_input_preparation = None
         runner.ragged_verify_mode = False
-        runner.enable_pdmux = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
         runner.buffers = SimpleNamespace(
@@ -647,7 +646,6 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
         runner.enable_two_batch_overlap = False
-        runner.enable_pdmux = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
         runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
         eager = []

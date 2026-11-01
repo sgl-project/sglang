@@ -60,37 +60,6 @@ class TestLongcatFlashRouterHpcGemm(CustomTestCase):
             ):
                 LongcatFlashMoE(config=config, layer_id=0)
 
-    def _assert_dispatches_to_hpc_gemm(
-        self,
-        *,
-        hidden_size,
-        n_routed_experts,
-        zero_expert_num,
-        expected_min_m,
-    ):
-        router = LongcatFlashRouter(
-            _longcat_config(hidden_size, n_routed_experts),
-            zero_expert_num=zero_expert_num,
-            rounter_params_dtype=torch.float32,
-        )
-        hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16)
-        expected = torch.randn(
-            (4, n_routed_experts + zero_expert_num), dtype=torch.float32
-        )
-
-        with patch(
-            "sglang.srt.models.longcat_flash.linear_bf16_fp32",
-            return_value=expected,
-        ) as mock_linear:
-            out = router(hidden_states)
-
-        self.assertIs(out, expected)
-        mock_linear.assert_called_once()
-        args, kwargs = mock_linear.call_args
-        self.assertIs(args[0], hidden_states)
-        self.assertIs(args[1], router.classifier.weight)
-        self.assertEqual(kwargs["hpc_kernel_min_m"], expected_min_m)
-
     def _assert_uses_classifier(self, router, hidden_size):
         hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16)
         expected = torch.randn((4, router.n_routed_experts), dtype=torch.float32)
