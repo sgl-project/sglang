@@ -884,9 +884,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return result
 
     def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
-        """Stage the folded sampler's params, which the in-graph sample consumes,
-        before the draft replay. A batch past its static buffers has no captured
-        bucket, so the draft runs eager and the eager head reads none of them."""
+        # A batch past the sampler's static buffers has no captured bucket,
+        # so its draft runs eager and the eager head reads none of them.
         if self._draft_sampler is not None and bs <= self._draft_sampler.max_bs:
             self._draft_sampler.stage_sampling_params(
                 bs=bs, sampling_info=sampling_info
@@ -2706,6 +2705,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
+            # Consumed by the in-graph sample; must be staged before the replay.
             self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         with (
