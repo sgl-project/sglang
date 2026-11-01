@@ -672,19 +672,16 @@ class Glm5NextLinearAttention(nn.Module):
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
 
-        try:
-            core_attn_out = self.attn(
-                forward_batch,
-                mixed_qkv=mixed_qkv,
-                a=forget_gate,
-                b=beta,
-            )
-        finally:
-            if fused_onorm:
-                self.attn._k3_onorm_args = None
-                self.attn._k3_onorm_gate = None
+        core_attn_out = self.attn(
+            forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=forget_gate,
+            b=beta,
+        )
 
         if fused_onorm:
+            self.attn._k3_onorm_args = None
+            self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))

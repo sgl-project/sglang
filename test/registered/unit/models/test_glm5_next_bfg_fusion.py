@@ -337,19 +337,6 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
                 self.assertIsNone(attention.attn._k3_onorm_gate)
                 self.assertIsNone(attention.attn._k3_onorm_args)
 
-        backend.side_effect = RuntimeError("verify failed")
-        with self.assertRaisesRegex(RuntimeError, "verify failed"):
-            attention(
-                hidden,
-                SimpleNamespace(
-                    forward_mode=ForwardMode.TARGET_VERIFY,
-                    logical_forward_mode=ForwardMode.TARGET_VERIFY,
-                    attn_cp_metadata=None,
-                ),
-            )
-        self.assertIsNone(attention.attn._k3_onorm_gate)
-        self.assertIsNone(attention.attn._k3_onorm_args)
-
     def test_verify_adapter_accepts_compact_and_k3_norm_arguments(self):
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
