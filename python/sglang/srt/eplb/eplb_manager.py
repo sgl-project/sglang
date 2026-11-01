@@ -9,10 +9,12 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.errors import ElasticLayoutFatal
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     format_expert_location_layout,
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
@@ -24,6 +26,10 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+class ExpertLayoutDivergence(ElasticLayoutFatal):
+    """A reshuffle stopped after a chunk installed, so cohort layouts may disagree."""
 
 
 class EPLBManager:
@@ -104,11 +110,15 @@ class EPLBManager:
             return
 
         elastic_state = ElasticEPStateManager.instance()
+        # dump_record's WORLD collectives would miss ranks arriving or leaving.
+        if ElasticEPStateManager.is_scale_pending():
+            return
         is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
         # A failed later scale leaves the previously committed world serving.
         if is_post_scale_rebalance and (
             elastic_state.pending_ep_size is not None
-            or elastic_state.scale_phase not in ("serving_expanded", "failed")
+            or elastic_state.scale_phase
+            not in ("serving_expanded", "serving_shrunk", "failed")
         ):
             return
 
@@ -137,6 +147,10 @@ class EPLBManager:
             broadcast_over_world=is_post_scale_rebalance,
         )
 
+        from sglang.srt.elastic_ep.elastic_ep import (
+            cohort_vote_via_store,
+            live_cohort_size,
+        )
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
         )
@@ -149,31 +163,34 @@ class EPLBManager:
             expert_location_metadata,
             update_layer_ids=all_update_layer_ids,
         )
+        # Deferred: raising mid-loop would skip the chunk barrier and strand the peers.
+        failure = None
         for chunk_layer_ids in update_layer_ids_chunks:
             if len(update_layer_ids_chunks) > 1:
                 yield
-            update_expert_location_with_recovery(
-                expert_location_updater=self._get_expert_location_updater(),
-                model=self._get_model(),
-                new_expert_location_metadata=expert_location_metadata,
-                update_layer_ids=chunk_layer_ids,
-                tp_rank=(
-                    self._elastic_global_rank()
-                    if is_post_scale_rebalance
-                    else get_parallel().tp_rank
-                ),
-                use_flat_topology=is_post_scale_rebalance,
-                expert_backup_client=self._get_expert_backup_client(),
-                update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
-                ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
-                init_lplb_solvers_callable=lambda: init_lplb_solvers(
-                    model_config=self._model_config
-                ),
-            )
+            if failure is None:
+                try:
+                    self._update_chunk(
+                        expert_location_metadata,
+                        chunk_layer_ids,
+                        init_lplb_solvers,
+                        flat=is_post_scale_rebalance,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[EPLBManager] rebalance update failed", exc_info=True
+                    )
+                    failure = exc
             if is_post_scale_rebalance:
                 # P2P waits only synchronize participating peers. Ranks without
-                # moves must also install this chunk before NIXL resumes.
-                dist.barrier()
+                # moves must also install this chunk before NIXL resumes. A store
+                # rendezvous over live ranks: WORLD still counts exited retirees.
+                cohort_vote_via_store(
+                    True, live_cohort_size(), tag="eplb_rebalance_chunk"
+                )
+
+        if failure is not None:
+            raise failure
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
@@ -183,6 +200,169 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def snapshot_logical_count(self):
+        """Dump logical counts while the pre-scale map is installed: the recorder
+        converts through the metadata a shrink rewrites in place."""
+        try:
+            return get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )["logical_count"]
+        except Exception:
+            # Load-awareness is an optimization; the reshuffle re-dumps if this is None.
+            logger.warning(
+                "[EPLBManager] pre-scale count snapshot failed", exc_info=True
+            )
+            return None
+
+    def reshuffle_for_scale(self, cohort_size: int, logical_count=None) -> bool:
+        """Rebalance onto the post-scale cohort; ``logical_count`` should be the
+        pre-truncation snapshot. Pre-checks abort by cohort vote: a per-rank bail
+        strands peers in the P2P wait."""
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return False
+        # num_local_physical_experts asserts unless ep_size divides the width, and an
+        # offset joiner pins ep_size, so a shrink can leave one rank indivisible: vote.
+        healthy = metadata.num_physical_experts % metadata.ep_size == 0
+        if not healthy:
+            logger.warning(
+                "[EPLBManager] skip scale reshuffle: %d physical, ep_size=%d",
+                metadata.num_physical_experts,
+                metadata.ep_size,
+            )
+        if not self._cohort_accepts(healthy, cohort_size, "dims"):
+            return False
+
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            init_lplb_solvers,
+        )
+
+        if logical_count is None:
+            logical_count = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )["logical_count"]
+
+        # One owner proposes so process-local topology cannot skew the layout.
+        is_owner = dist.get_rank() == 0
+        current_p2l = metadata.physical_to_logical_map
+        proposed = None
+        if is_owner:
+            try:
+                proposed = self._scaled_p2l(metadata, logical_count)
+            except Exception:
+                logger.warning(
+                    "[EPLBManager] scale reshuffle layout failed", exc_info=True
+                )
+        # Only the owner holds a verdict; peers abstain as yes so unanimity is its own.
+        if not self._cohort_accepts(
+            proposed is not None or not is_owner, cohort_size, "layout"
+        ):
+            return False
+
+        p2l = proposed if is_owner else torch.empty_like(current_p2l)
+        # A scale cohort is dense (top slots retire or fill), so ids are range(size).
+        self._share_p2l(p2l, is_owner=is_owner, cohort_ranks=range(cohort_size))
+        new_metadata = None
+        try:
+            new_metadata = ExpertLocationMetadata.init_by_mapping(
+                self._model_config, p2l, moe_ep_rank=self._elastic_global_rank()
+            )
+        except Exception:
+            logger.warning(
+                "[EPLBManager] scale reshuffle metadata failed", exc_info=True
+            )
+        if not self._cohort_accepts(new_metadata is not None, cohort_size, "metadata"):
+            return False
+
+        for chunk_layer_ids in self._compute_update_layer_ids_chunks():
+            failed = False
+            try:
+                self._update_chunk(
+                    new_metadata, chunk_layer_ids, init_lplb_solvers, flat=True
+                )
+            except Exception:
+                logger.warning(
+                    "[EPLBManager] scale reshuffle update failed", exc_info=True
+                )
+                failed = True
+            # Per chunk, before the next chunk's p2p ops go out to a rank that gave up;
+            # also the rendezvous where ranks with no moves install the chunk.
+            if not self._cohort_accepts(not failed, cohort_size, "chunk"):
+                # Not a clean abort, even on chunk 0: passing ranks installed it.
+                raise ExpertLayoutDivergence(
+                    "scale reshuffle stopped on a failed chunk vote; layout may diverge"
+                )
+        return True
+
+    def _update_chunk(self, metadata, layer_ids, init_lplb_solvers, *, flat: bool):
+        update_expert_location_with_recovery(
+            expert_location_updater=self._get_expert_location_updater(),
+            model=self._get_model(),
+            new_expert_location_metadata=metadata,
+            update_layer_ids=layer_ids,
+            tp_rank=self._elastic_global_rank() if flat else get_parallel().tp_rank,
+            # Post-scale: rank // gpus_per_node mistracks a masked partial-node shrink.
+            use_flat_topology=flat,
+            expert_backup_client=self._get_expert_backup_client(),
+            update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
+            ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
+            init_lplb_solvers_callable=lambda: init_lplb_solvers(
+                model_config=self._model_config
+            ),
+        )
+
+    @staticmethod
+    def _share_p2l(p2l: torch.Tensor, *, is_owner: bool, cohort_ranks=None) -> None:
+        """Hand rank 0's layout to the live ranks; WORLD counts exited retirees."""
+        from sglang.srt.elastic_ep.elastic_ep import (
+            live_cohort_ranks,
+            share_expert_map_via_store,
+        )
+
+        if not share_expert_map_via_store(
+            p2l,
+            is_src=is_owner,
+            cohort_ranks=live_cohort_ranks() if cohort_ranks is None else cohort_ranks,
+            group_rank=dist.get_rank(),
+        ):
+            dist.broadcast(p2l, src=0)
+
+    @staticmethod
+    def _cohort_accepts(ok: bool, cohort_size: int, tag: str) -> bool:
+        """Make a local verdict cohort-wide so aborts stay collective."""
+        from sglang.srt.elastic_ep.elastic_ep import cohort_vote_via_store
+
+        if cohort_vote_via_store(ok, cohort_size, tag=f"reshuffle_{tag}"):
+            return True
+        logger.warning("[EPLBManager] scale reshuffle aborted cohort-wide (%s)", tag)
+        return False
+
+    def _scaled_p2l(self, metadata, logical_count) -> torch.Tensor:
+        """Propose a layout sized from the installed metadata, not init_by_eplb, which
+        can size to the pre-shrink launch cohort."""
+        from sglang.srt.eplb import eplb_algorithms
+
+        current_p2l = metadata.physical_to_logical_map
+        num_groups = ModelConfigForExpertLocation.from_model_config(
+            self._model_config
+        ).num_groups
+        p2l = eplb_algorithms.rebalance_experts(
+            tokens_per_expert=logical_count.to(current_p2l.device),
+            num_physical_experts=metadata.num_physical_experts,
+            num_local_physical_experts=metadata.num_local_physical_experts,
+            num_groups=num_groups,
+            # An arbitrary survivor set need not divide by node.
+            num_nodes=1,
+            algorithm=eplb_algorithms.compute_algorithm(
+                raw_algorithm=get_exec().moe.eplb_algorithm,
+                num_groups=num_groups,
+                num_nodes=1,
+            ),
+        )[0].to(current_p2l.device)
+        if p2l.shape != current_p2l.shape:
+            raise ValueError(f"layout {tuple(p2l.shape)} != {tuple(current_p2l.shape)}")
+        return p2l.contiguous()
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool
@@ -198,21 +378,24 @@ class EPLBManager:
         # One owner prevents process-local launch topology from influencing
         # the mapping chosen for the expanded world.
         if dist.get_rank() == 0:
-            computed_metadata = ExpertLocationMetadata.init_by_eplb(
-                self._model_config,
-                logical_count,
-                # Arbitrary append topologies may not preserve node divisibility.
-                use_flat_topology=True,
-            )
-            physical_to_logical_map = (
-                computed_metadata.physical_to_logical_map.contiguous()
-            )
+            try:
+                physical_to_logical_map = self._scaled_p2l(
+                    current_metadata, logical_count
+                )
+            except Exception:
+                # Peers already await the broadcast; no-op with the installed map.
+                logger.warning(
+                    "[EPLBManager] post-scale layout failed; skipping", exc_info=True
+                )
+                physical_to_logical_map = (
+                    current_metadata.physical_to_logical_map.contiguous()
+                )
         else:
             physical_to_logical_map = torch.empty_like(
                 current_metadata.physical_to_logical_map
             )
 
-        dist.broadcast(physical_to_logical_map, src=0)
+        self._share_p2l(physical_to_logical_map, is_owner=dist.get_rank() == 0)
         return ExpertLocationMetadata.init_by_mapping(
             self._model_config,
             physical_to_logical_map,
@@ -295,6 +478,42 @@ class EPLBManager:
         )
 
 
+def reload_missing_expert_weights(
+    missing_logical_experts,
+    *,
+    model: nn.Module,
+    expert_backup_client,
+    update_weights_from_disk_callable,
+) -> None:
+    """Reload logicals whose slot does not hold them from backup or disk: the p2p
+    transfer trusts the installed map and cannot source them from the cohort."""
+    if len(missing_logical_experts) == 0:
+        return
+    if callable(getattr(model, "generate_weight_name_filter", None)):
+        weight_name_filter = model.generate_weight_name_filter(missing_logical_experts)
+    else:
+        logger.info(
+            "[Elastic EP] Model does not implement generate_weight_name_filter. "
+            "Performing full weight reload."
+        )
+        weight_name_filter = None
+
+    if expert_backup_client is not None and expert_backup_client.use_backup:
+        expert_backup_client.update_weights(weight_name_filter)
+    else:
+        success, message = update_weights_from_disk_callable(
+            get_model().model_path,
+            get_model().load_format,
+            weight_name_filter=weight_name_filter,
+        )
+        if not success:
+            # Ignored, the slot would serve its old expert under the new map's label.
+            raise RuntimeError(
+                f"[Elastic EP] failed to reload {len(missing_logical_experts)} "
+                f"missing expert(s) from disk: {message}"
+            )
+
+
 def update_expert_location_with_recovery(
     *,
     expert_location_updater: ExpertLocationUpdater,
@@ -317,31 +536,12 @@ def update_expert_location_with_recovery(
         use_flat_topology=use_flat_topology,
     )
 
-    if len(p2p_missing_logical_experts) > 0:
-        # Load the missing expert weights from disk
-        if callable(getattr(model, "generate_weight_name_filter", None)):
-            # Filter and load only missing expert weights
-            weight_name_filter = model.generate_weight_name_filter(
-                p2p_missing_logical_experts
-            )
-        else:
-            # Do a full reload from disk/DRAM
-            logger.info(
-                "[Elastic EP] Model does not implement generate_weight_name_filter. "
-                "Performing full weight reload."
-            )
-            weight_name_filter = None
-
-        if expert_backup_client is not None and expert_backup_client.use_backup:
-            # Load the missing weights from the DRAM backup
-            expert_backup_client.update_weights(weight_name_filter)
-        else:
-            # Load the missing weights from disk
-            update_weights_from_disk_callable(
-                get_model().model_path,
-                get_model().load_format,
-                weight_name_filter=weight_name_filter,
-            )
+    reload_missing_expert_weights(
+        p2p_missing_logical_experts,
+        model=model,
+        expert_backup_client=expert_backup_client,
+        update_weights_from_disk_callable=update_weights_from_disk_callable,
+    )
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
