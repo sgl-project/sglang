@@ -77,6 +77,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # A static pool's window: the tail a running request keeps of it, by the
+    # window pool's name, bound once at startup (`StaticKVStorage`).
+    window_retention: Optional[Dict[str, int]] = None
 
     @property
     def state_slots(self):

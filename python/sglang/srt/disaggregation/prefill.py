@@ -67,7 +67,6 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     record_network_transfer,
-    retained_window_lengths,
     setup_state_kv_args,
     state_indices_per_entry,
 )
@@ -120,9 +119,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
-
-# The default window of a window payload: the scheduler's sliding window.
-_SCHEDULER_WINDOW = object()
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -438,11 +434,7 @@ class PrefillBootstrapQueue:
             storage,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
-            window_tails=retained_window_lengths(
-                self.scheduler.token_to_kv_pool_allocator,
-                getattr(self.scheduler.tree_cache, "draft_window_reaches", None),
-                self.scheduler.sliding_window_size,
-            ),
+            window_tails=storage.retained_window_lengths(),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1786,10 +1778,7 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload(sub_pool=None, window=_SCHEDULER_WINDOW):
-                if window is _SCHEDULER_WINDOW:
-                    # Read only when a window entry is sent.
-                    window = self.sliding_window_size
+            def _swa_payload(sub_pool=None):
                 storage = kv_storage_of(
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
@@ -1797,18 +1786,11 @@ class SchedulerDisaggregationPrefillMixin:
                     sub_pool = window_sub_pool_of(self.token_to_kv_pool_allocator)
                 # The whole tail the decode keeps, readers reaching further
                 # back than the window included.
-                retain = retained_window_lengths(
-                    self.token_to_kv_pool_allocator,
-                    getattr(self.tree_cache, "draft_window_reaches", None),
-                    window,
-                ).get(sub_pool)
                 resume = storage.resume_units(
                     sub_pool,
                     req,
                     token_start=req.disagg_decode_prefix_len,
                     token_boundary=seq_len,
-                    window=window,
-                    retain=retain,
                 )
                 units = resume.unit_ids
                 return _DeviceRows(units) if host_indices else units.cpu().numpy()

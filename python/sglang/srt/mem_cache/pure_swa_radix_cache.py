@@ -24,7 +24,6 @@ class PureSWARadixCache(RadixCache):
     def __init__(self, params: CacheInitParams):
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
-        self.draft_window_reaches = params.draft_window_reaches
 
     def supports_swa(self) -> bool:
         assert self.sliding_window_size is not None, (

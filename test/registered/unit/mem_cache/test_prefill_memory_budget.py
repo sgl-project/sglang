@@ -38,7 +38,9 @@ _NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
+def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None, window=8):
+    """A full + window pool whose window states no length: ``window`` is the
+    length the cache builder binds for it, as for a model that resolves it."""
     setup_allocator_context()
     # `pool_tokens` sizes both sub-pools directly, for a test whose arithmetic
     # needs an exact token count rather than whatever a byte budget buys.
@@ -49,7 +51,7 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         if pool_tokens is not None
         else dict(total_bytes=total_bytes)
     )
-    return build_test_unified_pools(
+    allocator = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -68,6 +70,8 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         lazy_compaction=True,
         **sized,
     ).token_to_kv_pool_allocator
+    allocator.storage.bind_window_retention(window, None)
+    return allocator
 
 
 def _cache():
@@ -490,7 +494,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 class TestSharedPrefillAdmission(unittest.TestCase):
     def _new_admission(self, page_size, pool_pages, *, ignore_eos=False):
         allocator = _shared_allocator(
-            page_size=page_size, pool_tokens=pool_pages * page_size
+            page_size=page_size, pool_tokens=pool_pages * page_size, window=page_size
         )
         # Each end may borrow the other's unused initial share.
         self.assertEqual(allocator.size_full, 2 * pool_pages * page_size)

@@ -36,6 +36,15 @@ class _FakeAllocator:
 
     device = "cpu"
     storage = None
+    # The one window pool, keeping the cache's 4-token window (as the cache
+    # builder binds it).
+    window_retention = {"swa": 4}
+
+    def window_pool_names(self):
+        return ("swa",)
+
+    def get_kvcache(self):
+        return SimpleNamespace(request_window=None)
 
     def __init__(self, page_size=1):
         self.page_size = page_size
