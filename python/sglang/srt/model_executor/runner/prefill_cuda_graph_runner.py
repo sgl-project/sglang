@@ -54,6 +54,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -1758,7 +1759,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
-        with self.model_context():
+        # Capture calls the model directly, bypassing ModelRunner.forward.
+        # Exclude draft hooks even when the model has no internal recorder guard.
+        recording_context = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self.model_runner.is_draft_worker
+            else nullcontext()
+        )
+        with self.model_context(), recording_context:
             self._capture()
 
     def _capture(self) -> None:

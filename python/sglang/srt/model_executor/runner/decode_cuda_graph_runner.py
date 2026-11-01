@@ -42,6 +42,7 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
 from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
@@ -1278,7 +1279,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        with self.model_context():
+        # Capture calls the model directly, bypassing ModelRunner.forward.
+        # Exclude draft hooks even when the model has no internal recorder guard.
+        recording_context = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self.model_runner.is_draft_worker
+            else contextlib.nullcontext()
+        )
+        with self.model_context(), recording_context:
             self._capture()
 
     def _capture(self) -> None:
