@@ -56,6 +56,7 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         incremental_streaming_output,
         disaggregation_mode,
         deployment_info,
+        dp_listeners: _,
     } = info;
     let max_context_length = u32::try_from(max_context_length)
         .map_err(|_| format!("max_context_length {max_context_length} exceeds uint32"))?;

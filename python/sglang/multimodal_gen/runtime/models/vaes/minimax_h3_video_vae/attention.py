@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Attention module for the MiniMax H3 visual VAE (inference-only bundle).
-from contextlib import nullcontext
+import math
 from typing import Optional
 
 import torch
@@ -8,7 +8,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.utils import logging
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -25,15 +24,36 @@ _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
 )
 
 
+def _math_sdpa(query, key, value):
+    """``F.scaled_dot_product_attention`` on ``SDPBackend.MATH``, bit-for-bit.
+
+    Replays aten's ``_scaled_dot_product_attention_math`` for unmasked,
+    non-causal inputs without the work this caller discards: ``_safe_softmax``'s
+    all ``-inf`` row masking (no row is masked) and the downcast of the
+    attention weights it also returns.
+    """
+    device = query.device.type
+    # autocast casts the SDPA inputs once; aten's math ops then run uncast
+    if torch.is_autocast_enabled(device):
+        dtype = torch.get_autocast_dtype(device)
+        query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+    out_dtype = query.dtype
+    if not torch.backends.cuda.fp16_bf16_reduction_math_sdp_allowed():
+        query, key, value = query.float(), key.float(), value.float()
+    # aten scales q and k by sqrt(1 / sqrt(head_dim)) each
+    scale = math.sqrt(1.0 / math.sqrt(query.shape[-1]))
+    with torch.autocast(device, enabled=False):
+        attn = torch.matmul(query * scale, key.transpose(-2, -1) * scale)
+        out = torch.matmul(torch.softmax(attn, -1), value)
+    return out.to(out_dtype)
+
+
 def _sdpa_attention(query, key, value):
-    context = sdpa_kernel([SDPBackend.MATH]) if _FORCE_ROCM_MATH_SDPA else nullcontext()
-    with context:
-        return F.scaled_dot_product_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            dropout_p=0.0,
-        ).transpose(1, 2)
+    query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+    if _FORCE_ROCM_MATH_SDPA:
+        return _math_sdpa(query, key, value).transpose(1, 2)
+    out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
+    return out.transpose(1, 2)
 
 
 def _vit_norm_input(module, hidden_states):
