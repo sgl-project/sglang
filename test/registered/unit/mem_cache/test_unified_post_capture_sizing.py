@@ -582,25 +582,32 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
 
         from sglang.srt.managers.schedule_batch import ReqKvInfo
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import get_memory
         from sglang.srt.server_args import ServerArgs
 
-        for draft_window in (32, 96):
-            with self.subTest(draft_window=draft_window):
+        # One or two draft windows beside the target's: two or three window
+        # sub-pools, each with a host pool of its own.
+        for draft_windows in (
+            {"window_32": 32},
+            {"window_96": 96},
+            {"window_96": 96, "window_16": 16},
+        ):
+            with self.subTest(draft_windows=draft_windows):
                 placement = FusedDraftPlacement.from_counts(
-                    counts={"draft_swa": [1]},
+                    counts={name: [1] for name in draft_windows},
                     regions={
-                        "draft_swa": DenseDraftRegion(
+                        name: DenseDraftRegion(
                             lane_num=1,
                             head_num=1,
                             head_dim=64,
                             store_dtype=torch.float16,
                         )
+                        for name in draft_windows
                     },
                     new_bands={
-                        "draft_swa": DraftBand(kind="window", window=draft_window)
+                        name: DraftBand(kind="window", window=window)
+                        for name, window in draft_windows.items()
                     },
                 )
                 bundle = _bundle(
@@ -644,9 +651,10 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                     expected[band.sub_pool_name] = i + 11
                 backup = cache.backup_kv_cache(req)
                 self.assertIsNotNone(backup)
+                # Window host pools go by their sub-pools' names.
                 self.assertEqual(
                     {t.name for t in backup.pool_transfers},
-                    {PoolName.SWA, PoolName.AUXILIARY_SWA},
+                    {"window_64", *draft_windows},
                 )
                 a.free(source)
                 blocker = a.alloc(132)
@@ -659,7 +667,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 cache.restore_kv_cache(req, backup)
                 cache._finish_restore(req.kv)
                 for band in a.members:
-                    window = {"full": 132, "window_64": 64, "draft_swa": draft_window}[
+                    window = {"full": 132, "window_64": 64, **draft_windows}[
                         band.sub_pool_name
                     ]
                     start = max(0, 129 - window) // 4 * 4
@@ -681,12 +689,12 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 a.free(destination)
                 self.assertEqual(bundle.storage.accounting_violations(), [])
 
-    def test_second_window_host_pool_attaches_to_its_own_cache_component(self):
-        """A separately retained draft window must survive final HiCache attachment."""
+    def test_every_window_host_pool_attaches_to_its_own_cache_component(self):
+        """Separately retained draft windows must survive final HiCache
+        attachment, each in a host pool named by its sub-pool."""
         from unittest.mock import patch
 
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as host
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -695,10 +703,14 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         region = DenseDraftRegion(
             lane_num=1, head_num=1, head_dim=8, store_dtype=torch.float16
         )
+        draft_windows = {"window_32": 32, "window_16": 16}
         placement = FusedDraftPlacement.from_counts(
-            counts={"draft_swa": [1]},
-            regions={"draft_swa": region},
-            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+            counts={name: [1] for name in draft_windows},
+            regions={name: region for name in draft_windows},
+            new_bands={
+                name: DraftBand(kind="window", window=window)
+                for name, window in draft_windows.items()
+            },
         )
         bundle = _bundle(
             total_bytes=1 << 20,
@@ -729,21 +741,26 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             host.attach_hybrid_pool_to_unified_cache(
                 cache, params, None, load_cache_event=None
             )
-        second = cache.window_slots()[1]
-        pools = (
-            cache.full_kv_pool_host,
-            cache.swa_kv_pool_host,
-            cache.components[second]._swa_kv_pool_host,
+        windows = cache.window_slots()
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0], ComponentType.SWA)
+        pools = [cache.components[ct]._swa_kv_pool_host for ct in windows]
+        for pool in (cache.full_kv_pool_host, *pools):
+            self.addCleanup(pool.destroy)
+        self.assertIs(cache.swa_kv_pool_host, pools[0])
+        self.assertEqual(len({id(pool) for pool in pools}), 3)
+        self.assertEqual(
+            [cache.components[ct].pool_name for ct in windows],
+            ["window_64", *draft_windows],
+        )
+        self.assertEqual(
+            {str(e.name) for e in cache.host_pool_group.entries},
+            {"kv", "window_64", *draft_windows},
         )
         for pool in pools:
-            self.addCleanup(pool.destroy)
-        self.assertIsNot(pools[1], pools[2])
-        self.assertIsNotNone(pools[2])
-        self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
-        self.assertEqual(cache.components[second].pool_name, PoolName.AUXILIARY_SWA)
-        ids = pools[2].alloc(4)
-        self.assertIsNotNone(ids)
-        pools[2].free(ids)
+            ids = pool.alloc(4)
+            self.assertIsNotNone(ids)
+            pool.free(ids)
 
     def test_flashinfer_idle_spec_inputs_use_dummy_decode_metadata(self):
         """Padded idle target and draft ranks must plan without prepared draft CSR."""

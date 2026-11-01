@@ -6,7 +6,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import requests
 import torch
@@ -809,15 +809,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self,
         *,
         sidecar_pool_specs: Sequence[SidecarPoolSpec],
-        swa_trailing_pages: Optional[int],
+        window_trailing_pages: Mapping[str, int],
         page_size: int,
     ) -> dict:
         """Describe physical objects using the same key builders as writes.
 
         Args:
             sidecar_pool_specs: Sidecar hit policies and their index-source pools.
-            swa_trailing_pages: The SWA component's full_window_pages, or None
-                when no SWA component exists. Mamba uses one trailing page.
+            window_trailing_pages: Each window component's full_window_pages,
+                by its host pool's name; empty when no window component
+                exists. Mamba uses one trailing page.
             page_size: Resolved engine page size in tokens.
 
         Returns:
@@ -866,7 +867,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
 
         specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
-        trailing_pages = {PoolName.MAMBA: 1, PoolName.SWA: swa_trailing_pages}
+        trailing_pages = {PoolName.MAMBA: 1, **window_trailing_pages}
         for pool_name in self.registered_pools:
             if pool_name == PoolName.KV:
                 continue
@@ -1001,7 +1002,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
-        elif pool_name == PoolName.SWA:
+        elif pool_name == PoolName.SWA or str(pool_name).startswith("window"):
+            # A window host pool: `swa`, or a unified pool's window sub-pool,
+            # named by the sub-pool and keyed by that name.
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
                 # Ordinary MHA SWA mirrors a K/V pool.
                 suffixes = [

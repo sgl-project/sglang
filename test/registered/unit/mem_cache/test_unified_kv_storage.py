@@ -84,11 +84,11 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "WINDOW_32")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "window_32", "WINDOW_32")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("window_32", "swa", "WINDOW_32"),
+                ("window_32", "window_32", "WINDOW_32"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
@@ -332,7 +332,7 @@ class TestHostStack(CustomTestCase):
         result, controller, cache = self._build("swa", backend=None)
         storage = cache.token_to_kv_pool_allocator.storage
         kv, swa = result.host_pool_group.entry_map.values()
-        self.assertEqual((kv.name, swa.name), (PoolName.KV, PoolName.SWA))
+        self.assertEqual((kv.name, swa.name), (PoolName.KV, "window_32"))
         for entry, sub_pool in ((kv, "full"), (swa, "window_32")):
             self.assertEqual(entry.host_pool.kind, "envelope")
             self.assertEqual(entry.host_pool.name, sub_pool)
@@ -390,7 +390,7 @@ class TestHostStack(CustomTestCase):
         result, _, _ = self._build("swa", backend="file")
         self.assertEqual(
             [e.name for e in result.host_pool_group.entry_map.values()],
-            [PoolName.KV, PoolName.SWA],
+            [PoolName.KV, "window_32"],
         )
 
 

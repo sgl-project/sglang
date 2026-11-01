@@ -275,7 +275,8 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
         # A store without SWA pages tombstones restored tails instead.
-        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
+        self._swa_pool = swa.pool_name if swa is not None else PoolName.SWA
+        self._skip_swa = swa is not None and self._swa_pool not in cache_linker.pools
         self._components = tuple(
             component
             for component in cache._components_tuple
@@ -338,7 +339,7 @@ class UnifiedCacheLinkerWrapper:
             return result
         hit_tokens = hit_pages * page
 
-        swa_transfer = by_pool.get(PoolName.SWA)
+        swa_transfer = by_pool.get(self._swa_pool)
         swa_host_hit_length = (
             min(len(swa_transfer.keys), hit_pages) * page
             if swa_transfer is not None
@@ -517,7 +518,7 @@ class UnifiedCacheLinkerWrapper:
             if transfers is None:
                 continue
             if self._skip_swa:
-                transfers = [t for t in transfers if t.name != PoolName.SWA]
+                transfers = [t for t in transfers if t.name != self._swa_pool]
             if self.offload_skip_prefix_len:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
