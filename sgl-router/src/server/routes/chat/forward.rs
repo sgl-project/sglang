@@ -241,13 +241,14 @@ async fn dispatch<T: Transport>(
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
+    let pd_prefill_rank = pd.is_some().then_some(prefill_rank).flatten();
     let prefill_leg = Leg::new(
         dp_aware,
         headers.clone(),
         &body,
         &additions,
         prefill_rank,
-        None,
+        pd_prefill_rank,
     );
     let prefill_load_guards = (
         worker_load_guard,
@@ -721,7 +722,7 @@ fn prompt_dp_rank(
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
 /// the body, which `/generate` reads instead, carries it or null to unpin.
-/// Decode's body also names the pinned prefill rank, so decode need not look it up.
+/// In PD mode, both bodies also name the pinned prefill rank so neither side needs a lookup.
 fn with_dp_rank(
     dp_aware: bool,
     mut headers: HeaderMap,

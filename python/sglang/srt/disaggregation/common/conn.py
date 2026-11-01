@@ -2155,6 +2155,7 @@ class CommonKVSender(BaseKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        req_disagg_prefill_dp_rank: Optional[int] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -2199,37 +2200,61 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().num_dp_ranks > 1 and not req_has_disagg_prefill_dp_rank:
+        if req_disagg_prefill_dp_rank is not None:
+            req_has_disagg_prefill_dp_rank = True
+        if get_parallel().num_dp_ranks > 1:
+            dispatched_dp_rank = self._dispatched_dp_rank()
             if (
-                get_parallel().load_balance_method != "follow_bootstrap_room"
-                or envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+                req_disagg_prefill_dp_rank is not None
+                and req_disagg_prefill_dp_rank != dispatched_dp_rank
             ):
-                self._register_prefill_dp_rank()
-            elif (
-                self.kv_mgr.attn_dp_rank
-                != self.bootstrap_room % get_parallel().num_dp_ranks
-            ):
-                # follow_bootstrap_room was overridden by external routed_dp_rank
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
-                    f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                    f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
-                    f"{self.bootstrap_room} implies dp_rank "
-                    f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
-                    f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
-                    f"to allow mixed routing.",
+                    f"disagg_prefill_dp_rank mismatch: dispatched to dp_rank "
+                    f"{dispatched_dp_rank} but request specified "
+                    f"disagg_prefill_dp_rank {req_disagg_prefill_dp_rank}.",
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
                 return
+            if not req_has_disagg_prefill_dp_rank:
+                if (
+                    get_parallel().load_balance_method != "follow_bootstrap_room"
+                    or envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+                ):
+                    self._register_prefill_dp_rank()
+                elif (
+                    dispatched_dp_rank
+                    != self.bootstrap_room % get_parallel().num_dp_ranks
+                ):
+                    # follow_bootstrap_room was overridden by external routed_dp_rank
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                        f"{dispatched_dp_rank} but bootstrap_room "
+                        f"{self.bootstrap_room} implies dp_rank "
+                        f"{self.bootstrap_room % get_parallel().num_dp_ranks}. "
+                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                        f"to allow mixed routing.",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    self.conclude_state = KVPoll.Failed
+                    return
         # Bootstrap timeout clock starts after the registration above.
         self.init_time = time.time()
+
+    def _dispatched_dp_rank(self) -> int:
+        system_dp_size = getattr(self.kv_mgr, "system_dp_size", 1)
+        if isinstance(system_dp_size, int) and system_dp_size > 1:
+            return self.kv_mgr.system_dp_rank
+        return self.kv_mgr.attn_dp_rank
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
+            "dp_rank": self._dispatched_dp_rank(),
         }
         try:
             response = requests.post(url, json=payload, timeout=5)

@@ -217,5 +217,187 @@ class TestRegisterToBootstrap(CustomTestCase):
         return mgr
 
 
+class TestCommonKVSenderDPAwareRouting(CustomTestCase):
+    """Tests for CommonKVSender DP-aware disagg_prefill_dp_rank handling."""
+
+    def _make_sender_mgr(
+        self, attn_dp_rank: int = 2, system_dp_size: int = 1, system_dp_rank: int = 0
+    ):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = MagicMock(spec=CommonKVManager)
+        mgr.deferred_bootstrap = None
+        mgr.is_dummy_cp_rank = False
+        mgr.sender_trace_module = None
+        mgr.attn_dp_rank = attn_dp_rank
+        mgr.system_dp_size = system_dp_size
+        mgr.system_dp_rank = system_dp_rank
+        mgr.request_status = {}
+
+        def _update_status(room, status):
+            mgr.request_status[room] = status
+
+        mgr.update_status.side_effect = _update_status
+        mgr.check_status.side_effect = lambda room: mgr.request_status[room]
+        return mgr
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_matching_disagg_prefill_dp_rank_skips_conflict_and_bootstrap_post(
+        self, mock_post
+    ):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room",
+            dp_size=1,
+            attn_dp_size=4,
+            enable_dp_attention=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        mgr = self._make_sender_mgr(attn_dp_rank=2)
+        # bootstrap_room=12 -> 12 % 4 == 0 != attn_dp_rank (2)
+        with envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(False):
+            sender = CommonKVSender(
+                mgr=mgr,
+                bootstrap_addr="127.0.0.1:8998",
+                bootstrap_room=12,
+                req_has_disagg_prefill_dp_rank=True,
+                req_disagg_prefill_dp_rank=2,
+            )
+
+        self.assertIsNone(sender.conclude_state)
+        self.assertEqual(mgr.request_status[12], KVPoll.Bootstrapping)
+        mgr.record_failure.assert_not_called()
+        mock_post.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_matching_disagg_prefill_dp_rank_with_force_query_still_skips_post(
+        self, mock_post
+    ):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room",
+            dp_size=4,
+            attn_dp_size=1,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        mgr = self._make_sender_mgr(attn_dp_rank=0, system_dp_size=4, system_dp_rank=3)
+        with envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(True):
+            sender = CommonKVSender(
+                mgr=mgr,
+                bootstrap_addr="127.0.0.1:8998",
+                bootstrap_room=12,
+                req_disagg_prefill_dp_rank=3,
+            )
+
+        self.assertIsNone(sender.conclude_state)
+        self.assertEqual(mgr.request_status[12], KVPoll.Bootstrapping)
+        mgr.record_failure.assert_not_called()
+        mock_post.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_mismatched_disagg_prefill_dp_rank_records_failure(self, mock_post):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room",
+            dp_size=1,
+            attn_dp_size=4,
+            enable_dp_attention=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        mgr = self._make_sender_mgr(attn_dp_rank=2)
+        sender = CommonKVSender(
+            mgr=mgr,
+            bootstrap_addr="127.0.0.1:8998",
+            bootstrap_room=12,
+            req_has_disagg_prefill_dp_rank=True,
+            req_disagg_prefill_dp_rank=1,
+        )
+
+        self.assertEqual(sender.conclude_state, KVPoll.Failed)
+        self.assertEqual(mgr.request_status[12], KVPoll.Failed)
+        mgr.record_failure.assert_called_once()
+        self.assertIn(
+            "disagg_prefill_dp_rank mismatch", mgr.record_failure.call_args[0][1]
+        )
+        mock_post.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.post")
+    def test_missing_disagg_prefill_dp_rank_conflicts_without_force_query(
+        self, mock_post
+    ):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        override = get_context().override_server_args(
+            load_balance_method="follow_bootstrap_room",
+            dp_size=1,
+            attn_dp_size=4,
+            enable_dp_attention=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        mgr = self._make_sender_mgr(attn_dp_rank=2)
+        with envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(False):
+            sender = CommonKVSender(
+                mgr=mgr,
+                bootstrap_addr="127.0.0.1:8998",
+                bootstrap_room=12,
+                req_has_disagg_prefill_dp_rank=False,
+                req_disagg_prefill_dp_rank=None,
+            )
+
+        self.assertEqual(sender.conclude_state, KVPoll.Failed)
+        self.assertEqual(mgr.request_status[12], KVPoll.Failed)
+        mgr.record_failure.assert_called_once()
+        self.assertIn(
+            "follow_bootstrap_room conflict", mgr.record_failure.call_args[0][1]
+        )
+        mock_post.assert_not_called()
+
+    def test_prefill_bootstrap_queue_create_sender_passes_disagg_prefill_dp_rank(self):
+        from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
+        from sglang.srt.disaggregation.utils import TransferBackend
+
+        pm = MagicMock(spec=PrefillBootstrapQueue)
+        pm._check_if_req_exceed_kv_capacity.return_value = False
+        pm.transfer_backend = TransferBackend.NIXL
+        pm.kv_manager = MagicMock()
+        pm.bootstrap_port = 8998
+
+        req = MagicMock()
+        req.bootstrap_host = "127.0.0.1"
+        req.bootstrap_room = 99
+        req.disagg_prefill_dp_rank = 3
+
+        fake_sender_cls = MagicMock()
+        with patch(
+            "sglang.srt.disaggregation.prefill.get_kv_class",
+            return_value=fake_sender_cls,
+        ):
+            ok = PrefillBootstrapQueue.create_sender(pm, req, num_kv_heads=8)
+
+        self.assertTrue(ok)
+        fake_sender_cls.assert_called_once_with(
+            mgr=pm.kv_manager,
+            bootstrap_addr="127.0.0.1:8998",
+            bootstrap_room=99,
+            req_has_disagg_prefill_dp_rank=True,
+            req_disagg_prefill_dp_rank=3,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
