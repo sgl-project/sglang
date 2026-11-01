@@ -483,6 +483,7 @@ class TestStaticMambaSlotBudget(CustomTestCase):
 
     def _adder(self, static: bool, lazy: bool = False):
         adder = SimpleNamespace(
+            _mamba_slot_cost=0,
             _static_mamba_slots=static,
             tree_cache=SimpleNamespace(
                 req_to_token_pool=SimpleNamespace(
@@ -571,8 +572,11 @@ class TestStaticMambaSlotBudget(CustomTestCase):
         # must stop pulling new requests once the remaining slot budget is
         # below a worst-case cold request, because init_next_round_input's
         # mamba COW allocates BEFORE add_one_req can reject. Headroom = the
-        # cold factor on the static pool (lazy variant = 2), on the shared
-        # pool too, and 0 (pre-check disabled) without a mamba pool.
+        # cold factor on the static pool (lazy variant = 2), 1 on the shared
+        # pool (its pre-gate COW allocates a single slot, and the steady-state
+        # footprint is already covered by the token reserve — the cold factor
+        # would withhold admission near pool-empty), and 0 (pre-check
+        # disabled) without a mamba pool.
         from sglang.srt.managers.schedule_policy import PrefillAdder
 
         self.assertEqual(PrefillAdder._mamba_match_headroom(self._adder(static=True)), 3)
@@ -588,7 +592,69 @@ class TestStaticMambaSlotBudget(CustomTestCase):
             _static_mamba_slots=False,
             tree_cache=self._adder(static=True).tree_cache,
         )
-        self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 3)
+        self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 1)
+
+
+class TestMambaAuditWithBareTreeCache(CustomTestCase):
+    """Regression (A800 --disable-radix-cache crash): the [MambaAudit] slot
+    audit calls tree_cache.mamba_evictable_size(), which only the mamba-aware
+    radix caches define. A tree_cache implementation without the override must
+    answer 0 through the BasePrefixCache default so the audit runs instead of
+    raising AttributeError in _get_new_batch_prefill_raw."""
+
+    def test_audit_with_bare_tree_cache(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+        class _BareTreeCache(BasePrefixCache):
+            # Smallest concrete cache: inherits the BasePrefixCache defaults
+            # and nothing else — the stand-in for any tree_cache
+            # implementation that does not override mamba_evictable_size.
+            def reset(self):
+                pass
+
+            def match_prefix(self, params):
+                pass
+
+            def checkpoint(self, req, *, up_to, **kwargs):
+                pass
+
+            def evict(self, params):
+                pass
+
+            def inc_lock_ref(self, node):
+                pass
+
+            def dec_lock_ref(self, node, params=None):
+                pass
+
+        tree_cache = _BareTreeCache()
+        self.assertEqual(tree_cache.mamba_evictable_size(), 0)
+
+        fake_scheduler = SimpleNamespace(
+            _mamba_audit_last_ts=0.0,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    debug_stats=lambda: {
+                        "size": 9,
+                        "free": 9,
+                        "alloc_total": 0,
+                        "free_total": 0,
+                        "group_degraded": 0,
+                    }
+                )
+            ),
+            tree_cache=tree_cache,
+            chunked_req=None,
+            waiting_queue=[],
+        )
+        adder = SimpleNamespace(can_run_list=[], rem_mamba_slots=None)
+        running_batch = SimpleNamespace(reqs=[])
+        with self.assertLogs("sglang.srt.managers.scheduler", level="INFO") as cm:
+            Scheduler._maybe_audit_mamba_slots(fake_scheduler, adder, running_batch)
+        self.assertTrue(any("[MambaAudit]" in line for line in cm.output))
+        # evictable must read 0 through the base default, not crash.
+        self.assertTrue(any("evictable=0" in line for line in cm.output))
 
 
 class _FakeArgs:
