@@ -400,6 +400,52 @@ def _mxfp4_asm_input(linear: nn.Module, num_tokens: int) -> bool:
     )
 
 
+def _output_gate_mxfp4_quant(
+    o_proj: nn.Module, attn_output_gate: bool, num_heads: int, head_dim: int
+):
+    """The output gate that hands ``o_proj`` its MXFP4 input, or None.
+
+    On ROCm/AITER gfx95 with a Quark W4A4 MXFP4 o_proj, one Triton kernel
+    computes sigmoid(gate) * attn_output and quantizes it to fp4x2 with
+    shuffled E8M0 scales, in place of fused_sigmoid_mul and the projection's
+    per_1x32_f4_quant, bit for bit. Whether a batch takes it is decided by
+    _mxfp4_asm_input, since the ASM GEMM is chosen after weight loading.
+    """
+    if not (
+        _use_aiter
+        and _is_gfx95
+        and attn_output_gate
+        and num_heads * head_dim % 256 == 0
+    ):
+        return None
+    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+        QuarkW4A4MXFP4,
+        _AsmShuffledMxfp4Input,
+    )
+
+    if not isinstance(getattr(o_proj, "scheme", None), QuarkW4A4MXFP4):
+        return None
+    from sglang.kernels.ops.elementwise.elementwise import (
+        fused_sigmoid_mul_mxfp4_quant,
+    )
+
+    def gate_and_quant(attn_output: torch.Tensor, gate: torch.Tensor):
+        x_q, x_scales = fused_sigmoid_mul_mxfp4_quant(
+            attn_output, gate.view(attn_output.shape[0], num_heads, head_dim)
+        )
+        return _AsmShuffledMxfp4Input(
+            (x_q.view(aiter_dtypes.fp4x2), x_scales.view(aiter_dtypes.fp8_e8m0))
+        )
+
+    _log_output_gate_mxfp4_quant_fusion()
+    return gate_and_quant
+
+
+@lru_cache(maxsize=1)
+def _log_output_gate_mxfp4_quant_fusion() -> None:
+    logger.info("Enabled fused output gate + MXFP4-quant for o_proj input.")
+
+
 class _GemmaRMSNormMXFP4Quant(GemmaRMSNorm):
     """Gemma RMSNorm that also quantizes its output for the MXFP4 projection
     it feeds. One Triton kernel adds the residual, normalizes and writes fp4x2
@@ -1658,6 +1704,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
+        self.output_gate_mxfp4_quant = _output_gate_mxfp4_quant(
+            self.o_proj, self.attn_output_gate, self.num_heads, self.head_dim
+        )
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -1947,6 +1996,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif self.output_gate_mxfp4_quant is not None and _mxfp4_asm_input(
+                self.o_proj, attn_output.shape[0]
+            ):
+                attn_output = self.output_gate_mxfp4_quant(attn_output, gate)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:

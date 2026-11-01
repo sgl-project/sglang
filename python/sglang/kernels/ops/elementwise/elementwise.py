@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -109,6 +111,121 @@ def fused_sigmoid_mul(
         **kwargs,
     )
     return (q, s) if quant else out
+
+
+@triton.jit
+def _fused_sigmoid_mul_mxfp4_quant_kernel(
+    attn_output_ptr,
+    gate_ptr,
+    q_ptr,
+    scale_ptr,
+    gate_stride_row,
+    gate_stride_head,
+    hidden_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """sigmoid(gate) * attn_output as fused_sigmoid_mul writes it, then MXFP4 of
+    that the way AITER per_1x32_f4_quant(shuffle=True) quantizes it."""
+    row = tl.program_id(0).to(tl.int64)
+    pid_block = tl.program_id(1)
+
+    offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    head = offsets // HEAD_DIM
+    d = offsets - head * HEAD_DIM
+    attn = tl.load(attn_output_ptr + row * hidden_dim + offsets).to(tl.float32)
+    g = tl.load(gate_ptr + row * gate_stride_row + head * gate_stride_head + d).to(
+        tl.float32
+    )
+    y = (attn * tl.sigmoid(g)).to(attn_output_ptr.dtype.element_ty).to(tl.float32)
+
+    # E8M0 scale ceil_pow2(amax / 6) (RoundUp) per 32 values with amax floored
+    # at 1e-10, E2M1 round to nearest even, as in the Gemma norm + MXFP4 quant
+    # kernel (sglang.kernels.ops.layernorm.minimax_m3_rmsnorm).
+    NB: tl.constexpr = BLOCK_H // 32
+    yb = tl.reshape(y, (NB, 32))
+    amax = tl.maximum(tl.max(tl.abs(yb), axis=1, keep_dims=True), 1e-10)
+    u = (amax * (1.0 / 6.0)).to(tl.int32, bitcast=True)
+    e = (u >> 23) & 0xFF
+    e = tl.where((e < 0xFF) & ((u & 0x7FFFFF) != 0), e + 1, e)
+    e = tl.minimum(e, 254)
+    qx = yb * tl.exp2((127 - e).to(tl.float32))
+    # gfx950 conversion, two values per instruction; four bytes (one thread's
+    # eight values) per 32-bit store.
+    lo, hi = tl.split(tl.reshape(qx, (NB, 16, 2)))
+    byts = (
+        tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+            "=v,v,v,v",
+            args=[lo, hi, 1.0],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        & 0xFF
+    )
+    shifts = tl.arange(0, 4) * 8
+    words = tl.sum(tl.reshape(byts, (NB, 4, 4)) << shifts[None, None, :], axis=2)
+    wcols = pid_block * (BLOCK_H // 8) + tl.arange(0, NB * 4)
+    tl.store(q_ptr + row * (hidden_dim // 8) + wcols, tl.reshape(words, (NB * 4,)))
+    # E8M0 scales in the tile order of the AITER ASM FP4 GEMM.
+    c = pid_block * NB + tl.arange(0, NB)
+    sidx = (
+        (row % 32) // 16
+        + ((c % 8) // 4) * 2
+        + (row % 16) * 4
+        + (c % 4) * 64
+        + (c // 8) * 256
+        + (row // 32) * 32 * (hidden_dim // 32)
+    )
+    tl.store(scale_ptr + sidx, tl.reshape(e, (NB,)).to(tl.uint8))
+
+
+def fused_sigmoid_mul_mxfp4_quant(
+    attn_output: torch.Tensor, gate: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fused_sigmoid_mul(attn_output, gate) quantized to MXFP4 for an AITER ASM
+    FP4 GEMM (gfx950), in one pass.
+
+    attn_output: (T, H * D) bf16 or fp16, contiguous; gate: (T, H, D), may be
+    strided over T and H. H * D must be a multiple of 256. Returns ``(x_fp4,
+    x_scales)``: uint8 ``(T, H * D // 2)`` (two E2M1 codes per byte) and uint8
+    E8M0 ``(round_up(T, 256), H * D // 32)`` in the ASM GEMM tile order (rows
+    >= T are not written), the bytes that per_1x32_f4_quant(shuffle=True)
+    writes for fused_sigmoid_mul's output.
+    """
+    num_tokens, num_heads, head_dim = gate.shape
+    hidden_dim = num_heads * head_dim
+    assert attn_output.shape == (num_tokens, hidden_dim), (
+        attn_output.shape,
+        gate.shape,
+    )
+    assert attn_output.is_contiguous() and gate.stride(2) == 1
+    assert hidden_dim % 256 == 0, hidden_dim
+    x_fp4 = torch.empty(
+        (num_tokens, hidden_dim // 2), dtype=torch.uint8, device=attn_output.device
+    )
+    x_scales = torch.empty(
+        ((num_tokens + 255) // 256 * 256, hidden_dim // 32),
+        dtype=torch.uint8,
+        device=attn_output.device,
+    )
+    if num_tokens == 0:
+        return x_fp4, x_scales
+    block_h = math.gcd(hidden_dim, 2048)
+    _fused_sigmoid_mul_mxfp4_quant_kernel[(num_tokens, hidden_dim // block_h)](
+        attn_output,
+        gate,
+        x_fp4.view(torch.int32),
+        x_scales,
+        gate.stride(0),
+        gate.stride(1),
+        hidden_dim,
+        HEAD_DIM=head_dim,
+        BLOCK_H=block_h,
+        num_warps=4,
+    )
+    return x_fp4, x_scales
 
 
 @triton.jit
