@@ -6,14 +6,21 @@ would show them. The record stays pristine; the update lands in the runtime
 context, which is where a reader of any field asks for the value in effect.
 """
 
+import asyncio
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import msgspec
 import msgspec.structs
 
 import sglang
+from sglang.srt.managers.io_struct import (
+    AttachCacheLinkerReqInput,
+    AttachCacheLinkerReqOutput,
+    DetachCacheLinkerReqOutput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -61,6 +68,40 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             hicache_storage_backend_extra_config=None,
         )
         self.assertIsNone(manager.config_value("hicache_storage_backend"))
+
+    def test_linker_rpc_updates_its_own_config_readback(self):
+        manager = _manager(
+            self,
+            enable_unified_cache_external_linker=True,
+            hicache_storage_backend_extra_config='{"legacy": true}',
+        )
+        manager.auto_create_handle_loop = Mock()
+        manager.attach_cache_linker_communicator = AsyncMock(
+            return_value=[AttachCacheLinkerReqOutput(success=True)]
+        )
+        manager.detach_cache_linker_communicator = AsyncMock(
+            return_value=[DetachCacheLinkerReqOutput(success=True)]
+        )
+        config = {"master_server_address": "new:50051"}
+        out = asyncio.run(
+            manager.attach_cache_linker(
+                AttachCacheLinkerReqInput(backend="mooncake", config=config),
+            )
+        )
+        self.assertTrue(out.success)
+        sent = manager.attach_cache_linker_communicator.call_args.args[0]
+        self.assertEqual(sent.config, config)
+        self.assertEqual(sent.backend, "mooncake")
+        self.assertEqual(
+            manager.config_value("unified_cache_external_linker_config"), config
+        )
+        out = asyncio.run(manager.detach_cache_linker())
+        self.assertTrue(out.success)
+        self.assertIsNone(manager.config_value("unified_cache_external_linker_config"))
+        self.assertEqual(
+            manager.config_value("hicache_storage_backend_extra_config"),
+            '{"legacy": true}',
+        )
 
     def test_an_unknown_field_is_refused(self):
         manager = _manager(self)
@@ -122,6 +163,8 @@ class TestTokenizerConfigUpdates(CustomTestCase):
 
 
 CONTROL_PLANE_FIELDS = (
+    "unified_cache_external_linker_backend",
+    "unified_cache_external_linker_config",
     "weight_version",
     "model_path",
     "served_model_name",

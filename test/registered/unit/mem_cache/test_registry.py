@@ -255,17 +255,21 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             get_context().override_server_args(
                 enable_unified_cache_external_linker=True,
                 unified_cache_external_linker_backend="mori",
+                unified_cache_external_linker_config={"a": 1},
             ),
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
-            enable_external_cache_linker=False, write_through_threshold=256
+            enable_external_cache_linker=False,
+            write_through_threshold=256,
+            backfill_missing_hash_values=lambda: 0,
         )
         cache.tree_components = (ComponentType.FULL,) + (
             (ComponentType.MAMBA,) if has_state else ()
         )
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
+        cache._all_reduce_attn_groups = lambda tensor, op: None
         counter = MagicMock(name="layer_done_counter")
         linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
         kvcache = ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value
@@ -299,7 +303,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ctx.server_args,
             ctx.params,
             components=set(cache.tree_components),
-            extra_config={},
+            extra_config={"a": 1},
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         self.assertIsInstance(cache.linker, UnifiedCacheLinkerWrapper)

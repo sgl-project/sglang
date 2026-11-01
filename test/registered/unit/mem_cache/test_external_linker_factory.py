@@ -294,6 +294,42 @@ class TestExternalLinkerFactory(unittest.TestCase):
                         passed_config["backend_option"]["value"] = 2
                         self.assertEqual(config["backend_option"]["value"], 1)
 
+    def test_runtime_attachment_loads_dynamic_plugin_with_explicit_config(self):
+        from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+            CacheLinkerAttachment,
+        )
+
+        cache = Mock(components={"full": object()})
+        params = Mock()
+        stream = object()
+        attachment = CacheLinkerAttachment(
+            cache,
+            server_args="args",
+            params=params,
+            register_layer_transfer_counter=Mock(),
+            forward_stream=stream,
+        )
+        config = {**_CONFIG, "linker_extra_config": {"nested": {"directory": "/new"}}}
+        with get_context().override_server_args(
+            unified_cache_external_linker_backend="mooncake",
+            hicache_storage_backend_extra_config='{"master_server_address": "old"}',
+        ):
+            attachment.attach("dynamic", config)
+        plugin = cache.init_cache_linker.call_args.args[0]
+        self.assertIs(plugin.forward_stream, stream)
+        self.assertEqual(plugin.args[3], config["linker_extra_config"])
+        self.assertIn("already attached", attachment.attach("dynamic", config))
+        config["linker_extra_config"]["nested"]["directory"] = "changed"
+        self.assertEqual(
+            attachment.linker_config["linker_extra_config"]["nested"]["directory"],
+            "/new",
+        )
+        self.assertEqual(plugin.args[3]["nested"]["directory"], "/new")
+        attachment.detach()
+        cache.close_cache_linker.assert_called_once()
+        self.assertIsNone(attachment.linker_backend)
+        self.assertIsNone(attachment.linker_config)
+
     def test_explicit_config_does_not_read_launch_defaults(self):
         with get_context().override_server_args(
             unified_cache_external_linker_backend="dynamic",
