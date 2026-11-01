@@ -440,6 +440,7 @@ the queue is full or the wait expires. Retry only the latter, with backoff.
 If streaming headers have already been sent, the error arrives as an SSE error
 event instead of a different HTTP status. Native Engine calls raise the corresponding
 `MmMemoryRequestTooLarge` or `MmMemoryOverloaded` exception.
+Native gRPC maps these to `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`, respectively.
 
 With `--enable-metrics`, inspect `sglang:mm_publication_requests_total`,
 `sglang:mm_publication_wait_seconds`, and `sglang:mm_publication_state` (pending

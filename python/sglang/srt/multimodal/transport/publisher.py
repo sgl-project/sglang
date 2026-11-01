@@ -98,9 +98,12 @@ class BoundedFeaturePublisher:
             raise
 
         # the native task owns input tensors and accounting after submission
+        wrapped = asyncio.wrap_future(future)
         try:
-            proxies = await asyncio.shield(asyncio.wrap_future(future))
+            proxies = await asyncio.shield(wrapped)
         except asyncio.CancelledError:
+            # shield preserves the native operation, but nobody awaits this copy
+            wrapped.add_done_callback(lambda done: done.exception())
 
             def cancel_completed(done):
                 try:
@@ -128,7 +131,10 @@ class BoundedFeaturePublisher:
         return self.pool.publish_reserved_batch(tensors, reservations)
 
     def _cancel_completed(self, future):
-        if future.exception() is None:
+        error = future.exception()
+        if error is not None:
+            logger.error("Abandoned GPU publication failed: %s", error)
+        else:
             errors = []
             for proxy in future.result():
                 try:

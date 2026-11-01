@@ -23,6 +23,7 @@ from sglang.srt.multimodal.transport.admission import (
     MmMemoryRequestTooLarge,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -37,6 +38,59 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestGuardedDispatchCleanup(CustomTestCase):
+    def test_cancelled_failed_native_copy_drains_accounting(self):
+        started, finish = threading.Event(), threading.Event()
+
+        def fail_copy(*args):
+            started.set()
+            if not finish.wait(5):
+                raise TimeoutError("test did not unblock copy")
+            raise RuntimeError("native copy failed")
+
+        pool = SimpleNamespace(
+            publication_capacity=1024,
+            set_capacity_callback=lambda callback: None,
+            publication_data_size=lambda tensors: tensors[0].numel() * 4,
+            reservation_size=lambda size: size,
+            try_reserve_batch=lambda sizes: sizes,
+            publish_reserved_batch=fail_copy,
+        )
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+
+        async def run():
+            errors = []
+            asyncio.get_running_loop().set_exception_handler(
+                lambda loop, context: errors.append(context)
+            )
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+                ],
+            )
+            task = asyncio.create_task(publisher.prepare([output]))
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(publisher.admission.pending_bytes, 16)
+            finish.set()
+            for _ in range(100):
+                if publisher.admission.pending_count == 0:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+            self.assertEqual(errors, [])
+
+        try:
+            with self.assertLogs(
+                "sglang.srt.multimodal.transport.publisher", level="ERROR"
+            ):
+                asyncio.run(run())
+        finally:
+            finish.set()
+            publisher.shutdown()
+
     def test_native_http_preserves_admission_errors_including_sse(self):
         """Pool exhaustion is retryable overload, not malformed input or a 500."""
 
