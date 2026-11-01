@@ -176,11 +176,12 @@ def _use_rocm_triton_softmax_topk(
     num_shared_topk_slots: int,
     packed_out: Optional[torch.Tensor],
 ) -> bool:
-    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    """Use the lower-latency Triton router for Qwen3.5 and Qwen3-Next
+    decode-sized rows."""
     return (
         _use_aiter
         and _is_gfx95
-        and hidden_states.shape[1] == 4096
+        and hidden_states.shape[1] in (2048, 4096)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[0] <= 128
         and gating_output.shape[1] == 512
