@@ -289,10 +289,8 @@ class TestRunningReqsHooks(CustomTestCase):
                 self.assertEqual(len(s.running_reqs), 0)
 
     def test_converted_step_launches_no_finished_row(self):
-        # DP attention converts this rank's decode step to extend while a peer
-        # prefills, so with SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP the loop
-        # processes the previous result early. Scheduling must come after it, so
-        # the row that result finishes is not launched again.
+        # A DP-converted extend step with SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP
+        # processes the previous result early; the row it finishes is not launched.
         done, kept = _req("done"), _req("kept")
 
         def mlp_sync(batch, **_):
@@ -320,10 +318,8 @@ class TestRunningReqsHooks(CustomTestCase):
         self.assertEqual(list(s.running_reqs), [kept])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
-        # NGRAM cannot advance the grammar FSM inside verify(), so the loop
-        # processes the previous result early while a grammar row runs. The
-        # grammar row it finishes is not launched; the launch after that
-        # overlaps again, with the kept row's previous step unprocessed.
+        # A grammar row under NGRAM processes the previous result early; once it
+        # finishes, the loop overlaps again.
         done, kept = _req("done"), _req("kept")
         done.grammar = MagicMock()
 

@@ -2146,8 +2146,6 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            # If the next batch does not overlap with the last batch, process the
-            # last batch before scheduling, which then drops the requests it finishes.
             process_last_batch_early = self.should_process_last_batch_early(
                 self.last_batch
             )
@@ -2202,19 +2200,13 @@ class Scheduler(
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
     ) -> bool:
-        """Whether the overlap loop processes the last batch's result before
-        scheduling the next batch instead of after launching it. Decided before
-        scheduling, from the only result still pending, so no launched batch
-        carries a request that result finishes."""
+        """Whether to process the last result before scheduling the next batch,
+        not after launching it, so the requests it finishes are never launched."""
         if last_batch is None:
             return False
 
-        # After a prefill batch, process it early to improve its TTFT when the next
-        # batch is a prefill too (also when it is not: the next batch is unknown yet).
-        # This might slightly hurt the throughput, so we use an environment variable to control it.
-        # In DP attention mode, use the globally synchronized is_extend_in_batch
-        # so all DP ranks make the same overlap decision (avoiding deadlock).
-        # In non-DP mode, use the local forward_mode directly.
+        # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
+        # synced, so all ranks decide the same (no deadlock).
         if envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get():
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
@@ -2223,12 +2215,7 @@ class Scheduler(
             if last_batch_is_extend:
                 return True
 
-        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
-        # path for host-draft algorithms, not a pending migration.
-        # Algorithms that support grammar overlap advance the FSM inside verify()
-        # via the grammar barrier (overlapping the target forward), which resolves
-        # whatever result is still pending in the queue (including the
-        # extend->decode boundary), so no grammar-specific early processing is needed.
+        # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()
 
     def _advance_pending_grammar(self):

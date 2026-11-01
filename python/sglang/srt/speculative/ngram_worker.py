@@ -234,10 +234,8 @@ class NGRAMWorker(BaseSpecWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        # A request's last round of accepted tokens reaches req.output_ids when
-        # the scheduler processes that round's result; until then (overlap) it is
-        # spliced in from spec_info. This launch is already counted, so a count
-        # above one means an earlier round of this request is unprocessed.
+        # Splice the last round's accepted tokens until its result is processed;
+        # this launch is counted, so a count above one means it is not yet.
         pending = [req.inflight_steps > 1 for req in batch.reqs]
 
         # Accept-independent prep, hoisted above the blocking .cpu() below.

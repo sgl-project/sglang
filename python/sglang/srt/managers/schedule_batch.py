@@ -2890,9 +2890,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.dllm_config is not None
 
     def grammar_needs_sync(self) -> bool:
-        """Whether grammar keeps this batch's requests off the overlap path: their
-        pending result is processed before the next batch is scheduled. Needed by
-        speculative algorithms that cannot advance the FSM inside verify()."""
+        """Whether a spec algorithm that cannot advance the grammar FSM inside
+        verify() needs this batch's result processed before the next schedule."""
         return (
             self.has_grammar
             and not self.spec_algorithm.is_none()
