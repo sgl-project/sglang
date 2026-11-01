@@ -43,6 +43,7 @@ class LoRAConfig:
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
         self.use_dora = self.hf_config.get("use_dora", False)
+        self.bias = self.hf_config.get("bias", "none")
 
         # Filter fake added tokens: tokens with ID < base_vocab_size are already
         # part of the base vocabulary and should not be treated as added tokens.
