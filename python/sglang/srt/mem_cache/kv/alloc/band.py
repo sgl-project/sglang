@@ -31,6 +31,7 @@ import inspect
 import logging
 import os
 from typing import (
+    Dict,
     Generic,
     Hashable,
     List,
@@ -153,94 +154,6 @@ class _CapacityField(Generic[_T]):
     def __set__(self, obj, value: _T) -> None:
         obj.__dict__[self._name] = value
         obj._capacity_epoch += 1
-
-
-def _float_open_short_side(flt, demand) -> None:
-    """Float relocation policy, driven by a demand vector: pages per band, zero
-    for bands the operation does not touch. A grow-down end faces the float's
-    HIGH side, a grow-up end its LOW side; `make_room`'s `min_bytes` is a TARGET
-    for the whole band, so the ask is a total, never a delta.
-    """
-    if flt is None or flt._is_frontier_transparent():
-        return  # no float involved / empty float never blocks
-    if not any(pages > 0 for pages in demand.values()):
-        return  # nothing demanded -- nothing to open (also keeps slack's max() total)
-    for band_alloc, pages in demand.items():
-        if pages <= 0:
-            continue
-        index_room = (
-            band_alloc.num_pages
-            - band_alloc.min_page_index
-            - band_alloc._allocated_pages()
-        )
-        if pages > index_room:
-            return  # index space binds; bytes cannot fix this
-    sides = {"low": 0, "high": 0}
-    for band_alloc, pages in demand.items():
-        if band_alloc is flt or pages <= 0:
-            continue
-        holes = len(band_alloc._free_phys_pages) if band_alloc.lazy_compaction else 0
-        ext = max(0, pages - holes)
-        above = flt.high_peer
-        while above is not None and above is not band_alloc:
-            above = above.high_peer
-        side = "high" if above is band_alloc else "low"
-        sides[side] += ext * band_alloc.entry_bytes_per_page
-    band = {
-        "low": max(
-            0, flt._byte_low_frontier() - flt._chain_high_frontier_below_bytes()
-        ),
-        "high": max(
-            0, flt._chain_low_frontier_above_bytes() - flt._byte_high_frontier()
-        ),
-    }
-    surplus = {side: band[side] - sides[side] for side in ("low", "high")}
-    f_pages = demand.get(flt, 0)
-    f_bytes = max(0, f_pages - flt._hole_pages()) * flt.entry_bytes_per_page
-
-    def open_side(side, raw_gap):
-        # The donor demand is measured from its raw frontier; make_room takes
-        # a gap measured from the float's aligned region boundary.
-        epp = flt.entry_bytes_per_page
-        lo, hi = flt._region_bounds_pages()
-        if side == "low":
-            frontier = flt._chain_high_frontier_below_bytes()
-            target = -(-(frontier + raw_gap) // epp)
-            gap = (target - lo) * epp
-        else:
-            frontier = flt._chain_low_frontier_above_bytes()
-            target = (frontier - raw_gap) // epp
-            gap = (hi - target) * epp
-        flt.make_room(side=side, min_bytes=max(0, gap))
-
-    if surplus["low"] < 0 and surplus["high"] < 0:
-        # One-sided relief does not jointly compact/reposition interior holes
-        # when both peer gaps are deficient. This is not an impossibility proof.
-        return
-    if surplus["low"] < 0 or surplus["high"] < 0:
-        short, far = ("low", "high") if surplus["low"] < 0 else ("high", "low")
-        target = sides[short] + max(0, f_bytes - max(0, surplus[far]))
-        if target > band[short]:
-            open_side(short, target)
-        return
-    if f_bytes > max(surplus.values()):
-        short = "low" if surplus["low"] >= surplus["high"] else "high"
-        open_side(short, sides[short] + f_bytes)
-
-
-def relieve_for_alloc(short_pool, need_tokens: int) -> bool:
-    """THE shortfall ladder: every allocation shortfall in the unified pool runs
-    exactly this, whether a single band's own alloc or the chain allocator's coupled
-    multi-band alloc. The urgent flush is called unconditionally -- an eager END no-ops
-    and a FLOAT always has boundary absorption to do -- so the ladder never
-    branches on lazy mode, member kind, or layout.
-    """
-    for m in short_pool._flush_targets():
-        m.flush_for_allocation()
-    if need_tokens <= short_pool.available_size():
-        return True
-    short_pool._ask_float_for_room(need_tokens)
-    return need_tokens <= short_pool.available_size()
 
 
 def _drains_on_urgent_flush(neighbor) -> bool:
@@ -850,21 +763,20 @@ class Band:
         """
         return self.cap_available(self._schedulable_physical_tokens())
 
-    def _flush_targets(self):
-        """A band short on its OWN alloc asks only its growth-side neighbour to
-        flush. Never itself: own compaction trades one hole for one gap byte (net
-        zero); only a NEIGHBOUR's compaction releases into the shared gap.
-        """
-        neighbor = self._growth_side_neighbor()
-        return () if neighbor is None else (neighbor,)
+    # The chain allocator this band is a member of, set when it joins one.
+    chain_allocator = None
 
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """A band short on its OWN pages asks the growth-side member, if it is a
-        float, to open the side facing it; the policy is `_float_open_short_side`."""
-        blocker = self._growth_side_neighbor()
-        if not isinstance(blocker, FloatBand):
-            return
-        _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
+    def relieve(self, need_tokens: int) -> bool:
+        """A take of ``need_tokens`` of this band alone is short where the band
+        stands: have the chain lay itself out for it, by the planner's least
+        rearrangement, and say whether it then fits in place."""
+        chain = self.chain_allocator
+        if chain is None:
+            return False
+        pages = -(-need_tokens // self.page_size)
+        if not chain.lay_out_for({self.sub_pool_name: pages}):
+            return False
+        return need_tokens <= self.available_size()
 
     # -- physical-slot / physical-page primitives --
 
@@ -1164,10 +1076,8 @@ class Band:
                 f"Band({self.sub_pool_name!r}).alloc: need_size="
                 f"{need_size} must be a multiple of page_size={self.page_size}"
             )
-            if need_size > self.available_size():
-                # Shortfall: flush the PEER, not own -- see `_flush_targets`.
-                if not relieve_for_alloc(self, need_size):
-                    return None
+            if need_size > self.available_size() and not self.relieve(need_size):
+                return None
             num_pages = need_size // self.page_size
             if num_pages > len(self.free_virtual_ids):
                 return None
@@ -1219,12 +1129,7 @@ class Band:
                 self._free_lazy(free_index, pages=_pages)
                 return
             # --- EAGER path ---
-            self._wait_band_transfers()
-            # Near-no-op in normal mode (sampling's CPU sync already drained
-            # forward_stream); in overlap mode it does the serializing.
-            if self.forward_stream is not None:
-                with record_function("Band.free.wait_stream"):
-                    torch.cuda.current_stream().wait_stream(self.forward_stream)
+            # v2p has one writer, the schedule stream: read it before any wait.
             with record_function("Band.free.v2p_lookup"):
                 free_v_pages = (
                     _pages
@@ -1235,11 +1140,18 @@ class Band:
                 )
                 freed_p_pages = self.ids.virtual_to_physical[free_v_pages]
             with record_function("Band.free.sync_check"):
-                # `.item()` forces a CPU/GPU sync -- own trace region to measure it.
-                if bool((freed_p_pages < 0).any().item()):
+                # One D2H, before the waits below, which would park it.
+                freed_host = freed_p_pages.tolist()
+                if any(p < 0 for p in freed_host):
                     self._raise_stale_slot_assertion(
                         free_v=free_v_pages, freed_p=freed_p_pages
                     )
+            self._wait_band_transfers(freed_host)
+            # Near-no-op in normal mode (sampling's CPU sync already drained
+            # forward_stream); in overlap mode it does the serializing.
+            if self.forward_stream is not None:
+                with record_function("Band.free.wait_stream"):
+                    torch.cuda.current_stream().wait_stream(self.forward_stream)
             self.ids.virtual_to_physical.index_fill_(0, free_v_pages, -1)
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
@@ -1302,6 +1214,7 @@ class Band:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
             self.live_page_count -= int(freed_p_pages.shape[0])
+            self._note_recent_holes(freed_p_pages, free_v_pages)
 
     def _release_phys_pages_batch(
         self, pages: torch.Tensor, *, host: Optional[List[int]] = None
@@ -1502,6 +1415,8 @@ class Band:
         band (None when unknown), oldest first. Pays a bs-sized D2H sync per
         forward; call it before any stream wait, or the read parks the host.
         """
+        if self._relief_sets is not None:
+            return list(self._relief_sets[0])
         self.usage.prune()
         forwards = self.usage.forwards()
         if not forwards:
@@ -1543,6 +1458,8 @@ class Band:
     ) -> List[Tuple[object, Set[int], bool, Optional[TransferRelease]]]:
         """Each live transfer with the physical PAGE ids it touches now, oldest
         first. Pays a D2H sync per transfer; call it before any stream wait."""
+        if self._relief_sets is not None:
+            return list(self._relief_sets[1])
         self.usage.prune()
         transfers = self.usage.transfers()
         if not transfers:
@@ -1588,6 +1505,18 @@ class Band:
             for signal, pages, writes, release in transfer_sets
             if not writes and not src_set.isdisjoint(pages)
         )
+
+    @classmethod
+    def _reader_groups(
+        cls, srcs: Sequence[int], transfer_sets
+    ) -> List[Tuple[tuple, List[int]]]:
+        """``srcs`` grouped by the release keys of the transfers that still
+        read them (`_readers_of`), so a page no transfer reads is not held
+        with one that a slow transfer reads."""
+        groups: Dict[tuple, List[int]] = {}
+        for src in srcs:
+            groups.setdefault(cls._readers_of([src], transfer_sets), []).append(src)
+        return list(groups.items())
 
     def _wait_writers(
         self,
@@ -1639,6 +1568,121 @@ class Band:
     def _wait_fences_on(self, pages: Sequence[int]) -> None:
         for first, end in _page_runs(pages):
             self._wait_fences(first, end)
+
+    def _fenced(self, page: int) -> bool:
+        """Whether an unfinished fence of the chain meets ``page``."""
+        lo = page * self.entry_bytes_per_page
+        hi = lo + self.entry_bytes_per_page
+        return any(band.usage.fence_meets(lo, hi) for band in self._chain_bands())
+
+    def _note_recent_holes(
+        self, freed_pages: torch.Tensor, freed_virtual: torch.Tensor
+    ) -> None:
+        """Pages just freed while a forward that writes this band is
+        unretired: it was launched before the free and may still write a page
+        it was handed (a released row's next slot in an overlapped batch). A
+        copy or take that writes such a page later waits the newest forward
+        first. A forward that only reads a freed row can only spoil the
+        released request's own output. No device read here."""
+        latest = self.usage.latest_forward
+        if (
+            latest is None
+            or freed_pages.numel() == 0
+            or self._retired(latest)
+            or not self.usage.forwards()
+        ):
+            return
+        self.usage.record_recent_holes(latest, freed_pages, freed_virtual)
+
+    def _forward_written_pages(self) -> Optional[Set[int]]:
+        """Virtual pages the unretired forwards write in this band; None when
+        some forward's writes are unknown. Reads the device."""
+        written: Set[int] = set()
+        for use in self.usage.forwards():
+            if use.ids is None:
+                return None
+            ids = use.ids
+            # Forward write ids are WIDENED virtual ids under DCP.
+            if self.shards_under_dcp:
+                dcp_size = get_parallel().attn_dcp_size
+                if dcp_size > 1:
+                    ids = ids // dcp_size
+            written.update((ids // self.page_size).tolist())
+        return written
+
+    def _resolve_recent_holes(self) -> None:
+        """Fence every chain band's recent holes that a running forward
+        writes, on their bytes. Reads the device; call it before any stream
+        wait."""
+        for band in self._chain_bands():
+            band._resolve_own_recent_holes()
+
+    def _resolve_own_recent_holes(self) -> None:
+        if self.usage.has_recent_holes():
+            self.usage.prune()
+            self.usage.resolve_recent_holes(
+                self.entry_bytes_per_page, self._forward_written_pages()
+            )
+
+    # -- one relief: every host read before the first stream wait --
+
+    # (write sets, transfer page sets) read at the start of the relief in
+    # progress, or None outside one.
+    _relief_sets = None
+
+    def begin_relief(self) -> None:
+        """Read everything this band's flush or relocation reads on the host,
+        before any band of the relief waits on the stream: the write sets of
+        unfinished forwards, the pages of live transfers, the free list, and
+        the recent holes as fences. Until `end_relief`, the flush and the
+        relocation read these copies; nothing is recorded during a relief,
+        and a forward or transfer that ends meanwhile only makes them wait for
+        something already done."""
+        self._relief_sets = None
+        sets = (self._inflight_write_sets(), self._transfer_page_sets())
+        self._resolve_own_recent_holes()
+        self._free_pages_snapshot()
+        self._relief_sets = sets
+
+    def end_relief(self) -> None:
+        self._relief_sets = None
+
+    def held_pending_count(self) -> int:
+        """Pending pages that are fixed: they stay where they are and return
+        to the free list only later, so they count as occupied."""
+        pending = self.usage.pending_pages
+        if not pending or not self.usage.fixed:
+            return 0
+        return len(pending & self.fixed_pages())
+
+    def occupied_pages(self) -> int:
+        """Pages an urgent pass keeps: live pages, and pending pages that are
+        fixed."""
+        return self.live_page_count + self.held_pending_count()
+
+    def network_rows(self, transfer_sets=None) -> Set[int]:
+        """Pages a network transfer reads or writes until its logical release,
+        and pages pending on such a release. Moving one would wait the
+        engine's completion flag on the GPU. Decided from logical releases
+        only, the same on every rank."""
+        if transfer_sets is None:
+            transfer_sets = self._transfer_page_sets()
+        rows: Set[int] = set()
+        for _, pages, _, release in transfer_sets:
+            if release is not None and not release.released:
+                rows.update(pages)
+        rows.update(self.usage.network_held_pending())
+        return rows
+
+    def has_network_rows(self) -> bool:
+        """Whether a network transfer is unreleased on this band, or a page
+        pending on one: no device read."""
+        if self.usage.network_held_pending():
+            return True
+        return any(
+            use.release is not None and not use.release.released
+            for use in self.usage.transfers()
+        )
 
     def _maybe_emit_stats(self) -> None:
         """Env-gated periodic stats emit (at most once per interval) at `_flush` end.
@@ -1716,7 +1760,9 @@ class Band:
         if not self.usage.has_pending():
             return
         with record_function("Band._drain_pending_reuse"):
-            ready = self.usage.take_ready_vacated(urgent=urgent)
+            ready = self.usage.take_ready_vacated(
+                urgent=urgent, keep=self.fixed_pages()
+            )
             for use in ready:
                 if use.signal is not None:
                     self._wait_on_stream(use.signal)
@@ -1843,8 +1889,11 @@ class Band:
         if not self.lazy_compaction:
             return 0
         self.usage.prune()
-        # Read the transfers' pages on the host before any stream wait below.
+        # Read the transfers' pages and the recent holes on the host before
+        # any stream wait below.
         transfer_sets = self._transfer_page_sets()
+        if self._relief_sets is None:
+            self._resolve_recent_holes()
         # Only a transfer with a logical release may stop a walk: whether one
         # without is still listed depends on its event having fired, which ranks
         # see at different times. A copy of a page such a transfer writes waits
@@ -1990,6 +2039,10 @@ class Band:
 
                 # Case B/C: no write race. dst from holes_cpu by cursor (no sync).
                 dst = holes_cpu[dst_cursor]
+                if not urgent and self._fenced(dst):
+                    # A forward may still touch this hole: only a move an
+                    # allocation needs waits for that.
+                    break
                 # Two-pointer crossing check: past the crossing the band is packed,
                 # and moving further would shuffle a hole back toward the frontier
                 # and block the watermark retreat.
@@ -2094,8 +2147,11 @@ class Band:
             f"[{self.sub_pool_name}] page copy of a fixed page"
         )
         with record_function("Band._commit_move_batch"):
-            readers = self._readers_of(srcs, transfer_sets)
+            groups = self._reader_groups(srcs, transfer_sets)
             self._wait_writers(srcs, [], transfer_sets)
+            # A destination freed while a forward ran may still be written or
+            # read by it.
+            self._wait_fences_on(dsts)
             src_pages_t = self._to_device(srcs)
             dst_pages_t = self._to_device(dsts)
             v_moveds_t = self.ids.physical_to_virtual[src_pages_t]
@@ -2110,29 +2166,37 @@ class Band:
             self.ids.physical_to_virtual[dst_pages_t] = v_moveds_t
             self.ids.physical_to_virtual.index_fill_(0, src_pages_t, -1)
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
-            # Src disposition. `src_pages_t` is reused as the pending pages' device
+            # Src disposition, per group of srcs the same transfers read.
+            # A single group reuses `src_pages_t` as the pending pages' device
             # tensor (no second H2D at drain).
-            if fence:
-                self._fence_vacated(srcs, readers)
-                return
-            release = tuple(k for k in (latest_event, *readers) if k is not None)
-            release = (
-                None if not release else release[0] if len(release) == 1 else release
-            )
-            if self._retired(release):
-                if release is not None:
-                    # A retired forward can still run its tail, and a transfer
-                    # counts as retired once its event is waited: reuse after.
-                    self._wait_on_stream(release)
-                released_fired.append((src_pages_t, list(srcs)))
-            else:
-                self.usage.vacate(
-                    release,
-                    (),
-                    page_bytes=self.entry_bytes_per_page,
-                    pages=srcs,  # copied: the caller mutates `srcs`
-                    batch=src_pages_t,
+            for readers, group in groups:
+                if fence:
+                    self._fence_vacated(group, readers)
+                    continue
+                group_t = src_pages_t if len(groups) == 1 else self._to_device(group)
+                release = tuple(k for k in (latest_event, *readers) if k is not None)
+                release = (
+                    None
+                    if not release
+                    else release[0]
+                    if len(release) == 1
+                    else release
                 )
+                if self._retired(release):
+                    if release is not None:
+                        # A retired forward can still run its tail, and a
+                        # transfer counts as retired once its event is waited:
+                        # reuse after.
+                        self._wait_on_stream(release)
+                    released_fired.append((group_t, list(group)))
+                else:
+                    self.usage.vacate(
+                        release,
+                        (),
+                        page_bytes=self.entry_bytes_per_page,
+                        pages=list(group),  # copied: the caller mutates `srcs`
+                        batch=group_t,
+                    )
 
     def flush_for_allocation(self) -> int:
         """Public urgent flush used by peer allocation-pressure recovery."""
@@ -2210,15 +2274,18 @@ class Band:
         move like any page from here on."""
         self.unfix_pages(_LOAD_RESERVATION)
 
-    def _wait_band_transfers(self) -> None:
-        """Order the current stream after the transfers recorded on this band,
-        before a free that hands pages back at once (eager compaction, a float's
-        free, a cancelled reservation): a copy may still read or write a freed
-        page. Freed pages are device ids here; matching them to the transfers'
-        pages would read the device, so every transfer of the band is waited."""
-        self.usage.prune()
-        for use in self.usage.transfers():
-            self._wait_on_stream(use.signal)
+    def _wait_band_transfers(self, pages: Sequence[int]) -> None:
+        """Order the current stream after the transfers recorded on this band
+        that touch ``pages`` (physical, on the host), before a free that hands
+        them back at once (eager compaction, a cancelled reservation): a copy
+        may still read or write a freed page. Transfers on other pages are not
+        waited, a network one least of all."""
+        freed = set(pages)
+        if not freed:
+            return
+        for signal, touched, _, _ in self._transfer_page_sets():
+            if not freed.isdisjoint(touched):
+                self._wait_on_stream(signal)
 
     def _expand_pages_to_tokens(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:
@@ -2236,9 +2303,8 @@ class Band:
             f"Band({self.sub_pool_name!r}).alloc_physical: need_size="
             f"{need_size} must be a multiple of page_size={self.page_size}"
         )
-        if need_size > self.available_size():
-            if not relieve_for_alloc(self, need_size):
-                return None
+        if need_size > self.available_size() and not self.relieve(need_size):
+            return None
         free_before = set(self._free_pages_snapshot())
         span_before = set(range(*self._span_range()))
         physical_pages = self.take_physical_pages(need_size // self.page_size)
@@ -2289,7 +2355,8 @@ class Band:
         physical_pages = (
             free_index.detach().to(torch.int64)[:: self.page_size] // self.page_size
         )
-        self._wait_band_transfers()
+        # Off the step path (a cancelled or released reservation): one D2H.
+        self._wait_band_transfers(physical_pages.tolist())
         if self.forward_stream is not None and not self.lazy_compaction:
             torch.cuda.current_stream().wait_stream(self.forward_stream)
         virtual_pages = self.ids.physical_to_virtual[physical_pages]
@@ -2344,7 +2411,8 @@ class FloatBand(Band):
     the boundary on the side with the LARGER free gap, and from empty it positions
     the span at the MIDPOINT of the inter-frontier region so free gap exists on
     both sides and neighbor growth does not immediately force a data move. Data
-    moves happen only ON DEMAND, via ``make_room`` / ``compact_holes``. An EMPTY
+    moves happen only ON DEMAND, when the chain's planned layout relocates the
+    float (`relocate_into`). An EMPTY
     float resets its span and is frontier-transparent: it occupies no bytes and
     must never wall off free space.
 
@@ -2636,6 +2704,7 @@ class FloatBand(Band):
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
+            self._note_recent_holes(freed_p_pages, free_v_pages)
             # Park is sync-free (span/hole COUNTS only); boundary absorption is
             # DEFERRED -- see `_absorb_span_boundary_holes`.
             self._holes_dirty = True
@@ -2649,7 +2718,8 @@ class FloatBand(Band):
         physical_pages = (
             free_index.detach().to(torch.int64)[:: self.page_size] // self.page_size
         )
-        self._wait_band_transfers()
+        # Off the step path (a cancelled or released reservation): one D2H.
+        self._wait_band_transfers(physical_pages.tolist())
         virtual_pages = self.ids.physical_to_virtual[physical_pages]
         bound_pages = virtual_pages[virtual_pages >= 0]
         self.ids.virtual_to_physical.index_fill_(0, bound_pages, -1)
@@ -2676,8 +2746,8 @@ class FloatBand(Band):
         DEFERRED, not per-free: deciding how far to walk needs the hole set on the
         HOST, so this is the float's one D2H, and doing it per free put a host sync
         on the per-decode-step path. Callers place it where a sync is already free
-        (the per-step opportunistic flush) or already warranted (the head of the
-        shortfall ladder). Skipping it is only ever CONSERVATIVE: the span reads
+        (the per-step opportunistic flush) or already warranted (an urgent
+        flush). Skipping it is only ever CONSERVATIVE: the span reads
         wider than its live content, while `_live_pages()`, hence transparency and
         the byte-conservation identity, stay exact.
         """
@@ -2708,113 +2778,6 @@ class FloatBand(Band):
 
     # -- on-demand data movement --
 
-    def make_room(self, *, side: str, min_bytes: int) -> int:
-        """Open >= ``min_bytes`` of CONTIGUOUS free space between this pool's
-        ``side`` boundary and the region bound on that side, relocating the
-        minimum set of live boundary pages (holes-first destinations, then the far
-        gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
-        means the ask is impossible now or movement is gated, and state is then
-        unchanged.
-        Scheduler-phase only; stream safety is owned HERE, not by the caller:
-        the copy waits only a forward that writes a moved page, after the plan
-        and the write sets are read on the host, and the vacated pages are
-        fenced. Moves at most min(L_live, G) pages: every live page when the ask
-        exceeds them.
-        """
-        assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
-        epp = self.entry_bytes_per_page
-        gap_low, gap_high = self._gap_pages()
-        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
-        if self.moves_blocked():
-            return gap_side_bytes
-        lo, hi = self._region_bounds_pages()
-        if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
-            return gap_side_bytes
-
-        # Capacity: even packing every live page flush against the far side
-        # cannot open more than (region - live) bytes.
-        live = self._live_pages()
-        if (hi - lo - live) * epp < min_bytes:
-            return gap_side_bytes  # impossible now; untouched
-
-        need_pages = (min_bytes - gap_side_bytes + epp - 1) // epp
-
-        holes = set(self._free_pages_snapshot())
-        span = range(self.low_wm_page, self.high_wm_page)
-        live_pages_sorted = [p for p in span if p not in holes]
-
-        if need_pages >= live:
-            # Pack only far enough to satisfy this side. Packing against the
-            # opposite edge would erase room reserved for that neighbour.
-            gap_pages = -(-min_bytes // epp)
-            if side == "high":
-                end = hi - gap_pages
-                final = list(range(end - live, end))
-            else:
-                start = lo + gap_pages
-                final = list(range(start, start + live))
-            self._relocate_to_positions(live_pages_sorted, final)
-            gap_low2, gap_high2 = self._gap_pages()
-            return (gap_low2 if side == "low" else gap_high2) * epp
-
-        # Boundary relocation (G < L_live):
-        # Sources: live pages nearest the demanded side, retreating inward.
-        if side == "high":
-            srcs = list(reversed(live_pages_sorted))[: min(need_pages, live)]
-        else:
-            srcs = live_pages_sorted[: min(need_pages, live)]
-        src_set = set(srcs)
-
-        # Strictly on the far side of EVERY source: keeps the batched move
-        # src/dst-disjoint and actually retreats the edge.
-        if side == "high":
-            usable_holes = sorted(h for h in holes if h < min(srcs))
-        else:
-            usable_holes = sorted((h for h in holes if h > max(srcs)), reverse=True)
-        dsts: List[int] = list(usable_holes[: len(srcs)])
-        n_fresh = len(srcs) - len(dsts)
-        if n_fresh > 0:
-            # Far-gap feasibility for the fresh destinations.
-            if side == "high":
-                if n_fresh > gap_low:
-                    return gap_side_bytes
-                dsts += list(
-                    range(self.low_wm_page - 1, self.low_wm_page - 1 - n_fresh, -1)
-                )
-            else:
-                if n_fresh > gap_high:
-                    return gap_side_bytes
-                dsts += list(range(self.high_wm_page, self.high_wm_page + n_fresh))
-
-        if srcs:
-            write_sets = self._inflight_write_sets()
-            transfer_sets = self._transfer_page_sets()
-            src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
-            self._wait_writers(srcs, write_sets, transfer_sets)
-            self._wait_fences_on([p for p in dsts if p not in holes])
-            self._move_pages_and_rebind(src_t, dst_t)
-            self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
-            # The sources end outside the new span: the edge retreats past them.
-            self._fence_vacated(srcs, self._readers_of(srcs, transfer_sets))
-
-        # Reconstruct the span from final live positions: everything between
-        # the extremes is span; non-live pages inside are holes.
-        final_live = sorted((set(live_pages_sorted) - src_set) | set(dsts))
-        self.low_wm_page = final_live[0]
-        self.high_wm_page = final_live[-1] + 1
-        final_live_set = set(final_live)
-        new_holes = [
-            p
-            for p in range(self.low_wm_page, self.high_wm_page)
-            if p not in final_live_set
-        ]
-        self._set_free_pages(self._to_device(new_holes), host=new_holes)
-        self._holes_dirty = True  # the span moved; re-check its boundaries
-        self._absorb_span_boundary_holes()
-
-        gap_low2, gap_high2 = self._gap_pages()
-        return (gap_low2 if side == "low" else gap_high2) * epp
-
     def relocate_into(self, first: int, end: int) -> int:
         """Move this float into the page block ``[first, end)``: live pages
         already inside stay, the others are copied to free pages of the block,
@@ -2835,77 +2798,22 @@ class FloatBand(Band):
         if srcs:
             write_sets = self._inflight_write_sets()
             transfer_sets = self._transfer_page_sets()
+            if self._relief_sets is None:
+                self._resolve_recent_holes()
             src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
             self._wait_writers(srcs, write_sets, transfer_sets)
-            self._wait_fences_on([p for p in dsts if p not in holes])
+            # Holes too: one freed while a forward ran may still be touched.
+            self._wait_fences_on(dsts)
             self._move_pages_and_rebind(src_t, dst_t)
             self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
             # Every source lies outside the block, so outside the new span.
-            self._fence_vacated(srcs, self._readers_of(srcs, transfer_sets))
+            for readers, group in self._reader_groups(srcs, transfer_sets):
+                self._fence_vacated(group, readers)
         kept = inside | set(dsts)
         self.low_wm_page, self.high_wm_page = first, end
         new_holes = [p for p in range(first, end) if p not in kept]
         self._set_free_pages(self._to_device(new_holes), host=new_holes)
         return len(srcs)
-
-    def _relocate_to_positions(self, live_sorted: List[int], final: List[int]) -> int:
-        """Order-preserving relocation of the live pages onto the ``final``
-        positions (an ascending hole-free block). Batched disjoint move when
-        possible, else ORDERED singleton moves: by induction each destination is a
-        hole or an already-vacated source. Returns pages moved.
-        """
-        assert len(live_sorted) == len(final)
-        pairs = [(s, d) for s, d in zip(live_sorted, final) if s != d]
-        if pairs:
-            src_set = {s for s, _ in pairs}
-            dst_set = {d for _, d in pairs}
-            live_set = set(live_sorted)
-            transfer_sets = self._transfer_page_sets()
-            if src_set.isdisjoint(dst_set):
-                write_sets = self._inflight_write_sets()
-                src_t = self._to_device([s for s, _ in pairs])
-                dst_t = self._to_device([d for _, d in pairs])
-                self._wait_writers(src_set, write_sets, transfer_sets)
-                self._wait_fences_on([d for d in dst_set if d not in live_set])
-                self._move_pages_and_rebind(src_t, dst_t)
-                self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
-                # Disjoint: every source lies outside the final block.
-                self._fence_vacated(
-                    sorted(src_set), self._readers_of(src_set, transfer_sets)
-                )
-            else:
-                # Interior packing can move pages in both directions. For an
-                # order-preserving mapping, leftward moves are safe in ascending
-                # source order and rightward moves in descending source order;
-                # the two groups cannot overwrite each other's unread sources.
-                ordered = [pair for pair in pairs if pair[1] < pair[0]] + [
-                    pair for pair in reversed(pairs) if pair[1] > pair[0]
-                ]
-                # Built ONCE: a copy per page in the loop is an H2D per page, and
-                # a shift can span the whole pool.
-                src_all = self._to_device([s for s, _ in ordered])
-                dst_all = self._to_device([d for _, d in ordered])
-                # Some destinations are sources vacated earlier in this pass, which
-                # a forward or a transfer may still read: wait every recorded
-                # forward, and every transfer touching a source.
-                self._settle_inflight_forward()
-                for signal, pages, _, _ in transfer_sets:
-                    if not src_set.isdisjoint(pages):
-                        self._wait_on_stream(signal)
-                self._wait_fences_on([d for d in dst_set if d not in live_set])
-                for i in range(len(ordered)):
-                    s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
-                    self._move_pages_and_rebind(s_t, d_t)
-                    self.ids.physical_to_virtual.index_fill_(0, s_t, -1)
-        if final:
-            self.low_wm_page = final[0]
-            self.high_wm_page = final[-1] + 1
-        else:
-            self._reset_watermarks()
-        self._set_free_pages(
-            torch.empty(0, dtype=torch.int64, device=self.device), host=[]
-        )
-        return len(pairs)
 
     def _byte_accounting_violations(self) -> List[str]:
         out: List[str] = []
@@ -2938,8 +2846,9 @@ class FloatBand(Band):
     def _flush(self, *, urgent: bool) -> int:
         """Boundary absorption only -- never data movement. For a float the
         `_free_phys_pages` entries are INTERIOR HOLES, reusable assets by design,
-        not a compaction backlog; relocation happens on demand via `make_room` /
-        `compact_holes`. What a flush point buys is handing back unneeded span."""
+        not a compaction backlog; relocation happens on demand, when a planned
+        layout moves the float. What a flush point buys is handing back unneeded
+        span."""
         return self._absorb_span_boundary_holes()
 
     def flush_opportunistic(self) -> int:
@@ -2950,24 +2859,6 @@ class FloatBand(Band):
             if not self._holes_dirty or self._free_phys_pages.numel() == 0:
                 return 0
             return self._flush(urgent=False)
-
-    def compact_holes(self, *, retreat_side: str) -> int:
-        """Close ALL interior holes by packing live pages toward the side
-        OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on
-        ``retreat_side`` by the hole count. Returns pages moved."""
-        assert retreat_side in ("low", "high")
-        if self.moves_blocked() or self._hole_pages() == 0:
-            return 0
-        # `_relocate_to_positions` settles before its first copy.
-        holes = set(self._free_pages_snapshot())
-        live_sorted = [
-            p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes
-        ]
-        if retreat_side == "high":
-            final = list(range(self.low_wm_page, self.low_wm_page + len(live_sorted)))
-        else:
-            final = list(range(self.high_wm_page - len(live_sorted), self.high_wm_page))
-        return self._relocate_to_positions(live_sorted, final)
 
     # -- band-incompatible base APIs --
 

@@ -629,10 +629,10 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 if cap is not None:
                     self.assertLessEqual(a.size_full, cap)
-                    self.assertFalse(a.can_reserve(1500, 20))
+                    self.assertFalse(a.admits(1500, a._window_demand(1500, 20)))
                     continue
                 self.assertGreaterEqual(a.size_full, 1500)
-                self.assertTrue(a.can_reserve(1500, 20))
+                self.assertTrue(a.admits(1500, a._window_demand(1500, 20)))
                 chunks = []
                 for i in range(375):
                     if i >= 5:
@@ -1215,14 +1215,16 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 if not state:
                     self.assertTrue(
-                        a.can_reserve(
+                        a.admits(
                             4,
-                            4,
-                            full_evictable_tokens=cache.full_evictable_size(),
-                            swa_evictable_tokens=cache.swa_evictable_size(),
+                            a._window_demand(4, 4),
+                            evictable={
+                                a.full_attn_allocator.sub_pool_name: cache.full_evictable_size(),
+                                a.swa_attn_allocator.sub_pool_name: cache.swa_evictable_size(),
+                            },
                         )
                     )
-                self.assertFalse(a.can_reserve(20, 4, empty_pool=True))
+                self.assertFalse(a.admits(20, a._window_demand(20, 4), empty_pool=True))
                 self.assertFalse(a.ensure_capacity(1, 1))
                 self.assertTrue(a.evict_to_free_tokens(cache, 4))
                 self.assertLessEqual(a.full_attn_allocator.allocated_count(), 12)
@@ -1611,7 +1613,9 @@ class TestDeclaredParts(CustomTestCase):
                 first = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(first)
                 self.assertEqual(alloc.available_size(), 16 * dcp)
-                self.assertFalse(alloc.can_reserve(20 * dcp, 0))
+                self.assertFalse(
+                    alloc.admits(20 * dcp, alloc._window_demand(20 * dcp, 0))
+                )
                 second = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(second)
                 self.assertIsNone(alloc.alloc(4 * dcp))
@@ -1869,8 +1873,8 @@ class TestDeclaredParts(CustomTestCase):
                 tree_core_backend="python",
             )
         )
-        self.assertTrue(a.can_reserve(400, 16))
-        self.assertFalse(a.can_reserve(400, 400))
+        self.assertTrue(a.admits(400, a._window_demand(400, 16)))
+        self.assertFalse(a.admits(400, a._window_demand(400, 400)))
         full_budget = a.full_available_size()
         swa_budget = a.conserve_swa_available_size()
         self.assertTrue(
@@ -1885,7 +1889,7 @@ class TestDeclaredParts(CustomTestCase):
         # Pending requests and decode headroom are deducted from these budgets.
         # They must still be charged to the joint byte demand, not just compared
         # with this request's individual token counts.
-        self.assertFalse(a.can_reserve(full_budget, 16))
+        self.assertFalse(a.admits(full_budget, a._window_demand(full_budget, 16)))
         for full_reserved, swa_reserved, fits in (
             (4, 4, True),
             (full_budget - 400, 0, False),
@@ -2259,9 +2263,11 @@ class TestDeclaredParts(CustomTestCase):
         )
         storage, _, _ = _build(fused_draft=placement)
         a = storage.allocator
-        empty_demands = [n for n in range(8, 128, 4) if a.can_reserve(n, n)]
+        empty_demands = [
+            n for n in range(8, 128, 4) if a.admits(n, a._window_demand(n, n))
+        ]
         ids = []
-        while a.can_reserve(4, 4):
+        while a.admits(4, a._window_demand(4, 4)):
             allocation = a.alloc(4)
             self.assertIsNotNone(allocation)
             ids.append(allocation)
@@ -2445,10 +2451,10 @@ class TestDeclaredParts(CustomTestCase):
         )
         # The evicted end holes are credited before any flush: the planned
         # take compacts the ends.
-        self.assertTrue(a.can_reserve(8, 8))
+        self.assertTrue(a.admits(8, a._window_demand(8, 8)))
         for band in (a.full_attn_allocator, a.swa_attn_allocator):
             band.flush_for_allocation()
-        self.assertTrue(a.can_reserve(8, 8))
+        self.assertTrue(a.admits(8, a._window_demand(8, 8)))
         fresh = a.alloc(8)
         self.assertIsNotNone(fresh)
         a.free(fresh)

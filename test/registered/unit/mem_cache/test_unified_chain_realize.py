@@ -225,7 +225,9 @@ class TestChainRealize(CustomTestCase):
             tokens = rng.choice((1, 2, 4, 8, 16, 24, 32))
             if rng.random() < 0.5 or allocator.mamba_allocator is None:
                 fits = allocator.ensure_capacity(tokens, tokens)
-                admitted = allocator.can_reserve(tokens, tokens)
+                admitted = allocator.admits(
+                    tokens, allocator._window_demand(tokens, tokens)
+                )
                 taken = allocator.alloc(tokens)
             else:
                 fits = allocator.ensure_capacity(0, 0, state_slots=tokens % 4 + 1)

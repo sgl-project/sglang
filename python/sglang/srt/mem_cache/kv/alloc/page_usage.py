@@ -1,8 +1,9 @@
 """Who may still touch a band's physical pages, and until when.
 
 One record per use, in one list: a forward that writes the band, a transfer
-that reads or writes it, and the pages a move vacated while some reader could
-still read them. Every move, reuse and write decision of the band reads this
+that reads or writes it, the pages a move vacated while some reader could
+still read them, and the pages freed while a forward that may still touch them
+runs. Every move, reuse and write decision of the band reads this
 ledger: a copy waits the writers of its sources, a vacated page returns to the
 free list once its readers retired, and a write into vacated bytes outside the
 band waits their readers. Decisions read retirement (a forward the scheduler
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.kv.alloc.signals import TransferRelease, signal_fired
 FORWARD = "forward"
 TRANSFER = "transfer"
 VACATED = "vacated"
+RECENT = "recent"
 
 
 class PageUse:
@@ -31,7 +33,8 @@ class PageUse:
     engine was handed; None for a forward whose writes are unknown. A vacated
     use holds byte range ``[lo, hi)``, and, when the pages return to this
     band's free list, their ids on the host and on the device (``pages``,
-    ``batch``)."""
+    ``batch``). A recent use holds, in ``batch``, device page ids freed while
+    the forward ``signal`` ran, which may still write or read them."""
 
     __slots__ = (
         "kind",
@@ -202,6 +205,61 @@ class PageUsage:
                 PageUse(VACATED, key, lo=first * page_bytes, hi=end * page_bytes)
             )
 
+    def record_recent_holes(
+        self, key, batch: torch.Tensor, virtual: torch.Tensor
+    ) -> None:
+        """Physical pages ``batch``, which held virtual pages ``virtual``, went
+        back to the free list while the forward ``key`` and those before it
+        ran: one of them may still write a page it was handed (a forward
+        launched before a request's row was released writes the row's next
+        slot). Kept on the device; `resolve_recent_holes` fences those a
+        running forward writes."""
+        self.uses = [u for u in self.uses if u.kind != RECENT or not self._ended(u)]
+        self.uses.append(PageUse(RECENT, key, batch=batch, ids=virtual))
+
+    def resolve_recent_holes(
+        self, page_bytes: int, written: Optional[Set[int]]
+    ) -> None:
+        """Fence the recent holes that a running forward still writes, keyed by
+        the newest forward at their free: a copy or take that writes one waits
+        it first. ``written``: the virtual pages the running forwards write,
+        None when some forward's writes are unknown. Reads the device once;
+        call it before any stream wait."""
+        recent = [u for u in self.uses if u.kind == RECENT and not self._ended(u)]
+        self.uses = [u for u in self.uses if u.kind != RECENT]
+        if not recent:
+            return
+        pages = torch.cat([u.batch.reshape(-1) for u in recent]).tolist()
+        virtual = torch.cat([u.ids.reshape(-1) for u in recent]).tolist()
+        start = 0
+        for use in recent:
+            n = use.batch.numel()
+            chunk = sorted(
+                {
+                    page
+                    for page, v in zip(
+                        pages[start : start + n], virtual[start : start + n]
+                    )
+                    if written is None or v in written
+                }
+            )
+            start += n
+            runs, first, prev = [], None, None
+            for page in chunk:
+                if first is None:
+                    first = prev = page
+                elif page == prev + 1:
+                    prev = page
+                else:
+                    runs.append((first, prev + 1))
+                    first = prev = page
+            if first is not None:
+                runs.append((first, prev + 1))
+            self.vacate(use.signal, runs, page_bytes=page_bytes)
+
+    def has_recent_holes(self) -> bool:
+        return any(use.kind == RECENT for use in self.uses)
+
     # -- reading --
 
     def prune(self) -> None:
@@ -210,6 +268,9 @@ class PageUsage:
         self.uses = [use for use in self.uses if not self._ended(use)]
 
     def _ended(self, use: PageUse) -> bool:
+        if use.kind == RECENT:
+            # Only decides whether a later write waits: a fired event needs none.
+            return signal_fired(use.signal)
         if use.kind == FORWARD:
             return self.retired(use.signal)
         if use.kind == TRANSFER:
@@ -241,15 +302,19 @@ class PageUsage:
                 batches.append(use.batch)
         return out
 
-    def take_ready_vacated(self, *, urgent: bool) -> List[PageUse]:
+    def take_ready_vacated(
+        self, *, urgent: bool, keep: Set[int] = frozenset()
+    ) -> List[PageUse]:
         """Remove and return the vacated uses whose pages may return to the
-        free list: those whose readers retired, or every one when urgent."""
+        free list: those whose readers retired, or every one when urgent;
+        never one holding a page of ``keep`` (pages that must stay put)."""
         ready, kept = [], []
         for use in self.uses:
             if (
                 use.kind == VACATED
                 and use.pages is not None
                 and (urgent or self.retired(use.signal))
+                and keep.isdisjoint(use.pages)
             ):
                 ready.append(use)
             else:
@@ -275,6 +340,30 @@ class PageUsage:
             kept.append(use)
         self.uses = kept
         return waits
+
+    def fence_meets(self, lo: int, hi: int) -> bool:
+        """Whether an unfinished fence meets bytes ``[lo, hi)``; removes
+        nothing."""
+        return any(
+            use.kind == VACATED
+            and use.pages is None
+            and use.lo < hi
+            and lo < use.hi
+            and not signal_fired(use.signal)
+            for use in self.uses
+        )
+
+    def network_held_pending(self) -> Set[int]:
+        """Pending pages a network transfer still reads, until its logical
+        release: they return to the free list only after the release, so a
+        layout that does not need them treats them as occupied."""
+        held: Set[int] = set()
+        for use in self.uses:
+            if use.kind == VACATED and use.pages is not None:
+                keys = use.signal if isinstance(use.signal, tuple) else (use.signal,)
+                if any(isinstance(k, TransferRelease) and not k.released for k in keys):
+                    held.update(use.pages)
+        return held
 
     def has_fences(self) -> bool:
         return any(use.kind == VACATED and use.pages is None for use in self.uses)

@@ -17,6 +17,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    open_float_side,
     setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
@@ -79,8 +80,8 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
     def test_float_move_waits_a_load_that_writes_a_moved_page(self):
         """REGRESSION: a window float relocated pages a host load was still
         writing: only an end flush waited host copies. A delayed load rewrites
-        every live window page; after `make_room`, the moved pages must carry
-        the load's bytes, and `make_room` must return before the load ends."""
+        every live window page; after the float moves, the moved pages must
+        carry the load's bytes, and the move must return before the load ends."""
         pool, alloc, live, schedule, copier = self._chain()
         flt = alloc.swa_attn_allocator
         epp = flt.entry_bytes_per_page
@@ -95,8 +96,8 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         flt.record_transfer(done, live, writes=True)
 
         with torch.cuda.stream(schedule):
-            opened = flt.make_room(side="low", min_bytes=ask)
-            self.assertFalse(done.query(), "make_room blocked the host on the load")
+            opened = open_float_side(flt, "low", ask)
+            self.assertFalse(done.query(), "the move blocked the host on the load")
         torch.cuda.synchronize()
         self.assertGreaterEqual(opened, ask)
         moved = flt.ids.virtual_to_physical[live].tolist()
@@ -128,7 +129,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         flt.record_transfer(done, live, writes=False)
 
         with torch.cuda.stream(schedule):
-            flt.make_room(side="low", min_bytes=self._ask(flt))
+            open_float_side(flt, "low", self._ask(flt))
             copied = torch.cuda.Event()
             copied.record()
         copied.synchronize()
@@ -150,7 +151,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
     def test_float_move_waits_a_flag_published_by_the_host(self):
         """A transfer outside every CUDA stream signals with a completion flag
         the host publishes. A delayed writer rewrites every live window page;
-        a host thread publishes the flag only after it ends. `make_room` must
+        a host thread publishes the flag only after it ends. The move must
         return at once, and the moved pages must carry the writer's bytes."""
         pool, alloc, live, schedule, copier = self._chain()
         flt = alloc.swa_attn_allocator
@@ -173,8 +174,8 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         flt.record_transfer(flag, live, writes=True)
 
         with torch.cuda.stream(schedule):
-            opened = flt.make_room(side="low", min_bytes=ask)
-            self.assertFalse(flag.query(), "make_room blocked the host on the flag")
+            opened = open_float_side(flt, "low", ask)
+            self.assertFalse(flag.query(), "the move blocked the host on the flag")
         publisher.start()
         publisher.join()
         torch.cuda.synchronize()

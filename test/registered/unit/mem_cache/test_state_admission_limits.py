@@ -118,7 +118,9 @@ class TestStateAdmissionLimits(unittest.TestCase):
                         self.assertIsNotNone(allocator.alloc(3))
                     self.assertFalse(allocator.verify_byte_accounting())
                     self.assertEqual(allocator.full_attn_allocator.allocated_count(), 6)
-                    self.assertFalse(allocator.can_reserve(507, 1))
+                    self.assertFalse(
+                        allocator.admits(507, allocator._window_demand(507, 1))
+                    )
 
     def test_fractional_pending_tokens_round_up_at_the_physical_boundary(self):
         allocator = _build(window=False, lazy=True).allocator

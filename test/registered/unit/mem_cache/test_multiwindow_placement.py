@@ -385,9 +385,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                         auxiliary_swa_tokens=demand["auxiliary_swa"],
                         state_slots=demand["state_slots"],
                     )
-                    pages = allocator._policy._demands(
-                        allocator, *args, *kwargs.values()
-                    )
+                    pages = allocator.page_demands(*args, **kwargs).items()
                     # Only a relayout serves it: no layout in place does.
                     self.assertIsNone(
                         plan(
