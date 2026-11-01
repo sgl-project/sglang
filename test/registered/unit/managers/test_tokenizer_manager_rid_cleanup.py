@@ -146,6 +146,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm._pending_abort_deadlines = {}
     tm.encoder_dispatch_ready = {}
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -1835,6 +1836,99 @@ class TestPendingAbortRefire(CustomTestCase):
         (sent,) = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertIsInstance(sent, AbortReq)
         self.assertEqual((sent.rid, sent.forward), ("dup_abort", False))
+
+
+class TestSingleTokenizerPendingAbort(CustomTestCase):
+    """An abort for a rid not registered yet must abort the request on arrival.
+
+    With one tokenizer worker an unknown-rid abort used to be a silent no-op,
+    so an abort racing the HTTP handler let the request run unaborted (same
+    gap as the multi-tokenizer one, without a router to remember it).
+    """
+
+    @staticmethod
+    def _make_tm(case):
+        tm = TestAbortBeforeDispatch._make_tm(case)
+        return tm
+
+    @staticmethod
+    async def _drive_generate(tm, rid):
+        obj = GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+        tokenized = MagicMock()
+        tokenized.rid = rid
+        tokenized.mm_inputs = None
+
+        async def tokenize(_obj):
+            return tokenized
+
+        tm._tokenize_one_request = tokenize
+        return await asyncio.wait_for(tm.generate_request(obj).__anext__(), timeout=2)
+
+    def test_abort_before_registration_finishes_the_request(self):
+        tm = self._make_tm(self)
+        tm.abort_request("early_rid")
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 0)
+
+        out = asyncio.run(self._drive_generate(tm, "early_rid"))
+
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertNotIn("early_rid", tm.rid_to_state)
+        # Neither the abort nor the generate ever reached the scheduler.
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 0)
+
+    def test_pending_abort_is_one_shot(self):
+        tm = self._make_tm(self)
+        tm.abort_request("reused_rid")
+        out = asyncio.run(self._drive_generate(tm, "reused_rid"))
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+
+        task = asyncio.run(self._second_generate_dispatches(tm, "reused_rid"))
+        self.assertTrue(task)
+
+    async def _second_generate_dispatches(self, tm, rid):
+        gen = tm.generate_request(
+            GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+        )
+        tokenized = MagicMock()
+        tokenized.rid = rid
+        tokenized.mm_inputs = None
+
+        async def tokenize(_obj):
+            return tokenized
+
+        tm._tokenize_one_request = tokenize
+        waiter = asyncio.create_task(gen.__anext__())
+        while not tm.rid_to_state.get(rid) or not tm.rid_to_state[rid].dispatched:
+            if tm._dispatch_to_scheduler.call_count and tm.rid_to_state.get(rid):
+                break
+            await asyncio.sleep(0)
+        dispatched = any(
+            getattr(c.args[0], "rid", None) == rid
+            for c in tm._dispatch_to_scheduler.call_args_list
+        )
+        waiter.cancel()
+        return dispatched
+
+    def test_pending_abort_expires(self):
+        tm = self._make_tm(self)
+        tm.PENDING_ABORT_TTL = 0.0  # expires immediately
+        tm.abort_request("stale_rid")
+        dispatched = asyncio.run(self._second_generate_dispatches(tm, "stale_rid"))
+        self.assertTrue(dispatched)
+
+    def test_multi_worker_mode_does_not_record_locally(self):
+        # The router's pending table owns this rid; a local record would arm a
+        # second, unclaimable kill.
+        tm = self._make_tm(self)
+        override = get_context().override_server_args(
+            speculative_algorithm=None, tokenizer_worker_num=2
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        tm.abort_request("other_workers_rid")
+        self.assertEqual(len(tm._pending_abort_deadlines), 0)
+        (sent,) = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertTrue(sent.forward)
 
 
 class TestLoRARequestLifecycle(CustomTestCase):
