@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,11 @@ import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     SGLDiffusionGenerator,
+    _apply_cache_mode,
+)
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.options import (
+    PLUGIN_KEYS,
+    SGLDOptions,
 )
 
 
@@ -323,6 +329,115 @@ def test_multi_gpu_single_file_starts_without_cfg_parallel(
     assert "cfg_parallel_degree" not in seen
 
 
+def _status_runtime(**widgets):
+    """A runtime whose worker was started from SGLDOptions(**widgets)."""
+    from sglang.multimodal_gen.runtime.utils.perf_logger import (
+        MemorySnapshot,
+        RequestMetrics,
+    )
+
+    options = SGLDOptions().create_options(**widgets)[0]
+    plugin = {k: options.pop(k) for k in PLUGIN_KEYS if k in options}
+    # ServerArgs defaults for the fields the status reads, then the loader's kwargs.
+    server_args = {
+        "num_gpus": 1,
+        "tp_size": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "attention_backend": None,
+        "quantization": None,
+        "enable_torch_compile": False,
+        "regional_compile": False,
+        "enable_breakable_cuda_graph": False,
+        "dit_layerwise_offload": False,
+        "dit_layerwise_resident_layers": 0.0,
+        "dit_offload_prefetch_size": 0.0,
+    }
+    server_args.update((k, v) for k, v in options.items() if k in server_args)
+    runtime = SGLDiffusionGenerator()
+    runtime.generator = SimpleNamespace(
+        server_args=SimpleNamespace(
+            model_path="z.safetensors",
+            pipeline_class_name="ZImagePipeline",
+            **server_args,
+        )
+    )
+    runtime.model_type = "zimage"
+    runtime.last_options = {
+        "sgld_options": options,
+        "int8_kernel": plugin.get("int8_kernel", "auto"),
+    }
+    metrics = RequestMetrics(request_id="r")
+    metrics.total_duration_ms = 123.4
+    metrics.record_memory_snapshot(
+        "after_forward",
+        MemorySnapshot(
+            allocated_mb=1.0,
+            reserved_mb=2.0,
+            peak_allocated_mb=3000.0,
+            peak_reserved_mb=4000.0,
+        ),
+    )
+    runtime.executor = SimpleNamespace(last_metrics=metrics)
+    _apply_cache_mode(runtime.executor, plugin)
+    runtime._worker_processes = lambda: [SimpleNamespace(pid=7, is_alive=lambda: True)]
+    runtime._is_live = lambda: False
+    return runtime
+
+
+def test_status_text_reports_sgldoptions_widget_values() -> None:
+    """Every loader widget a user sets reads back unchanged, under its own name."""
+    widgets = {
+        "num_gpus": 2,
+        "parallel_mode": "manual",
+        "tp_size": 2,
+        "attention_backend": "flash_attention",
+        "quantization": "convrot_int8",
+        "int8_gemm": "sglang_jit",
+        "execution_mode": "torch_compile",
+        "regional_compile": True,
+        "memory_mode": "layerwise_offload",
+        "resident_layers": 2,
+        "prefetch_layers": 1,
+    }
+    text = _status_runtime(
+        **widgets, cache_mode="cache_dit", cache_dit_tuning="manual"
+    ).status_text()
+    for name, value in widgets.items():
+        assert f" {name}={value}" in text
+    assert "per-run settings (apply to the next request): cache_mode=cache_dit" in text
+    assert "'max_warmup_steps': 4" in text
+
+
+def test_status_text_defaults_hide_fields_that_do_not_apply() -> None:
+    text = _status_runtime().status_text()
+    assert "NOT live pids=[7]" in text
+    assert (
+        "loader settings (fixed until the worker restarts): model_type=zimage "
+        "num_gpus=1 parallel_mode=auto tp_size=1 ulysses_degree=1 ring_degree=1 "
+        "attention_backend=auto quantization=none execution_mode=eager "
+        "memory_mode=resident\n"
+    ) in text
+    assert "cache_mode=off\n" in text
+    assert "123.4 ms" in text
+    assert "peak allocated 3000 MiB, peak reserved 4000 MiB" in text
+
+
+def test_status_text_reports_backend_for_prequantized_h3() -> None:
+    text = _status_runtime(int8_gemm="comfy_kitchen").status_text()
+    assert "quantization=none" in text
+    assert "int8_gemm=comfy_kitchen" in text
+
+
+def test_status_text_before_first_call_and_without_worker() -> None:
+    runtime = _status_runtime()
+    runtime.executor.last_metrics = None
+    assert "last DiT call: none yet" in runtime.status_text()
+    _apply_cache_mode(runtime.executor, {})
+    assert "cache_mode=worker default" in runtime.status_text()
+    assert "not started" in SGLDiffusionGenerator().status_text()
+
+
 def test_spawned_workers_do_not_reexecute_launcher_main(monkeypatch) -> None:
     """Workers must not re-run ComfyUI's main.py; its imports break under spawn."""
     import multiprocessing.spawn
@@ -449,3 +564,31 @@ def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
     client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
     assert client.get_model_info() == card
     assert urls == ["http://host:30010/v1/models"]
+
+
+def test_status_text_reads_executor_that_ran_after_rebuild() -> None:
+    """After a cached executor rebuilds the worker, status shows its metrics."""
+    runtime = _status_runtime()
+    running = runtime.executor
+    runtime.executor = SimpleNamespace(last_metrics=None)
+    runtime._owns_live = lambda executor: True
+    runtime.ensure_executor(running)
+    assert "123.4 ms" in runtime.status_text()
+
+
+def test_worker_status_is_pushed_to_the_page(monkeypatch) -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        _push_worker_status,
+    )
+
+    sent = []
+    server = SimpleNamespace(
+        PromptServer=SimpleNamespace(
+            instance=SimpleNamespace(send_sync=lambda *a: sent.append(a))
+        )
+    )
+    monkeypatch.setitem(sys.modules, "server", server)
+    monkeypatch.setattr(SGLDiffusionGenerator, "shared", lambda: _status_runtime())
+    _push_worker_status()
+    assert sent[0][0] == "sgld.worker_status"
+    assert "123.4 ms" in sent[0][1]["text"]

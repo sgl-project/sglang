@@ -12,8 +12,7 @@ The distributed cases run over gloo on CPU, so they need no GPU.
 """
 
 import math
-import os
-import socket
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -299,12 +298,6 @@ class TestTileShard(unittest.TestCase):
                 self.assertEqual(model._tile_shard(), (0, 1, None))
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _check_gather(group, rank, world_size, dtype, tile_shapes):
     """Every rank must rebuild the same tile list, whatever it held itself."""
     tiles = [
@@ -340,10 +333,10 @@ def _check_sharded_decode(group, rank, world_size, dtype, latent_shape, steps):
         assert torch.equal(got, serial_noise[index])
 
 
-def _distributed_worker(rank, world_size, port):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+def _distributed_worker(rank, world_size, init_method):
+    dist.init_process_group(
+        "gloo", init_method=init_method, rank=rank, world_size=world_size
+    )
     try:
         # A group narrower than the world, so an even split gets covered too.
         pair = dist.new_group([0, 1])
@@ -383,12 +376,15 @@ class TestShardedDecode(unittest.TestCase):
     """The real gather, over a real process group."""
 
     def test_three_ranks_agree_with_the_serial_decode(self):
-        mp.spawn(
-            _distributed_worker,
-            args=(3, _free_port()),
-            nprocs=3,
-            join=True,
-        )
+        # Rendezvous through a file, not a TCP port: a port probed free here
+        # can be taken by a concurrent job before rank 0 listens on it.
+        with tempfile.TemporaryDirectory() as tmp:
+            mp.spawn(
+                _distributed_worker,
+                args=(3, f"file://{tmp}/store"),
+                nprocs=3,
+                join=True,
+            )
 
 
 class TestTileIntervals(unittest.TestCase):

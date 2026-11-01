@@ -110,6 +110,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -278,6 +279,14 @@ def _validate_minimax_m3_request(request: ChatCompletionRequest) -> str | None:
                 "thinking.type must be 'adaptive', 'enabled' or 'disabled', "
                 f"got {thinking_type!r}."
             )
+    effort = request.reasoning_effort
+    if effort is None:
+        effort = (request.chat_template_kwargs or {}).get("reasoning_effort")
+    if effort is not None and effort not in _M3_REASONING_EFFORTS:
+        return (
+            f"reasoning_effort must be one of {', '.join(_M3_REASONING_EFFORTS)}, "
+            f"got {effort!r}."
+        )
     root_positions = [
         position
         for position, message in enumerate(request.messages)
@@ -338,8 +347,6 @@ def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     )
     if request.thinking is not None:
         template_kwargs.setdefault("thinking_mode", request.thinking["type"])
-    if effort in ("none", "minimal"):
-        template_kwargs.setdefault("thinking_mode", "disabled")
     if template_kwargs.get("thinking_mode") == "disabled":
         # An effort means nothing once thinking is off.
         effort = None
@@ -384,6 +391,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     _default_sampling_params_logged = False
     _KIMI_K3_GENERATION_STUB_TOKENS = 3
+
+    async def handle_request(self, request, raw_request):
+        if self._doc_splitter is not None:
+            return await self._doc_splitter.handle_request(request, raw_request)
+        return await super().handle_request(request, raw_request)
 
     def __init__(
         self,
@@ -471,6 +483,9 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
+        )
+        self._doc_splitter = ChatDocSplitter.for_model(
+            self, handle_window=super().handle_request
         )
 
     def _probe_prompt_text_round_trip(self) -> bool:
@@ -1101,7 +1116,12 @@ class OpenAIServingChat(OpenAIServingBase):
             and reasoning_parser.detector.answer_started
         )
 
-    def _validate_request(self, request: ChatCompletionRequest) -> str | None:
+    def _validate_request(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        validate_max_output_tokens: bool = True,
+    ) -> str | None:
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
@@ -1181,7 +1201,8 @@ class OpenAIServingChat(OpenAIServingBase):
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = get_model().context_length
         if (
-            max_output_tokens
+            validate_max_output_tokens
+            and max_output_tokens
             and server_context_length
             and max_output_tokens > server_context_length
         ) and not get_serving().allow_auto_truncate:
@@ -2354,7 +2375,12 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
-        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
+        conv = generate_chat_conv(
+            request,
+            self.template_manager.chat_template_name,
+            # Unlimited-OCR v2 prompts place "<PAGE><image>" per page in the text.
+            inline_image_placeholders=self._doc_splitter is not None,
+        )
 
         # If we should continue the final assistant message, adjust the conversation.
         if (

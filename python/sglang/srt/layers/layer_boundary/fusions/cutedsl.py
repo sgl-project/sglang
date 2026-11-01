@@ -28,7 +28,6 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
-    get_disagg,
     get_exec,
     get_flags,
     get_parallel,
@@ -398,11 +397,6 @@ def prepare_cutedsl_fusion(
             f"{type(model).__name__} installed no CuTe DSL fusion service, so no "
             "allreduce fusion would run at all. Drop the flag, or choose 'auto', "
             "'trtllm' or 'mnnvl'."
-        )
-    if get_disagg().enable_pdmux:
-        raise RuntimeError(
-            "FlashInfer MNNVL CuTe DSL fusion does not support concurrent PDMux "
-            "streams sharing one mutable workspace"
         )
     services = {id(f.service): f.service for f in fusions}
     max_m = _resolve_max_m(max_running_requests=max_running_requests)

@@ -265,7 +265,7 @@ struct SPCollectiveKernel {
     auto input_elems = SymbolicSize{"input_elems"};
     auto local_elems = SymbolicSize{"local_elems"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({input_elems}).with_dtype<bf16_t>().with_device(device).verify(input);
     TensorMatcher({local_elems}).with_dtype<bf16_t>().with_device(device).verify(output);
     if (residual.has_value()) {

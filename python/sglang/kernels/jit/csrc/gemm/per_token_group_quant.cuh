@@ -522,7 +522,7 @@ QuantHostContext<Trait> build_quant_context( //
   constexpr int64_t kSiluFactor = Trait::kFuseSiluAndMul ? 2 : 1;
 
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   auto E = SymbolicSize{"num_experts"};
   auto N = SymbolicSize{"num_tokens"};
   auto H = SymbolicSize{"hidden_size"};
