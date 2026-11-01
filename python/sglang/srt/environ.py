@@ -1180,7 +1180,7 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
     # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
