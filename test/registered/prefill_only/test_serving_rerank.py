@@ -282,8 +282,9 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                     (no_logprob, 2152, "no"),
                 ]
 
-                # The rerank handler checks output_top_logprobs[0] for the first generated token
-                meta_info = {"output_top_logprobs": [top_logprobs]}
+                # The rerank handler reads the requested yes/no logprobs of the
+                # first generated token
+                meta_info = {"output_token_ids_logprobs": [top_logprobs]}
 
                 yield {"meta_info": meta_info, "embedding": None}
 
@@ -304,6 +305,66 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
 
         self.assertEqual(res[1].document, "doc2")
         self.assertAlmostEqual(res[1].score, 0.3)  # 0.3 / (0.3+0.7) = 0.3
+
+    def test_handle_vl_reranker_request_label_outside_top_logprobs(self):
+        """A label ranked outside the top-k list still contributes to the score."""
+        import math
+
+        yes_id, no_id = 9693, 2152
+        # "yes" is far less likely than 50 other tokens, so it is missing from a
+        # top-50 list, but its probability still matters for p_yes / (p_yes + p_no).
+        p_yes, p_no = 0.002, 0.02
+        distribution = [(math.log(p_yes), yes_id, "yes"), (math.log(p_no), no_id, "no")]
+        distribution += [
+            (math.log((1 - p_yes - p_no) / 50), 100 + i, "other") for i in range(50)
+        ]
+
+        class _TM(_DummyTokenizerManager):
+            def __init__(self):
+                self.server_args = object()
+                self.model_config = Mock()
+                self.model_config.is_generation = True
+                self.model_config.model_path = "qwen/qwen3-vl"
+                self.tokenizer = Mock()
+                self.tokenizer.chat_template = (
+                    "{% for x in query %}{{ x.text }}{% endfor %}"
+                    "{% for x in document %}{{ x.text }}{% endfor %}"
+                    'answer can only be "yes" or "no" <|vision_start|>'
+                )
+                self.requests = []
+
+            async def generate_request(self, req, _raw):
+                self.requests.append(req)
+                meta_info = {}
+                if req.top_logprobs_num:
+                    meta_info["output_top_logprobs"] = [
+                        sorted(distribution, reverse=True)[: req.top_logprobs_num]
+                    ]
+                if req.token_ids_logprob:
+                    # Returned in requested-id order, not probability order.
+                    meta_info["output_token_ids_logprobs"] = [
+                        [
+                            row
+                            for i in req.token_ids_logprob
+                            for row in distribution
+                            if row[1] == i
+                        ]
+                    ]
+                yield {"meta_info": meta_info, "embedding": None}
+
+        tm = _TM()
+        handler = OpenAIServingRerank(tm)
+        req = V1RerankReqInput(query="query", documents=["doc"], return_documents=True)
+        res = asyncio.run(handler._handle_non_streaming_request(req, req, Mock()))
+
+        self.assertEqual(len(res), 1)
+        self.assertAlmostEqual(res[0].score, p_yes / (p_yes + p_no))
+        self.assertEqual(len(tm.requests), 1)
+        self.assertEqual(
+            tm.requests[0].token_ids_logprob,
+            [handler._yes_token_id, handler._no_token_id],
+        )
+        self.assertFalse(tm.requests[0].top_logprobs_num)
 
 
 if __name__ == "__main__":
