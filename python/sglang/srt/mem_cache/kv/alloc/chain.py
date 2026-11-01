@@ -1647,13 +1647,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
-        swa_tail_len: int,
-        window_tail_lens: Optional[Mapping[str, int]] = None,
+        window_tail_lens: Mapping[str, int],
     ) -> Optional[torch.Tensor]:
         """Decode-node prealloc: owner KV for the whole sequence, window KV for
-        the live window tail only. ``swa_tail_len`` is the target window's
-        tail; ``window_tail_lens`` names any window's own tail by sub-pool (a
-        window it does not name keeps the whole sequence).
+        the live window tail only. ``window_tail_lens`` names every window's
+        own tail by sub-pool.
 
         The owner and the window SHARE one virtual id space (a virtual page names
         an owner-physical page and, if bound, a window-physical one), so the tail
@@ -1665,9 +1663,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         already bound and costs no new window page.
         """
         assert len(prefix_lens_cpu) == 1
-        tails = dict(window_tail_lens or {})
-        if self.swa_attn_allocator is not None:
-            tails.setdefault(self.swa_attn_allocator.sub_pool_name, swa_tail_len)
+        tails = dict(
+            TokenDemand(extend_num_tokens, window_tail_lens)
+            .checked(self.window_pool_names())
+            .window_tokens
+        )
         assert all(0 <= tail <= extend_num_tokens for tail in tails.values())
         with record_function("ChainAllocator.alloc_extend_swa_tail"):
             prefix_len = int(prefix_lens_cpu[0])
@@ -1690,11 +1690,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 )
 
             tail_pages = {
-                window.sub_pool_name: (
-                    new_tail_pages(tails[window.sub_pool_name])
-                    if window.sub_pool_name in tails
-                    else num_new_pages
-                )
+                window.sub_pool_name: new_tail_pages(tails[window.sub_pool_name])
                 for window in self._windows
             }
             return self._allocate(

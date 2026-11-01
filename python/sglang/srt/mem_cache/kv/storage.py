@@ -251,15 +251,13 @@ class KVStorage:
         last_loc: torch.Tensor,
         num_tokens: int,
         make_room: Callable[[int], Any],
-        window_tail: Optional[int] = None,
         window_tails: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Owner token ids for ``[prefix_len, seq_len)`` of each request's
         ``rows`` entry, by page, continuing each request's last page from
-        ``last_loc``; None when they do not fit. With ``window_tail`` (one
-        request whose KV a peer sends), the target's window binds pages for
-        its last ``window_tail`` tokens only, and each window ``window_tails``
-        names (by sub-pool) for its own last tokens."""
+        ``last_loc``; None when they do not fit. With ``window_tails`` (one
+        request whose KV a peer sends; every window, by sub-pool), each
+        window binds pages for its own last tokens only."""
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -268,7 +266,7 @@ class KVStorage:
             shard_size=1,
         )
         make_room(demand)
-        if window_tail is not None:
+        if window_tails is not None:
             return self._allocator.alloc_extend_swa_tail(
                 prefix_lens=prefix_lens,
                 prefix_lens_cpu=prefix_lens_cpu,
@@ -276,7 +274,6 @@ class KVStorage:
                 seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=num_tokens,
-                swa_tail_len=window_tail,
                 window_tail_lens=window_tails,
             )
         return self._allocator.alloc_extend(

@@ -2612,12 +2612,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len=total_prefix_len,
                 prefix_indices=prefix_indices,
                 uses_swa_tail=uses_swa_tail,
-                swa_tail_len=swa_tail_len,
-                window_tails={
-                    name: tail
-                    for name, tail in self._window_tails(fill_len).items()
-                    if name != window_sub_pool_of(allocator)
-                },
+                window_tails=self._window_tails(fill_len),
                 req_to_token_pool=self.req_to_token_pool,
             )
         assert kv_loc is not None, (
@@ -2714,12 +2709,11 @@ def alloc_for_decode_prealloc(
     total_prefix_len: int,
     prefix_indices: Optional[torch.Tensor],
     uses_swa_tail: bool,
-    swa_tail_len: int,
-    window_tails: Optional[Dict[str, int]] = None,
+    window_tails: Dict[str, int],
     req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
-    """``swa_tail_len`` is the target window's live tail; ``window_tails``
-    names each further window's own tail by sub-pool."""
+    """``window_tails`` names every window's live tail by window pool; with
+    ``uses_swa_tail`` each window binds only that tail of the new pages."""
     req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
         return storage.take_tokens(delta_len, make_room=_evicted_by_caller)
@@ -2739,7 +2733,8 @@ def alloc_for_decode_prealloc(
             total_prefix_len=total_prefix_len,
             last_loc=last_loc,
             uses_swa_tail=uses_swa_tail,
-            swa_tail_len=swa_tail_len,
+            # The NPU pool keeps one window.
+            swa_tail_len=next(iter(window_tails.values()), fill_len),
             req_to_token_pool=req_to_token_pool,
         )
     kv_loc = storage.take_extend(
@@ -2753,20 +2748,25 @@ def alloc_for_decode_prealloc(
         make_room=_evicted_by_caller,
         # Full-attention layers reuse prefix KV; window layers allocate only
         # the live tail of their own window.
-        window_tail=swa_tail_len if uses_swa_tail else None,
-        **({"window_tails": window_tails} if uses_swa_tail and window_tails else {}),
+        window_tails=window_tails if uses_swa_tail else None,
     )
     if uses_swa_tail and kv_loc is not None:
-        cursors = {ComponentType.SWA: swa_tail_len}
-        chain = storage.allocator if window_tails else None
-        for name, tail in (window_tails or {}).items():
-            band = chain.window_allocators[name]
-            cursors[chain.window_component(band)] = tail
-        for component, tail in cursors.items():
+        for name, tail in window_tails.items():
             evicted_seqlen = fill_len - tail
             assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
-            req.kv.set_evicted_seqlen(component, evicted_seqlen)
+            req.kv.set_evicted_seqlen(
+                _window_tree_component(allocator, name), evicted_seqlen
+            )
     return kv_loc
+
+
+def _window_tree_component(allocator, name: str) -> ComponentType:
+    """The prefix-tree slot of window pool ``name``: a unified pool's window
+    sub-pool's slot, or a static pool's one window."""
+    windows = getattr(allocator, "window_allocators", None)
+    if windows is None:
+        return ComponentType.SWA
+    return allocator.window_component(windows[name])
 
 
 def _alloc_for_decode_prealloc_dsv4(

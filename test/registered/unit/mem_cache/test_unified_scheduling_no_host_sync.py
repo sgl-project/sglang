@@ -97,7 +97,9 @@ class _Step:
             self.tail_seq,
             self.tail_last,
             tokens,
-            swa_tail_len=PAGE_SIZE + 1,
+            window_tail_lens=dict.fromkeys(
+                self.allocator.window_pool_names(), PAGE_SIZE + 1
+            ),
         )
 
     def retire_window(self):

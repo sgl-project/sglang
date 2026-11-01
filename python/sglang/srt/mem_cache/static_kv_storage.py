@@ -11,7 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
 import torch
@@ -215,7 +215,7 @@ class StaticKVStorage:
         last_loc: torch.Tensor,
         num_tokens: int,
         make_room: Callable[[int], Any],
-        window_tail: Optional[int] = None,
+        window_tails: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         # Over estimate the number of tokens: assume each request needs a new
         # page (one page per CLASS per request under sharding — the min-class
@@ -255,7 +255,9 @@ class StaticKVStorage:
             if self._batch is not None:
                 extra_alloc_kwargs["req_to_token_pool"] = self._batch.req_to_token_pool
 
-        if window_tail is not None:
+        if window_tails is not None:
+            # A static pool keeps one window.
+            (window_tail,) = window_tails.values()
             out = allocator.alloc_extend_swa_tail(
                 prefix_lens=prefix_lens,
                 prefix_lens_cpu=prefix_lens_cpu,

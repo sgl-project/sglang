@@ -278,7 +278,6 @@ class TestUnifiedWindowLengths(CustomTestCase):
     def test_prealloc_binds_each_window_its_own_tail(self):
         storage = _storage(device="cuda")
         allocator = storage.allocator
-        target = allocator.swa_attn_allocator.sub_pool_name
         for seq_len in (5, 23, 37, 64):
             with self.subTest(seq_len=seq_len):
                 req = SimpleNamespace(kv=ReqKvInfo())
@@ -296,7 +295,6 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     total_prefix_len=0,
                     prefix_indices=None,
                     uses_swa_tail=True,
-                    swa_tail_len=tails.pop(target),
                     window_tails=tails,
                 )
                 self.assertIsNotNone(kv_loc)
