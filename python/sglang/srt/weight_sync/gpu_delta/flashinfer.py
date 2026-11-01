@@ -76,7 +76,13 @@ def identify_layout(layer, backend):
         if not method.quant_config.is_checkpoint_nvfp4_serialized:
             raise ValueError("GPU delta does not admit on-load NVFP4 quantization")
         if backend == "trtllm":
-            layout = FlashInferLayout("nvfp4", backend, gated, "w4a4", up_first=False)
+            layout = FlashInferLayout(
+                "nvfp4",
+                backend,
+                gated,
+                "w4a4",
+                up_first=method.load_up_proj_weight_first,
+            )
         elif backend == "cutedsl":
             if not method._is_cutedsl_v2_standard:
                 raise ValueError("GPU delta requires the standard CuTe DSL layout")
@@ -87,7 +93,15 @@ def identify_layout(layer, backend):
                 raise ValueError(f"unsupported CuTe DSL quant mode: {mode}")
             layout = FlashInferLayout("nvfp4", backend, gated, mode, up_first=True)
         elif backend == "megamoe":
-            layout = FlashInferLayout("nvfp4", backend, gated, "w4a4", up_first=False)
+            config = layer._flashinfer_megamoe_layer._megakernel_config
+            config_name = type(config).__name__
+            if config_name == "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig":
+                mode = "w4a4"
+            elif config_name == "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig":
+                mode = "w4a16"
+            else:
+                raise ValueError("unsupported FlashInfer NVFP4 MegaMoE consumer")
+            layout = FlashInferLayout("nvfp4", backend, gated, mode, up_first=False)
         else:
             raise ValueError(f"unsupported NVFP4 expert backend: {backend}")
     elif name == "Mxfp4FlashinferTrtllmMoEMethod":
@@ -680,7 +694,7 @@ def consumer_objects(layer, layout):
         )
         for weights, scales in mega._transformed:
             objects.extend((weights, scales))
-        if layout.format == "nvfp4":
+        if layout.format == "nvfp4" and layout.quant_mode == "w4a4":
             config = mega._megakernel_config
             objects.extend(
                 (
