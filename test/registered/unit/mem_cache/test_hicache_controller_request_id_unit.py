@@ -230,6 +230,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             prefix_keys=None,
             sidecar_hash_values=None,
             sidecar_hit_pages=0,
+            published_transfer_acks=0,
         )
         with mock.patch.object(
             hybrid_cc_module, "get_thread_caller_info", return_value=None

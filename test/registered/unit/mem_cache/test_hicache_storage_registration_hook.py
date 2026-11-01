@@ -103,6 +103,8 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     controller = object.__new__(cls)
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
+    controller.prefetch_thread = controller.prefetch_io_aux_thread = None
+    controller.prefetch_sync_thread = controller.backup_thread = None
     controller.storage_host_pool = storage_host_pool
     controller.mem_pool_host = mem_pool_host
     controller.page_size = PAGE

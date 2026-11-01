@@ -94,6 +94,10 @@ class InstantWriteBackController:
     _resolve_device_transfers = HybridCacheController._resolve_device_transfers
     _num_tokens_by_pool = HybridCacheController._num_tokens_by_pool
 
+    def storage_workers_alive(self) -> bool:
+        # No storage threads here: the tick's liveness word is always 1.
+        return True
+
     def __init__(self, host_group: HostPoolGroup, device_allocator):
         self.mem_pool_host = host_group
         self.mem_pool_device_allocator = device_allocator

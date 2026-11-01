@@ -33,6 +33,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
+            storage_workers_alive=lambda: True,
             ack_write_queue=[
                 SimpleNamespace(
                     finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
@@ -53,14 +54,15 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         leader.check_hicache_events()
 
         leader._all_reduce.assert_called_once()
-        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2, 0, 0])
+        # [write acks, load acks, workers alive, digest, -digest]
+        self.assertEqual(leader._all_reduce.call_args.args[0].tolist(), [1, 2, 1, 0, 0])
         leader.writing_check.assert_called_once_with(finish_count=1)
         leader.loading_check.assert_called_once_with(finish_count=2)
 
         follower = self._make_cache(1, [True], [True])
 
         def reduce_to_min(counts, _):
-            counts.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int64))
+            counts.copy_(torch.tensor([1, 1, 1, 0, 0], dtype=torch.int64))
 
         follower._all_reduce.side_effect = reduce_to_min
         follower.check_hicache_events()
