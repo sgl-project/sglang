@@ -18,7 +18,6 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_schedule,
-    get_server_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,9 +37,10 @@ class KVFloor:
 
 
 def _requests_set() -> Optional[int]:
-    """--max-running-requests as the user set it (the record): a value SGLang resolves itself
-    (e.g. a model's default) caps the request pool, but is no target for the KV cache."""
-    return get_server_args().max_running_requests
+    """--max-running-requests as the user set it. SGLang resolves its own value only under
+    speculative decoding, which paged experts refuse, and for DeepSeek-V4, whose experts they
+    do not page yet, so here the resolved value is the user's (None if unset)."""
+    return get_schedule().max_running_requests
 
 
 def kv_floor(model_context_len: int) -> KVFloor:

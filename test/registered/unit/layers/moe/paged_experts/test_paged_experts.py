@@ -705,21 +705,13 @@ class TestSizing(CustomTestCase):
         )
 
     @contextlib.contextmanager
-    def _patched(self, context_length=None, requests_set=..., **schedule):
-        """sizing's view of the server arguments; yields the overrides it makes.
-        ``requests_set``: --max-running-requests as the user passed it (the record); by
-        default the same as the resolved ``max_running_requests``."""
-        if requests_set is ...:
-            requests_set = schedule.get("max_running_requests")
+    def _patched(self, context_length=None, **schedule):
+        """sizing's view of the server arguments; yields the overrides it makes."""
         overrides = []
         context = SimpleNamespace(override=lambda source, **f: overrides.append(f))
         with (
             patch(
                 self._SIZING + "get_schedule", return_value=self._schedule(**schedule)
-            ),
-            patch(
-                self._SIZING + "get_server_args",
-                return_value=SimpleNamespace(max_running_requests=requests_set),
             ),
             patch(
                 self._SIZING + "get_model",
@@ -732,18 +724,6 @@ class TestSizing(CustomTestCase):
     def _floor(self, model_context, context_length=None, **schedule):
         with self._patched(context_length, **schedule):
             return sizing.kv_floor(model_context)
-
-    def test_only_requests_the_user_set_are_a_target(self):
-        """A --max-running-requests SGLang resolves itself (DeepSeek-V4's 256) caps the
-        request pool but is no target: the KV cache aims for one request, and the Mamba state
-        is not raised to 256. Control: the same 256, or 4, set by the user is the target."""
-        f = self._floor(4096, max_running_requests=256, requests_set=None)
-        self.assertEqual((f.tokens, f.requests), (4096, 1))
-        f = self._floor(4096, max_running_requests=256, requests_set=4)
-        self.assertEqual((f.tokens, f.requests), (4096 * 4, 4))
-        resolved = dict(max_total_tokens=1000, max_running_requests=256)
-        self.assertEqual(self._mamba_slots(10**6, requests_set=None, **resolved), [2])
-        self.assertEqual(self._mamba_slots(10**6, requests_set=256, **resolved), [472])
 
     def test_kv_floor_promises_one_request_and_aims_for_the_rest(self):
         f = self._floor(262144, max_total_tokens=10240, max_running_requests=4)
