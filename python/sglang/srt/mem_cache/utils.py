@@ -100,19 +100,22 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
-
-    if enable_custom_mem_pool:
-        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
+    if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
         from sglang.srt.disaggregation.mooncake.utils import (
             init_mooncake_custom_mem_pool,
         )
 
         return init_mooncake_custom_mem_pool(device)
-    else:
-        return False, None, None
+
+    from sglang.srt.mem_cache.fabric_mem_pool import (
+        init_cuda_vmm_fabric_mem_pool,
+        should_use_nixl_fabric_mem_pool,
+    )
+
+    if should_use_nixl_fabric_mem_pool(device):
+        return init_cuda_vmm_fabric_mem_pool(device)
+
+    return False, None, None
 
 
 def get_hash_str(

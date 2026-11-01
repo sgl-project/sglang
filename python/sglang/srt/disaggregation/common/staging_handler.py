@@ -758,11 +758,9 @@ def _get_custom_mem_pool(device: str):
     Returns (custom_mem_pool, pool_type) tuple. custom_mem_pool may be None
     if no custom pool is configured.
     """
-    from sglang.srt.disaggregation.mooncake.utils import (
-        init_mooncake_custom_mem_pool,
-    )
+    from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
-    _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
+    _, custom_mem_pool, pool_type = maybe_init_custom_mem_pool(device)
     if custom_mem_pool is None and torch.device(device).type == "xpu":
         logger.info(
             "Staging buffer using the default XPU allocator (no custom mem pool)."

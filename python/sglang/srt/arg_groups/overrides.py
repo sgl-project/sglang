@@ -1868,6 +1868,12 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
         return False
+    from sglang.srt.mem_cache.fabric_mem_pool import (
+        nixl_fabric_custom_mem_pool_planned,
+    )
+
+    if nixl_fabric_custom_mem_pool_planned(cfg):
+        return False
     # Mooncake over EFA cannot register the CUDA VMM allocation used by
     # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
     if (
