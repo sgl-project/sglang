@@ -404,6 +404,28 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_always_present_dispatch_preserves_the_stock_path(self):
+        stock_result = object()
+        with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
+            dispatch = eagle_megakernel.init_eagle_draft_runtime(draft_worker=object())
+        self.assertIs(dispatch, eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME)
+        self.assertIs(
+            dispatch.run_draft_loop(
+                runner=object(),
+                forward_batch=object(),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+        self.assertIs(
+            _megakernel().run_draft_loop(
+                runner=object(),
+                forward_batch=SimpleNamespace(batch_size=1),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+
     def test_without_the_flag_or_an_offered_entry_sglang_keeps_its_own_path(self):
         self.assertIsNone(_init())
         self.assertIsNone(_init(draft={"draft_loop": print}, enabled=False))
@@ -484,7 +506,7 @@ class TestEagleEntries(CustomTestCase):
                 call.init_eagle_megakernel(draft_worker=worker),
             ],
         )
-        self.assertIs(worker.megakernel, order.init_eagle_megakernel.return_value)
+        self.assertIs(worker.draft_runtime, order.init_eagle_megakernel.return_value)
 
     def test_each_factory_runs_once_and_serves_only_what_every_rank_serves(self):
         """A rank on SGLang's code at a batch size would wait in collectives the
@@ -549,7 +571,11 @@ class TestEagleEntries(CustomTestCase):
         def served_extend(*rids):
             mk.note_draft_extend()
             extend_runner.bs = extend_runner.raw_bs = len(rids)
-            return mk.extend_tokens(runner=extend_runner, batch=_batch(*rids))
+            return mk.extend_tokens(
+                runner=extend_runner,
+                batch=_batch(*rids),
+                stock=lambda: (None, None, None),
+            )
 
         def begin(*rids):
             mk.begin_draft_round(
@@ -558,7 +584,7 @@ class TestEagleEntries(CustomTestCase):
             return rounds[-1].from_served_extend
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
-        _, topk_index = served_extend("a")
+        _, _, topk_index = served_extend("a")
         outs["topk_index"].zero_()  # the next replay rewrites it
         self.assertEqual(topk_index.tolist(), [[5]])
         self.assertTrue(begin("a"))
@@ -571,7 +597,9 @@ class TestEagleEntries(CustomTestCase):
         calls = len(rounds)
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
-        self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+        self.assertEqual(
+            served_extend("a", "b"), (None, None, None)
+        )  # SGLang's stock sampler there
 
 
 if __name__ == "__main__":
