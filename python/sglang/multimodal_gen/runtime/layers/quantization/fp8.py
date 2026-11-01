@@ -336,7 +336,11 @@ class Fp8LinearMethod(LinearMethodBase):
             # gemm_a8w8_bpreshuffle whenever use_aiter_bpreshuffle_gemm(N) holds,
             # and that kernel reads a (16, 16)-shuffled weight. Use the same
             # predicate so load-time layout and apply-time kernel always agree.
-            if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+            # Static-scale checkpoints (input_scale present) take the
+            # torch._scaled_mm path, which needs the unshuffled weight.
+            if getattr(layer, "input_scale", None) is None and (
+                use_aiter_bpreshuffle_gemm(weight.shape[0])
+            ):
                 from aiter.ops.shuffle import shuffle_weight
 
                 weight = shuffle_weight(weight.contiguous(), (16, 16))
