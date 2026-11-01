@@ -8,16 +8,33 @@ import triton
 import triton.language as tl
 
 
-def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
+def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64, protect_upto=0):
     arg_k = k - torch.mean(
         k, dim=-2, keepdim=True
     )  # smooth-k technique in SageAttention
     pooled_qblocks = mean_pool(q, BLKQ)
     pooled_kblocks = mean_pool(arg_k, BLKK)
+
+    num_q_heads = q.size(1)
+    num_kv_heads = k.size(1)
+    if num_q_heads != num_kv_heads:
+        if num_q_heads % num_kv_heads:
+            raise ValueError(
+                f"Q heads ({num_q_heads}) must be divisible by KV heads ({num_kv_heads})"
+            )
+        pooled_kblocks = pooled_kblocks.repeat_interleave(
+            num_q_heads // num_kv_heads, dim=1
+        )
+
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
 
     K = pooled_score.shape[-1]
-    topk = min(K, int(topk_ratio * K))
+    topk = max(1, min(K, int(topk_ratio * K)))
+    if protect_upto > 0:
+        n_pinned = min((int(protect_upto) + BLKK - 1) // BLKK, K)
+        if n_pinned > 0:
+            pooled_score[..., :n_pinned] = float("inf")
+            topk = min(K, topk + n_pinned)
     lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
 
     sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
