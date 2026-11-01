@@ -444,6 +444,19 @@ class TestMhcTileM16(CustomTestCase):
                 self.assertEqual(new, (old[0], want_m, old[2], old[3]), (m, bf16))
         self.assertTrue(saw_32)
 
+    def test_wraps_an_aiter_without_preshuffled_layouts(self):
+        """An aiter older than the preshuffled layouts takes (m, hidden_size) only; the
+        wrapper calls it so and still forces tile_m=16 at decode M."""
+
+        def two_arg_policy(m, hidden_size):
+            return _stock_gfx950_policy(m, hidden_size)
+
+        patched = it.make_mhc_tile_m16_config(two_arg_policy)
+        self.assertEqual(patched(8, 7168)[1], 16)
+        self.assertEqual(patched(4096, 7168), _stock_gfx950_policy(4096, 7168))
+        with self.assertRaises(TypeError):
+            patched(8, 7168, w_preshuffle_bf16=True)
+
     @unittest.skipUnless(__import__("torch").cuda.is_available(), "needs a GPU")
     def test_bit_identical_on_gpu(self):
         import aiter.ops.mhc as aiter_mhc
