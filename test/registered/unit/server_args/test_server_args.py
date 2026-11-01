@@ -76,6 +76,7 @@ from sglang.srt.arg_groups.parallel_hook import (
     handle_data_parallelism,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.arg_groups.platform_hook import handle_xpu_backends
 from sglang.srt.arg_groups.serving_hook import (
     handle_crash_dump_env,
     handle_deprecated_args,
@@ -3639,6 +3640,36 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
             Backend.BREAKABLE,
+        )
+
+
+class TestXpuCudaGraphResolution(CustomTestCase):
+    def test_xpu_tp_greater_than_one_disables_decode_graph(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="xpu",
+            tp_size=2,
+            cuda_graph_backend_decode="full",
+        )
+        handle_cuda_graph_config(args)
+        handle_xpu_backends(args)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").decode.backend,
+            Backend.DISABLED,
+        )
+
+    def test_xpu_single_device_keeps_decode_graph(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="xpu",
+            tp_size=1,
+            cuda_graph_backend_decode="full",
+        )
+        handle_cuda_graph_config(args)
+        handle_xpu_backends(args)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").decode.backend,
+            Backend.FULL,
         )
 
 
