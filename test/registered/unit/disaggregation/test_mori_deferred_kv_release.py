@@ -70,7 +70,7 @@ from sglang.srt.disaggregation.mori.conn import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _manager(enabled: bool = True) -> MoriKVManager:
@@ -136,6 +136,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.request_status[11] = KVPoll.Transferring
         status = MagicMock()
         status.InProgress.return_value = False
+        status.Failed.return_value = False
         manager._submit_kv_transfer = MagicMock(return_value=[status])
         wait_results = iter((StatusCode.IN_PROGRESS, StatusCode.SUCCESS))
 
@@ -170,6 +171,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.return_value = StatusCode.IN_PROGRESS
         status = MagicMock()
         status.InProgress.return_value = True
+        status.Failed.return_value = False
         manager._submit_kv_transfer = MagicMock(return_value=[status])
         manager.conclude_failure = MagicMock()
         chunk = _chunk()
@@ -200,6 +202,45 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         )
         self.assertNotIn(11, manager._staging_outstanding)
         manager.conclude_failure.assert_called_once()
+
+    def test_failed_status_never_acks(self):
+        """A write that ended Failed() may still land in decode's pages, so
+        neither the pending ABORT nor a later one may be ACKed."""
+        for via_drainer in (False, True):
+            with self.subTest(via_drainer=via_drainer):
+                manager = _manager()
+                manager.request_status[11] = KVPoll.Transferring
+                manager.conclude_failure = MagicMock()
+                status = MagicMock()
+                status.InProgress.return_value = via_drainer
+                status.Failed.return_value = True
+                manager._submit_kv_transfer = MagicMock(return_value=[status])
+                manager.engine = MagicMock()
+                manager.engine.wait_all.return_value = (
+                    StatusCode.IN_PROGRESS if via_drainer else StatusCode.FAILED
+                )
+                manager._transfer_timeout_ms = 1 if via_drainer else 0
+                chunk = _chunk()
+                manager._mark_transfer_started(chunk)
+
+                with patch(
+                    "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+                    side_effect=(0.0, 0.002),
+                ):
+                    is_quiescent = manager._process_transfer_chunk(chunk)
+                manager._handle_abort_message(_abort_message())
+                if via_drainer:
+                    self.assertFalse(is_quiescent)
+                    queued_chunk, queued_statuses = manager._drain_queue.get_nowait()
+                    manager._drain_transfer_statuses(queued_chunk, queued_statuses)
+                else:
+                    self.assertTrue(is_quiescent)
+                    manager._mark_transfer_quiescent(chunk)
+                manager._handle_abort_message(_abort_message())
+
+                self.assertEqual(manager._sent, [])
+                self.assertIn(11, manager._deferred_ack_poisoned_rooms)
+                self.assertNotIn(11, manager._staging_outstanding)
 
     def test_room_cleared_after_drain_handoff_keeps_single_owner(self):
         manager = _manager()

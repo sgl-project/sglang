@@ -68,8 +68,6 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from uvicorn.supervisors.multiprocess import Multiprocess
 
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -82,6 +80,7 @@ from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
+    node_hosts_rust_server,
     run_detokenizer_process,
     run_scheduler_process,
 )
@@ -91,6 +90,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -120,6 +120,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
@@ -188,6 +189,7 @@ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
+    build_model_info_fields,
     build_server_info,
     delete_directory,
     freeze_gc,
@@ -747,7 +749,7 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide and crash the shared DetokenizerManager decode_status).
+    # collide, and colliding rids overwrite each other's detokenize state).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
@@ -809,7 +811,6 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
-    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         # Manager-owned, and moved by a weight update alongside `model_path`:
@@ -831,19 +832,11 @@ async def model_info():
         "disaggregation_mode": _global_state.tokenizer_manager.config_value(
             "disaggregation_mode"
         ),
-        "has_image_understanding": model_config.is_image_understandable_model,
-        "has_audio_understanding": model_config.is_audio_understandable_model,
-        "model_type": getattr(model_config.hf_config, "model_type", None),
-        "architectures": getattr(model_config.hf_config, "architectures", None),
-        # "hf_config": model_config.hf_config.to_dict(),
+        **build_model_info_fields(
+            _global_state.tokenizer_manager.model_config,
+            _global_state.tokenizer_manager.server_args,
+        ),
     }
-    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
-    if embedding_model_spec is not None:
-        result["embedding"] = resolved_embedding_plan(
-            embedding_model_spec,
-            config=resolving_view(_global_state.tokenizer_manager.server_args),
-            model_config=model_config,
-        )
     return msgspec_to_builtins(result)
 
 
@@ -1194,6 +1187,25 @@ async def hicache_storage_backend_status():
             "hicache_write_policy",
         )
     }
+
+
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.hicache_storage import (
+        disabled_l3_layout,
+        merge_l3_layouts,
+    )
+
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
@@ -1716,15 +1728,27 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(
-        tools=obj.tools,
-        tool_call_parser=obj.tool_call_parser,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.tool_call_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
+    else:
+        # 1) Initialize the parser based on the request body
+        parser = FunctionCallParser(
+            tools=obj.tools,
+            tool_call_parser=obj.tool_call_parser,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+        # 2) Call the non-stream parsing method (non-stream)
+        normal_text, calls = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1744,22 +1768,38 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(
-        model_type=obj.reasoning_parser,
-        request=request,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
-
-    # 2) Call the non-stream parsing method (non-stream)
-    if obj.return_blocks:
-        blocks = parser.parse_non_stream_blocks(obj.text)
-        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
-        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
-        reasoning_text = "".join(reasoning_blocks)
-        normal_text = "".join(text_blocks)
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.reasoning_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
+        blocks = (
+            [{"type": "reasoning", "text": reasoning_text}] if reasoning_text else []
+        )
+        blocks.append({"type": "text", "text": normal_text})
     else:
-        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+        # 1) Initialize the parser based on the request body
+        parser = ReasoningParser(
+            model_type=obj.reasoning_parser,
+            request=request,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
+
+        # 2) Call the non-stream parsing method (non-stream)
+        if obj.return_blocks:
+            blocks = parser.parse_non_stream_blocks(obj.text)
+            reasoning_text = "".join(
+                b["text"] for b in blocks if b["type"] == "reasoning"
+            )
+            normal_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        else:
+            reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1767,8 +1807,12 @@ async def separate_reasoning_request(
         "text": normal_text,
     }
     if obj.return_blocks:
-        response_data["reasoning_blocks"] = reasoning_blocks
-        response_data["text_blocks"] = text_blocks
+        response_data["reasoning_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "reasoning"
+        ]
+        response_data["text_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "text"
+        ]
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -2135,8 +2179,14 @@ async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """SageMaker health check: 200 when is_healthy(), else 503.
+
+    Unlike /ready, a paused server still reports 200, so an intentional pause
+    (e.g. a weight sync) does not get the instance replaced. Stays a flag check
+    because SageMaker times out /ping after 2 seconds.
+    """
+    status_code = 200 if _global_state.tokenizer_manager.is_healthy() else 503
+    return Response(status_code=status_code)
 
 
 @app.post("/invocations")
@@ -2679,6 +2729,19 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _granian_http1_settings():
+    from granian.http import HTTP1Settings
+
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+
+
 def _run_granian_server(
     host,
     port,
@@ -2722,6 +2785,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
@@ -3095,9 +3159,30 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
+        from sglang.srt.rust_server.server import drain_notify_name
+        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+        drain = None
+        # Without a local listener (the DP controller starts the schedulers),
+        # SIGTERM keeps its previous effect. Installed before the sidecar
+        # block, so SIGTERM stops the sidecar first and then reaches the drain.
+        if scheduler_init_result.rust_listener_procs:
+            drain = RustServerSigtermDrain(
+                scheduler_init_result.scheduler_procs,
+                scheduler_init_result.rust_listener_procs,
+                subprocess_watchdog,
+                drain_notify_name(port_args.instance_id),
+            )
+            drain.install()
+        # Every listener is bound before its scheduler reports ready, so the
+        # sidecar can connect at once.
+        with rust_server_sidecar(node_hosts_rust_server()):
+            if launch_callback is not None:
+                launch_callback()
+            if drain is not None:
+                drain.wait()
+            else:
+                scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,

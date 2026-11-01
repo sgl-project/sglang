@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=318, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=276, stage="base-b", runner_config="2-gpu-large")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -82,7 +82,7 @@ class TestKimiLinearUnifiedMemory(
     GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     """BUG REGRESSION. The unified pool must keep GSM8K at the static-pool bar;
-    a wrapper backend that drops `kv_index_translator` silently skips the MLA
+    a wrapper backend that drops `runner_ids` silently skips the MLA
     prefix translation and the model reads the wrong KV."""
 
     model = KIMI_LINEAR_MODEL

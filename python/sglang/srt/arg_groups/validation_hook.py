@@ -11,10 +11,12 @@ from typing import Any, Dict, List, Optional
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    declare_resolution,
     resolved_view,
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -24,7 +26,6 @@ from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
-from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -86,10 +87,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")
     if cfg.disaggregation_mode != "null":
         raise ValueError("--enable-watermark is not supported with PD disaggregation")
-    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3", "DSPARK"}:
         raise ValueError(
             "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
-            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+            f"EAGLE3, and DSPARK, got {cfg.speculative_algorithm!r}"
         )
     if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
         raise ValueError(
@@ -113,6 +114,10 @@ def validate_response_store(server_args: Any) -> None:
             "--disaggregation-mode=prefill or decode; response storage must "
             "remain disabled in PD mode."
         )
+
+
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:
@@ -200,6 +205,22 @@ def check_server_args(server_args: Any):
         "(--attn-dp-size) across nodes"
     )
 
+    # Rust-mode prefill registers per-listener bootstrap rows only under attention DP;
+    # plain DP replicas all register with the --port listener.
+    if (
+        envs.SGLANG_RUST_SERVER.get()
+        and cfg.disaggregation_mode == "prefill"
+        and cfg.dp_size > 1
+        and not attn_dp_enabled_of(cfg)
+    ):
+        raise ValueError(
+            f"SGLANG_RUST_SERVER prefill does not support --dp-size {cfg.dp_size} "
+            "replicas: every replica registers its KV bootstrap rows with the "
+            "--port listener, so the other replicas' listeners advertise "
+            "registries that never become ready. Launch one prefill server per "
+            "replica, or unset SGLANG_RUST_SERVER."
+        )
+
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 
@@ -243,31 +264,6 @@ def check_server_args(server_args: Any):
         assert cfg.chunked_prefill_size % cfg.page_size == 0, (
             "chunked_prefill_size must be divisible by page_size"
         )
-
-    # Check pdmux
-    if cfg.enable_pdmux:
-        assert cfg.pp_size == 1, (
-            "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-        )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
-        )
-        assert cfg.disaggregation_mode == "null", (
-            "PD-Multiplexing is not compatible with disaggregation mode."
-        )
-        assert cfg.disable_overlap_schedule, (
-            "PD-Multiplexing is not compatible with overlap schedule."
-        )
-
-        # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-        import torch
-
-        if torch_release >= (2, 7):
-            logger.warning(
-                "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                f"  Current torch version is {torch.__version__}.\n"
-                "  Please manually install torch 2.6.x."
-            )
 
     assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
@@ -688,6 +684,68 @@ def validate_sampling_mask_max_tokens(server_args: Any):
             "--sampling-mask-max-tokens must be positive "
             f"(got {cfg.sampling_mask_max_tokens})."
         )
+
+
+_AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
+
+
+def handle_aux_hidden_state_capture(server_args: Any):
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    Must run before anything reads speculative_algorithm: with the flag, that
+    argument only names the capture convention and is reset to None here, so
+    the speculative stack stays off.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_return_aux_hidden_states:
+        if cfg.return_aux_hidden_state_layer_ids is not None:
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids requires "
+                "--enable-return-aux-hidden-states."
+            )
+        return
+    method = (cfg.speculative_algorithm or "").upper()
+    if method not in _AUX_HIDDEN_STATE_CAPTURE_METHODS:
+        raise ValueError(
+            "--enable-return-aux-hidden-states needs --speculative-algorithm "
+            "EAGLE3, DFLASH or DSPARK to name the capture convention, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "--enable-return-aux-hidden-states captures without a draft; drop "
+            "--speculative-draft-model-path."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--enable-return-aux-hidden-states only supports pp_size == 1: the "
+            "capture hooks only see the layers on the last pipeline rank."
+        )
+    layer_ids = cfg.return_aux_hidden_state_layer_ids
+    if method != "EAGLE3" and not layer_ids:
+        raise ValueError(
+            f"--enable-return-aux-hidden-states with {method} requires "
+            "--return-aux-hidden-state-layer-ids."
+        )
+    if layer_ids is not None:
+        if len(layer_ids) == 0:
+            raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+        if any(layer_id < 0 for layer_id in layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must be non-negative, got "
+                f"{list(layer_ids)}."
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+                f"{list(layer_ids)}."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_aux_hidden_state_capture",
+        speculative_algorithm=None,
+        aux_hidden_state_capture=method.lower(),
+    )
 
 
 def check_two_batch_overlap(server_args: Any):
