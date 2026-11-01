@@ -907,6 +907,12 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
+LINGBOT_VIDEO_TI2V_CI_sampling_params = replace(
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+)
+
 LONGLIVE2_T2V_CI_sampling_params = replace(
     REALTIME_MODEL_sampling_params,
     image_path=None,
