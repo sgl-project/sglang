@@ -1,4 +1,4 @@
-"""Write-back eviction must wait for the checkpoint's KV producer."""
+"""HiCache backups must wait for the checkpoint's KV producer."""
 
 import unittest
 from array import array
@@ -17,7 +17,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
-register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -100,6 +100,72 @@ class TestHiCacheWriteBackOrdering(UnifiedRadixCacheFixtures, unittest.TestCase)
                 # older window from this same forward is still evictable.
                 evicted = cache.evict(EvictParams(swa_num_tokens=1))
             self.assertGreaterEqual(evicted.swa_num_tokens_evicted, 1)
+            self.assertTrue(snapshots)
+            for snapshot in snapshots:
+                self.assertTrue(
+                    torch.equal(snapshot, torch.full_like(snapshot, 42)),
+                    f"expected 42, copied {snapshot.unique().tolist()}",
+                )
+        finally:
+            forward.synchronize()
+
+    def test_write_through_stashed_chunk_waits_for_its_producer(self):
+        # Prefill read-done lets the scheduler stash a chunk while its forward
+        # still writes the KV; the write-through backup must copy the final KV.
+        self.cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=1,
+            sliding_window_size=4,
+            num_layers=2,
+            full_attention_layer_ids=(0,),
+            kv_size=64,
+            max_context_len=64,
+            head_num=1,
+            head_dim=64,
+        )
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_through")
+        cache.write_through_threshold = 1
+        controller = cache.cache_controller
+        forward = torch.cuda.Stream()
+        controller.write_fence_stream = forward
+        req = self._request(cache, allocator, req_pool, 0, length=12)
+        kv = allocator.get_kvcache()
+        buffers = [
+            buf
+            for pool in (kv.full_kv_pool, kv.swa_kv_pool)
+            for buf in pool.k_buffer + pool.v_buffer
+        ]
+        for buf in buffers:
+            buf.fill_(-1)
+        read_done = torch.cuda.Event()
+        torch.cuda.synchronize()
+        engine = controller.l2_transfer_engine
+        submit = engine.submit_device_to_host
+        snapshots = []
+
+        def record_copy(transfers):
+            completion = submit(transfers)
+            completion.finish_event.synchronize()
+            for transfer in transfers:
+                if transfer.host_indices.numel():
+                    snapshots.append(
+                        transfer.host_pool.get_data_page(
+                            int(transfer.host_indices[0])
+                        ).clone()
+                    )
+            return completion
+
+        with torch.cuda.stream(forward):
+            read_done.record()
+            torch.cuda._sleep(600_000_000)
+            for buf in buffers:
+                buf.fill_(42)
+        torch.cuda.current_stream().wait_event(read_done)
+        try:
+            with patch.object(engine, "submit_device_to_host", side_effect=record_copy):
+                cache.checkpoint(req, up_to=12)
+                cache.flush_pending_backups()
             self.assertTrue(snapshots)
             for snapshot in snapshots:
                 self.assertTrue(

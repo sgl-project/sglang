@@ -402,7 +402,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         def prepare_context_input(current_latents):
             return current_latents
 
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
+        with self.progress_bar(
+            total=len(block_sizes) * len(timesteps), batch=batch
+        ) as progress_bar:
             for block_index, current_num_frames in enumerate(block_sizes):
                 self._set_rope_temporal_offset(
                     batch, self._shot_index(batch, block_index)
@@ -630,6 +632,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent
 
+                self.check_cancelled(batch)
                 if progress_bar is not None:
                     progress_bar.update()
 
@@ -745,6 +748,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent
 
+                self.check_cancelled(batch)
                 if progress_bar is not None:
                     progress_bar.update()
 
