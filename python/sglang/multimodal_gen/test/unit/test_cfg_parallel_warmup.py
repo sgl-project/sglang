@@ -22,6 +22,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+    Flux3ImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
@@ -63,8 +66,10 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
     _apply_warmup_sampling_overrides,
+    _resolve_default_warmup_resolution,
     _resolve_warmup_num_frames,
     build_warmup_reqs,
+    get_model_sampling_defaults,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -331,6 +336,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
         server_args.num_gpus = 1
+        server_args.scheduler_endpoints = ["tcp://replica-0"]
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
@@ -831,6 +837,25 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(reqs[0].num_frames, 17)
         self.assertEqual(reqs[0].num_inference_steps, 2)
 
+    def test_bcg_capture_keeps_the_full_default_video_resolution(self):
+        # graphs replay only the captured shape, so the video area cap must not apply
+        server_args = MagicMock()
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.enable_breakable_cuda_graph = True
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            supported_resolutions=[(1280, 720), (832, 480)],
+        )
+
+        self.assertEqual(
+            _resolve_default_warmup_resolution(
+                server_args, sampling_defaults, server_based_warmup=True
+            ),
+            (1280, 720),
+        )
+
     def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
@@ -869,6 +894,70 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(reqs[0].height % 64, 0)
         self.assertEqual(reqs[0].num_frames, 25)
         server_args.pipeline_config.adjust_num_frames.assert_called_once_with(25)
+
+    def test_ltx25_two_stage_request_defaults_to_the_two_stage_canvas(self):
+        def adjusted(pipeline_class_name, **explicit):
+            params = LTX25SamplingParams(**explicit)
+            params._explicit_fields = set(explicit)
+            with patch.object(SamplingParams, "_adjust"):
+                params._adjust(SimpleNamespace(pipeline_class_name=pipeline_class_name))
+            return params.width, params.height
+
+        self.assertEqual(adjusted("LTX2Pipeline"), (960, 544))
+        self.assertEqual(adjusted(None), (960, 544))
+        self.assertEqual(adjusted("LTX2TwoStagePipeline"), (1920, 1088))
+        # An explicit size still wins.
+        self.assertEqual(
+            adjusted("LTX2TwoStagePipeline", width=1280, height=704), (1280, 704)
+        )
+
+    def test_ltx25_two_stage_bcg_warmup_uses_the_two_stage_canvas(self):
+        # BCG is on by default for LTX-2 two-stage on >=130 GiB GPUs and warms
+        # up at the sampling default; 960x544 used to fail the halve stage.
+        server_args = SimpleNamespace(
+            pipeline_config=LTX25PipelineConfig(),
+            pipeline_class_name="LTX2TwoStagePipeline",
+            model_path="Lightricks/LTX-2.5-Diffusers",
+            model_id=None,
+            backend="sglang",
+            warmup_sampling_params=None,
+            enable_breakable_cuda_graph=True,
+        )
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=LTX25SamplingParams()
+        ):
+            defaults = get_model_sampling_defaults(server_args)
+
+        self.assertEqual((defaults.width, defaults.height), (960, 544))
+        self.assertEqual(
+            _resolve_default_warmup_resolution(
+                server_args, defaults, server_based_warmup=True
+            ),
+            (1920, 1088),
+        )
+        server_args.pipeline_class_name = "LTX2Pipeline"
+        self.assertEqual(
+            _resolve_default_warmup_resolution(
+                server_args, defaults, server_based_warmup=True
+            ),
+            (960, 544),
+        )
+
+    def test_ltx2_two_stage_bcg_skips_an_unhalvable_default(self):
+        server_args = MagicMock()
+        server_args.pipeline_class_name = "LTX2TwoStagePipeline"
+        server_args.enable_breakable_cuda_graph = True
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.pipeline_config.vae_scale_factor = 32
+        sampling_defaults = SamplingParams(width=960, height=544, num_frames=121)
+
+        width, height = _resolve_default_warmup_resolution(
+            server_args, sampling_defaults, server_based_warmup=True
+        )
+
+        self.assertNotEqual((width, height), (960, 544))
+        self.assertEqual(width % 64, 0)
+        self.assertEqual(height % 64, 0)
 
     def test_ltx2_two_stage_single_gpu_keeps_generic_frame_cap(self):
         server_args = MagicMock()
@@ -1061,6 +1150,35 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs[0].image_path,
             ["/tmp/warmup.png", "/tmp/warmup.png"],
         )
+
+    def test_breakable_warmup_uses_configured_references(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = True
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+        references = ["first.png", "second.png"]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(
+                width=512,
+                height=512,
+                image_path=references,
+                flux3_mode="i2i",
+                num_inference_steps=16,
+            ),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+
+        self.assertEqual(req.image_path, references)
+        self.assertEqual(req.flux3_mode, "i2i")
+        self.assertEqual(req.sampling_params._explicit_fields, {"width", "height"})
 
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()

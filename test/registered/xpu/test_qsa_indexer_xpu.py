@@ -45,7 +45,7 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 
@@ -79,6 +79,10 @@ class _DispatchMetadata:
             torch.ones(1, dtype=torch.int32),
             1,
         )
+
+    @staticmethod
+    def prefill_max_row_keys(*_):
+        return None
 
     @staticmethod
     def get_prefill_mqa_inputs(layer_id, positions):

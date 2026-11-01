@@ -34,22 +34,31 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
 )
+from sglang.utils import LazyImport
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
-    from sgl_kernel import (
+    from sglang.srt.layers.sampling_renorm import (
         top_k_renorm_prob,
         top_p_renorm_prob,
+    )
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module; they default to the pytorch sampling backend.
+    min_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "min_p_sampling_from_probs"
+    )
+    top_k_top_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "top_k_top_p_sampling_from_probs"
     )
 
 if is_musa() or is_xpu():
     from sgl_kernel import (
         min_p_sampling_from_probs,
-        top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+    )
+
+    from sglang.srt.layers.sampling_renorm import (
+        top_k_renorm_prob,
         top_p_renorm_prob,
     )
 
@@ -710,12 +719,11 @@ class Sampler(nn.Module):
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
-            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
-            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
-            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            # Off by default to save an all-reduce; correct only while the last all-reduce,
+            # the lm_head matmul and every sampling kernel agree across ranks (the top-p /
+            # top-k renorm kernels run deterministically whenever tp_size > 1, see
+            # sampling_renorm.py). Enable this when TP ranks still desynchronize. Grammar
+            # always syncs: xgrammar makes it likely.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
@@ -868,6 +876,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
     if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
+        top_ps = top_ps.to(logits.dtype)
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
@@ -1047,16 +1056,27 @@ def apply_custom_logit_processor(
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
 
-        if token_offsets is not None:
-            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
-        selected = logits.index_select(0, indices)
         custom_params = [
             sampling_batch_info.custom_params[i]
             for i in rows
             for _ in range(num_tokens_in_batch)
         ]
-        result = entry.processor(selected, custom_params)
-        logits.index_copy_(0, indices, result.to(logits.dtype))
+        if len(rows) == batch_size:
+            # Rows are ascending and duplicate-free, so every row opted in and
+            # gather and scatter-back are the identity.
+            result = entry.processor(logits, custom_params)
+            if result is not logits:
+                # The gather path scatters the return value back implicitly, so
+                # a processor that builds a fresh tensor must still land here.
+                logits.copy_(result)
+        else:
+            if token_offsets is not None:
+                indices = (
+                    indices[:, None] * num_tokens_in_batch + token_offsets
+                ).flatten()
+            selected = logits.index_select(0, indices)
+            result = entry.processor(selected, custom_params)
+            logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
             f"Custom logit processor {entry.processor.__class__.__name__} is applied."

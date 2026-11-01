@@ -399,6 +399,8 @@ class TestAudioUnderstandableFlag(CustomTestCase):
                 audio_config={"num_mel_bins": 128}
             ).is_audio_understandable_model
         )
+
+
 class TestDefaultContextLength(CustomTestCase):
     """The default context sizes one window, never the document."""
 

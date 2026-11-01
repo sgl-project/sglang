@@ -3,12 +3,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/forward_context.py
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
     from sglang.multimodal_gen.runtime.pipelines_core import Req
+
+# Req.extra key for what models keep for one denoising loop (Wan's text K/V): the denoising
+# stage drops it when the loop ends; the leading "_" keeps it out of request transfers
+DENOISING_LOOP_STATE = "_denoising_loop_state"
 
 
 @dataclass
@@ -16,6 +22,34 @@ class ForwardContext:
     current_timestep: int
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
+    _trtllm_gen_sequence_metadata_cache: dict[
+        tuple[int, int, int, int],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ] = field(default_factory=dict)
+    quality: str = field(default="exact", kw_only=True)
+
+    @torch.compiler.disable
+    def get_trtllm_gen_sequence_metadata(
+        self, device_index: int, batch: int, q_len: int, kv_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return shared dense ragged-attention metadata for this model forward."""
+        key = (device_index, batch, q_len, kv_len)
+        metadata = self._trtllm_gen_sequence_metadata_cache.get(key)
+        if metadata is None:
+            # Built on the device: a host-to-device copy cannot be captured by
+            # a CUDA graph.
+            device = torch.device("cuda", device_index)
+            metadata = (
+                torch.arange(
+                    0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=device
+                ),
+                torch.arange(
+                    0, (batch + 1) * kv_len, kv_len, dtype=torch.int32, device=device
+                ),
+                torch.full((batch,), kv_len, dtype=torch.int32, device=device),
+            )
+            self._trtllm_gen_sequence_metadata_cache[key] = metadata
+        return metadata
 
 
 _forward_context: Optional["ForwardContext"] = None
@@ -36,7 +70,11 @@ def get_forward_context_or_none() -> "ForwardContext | None":
 
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    quality: str = "exact",
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -48,6 +86,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        quality=quality,
     )
 
     try:
