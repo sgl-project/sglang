@@ -1,4 +1,4 @@
-"""Auth utilities for HTTP servers.
+"""Auth utilities for HTTP and WebSocket servers.
 
 This module is intentionally lightweight (no torch import) so it can be used in unit tests.
 """
@@ -35,18 +35,34 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_effective_routes(app: Any):
+    """Iterate effective routes across supported FastAPI versions."""
+    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
+        app, "routes", []
+    )
+    try:
+        from fastapi.routing import iter_route_contexts
+    except ImportError:
+        # FastAPI 0.137 preserves included routers without iter_route_contexts.
+        for route in routes:
+            contexts = getattr(route, "effective_route_contexts", None)
+            if contexts is not None:
+                for context in contexts():
+                    yield getattr(context, "starlette_route", None) or context
+            else:
+                yield route
+    else:
+        for context in iter_route_contexts(routes):
+            yield getattr(context, "starlette_route", None) or context
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    # Prefer app.router.routes when available; fall back to app.routes.
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-
-    for route in routes:
+    for route in _iter_effective_routes(app):
         try:
             match, child_scope = route.matches(scope)
         except Exception:
@@ -61,10 +77,7 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
 
 def app_has_admin_force_endpoints(app: Any) -> bool:
     """Return True if any route endpoint is marked as ADMIN_FORCE."""
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-    for route in routes:
+    for route in _iter_effective_routes(app):
         endpoint = getattr(route, "endpoint", None)
         if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
             return True
@@ -90,16 +103,18 @@ def decide_request_auth(
       it must be rejected (403) even if api_key is provided.
 
     NOTE :
-    - Health/readiness/metrics endpoints are always allowed (even when
+    - Health/readiness/liveness/metrics endpoints are always allowed (even when
       api_key/admin_api_key is set), to support k8s probes and Prometheus
       scraping without embedding secrets.
-    - We match them by prefix to cover common variants like /health_generate.
+    - Health, readiness, and metrics are matched by prefix to cover variants like
+      /health_generate. Liveness is matched exactly.
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
 
     if (
-        path.startswith("/health")
+        path == "/liveness"
+        or path.startswith("/health")
         or path.startswith("/ready")
         or path.startswith("/metrics")
     ):
@@ -160,7 +175,7 @@ def add_api_key_middleware(
     """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
-    from starlette.requests import Request
+    from starlette.requests import HTTPConnection
 
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
@@ -172,16 +187,16 @@ def add_api_key_middleware(
             self.fastapi_app = fastapi_app
 
         async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
+            if scope["type"] not in ("http", "websocket"):
                 await self.app(scope, receive, send)
                 return
 
-            request = Request(scope, receive=receive)
+            request = HTTPConnection(scope)
             path = request.url.path
             authz = request.headers.get("Authorization")
             level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
             decision = decide_request_auth(
-                method=request.method,
+                method=scope.get("method", "GET"),
                 path=path,
                 authorization_header=authz,
                 api_key=self.api_key,
@@ -190,6 +205,9 @@ def add_api_key_middleware(
             )
 
             if not decision.allowed:
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
                 response = ORJSONResponse(
                     content={
                         "error": (
