@@ -243,12 +243,16 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.device_module = device_module
         self.enable_staging = False
         self.enable_overlap = True
+        self.enable_lmcache = False
         self.forward_stream = object()
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
         self.send_kv_chunk = Mock()
 
 
-def test_early_send_wait_event_comes_from_the_scheduler_device_module():
+@pytest.mark.parametrize(
+    "overlap,lmcache", [(True, False), (False, True), (True, True), (False, False)]
+)
+def test_early_send_wait_event_comes_from_the_scheduler_device_module(overlap, lmcache):
     """The early-send event is created on the scheduler's device.
 
     forward_stream is built from that same device, and an event of one accelerator
@@ -263,6 +267,8 @@ def test_early_send_wait_event_comes_from_the_scheduler_device_module():
             recorded.append(stream)
 
     scheduler = _EarlySendScheduler(SimpleNamespace(Event=_Event))
+    scheduler.enable_overlap = overlap
+    scheduler.enable_lmcache = lmcache
     req = SimpleNamespace(
         pending_bootstrap=False,
         prefix_len=8,
@@ -275,8 +281,12 @@ def test_early_send_wait_event_comes_from_the_scheduler_device_module():
     with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
         scheduler.maybe_send_cached_prefix_chunk(req)
 
-    assert isinstance(req.disagg_kv_sender._early_send_wait_event, _Event)
-    assert recorded == [scheduler.forward_stream]
+    if overlap or lmcache:
+        assert isinstance(req.disagg_kv_sender._early_send_wait_event, _Event)
+        assert recorded == [scheduler.forward_stream]
+    else:
+        assert req.disagg_kv_sender._early_send_wait_event is None
+        assert not recorded
     scheduler.send_kv_chunk.assert_called_once()
 
 

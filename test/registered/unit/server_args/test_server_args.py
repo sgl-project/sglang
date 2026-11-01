@@ -3012,6 +3012,30 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
+    def test_lmcache_allows_colocated_and_pd_prefill(self):
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                args = self._make_args(enable_lmcache=True, disaggregation_mode=mode)
+                handle_cache_compatibility(args)
+
+    def test_lmcache_rejects_pd_decode(self):
+        args = self._make_args(enable_lmcache=True, disaggregation_mode="decode")
+        with self.assertRaisesRegex(NotImplementedError, "PD decode"):
+            handle_cache_compatibility(args)
+
+    def test_lmcache_pd_prefill_keeps_parallelism_guards(self):
+        for overrides, message in (
+            ({"attn_dp_size": 2, "tp_size": 2}, "DP attention"),
+            ({"dcp_size": 2}, "DCP-aware"),
+            ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    enable_lmcache=True, disaggregation_mode="prefill", **overrides
+                )
+                with self.assertRaisesRegex(NotImplementedError, message):
+                    handle_cache_compatibility(args)
+
     def test_prefill_weight_versions_rejects_hierarchical_cache(self):
         """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
         args = self._make_args(
