@@ -1319,7 +1319,8 @@ fn build_outgoing_body(
 /// Preserve caller-provided IDs. Exclude requests that may render differently
 /// with dynamo-render:
 /// - Non-leading system turns or consecutive users, which strict templates rewrite.
-/// - Historical `reasoning_content`, which may be injected into message content.
+/// - Historical `reasoning_content` or its `reasoning` alias, which may be
+///   injected into message content.
 /// - Tools and tool-call history, which the engine merges and normalizes
 ///   before rendering.
 /// - Non-string or missing content, which the engine flattens or blanks.
@@ -1440,9 +1441,9 @@ fn request_has_reasoning_content(value: &Value) -> bool {
         .and_then(|messages| messages.as_array())
         .is_some_and(|messages| {
             messages.iter().any(|message| {
-                message
-                    .get("reasoning_content")
-                    .is_some_and(|v| !v.is_null())
+                ["reasoning_content", "reasoning"]
+                    .iter()
+                    .any(|key| message.get(key).is_some_and(|v| !v.is_null()))
             })
         })
 }
@@ -1973,6 +1974,8 @@ mod tests {
             .unwrap()
             .remove("reasoning_content");
         assert!(can_forward_chat_tokens(&value));
+        value["messages"][1]["reasoning"] = "prior reasoning".into();
+        assert!(!can_forward_chat_tokens(&value));
     }
 
     #[test]
