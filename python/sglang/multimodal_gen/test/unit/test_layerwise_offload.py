@@ -207,6 +207,7 @@ class _TestServerArgs(SimpleNamespace):
     )
     _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
     layerwise_tuning_for = ServerArgs.layerwise_tuning_for
+    node_local_gpu_worker_count = ServerArgs.node_local_gpu_worker_count
 
 
 def _server_args(**kwargs):
@@ -234,6 +235,8 @@ def _server_args(**kwargs):
         layerwise_residency_policy={},
         layerwise_residency_lifetime={},
         pin_cpu_memory=False,
+        num_gpus=1,
+        nnodes=1,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
         pipeline_class_name=None,
@@ -481,7 +484,7 @@ def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
+def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget(monkeypatch):
     transformer = _NestedDummyModel()
     vae = torch.nn.Linear(4, 4, bias=False)
     encoder = torch.nn.Linear(32, 32, bias=False)
@@ -496,9 +499,16 @@ def test_snapshot_and_layerwise_share_the_residency_managers_pin_budget():
             "text_encoder": "snapshot-offload",
         },
         pin_cpu_memory=True,
+        num_gpus=8,
+        nnodes=2,
+    )
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 32 * 1024**3
     )
     manager = ComponentResidencyManager(pipeline, args)
     budget = manager.host_pin_budget
+    assert args.node_local_gpu_worker_count == 4
+    assert budget.available_bytes == 8 * 1024**3
     budget.available_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES + 1024
     budget.reserve_bytes = host_memory_budget.MIN_HOST_RESERVE_BYTES
     configured = configure_layerwise_offload_modules(modules, args, pin_budget=budget)
