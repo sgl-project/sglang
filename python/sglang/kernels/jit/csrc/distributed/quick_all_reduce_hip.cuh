@@ -77,7 +77,7 @@ struct QuickAllReduce {
         "the JIT quick all-reduce runs INT4 or INT8 on bf16 cast to fp16 only");
     auto N = SymbolicSize{"num_elements"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(inp).verify(out);
     auto* comms = reinterpret_cast<quickreduce::DeviceComms*>(comm);
     const int64_t n = N.unwrap();
