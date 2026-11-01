@@ -99,13 +99,23 @@ class BoundedFeaturePublisher:
             self.admission.finish(ticket)
             raise
 
-        # the native task owns input tensors and accounting after submission
-        wrapped = asyncio.wrap_future(future)
+        # notify once, without a shield/wrap_future chain delaying dispatch;
+        # cancelling this event wait cannot cancel the native task
+        loop = asyncio.get_running_loop()
+        completed = asyncio.Event()
+
+        def notify_completion(done):
+            try:
+                loop.call_soon_threadsafe(completed.set)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
+
+        future.add_done_callback(notify_completion)
         try:
-            proxies = await asyncio.shield(wrapped)
+            await completed.wait()
+            proxies = future.result()
         except asyncio.CancelledError:
-            # shield preserves the native operation, but nobody awaits this copy
-            wrapped.add_done_callback(lambda done: done.exception())
 
             def cancel_completed(done):
                 try:

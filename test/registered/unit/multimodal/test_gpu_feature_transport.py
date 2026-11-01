@@ -38,6 +38,53 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestGuardedDispatchCleanup(CustomTestCase):
+    def test_cancelled_queued_copy_still_runs_and_releases(self):
+        unblock = threading.Event()
+        published, cancelled = [], []
+
+        def publish(*args):
+            published.append("proxy")
+            return ["proxy"]
+
+        pool = SimpleNamespace(
+            publication_capacity=1024,
+            set_capacity_callback=lambda callback: None,
+            publication_data_size=lambda tensors: tensors[0].numel() * 4,
+            reservation_size=lambda size: size,
+            try_reserve_batch=lambda sizes: sizes,
+            publish_reserved_batch=publish,
+            cancel_proxy=cancelled.append,
+        )
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+        blocker = publisher.executor.submit(unblock.wait, 5)
+
+        async def run():
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+                ],
+            )
+            task = asyncio.create_task(publisher.prepare([output]))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(publisher.admission.pending_bytes, 16)
+            self.assertEqual(published, [])
+            # leave the event loop closed before the native operation completes
+
+        try:
+            asyncio.run(run())
+        finally:
+            unblock.set()
+            blocker.result(5)
+            publisher.shutdown()
+        self.assertEqual(published, ["proxy"])
+        self.assertEqual(cancelled, ["proxy"])
+        self.assertEqual(publisher.admission.pending_bytes, 0)
+        self.assertEqual(publisher.admission.pending_count, 0)
+
     def test_cancelled_failed_native_copy_drains_accounting(self):
         started, finish = threading.Event(), threading.Event()
 
