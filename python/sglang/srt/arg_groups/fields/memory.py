@@ -32,7 +32,9 @@ class Memory(msgspec.Struct):
                 "lower-priority requests first, and 'tlru' stands for "
                 "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
                 "a conversation that cannot affect tail TTFT before falling back "
-                "to LRU. See "
+                "to LRU. 'joint_lru' evicts full-attention and SWA KV in one "
+                "shared least-recently-used order on a full/SWA hybrid model with "
+                "--enable-unified-memory, and acts as 'lru' elsewhere. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
