@@ -303,10 +303,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.class().status();
         let code = self.error_code();
-        let typ = match status.as_u16() {
-            400..=499 => "invalid_request_error",
-            _ => "server_error",
-        };
+        let typ = crate::protocol::openai_error_type(status.as_u16());
         let message = self.client_message();
         let mut resp = (
             status,
