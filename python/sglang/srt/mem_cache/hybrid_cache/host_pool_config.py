@@ -129,16 +129,16 @@ def _prepare_sidecar(
         if (
             draft_buffers.page_size,
             draft_buffers.compress_ratio,
-            draft_buffers.key_format,
+            draft_buffers.key_layout,
             draft_buffers.kernel_page_bytes,
         ) != (
             buffers.page_size,
             buffers.compress_ratio,
-            buffers.key_format,
+            buffers.key_layout,
             buffers.kernel_page_bytes,
         ):
             raise ValueError(
-                f"{target.pool_name}: draft[{depth}] index key format differs from target"
+                f"{target.pool_name}: draft[{depth}] index key layout differs from target"
             )
         device_to_host[len(model_layer_ids) + depth] = len(packed_buffers)
         transfer_layers.add(len(model_layer_ids) + depth)
