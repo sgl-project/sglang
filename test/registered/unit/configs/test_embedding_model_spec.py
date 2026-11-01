@@ -119,6 +119,23 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertEqual(spec.task, EmbeddingTask.NONE)
         self.assertEqual(spec.family, "none")
 
+    def test_qwen_classification_uses_raw_scores_and_retains_multimodal_support(self):
+        for architecture, multimodal in (
+            ("Qwen3ForSequenceClassification", False),
+            ("Qwen3_5ForSequenceClassification", True),
+        ):
+            with self.subTest(architecture=architecture):
+                spec = resolve_embedding_model_spec(
+                    [architecture],
+                    is_embedding_requested=False,
+                    is_embedding_gemma=False,
+                )
+                self.assertEqual(spec.task, EmbeddingTask.CLASSIFY)
+                self.assertEqual(spec.pooling, PoolingStrategy.MODEL_DEFINED)
+                self.assertFalse(spec.normalize)
+                self.assertFalse(spec.requires_embedding_flag)
+                self.assertEqual(spec.supports_multimodal, multimodal)
+
     def test_embedding_gemma2_declares_multimodal_spec(self):
         spec = resolve_embedding_model_spec(
             ["EmbeddingGemma2Model"],

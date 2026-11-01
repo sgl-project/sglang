@@ -2415,8 +2415,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         language_model_cls=Qwen3_5ForCausalLM,
+        create_lm_head: bool = True,
     ):
-        super().__init__(config, quant_config, prefix, language_model_cls)
+        super().__init__(
+            config,
+            quant_config,
+            prefix,
+            language_model_cls,
+            create_lm_head=create_lm_head,
+        )
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2568,6 +2575,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if (
                     self.config.tie_word_embeddings
                     and name == "model.embed_tokens.weight"
+                    and "lm_head.weight" in params_dict
                     and (_is_cpu and _is_amx_available)
                 ):
                     param_lm_head = params_dict["lm_head.weight"]
