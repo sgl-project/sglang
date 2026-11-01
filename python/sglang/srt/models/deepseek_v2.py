@@ -587,7 +587,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
