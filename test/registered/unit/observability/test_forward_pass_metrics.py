@@ -940,7 +940,7 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+            queue=[], pre_allocated_token_counts=lambda windows: (0, {})
         )
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)

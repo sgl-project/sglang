@@ -3995,6 +3995,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
 
+    def window_protected_size(self, component: ComponentType) -> int:
+        if component not in self.components:
+            return 0
+        return self.tree_core.component_protected_size(component)
+
     def mamba_protected_size(self) -> int:
         return self.tree_core.mamba_protected_size()
 

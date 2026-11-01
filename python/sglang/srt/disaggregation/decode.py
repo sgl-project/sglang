@@ -29,7 +29,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -89,8 +89,8 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
-    kv_private_swa_tokens,
     kv_private_tokens,
+    kv_private_window_tokens,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
@@ -2261,18 +2261,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.host_staged
         )
 
-    def pre_allocated_token_counts(self) -> Tuple[int, int]:
-        """(full, SWA) KV slots held by transfer-queue requests: KV reserved
-        for an incoming transfer, not yet in the running batch. Pages are
-        charged the way the pool stats charge a request's private KV."""
+    def pre_allocated_token_counts(
+        self, windows: Sequence[ComponentType] = ()
+    ) -> Tuple[int, Dict[ComponentType, int]]:
+        """KV slots held by transfer-queue requests: KV reserved for an
+        incoming transfer, not yet in the running batch; the full pool's, and
+        each window slot's in ``windows`` by that window's own cursor. Pages
+        are charged the way the pool stats charge a request's private KV."""
         page_size = self.token_to_kv_pool_allocator.page_size
-        full_tokens = swa_tokens = 0
+        full_tokens = 0
+        window_tokens = {component: 0 for component in windows}
         for decode_req in self.transfer_queue.queue:
             if decode_req.host_staged:
                 continue
-            full_tokens += kv_private_tokens(decode_req.req.kv, page_size)
-            swa_tokens += kv_private_swa_tokens(decode_req.req.kv, page_size)
-        return full_tokens, swa_tokens
+            kv = decode_req.req.kv
+            full_tokens += kv_private_tokens(kv, page_size)
+            for component in windows:
+                window_tokens[component] += kv_private_window_tokens(
+                    kv, page_size, component
+                )
+        return full_tokens, window_tokens
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None

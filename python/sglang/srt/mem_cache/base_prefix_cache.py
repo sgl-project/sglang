@@ -668,9 +668,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
-    def swa_transient_size(self):
-        """Allocated SWA tokens owned outside the request and tree views."""
-        return 0
+    def window_protected_size(self, component: ComponentType) -> int:
+        """Locked tokens of one window slot (`ComponentType.SWA` for a
+        cache that keeps its one window without slots)."""
+        return self.swa_protected_size() if component == ComponentType.SWA else 0
 
     def total_size(self):
         raise NotImplementedError()

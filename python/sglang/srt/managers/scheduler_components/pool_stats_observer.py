@@ -33,12 +33,14 @@ def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
     return ceil_align(kv.kv_allocated_len, page_size) - kv.cache_protected_len
 
 
-def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
+def kv_private_window_tokens(
+    kv: ReqKvInfo, page_size: int, component: ComponentType
+) -> int:
     # Window eviction frees only [window_dead_lo, evicted); [protected, window_dead_lo)
     # stays held until the request finishes, even after the cursor jumps past it.
     allocated = ceil_align(kv.kv_allocated_len, page_size)
     window_freed = max(
-        0, kv.get_evicted_seqlen(ComponentType.SWA) - kv.window_dead_lo(page_size)
+        0, kv.get_evicted_seqlen(component) - kv.window_dead_lo(page_size)
     )
     return allocated - kv.cache_protected_len - window_freed
 
@@ -57,6 +59,9 @@ class WindowPoolStats:
 
     name: str
     sub_pool: str
+    # The tree slot whose cursors and locks describe this window; a tree that
+    # keeps no window slots retires its one window as `ComponentType.SWA`.
+    component: ComponentType
     capacity: int
     available_size: int
     evictable_size: int
@@ -208,10 +213,11 @@ class SchedulerPoolStatsObserver:
         page_size = self.tree_cache.page_size
         return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
 
-    def session_held_swa_tokens(self) -> int:
+    def session_held_window_tokens(self, component: ComponentType) -> int:
         page_size = self.tree_cache.page_size
         return sum(
-            kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
+            kv_private_window_tokens(kv, page_size, component)
+            for kv in self._session_kv_rows()
         )
 
     def session_held_req_count(self) -> int:
@@ -317,24 +323,27 @@ class SchedulerPoolStatsObserver:
             mamba_evictable_size=mamba_evictable_size,
         )
 
+    def _window_slot(self, sub_pool: str) -> Optional[ComponentType]:
+        """The tree slot keeping window sub-pool ``sub_pool``, if any."""
+        for slot in self.tree_cache.window_slots():
+            if self.storage.tree_sub_pool(slot) == sub_pool:
+                return slot
+        return None
+
     def _window_evictable_size(self, sub_pool: str) -> int:
         """Evictable tokens the prefix tree holds in window sub-pool
         ``sub_pool``: its slot's, or, for a tree keeping one pool and no window
         slots, everything it can evict."""
-        slots = self.tree_cache.window_slots()
-        if not slots:
+        if not self.tree_cache.window_slots():
             return self.tree_cache.evictable_size()
-        for slot in slots:
-            if self.storage.tree_sub_pool(slot) == sub_pool:
-                return self.tree_cache.window_evictable_size(slot)
-        return 0
+        slot = self._window_slot(sub_pool)
+        return 0 if slot is None else self.tree_cache.window_evictable_size(slot)
 
     def _in_tree_order(
         self, windows: Tuple[SubPoolUsage, ...]
     ) -> Tuple[SubPoolUsage, ...]:
-        """The window sub-pools in the prefix tree's window order, the tree's
-        first window first: the one its protected, transient and session-held
-        window counts describe. A sub-pool no slot keeps comes last."""
+        """The window sub-pools in the prefix tree's window order. A sub-pool
+        no slot keeps comes last."""
         order = {
             self.storage.tree_sub_pool(slot): i
             for i, slot in enumerate(self.tree_cache.window_slots())
@@ -377,6 +386,7 @@ class SchedulerPoolStatsObserver:
                 WindowPoolStats(
                     name=window.label,
                     sub_pool=window.name,
+                    component=self._window_slot(window.name) or ComponentType.SWA,
                     capacity=capacity,
                     available_size=available,
                     evictable_size=evictable,

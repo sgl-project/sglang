@@ -7,8 +7,10 @@ from typing import (
     TYPE_CHECKING,
     Callable,
     Deque,
+    Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
 )
 
@@ -19,14 +21,16 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
-    kv_private_swa_tokens,
+    WindowPoolStats,
     kv_private_tokens,
+    kv_private_window_tokens,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -159,10 +163,11 @@ class SchedulerInvariantChecker:
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
-    def _check_window_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
-        """Conservation of the tree's first window, the window whose protected,
-        transient and session-held counts the tree reports."""
-        window = ps.windows[0]
+    def _check_window_pool(
+        self, window: WindowPoolStats, uncached: int = 0
+    ) -> Tuple[bool, str]:
+        """Conservation of one window sub-pool, by the counts of the tree slot
+        that keeps it."""
         allocator = self.token_to_kv_pool_allocator
         if is_swa_req_ring(allocator):
             # Per-request window ring: there is no token pool to conserve;
@@ -177,8 +182,8 @@ class SchedulerInvariantChecker:
             window.name,
             window.available_size,
             window.evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
+            self.tree_cache.window_protected_size(window.component),
+            self.pool_stats_observer.session_held_window_tokens(window.component),
             window.capacity,
             uncached,
         )
@@ -284,20 +289,25 @@ class SchedulerInvariantChecker:
                 owners.append(req)
         return owners
 
-    def _get_total_uncached_sizes(self, has_window: bool) -> Tuple[int, int]:
-        """(full, swa) footprint of the KV rows requests own; 0 swa without a window."""
+    def _get_total_uncached_sizes(
+        self, windows: Sequence[ComponentType] = ()
+    ) -> Tuple[int, Dict[ComponentType, int]]:
+        """The full footprint of the KV rows requests own, and each window
+        slot's in ``windows``."""
         full_uncached = 0
-        swa_uncached = self.tree_cache.swa_transient_size()
+        window_uncached = {component: 0 for component in windows}
         for req in self._requests_owning_rows():
             assert req.kv.cache_protected_len % self.page_size == 0
             full_uncached += kv_private_tokens(req.kv, self.page_size)
-            if has_window:
-                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
+            for component in windows:
+                window_uncached[component] += kv_private_window_tokens(
+                    req.kv, self.page_size, component
+                )
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
-        return full_uncached, swa_uncached
+        return full_uncached, window_uncached
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
     def self_check_during_busy(self):
@@ -305,34 +315,36 @@ class SchedulerInvariantChecker:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes(bool(ps.windows))
+        full_uncached, window_uncached = self._get_total_uncached_sizes(
+            tuple(window.component for window in ps.windows)
+        )
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
-        swa_leak, swa_msg = False, ""
-        if ps.windows:
-            swa_leak, swa_msg = self._check_window_pool(ps, uncached=swa_uncached)
+        window_checks = [
+            self._check_window_pool(window, uncached=window_uncached[window.component])
+            for window in ps.windows
+        ]
+        window_leaks = [msg for leak, msg in window_checks if leak]
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
-        full_line = f"[Mem Check (BUSY)] {full_msg}"
-        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+        lines = [f"[Mem Check (BUSY)] {full_msg}"] + [
+            f"[Mem Check (BUSY)] {msg}" for _, msg in window_checks if msg
+        ]
 
         if level > 1:
             # Verbose: log every iteration.
-            logger.info(full_line)
-            if swa_line:
-                logger.info(swa_line)
+            for line in lines:
+                logger.info(line)
         elif level == 1:
             # Quiet: buffer and stay silent; flush the recent ones only on a leak.
-            self.recent_busy_msgs.append(full_line)
-            if swa_line:
-                self.recent_busy_msgs.append(swa_line)
-            if full_leak or swa_leak:
+            self.recent_busy_msgs.extend(lines)
+            if full_leak or window_leaks:
                 for msg in self.recent_busy_msgs:
                     logger.info(msg)
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
-        assert not swa_leak, f"Window Pool Mem Leak Detected! {swa_msg}"
+        assert not window_leaks, f"Window Pool Mem Leak Detected! {window_leaks}"
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
@@ -459,10 +471,10 @@ class SchedulerInvariantChecker:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if ps.windows:
-            swa_leak, swa_msg = self._check_window_pool(ps)
-            has_leak |= swa_leak
-            messages.append(swa_msg)
+        for window in ps.windows:
+            window_leak, window_msg = self._check_window_pool(window)
+            has_leak |= window_leak
+            messages.append(window_msg)
 
         if ps.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
