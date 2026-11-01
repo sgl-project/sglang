@@ -33,8 +33,10 @@ _BUF_BLOCK = 4096
 def _count_kernel(topk_ids_ptr, hist_ptr, P, CP: tl.constexpr, E: tl.constexpr):
     c = tl.program_id(0)
     offs = c * CP + tl.arange(0, CP)
-    m = offs < P
-    e = tl.load(topk_ids_ptr + offs, mask=m, other=0)
+    e = tl.load(topk_ids_ptr + offs, mask=offs < P, other=0)
+    # an id outside [0, E), such as a padded row's -1, routes nowhere
+    m = (offs < P) & (e >= 0) & (e < E)
+    e = tl.where(m, e, 0)
     tl.store(hist_ptr + c * E + tl.arange(0, E), tl.histogram(e, E, mask=m))
 
 
@@ -206,9 +208,12 @@ def _place_quant_kernel(
     P = M * TOPK
     offs_q = c * (CHUNK * TOPK) + tl.arange(0, CHUNK * TOPK)
     eq = tl.load(topk_ids_ptr + offs_q, mask=offs_q < P, other=E)
+    eq = tl.where((eq >= 0) & (eq < E), eq, E)
     offs_p = pid * TOPK + tl.arange(0, TOPK)
     ep = tl.load(topk_ids_ptr + offs_p)
     wp = tl.load(topk_w_ptr + offs_p)
+    routed = (ep >= 0) & (ep < E)
+    ep = tl.where(routed, ep, E)
     # aiter orders the rows of an expert by pair index
     rank = tl.sum(
         ((eq[None, :] == ep[:, None]) & (offs_q[None, :] < offs_p[:, None])).to(
@@ -219,9 +224,9 @@ def _place_quant_kernel(
     base_p = tl.sum(
         tl.where(ep[:, None] == tl.arange(0, E)[None, :], base[None, :], 0), axis=1
     )
-    dest = base_p + tl.load(prefix_ptr + c * E + ep) + rank
-    tl.store(sorted_ids_ptr + dest, (tl.arange(0, TOPK) << 24) | pid)
-    tl.store(sorted_w_ptr + dest, wp)
+    dest = base_p + tl.load(prefix_ptr + c * E + ep, mask=routed, other=0) + rank
+    tl.store(sorted_ids_ptr + dest, (tl.arange(0, TOPK) << 24) | pid, mask=routed)
+    tl.store(sorted_w_ptr + dest, wp, mask=routed)
 
     _quant_groups(x0, a1_ptr, ts_ptr, offs_t, mt, 0, GS, D)
     _quant_groups(x1, a1_ptr, ts_ptr, offs_t, mt, GS, GS, D)

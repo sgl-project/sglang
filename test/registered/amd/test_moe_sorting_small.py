@@ -204,12 +204,16 @@ class TestMoeSortQuant(CustomTestCase):
         )
         cls.dev = torch.device("cuda", 0)
 
-    def _routing(self, m, seed):
+    def _routing(self, m, seed, padded=0):
         g = torch.Generator(device="cpu").manual_seed(seed)
         ids = torch.stack(
             [torch.randperm(self.E, generator=g)[: self.TOPK] for _ in range(m)]
         )
         w = torch.rand(m, self.TOPK, generator=g) + 0.05
+        # graph-padded rows past moe_num_token_non_padded: -1 ids, zero weights
+        if padded:
+            ids[m - padded :] = -1
+            w[m - padded :] = 0.0
         return ids.to(torch.int32).to(self.dev), w.to(self.dev)
 
     def _aiter_sort(self, ids, w, bs):
@@ -232,12 +236,13 @@ class TestMoeSortQuant(CustomTestCase):
 
         empty = torch.empty((0, 0), dtype=torch.bfloat16, device=self.dev)
         for bs in (16, 32, 64):
-            for m in (17, 64, 200, 384, 1000):
-                ids, w = self._routing(m, m + bs)
+            for m, padded in ((17, 0), (64, 0), (200, 0), (384, 0), (1000, 0),
+                              (64, 9), (1000, 337)):  # fmt: skip
+                ids, w = self._routing(m, m + bs, padded)
                 ref = self._aiter_sort(ids, w, bs)
                 out = moe_sort_quant(ids, w, self.E, bs, empty)
                 nv = int(ref[3][0])
-                msg = f"m={m} bs={bs}"
+                msg = f"m={m} padded={padded} bs={bs}"
                 self.assertTrue(torch.equal(ref[3], out[3]), msg)
                 self.assertTrue(torch.equal(ref[0][:nv], out[0][:nv]), msg)
                 self.assertTrue(torch.equal(ref[1][:nv], out[1][:nv]), msg)
@@ -249,8 +254,8 @@ class TestMoeSortQuant(CustomTestCase):
         from sglang.kernels.ops.moe.moe_sort_quant import moe_sort_quant
 
         empty = torch.empty((0, 0), dtype=torch.bfloat16, device=self.dev)
-        for m, bs in ((256, 32), (384, 32), (1000, 64)):
-            ids, w = self._routing(m, m)
+        for m, bs, padded in ((256, 32, 0), (384, 32, 0), (1000, 64, 0), (384, 32, 61)):
+            ids, w = self._routing(m, m, padded)
             x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
             sid, sw, _, nv, _ = self._aiter_sort(ids, w, bs)
             ref_q, ref_s = self.orig_fp4_quant(
@@ -264,9 +269,14 @@ class TestMoeSortQuant(CustomTestCase):
                 num_experts_upper_bound=self.E,
             )
             out = moe_sort_quant(ids, w, self.E, bs, empty, x=x)
-            msg = f"m={m} bs={bs}"
+            msg = f"m={m} padded={padded} bs={bs}"
+            # aiter skips the codes of padded tokens, which no sorted row reads
+            live = m - padded
             self.assertTrue(
-                torch.equal(ref_q.view(torch.uint8), out[4].view(torch.uint8)), msg
+                torch.equal(
+                    ref_q.view(torch.uint8)[:live], out[4].view(torch.uint8)[:live]
+                ),
+                msg,
             )
             # aiter leaves the scale rows of padding slots unwritten; compare the real ones
             n = int(nv[0])
