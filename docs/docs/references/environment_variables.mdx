@@ -1298,6 +1298,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When <code>tool_choice</code> names a function, render every request tool into the chat template instead of only the named one, so the prompt keeps the prefix of earlier turns. The variable applies only when the grammar backend is <code>xgrammar</code> and the parser builds an output constraint for the named tool. The prompt keeps only the named tool with the parsers <code>hunyuan</code>, <code>muse</code>, and <code>spark25</code>, which build no constraint for a named tool, with <code>deepseekv3</code>, <code>inkling</code>, and <code>llama3</code>, whose output parsers can read a call to another tool from the text after the forced call, and when the request sets its own output constraint.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEFAULT_THINKING</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable model thinking/reasoning output by default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

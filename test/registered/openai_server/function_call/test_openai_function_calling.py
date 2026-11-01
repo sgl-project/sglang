@@ -601,6 +601,29 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
         self.assertIn("city", args_obj, "Function arguments should have 'city'")
 
+        # The prompt asks for the other tool, and the named tool still comes back.
+        messages = [
+            {
+                "role": "user",
+                "content": "Call sub with int_a=7 and int_b=2. Do not call get_weather.",
+            }
+        ]
+        for seed in range(10):
+            response = client.chat.completions.create(
+                model=self.model,
+                max_tokens=200,
+                messages=messages,
+                temperature=0.8,
+                top_p=0.8,
+                seed=seed,
+                tools=tools,
+                tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            )
+            tool_calls = response.choices[0].message.tool_calls or []
+            self.assertEqual(
+                {call.function.name for call in tool_calls}, {"get_weather"}
+            )
+
     def test_streaming_multiple_choices_finish_reason(self):
         """
         Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.

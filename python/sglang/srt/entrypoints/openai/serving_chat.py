@@ -1944,6 +1944,30 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+            # Keep every tool in the prompt, so that this turn extends the prefix
+            # of earlier turns, only when the grammar limits output to the named tool.
+            if (
+                isinstance(request.tool_choice, ToolChoice)
+                and request.tools
+                and envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.get()
+                and tool_call_constraint is not None
+                # Another output constraint replaces the full-assistant tool grammar.
+                and not (
+                    output_constrained
+                    or request.regex
+                    or request.ebnf
+                    or (
+                        request.response_format is not None
+                        and request.response_format.type != "text"
+                    )
+                )
+                # These parsers read a call to another tool from the free text
+                # that their legacy tags allow after the forced call.
+                and self.tool_call_parser not in ("deepseekv3", "inkling", "llama3")
+                # Other backends do not enforce the named call.
+                and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
+            ):
+                tools = [item.model_dump() for item in request.tools]
 
         if tool_call_constraint is None and self._takes_turn_grammar(
             request, output_constrained=output_constrained

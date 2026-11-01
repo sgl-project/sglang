@@ -2517,6 +2517,63 @@ class ServingChatTestCase(CustomTestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    def test_named_tool_choice_keeps_tools_only_when_the_grammar_enforces_it(self):
+        """A named turn keeps every tool, and so the prefix of earlier turns, only
+        when the switch is on and the grammar enforces the named call."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        tools = [
+            {"type": "function", "function": {"name": name, "parameters": {}}}
+            for name in ("search_logs", "submit")
+        ]
+        text_format = {"response_format": {"type": "text"}}
+        json_format = {"response_format": {"type": "json_object"}}
+        for switch, parser, backend, output_constrained, extra, keeps in (
+            (False, "hermes", "xgrammar", False, {}, False),
+            (True, "hermes", "xgrammar", False, {}, True),
+            (True, "hermes", "llguidance", False, {}, False),
+            # No output constraint for a named tool.
+            (True, "hunyuan", "xgrammar", False, {}, False),
+            # The parser reads a call to another tool from the free text after
+            # the forced call.
+            (True, "deepseekv3", "xgrammar", False, {}, False),
+            (True, "inkling", "xgrammar", False, {}, False),
+            (True, "llama3", "xgrammar", False, {}, False),
+            (True, "glm47", "xgrammar", False, text_format, True),
+            # The output constraint replaces the full-assistant tool grammar.
+            (True, "glm47", "xgrammar", False, {"regex": "x"}, False),
+            (True, "glm47", "xgrammar", False, json_format, False),
+            # Responses text.format arrives as output_constrained.
+            (True, "glm47", "xgrammar", True, {}, False),
+        ):
+            self.chat.tool_call_parser = parser
+            self.tm._config_overrides["grammar_backend"] = backend
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Summarize."}],
+                tools=tools,
+                tool_choice={"type": "function", "function": {"name": "submit"}},
+                **extra,
+            )
+            with (
+                envs.SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS.override(switch),
+                self.subTest(
+                    switch=switch,
+                    parser=parser,
+                    backend=backend,
+                    output_constrained=output_constrained,
+                    extra=extra,
+                ),
+            ):
+                self.chat._process_messages(
+                    req, is_multimodal=False, output_constrained=output_constrained
+                )
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in kwargs["tools"]],
+                    ["search_logs", "submit"] if keeps else ["submit"],
+                )
+
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
         terminal state finishes the request even under ignore_eos."""
