@@ -23,7 +23,7 @@ class TestRingTailPadDispatch(unittest.TestCase):
         obj.backend = AttentionBackendEnum.FA
         obj.causal = False
         obj.dropout_p = 0.0
-        obj.attn_impl = object()
+        obj.attn_impl = SimpleNamespace(supports_ring_kv_chunk=lambda: True)
         return obj
 
     def test_tail_pad_meta_reaches_the_ring_kernel(self):
