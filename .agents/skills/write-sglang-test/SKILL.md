@@ -96,6 +96,8 @@ named `nightly-test-{runner_config}` — one suite per machine type, holding eve
 that runs nightly on it, with `auto_partition` splitting the work. There is no
 per-purpose split; kernel, eval, perf, and precision all share their machine's suite.
 
+Tests in the extra, nightly, and weekly tiers do not run on a normal PR; run them on demand with `/rerun-test` (see the `rerun-test` skill).
+
 > **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 ### Choosing a Suite

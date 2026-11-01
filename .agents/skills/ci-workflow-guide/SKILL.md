@@ -409,6 +409,8 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
+Base CI covers only the core default paths; tests in the extra, nightly, and weekly tiers do not run on a normal PR. To cover what a change touches, run those tests with `/rerun-test`; the `rerun-test` skill describes how to pick them.
+
 ### Opt-in CI tiers (pr-test-extra and friends)
 
 The registry contains `nv-extra`, selecting `pr-test-extra.yml` with
