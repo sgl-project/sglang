@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_intel,
     is_nvidia,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -1216,7 +1217,10 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    # The fused and unfused paths round differently, so a sequence prefilled alone
+    # (small grid) and in a batch (large grid) would differ; batch-invariant mode
+    # keeps the unfused path for every batch.
+    _small_grid = _B * _NT_pr * _H_pr <= 256 and not is_batch_invariant_mode_enabled()
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
