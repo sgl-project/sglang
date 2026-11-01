@@ -229,7 +229,7 @@ def _split_hicache_size(
 ) -> tuple[float, ...]:
     device_pool_sizes = []
     for kv_pool in kv_pools:
-        size_bytes = getattr(kv_pool, "host_capacity_bytes", None)
+        size_bytes = kv_pool.host_capacity_bytes
         if size_bytes is None:
             size_bytes = kv_pool.get_kv_size_bytes()
         device_pool_sizes.append(
@@ -634,9 +634,9 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
+    c128_attn_allocator: Any,
 ) -> tuple[int, int, int]:
-    allocator = params.token_to_kv_pool_allocator
-    device_full_size = getattr(allocator, "size_full", kvcache.size)
+    device_full_size = params.token_to_kv_pool_allocator.size_full
     device_full_pages = (device_full_size + page_size - 1) // page_size
 
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
@@ -654,7 +654,6 @@ def _deepseek_v4_num_host_pages(
     # For example, host pages = device pages * hicache_ratio.
     # GPU keeps the FULL page count because C128 is a KV-derived sidecar.
     c128_host_pages = full_host_pages
-    c128_attn_allocator = getattr(allocator, "c128_attn_allocator", None)
     if c128_attn_allocator is not None:
         c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
     return full_host_pages, swa_host_pages, c128_host_pages
@@ -824,6 +823,7 @@ def build_deepseek_v4_hicache_stack(
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     host_c128_evict_fn: Optional[Callable[[int], Any]] = None,
+    c128_attn_allocator: Any = None,
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
@@ -875,6 +875,7 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+        c128_attn_allocator=c128_attn_allocator,
     )
 
     logical_host_pool = LogicalHostPool(
@@ -1032,10 +1033,6 @@ def build_deepseek_v4_hicache_stack(
         # GPU pools lack this attribute and fall back to the global page_size.
         c128_slot_page_size = (
             c128_info.page_slots if c128_info.layout == "pa_nd" else page_size
-        )
-        # NPU derives the independent C128 host budget from its device pool.
-        c128_attn_allocator = getattr(
-            params.token_to_kv_pool_allocator, "c128_attn_allocator", None
         )
         c128_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C128),
@@ -2049,6 +2046,8 @@ class _DeepSeekV4Strategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        # NPU drives C128 as an independent tree component with its own allocator.
+        independent_c128 = ComponentType.C128 in cache.components
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
             params=params,
             kvcache=kvcache,
@@ -2056,11 +2055,15 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # NPU delegates C128 host pressure to FULL host-leaf eviction.
             # _delegate_c128_host_evict converts C128 slots to FULL tokens.
             host_c128_evict_fn=(
                 (lambda n: _delegate_c128_host_evict(cache, n))
-                if ComponentType.C128 in cache.components
+                if independent_c128
+                else None
+            ),
+            c128_attn_allocator=(
+                params.token_to_kv_pool_allocator.c128_attn_allocator
+                if independent_c128
                 else None
             ),
             prefetch_threshold=prefetch_threshold,
