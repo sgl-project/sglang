@@ -167,6 +167,41 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         tree_cache.evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=100))
         tree_cache.evict.assert_not_called()
 
+    def test_default_cache_evicts_the_shortfall_of_a_demand(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            BasePrefixCache,
+            EvictResult,
+        )
+
+        for supports_swa, demand, expected in [
+            (False, EvictParams(num_tokens=100), EvictParams(num_tokens=70)),
+            (False, EvictParams(num_tokens=30), None),
+            (
+                True,
+                EvictParams(num_tokens=100, swa_num_tokens=100),
+                EvictParams(num_tokens=60, swa_num_tokens=90),
+            ),
+            (True, EvictParams(num_tokens=40, swa_num_tokens=10), None),
+        ]:
+            with self.subTest(supports_swa=supports_swa, demand=demand):
+                allocator = SimpleNamespace(
+                    available_size=lambda: 30,
+                    full_available_size=lambda: 40,
+                    swa_available_size=lambda: 10,
+                )
+                cache = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_swa=lambda: supports_swa,
+                    evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
+                )
+                BasePrefixCache.evict_for_alloc(cache, demand)
+                if expected is None:
+                    cache.evict.assert_not_called()
+                else:
+                    cache.evict.assert_called_once_with(expected)
+
 
 if __name__ == "__main__":
     unittest.main()
