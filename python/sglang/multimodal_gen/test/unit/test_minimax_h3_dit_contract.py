@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    BaseBreakableCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -21,7 +24,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionBackend,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+    SDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -43,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_group_attend,
     _modulate_gate,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
@@ -59,6 +66,55 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
+@torch.no_grad()
+def test_embedding_pool_outputs_match_eager_across_replays():
+    state = SimpleNamespace(
+        hidden_size=4,
+        arch=SimpleNamespace(time_embed_dim=2),
+        video_patch_proj=lambda x: (x * 2, None),
+        audio_patch_proj=lambda x: (x * 3, None),
+        _time_embedding=lambda t: torch.stack((t, t + 1), dim=-1),
+    )
+
+    class Embedding(torch.nn.Module):
+        def forward(self, **kwargs):
+            return MiniMaxH3DiTModel._embed(state, **kwargs)
+
+    device = torch.device("cuda:0")
+    kwargs = dict(
+        x=torch.randn(4, 4, device=device),
+        audio_x=torch.randn(5, 4, device=device),
+        text_embeddings_selected=torch.randn(2, 4, device=device, dtype=torch.bfloat16),
+        unique_timesteps=torch.tensor([0.5], device=device),
+        img_pos=torch.tensor([2, 3], device=device),
+        audio_pos=torch.tensor([4], device=device),
+        text_pos=torch.tensor([0, 1], device=device),
+        refiner_cu_seqlens=torch.tensor([0, 2, 2], device=device),
+        refiner_max_seqlen=2,
+        row_start=0,
+        row_stop=6,
+        device=device,
+        refined_prompt_embeds_length=2,
+    )
+    model = Embedding()
+    runner = BaseBreakableCudaGraphRunner(model, device)
+    try:
+        assert runner.capture(**kwargs)
+        assert next(iter(runner.entries.values())).num_segments == 2
+        for value in (0.25, 0.75):
+            kwargs["unique_timesteps"].fill_(value)
+            kwargs["x"].normal_()
+            kwargs["audio_x"].normal_()
+            kwargs["text_embeddings_selected"].normal_()
+            expected = model(**kwargs)
+            actual = runner(**kwargs)
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    finally:
+        runner.reset()
 
 
 def test_pruned_adaln_lora_projection_preserves_affine_term():
@@ -361,6 +417,31 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     assert output.data_ptr() != x.data_ptr()
     torch.testing.assert_close(x, original, rtol=0, atol=0)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_attend_skips_only_the_trailing_alignment_rows():
+    """The pipelined Ulysses group attention gives the real rows the bytes of
+    forward_varlen and leaves the packing's alignment rows zero."""
+    used, total = 16400, 16448  # long enough for FA4 on sm_103
+    impl = DynamicCudnnSDPAImpl(
+        num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+    )
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(total, 2, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    bounds = (0, used, total)
+    kwargs = dict(
+        cu_seqlens=torch.tensor(bounds, device="cuda", dtype=torch.int32),
+        cu_seqlens_host=bounds,
+        max_seqlen=used,
+    )
+    ref = impl.forward_varlen(q, k, v, **kwargs)
+    got = _minimax_h3_group_attend(impl, **kwargs)(q, k, v)
+    assert torch.equal(got[:used], ref[:used])
+    assert not got[used:].any()
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():

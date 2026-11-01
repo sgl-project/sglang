@@ -130,6 +130,12 @@ Selecting weights:
 - `--model-variant dev` serves the full / SFT DiT from `transformer_full/`; the
   default is the distilled one. See [section 4.5](#4-5-the-dev-transformer).
 
+On GPUs with at least 130 GiB, `LTX2TwoStagePipeline` serving turns on breakable
+CUDA graphs by default, as for LTX-2 / LTX-2.3. Graphs are captured per shape at
+warmup, so pass the shape you serve (for example `--warmup-resolutions 1920x1088
+--warmup-num-frames 121`); other shapes run eager. Pass
+`--enable-breakable-cuda-graph false` to run eager throughout.
+
 ### 3.3 Multi-GPU presets
 
 | Target | Recommended server flags | Notes |

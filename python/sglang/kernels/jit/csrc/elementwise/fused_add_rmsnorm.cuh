@@ -147,7 +147,7 @@ struct FusedAddRMSNormKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({D, 1})

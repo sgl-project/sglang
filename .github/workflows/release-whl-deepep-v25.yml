@@ -1,0 +1,157 @@
+name: Release sgl-deep-ep-v25
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Public wheel version (for example, 0.1.0 or 0.1.1rc0)"
+        type: string
+        required: true
+      deepep-ref:
+        description: "DeepEP ref containing the implementation and sgl_deep_ep_v25 package"
+        type: string
+        required: false
+        default: "sgl-deepep-v25"
+
+concurrency:
+  group: release-sgl-deep-ep-v25
+  cancel-in-progress: false
+
+env:
+  TORCH_VERSION: "2.14.1"
+  # PyTorch's CUDA build; the extension only needs CUDA 13. The wheels are built with the
+  # CUDA 13.4 toolkit; DeepEP 2.5 needs CUDA 13.1+ for the build and for runtime JIT.
+  TORCH_CUDA_TAG: "cu130"
+  RELEASE_TAG: sgl-deep-ep-v25-v${{ inputs.version }}
+
+jobs:
+  build-cu134-matrix:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Checkout DeepEP
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ inputs['deepep-ref'] || 'sgl-deepep-v25' }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Build wheels
+        env:
+          SGL_DEEP_EP_V25_VERSION: ${{ inputs.version }}
+        run: |
+          bash scripts/build_sgl_deepep_v25.sh \
+            "${{ matrix.python-version }}" \
+            "13.4" \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ matrix.arch }}"
+
+      - name: Upload CUDA-tagged wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-v25-wheel-cu134-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist/*.whl
+          if-no-files-found: error
+
+      - name: Upload PyPI wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-v25-pypi-cu134-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist-pypi/*.whl
+          if-no-files-found: error
+
+  release-whl:
+    needs: build-cu134-matrix
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      needs.build-cu134-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Download CUDA-tagged wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: deepep-v25-wheel-*
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          fail_on_unmatched_files: true
+          files: dist/*.whl
+
+      - name: Clone wheel index
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+        run: |
+          git clone --branch gh-pages \
+            "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
+
+      - name: Update wheel index
+        run: |
+          python3 scripts/update_deepep_whl_index.py \
+            --cuda 134 \
+            --package sgl-deep-ep-v25 \
+            --release-tag-prefix sgl-deep-ep-v25-v
+
+      - name: Push wheel indexes
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wheel indexes are already up to date"
+          else
+            git commit -m "update sgl-deep-ep-v25 whl indexes for v${RELEASE_VERSION}"
+            git push origin gh-pages
+          fi
+
+  release-pypi:
+    needs: build-cu134-matrix
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      needs.build-cu134-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PyPI wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-pypi
+          merge-multiple: true
+          pattern: deepep-v25-pypi-cu134-*
+
+      - name: Upload to PyPI
+        env:
+          TWINE_PASSWORD: ${{ secrets.SGL_DEEP_EP_V25_PYPI_TOKEN }}
+          TWINE_USERNAME: __token__
+        run: |
+          python3 -m pip install --upgrade twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing dist-pypi/*.whl

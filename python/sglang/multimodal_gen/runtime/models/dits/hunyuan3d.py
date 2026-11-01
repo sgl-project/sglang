@@ -42,29 +42,6 @@ def _fused_add_gate(
     return torch.addcmul(residual, x, gate)
 
 
-class MixedRowParallelLinear(RowParallelLinear):
-    """RowParallel for inputs concatenated from multiple separately-sharded sources."""
-
-    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
-        self.input_sizes = input_sizes
-        super().__init__(sum(input_sizes), output_size, **kwargs)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        input_dim = getattr(param, "input_dim", None)
-        if input_dim is not None:
-            shards = []
-            offset = 0
-            for sz in self.input_sizes:
-                part = loaded_weight.narrow(input_dim, offset, sz)
-                per_rank = sz // self.tp_size
-                shard = part.narrow(input_dim, self.tp_rank * per_rank, per_rank)
-                shards.append(shard)
-                offset += sz
-            param.data.copy_(torch.cat(shards, dim=input_dim))
-        else:
-            param.data.copy_(loaded_weight)
-
-
 def _flux_timestep_embedding(
     t: torch.Tensor, dim, max_period=10000, time_factor: float = 1000.0
 ):
@@ -377,9 +354,10 @@ class _FluxSingleStreamBlock(nn.Module):
             bias=True,
             gather_output=False,
         )
-        self.linear2 = MixedRowParallelLinear(
-            [hidden_size, self.mlp_hidden_dim],
+        self.linear2 = RowParallelLinear(
+            hidden_size + self.mlp_hidden_dim,
             hidden_size,
+            input_sizes=[hidden_size, self.mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
         )
