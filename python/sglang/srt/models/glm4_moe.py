@@ -840,7 +840,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         capture_output=None,
     ) -> torch.Tensor:
-
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
@@ -1102,7 +1101,6 @@ class Glm4MoeForCausalLM(nn.Module):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-
                 pattern = re.compile(
                     r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
                 )
@@ -1289,11 +1287,13 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
     # so the inherited DeepSeek name would never match what the gate compares.
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
-    # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
-    # substr mapping would wrongly rewrite GLM's real layer-61 weights.
-    # exclude_layers remapping for the MTP layer is handled explicitly in
-    # _resolve_nextn_quant_config below instead.
+    # PTPC selection needs checkpoint names until _resolve_nextn_quant_config
+    # installs the draft-specific schemes and exclusion mappings.
     hf_to_sglang_mapper = WeightsMapper()
+
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 

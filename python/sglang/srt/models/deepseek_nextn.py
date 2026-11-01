@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import NextNEnabledConfig
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -72,7 +73,12 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # Bundled legacy MTP is BF16; separately packed MTP must retain its quantizer.
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not getattr(quant_config, "quantized_mtp", False)
+        ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
@@ -90,7 +96,12 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if quant_config is not None and quant_config.get_name() == "quark":
+        # A separately packed draft quantizes eh_proj too; its quant method still
+        # honors the checkpoint's ignore list.
+        if quant_config is not None and (
+            quant_config.get_name() == "quark"
+            or getattr(quant_config, "quantized_mtp", False)
+        ):
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
                 config.hidden_size,
@@ -249,18 +260,19 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
 
-    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
-    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
-    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.layers.61": "model.decoder",
-        },
-    )
-
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
-        return cls.hf_to_sglang_mapper
+        nextn = NextNEnabledConfig.from_config(config)
+        prefix = nextn.nextn_layer_prefix
+        return WeightsMapper(
+            orig_to_new_prefix={
+                **{
+                    f"{prefix}.{name}": f"model.{name}"
+                    for name in nextn.nextn_spec_weight_names
+                },
+                prefix: "model.decoder",
+            }
+        )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
