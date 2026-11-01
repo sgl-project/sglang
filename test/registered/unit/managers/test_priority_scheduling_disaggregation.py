@@ -576,7 +576,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             enable_deferred_kv_release=False,
         )
         queue.kv_manager = SimpleNamespace(
-            kv_args=SimpleNamespace(state_types=[]),
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[]),
         )
         queue.tree_cache = MagicMock()
 

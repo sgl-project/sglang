@@ -32,6 +32,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             page_size=page_size,
             gpu_id=0,
             state_types=[StateType.MAMBA],
+            state_sub_pools=[None],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
