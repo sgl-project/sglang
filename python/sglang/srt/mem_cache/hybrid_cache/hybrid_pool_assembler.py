@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
     MLABufferInfo,
+    PageRowBufferInfo,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1863,6 +1864,10 @@ class StackBuildResult:
 
 
 class StackStrategy:
+    def owns(self, kvcache: Any) -> bool:
+        """Whether this strategy alone assembles the pool's family."""
+        return False
+
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
         raise NotImplementedError
 
@@ -1903,10 +1908,13 @@ def _delegate_c128_host_evict(cache, n: int) -> int:
 
 
 class _DeepSeekV4Strategy(StackStrategy):
-    def matches(self, kvcache, components):
+    def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        return isinstance(kvcache, DeepSeekV4TokenToKVPool)
+
+    def matches(self, kvcache, components):
+        if not self.owns(kvcache):
             return False
         return components in (
             {ComponentType.FULL, ComponentType.SWA},
@@ -2214,12 +2222,13 @@ class _MambaSwaStrategy(StackStrategy):
 
 
 class _MiniMaxSparseStrategy(StackStrategy):
-    def matches(self, kvcache, components):
+    def owns(self, kvcache):
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
-        return isinstance(kvcache, MiniMaxSparseKVPool) and components == {
-            ComponentType.FULL
-        }
+        return isinstance(kvcache, MiniMaxSparseKVPool)
+
+    def matches(self, kvcache, components):
+        return self.owns(kvcache) and components == {ComponentType.FULL}
 
     def build(
         self,
@@ -2273,6 +2282,8 @@ class _KvStrategy(StackStrategy):
         # A pool wrapping sub-pool views has a strategy of its own.
         router = kvcache.layer_router
         if len(router.sub_pools()) > 1 or router.wrapped_view() is not None:
+            return False
+        if any(strategy.owns(kvcache) for strategy in _STRATEGIES):
             return False
         return components == {ComponentType.FULL}
 
@@ -2465,6 +2476,56 @@ def attach_hybrid_pool_to_unified_cache(
         raise
 
 
+def _nvfp4_main_host_size(
+    *, params: CacheInitParams, main_pool: Any, index_pool: Any
+) -> float:
+    """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+
+    memory = get_memory()
+    if memory.hicache_io_backend not in ("kernel", "direct"):
+        raise ValueError("M3.1 NVFP4 HiCache requires kernel or direct IO")
+    if memory.hicache_mem_layout not in (
+        "layer_first",
+        "page_first",
+        "page_first_direct",
+    ):
+        raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
+    main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
+    index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
+    draft_bytes = 0
+    for draft_pool in params.sidecar_draft_device_pools:
+        if (
+            type(draft_pool) is not MHATokenToKVPool
+            or draft_pool.size != main_pool.size
+            or draft_pool.page_size != params.page_size
+            or draft_pool.start_layer != 0
+            or draft_pool.layer_num > main_pool.layer_num
+        ):
+            raise ValueError(
+                "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
+                "token capacity/page size and at most as many layers as the target"
+            )
+        draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
+            draft_pool.size + draft_pool.page_size
+        )
+    total_bytes = main_bytes + index_bytes + draft_bytes
+    # --hicache-size covers main KV, index payload/scales and draft sidecars.
+    host_size = memory.hicache_size * main_bytes / total_bytes
+    slots = (
+        int(host_size * 1e9 // main_bytes)
+        if host_size > 0
+        else int(main_pool.size * memory.hicache_ratio)
+    )
+    slots = (slots // params.page_size + 1) * params.page_size
+    if slots * total_bytes > host_memory_budget_bytes():
+        raise ValueError(
+            "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
+        )
+    return host_size
+
+
 def build_minimax_sparse_hicache_stack(
     *,
     params: CacheInitParams,
@@ -2477,8 +2538,12 @@ def build_minimax_sparse_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     """KV (main_pool) + INDEXER (index_k_pool) host stack for MiniMax M3 sparse."""
-    # Mappings are stage-local keyed (controller iterates 0..transfer_layer_id_max).
-    # PP>1 stays gated below pending end-to-end validation of the sparse host path.
+    from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
+        MiniMaxM3Nvfp4IndexKPoolHost,
+        MiniMaxM3Nvfp4MainKVPoolHost,
+    )
+
+    # PP>1 stays gated pending end-to-end validation of the sparse host path.
     if params.pp_size > 1:
         raise NotImplementedError(
             "MiniMax-M3 sparse HiCache does not support pipeline parallelism "
@@ -2490,126 +2555,67 @@ def build_minimax_sparse_hicache_stack(
             "MiniMax sparse HiCache currently supports index-k-only sparse layers; "
             "index_kv_pool (value-bearing) layers are not cached/restored yet."
         )
+    memory = get_memory()
     main_pool = sparse_pool.main_pool
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
-
-    nvfp4 = isinstance(sparse_pool, MiniMaxM3Nvfp4KVPool)
-    host_size = get_memory().hicache_size
-    if nvfp4:
-        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
-        from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
-            MiniMaxM3Nvfp4IndexKPoolHost,
-            MiniMaxM3Nvfp4MainKVPoolHost,
-        )
-
-        if get_memory().hicache_io_backend not in ("kernel", "direct"):
-            raise ValueError("M3.1 NVFP4 HiCache requires kernel or direct IO")
-        if get_memory().hicache_mem_layout not in (
-            "layer_first",
-            "page_first",
-            "page_first_direct",
-        ):
-            raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
-        index_pool = sparse_pool.index_k_pool
-        main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
-        index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
-        draft_bytes = 0
-        for draft_pool in params.sidecar_draft_device_pools:
-            if (
-                type(draft_pool) is not MHATokenToKVPool
-                or draft_pool.size != main_pool.size
-                or draft_pool.page_size != params.page_size
-                or draft_pool.start_layer != 0
-                or draft_pool.layer_num > main_pool.layer_num
-            ):
-                raise ValueError(
-                    "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
-                    "token capacity/page size and at most as many layers as the target"
-                )
-            draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
-                draft_pool.size + draft_pool.page_size
-            )
-        total_bytes = main_bytes + index_bytes + draft_bytes
-        # --hicache-size covers main KV, index payload/scales and draft sidecars.
-        host_size *= main_bytes / total_bytes
-        slots = (
-            int(host_size * 1e9 // main_bytes)
-            if host_size > 0
-            else int(main_pool.size * get_memory().hicache_ratio)
-        )
-        slots = (slots // params.page_size + 1) * params.page_size
-        if slots * total_bytes > host_memory_budget_bytes():
-            raise ValueError(
-                "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
-            )
+    index_k_pool = sparse_pool.index_k_pool
+    (main_info,) = main_pool.get_device_pool_infos()
     start_layer = main_pool.start_layer
+    # Stage-local transfer ids; values index the host pool's local layer buffer.
     transfer_layer_id_max = main_pool.layer_num
-    # Stage-local keys (0..transfer_layer_id_max) match the controller's per-layer
-    # load loop; values index the host pool's local layer buffer.
-    full_layer_mapping = {
-        layer_id: layer_id for layer_id in range(transfer_layer_id_max)
-    }
 
-    if nvfp4:
+    if isinstance(main_info.buffer_info, PageRowBufferInfo):
         kv_host_pool = MiniMaxM3Nvfp4MainKVPoolHost(
-            main_pool.get_device_pool_infos()[0].buffer_info,
-            get_memory().hicache_ratio,
-            host_size,
+            main_info.buffer_info,
+            memory.hicache_ratio,
+            _nvfp4_main_host_size(
+                params=params, main_pool=main_pool, index_pool=index_k_pool
+            ),
             params.page_size,
-            get_memory().hicache_mem_layout,
+            memory.hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             device_capacity_tokens=main_pool.size,
             start_layer=main_pool.start_layer,
             end_layer=main_pool.end_layer,
         )
     else:
-        kv_host_pool = build_kv_host_pool(
-            kv_pool=main_pool,
-            page_size=params.page_size,
-            host_size=host_size,
-        )
+        kv_host_pool = build_kv_host_pool(kv_pool=main_pool, page_size=params.page_size)
     entries = [
         build_pool_entry(
             name=PoolName.KV,
             host_pool=kv_host_pool,
             device_pool=main_pool,
-            layer_mapping=full_layer_mapping,
+            layer_mapping={layer: layer for layer in range(transfer_layer_id_max)},
             transfer_layer_id_max=transfer_layer_id_max,
             is_anchor=True,
         ),
     ]
 
-    index_k_pool = sparse_pool.index_k_pool
     if index_k_pool is not None:
-        if nvfp4:
+        (index_info,) = index_k_pool.get_device_pool_infos()
+        if isinstance(index_info.buffer_info, PageRowBufferInfo):
             index_host_pool = MiniMaxM3Nvfp4IndexKPoolHost(
-                index_k_pool.get_device_pool_infos()[0].buffer_info,
+                index_info.buffer_info,
                 kv_host_pool,
-                get_memory().hicache_mem_layout,
+                memory.hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
                 start_layer=index_k_pool.start_layer,
                 end_layer=index_k_pool.end_layer,
             )
-            # NVFP4 page rows report compact layer ids, not the sparse model layers.
-            index_layer_ids = tuple(sparse_pool.index_k_layer_id_mapping)
         else:
-            (index_info,) = index_k_pool.get_device_pool_infos()
             index_host_pool = MHATokenToKOnlyPoolHost(
                 buffer_info=index_info.buffer_info,
                 anchor_host=kv_host_pool,
-                layout=get_memory().hicache_mem_layout,
+                layout=memory.hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
             )
-            index_layer_ids = index_info.layer_ids
         entries.append(
             build_pool_entry(
                 name=PoolName.INDEXER,
                 host_pool=index_host_pool,
                 device_pool=index_k_pool,
                 layer_mapping={
-                    gid - start_layer: sub_id
-                    for sub_id, gid in enumerate(index_layer_ids)
+                    layer - start_layer: index
+                    for index, layer in enumerate(index_info.layer_ids)
                 },
                 transfer_layer_id_max=transfer_layer_id_max,
             )

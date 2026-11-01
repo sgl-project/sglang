@@ -490,7 +490,13 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             size=800,
             start_layer=0,
             layer_shard_enabled=False,
-            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=object()),),
+            get_device_pool_infos=lambda: (
+                SimpleNamespace(
+                    pool_name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    buffer_info=object(),
+                ),
+            ),
         )
         draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_host_pool = SimpleNamespace(layer_num=1)
