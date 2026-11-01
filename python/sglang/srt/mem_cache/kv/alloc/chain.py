@@ -590,6 +590,24 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for member in self.members:
             member.prewarm_compaction()
 
+    def compaction_can_run(self) -> bool:
+        """Whether bytes freed on either side can serve the other side's next
+        allocation now: compaction is eager, or its moves are unblocked."""
+        return not self.lazy_compaction or all(
+            not band.moves_blocked()
+            for band in (self.full_attn_allocator, *self._windows)
+        )
+
+    def shared_bytes(self, full_tokens: int, swa_tokens: int) -> int:
+        """Shared-buffer bytes of FULL and SWA token counts, in whole pages."""
+        page_size = self.page_size
+        full_pages = (full_tokens + page_size - 1) // page_size
+        swa_pages = (swa_tokens + page_size - 1) // page_size
+        return (
+            full_pages * self.full_attn_allocator.entry_bytes_per_page
+            + swa_pages * self.swa_attn_allocator.entry_bytes_per_page
+        )
+
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to every member."""
         with record_function("ChainAllocator.set_latest_forward_done_event"):
