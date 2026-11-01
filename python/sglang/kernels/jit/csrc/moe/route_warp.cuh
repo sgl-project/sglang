@@ -1,6 +1,7 @@
 // MoE router: scoring + (grouped) top-k + renormalize, one warp per token.
 //
-// Scoring is sigmoid or sqrtsoftplus plus a correction bias, or softmax. Each lane
+// Scoring is sigmoid or sqrtsoftplus plus a correction bias, or softmax of the
+// logits plus an optional correction bias (weights keep the bias). Each lane
 // owns E / 32 contiguous experts as order-preserving u32 keys, sorts them once,
 // and every selection round only looks at the 32 lane heads: redux max of the
 // heads, redux min of the lanes holding it (lowest expert id wins ties), pop.
@@ -60,7 +61,7 @@ namespace ptx = device::route_warp::ptx;
 
 struct Params {
   const void* __restrict__ logits;             // [T, E], row stride `logits_stride`
-  const void* __restrict__ bias;               // [E] fp32 / bf16 / fp16, unused for softmax
+  const void* __restrict__ bias;               // [E] fp32 / bf16 / fp16, optional for softmax
   float* __restrict__ out_w;                   // [T, K + num_shared]
   int32_t* __restrict__ out_i;                 // [T, K + num_shared]
   int32_t* __restrict__ out_packed;            // optional [T, K + num_shared]: id << 16 | bf16(w)
@@ -105,15 +106,20 @@ SGL_DEVICE float softmax_exp(float x, float mx) {
   return ptx::ex2_approx_ftz((x - mx) * kLog2e);
 }
 
-// sqrt(max(x, 0) + log1p(exp(-|x|))), branch-free: exp(-|x|) = 2^n * 2^f with a
-// degree-7 polynomial for 2^f, log1p(z) = 2 atanh(z / (2 + z)) as an odd series.
+// sqrt(max(x, 0) + log1p(exp(-|x|))), branch-free: w = exp(-|x| / 2) = 2^n * 2^f with
+// a degree-7 polynomial for 2^f, z = w^2, log1p(z) = 2 atanh(z / (2 + z)) as an odd
+// series. For x <= 0 the result is w * sqrt(log1p(z) / z), which stays normal down to
+// x = -174 where z itself underflows.
 SGL_DEVICE float sqrtsoftplus(float x) {
-  constexpr float kL2eLo = 1.925963033500011e-08f;  // log2(e) - kLog2e
-  // Bounds n for the int conversion; exponents below -126 become 0 below.
-  const auto nx = fmaxf(-fabsf(x), -100.0f);
-  const auto t_hi = nx * kLog2e;
-  const auto t_lo = fmaf(nx, kLog2e, -t_hi) + nx * kL2eLo;
-  const auto n = rintf(t_hi);
+  constexpr float kHalfL2e = 0.5f * kLog2e;
+  constexpr float kHalfL2eLo = 0.5f * 1.925963033500011e-08f;  // (log2(e) - kLog2e) / 2
+  // Below -174 the result exp(x / 2) is subnormal; the clamp also keeps 2^n normal.
+  const auto nx = fmaxf(-fabsf(x), -174.0f);
+  const auto t_hi = nx * kHalfL2e;
+  const auto t_lo = fmaf(nx, kHalfL2e, -t_hi) + nx * kHalfL2eLo;
+  // n = rint(t_hi) via 1.5 * 2^23, whose low mantissa bits then hold n.
+  const auto n_shift = t_hi + 12582912.0f;
+  const auto n = n_shift - 12582912.0f;
   const auto f = (t_hi - n) + t_lo;
   // 2^f = e^(f ln2), Taylor to degree 7 (error < 5e-9 for |f| <= 1/2).
   auto e = 1.0f / 5040.0f;
@@ -124,13 +130,14 @@ SGL_DEVICE float sqrtsoftplus(float x) {
   e = fmaf(e, f * kLn2, 0.5f);
   e = fmaf(e, f * kLn2, 1.0f);
   e = fmaf(e, f * kLn2, 1.0f);
-  // 2^n with n < -126 flushed to 0 (a select here compiles to a branch).
-  const auto z = e * __int_as_float(max(static_cast<int32_t>(n) + 127, 0) << 23);
-  // s = z / (2 + z): rcp.approx and one Newton step, ~0.5 ulp.
+  // w = e * 2^n by an exponent add: 1.5 * 2^23 << 23 wraps to 0, and w stays normal.
+  const auto w = __int_as_float(__float_as_int(e) + (__float_as_int(n_shift) << 23));
+  const auto z = w * w;
+  // 1 / (2 + z): rcp.approx and one Newton step, ~0.5 ulp.
   const auto d = 2.0f + z;
-  const auto inv = ptx::rcp_approx_ftz(d);
-  const auto s0 = z * inv;
-  const auto s = fmaf(inv, fmaf(-d, s0, z), s0);
+  const auto inv0 = ptx::rcp_approx_ftz(d);
+  const auto inv = fmaf(inv0, fmaf(-d, inv0, 1.0f), inv0);
+  const auto s = z * inv;
   const auto s2 = s * s;
   auto poly = 1.0f / 13.0f;
   poly = fmaf(poly, s2, 1.0f / 11.0f);
@@ -138,11 +145,13 @@ SGL_DEVICE float sqrtsoftplus(float x) {
   poly = fmaf(poly, s2, 1.0f / 7.0f);
   poly = fmaf(poly, s2, 1.0f / 5.0f);
   poly = fmaf(poly, s2, 1.0f / 3.0f);
-  const auto two_s = 2.0f * s;
-  const auto sp = fmaxf(x, 0.0f) + fmaf(two_s * s2, poly, two_s);
-  // fmaxf drops NaN. Selecting before the MUFU keeps it unconditional; a select
-  // after it makes nvcc branch around the MUFU.
-  return ptx::sqrt_approx_ftz(x == x ? sp : x);
+  // r = log1p(z) / z = 2 / (2 + z) * (1 + s^2 poly).
+  const auto two_inv = 2.0f * inv;
+  const auto r = fmaf(two_inv * s2, poly, two_inv);
+  // NaN takes the x > 0 side and stays NaN. Selecting before the MUFU keeps it
+  // unconditional; a select after it makes nvcc branch around the MUFU.
+  const bool pos = !(x <= 0.0f);
+  return ptx::sqrt_approx_ftz(pos ? fmaf(z, r, x) : r) * (pos ? 1.0f : w);
 }
 
 enum class Scoring : uint32_t { SIGMOID = 0, SOFTMAX = 1, SQRTSOFTPLUS = 2 };
@@ -174,6 +183,7 @@ template <
     Scoring kScoring,
     typename T,
     typename TB,
+    bool kBias,
     bool kUsePDL,
     bool kMuseSpark,
     bool kTokenBias,
@@ -187,7 +197,8 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
   constexpr uint32_t VB = kVecSize<TB, L>;
   static_assert(E % 32 == 0 && L <= 16 && K >= 1 && K <= 32);
   static_assert(!kMuseSpark || kScoring == Scoring::SIGMOID);
-  static_assert(!kTokenBias || (!kSoftmax && !kMuseSpark));
+  static_assert(kBias || kSoftmax);
+  static_assert(!kTokenBias || (kBias && !kMuseSpark));
 
   // Lane rows padded so 128-bit accesses stay conflict-free.
   constexpr uint32_t kPitch = smem_pitch(L);
@@ -231,7 +242,7 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
     xv[i].load(row, i);
   }
   AlignedVector<TB, VB> bv[L / VB];
-  if constexpr (!kSoftmax) {
+  if constexpr (kBias) {
 #pragma unroll
     for (uint32_t i = 0; i < L / VB; ++i) {
       bv[i].load(bias + base, i);
@@ -246,8 +257,9 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
     auto x = cast<float>(xv[j / V][j % V]);
     if constexpr (kMuseSpark) x *= p.logit_scale;
     if constexpr (kSoftmax) {
-      val[j] = x;
-      biased[j] = x;
+      // Softmax ranks and weighs the biased logit.
+      val[j] = kBias ? x + cast<float>(bv[j / VB][j % VB]) : x;
+      biased[j] = val[j];
     } else {
       val[j] = kScoring == Scoring::SIGMOID ? sigmoid(x) : sqrtsoftplus(x);
       biased[j] = val[j] + cast<float>(bv[j / VB][j % VB]);
@@ -390,12 +402,11 @@ template <
     Scoring kScoring,
     typename T,
     typename TB,
+    bool kBias,
     bool kUsePDL,
     bool kMuseSpark,
     bool kTokenBias>
 struct RouteWarpKernel {
-  static constexpr bool kSoftmax = kScoring == Scoring::SOFTMAX;
-
   static void
   run(const tvm::ffi::TensorView logits,
       const tvm::ffi::Optional<tvm::ffi::TensorView> bias,
@@ -442,14 +453,16 @@ struct RouteWarpKernel {
     }
 
     auto p = Params{};
-    if constexpr (!kSoftmax) {
-      CHECK_HOST(bias.has_value()) << "route_warp: sigmoid routing needs a bias";
+    if constexpr (kBias) {
+      CHECK_HOST(bias.has_value()) << "route_warp: the biased instantiation needs a bias";
       TensorMatcher({E})  //
           .with_dtype<TB>()
           .with_device(device_sym)
           .ensure_alignment(kVecSize<TB, L> * sizeof(TB))
           .verify(bias.value());
       p.bias = bias.value().data_ptr();
+    } else {
+      CHECK_HOST(!bias.has_value()) << "route_warp: a bias needs the biased instantiation";
     }
     if (num_non_padded.has_value()) {
       // A 0-d or [1] device scalar, so no shape matcher.
@@ -506,8 +519,8 @@ struct RouteWarpKernel {
     }
     if (p.num_tokens == 0) return;
     const auto device = device_sym.unwrap();
-    const auto kernel_1 = route_warp_kernel<E, K, G, TG, kScoring, T, TB, kUsePDL, kMuseSpark, kTokenBias, 1>;
-    const auto kernel_4 = route_warp_kernel<E, K, G, TG, kScoring, T, TB, kUsePDL, kMuseSpark, kTokenBias, 4>;
+    const auto kernel_1 = route_warp_kernel<E, K, G, TG, kScoring, T, TB, kBias, kUsePDL, kMuseSpark, kTokenBias, 1>;
+    const auto kernel_4 = route_warp_kernel<E, K, G, TG, kScoring, T, TB, kBias, kUsePDL, kMuseSpark, kTokenBias, 4>;
     // One warp per CTA (64 registers under a 32-thread bound, vs 40) while all tokens
     // fit in one wave; past that, four warps per CTA (B200 sweep, 256..16384 tokens).
     static const uint32_t s_single_warp_occupancy = runtime::get_blocks_per_sm(kernel_1, 32);

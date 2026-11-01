@@ -4,11 +4,15 @@ exact ties, padding, packed ids, fused shared slots), and srt must dispatch to i
 
 from __future__ import annotations
 
+import functools
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.kernels.jit.utils import parallel_compile
+from sglang.kernels.ops.moe import moe_route_warp as route_warp_module
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.kernels.ops.moe.moe_route_warp import covered, moe_route_warp
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -28,6 +32,40 @@ CONFIGS = {
     "gpt_oss": (128, 4, "softmax", 1, 1, torch.bfloat16),
     "deepseek_v4": (384, 6, "sqrtsoftplus", 1, 1, torch.float32),
 }
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _prebuild() -> None:
+    # (experts, routed topk, groups, topk_groups, scoring, logits, bias dtype, has_bias, token_bias)
+    f32, bf16 = torch.float32, torch.bfloat16
+    variants = set()
+    for experts, topk, scoring, groups, topk_groups, dtype in CONFIGS.values():
+        has_bias = scoring != "softmax"
+        variants.add(
+            (experts, topk, groups, topk_groups, scoring, dtype, f32, has_bias, False)
+        )
+        variants.add(
+            (experts, topk, groups, topk_groups, scoring, dtype, f32, True, False)
+        )
+    variants |= {
+        (384, 6, 1, 1, "sqrtsoftplus", f32, bf16, True, False),
+        (384, 8, 1, 1, "sigmoid", f32, bf16, True, False),
+        (384, 8, 1, 1, "sigmoid", f32, torch.float16, True, False),
+        (384, 6, 1, 1, "sqrtsoftplus", f32, f32, True, True),
+        (128, 8, 1, 1, "softmax", bf16, bf16, True, False),
+        (512, 10, 1, 1, "softmax", bf16, bf16, True, False),
+        (128, 4, 1, 1, "softmax", bf16, bf16, True, False),
+        (128, 8, 1, 1, "softmax", bf16, f32, True, True),
+    }
+    parallel_compile(
+        functools.partial(
+            route_warp_module._jit_route_warp_module,
+            *v[:8],
+            muse_spark=False,
+            token_bias=v[8],
+        )
+        for v in sorted(variants, key=str)
+    )
 
 
 def _inputs(config: str, num_tokens: int, seed: int = 0):
@@ -71,8 +109,8 @@ def _reference(
     """fp64 routing: (weights, ids, near_tie rows, ranking scores); ties go to the lowest id."""
     x = scores.double()
     if scoring_func == "softmax":
-        act = x.softmax(-1)
-        ranking = x
+        ranking = x if bias is None else x + bias.double()
+        act = ranking.softmax(-1)
     else:
         if scoring_func == "sigmoid":
             act = x.sigmoid()
@@ -179,6 +217,102 @@ def test_sqrtsoftplus_logit_ranges(scale: float, shift: float, bias_dtype) -> No
     scores = torch.randn(4000, 384, device=DEVICE, generator=g) * scale + shift
     bias = (torch.randn(384, device=DEVICE, generator=g) * 0.1).to(bias_dtype)
     _check(scores, bias, topk=6, scoring_func="sqrtsoftplus", renormalize=True)
+
+
+@pytest.mark.parametrize("shift", [-50, -88, -104, -120, -170])
+@pytest.mark.parametrize("zero_bias", [True, False])
+def test_sqrtsoftplus_negative_tail(shift: float, zero_bias: bool) -> None:
+    # exp(x) is subnormal or zero here, sqrt(softplus(x)) ~ exp(x / 2) is still normal.
+    g = torch.Generator(device=DEVICE).manual_seed(-shift)
+    scores = torch.randn(1000, 384, device=DEVICE, generator=g) + shift
+    bias = torch.randn(384, device=DEVICE, generator=g) * 0.1
+    if zero_bias:
+        bias.zero_()
+    kwargs = dict(topk=6, scoring_func="sqrtsoftplus", renormalize=True)
+    w, i = moe_route_warp(scores, bias, **kwargs)
+    rw, ri, _, _ = _reference(scores, bias, **kwargs)
+    assert torch.equal(i.long(), ri)
+    torch.testing.assert_close(w.double(), rw, rtol=1e-5, atol=1e-6)
+
+
+def test_sqrtsoftplus_uniform_tail() -> None:
+    scores = torch.full((4, 384), -88.0, device=DEVICE)
+    bias = torch.zeros(384, device=DEVICE)
+    w, i = moe_route_warp(scores, bias, topk=6, scoring_func="sqrtsoftplus")
+    assert torch.equal(
+        i, torch.arange(6, device=DEVICE, dtype=torch.int32).expand(4, 6)
+    )
+    torch.testing.assert_close(w, torch.full_like(w, 1 / 6))
+
+
+def _softmax_bias(scores: torch.Tensor, dtype=torch.float32):
+    g = torch.Generator(device=DEVICE).manual_seed(scores.shape[0] + 17)
+    return (torch.randn(scores.shape[1], device=DEVICE, generator=g) * 2).to(dtype)
+
+
+@pytest.mark.parametrize("config", ["qwen3_moe", "qwen3_5_moe", "gpt_oss"])
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(),
+        dict(renormalize=False),
+        dict(apply_routed_scaling_factor_on_output=True),
+        dict(num_fused_shared_experts=1),
+        dict(num_fused_shared_experts=1, renormalize=False),
+        dict(renormalize_epsilon=1e-20),
+    ],
+)
+def test_softmax_bias(config: str, bias_dtype, overrides) -> None:
+    scores, _ = _inputs(config, 600, seed=21)
+    bias = _softmax_bias(scores, bias_dtype)
+    kwargs = _kwargs(config, **overrides)
+    kwargs["topk"] += overrides.get("num_fused_shared_experts", 0)
+    w, i = moe_route_warp(scores, bias, **kwargs)
+    k_routed = kwargs["topk"] - overrides.get("num_fused_shared_experts", 0)
+    _assert_matches(w, i, _reference(scores, bias, **kwargs), k_routed)
+    # The bias must change the selection, or this test checks nothing.
+    _, i0 = moe_route_warp(scores, None, **kwargs)
+    assert not torch.equal(i, i0)
+    # Same selection and weights as the Triton router.
+    with patch.object(route_warp_module, "covered", lambda *args: False):
+        tw, ti = moe_fused_gate(scores, bias, **kwargs)
+    assert torch.equal(ti, i)
+    torch.testing.assert_close(tw, w, rtol=1e-5, atol=1e-7)
+
+
+def test_softmax_bias_dispatch() -> None:
+    scores, _ = _inputs("qwen3_moe", 64, seed=4)
+    bias = _softmax_bias(scores)
+    kwargs = _kwargs("qwen3_moe")
+    w, i = moe_fused_gate(scores, bias, **kwargs)
+    rw, ri = moe_route_warp(scores, bias, **kwargs)
+    assert torch.equal(i, ri) and torch.equal(w, rw)
+
+
+def test_softmax_bias_grouped_falls_back() -> None:
+    # Grouped softmax stays on the Triton router, bias included.
+    scores, _ = _inputs("qwen3_moe", 64, seed=6)
+    bias = _softmax_bias(scores)
+    kwargs = _kwargs("qwen3_moe", num_expert_group=8, topk_group=4)
+    assert not covered(scores.dtype, 128, 8, "softmax", 0, 8, 4)
+    w, i = moe_fused_gate(scores, bias, **kwargs)
+    _assert_matches(w, i, _reference(scores, bias, **kwargs), 8)
+
+
+def test_softmax_token_bias() -> None:
+    scores, _ = _inputs("qwen3_moe", 600, seed=8)
+    bias = _softmax_bias(scores)
+    bias_alt = bias.flip(0).contiguous()
+    g = torch.Generator(device=DEVICE).manual_seed(8)
+    input_ids = torch.randint(
+        0, 4, (600,), device=DEVICE, dtype=torch.int32, generator=g
+    )
+    kwargs = _kwargs("qwen3_moe")
+    token_kwargs = dict(input_ids=input_ids, bias_alt=bias_alt, bias_alt_token_id=2)
+    w, i = moe_route_warp(scores, bias, **kwargs, **token_kwargs)
+    row_bias = torch.where((input_ids == 2)[:, None], bias_alt, bias)
+    _assert_matches(w, i, _reference(scores, row_bias, **kwargs), 8)
 
 
 @pytest.mark.parametrize(
