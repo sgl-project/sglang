@@ -229,6 +229,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if server_args.performance_mode == "memory":
+            # Batched decoder tiles add activations on top of the resident
+            # decoder; memory mode keeps the one-tile recipe at every tier.
+            self.vae_config.decoder_tile_batch = 1
+            self.vae_config.window_batch = 1
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -346,7 +351,8 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-        self.vae_config.stack_tiling = True
+        # FastVideo's recipe decodes each rank's tiles in one call.
+        self.vae_config.decoder_tile_batch = 0
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
@@ -411,9 +417,9 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-        # Stack tiling batches every VAE tile in one forward; FastH3 only
-        # decodes, but Omni also encodes reference videos, which runs out of
-        # memory stacked.
+        # Omni also encodes reference videos. The encoder runs one tile per
+        # forward regardless, and the decoder keeps the base
+        # ``decoder_tile_batch`` cap instead of FastH3's all-tiles recipe.
 
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
@@ -425,10 +431,31 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
         MiniMaxH3PipelineConfig.validate_server_args(self, server_args)
 
 
+@dataclass
+class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
+    """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    def validate_server_args(self, server_args) -> None:
+        # A BF16 merge rounds away about a third of the adapters' update (by
+        # norm, under auto's 50% cutoff), so keep them unmerged like the
+        # reference unless a merge mode is chosen explicitly.
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; Pika H3 Flex has no audited high-quality "
+            'deployment. Use quality="exact", or the default "lossless".'
+        )
+
+
 __all__ = [
     "FastH3OmniPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
 ]
 
 
@@ -437,6 +464,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
@@ -476,6 +504,18 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=PikaH3FlexSamplingParams,
+        pipeline_config_cls=PikaH3FlexPipelineConfig,
+        hf_model_paths=[
+            "Pika-Labs/Pika-H3-Flex",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )

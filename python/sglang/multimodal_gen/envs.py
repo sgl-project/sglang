@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
+    SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
         "~/.cache/sglang/diffusion/host_spill"
@@ -58,10 +59,12 @@ if TYPE_CHECKING:
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
     # head groups for pipelining the Ulysses exchange against dense attention
-    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
+    # or over the collective one for MiniMax-H3 on aiter:
     # -1 picks the most groups that divide the heads per rank while each group's
-    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
-    # 1 keeps the sequential exchange; N >= 2 forces N groups
+    # call still fills the GPU (two on the collective path), and steps aside when
+    # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
+    # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
@@ -243,6 +246,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shard pad span.
     "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
+    ),
+    # Skip the per-field torch.isnan() scan (a full-size kernel plus a host
+    # sync) that StageValidators runs alongside shape/type checks on every
+    # request. Shape/type checks still run; only the NaN scan is skipped.
+    "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.

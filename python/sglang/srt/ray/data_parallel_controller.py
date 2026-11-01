@@ -24,7 +24,6 @@ import zmq
 from sglang.srt.entrypoints.engine import _calculate_rank_ranges
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
-from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.ray.engine import (
     _compute_world_size,
     _create_scheduler_actor,
@@ -275,12 +274,7 @@ class RayDataParallelController(DataParallelController):
 
         # Store init info from the first actor (same across all actors)
         if scheduler_infos:
-            self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
-            self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
-            self.startup_time = aggregate_scheduler_startup_times(
-                [self.startup_time]
-                + [info.get("startup_time") for info in scheduler_infos]
-            )
+            self._record_scheduler_init_infos(scheduler_infos)
 
         # Start event loops (non-blocking — runs until actor is killed)
         self.event_loop_refs.extend(
