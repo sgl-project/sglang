@@ -4975,8 +4975,10 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # The slice start is kv_indptr[bs], already known on the host as
+            # paged_kernel_lens_sum; slicing at the device value would block
+            # the host until the GPU drains.
+            kv_indices[paged_kernel_lens_sum:] = kv_indices[0]
 
             extend_lens = seq_lens - prefix_lens
 
