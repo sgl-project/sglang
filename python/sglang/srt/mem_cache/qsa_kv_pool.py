@@ -64,7 +64,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 buffer_info=IndexKeyBufferInfo(
                     page_size=self.page_size,
                     compress_ratio=self.qsa_compress_ratio,
-                    key_format=IndexKeyFormat.DENSE,
+                    key_format=IndexKeyFormat.KEY_ROWS,
                     buffers=tuple(self.qsa_compressed_k_buffer_pool),
                 ),
             ),

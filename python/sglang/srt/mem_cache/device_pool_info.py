@@ -67,7 +67,8 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 class IndexKeyFormat(Enum):
     # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
     DSA_FP8 = "dsa_fp8"
-    DENSE = "dense"
+    # Each buffer row is one key, [num_keys, head_num, head_dim] in the buffer dtype.
+    KEY_ROWS = "key_rows"
 
     def page_bytes(self, key_count: int) -> int:
         # Each physical format owns its sizing, including scales and padding.
@@ -88,13 +89,13 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def page_bytes(self) -> int:
-        if self.key_format is IndexKeyFormat.DENSE:
+        if self.key_format is IndexKeyFormat.KEY_ROWS:
             return self.buffers[0][0].nbytes * (self.page_size // self.compress_ratio)
         return self.key_format.page_bytes(self.page_size // self.compress_ratio)
 
     @property
     def kernel_page_bytes(self) -> int:
-        if self.key_format is IndexKeyFormat.DENSE:
+        if self.key_format is IndexKeyFormat.KEY_ROWS:
             return self.page_bytes
         return self.key_format.page_bytes(
             self.page_size // self.compress_ratio
@@ -121,9 +122,9 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(f"unsupported index key format {self.key_format}")
         if not buffers:
             raise ValueError("index key input must contain at least one buffer")
-        if self.key_format is IndexKeyFormat.DENSE:
+        if self.key_format is IndexKeyFormat.KEY_ROWS:
             if self.kernel_page_size is not None:
-                raise ValueError("dense index keys use full-KV page coverage")
+                raise ValueError("key-row index keys use full-KV page coverage")
             key_rows = self.page_size // self.compress_ratio
             first = buffers[0]
             for layer, buffer in enumerate(buffers):
@@ -136,7 +137,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                     or not buffer.is_contiguous()
                 ):
                     raise ValueError(
-                        f"dense index buffer[{layer}] requires contiguous complete pages "
+                        f"key-row index buffer[{layer}] requires contiguous complete pages "
                         f"of {key_rows} rows with matching row bytes and device"
                     )
             return
