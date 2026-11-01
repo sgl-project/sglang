@@ -28,6 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
+  plugin_kernels/  # plugin kernel backend: contracts of external kernel
+                   # libraries, as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -84,7 +86,9 @@ Runtime integration that owns process groups, symmetric buffers, workspace
 classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
 collective-GEMM communication adapters and workspaces live in
 `srt/layers/communication/`, while their callable kernels live in
-`kernels/ops/communication/` and take that state as arguments. Reference/test oracles belong in
+`kernels/ops/communication/` and take that state as arguments. Likewise the
+integration of kernel plugins lives in `srt/kernel_plugins/`, and their
+contracts in `kernels/plugin_kernels/` (see below). Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
@@ -127,6 +131,36 @@ agent_kernels = [
 ]
 ```
 
+## Plugin kernel backend: `plugin_kernels/`
+
+This directory holds the contracts of external kernel libraries that load as
+SGLang plugins (the `sglang.srt.plugins` entry point) and replace a model's step
+with kernels specialized for one model, configuration and platform: today the
+small-batch decode and verify steps, possibly prefill or high-throughput steps
+later. `KernelBackend.PLUGIN` records them. These are kernel plugins, not the
+platform plugins that add a device. The kernels stay in the libraries, and the
+code is split at the kernel/runtime boundary:
+
+- `kernels/plugin_kernels/<hardware>/` holds what a plugin implements and
+  registers: its spec (registration, API version, requirements, capability and
+  width declarations, the build and forward contract) and any thin wrappers
+  around its kernels, under `<hardware>/<model>/`. It imports nothing from
+  `srt`.
+- `srt/kernel_plugins/<hardware>/binding.py` holds SGLang's integration: it
+  reads the server configuration at argument resolution, observes weight
+  loading, coordinates TP ranks, plans CUDA graph coverage, installs the
+  model-forward dispatch with its fallback, and hands a plugin the runtime
+  state it may use.
+
+| Hardware | Server flag | Library |
+| --- | --- | --- |
+| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
+
+An operator exposed from here registers into its logical group with
+`KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
+`test_kernels_namespace.py` enforces the pairing. See `plugin_kernels/README.md`.
+
 ## How it works
 
 Each `ops.<group>` function is a thin wrapper that forwards to a chosen
@@ -168,7 +202,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` /
+    `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared
