@@ -1,15 +1,26 @@
 ---
 title: HiDream-O1-Image
 description: Serve HiDream-O1-Image Dev-2604, Dev, and Full checkpoints with SGLang Diffusion.
-metatags:
-    description: "Run HiDream-ai/HiDream-O1-Image checkpoints (Dev-2604, Dev, Full) with SGLang Diffusion."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "editing", "flow matching", "NPU"]} />
 
-## 1. Model Introduction
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). The command builder below targets Linux/CUDA; use the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for NPU environments. Exact deployment recipes remain unverified unless explicitly marked otherwise.
+
+```bash
+uv pip install -e 'python[diffusion]'
+```
+
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/HiDream/hidream-o1-image.jsx';
+
+<Deployment config={config} />
+
+## 2. Model capabilities
 
 [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) is a
 unified VLM diffusion model: a Qwen3-VL backbone handles text encoding, vision
@@ -19,7 +30,9 @@ text encoder or VAE.
 One pipeline serves three checkpoints. The variant is detected from the
 served model path and each variant resolves its sampling recipe
 automatically, following the official README checkpoint table. Explicit
-request fields override the recipe.
+request fields override the recipe. All variants load fp32 master weights
+(about 2x the memory and latency of bf16); latents and autocast compute stay
+bf16, matching the official pipeline.
 
 | Model ID | Weights | Scheduler | Steps | Guidance | Noise (start -> end, clip) |
 | --- | --- | --- | --- | --- | --- |
@@ -27,24 +40,7 @@ request fields override the recipe.
 | `hidream-ai/HiDream-O1-Image-Dev` | fp32 | flash | 28 | 0.0 | 8.0 -> 8.0, clip 8.0 |
 | `hidream-ai/HiDream-O1-Image` (Full) | fp32 | UniPC | 50 | 5.0 | none (z-init scale 7.5) |
 
-All variants load fp32 master weights (about 2x the memory and latency of
-bf16). Latents and autocast compute stay bf16 for every variant, matching
-the official pipeline; NPU attention kernels require bf16/fp16 activations,
-so fp32 weights are never run without the bf16 autocast.
-
-## 2. Installation
-
-Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
-## 3. Serve HiDream-O1-Image
-
-```bash Command
-sglang serve \
-  --model-path HiDream-ai/HiDream-O1-Image-Dev-2604 \
-  --port 30000
-```
-
-## 4. Generate and edit
+## 3. Generate and edit
 
 Text-to-image:
 
@@ -82,7 +78,7 @@ response = requests.post(
 response.raise_for_status()
 ```
 
-## 5. Request constraints
+## 4. Request constraints
 
 - Resolution snaps to the closest supported preset (2048x2048 up to
   3104x1312, multiples of 32). A single-reference edit keeps the reference
@@ -102,3 +98,5 @@ response.raise_for_status()
   art. The official workflow refines prompts with the Prompt Agent; connect
   `--prompt-enhancer-config` and set `enhance_prompt=true` (text-to-image
   only). See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
+- NPU attention kernels require bf16/fp16 activations, so fp32 weights are
+  never run without the bf16 autocast.
