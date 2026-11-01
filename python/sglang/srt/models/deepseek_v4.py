@@ -217,6 +217,8 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 if _is_npu:
     import torch_npu
 
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
 
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
@@ -2237,6 +2239,7 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        defer_npu_q_projection: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -2431,9 +2434,12 @@ class MQALayer(MqaAttentionBase):
                 kv = None
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
-            q, _ = self.wq_b(q_lora)
-            q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            if defer_npu_q_projection:
+                q = q_lora
+            else:
+                q, _ = self.wq_b(q_lora)
+                q = q.view(-1, self.n_local_heads, self.head_dim)
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2445,8 +2451,8 @@ class MQALayer(MqaAttentionBase):
                 forward_batch, positions, q.dtype, inverse=False
             )
             Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                q,
-                kv.unsqueeze(1),
+                kv.unsqueeze(1) if defer_npu_q_projection else q,
+                None if defer_npu_q_projection else kv.unsqueeze(1),
                 cos4,
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
@@ -2600,6 +2606,79 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_npu_chunked_prefill(
+        self,
+        x,
+        positions,
+        forward_batch,
+        attn_backend,
+        x_quant,
+        chunk_size,
+        defer_all_reduce,
+    ):
+        # Cache writes, compression and index selection still see the complete
+        # request, once. Only the large query/output intermediates are tiled.
+        q_lora, _ = self._forward_prepare(
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            x_quant=x_quant,
+            defer_npu_q_projection=True,
+        )
+        cos, sin = self._get_npu_rope_position_cache(
+            forward_batch, positions, q_lora.dtype, inverse=False
+        )
+        inv_cos, inv_sin = self._get_npu_rope_position_cache(
+            forward_batch, positions, q_lora.dtype, inverse=True
+        )
+        output = x.new_empty(x.shape[0], self.n_local_groups, self.o_lora_rank)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        sink = self._local_attn_sink(self.n_local_heads)
+        for begin in range(0, x.shape[0], chunk_size):
+            end = min(begin + chunk_size, x.shape[0])
+            q, _ = self.wq_b(q_lora[begin:end])
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                q,
+                None,
+                cos[begin:end],
+                sin[begin:end],
+                qk_nope_dim=self.qk_nope_head_dim,
+            )
+            with attn_backend.prefill_query_chunk(
+                begin, end, x.shape[0], self.compress_ratio
+            ):
+                o = attn_backend.forward(
+                    q=q,
+                    k=q,
+                    v=q,
+                    layer=self.attn_mqa,
+                    forward_batch=forward_batch,
+                    compress_ratio=self.compress_ratio,
+                    attn_sink=sink,
+                    save_kv_cache=False,
+                )
+            # Attention has consumed Q; let the WO_A scratch reuse its storage.
+            del q
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                o,
+                None,
+                inv_cos[begin:end],
+                inv_sin[begin:end],
+                qk_nope_dim=self.qk_nope_head_dim,
+            )
+            projected = _apply_wo_a_bf16_matmul(
+                o.view(end - begin, self.n_local_groups, -1),
+                wo_a,
+                is_decode=False,
+                is_prefill=True,
+            )
+            output[begin:end].copy_(projected)
+            del o, projected
+        return self._project_wo_b(output, defer_all_reduce)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2612,6 +2691,34 @@ class MQALayer(MqaAttentionBase):
             return x
 
         attn_backend = get_attn_backend()
+        chunk_size = envs.SGLANG_DSV4_NPU_PREFILL_CHUNK_SIZE.get() if _is_npu else 0
+        if (
+            chunk_size > 0
+            and x.shape[0] > chunk_size
+            and not self.is_dsv41
+            and not is_npu_arch35()
+            and self.attn_tp_size == 1
+            and self.n_local_heads == 64
+            and not self.wo_a_fp8
+            and not self.use_npu_arch35_mxfp8_wo_a
+            and getattr(self.wo_a, "weight", None) is not None
+            and self.wo_a.weight.dtype == x.dtype == torch.bfloat16
+            and forward_batch.batch_size == 1
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not is_cp_active(forward_batch)
+            and not get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
+            and not attn_backend._is_dspark_draft_worker
+        ):
+            return self._forward_npu_chunked_prefill(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                x_quant,
+                chunk_size,
+                defer_all_reduce,
+            )
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
