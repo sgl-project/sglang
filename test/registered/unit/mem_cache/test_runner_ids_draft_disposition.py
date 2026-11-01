@@ -130,7 +130,12 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         device=_DEV,
         enable_memory_saver=False,
         page_size=_PS,
-        fused_draft=FusedDraftPlacement.from_counts(counts=counts, regions=regions),
+        fused_draft=FusedDraftPlacement.from_counts(
+            counts=counts,
+            regions=regions,
+            # This pool names its window sub-pool `swa`.
+            hosted={"swa": "window"} if "swa" in counts else None,
+        ),
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
