@@ -1,10 +1,10 @@
 """Windows of different lengths are separate sub-pools named by their length.
 
 A plan may declare several windows. The longest keeps the name, and the
-external names, a single-window model has always used; every other window
-takes the next window slot's external names, and a slot past what the prefix
-tree and PD peers carry is refused where they read it. Storage, sizing and the
-allocator hold any number of windows.
+external names, a single-window model has always used; every other window's
+prefix tree slot is named by its sub-pool. Storage, sizing, the allocator and
+the prefix tree hold any number of windows; host stores and PD peers carry one
+further window and refuse more where they read it.
 """
 
 import random
@@ -24,7 +24,11 @@ from sglang.srt.mem_cache.kv.decl import (
     kv_layer_decls,
     window_sub_pool_name,
 )
-from sglang.srt.mem_cache.kv.plan import SubPoolExternal, plan_kv_storage
+from sglang.srt.mem_cache.kv.plan import (
+    SubPoolExternal,
+    plan_kv_storage,
+    tree_slot_ids,
+)
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -97,32 +101,52 @@ class TestWindowNames(CustomTestCase):
         # A window's name does not depend on the other windows.
         self.assertEqual(_plan((16,)).primary_window().name, "window_16")
 
-    def test_external_names_follow_window_slots(self):
-        swa = SubPoolExternal(
-            host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
+    def test_external_names_follow_sub_pools_and_window_slots(self):
+        # A window's prefix tree slot is named by its sub-pool. Host stores and
+        # PD peers name window entries by window slot and keep two.
+        first = SubPoolExternal(
+            host_pool="swa", tree_component="WINDOW_16", metrics="swa", wire="swa"
         )
-        auxiliary = SubPoolExternal(
-            host_pool="auxiliary_swa",
-            tree_component="AUXILIARY_SWA",
-            metrics="swa",
-            wire="auxiliary_swa",
-        )
-        # One window: the names every single-window peer and host store use.
-        self.assertEqual(_plan((16,)).sub_pool("window_16").external, swa)
+        self.assertEqual(_plan((16,)).sub_pool("window_16").external, first)
         two = _plan((16, 64))
-        self.assertEqual(two.sub_pool("window_64").external, swa)
-        self.assertEqual(two.sub_pool("window_16").external, auxiliary)
         self.assertEqual(
-            [slot.component for slot in two.tree_slots()],
-            ["FULL", "SWA", "AUXILIARY_SWA"],
+            two.sub_pool("window_64").external,
+            SubPoolExternal(
+                host_pool="swa", tree_component="WINDOW_64", metrics="swa", wire="swa"
+            ),
         )
-        self.assertEqual([slot.window for slot in two.tree_slots()][1:], [64, 16])
+        self.assertEqual(
+            two.sub_pool("window_16").external,
+            SubPoolExternal(
+                host_pool="auxiliary_swa",
+                tree_component="WINDOW_16",
+                metrics="swa",
+                wire="auxiliary_swa",
+            ),
+        )
+        slots = two.tree_slots()
+        self.assertEqual(
+            [slot.component for slot in slots], ["FULL", "WINDOW_64", "WINDOW_16"]
+        )
+        self.assertEqual(
+            [slot.host_pool for slot in slots], ["kv", "swa", "auxiliary_swa"]
+        )
+        self.assertEqual([slot.window for slot in slots][1:], [64, 16])
+        # The tree's first window slot plays the window role.
+        self.assertEqual(
+            [ct.name for ct in tree_slot_ids(slots).values()],
+            ["FULL", "SWA", "WINDOW_16"],
+        )
         self.assertEqual(
             [e.state_type for e in two.wire_entries()], ["swa", "auxiliary_swa"]
         )
+        # A prefix tree keeps every window; PD peers have no entry for a third.
         three = _plan((64, 16, 8))
-        with self.assertRaisesRegex(ValueError, "at most 2 windows"):
-            three.tree_slots()
+        self.assertEqual(
+            [(slot.component, slot.window) for slot in three.tree_slots()],
+            [("FULL", None), ("WINDOW_64", 64), ("WINDOW_16", 16), ("WINDOW_8", 8)],
+        )
+        self.assertEqual(three.sub_pool("window_8").external.host_pool, "window_8")
         with self.assertRaisesRegex(ValueError, "no state type"):
             three.wire_entries()
 
@@ -369,10 +393,13 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                 req.seqlen = frontier + 1
                 req.decode_batch_idx = frontier - 16
                 batch.maybe_evict_swa()
-                cache.evict(EvictParams(swa_num_tokens=80, auxiliary_swa_num_tokens=80))
+                short = cache.window_slots()[1]
+                cache.evict(
+                    EvictParams(swa_num_tokens=80, window_num_tokens={short: 80})
+                )
                 for ct, window in (
                     (ComponentType.SWA, long_window),
-                    (ComponentType.AUXILIARY_SWA, short_window),
+                    (short, short_window),
                 ):
                     self.assertEqual(
                         node.component_data[ct].lock_ref,
@@ -388,11 +415,151 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
             cache.unlock(lock)
             cache.evict(
                 EvictParams(
-                    num_tokens=80, swa_num_tokens=80, auxiliary_swa_num_tokens=80
+                    num_tokens=80,
+                    swa_num_tokens=80,
+                    window_num_tokens={cache.window_slots()[1]: 80},
                 )
             )
             self.assertEqual(storage.accounting_violations(), [])
             self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
+
+
+class TestThreeWindowTree(CustomTestCase):
+    """A prefix tree keeps one slot per window sub-pool: each window's values,
+    locks and evictions are its own."""
+
+    def _cache(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        storage = _storage((16, 8, 4), lazy=False)
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=storage.allocator,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        return storage, cache
+
+    def test_each_window_slot_matches_locks_and_evicts_alone(self):
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        swa, swa_8, swa_4 = cache.window_slots()
+        self.assertEqual(
+            [ct.name for ct in (swa, swa_8, swa_4)], ["SWA", "WINDOW_8", "WINDOW_4"]
+        )
+        self.assertIs(swa, ComponentType.SWA)
+        self.assertEqual(
+            [(name, ct) for name, ct, _, _ in a.admission_windows(cache)],
+            [("window_16", swa), ("window_8", swa_8), ("window_4", swa_4)],
+        )
+        self.assertEqual(
+            [cache.window_retain_size(ct) for ct in (swa, swa_8, swa_4)], [16, 8, 4]
+        )
+
+        key = RadixKey(array("q", range(16)))
+        cache.insert(InsertParams(key=key, value=a.alloc(16).clone()))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(match.device_prefix_len, 16)
+        node = cache.tree_core.node_by_id(match.last_device_node)
+        for ct in (swa, swa_8, swa_4):
+            self.assertEqual(cache.window_evictable_size(ct), 16)
+            self.assertIsNotNone(node.component_data[ct].value)
+
+        # A lock holds each window slot's own trailing window of the prefix.
+        lock = cache.lock(match.last_device_node)
+        for ct in (swa, swa_8, swa_4):
+            self.assertEqual(node.component_data[ct].lock_ref, 1)
+        self.assertEqual(
+            [cache.window_evictable_size(ct) for ct in (swa, swa_8, swa_4)],
+            [0, 8, 12],
+        )
+        # Each further window evicts what lies before its own window, alone.
+        result = cache.evict(EvictParams(window_num_tokens={swa_8: 16, swa_4: 16}))
+        self.assertEqual(result.window_num_tokens_evicted, {swa_8: 8, swa_4: 12})
+        self.assertEqual(
+            (result.num_tokens_evicted, result.swa_num_tokens_evicted), (0, 0)
+        )
+        self.assertEqual(
+            {b.sub_pool_name: b.allocated_count() for b in a.bands},
+            {"full": 16, "window_16": 16, "window_8": 8, "window_4": 4},
+        )
+        # Every window still holds its trailing tokens: the prefix matches whole.
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 16
+        )
+        cache.unlock(lock)
+
+        cache.evict(
+            EvictParams(
+                num_tokens=64,
+                swa_num_tokens=64,
+                window_num_tokens={swa_8: 64, swa_4: 64},
+            )
+        )
+        self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_reclaim_evicts_a_further_window_for_its_own_demand(self):
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        _, _, swa_4 = cache.window_slots()
+        # Fill the pool with cached prefixes.
+        start = 1000
+        while (ids := a.alloc(16)) is not None:
+            key = RadixKey(array("q", range(start, start + 16)))
+            cache.insert(InsertParams(key=key, value=ids.clone()))
+            start += 16
+        reclaimable = a._reclaimable_units(cache)
+        pages = next(
+            (
+                n
+                for n in range(1, 64)
+                if not a._units_fit({"window_4": n})
+                and a._admits_pages({"window_4": n}, reclaimable)
+            ),
+            None,
+        )
+        self.assertIsNotNone(pages)
+        full_before = cache.full_evictable_size()
+        own_before = cache.window_evictable_size(swa_4)
+        self.assertTrue(a.reclaim(cache, {"window_4": pages}))
+        # The window's own entries go first and suffice: no token entry goes.
+        self.assertLess(cache.window_evictable_size(swa_4), own_before)
+        self.assertEqual(cache.full_evictable_size(), full_before)
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_rust_tree_core_defers_several_windows_to_python(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+            _rust_fallback_reason,
+        )
+
+        storage = _storage((16, 8, 4), lazy=False)
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=storage.requests,
+            token_to_kv_pool_allocator=storage.allocator,
+            page_size=4,
+            tree_slots=storage.tree_slots(),
+        )
+        self.assertIn("several window slots", _rust_fallback_reason(params))
 
 
 if __name__ == "__main__":

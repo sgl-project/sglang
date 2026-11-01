@@ -4,10 +4,12 @@ import dataclasses
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Mapping,
     NamedTuple,
     Optional,
     Protocol,
@@ -178,7 +180,11 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
-    auxiliary_swa_num_tokens: int = 0
+    # Tokens per further window slot (any window but the tree's first, whose
+    # tokens are ``swa_num_tokens``), by component id.
+    window_num_tokens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -188,7 +194,10 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
-    auxiliary_swa_num_tokens_evicted: int = 0
+    # Tokens evicted per further window slot, by component id.
+    window_num_tokens_evicted: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -344,7 +353,9 @@ class MatchResult(NamedTuple):
     # Reusable prefix length in FULL's device-value scan, before node-boundary
     # or auxiliary constraints. None means no shorter prefix was reported.
     full_device_match_len: Optional[int] = None
-    auxiliary_swa_host_hit_length: int = 0
+    # Host hit tokens per further window slot (the first window's are
+    # ``swa_host_hit_length``), by component id.
+    window_host_hit_lengths: Mapping[ComponentType, int] = MappingProxyType({})
 
 
 def zero_match_result(
@@ -361,7 +372,7 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
-        auxiliary_swa_host_hit_length=0,
+        window_host_hit_lengths=MappingProxyType({}),
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
@@ -615,7 +626,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
-    def auxiliary_swa_evictable_size(self):
+    def window_evictable_size(self, component: ComponentType) -> int:
+        """Evictable tokens of one window slot."""
         return 0
 
     def protected_size(self):
@@ -705,8 +717,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
-    def supports_auxiliary_swa(self) -> bool:
-        return False
+    def window_slots(self) -> tuple[ComponentType, ...]:
+        """The tree's window slot ids, the first window first; a tree keeping
+        several windows tracks each one's cursors and prefix locks."""
+        return ()
 
     @property
     def swa_retain_window(self) -> Optional[int]:

@@ -75,13 +75,13 @@ def _random_history(allocator, rng):
             allocator.free_window("draft_swa", live[rng.randrange(len(live))])
 
 
-def _load_back(allocator, rng, full, swa, auxiliary_swa, state_slots):
+def _load_back(allocator, rng, full, swa, draft_swa, state_slots):
     """Issue a host load's takes in a random band order: the owner's token
     ids, each window's host rows, and state slots. Returns the first refused
     sub-pool (or None) and the window rows reserved, which only a prefix tree
     binds."""
     storage = allocator.storage
-    takes = [("full", full), ("window_16", swa), ("draft_swa", auxiliary_swa)]
+    takes = [("full", full), ("window_16", swa), ("draft_swa", draft_swa)]
     if state_slots:
         takes.append(("mamba", state_slots))
     rng.shuffle(takes)
@@ -192,12 +192,10 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 cache = SimpleNamespace(
                     sliding_window_size=16,
                     # The target's window slot retains its own window.
-                    window_retain_size=lambda component: (
-                        16 if component == "SWA" else 12
-                    ),
+                    window_retain_size=lambda component: 16 if component.is_swa else 12,
                     full_evictable_size=lambda: 0,
                     swa_evictable_size=lambda: 0,
-                    auxiliary_swa_evictable_size=lambda: 0,
+                    window_evictable_size=lambda component: 0,
                     supports_prefix_sharing=lambda: True,
                     supports_mamba=lambda: True,
                     mamba_evictable_size=lambda: 0,
@@ -206,7 +204,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 cap = budget._chunk_cap(
                     max_chunk_tokens=11,
                     chunk_limit=12,
-                    host_hit_lengths=(0, 0),
+                    host_hit_lengths=None,
                     state_slots=1,
                 )
                 selected = budget.fit_chunk(
@@ -342,7 +340,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 window = allocator.window_allocators["draft_swa"]
                 take_host, cancel_host = allocator.storage.host_load_alloc("draft_swa")
                 with allocator.scoped_physical_takes(
-                    8, 8, auxiliary_swa_tokens=16, state_slots=2
+                    8, 8, window_tokens={"draft_swa": 16}, state_slots=2
                 ):
                     # H2D may allocate an empty float before the pending state
                     # and token work. Its midpoint heuristic must not consume
@@ -372,8 +370,8 @@ class TestMultiwindowPlacement(unittest.TestCase):
         of refusing the reservation it was promised. (Several windows reclaim
         for a load as for a preallocation.)"""
         for state, demand in (
-            (False, dict(full=0, swa=8, auxiliary_swa=0, state_slots=0)),
-            (True, dict(full=0, swa=32, auxiliary_swa=32, state_slots=1)),
+            (False, dict(full=0, swa=8, draft_swa=0, state_slots=0)),
+            (True, dict(full=0, swa=32, draft_swa=32, state_slots=1)),
         ):
             for lazy in (False, True):
                 with self.subTest(state=state, lazy=lazy):
@@ -382,7 +380,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                         self.assertIsNotNone(allocator.alloc(tokens))
                     args = (demand["full"], demand["swa"])
                     kwargs = dict(
-                        auxiliary_swa_tokens=demand["auxiliary_swa"],
+                        window_tokens={"draft_swa": demand["draft_swa"]},
                         state_slots=demand["state_slots"],
                     )
                     pages = allocator.page_demands(*args, **kwargs).items()
@@ -399,7 +397,11 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     )
                     with allocator.scoped_physical_takes(*args, **kwargs):
                         refused, reserved = _load_back(
-                            allocator, random.Random(0), *args, *kwargs.values()
+                            allocator,
+                            random.Random(0),
+                            *args,
+                            demand["draft_swa"],
+                            demand["state_slots"],
                         )
                     self.assertIsNone(refused)
                     _give_back(reserved)
@@ -423,7 +425,9 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     if not (full or swa or aux or state_slots):
                         continue
                     args = (full, swa)
-                    kwargs = dict(auxiliary_swa_tokens=aux, state_slots=state_slots)
+                    kwargs = dict(
+                        window_tokens={"draft_swa": aux}, state_slots=state_slots
+                    )
                     # Nothing is cached, so reclaim is ready exactly when the
                     # demand fits.
                     if not allocator.ensure_capacity(*args, **kwargs):
@@ -446,7 +450,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
         allocator = _build(state=False, lazy=True, draft_dim=8)
         window = allocator.window_allocators["draft_swa"]
         with self.assertRaisesRegex(RuntimeError, "after H2D"):
-            with allocator.scoped_physical_takes(4, 4, auxiliary_swa_tokens=4):
+            with allocator.scoped_physical_takes(4, 4, window_tokens={"draft_swa": 4}):
                 self.assertIsNotNone(window.alloc_physical(4))
                 raise RuntimeError("after H2D")
         self.assertTrue(all(b._physical_take_scope is None for b in allocator.members))

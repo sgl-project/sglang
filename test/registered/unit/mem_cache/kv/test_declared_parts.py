@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +31,10 @@ from sglang.test.unified_allocator_fixtures import (
 )
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+# The tree slot of the fused draft's window sub-pool ("draft_swa") when the
+# target keeps a window of its own.
+DRAFT_WINDOW = ComponentType.of("DRAFT_SWA")
 
 
 class _RequestKV:
@@ -335,18 +340,20 @@ class TestDeclaredParts(CustomTestCase):
                         # after this window has left the current decode tail.
                         with patch.object(cache, "swa_retain_floor", return_value=0):
                             batch.maybe_evict_swa()
-                        for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
+                        for ct in (ComponentType.SWA, DRAFT_WINDOW):
                             self.assertEqual(node.component_data[ct].lock_ref, 1)
                     batch.maybe_evict_swa()
                     # Repeated scheduling must neither release twice nor drop
                     # the longer window while it still reads the cached prefix.
                     batch.maybe_evict_swa()
                     cache.evict(
-                        EvictParams(swa_num_tokens=80, auxiliary_swa_num_tokens=80)
+                        EvictParams(
+                            swa_num_tokens=80, window_num_tokens={DRAFT_WINDOW: 80}
+                        )
                     )
                     for ct, window in (
                         (ComponentType.SWA, 16),
-                        (ComponentType.AUXILIARY_SWA, draft_window),
+                        (DRAFT_WINDOW, draft_window),
                     ):
                         self.assertEqual(
                             node.component_data[ct].lock_ref,
@@ -363,7 +370,9 @@ class TestDeclaredParts(CustomTestCase):
                 cache.unlock(lock)
                 cache.evict(
                     EvictParams(
-                        num_tokens=80, swa_num_tokens=80, auxiliary_swa_num_tokens=80
+                        num_tokens=80,
+                        swa_num_tokens=80,
+                        window_num_tokens={DRAFT_WINDOW: 80},
                     )
                 )
                 self.assertEqual(storage.accounting_violations(), [])
@@ -378,7 +387,6 @@ class TestDeclaredParts(CustomTestCase):
             DraftBand,
             FusedDraftPlacement,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_draft_pool import routed_draft_pool
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -471,9 +479,7 @@ class TestDeclaredParts(CustomTestCase):
                                 ).allocated_count(),
                                 window + interval + 4,
                             )
-                    self.assertGreater(
-                        req.kv.get_evicted_seqlen(ComponentType.AUXILIARY_SWA), 0
-                    )
+                    self.assertGreater(req.kv.get_evicted_seqlen(DRAFT_WINDOW), 0)
                     self.assertEqual(a.full_attn_allocator.allocated_count(), 64)
                     a.free(torch.cat(chunks))
                     self.assertEqual(storage.accounting_violations(), [])
@@ -1025,7 +1031,7 @@ class TestDeclaredParts(CustomTestCase):
                         skip_lock_components=(
                             ComponentType.FULL,
                             ComponentType.SWA,
-                            ComponentType.AUXILIARY_SWA,
+                            DRAFT_WINDOW,
                         ),
                     )
                     for node in nodes
@@ -1045,7 +1051,11 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertTrue(budget.check_prefill(**demand)[0])
                 self.assertIsNone(
                     a.reclaim_for_prealloc(
-                        cache, 248, 20, auxiliary_swa_tokens=244, state_slots=1
+                        cache,
+                        248,
+                        20,
+                        window_tokens={"draft_swa": 244},
+                        state_slots=1,
                     )
                 )
                 incoming_state = a.alloc_state_slots(1)
@@ -1138,7 +1148,7 @@ class TestDeclaredParts(CustomTestCase):
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
                     self.assertEqual(cache.swa_evictable_size(), 0)
-                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
+                    self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
                     self.assertEqual(cache.mamba_evictable_size(), 16)
                     phases = []
                     original = cache.evict_for_alloc
@@ -1788,7 +1798,7 @@ class TestDeclaredParts(CustomTestCase):
                             kv = ReqKvInfo(req_pool_idx=0)
                             kv.set_evicted_seqlen(ComponentType.SWA, 16)
                             if window < 16:
-                                kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 24)
+                                kv.set_evicted_seqlen(DRAFT_WINDOW, 24)
                             storage.free_row(kv, [(0, 32)])
                         if grouped:
                             a.free_group_end()
@@ -1980,7 +1990,7 @@ class TestDeclaredParts(CustomTestCase):
                 receipt = cache.inc_lock_ref(node)
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
-                    self.assertEqual(cache.auxiliary_swa_evictable_size(), 0)
+                    self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
                     self.assertEqual(cache.swa_evictable_size(), 144)
                     self.assertFalse(a.ensure_capacity(4, 4))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
@@ -2021,14 +2031,12 @@ class TestDeclaredParts(CustomTestCase):
                 ComponentType.SWA: SimpleNamespace(
                     value=None, host_value=torch.arange(4)
                 ),
-                ComponentType.AUXILIARY_SWA: SimpleNamespace(
-                    value=None, host_value=torch.arange(32)
-                ),
+                DRAFT_WINDOW: SimpleNamespace(value=None, host_value=torch.arange(32)),
             },
         )
         for order in (
-            (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
-            (ComponentType.AUXILIARY_SWA, ComponentType.SWA),
+            (ComponentType.SWA, DRAFT_WINDOW),
+            (DRAFT_WINDOW, ComponentType.SWA),
         ):
             with self.subTest(order=order):
                 result = MatchResult(64, node, node, node, full_kv_hit_length=64)
@@ -2041,15 +2049,18 @@ class TestDeclaredParts(CustomTestCase):
                         result, None, [], 0
                     )
                 self.assertEqual(result.swa_host_hit_length, 4)
-                self.assertEqual(result.auxiliary_swa_host_hit_length, 32)
+                self.assertEqual(result.window_host_hit_lengths, {DRAFT_WINDOW: 32})
                 req = Req.__new__(Req)
-                req.matched_auxiliary_swa_host_hit_length = (
-                    result.auxiliary_swa_host_hit_length
+                req.matched_window_host_hit_lengths = dict(
+                    result.window_host_hit_lengths
                 )
                 req.staged_prefetch_plan = None
-                self.assertEqual(req.auxiliary_swa_host_hit_length, 32)
-                req.staged_prefetch_plan = SimpleNamespace(window_tokens=lambda ct: 16)
-                self.assertEqual(req.auxiliary_swa_host_hit_length, 16)
+                self.assertEqual(req.window_host_hit_lengths, {DRAFT_WINDOW: 32})
+                req.staged_prefetch_plan = SimpleNamespace(
+                    windows={ComponentType.SWA: None, DRAFT_WINDOW: None},
+                    window_tokens=lambda ct: 16,
+                )
+                self.assertEqual(req.window_host_hit_lengths, {DRAFT_WINDOW: 16})
 
     def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -2128,11 +2139,11 @@ class TestDeclaredParts(CustomTestCase):
                     extend_input_len=1,
                     max_new_tokens=400,
                     swa_host_hit_length=5,
-                    auxiliary_swa_host_hit_length=9,
+                    window_host_hit_lengths={DRAFT_WINDOW: 9},
                     chunk_limit=8,
                 )
                 self.assertEqual(full, 416)
-                self.assertEqual(demand["auxiliary_swa_tokens"], 44)
+                self.assertEqual(demand["window_tokens"]["draft_swa"], 44)
                 self.assertGreater(primary, budget.window_offsets["window_16"])
                 self.assertEqual(storage.accounting_violations(), [])
 
@@ -2161,10 +2172,12 @@ class TestDeclaredParts(CustomTestCase):
         cache = SimpleNamespace(
             sliding_window_size=16,
             # The target's window slot retains its own window; the draft's more.
-            window_retain_size=lambda component: 16 if component == "SWA" else 32,
+            window_retain_size=lambda component: (
+                16 if component == ComponentType.SWA else 32
+            ),
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
-            auxiliary_swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda component: 0,
             supports_mamba=lambda: False,
             supports_prefix_sharing=lambda: True,
             evict_for_alloc=lambda *args, **kwargs: EvictResult(),
@@ -2201,7 +2214,9 @@ class TestDeclaredParts(CustomTestCase):
         )
         self.assertEqual(budget.check_prefill(**kwargs), (True, None))
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=capacity),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: capacity}
+            ),
             (False, None),
         )
         prepare = dict(
@@ -2212,26 +2227,36 @@ class TestDeclaredParts(CustomTestCase):
             chunk_limit=None,
         )
         self.assertFalse(
-            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=capacity)
+            budget.prepare_load_back(
+                **prepare, window_host_hit_lengths={DRAFT_WINDOW: capacity}
+            )
         )
         restore = min(32, capacity - 8)
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: restore}
+            ),
             (True, None),
         )
         budget.reserve(capacity, 0)
         self.assertEqual(
-            budget.check_prefill(**kwargs, auxiliary_swa_host_hit_length=restore),
+            budget.check_prefill(
+                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: restore}
+            ),
             (False, None),
         )
         budget = a.create_prefill_budget(cache)
         self.assertTrue(
-            budget.prepare_load_back(**prepare, auxiliary_swa_host_hit_length=restore)
+            budget.prepare_load_back(
+                **prepare, window_host_hit_lengths={DRAFT_WINDOW: restore}
+            )
         )
         # Realize a window-only host restoration, then the promised joint
         # allocation. Admission must leave both in the same byte envelope.
         window = next(w for w in a._windows if w.sub_pool_name == "draft_swa")
-        with budget.load_back_scope(**prepare, auxiliary_swa_host_hit_length=restore):
+        with budget.load_back_scope(
+            **prepare, window_host_hit_lengths={DRAFT_WINDOW: restore}
+        ):
             window.alloc_with_virtual(resident[:restore:4] // 4)
         self.assertIsNotNone(a.alloc(8))
         self.assertEqual(storage.accounting_violations(), [])
@@ -2424,7 +2449,7 @@ class TestDeclaredParts(CustomTestCase):
                     value=value.clone(),
                     component_evicted_seqlens={
                         ComponentType.SWA: value.numel() - 8,
-                        ComponentType.AUXILIARY_SWA: value.numel() - 4,
+                        DRAFT_WINDOW: value.numel() - 4,
                     },
                 )
             )
@@ -2435,7 +2460,7 @@ class TestDeclaredParts(CustomTestCase):
             (
                 cache.full_evictable_size(),
                 cache.swa_evictable_size(),
-                cache.auxiliary_swa_evictable_size(),
+                cache.window_evictable_size(DRAFT_WINDOW),
             ),
             (80, 8, 4),
         )
@@ -2450,7 +2475,7 @@ class TestDeclaredParts(CustomTestCase):
             EvictParams(
                 num_tokens=80,
                 swa_num_tokens=8,
-                auxiliary_swa_num_tokens=4,
+                window_num_tokens={DRAFT_WINDOW: 4},
             )
         )
         # The evicted end holes are credited before any flush: the planned
@@ -2629,7 +2654,7 @@ class TestDeclaredParts(CustomTestCase):
         key = RadixKey(array("q", range(32)))
         ids = alloc.alloc(32)
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        cache.evict(EvictParams(auxiliary_swa_num_tokens=4))
+        cache.evict(EvictParams(window_num_tokens={DRAFT_WINDOW: 4}))
         old_full = alloc.full_attn_allocator.ids.translate(ids).clone()
         incoming = alloc.alloc(32)
         self.assertIsNotNone(incoming)
@@ -2641,7 +2666,9 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(matched.device_prefix_len, 32)
         self.assertEqual(storage.accounting_violations(), [])
         cache.evict(
-            EvictParams(num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64)
+            EvictParams(
+                num_tokens=64, swa_num_tokens=64, window_num_tokens={DRAFT_WINDOW: 64}
+            )
         )
         self.assertEqual(
             {b.sub_pool_name: b.allocated_count() for b in alloc.bands},

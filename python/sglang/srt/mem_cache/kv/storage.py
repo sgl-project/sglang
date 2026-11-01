@@ -9,6 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -30,6 +31,7 @@ from sglang.srt.mem_cache.kv.plan import (
     SubPoolExternal,
     TreeSlot,
     WireEntry,
+    tree_slot_ids,
 )
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
@@ -313,10 +315,11 @@ class KVStorage:
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         component_type = ComponentType.SWA if component_type is None else component_type
+        slot_ids = self._tree_slot_ids
         sub_pool = next(
             s.name
             for s in self._plan.sub_pools
-            if s.external.tree_component == component_type.name
+            if slot_ids.get(s.external.tree_component) == component_type
         )
         free_swa_out_of_window_slots(
             req,
@@ -354,10 +357,18 @@ class KVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    def tree_sub_pool(self, component: str) -> str:
-        """The sub-pool whose values the prefix tree's ``component`` holds."""
+    @functools.cached_property
+    def _tree_slot_ids(self):
+        """Each tree component name's id inside the prefix tree."""
+        return tree_slot_ids(self._plan.tree_slots())
+
+    def tree_sub_pool(self, component, *, family: Optional[str] = None) -> str:
+        """The sub-pool whose values the prefix tree's ``component`` (a
+        component id, `tree_slot_ids`) holds; ``family``, the slot's family,
+        is not needed here, as every slot is named by its sub-pool."""
+        slot_ids = self._tree_slot_ids
         for s in self._sub_pools:
-            if s.external.tree_component == component:
+            if slot_ids.get(s.external.tree_component) == component:
                 return s.name
         raise KeyError(f"no sub-pool backs the tree component {component!r}")
 
@@ -408,10 +419,11 @@ class KVStorage:
 
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
+        slot_ids = self._tree_slot_ids
         for sub_pool in self._sub_pools:
             if sub_pool.name not in self._allocator.window_allocators:
                 continue
-            component = ComponentType[sub_pool.external.tree_component]
+            component = slot_ids[sub_pool.external.tree_component]
             dead_lo = (
                 kv.swa_dead_lo(self._allocator.page_size)
                 if component == ComponentType.SWA

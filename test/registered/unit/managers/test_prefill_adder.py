@@ -144,7 +144,7 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
-        req.auxiliary_swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
