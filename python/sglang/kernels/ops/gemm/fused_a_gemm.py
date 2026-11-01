@@ -61,15 +61,12 @@ def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
     )
 
 
-def fp8_small_m_eligible(
-    layer: torch.nn.Module, weight_block_size: list[int], block_fp8_as_mxfp8: bool
-) -> bool:
-    # SM10x only (SM100, SM103, SM107), where the kernel is validated; MXFP8-view layers keep their own kernel.
+def fp8_small_m_eligible(layer: torch.nn.Module, weight_block_size: list[int]) -> bool:
+    # SM10x only (SM100, SM103, SM107), where the kernel is validated; MXFP8-view layers have 32-wide K blocks.
     if (
         not _IS_CUDA
         or _DEVICE_SM // 10 != 10
         or weight_block_size != [128, 128]
-        or block_fp8_as_mxfp8
         or layer.bias is not None
     ):
         return False

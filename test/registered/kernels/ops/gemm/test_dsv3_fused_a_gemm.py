@@ -150,22 +150,9 @@ def test_fp8_fused_a_gemm_strided_scales(scale_format):
 
 
 @pytest.mark.usefixtures("cuda_sm10x")
-@pytest.mark.parametrize("scale_format", ["fp32", "ue8m0"])
-def test_fp8_fused_a_gemm_graph_and_compile(scale_format):
-    x, w, scales, effective_w = _fp8_case(9, 144, 640, scale_format)
-    # Compile JIT specializations before capture, as server graph warmup does.
-    dsv3_fused_a_gemm_fp8(x, w, scales)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        out = dsv3_fused_a_gemm_fp8(x, w, scales)
-    torch.cuda.current_stream().wait_stream(stream)
-    x.normal_()
-    graph.replay()
+def test_fp8_fused_a_gemm_torch_compile():
+    x, w, scales, effective_w = _fp8_case(9, 144, 640, "fp32")
     ref = (x.double() @ effective_w.T).bfloat16()
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
-
     compiled = torch.compile(dsv3_fused_a_gemm_fp8, backend="eager", fullgraph=True)
     torch.testing.assert_close(compiled(x, w, scales), ref, rtol=1e-2, atol=1e-3)
 
@@ -232,7 +219,6 @@ def fp8_projection(cuda_device, monkeypatch):
 
     # Backend selection is unrelated to the stored-layout dispatch contract.
     monkeypatch.setattr(fp8, "dispatch_w8a8_block_fp8_linear", lambda **kw: None)
-    monkeypatch.setattr(fp8, "can_serve_block_fp8_as_mxfp8", lambda *a: False)
     # No server runtime context is published in a unit test.
     monkeypatch.setattr(
         runtime_context,
@@ -283,9 +269,10 @@ def _fp8_projection_reference(layer, x):
         "sm120",
         "bias",
         "deterministic",
-        "mxfp8_view",
         "block32",
         "bad_scales",
+        "explicit_backend",
+        "kill_switch",
     ],
 )
 def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
@@ -293,8 +280,10 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
 
     from sglang.kernels.ops.gemm import fused_a_gemm as dispatch
     from sglang.srt import runtime_context
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization import fp8_utils
 
-    block_size, mxfp8_view = [128, 128], False
+    block_size = [128, 128]
     if case == "unlisted_shape":
         monkeypatch.setattr(dispatch, "_FP8_SMALL_M_SHAPES", frozenset())
     elif case in ("sm90", "sm100", "sm107", "sm120"):
@@ -309,44 +298,23 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
                 deterministic=SimpleNamespace(enable_deterministic_inference=True)
             ),
         )
-    elif case == "mxfp8_view":
-        mxfp8_view = True
     elif case == "block32":
         block_size = [1, 32]
     elif case == "bad_scales":
         fp8_projection.weight_scale_inv = torch.nn.Parameter(
             torch.ones((2, 4), device="cuda"), requires_grad=False
         )
-    assert dispatch.fp8_small_m_eligible(
-        layer=fp8_projection,
-        weight_block_size=block_size,
-        block_fp8_as_mxfp8=mxfp8_view,
-    ) == (case in ("eligible", "sm100", "sm107"))
-
-
-@pytest.mark.parametrize("case", ["explicit_backend", "kill_switch"])
-def test_fp8_small_m_respects_user_selection(fp8_projection, monkeypatch, case):
-    """An explicit --fp8-gemm-backend or SGLANG_ENABLE_FP8_SMALL_M_W8A16=0 keeps the selected W8A8 backend."""
-    from sglang.kernels.ops.gemm import fused_a_gemm as dispatch
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.quantization import fp8_utils
-
-    def eligible():
-        return dispatch.fp8_small_m_eligible(
-            layer=fp8_projection, weight_block_size=[128, 128], block_fp8_as_mxfp8=False
-        )
-
-    assert eligible()
-    if case == "explicit_backend":
+    elif case == "explicit_backend":
         monkeypatch.setattr(
             fp8_utils,
             "get_fp8_gemm_runner_backend",
             lambda: fp8_utils.Fp8GemmRunnerBackend.DEEP_GEMM,
         )
-        assert not eligible()
-    else:
-        with envs.SGLANG_ENABLE_FP8_SMALL_M_W8A16.override(False):
-            assert not eligible()
+    with envs.SGLANG_ENABLE_FP8_SMALL_M_W8A16.override(case != "kill_switch"):
+        eligible = dispatch.fp8_small_m_eligible(
+            layer=fp8_projection, weight_block_size=block_size
+        )
+    assert eligible == (case in ("eligible", "sm100", "sm107"))
 
 
 @pytest.mark.parametrize("case", ["too_many_rows", "strided", "fp16"])

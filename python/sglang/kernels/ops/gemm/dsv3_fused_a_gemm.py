@@ -95,21 +95,11 @@ def dsv3_fused_a_gemm(
     return result
 
 
-def _is_sm10x() -> bool:
-    if is_hip_runtime():
-        return False
-    return get_jit_cuda_arch().major == 10
-
-
 @cache_once
-def dsv3_fused_a_gemm_fp8_module(k: int, n: int, scale_dtype: torch.dtype) -> Module:
-    if not _is_sm10x():
+def dsv3_fused_a_gemm_fp8_module(k: int, n: int, packed_scales: bool) -> Module:
+    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
         raise RuntimeError("dsv3_fused_a_gemm_fp8 is validated on SM10x only")
-    if k <= 0 or k % 128 or n <= 0 or n % 16:
-        raise ValueError("K must be a positive multiple of 128; N a multiple of 16")
-    if scale_dtype not in (torch.float32, torch.int32):
-        raise ValueError("weight_scale must contain FP32 scales or packed UE8M0 int32")
-    args = make_cpp_args(k, n, scale_dtype == torch.int32, is_arch_support_pdl())
+    args = make_cpp_args(k, n, packed_scales, is_arch_support_pdl())
     return load_jit(
         "dsv3_fused_a_gemm_fp8",
         *args,
@@ -118,9 +108,7 @@ def dsv3_fused_a_gemm_fp8_module(k: int, n: int, scale_dtype: torch.dtype) -> Mo
     )
 
 
-@register_custom_op(
-    op_name="jit_dsv3_fused_a_gemm_fp8", mutates_args=["out"], eager=True
-)
+@register_custom_op(op_name="jit_dsv3_fused_a_gemm_fp8", mutates_args=["out"])
 def _dsv3_fused_a_gemm_fp8_run(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -128,7 +116,7 @@ def _dsv3_fused_a_gemm_fp8_run(
     out: torch.Tensor,
 ) -> None:
     module = dsv3_fused_a_gemm_fp8_module(
-        weight.shape[1], weight.shape[0], weight_scale.dtype
+        weight.shape[1], weight.shape[0], weight_scale.dtype == torch.int32
     )
     module.run(input, weight, weight_scale, out)
 

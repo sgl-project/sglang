@@ -949,9 +949,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale_inv.set_(scale_reordered)
 
         self.small_m_w8a16 = fp8_small_m_eligible(
-            layer=layer,
-            weight_block_size=self.weight_block_size,
-            block_fp8_as_mxfp8=self.block_fp8_as_mxfp8,
+            layer=layer, weight_block_size=self.weight_block_size
         )
 
     def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
