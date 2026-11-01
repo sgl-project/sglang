@@ -68,7 +68,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, validate_n
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
@@ -544,12 +544,13 @@ class GenerateReqInput:
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
+        # Validate before inputs are expanded n times; verify() runs too late.
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != validate_n(sampling_params.get("n", 1)):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
