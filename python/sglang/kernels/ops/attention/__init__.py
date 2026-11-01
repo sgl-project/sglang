@@ -292,6 +292,16 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
+        op="attention.cute_sparse_mla_h16_fwd",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16:cute_sparse_mla_h16_fwd",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.get_block_table",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",

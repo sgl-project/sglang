@@ -22,6 +22,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     import_backend_class,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_spec,
@@ -184,6 +185,11 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
+    if (_is_hip or _is_npu) and get_exec().kernel.dsv4_prefill_backend == "cutedsl_h16":
+        platform = "HIP" if _is_hip else "NPU"
+        raise ValueError(
+            f"DeepSeek-V4 cutedsl_h16 prefill requires CUDA SM90, not {platform}."
+        )
     if _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
