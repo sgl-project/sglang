@@ -218,6 +218,7 @@ class KVStorage:
         retain_floor: Optional[int],
         shares_prefixes: bool,
         eviction_interval: int = 1,
+        reprefill_tail_tokens: int = 0,
     ) -> None:
         """Retire the window rows a running request no longer reads: those more
         than ``window`` tokens behind ``frontier``, at most up to
@@ -235,6 +236,7 @@ class KVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            reprefill_tail_tokens=reprefill_tail_tokens,
         )
 
     def release_row(self, req: Req) -> None:
