@@ -6,10 +6,21 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import msgspec
 import torch
 
+from sglang.srt.managers import tokenizer_manager
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.cuda_vmm_transport_utils import (
     CudaVmmMemoryPool,
     _CudaVmmMemoryChunk,
@@ -18,6 +29,70 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestGuardedDispatchCleanup(CustomTestCase):
+    def test_serialized_dispatch_failure_still_releases_ipc(self):
+        """Pickling must not hide unpublished leases from failure cleanup."""
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                proxy = object.__new__(CudaIpcTensorTransportProxy)
+                item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+                obj = TokenizedGenerateReqInput(
+                    rid="failed-dispatch",
+                    input_text="",
+                    input_ids=[1],
+                    input_embeds=None,
+                    mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=[item]),
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                    time_stats=APIServerReqTimeStats(),
+                )
+                manager = object.__new__(tokenizer_manager.TokenizerManager)
+                manager.rid_to_state = {}
+                manager.encoder_dispatch_ready = {}
+                manager.mm_processor = SimpleNamespace(
+                    cuda_ipc_publisher=SimpleNamespace(
+                        prepare=AsyncMock(return_value=[item])
+                    ),
+                    cudaipc_mmfeature_pool=MagicMock(),
+                )
+                manager.cuda_vmm_feature_transport = MagicMock()
+                manager.cuda_vmm_feature_transport.prepare_for_dispatch_async = (
+                    AsyncMock(return_value=[])
+                )
+                manager.positional_embeds_transport = MagicMock()
+                manager.batch_tokenized_generate_req_type = lambda **kwargs: kwargs
+                manager.canary_info_hook = None
+
+                def fail_dispatch(_):
+                    # The real wire conversion has already pickled this field.
+                    self.assertIsInstance(
+                        obj.mm_inputs.mm_items[0].feature, msgspec.msgpack.Ext
+                    )
+                    raise RuntimeError("send failed")
+
+                manager._dispatch_to_scheduler = fail_dispatch
+                with (
+                    get_context().override_server_args(mm_admission_timeout_ms=0),
+                    patch.object(
+                        tokenizer_manager, "wrap_shm_features", lambda obj: obj
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "send failed"),
+                ):
+                    asyncio.run(
+                        manager._send_batch_request([obj])
+                        if batch
+                        else manager._send_one_request(obj)
+                    )
+                manager.mm_processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(
+                    proxy
+                )
 
 
 class TestVmmAtomicReservation(CustomTestCase):

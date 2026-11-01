@@ -906,7 +906,7 @@ def handle_multimodal_feature_transport(server_args: Any):
     overflow_behavior = (
         "capacity pressure uses bounded admission without CPU spill"
         if cfg.mm_admission_timeout_ms is not None
-        else "a full pool falls back to CPU transport"
+        else "a full pool falls back to inline CPU transport"
     )
     if requested_transport == "cuda_vmm":
         if not get_platform().is_cuda:

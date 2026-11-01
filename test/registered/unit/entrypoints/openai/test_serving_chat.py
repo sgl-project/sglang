@@ -405,11 +405,20 @@ class ServingChatTestCase(CustomTestCase):
 
                 for request in (self.basic_req, self.stream_req):
                     with self.subTest(status=status, stream=request.stream):
-                        with patch.object(self.tm, "generate_request", generate):
+                        with (
+                            patch.object(self.tm, "generate_request", generate),
+                            patch.object(
+                                self.chat,
+                                "_process_messages",
+                                return_value=MessageProcessingResult(
+                                    "Test prompt", [1, 2, 3], None, None, [], [], None
+                                ),
+                            ),
+                        ):
                             response = await self.chat.handle_request(
                                 request, self.fastapi_request
                             )
-                        self.assertEqual(response.status_code, status)
+                        self.assertEqual(response.status_code, status, response.body)
                         payload = json.loads(response.body)
                         self.assertEqual(payload["type"], error_type)
                         self.assertEqual(payload["code"], status)

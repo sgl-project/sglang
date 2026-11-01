@@ -381,6 +381,11 @@ default) on the base GPU and fall back to CPU per tensor when full. This setting
 does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults to
 2 processor workers and 16 I/O workers; leave those flags unset unless tuning.
 
+For unified serving, you can opt into `--mm-admission-timeout-ms 1000` to wait up
+to one second for IPC/VMM pool space and reject on pressure instead of spilling
+to CPU. This is not a preprocessing VRAM cap or a recommended default; clients
+must handle 413/429 responses. See [GPU feature-pool admission](/docs/supported-models/multimodal_language_models#gpu-feature-pool-admission).
+
 #### VLM compatibility
 
 | Feature | K3 behavior |

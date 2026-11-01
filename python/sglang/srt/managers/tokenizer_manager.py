@@ -1828,12 +1828,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        prepared_ipc_items = []
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
         try:
             if get_mm().mm_admission_timeout_ms is not None:
-                await self._prepare_guarded_cuda_ipc((tokenized_obj.mm_inputs,))
+                prepared_ipc_items = await self._prepare_guarded_cuda_ipc(
+                    (tokenized_obj.mm_inputs,)
+                )
             prepared_mm_items = (
                 await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
                     (tokenized_obj.mm_inputs,)
@@ -1863,17 +1866,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
         finally:
             if not dispatched:
-                if get_mm().mm_admission_timeout_ms is not None:
-                    self._cancel_cuda_ipc_features((tokenized_obj,))
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
-                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                self._cancel_prepared_transports(
+                    prepared_ipc_items, prepared_mm_items, prepared_embeds
+                )
+
+    def _cancel_prepared_transports(self, ipc_items, vmm_items, embeds):
+        errors = []
+        for cancel, items in (
+            (self._cancel_cuda_ipc_items, ipc_items),
+            (self.cuda_vmm_feature_transport.cancel_for_dispatch, vmm_items),
+            (self.positional_embeds_transport.cancel_for_dispatch, embeds),
+        ):
+            try:
+                cancel(items)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise RuntimeError(
+                "Failed to release unpublished multimodal inputs"
+            ) from errors[0]
 
     async def _prepare_guarded_cuda_ipc(self, mm_inputs_batch):
         if (
             self.mm_processor is not None
             and self.mm_processor.cuda_ipc_publisher is not None
         ):
-            await self.mm_processor.cuda_ipc_publisher.prepare(mm_inputs_batch)
+            return await self.mm_processor.cuda_ipc_publisher.prepare(mm_inputs_batch)
+        return []
 
     def _drop_aborted_before_dispatch(self, tokenized_objs):
         """Return *tokenized_objs* without the requests aborted before dispatch.
@@ -1928,6 +1947,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _cancel_cuda_ipc_features(self, tokenized_objs) -> None:
         """Return the CUDA IPC feature slices preprocessing published for
         requests that are never dispatched: no scheduler acknowledges them."""
+        self._cancel_cuda_ipc_items(
+            item
+            for obj in tokenized_objs
+            if obj.mm_inputs is not None
+            for item in obj.mm_inputs.mm_items
+        )
+
+    def _cancel_cuda_ipc_items(self, items) -> None:
+        """Keep item references usable even after the request is serialized."""
+        if not items:
+            return
         pool = (
             self.mm_processor.cudaipc_mmfeature_pool
             if self.mm_processor is not None
@@ -1936,21 +1966,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if pool is None:
             return
         errors = []
-        for tokenized_obj in tokenized_objs:
-            if tokenized_obj.mm_inputs is None:
-                continue
-            for item in tokenized_obj.mm_inputs.mm_items:
-                for field, tensor in (
-                    ("feature", item.feature),
-                    ("precomputed_embeddings", item.precomputed_embeddings),
-                ):
-                    if isinstance(tensor, CudaIpcTensorTransportProxy):
-                        try:
-                            pool.cancel_proxy(tensor)
-                        except BaseException as error:
-                            errors.append(error)
-                        finally:
-                            setattr(item, field, None)
+        for item in items:
+            for field, tensor in (
+                ("feature", item.feature),
+                ("precomputed_embeddings", item.precomputed_embeddings),
+            ):
+                if isinstance(tensor, CudaIpcTensorTransportProxy):
+                    try:
+                        pool.cancel_proxy(tensor)
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        setattr(item, field, None)
         if errors:
             raise RuntimeError(
                 f"Failed to cancel {len(errors)} IPC transport slice(s)"
@@ -1973,12 +2000,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        prepared_ipc_items = []
         prepared_mm_items = []
         prepared_embeds = []
         dispatched = False
         try:
             if get_mm().mm_admission_timeout_ms is not None:
-                await self._prepare_guarded_cuda_ipc(
+                prepared_ipc_items = await self._prepare_guarded_cuda_ipc(
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             prepared_mm_items = (
@@ -2017,10 +2045,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
         finally:
             if not dispatched:
-                if get_mm().mm_admission_timeout_ms is not None:
-                    self._cancel_cuda_ipc_features(tokenized_objs)
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
-                self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                self._cancel_prepared_transports(
+                    prepared_ipc_items, prepared_mm_items, prepared_embeds
+                )
 
     def _coalesce_streaming_chunks(
         self,

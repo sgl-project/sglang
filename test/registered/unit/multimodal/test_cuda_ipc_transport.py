@@ -88,6 +88,21 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, guarded=Fal
     result_queue.put(("ok", None))
 
 
+def _consume_pooled_tensors(proxies, expected, result_queue):
+    """CUDA IPC event handles must be opened by another process, not locally."""
+    try:
+        torch.cuda.set_device(0)
+        for proxy in proxies:
+            copied = proxy.reconstruct_on_target_device(0)
+            torch.testing.assert_close(copied.cpu(), expected, rtol=0, atol=0)
+            del copied
+        torch.cuda.synchronize()
+        _pool_handle_cache_clear()
+        result_queue.put(None)
+    except Exception as error:
+        result_queue.put(repr(error))
+
+
 class TestCudaIpcTransport(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -112,12 +127,26 @@ class TestCudaIpcTransport(CustomTestCase):
             with self.assertRaises(MmMemoryOverloaded):
                 await publisher.prepare([rejected])
             self.assertIs(rejected.mm_items[0].feature, source)
-            for output in (first, second):
-                proxy = output.mm_items[0].feature
+            proxies = [output.mm_items[0].feature for output in (first, second)]
+            for proxy in proxies:
                 self.assertIsInstance(proxy, CudaIpcTensorTransportProxy)
-                copied = proxy.reconstruct_on_target_device(0)
-                self.assertTrue(torch.equal(copied, source))
-            torch.cuda.synchronize()
+            ctx = mp.get_context("spawn")
+            results = ctx.Queue()
+            consumer = ctx.Process(
+                target=_consume_pooled_tensors,
+                args=(proxies, source.cpu(), results),
+            )
+            consumer.start()
+            try:
+                self.assertIsNone(await asyncio.to_thread(results.get, True, 60))
+                await asyncio.to_thread(consumer.join, 10)
+                self.assertEqual(consumer.exitcode, 0)
+            finally:
+                if consumer.is_alive():
+                    consumer.terminate()
+                    consumer.join(10)
+                results.close()
+                results.join_thread()
             deadline = time.monotonic() + 5
             while pool.active_lease_count and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
