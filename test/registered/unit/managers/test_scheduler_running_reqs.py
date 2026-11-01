@@ -90,6 +90,18 @@ def _scheduler():
     s.profiler_manager = MagicMock()
     s.forward_sleep_time = None
     s.enable_staging = False
+    # process_batch_result around the mode-specific processing
+    s._deferred_responses = None
+    s.publish_load_snapshot = Mock()
+    s.load_publisher = MagicMock()
+    s.load_inquirer = MagicMock()
+    s.batch_result_processor = MagicMock()
+    s.tree_cache = MagicMock()
+    s._record_step_counters = Mock()
+    s.enable_fpm = False
+    s._maybe_clear_mm_inputs = Mock()
+    s.maybe_send_health_check_signal = Mock()
+    s.invariant_checker = SchedulerInvariantChecker.__new__(SchedulerInvariantChecker)
     return s
 
 
@@ -332,52 +344,22 @@ class TestRunningReqsHooks(CustomTestCase):
         s._add_request_to_queue.assert_called_once_with(victim)
         self.assertEqual(list(s.running_reqs), [other])
 
-
-class TestInflightSteps(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        enter_scope(self, published_topology())
-
-    def _scheduler(self):
+    def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
         s = _scheduler()
-        # process_batch_result around the mode-specific processing
-        s._deferred_responses = None
-        s.publish_load_snapshot = Mock()
-        s.load_publisher = MagicMock()
-        s.load_inquirer = MagicMock()
-        s.batch_result_processor = MagicMock()
-        s.tree_cache = MagicMock()
-        s._record_step_counters = Mock()
-        s.enable_fpm = False
-        s._maybe_clear_mm_inputs = Mock()
-        s.maybe_send_health_check_signal = Mock()
-        s.invariant_checker = SchedulerInvariantChecker.__new__(
-            SchedulerInvariantChecker
-        )
-        return s
-
-    def test_launch_counts_and_processing_uncounts(self):
-        s = self._scheduler()
         a, b = _req("a"), _req("b")
         first = _batch([a, b], ForwardMode.DECODE)
         second = _batch([a], ForwardMode.DECODE)
-
         _launch(s, first)
         _launch(s, second)
         self.assertEqual((a.inflight_steps, b.inflight_steps), (2, 1))
 
-        s.process_batch_result(first, MagicMock())
-        self.assertEqual((a.inflight_steps, b.inflight_steps), (1, 0))
-        s.process_batch_result(second, MagicMock())
-        self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
-
-    def test_check_rejects_processing_a_step_never_launched(self):
-        s = self._scheduler()
-        with (
-            envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
-            self.assertRaisesRegex(RuntimeError, "launched with \[\]"),
-        ):
-            s.process_batch_result(_batch([_req("a")], ForwardMode.DECODE), MagicMock())
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            s.process_batch_result(first, MagicMock())
+            s.process_batch_result(second, MagicMock())
+            self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
+            with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
+                never_launched = _batch([_req("c")], ForwardMode.DECODE)
+                s.process_batch_result(never_launched, MagicMock())
 
 
 if __name__ == "__main__":
