@@ -280,6 +280,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    input_deepstack_embeds: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
 
     @classmethod
@@ -294,6 +295,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        deepstack_replay_width: int = 0,
         enable_input_embeds: Optional[bool] = None,
         pp_size: int = 1,
         is_first_pp_rank: bool = False,
@@ -331,8 +333,15 @@ class PrefillInputBuffers(ForwardInputBuffers):
 
             if is_multimodal:
                 mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
+                if deepstack_replay_width > 0:
+                    input_deepstack_embeds = torch.zeros(
+                        (max_num_tokens, deepstack_replay_width), dtype=dtype
+                    )
+                else:
+                    input_deepstack_embeds = None
             else:
                 mrope_positions = None
+                input_deepstack_embeds = None
 
             pp_proxy_tensors = (
                 allocate_pp_proxy_tensors(
@@ -359,5 +368,6 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            input_deepstack_embeds=input_deepstack_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
