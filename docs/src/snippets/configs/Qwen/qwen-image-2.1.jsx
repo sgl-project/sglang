@@ -1,6 +1,8 @@
 export const config = (() => {
 const sm12Hardware = ["rtx5090", "rtxpro6000", "dgx-spark"];
-const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : "fa";
+// One B200 serves the platform default, cuDNN SDPA: 2.22 s against 2.32 s with FlashAttention for
+// 1024px/40-step generation and 2.70 s against 2.89 s for an edit (2026-11-01, sglang 3a01d4cc).
+const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : s.hw === "b200" && Number(s.gpus_per_node) === 1 ? "cudnn" : "fa";
 const effectiveAttention = (s) => s.attention === "platform" || (sm12Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
@@ -83,10 +85,16 @@ const config = {
       options: [
         {
           id: "platform", label: "Automatic", recommended: true,
-          flags: (s) => s.hw === "b200" ? ["--attention-backend fa"] : [],
-          description: "Uses SDPA on RTX PRO 6000, RTX 5090, and DGX Spark, and FlashAttention on the other listed GPUs.",
+          flags: (s) => s.hw === "b200" && Number(s.gpus_per_node) !== 1 ? ["--attention-backend fa"] : [],
+          description: "Uses cuDNN SDPA on one B200, SDPA on RTX PRO 6000, RTX 5090, and DGX Spark, and FlashAttention on the other listed GPUs.",
         },
         { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000, RTX 5090, and DGX Spark." },
+        {
+          id: "cudnn", label: "cuDNN SDPA", flags: ["--attention-backend dynamic_cudnn_sdpa"],
+          soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("cudnn") && Number(s.gpus_per_node) === r.gpus_per_node),
+          softReason: "This hardware and placement combination has not completed HTTP verification with cuDNN SDPA.",
+          description: "Exact attention through cuDNN on Blackwell. Floating-point reduction order can differ from FlashAttention.",
+        },
         {
           id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"],
           soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("sdpa") && Number(s.gpus_per_node) === r.gpus_per_node),
@@ -298,7 +306,7 @@ const config = {
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
         { id: "h200-2-tp-turbo", weights: "turbo", hw: "h200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], verifiedWhen: (s) => s.weights === "turbo" && (!s.batching || s.batching === "off") },
-        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
+        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa", "cudnn"], batchSizes: [1, 2, 4], batchAttentions: ["fa", "cudnn"], default: true },
         { id: "b200-2-tp", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1, 2, 4], default: true },
@@ -324,7 +332,7 @@ const config = {
         if (![tp, ulysses, ring].every((n) => [1, 2, 4].includes(n))) errors.push("TP, Ulysses and Ring must each be 1, 2, or 4.");
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
-        if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
+        if (ring > 1 && ["sdpa", "cudnn"].includes(effectiveAttention(s))) errors.push(`Ring requires FlashAttention or SageAttention; ${effectiveAttention(s) === "sdpa" ? "Torch" : "cuDNN"} SDPA is unsupported.`);
         if (s.precision?.startsWith("nvfp4_") && !["b200", "rtxpro6000", "rtx5090", "dgx-spark"].includes(s.hw)) errors.push("Native NVFP4 requires a Blackwell GPU. Select B200, RTX PRO 6000, RTX 5090, or DGX Spark.");
         if (perNode === 1 && ["rtx5090", "rtx4090"].includes(s.hw) && s.placement === "resident") errors.push("The full resident pipeline exceeds this GPU's memory. Select CPU offload.");
         return errors;
@@ -385,7 +393,7 @@ const config = {
             request: errors.length ? "error" : requestVerified ? "verified" : "unverified",
           },
           resolvedSettings: {
-            attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)`
+            attention: s.attention === "platform" ? `${{ sdpa: "Torch SDPA", cudnn: "cuDNN SDPA" }[platformAttention(s)] || "FlashAttention"} (auto)`
               : sm12Hardware.includes(s.hw) && s.attention === "fa" ? "Torch SDPA (FA fallback)" : undefined,
             encoder: s.encoder === "auto" && world === 1 ? "Single GPU (auto)" : undefined,
           },
