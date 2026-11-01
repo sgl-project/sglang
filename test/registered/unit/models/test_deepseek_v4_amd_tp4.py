@@ -220,6 +220,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         return x
 
     experts.quant_method = None
+    experts.supports_routed_deferred_finalize = False
     experts.moe_runner_config = SimpleNamespace(inplace=False)
     gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate
     moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
