@@ -126,8 +126,8 @@ class MiniMaxIndexerCP:
         probe = torch.zeros((1, 128), dtype=torch.bfloat16, device=self.group.device)
         output = torch.empty((4, 128), dtype=probe.dtype, device=probe.device)
         self.group.all_gather_into_tensor(output, probe)
-        comm = self.group.pynccl_comm
-        if comm is not None and comm.available:
+        comm = self.group.get_available_pynccl_comm()
+        if comm is not None:
             # The ordinary eager fallback can use torch.distributed, whereas
             # graph replay uses PyNCCL. Warm the latter explicitly as well.
             with comm.change_state(enable=True):

@@ -105,7 +105,7 @@ struct FusedQKRopeKernel {
     auto K = SymbolicSize{"num_k_heads"};
     constexpr auto D = kRopeDim;
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, Q, D})  //
         .with_strides({-1, -1, 1})

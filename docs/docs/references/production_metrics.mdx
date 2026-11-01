@@ -343,10 +343,6 @@ disaggregated-decode placeholder batch), or, defensively, when one of its
 segments has not completed by result processing; the metric never waits on the
 device to find out.
 
-None of the three series is exported with `--enable-pdmux`: PD multiplexing
-runs decode and split prefill concurrently on separate streams, so one batch's
-forward time cannot be separated from the other's.
-
 To check that the metrics are exposed:
 
 ```bash

@@ -17,10 +17,11 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 PAGE_SIZE = 4
 
@@ -58,6 +59,7 @@ def _paged_prealloc():
     )
     fill_len = 3 * PAGE_SIZE - 1
     return lambda: alloc_for_decode_prealloc(
+        StaticKVStorage(None, allocator),
         allocator,
         req=_req(),
         fill_len=fill_len,
@@ -85,6 +87,7 @@ def _swa_tail_prealloc():
     )
     fill_len = 5 * PAGE_SIZE
     return lambda: alloc_for_decode_prealloc(
+        StaticKVStorage(None, allocator),
         allocator,
         req=_req(),
         fill_len=fill_len,
