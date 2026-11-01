@@ -163,6 +163,110 @@ class TestQwen35GDNMXFP4Routing(unittest.TestCase):
         norm.assert_called_once_with(x, z)
 
 
+class TestQwen35GDNOutProjInputEpilogue(unittest.TestCase):
+    """With the pipelined GDN chunk scan, the out_proj input is written by the
+    linear attention's epilogue on finished rows; otherwise the norm runs after
+    attention as before."""
+
+    NUM_TOKENS, NUM_HEADS, HEAD_DIM = 4, 3, 128
+
+    def _owner(self, scheme):
+        return SimpleNamespace(
+            norm=_make_norm(self.HEAD_DIM),
+            out_proj=_OutProj(scheme),
+            num_v_heads=self.NUM_HEADS,
+            attn_tp_size=1,
+            _out_proj_input_rows_fn=None,
+        )
+
+    def _buffers(self, owner, *, pipeline=True, epilogue_backend=True):
+        z = torch.empty(
+            (self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_DIM), dtype=torch.bfloat16
+        )
+        backend = SimpleNamespace(
+            linear_attn_backend=SimpleNamespace(
+                supports_extend_epilogue=epilogue_backend
+            )
+        )
+        with (
+            qwen3_5.envs.SGLANG_GDN_CHUNK_PIPELINE.override(pipeline),
+            patch(
+                "sglang.srt.model_executor.forward_context.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            return z, Qwen3_5GatedDeltaNet._out_proj_input_buffers(owner, z)
+
+    def test_buffers_and_rows_function_come_from_the_scheme(self):
+        prepared_input = (
+            torch.empty(1, dtype=torch.uint8),
+            torch.empty(1, dtype=torch.uint8),
+        )
+        rows_fn = Mock()
+        prepare_rows = Mock(return_value=(prepared_input, rows_fn))
+        owner = self._owner(
+            SimpleNamespace(prepare_fused_rmsnorm_gated_rows=prepare_rows)
+        )
+        z, actual = self._buffers(owner)
+        self.assertIs(actual, prepared_input)
+        self.assertIs(owner._out_proj_input_rows_fn, rows_fn)
+        prepare_rows.assert_called_once_with(
+            owner.out_proj,
+            self.NUM_TOKENS,
+            z,
+            owner.norm.weight,
+            num_heads=self.NUM_HEADS,
+            activation="swish",
+        )
+
+        o = torch.zeros(
+            (1, self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_DIM), dtype=torch.bfloat16
+        )
+        x_q, x_scales = prepared_input
+        Qwen3_5GatedDeltaNet._write_out_proj_input_rows(
+            owner, z, x_q, x_scales, o, 1, 3
+        )
+        args = rows_fn.call_args.args
+        self.assertEqual(
+            args[0].shape, (self.NUM_TOKENS * self.NUM_HEADS, self.HEAD_DIM)
+        )
+        self.assertEqual(args[0].data_ptr(), o.data_ptr())
+        self.assertEqual(
+            args[1:], (z, owner.norm.weight, owner.norm.eps, x_q, x_scales, 1, 3)
+        )
+
+    def test_norm_after_attention_without_pipeline_backend_or_scheme(self):
+        cases = {
+            "pipeline off": dict(pipeline=False),
+            "backend without epilogue": dict(epilogue_backend=False),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                prepare_rows = Mock()
+                owner = self._owner(
+                    SimpleNamespace(prepare_fused_rmsnorm_gated_rows=prepare_rows)
+                )
+                self.assertIsNone(self._buffers(owner, **kwargs)[1])
+                prepare_rows.assert_not_called()
+        with self.subTest("scheme without rows"):
+            self.assertIsNone(self._buffers(self._owner(SimpleNamespace()))[1])
+        with self.subTest("grouped norm"):
+            prepare_rows = Mock()
+            owner = self._owner(
+                SimpleNamespace(prepare_fused_rmsnorm_gated_rows=prepare_rows)
+            )
+            owner.norm.group_size = 64
+            self.assertIsNone(self._buffers(owner)[1])
+            prepare_rows.assert_not_called()
+        with self.subTest("scheme declines"):
+            owner = self._owner(
+                SimpleNamespace(
+                    prepare_fused_rmsnorm_gated_rows=Mock(return_value=None)
+                )
+            )
+            self.assertIsNone(self._buffers(owner)[1])
+
+
 class TestQwen38PrefillProjectionViews(CustomTestCase):
     """ROCm prefill reads the in_proj outputs as strided views only where the
     fused Qwen3.8 GDN prefill prologue consumes them; every other case keeps

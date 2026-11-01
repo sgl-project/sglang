@@ -14,6 +14,8 @@ MXFP4_BLOCK_SIZE = 32
 MXFP4_ROUND_UP = 1
 MXFP4_ROUND_EVEN = 2
 _MXFP4_SHUFFLE_GROUP_MULTIPLE = 8
+# Shuffled E8M0 scales are stored in tiles of 32 token rows.
+_MXFP4_SHUFFLE_TOKEN_TILE = 32
 
 
 def mxfp4_scale_shape(
@@ -295,6 +297,89 @@ def _rmsnorm_gated_mxfp4_kernel(
     tl.store(Scales + scale_offsets, scales, mask=scale_mask)
 
 
+def _rmsnorm_gated_mxfp4_buffers(
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    *,
+    shuffle_scales: bool,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_groups = num_heads * head_dim // MXFP4_BLOCK_SIZE
+    scale_m, scale_n = mxfp4_scale_shape(num_tokens, num_groups, shuffle=shuffle_scales)
+    out = torch.empty(
+        (num_tokens, num_heads * head_dim // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    scales = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=device)
+    return out, scales
+
+
+def _as_native_dtypes(
+    out: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.utility import dtypes
+
+    return out.view(dtypes.fp4x2), scales.view(dtypes.fp8_e8m0)
+
+
+def _launch_rmsnorm_gated_mxfp4(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    start: int,
+    end: int,
+    *,
+    num_heads: int,
+    activation: str,
+    round_mode: int,
+    shuffle_scales: bool,
+) -> None:
+    """Token rows [start, end) of x into the uint8 out and scales buffers
+    (start a multiple of the scale tile when the scales are shuffled)."""
+    num_head_rows, head_dim = x.shape
+    block_n = triton.next_power_of_2(head_dim)
+    # The full row count picks the launch, so a range of rows gets the same
+    # program shape, and bytes, as one launch over all rows.
+    rows_per_block = calc_rows_per_block(num_head_rows, x.device)
+    num_warps = min(max(block_n // 256, 1), 8)
+    z_is_3d = z.ndim == 3
+    scale_n = scales.shape[1]
+    num_rows = (end - start) * num_heads
+
+    with device_context(x.device):
+        _rmsnorm_gated_mxfp4_kernel[(cdiv(num_rows, rows_per_block),)](
+            X=x[start * num_heads : end * num_heads],
+            Z=z[start:end] if z_is_3d else z[start * num_heads : end * num_heads],
+            W=weight,
+            Out=out[start:end],
+            Scales=scales.view(-1)[start * scale_n :],
+            stride_x_row=x.stride(0),
+            stride_z_row=z.stride(0) if not z_is_3d else 0,
+            stride_z_token=z.stride(0) if z_is_3d else 0,
+            stride_z_head=z.stride(1) if z_is_3d else 0,
+            num_head_rows=num_rows,
+            eps=eps,
+            SCALE_N_PAD=scale_n,
+            HEAD_DIM=head_dim,
+            NUM_HEADS=num_heads,
+            BLOCK_N=block_n,
+            ROWS_PER_BLOCK=rows_per_block,
+            FP4_BLOCK_SIZE=MXFP4_BLOCK_SIZE,
+            Z_IS_3D=z_is_3d,
+            ACTIVATION=activation,
+            ROUND_MODE=round_mode,
+            ROUND_UP_MODE=MXFP4_ROUND_UP,
+            SHUFFLE_SCALES=shuffle_scales,
+            PK_FP4_CVT=is_gfx95_supported(),
+            num_warps=num_warps,
+        )
+
+
 def rmsnorm_gated_mxfp4_quant(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -322,51 +407,104 @@ def rmsnorm_gated_mxfp4_quant(
 
     num_head_rows, head_dim = x.shape
     num_rows = num_head_rows // num_heads
-    num_groups = num_heads * head_dim // MXFP4_BLOCK_SIZE
-    scale_m, scale_n = mxfp4_scale_shape(num_rows, num_groups, shuffle=shuffle_scales)
-    out = torch.empty(
-        (num_rows, num_heads * head_dim // 2),
-        dtype=torch.uint8,
-        device=x.device,
+    out, scales = _rmsnorm_gated_mxfp4_buffers(
+        num_rows, num_heads, head_dim, shuffle_scales=shuffle_scales, device=x.device
     )
-    scales = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x.device)
-
-    block_n = triton.next_power_of_2(head_dim)
-    rows_per_block = calc_rows_per_block(num_head_rows, x.device)
-    num_warps = min(max(block_n // 256, 1), 8)
-    z_is_3d = z.ndim == 3
-
-    with device_context(x.device):
-        _rmsnorm_gated_mxfp4_kernel[(cdiv(num_head_rows, rows_per_block),)](
-            X=x,
-            Z=z,
-            W=weight,
-            Out=out,
-            Scales=scales,
-            stride_x_row=x.stride(0),
-            stride_z_row=z.stride(0) if not z_is_3d else 0,
-            stride_z_token=z.stride(0) if z_is_3d else 0,
-            stride_z_head=z.stride(1) if z_is_3d else 0,
-            num_head_rows=num_head_rows,
-            eps=eps,
-            SCALE_N_PAD=scale_n,
-            HEAD_DIM=head_dim,
-            NUM_HEADS=num_heads,
-            BLOCK_N=block_n,
-            ROWS_PER_BLOCK=rows_per_block,
-            FP4_BLOCK_SIZE=MXFP4_BLOCK_SIZE,
-            Z_IS_3D=z_is_3d,
-            ACTIVATION=activation,
-            ROUND_MODE=round_mode,
-            ROUND_UP_MODE=MXFP4_ROUND_UP,
-            SHUFFLE_SCALES=shuffle_scales,
-            PK_FP4_CVT=is_gfx95_supported(),
-            num_warps=num_warps,
-        )
+    _launch_rmsnorm_gated_mxfp4(
+        x,
+        z,
+        weight,
+        eps,
+        out,
+        scales,
+        0,
+        num_rows,
+        num_heads=num_heads,
+        activation=activation,
+        round_mode=round_mode,
+        shuffle_scales=shuffle_scales,
+    )
 
     if use_native_dtypes:
-        from aiter.utility import dtypes
-
-        out = out.view(dtypes.fp4x2)
-        scales = scales.view(dtypes.fp8_e8m0)
+        out, scales = _as_native_dtypes(out, scales)
     return out, scales
+
+
+def rmsnorm_gated_mxfp4_buffers(
+    num_tokens: int,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    num_heads: int,
+    activation: str,
+    shuffle_scales: bool,
+    use_native_dtypes: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The buffers rmsnorm_gated_mxfp4_quant would return for an x that is not
+    computed yet (contiguous ``[num_tokens * num_heads, head_dim]`` rows of z's
+    dtype), to be filled by rmsnorm_gated_mxfp4_quant_rows; None when the
+    fused kernel cannot take that x."""
+    if num_tokens <= 0 or weight.ndim != 1:
+        return None
+    head_dim = weight.shape[0]
+    # A stand-in with x's shape, dtype, device and strides: all the kernel's
+    # contract depends on.
+    x = z.new_empty((1, head_dim)).expand(num_tokens * num_heads, head_dim)
+    if not can_use_rmsnorm_gated_mxfp4(
+        x,
+        z,
+        weight,
+        num_heads=num_heads,
+        activation=activation,
+        shuffle_scales=shuffle_scales,
+    ):
+        return None
+    out, scales = _rmsnorm_gated_mxfp4_buffers(
+        num_tokens, num_heads, head_dim, shuffle_scales=shuffle_scales, device=z.device
+    )
+    if use_native_dtypes:
+        out, scales = _as_native_dtypes(out, scales)
+    return out, scales
+
+
+def rmsnorm_gated_mxfp4_quant_rows(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    start: int,
+    end: int,
+    *,
+    num_heads: int,
+    activation: str,
+    round_mode: int,
+    shuffle_scales: bool,
+) -> None:
+    """Write token rows [start, end) of rmsnorm_gated_mxfp4_quant(x, z, ...)
+    into out and scales from rmsnorm_gated_mxfp4_buffers, byte for byte, so a
+    caller can quantize rows as they become final. With shuffled scales the
+    range starts at its 32-row scale tile: earlier rows of that tile are
+    written again, with the same bytes."""
+    if round_mode not in (MXFP4_ROUND_UP, MXFP4_ROUND_EVEN):
+        raise ValueError(f"unsupported MXFP4 round mode: {round_mode}")
+    if shuffle_scales:
+        start -= start % _MXFP4_SHUFFLE_TOKEN_TILE
+    end = min(end, x.shape[0] // num_heads)
+    if start >= end:
+        return
+    _launch_rmsnorm_gated_mxfp4(
+        x,
+        z,
+        weight,
+        eps,
+        out.view(torch.uint8),
+        scales.view(torch.uint8),
+        start,
+        end,
+        num_heads=num_heads,
+        activation=activation,
+        round_mode=round_mode,
+        shuffle_scales=shuffle_scales,
+    )

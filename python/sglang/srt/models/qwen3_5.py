@@ -538,6 +538,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+        # The out_proj input (gated RMSNorm + MXFP4 quant of the attention
+        # output) can be written by the linear attention as rows finish.
+        self.attn.output_epilogue = self._write_out_proj_input_rows
+        self._out_proj_input_rows_fn = None
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1010,6 +1014,67 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and not has_dp_padding
         )
 
+    def _out_proj_input_buffers(self, z: torch.Tensor):
+        """The prequantized out_proj input for the GDN output of z's tokens,
+        to be written by the linear attention as an epilogue on finished rows
+        (_write_out_proj_input_rows), or None to normalize after attention.
+
+        With the pipelined chunk scan (SGLANG_GDN_CHUNK_PIPELINE) the rows of
+        each part are normalized and quantized on the scan's side stream while
+        chunk_h runs the next part, instead of all rows after the scan."""
+        if not envs.SGLANG_GDN_CHUNK_PIPELINE.get():
+            return None
+        if (
+            self.norm.group_size is not None
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+        ):
+            return None
+        scheme = getattr(self.out_proj, "scheme", None)
+        prepare_rows = getattr(scheme, "prepare_fused_rmsnorm_gated_rows", None)
+        if prepare_rows is None:
+            return None
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not getattr(backend, "supports_extend_epilogue", False):
+            return None
+        prepared = prepare_rows(
+            self.out_proj,
+            z.shape[0],
+            z,
+            self.norm.weight,
+            num_heads=self.num_v_heads // self.attn_tp_size,
+            activation=self.norm.activation,
+        )
+        if prepared is None:
+            return None
+        out_proj_input, self._out_proj_input_rows_fn = prepared
+        return out_proj_input
+
+    def _write_out_proj_input_rows(
+        self,
+        z: torch.Tensor,
+        x_q: torch.Tensor,
+        x_scales: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> None:
+        """Linear-attention epilogue: gated RMSNorm + MXFP4 quant of output
+        rows [start, end) into the out_proj input from _out_proj_input_buffers."""
+        self._out_proj_input_rows_fn(
+            core_attn_out.reshape(-1, core_attn_out.shape[-1]),
+            z,
+            self.norm.weight,
+            self.norm.eps,
+            x_q,
+            x_scales,
+            start,
+            end,
+        )
+
     def _norm_and_out_proj(
         self,
         core_attn_out: torch.Tensor,
@@ -1134,12 +1199,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        out_proj_input = (
+            self._out_proj_input_buffers(z) if use_strided_prefill_z else None
+        )
         attn_result = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **(
+                {
+                    "epilogue_inputs": (
+                        z,
+                        *(t.view(torch.uint8) for t in out_proj_input),
+                    )
+                }
+                if out_proj_input is not None
+                else {}
+            ),
         )
+        if out_proj_input is not None:
+            output, _ = self.out_proj(out_proj_input)
+            return output
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(

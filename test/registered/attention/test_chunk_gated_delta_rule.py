@@ -726,6 +726,86 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     self.assertEqual(actual.dtype, expected.dtype)
                     self.assertTrue(torch.equal(actual, expected))
 
+    def test_epilogue_sees_every_row_once_when_final(self):
+        """epilogue(o, start, end) covers each output row exactly once, after
+        the row is final: per part of a pipelined scan (the side stream's parts
+        while chunk_h continues, the last part and any padded tail after it),
+        once over all rows in one pass. The output is the same as without it."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V, pool_size = 2, 6, 128, 128, 4
+        torch.manual_seed(0)
+        cases = (
+            # label, rows, sequence lengths, expected epilogue calls
+            ("16384 tokens, 4 parts", 16384, [16384], 4),
+            ("12600 tokens, 3 parts", 12600, [12600], 3),
+            ("10000 tokens + padded tail, 2 parts", 10240, [10000], 2),
+            ("8000 tokens, one pass", 8000, [8000], 1),
+            ("two sequences, one pass", 18000, [9000, 9000], 1),
+        )
+        for label, T, lens, num_calls in cases:
+            with self.subTest(label):
+                pool_init = (
+                    torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device)
+                    * 0.1
+                )
+                cache_indices = torch.arange(
+                    1, len(lens) + 1, dtype=torch.int32, device=device
+                )
+                cu_seqlens = torch.tensor(
+                    [0] + torch.tensor(lens).cumsum(0).tolist(),
+                    dtype=torch.long,
+                    device=device,
+                )
+                q = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                k = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                calls = []
+                seen = torch.full_like(v, float("nan"))
+
+                def epilogue(o, start, end):
+                    calls.append((start, end))
+                    seen[:, start:end].copy_(o[:, start:end])
+
+                results = []
+                for hook in (None, epilogue):
+                    pool = pool_init.clone()
+                    output = torch.full_like(v, float("nan"))
+                    with envs.SGLANG_GDN_CHUNK_PIPELINE.override(True):
+                        o, _, _ = chunk_gated_delta_rule(
+                            q=q,
+                            k=k,
+                            v=v,
+                            g=g,
+                            beta=beta,
+                            initial_state=pool,
+                            initial_state_indices=cache_indices,
+                            cu_seqlens=cu_seqlens,
+                            head_first=False,
+                            use_qk_l2norm_in_kernel=True,
+                            output=output,
+                            epilogue=hook,
+                        )
+                    results.append((o, pool))
+                (o0, pool0), (o1, pool1) = results
+                self.assertTrue(torch.equal(o1, o0))
+                self.assertTrue(torch.equal(pool1, pool0))
+                if not o1.is_cuda:
+                    continue  # the pipelined scan (and its part count) is GPU-only
+                self.assertEqual(len(calls), num_calls)
+                bounds = sorted(calls)
+                self.assertEqual(bounds[0][0], 0)
+                self.assertEqual(bounds[-1][1], T)
+                for (_, end), (start, _) in zip(bounds, bounds[1:]):
+                    self.assertEqual(end, start)
+                self.assertTrue(torch.equal(seen, o1))
+
     # ------------------------------------------------------------------
     # The fused kkt + solve kernel writes all of A (no zero fill first)
     # ------------------------------------------------------------------

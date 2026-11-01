@@ -531,6 +531,58 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         )
         return _AsmShuffledMxfp4Input(prequantized) if use_asm else prequantized
 
+    def prepare_fused_rmsnorm_gated_rows(
+        self,
+        layer: torch.nn.Module,
+        num_tokens: int,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        num_heads: int,
+        activation: str,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], Callable[..., None]] | None:
+        """prepare_fused_rmsnorm_gated_input for an x that is computed later,
+        some token rows at a time: the prequantized input's buffers, and
+        write_rows(x, z, weight, eps, x_q, x_scales, start, end), which fills
+        rows [start, end) with the bytes the one-shot input would have."""
+        if not _is_hip or getattr(layer, "dequantized_bf16", False):
+            return None
+        if weight.ndim != 1 or num_heads * weight.shape[0] != getattr(
+            layer, "input_size_per_partition", None
+        ):
+            return None
+        use_asm = getattr(layer, "use_aiter_asm_fp4_gemm", False)
+        round_mode = _aiter_asm_mxfp4_round_mode if use_asm else _MXFP4_ROUND_EVEN
+        if round_mode not in (_MXFP4_ROUND_UP, _MXFP4_ROUND_EVEN):
+            return None
+
+        import functools
+
+        from sglang.kernels.ops.attention.fla.rmsnorm_gated_mxfp4 import (
+            rmsnorm_gated_mxfp4_buffers,
+            rmsnorm_gated_mxfp4_quant_rows,
+        )
+
+        buffers = rmsnorm_gated_mxfp4_buffers(
+            num_tokens,
+            z,
+            weight,
+            num_heads=num_heads,
+            activation=activation,
+            shuffle_scales=use_asm,
+            use_native_dtypes=use_asm,
+        )
+        if buffers is None:
+            return None
+        write_rows = functools.partial(
+            rmsnorm_gated_mxfp4_quant_rows,
+            num_heads=num_heads,
+            activation=activation,
+            round_mode=round_mode,
+            shuffle_scales=use_asm,
+        )
+        return (_AsmShuffledMxfp4Input(buffers) if use_asm else buffers), write_rows
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8

@@ -7,7 +7,9 @@ from sglang.kernels.ops.attention.fla.rmsnorm_gated_mxfp4 import (
     MXFP4_ROUND_EVEN,
     MXFP4_ROUND_UP,
     can_use_rmsnorm_gated_mxfp4,
+    rmsnorm_gated_mxfp4_buffers,
     rmsnorm_gated_mxfp4_quant,
+    rmsnorm_gated_mxfp4_quant_rows,
 )
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -221,6 +223,110 @@ class TestRMSNormGatedMXFP4Kernel(unittest.TestCase):
             z_is_3d=True,
             round_mode=MXFP4_ROUND_UP,
             shuffle_scales=True,
+        )
+
+    def test_rows_write_the_bytes_of_one_launch(self):
+        """rmsnorm_gated_mxfp4_quant_rows over row ranges, in any order and
+        from starts inside a 32-row scale tile, fills rmsnorm_gated_mxfp4_buffers
+        with the bytes of one rmsnorm_gated_mxfp4_quant call."""
+        num_heads, head_dim, eps = 48, 128, 1e-6
+        cases = (
+            # tokens, shuffled scales, round mode, ranges
+            (
+                16384,
+                True,
+                MXFP4_ROUND_UP,
+                ((0, 4096), (12288, 16384), (4096, 8192), (8192, 12288)),
+            ),
+            (12596, True, MXFP4_ROUND_UP, ((0, 4160), (4160, 8384), (8384, 12596))),
+            (1000, True, MXFP4_ROUND_UP, ((0, 700), (690, 1000))),
+            (33, True, MXFP4_ROUND_UP, ((17, 33), (0, 17))),
+            (257, False, MXFP4_ROUND_EVEN, ((100, 257), (0, 100))),
+        )
+        for num_tokens, shuffle, round_mode, ranges in cases:
+            with self.subTest(num_tokens=num_tokens, shuffle=shuffle):
+                torch.manual_seed(num_tokens)
+                x = torch.randn(
+                    (num_tokens * num_heads, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                # z as the Qwen3.5 GDN reads it: a strided view of the in_proj output.
+                proj = torch.randn(
+                    (num_tokens, num_heads * head_dim + 64),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                z = proj[:, 64:].unflatten(-1, (num_heads, head_dim))
+                weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+                kwargs = dict(
+                    num_heads=num_heads,
+                    activation="silu",
+                    round_mode=round_mode,
+                    shuffle_scales=shuffle,
+                )
+                expected_q, expected_scales = rmsnorm_gated_mxfp4_quant(
+                    x, z, weight, eps, use_native_dtypes=shuffle, **kwargs
+                )
+                buffers = rmsnorm_gated_mxfp4_buffers(
+                    num_tokens,
+                    z,
+                    weight,
+                    num_heads=num_heads,
+                    activation="silu",
+                    shuffle_scales=shuffle,
+                    use_native_dtypes=shuffle,
+                )
+                self.assertIsNotNone(buffers)
+                actual_q, actual_scales = buffers
+                for actual, expected in (
+                    (actual_q, expected_q),
+                    (actual_scales, expected_scales),
+                ):
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    actual.view(torch.uint8).fill_(0xA5)
+                for start, end in ranges:
+                    rmsnorm_gated_mxfp4_quant_rows(
+                        x, z, weight, eps, actual_q, actual_scales, start, end, **kwargs
+                    )
+                self.assertTrue(
+                    torch.equal(
+                        actual_q.view(torch.uint8), expected_q.view(torch.uint8)
+                    )
+                )
+                actual_scales = actual_scales.view(torch.uint8)
+                expected_scales = expected_scales.view(torch.uint8)
+                if shuffle:
+                    rows = torch.arange(num_tokens, device="cuda")[:, None]
+                    groups = torch.arange(num_heads * head_dim // 32, device="cuda")[
+                        None, :
+                    ]
+                    valid = (
+                        (rows // 32 * actual_scales.shape[1]) * 32
+                        + (groups // 8) * 256
+                        + (groups % 4) * 64
+                        + (rows % 16) * 4
+                        + ((groups % 8) // 4) * 2
+                        + ((rows % 32) // 16)
+                    ).flatten()
+                    actual_scales = actual_scales.flatten()[valid]
+                    expected_scales = expected_scales.flatten()[valid]
+                self.assertTrue(torch.equal(actual_scales, expected_scales))
+
+        # The buffers decline what the kernel cannot take.
+        z = torch.empty((257, 3, 96), device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty(96, device="cuda", dtype=torch.bfloat16)
+        self.assertIsNone(
+            rmsnorm_gated_mxfp4_buffers(
+                257,
+                z,
+                weight,
+                num_heads=3,
+                activation="silu",
+                shuffle_scales=True,
+                use_native_dtypes=True,
+            )
         )
 
     def test_shuffled_round_up_rejects_unaligned_total_width(self):
