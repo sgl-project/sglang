@@ -8,8 +8,8 @@ import torch
 import torch.nn.functional as F
 import triton.testing
 
-from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )

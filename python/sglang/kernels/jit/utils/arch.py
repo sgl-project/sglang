@@ -118,9 +118,7 @@ def get_compile_arch() -> CompileArch:
     cuda = current_arch().cuda
     try:
         major, minor = (
-            cuda.capability
-            if cuda is not None
-            else torch.cuda.get_device_capability()
+            cuda.capability if cuda is not None else torch.cuda.get_device_capability()
         )
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")

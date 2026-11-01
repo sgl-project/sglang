@@ -3,8 +3,6 @@ from __future__ import annotations
 from functools import cached_property
 from typing import Optional, Tuple
 
-import torch
-
 from sglang.kernels.arch.base import DeviceArch
 
 

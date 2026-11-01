@@ -30,7 +30,6 @@ Epilogue. B is the MFMA's first operand, so a lane accumulates 4 consecutive col
 one row of C; the tile is staged through the idle LDS.
 """
 
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
