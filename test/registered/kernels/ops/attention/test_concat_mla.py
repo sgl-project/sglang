@@ -1,5 +1,7 @@
 import itertools
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -88,6 +90,100 @@ DTYPE = torch.bfloat16
 
 # Test configurations
 NUM_TOKENS_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_heads",
+    [(0, 12), (1, 12), (17, 12), (257, 24), (19, 8), (65536, 12)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_model_mha_k_concat(num_tokens, num_heads, dtype):
+    """Exercise model dispatch with strided KV projection and latent RoPE views."""
+    from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
+
+    attn = SimpleNamespace(
+        num_local_heads=num_heads,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        current_attention_backend="trtllm_mla",
+        kv_cache_dtype="fp8_e4m3",
+    )
+    kv = torch.randn(num_tokens, num_heads, 256, device="cuda", dtype=dtype)
+    latent = torch.randn(num_tokens, 1, 576, device="cuda", dtype=dtype)
+    k_nope, k_rope = kv[..., :128], latent[..., 512:]
+    expected = torch.empty(num_tokens, num_heads, 192, device="cuda", dtype=dtype)
+    torch_concat_mla_k(expected, k_nope, k_rope)
+    with patch.object(
+        forward_mha,
+        "concat_and_cast_mha_k_triton",
+        wraps=forward_mha.concat_and_cast_mha_k_triton,
+    ) as concat:
+        actual = forward_mha.DeepseekMHAForwardMixin._concat_and_cast_mha_k(
+            attn, k_nope, k_rope, None
+        )
+    concat.assert_called_once()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_model_mha_k_concat_graph():
+    from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
+
+    attn = SimpleNamespace(
+        num_local_heads=12,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        current_attention_backend="trtllm_mla",
+        kv_cache_dtype="fp8_e4m3",
+    )
+    kv = torch.randn(17, 12, 256, device="cuda", dtype=torch.bfloat16)
+    latent = torch.randn(17, 1, 576, device="cuda", dtype=torch.bfloat16)
+    k_nope, k_rope = kv[..., :128], latent[..., 512:]
+    concat = forward_mha.DeepseekMHAForwardMixin._concat_and_cast_mha_k
+    concat(attn, k_nope, k_rope, None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = concat(attn, k_nope, k_rope, None)
+    for _ in range(2):
+        kv.normal_()
+        latent.normal_()
+        graph.replay()
+        expected = torch.empty_like(actual)
+        torch_concat_mla_k(expected, k_nope, k_rope)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_model_mha_k_concat_fa3_fp8():
+    from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
+
+    attn = SimpleNamespace(
+        num_local_heads=12,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        qk_head_dim=192,
+        current_attention_backend="fa3",
+        kv_cache_dtype="fp8_e4m3",
+    )
+    k_nope = torch.randn(17, 12, 128, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(17, 1, 64, device="cuda", dtype=torch.bfloat16)
+    expected = torch.empty(17, 12, 192, device="cuda", dtype=torch.bfloat16)
+    torch_concat_mla_k(expected, k_nope, k_rope)
+    with patch.object(
+        forward_mha,
+        "get_token_to_kv_pool",
+        return_value=SimpleNamespace(dtype=torch.float8_e4m3fn),
+    ):
+        actual = forward_mha.DeepseekMHAForwardMixin._concat_and_cast_mha_k(
+            attn, k_nope, k_rope, None
+        )
+    assert actual.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        actual.view(torch.uint8),
+        expected.to(actual.dtype).view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
