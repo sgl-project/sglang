@@ -10,12 +10,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
-from sglang.srt.mem_cache.kv.alloc.pricing import (
-    ChainSnapshot,
-    FloatChain,
-    TokenEnds,
-    snapshot_chain,
-)
+from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
     FullLifetime,
@@ -50,15 +45,24 @@ def chain_snapshot(allocator) -> ChainSnapshot:
     )
 
 
-def token_ends(allocator) -> TokenEnds:
-    """The pricing constants of a chain of two token ends."""
-    return allocator._policy._ends(allocator)
-
-
-def float_chain(allocator) -> FloatChain:
-    """The roles of a chain whose window floats between two ends."""
-    roles = allocator.roles
-    return FloatChain(owner=roles.owner, window=roles.window, state=roles.state)
+def open_float_side(flt, side: str, min_bytes: int) -> int:
+    """Move a float's live pages, as a planned layout does (`relocate_into`
+    of one packed block), so the gap on ``side`` holds at least ``min_bytes``;
+    return the bytes then open on that side."""
+    epp = flt.entry_bytes_per_page
+    lo, hi = flt._region_bounds_pages()
+    live = flt._live_pages()
+    pages = -(-min_bytes // epp)
+    if side == "low":
+        first = lo + pages
+        end = first + live
+    else:
+        end = hi - pages
+        first = end - live
+    assert lo <= first and end <= hi, "the region cannot open that much"
+    flt.relocate_into(first, end)
+    gap_low, gap_high = flt._gap_pages()
+    return (gap_low if side == "low" else gap_high) * epp
 
 
 HOLD = "test-hold"

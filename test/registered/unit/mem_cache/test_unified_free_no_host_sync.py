@@ -106,8 +106,7 @@ _TOMBSTONE_METHODS = [
     (mea.Band, "_commit_move_batch"),
     (mea.FloatBand, "free"),
     (mea.FloatBand, "free_physical"),
-    (mea.FloatBand, "make_room"),
-    (mea.FloatBand, "_relocate_to_positions"),
+    (mea.FloatBand, "relocate_into"),
 ]
 
 

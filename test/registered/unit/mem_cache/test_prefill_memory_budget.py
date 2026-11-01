@@ -249,17 +249,22 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 self.assertEqual(budget.total_offset, admitted * reserved_tokens)
                 self.assertFalse(budget.check_prefill(**request)[0])
                 self.assertTrue(
-                    allocator.can_reserve(
+                    allocator.admits(
                         admitted * reserved_tokens,
-                        admitted * reserved_tokens,
-                        state_slots=slots,
+                        allocator._window_demand(
+                            admitted * reserved_tokens, admitted * reserved_tokens
+                        ),
+                        slots,
                     )
                 )
                 self.assertFalse(
-                    allocator.can_reserve(
+                    allocator.admits(
                         (admitted + 1) * reserved_tokens,
-                        (admitted + 1) * reserved_tokens,
-                        state_slots=slots + slots_per_request,
+                        allocator._window_demand(
+                            (admitted + 1) * reserved_tokens,
+                            (admitted + 1) * reserved_tokens,
+                        ),
+                        slots + slots_per_request,
                     )
                 )
                 self.assertTrue(
@@ -489,7 +494,12 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             with self.subTest(page_size=page_size):
                 allocator, req, adder = self._new_admission(page_size, pool_pages=6)
                 req.prefix_len = len(allocator.alloc(page_size))
-                self.assertTrue(allocator.can_reserve(page_size + 2, page_size + 2))
+                self.assertTrue(
+                    allocator.admits(
+                        page_size + 2,
+                        allocator._window_demand(page_size + 2, page_size + 2),
+                    )
+                )
 
                 self.assertIsNone(adder.add_chunked_req(req))
                 self.assertEqual(adder.can_run_list, [req])
@@ -502,7 +512,12 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                     page_size, pool_pages=5, ignore_eos=True
                 )
                 self.assertEqual(req.prefix_len, 0)
-                self.assertTrue(allocator.can_reserve(2 * page_size + 2, 2 * page_size))
+                self.assertTrue(
+                    allocator.admits(
+                        2 * page_size + 2,
+                        allocator._window_demand(2 * page_size + 2, 2 * page_size),
+                    )
+                )
 
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None

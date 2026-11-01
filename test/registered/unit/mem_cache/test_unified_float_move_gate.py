@@ -1,12 +1,12 @@
 """FLOAT movement gates protect transfer addresses while allowing hole reuse."""
 
-import itertools
 import unittest
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -15,6 +15,7 @@ from sglang.test.unified_allocator_fixtures import (
     arena_of,
     hold_band,
     release_band,
+    setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
 )
@@ -87,7 +88,7 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
     if pattern == "swa_edges":
         a.mamba_allocator.free(states[1:4])
     if gate:
-        for x in a._flush_targets():
+        for x in a.members:
             hold_band(x)
     return (a, kv, mk)
 
@@ -103,7 +104,7 @@ def snapshot(a):
             x.live_page_count,
             [(id(e), v[0]) for e, v in x.usage.pending_by_key().items()],
         )
-        for x in a._flush_targets()
+        for x in a.members
     ]
 
 
@@ -126,6 +127,10 @@ def payload(a, kv, mk):
 
 
 class TestFloatMovementGate(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(
@@ -136,62 +141,6 @@ class TestFloatMovementGate(CustomTestCase):
             )
             torch.testing.assert_close(buf[member.ids.translate(ids)], values)
         self.assertFalse(a.verify_byte_accounting())
-
-    def test_float_movement_owners_respect_gate(self):
-        for side, method, gates in itertools.product(
-            ("low", "high"),
-            ("make_room", "compact_holes"),
-            ((False, True), (True, False), (False, False)),
-        ):
-            with self.subTest(side=side, method=method, gates=gates):
-                a, kv, mk = build_geometry(1, (1, 1), True, "swa_internal", False)
-                sa = a.swa_attn_allocator
-                saved = payload(a, kv, mk)
-                # Two holders; the band stays while either holds it.
-                for key, opened in zip(("first", "second"), gates):
-                    if not opened:
-                        hold_band(sa, key)
-                before = snapshot(a)
-                low, high = sa._gap_pages()
-                gap = (low if side == "low" else high) * sa.entry_bytes_per_page
-                with (
-                    patch.object(
-                        sa,
-                        "_settle_inflight_forward",
-                        wraps=sa._settle_inflight_forward,
-                    ) as settle,
-                    patch.object(
-                        a.arena, "move_units", wraps=a.arena.move_units
-                    ) as copies,
-                ):
-                    if method == "make_room":
-                        self.assertEqual(
-                            sa.make_room(
-                                side=side, min_bytes=gap + sa.entry_bytes_per_page
-                            ),
-                            gap,
-                        )
-                    else:
-                        self.assertEqual(sa.compact_holes(retreat_side=side), 0)
-                self.assertEqual(settle.call_count, 0)
-                self.assertEqual(copies.call_count, 0)
-                self.assertEqual(snapshot(a), before)
-                release_band(sa, "first")
-                release_band(sa, "second")
-                with patch.object(
-                    a.arena, "move_units", wraps=a.arena.move_units
-                ) as copies:
-                    if method == "make_room":
-                        self.assertGreaterEqual(
-                            sa.make_room(
-                                side=side, min_bytes=gap + sa.entry_bytes_per_page
-                            ),
-                            gap + sa.entry_bytes_per_page,
-                        )
-                    else:
-                        self.assertGreater(sa.compact_holes(retreat_side=side), 0)
-                self.assertGreater(copies.call_count, 0)
-                self.check_saved(a, saved)
 
     def test_gated_token_recovery_and_hole_reuse(self):
         for ratio, pattern, demand in (
@@ -210,7 +159,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.assertEqual(copies.call_count, 0)
                 self.check_saved(a, saved)
                 if got is None:
-                    for member in a._flush_targets():
+                    for member in a.members:
                         release_band(member)
                     a.ensure_capacity(demand, demand)
                     self.assertIsNotNone(a.alloc(demand))
@@ -229,14 +178,23 @@ class TestFloatMovementGate(CustomTestCase):
         saved = payload(a, kv, mk)
         demand = ma.available_size() + 1
         hold_band(sa)
+        held = {p: int(sa.ids.physical_to_virtual[p]) for p in sa.fixed_pages()}
+        self.assertTrue(held)
+        # The held float is laid out around its pages, if at all: none of
+        # them moves, so no page is copied.
         with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
-            self.assertIsNone(ma.alloc(demand))
+            got = ma.alloc(demand)
         self.assertEqual(copies.call_count, 0)
+        for page, virtual in held.items():
+            self.assertEqual(int(sa.ids.physical_to_virtual[page]), virtual)
         self.check_saved(a, saved)
         release_band(sa)
-        with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
-            self.assertIsNotNone(ma.alloc(demand))
-        self.assertGreater(copies.call_count, 0)
+        if got is None:
+            with patch.object(
+                a.arena, "move_units", wraps=a.arena.move_units
+            ) as copies:
+                self.assertIsNotNone(ma.alloc(demand))
+            self.assertGreater(copies.call_count, 0)
         self.check_saved(a, saved)
 
 

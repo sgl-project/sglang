@@ -664,7 +664,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
         allocator.free_swa(indices)
 
-        self.assertTrue(allocator.can_reserve(0, 8))
+        self.assertTrue(allocator.admits(0, allocator._window_demand(0, 8)))
         self.assertTrue(allocator.ensure_capacity(0, 8))
         allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
         self.assertTrue(
@@ -689,7 +689,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         swa_allocator = allocator.swa_attn_allocator
         swa_pages = 2
         full_pages = (
-            allocator._policy._empty_shared_gap_bytes
+            allocator.full_attn_allocator._current_gap_bytes()
             - swa_pages * swa_allocator.entry_bytes_per_page
         ) // full_allocator.entry_bytes_per_page
         packed_bytes = (
@@ -703,22 +703,26 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertLessEqual(
             swa_pages, swa_allocator.num_pages - swa_allocator.min_page_index
         )
-        self.assertLessEqual(packed_bytes, allocator._policy._empty_shared_gap_bytes)
+        self.assertLessEqual(
+            packed_bytes, allocator.full_attn_allocator._current_gap_bytes()
+        )
         self.assertGreater(
             packed_bytes + full_allocator.entry_bytes_per_page,
-            allocator._policy._empty_shared_gap_bytes,
+            allocator.full_attn_allocator._current_gap_bytes(),
         )
         self.assertTrue(
-            allocator.can_reserve(
+            allocator.admits(
                 full_pages * page_size,
-                swa_pages * page_size,
+                allocator._window_demand(full_pages * page_size, swa_pages * page_size),
                 empty_pool=True,
             )
         )
         self.assertFalse(
-            allocator.can_reserve(
+            allocator.admits(
                 full_pages * page_size + 1,
-                swa_pages * page_size,
+                allocator._window_demand(
+                    full_pages * page_size + 1, swa_pages * page_size
+                ),
                 empty_pool=True,
             )
         )
@@ -750,22 +754,27 @@ class TestWindowChainAllocator(unittest.TestCase):
             reservation_swa_with_tail // page_size
         ) * swa_allocator.entry_bytes_per_page
         self.assertLessEqual(
-            reservation_bytes, allocator._policy._empty_shared_gap_bytes
+            reservation_bytes, allocator.full_attn_allocator._current_gap_bytes()
         )
         self.assertGreater(
-            reservation_bytes_with_tail, allocator._policy._empty_shared_gap_bytes
+            reservation_bytes_with_tail,
+            allocator.full_attn_allocator._current_gap_bytes(),
         )
         self.assertTrue(
-            allocator.can_reserve(
+            allocator.admits(
                 reservation_full_tokens,
-                reservation_swa_tokens,
+                allocator._window_demand(
+                    reservation_full_tokens, reservation_swa_tokens
+                ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
-            allocator.can_reserve(
+            allocator.admits(
                 reservation_full_tokens,
-                reservation_swa_with_tail,
+                allocator._window_demand(
+                    reservation_full_tokens, reservation_swa_with_tail
+                ),
                 empty_pool=True,
             )
         )
@@ -2651,7 +2660,7 @@ class TestChainFrontierWalk(unittest.TestCase):
 class TestFloatBand(CustomTestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
-    and the on-demand movers `make_room` and `compact_holes`."""
+    and the planned move `relocate_into`."""
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -2881,84 +2890,10 @@ class TestFloatBand(CustomTestCase):
         self.assertEqual(fla.available_size(), max(gap_low, gap_high) + 2)
         del da
 
-    def test_make_room_boundary_relocation(self):
-        _, _, fla, da, kv = self._build_tri()
-        v = fla.alloc(6)
-        self._stamp(fla, kv, v)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 3) * epp  # 3 pages beyond the current high gap
-        opened = fla.make_room(side="high", min_bytes=ask)
-        self.assertGreaterEqual(opened, ask)
-        # Cost min(L_live, G): moved exactly the 3 boundary pages, not 6.
-        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
-        self.assertEqual(moved, 3)
-        self._check_float_state(fla, kv)
-        # The opened space is real: the full end can now take it.
-        self.assertGreaterEqual(da.available_size(), 3)
-
-    def test_make_room_leapfrog_cost_bounded_by_live(self):
-        _, _, fla, _, kv = self._build_tri()
-        v = fla.alloc(2)  # tiny live mass
-        self._stamp(fla, kv, v)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 10) * epp  # demand >> live
-        opened = fla.make_room(side="high", min_bytes=ask)
-        self.assertGreaterEqual(opened, ask)
-        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
-        self.assertEqual(moved, 2)  # min(L_live, G) == L_live
-        self._check_float_state(fla, kv)
-
-    def test_joint_relief_translates_donor_bytes_to_float_grid(self):
-        from sglang.srt.mem_cache.kv.alloc.band import _float_open_short_side
-
-        specs = [
-            _make_mha_spec("low", "up", layer_num=1, head_num=1, head_dim=128),
-            _make_mha_spec("middle", "float", layer_num=1, head_num=1, head_dim=96),
-            _make_mha_spec("high", "down", layer_num=1, head_num=1, head_dim=32),
-        ]
-        arena = arena_of(specs, total_bytes=1792, device="cpu")
-        low = Band(arena=arena, sub_pool_name="low", device="cpu", is_id_owner=True)
-        middle = FloatBand(
-            arena=arena, sub_pool_name="middle", device="cpu", is_id_owner=True
-        )
-        high = Band(arena=arena, sub_pool_name="high", device="cpu", is_id_owner=True)
-        low.bind_high_peer(middle)
-        middle.bind_low_peer(low)
-        middle.bind_high_peer(high)
-        high.bind_low_peer(middle)
-        kv = _FakeKVCache(arena, "middle")
-        self.assertIsNotNone(high.alloc(1))
-        v = middle.alloc(1)
-        self._stamp(middle, kv, v)
-        middle._relocate_to_positions([int(middle.ids.virtual_to_physical[v][0])], [2])
-        self.assertEqual(middle._region_bounds_pages(), (2, 4))
-        # Raw frontiers are 512/1664, while the float's own grid is 384.
-        # The requested 512-byte low gap needs only 384 aligned float bytes.
-        _float_open_short_side(middle, {low: 1, middle: 0, high: 1})
-        self.assertEqual(int(middle.ids.virtual_to_physical[v][0]), 3)
-        self._check_float_state(middle, kv)
-        self.assertIsNotNone(high.alloc(1))
-        self.assertIsNotNone(low.alloc(1))
-
-    def test_make_room_leapfrog_preserves_opposite_gap(self):
-        for side in ("low", "high"):
-            with self.subTest(side=side):
-                _, _, fla, _, kv = self._build_tri()
-                v = fla.alloc(1)
-                self._stamp(fla, kv, v)
-                epp = fla.entry_bytes_per_page
-                before = dict(zip(("low", "high"), fla._gap_pages()))
-                ask = (before[side] + 2) * epp
-                self.assertEqual(fla.make_room(side=side, min_bytes=ask), ask)
-                after = dict(zip(("low", "high"), fla._gap_pages()))
-                other = "high" if side == "low" else "low"
-                self.assertEqual(after[other], before[other] - 2)
-                self.assertGreater(after[other], 0)
-                self._check_float_state(fla, kv)
-
-    def test_interior_pack_preserves_payload_with_mixed_move_directions(self):
+    def test_relocate_into_keeps_inside_pages_and_moves_the_rest(self):
+        """A planned float move: live pages already inside the target block
+        stay where they are, the others are copied into its free pages, in
+        both directions at once, and every page keeps its bytes."""
         _, _, fla, _, kv = self._build_tri()
         v = fla.alloc(13)
         self._stamp(fla, kv, v)
@@ -2967,88 +2902,27 @@ class TestFloatBand(CustomTestCase):
         keep = (physical == start) | (physical >= start + 8)
         fla.free(v[~keep])
         live = sorted(int(x) for x in physical[keep].tolist())
-        final = list(range(start + 6, start + 12))
-        self.assertTrue(any(d < src for src, d in zip(live, final)))
-        self.assertTrue(any(d > src for src, d in zip(live, final)))
-        fla._relocate_to_positions(live, final)
+        first, end = start + 6, start + 12
+        inside = [p for p in live if first <= p < end]
+        self.assertTrue(any(p < first for p in live))
+        self.assertTrue(any(p >= end for p in live))
+        moved = fla.relocate_into(first, end)
+        self.assertEqual(moved, len(live) - len(inside))
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), (first, end))
+        for p in inside:
+            self.assertNotEqual(int(fla.ids.physical_to_virtual[p]), -1)
         self._check_float_state(fla, kv)
-        torch.testing.assert_close(
-            fla.ids.virtual_to_physical[v[keep]],
-            torch.tensor(final, dtype=physical.dtype, device=physical.device),
-        )
 
-    def test_make_room_impossible_leaves_state_unchanged(self):
-        _, _, fla, _, kv = self._build_tri(n_float=8)
-        v = fla.alloc(6)
-        self._stamp(fla, kv, v)
+    def test_relocate_into_never_leaves_a_fixed_page_behind(self):
+        """A held page stays put: a block that would leave one behind is
+        refused before any page moves."""
+        _, _, fla, _, kv = self._build_tri()
+        vs = [fla.alloc(2) for _ in range(4)]
+        for v in vs:
+            self._stamp(fla, kv, v)
+        fla.free(vs[1])
         lo, hi = fla._region_bounds_pages()
-        epp = fla.entry_bytes_per_page
-        snapshot = (
-            fla.low_wm_page,
-            fla.high_wm_page,
-            fla._hole_pages(),
-            len(fla._inverse_history),
-        )
-        opened = fla.make_room(side="high", min_bytes=(hi - lo) * epp)
-        self.assertLess(opened, (hi - lo) * epp)
-        self.assertEqual(
-            snapshot,
-            (
-                fla.low_wm_page,
-                fla.high_wm_page,
-                fla._hole_pages(),
-                len(fla._inverse_history),
-            ),
-        )
-        self._check_float_state(fla, kv)
-
-    def test_make_room_uses_far_holes_before_far_gap(self):
-        _, _, fla, _, kv = self._build_tri()
-        va = fla.alloc(2)
-        vb = fla.alloc(2)
-        vc = fla.alloc(2)
-        for v in (va, vb, vc):
-            self._stamp(fla, kv, v)
-        lo_before = fla.low_wm_page
-        fla.free(self._interior_block(fla, (va, vb, vc)))  # 2 interior holes
-        self.assertEqual(fla._hole_pages(), 2)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        opened = fla.make_room(side="high", min_bytes=(gap_high + 2) * epp)
-        self.assertGreaterEqual(opened, (gap_high + 2) * epp)
-        # The two holes absorbed the two moved pages: low side untouched.
-        self.assertEqual(fla.low_wm_page, lo_before)
-        self.assertEqual(fla._hole_pages(), 0)
-        self._check_float_state(fla, kv)
-
-    def test_compact_holes_ordered_pack(self):
-        _, _, fla, _, kv = self._build_tri()
-        vs = [fla.alloc(2) for _ in range(4)]
-        for v in vs:
-            self._stamp(fla, kv, v)
-        fla.free(vs[1])  # interleaved holes
-        span_before = fla._span_pages()
-        moved = fla.compact_holes(retreat_side="high")
-        self.assertEqual(fla._hole_pages(), 0)
-        self.assertEqual(fla._span_pages(), span_before - 2)
-        self.assertGreater(moved, 0)
-        self._check_float_state(fla, kv)
-
-    def test_on_demand_movers_honor_pins(self):
-        """`make_room` / `compact_holes` relocate live pages just as `_flush`
-        does, so a closed move gate must stop them too: the shortfall ladder
-        reaches `make_room` while a host transfer or RDMA still addresses the
-        float's physical pages, and an ungated mover copies KV out from under
-        it. A blocked ask reports what is open now and leaves state untouched.
-        """
-        _, _, fla, _, kv = self._build_tri()
-        vs = [fla.alloc(2) for _ in range(4)]
-        for v in vs:
-            self._stamp(fla, kv, v)
-        fla.free(vs[1])  # an interior hole `compact_holes` would pack
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 2) * epp
+        live = fla._live_pages()
 
         def snapshot():
             return (
@@ -3060,13 +2934,12 @@ class TestFloatBand(CustomTestCase):
 
         hold_band(fla)
         before = snapshot()
-        self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
-        self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
+        with self.assertRaises(AssertionError):
+            fla.relocate_into(hi - live, hi)
         self.assertEqual(snapshot(), before)
         self._check_float_state(fla, kv)
-
         release_band(fla)
-        self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
+        self.assertGreater(fla.relocate_into(hi - live, hi), 0)
         self._check_float_state(fla, kv)
 
 

@@ -275,9 +275,8 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         demand = fa.ids.num_virtual_ids - fa.min_page_index + 1
         # Asymmetric SWA restore demand fits bytes/physical SWA slots, but
         # cannot address more virtual pages than its FULL ID owner provides.
-        self.assertLess(
-            demand * sa.entry_bytes_per_page, allocator._policy._empty_shared_gap_bytes
-        )
+        # The chain is empty: its shared gap is the empty chain's.
+        self.assertLess(demand * sa.entry_bytes_per_page, fa._current_gap_bytes())
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
         self.assertFalse(
             allocator.admits(0, allocator._window_demand(0, demand), empty_pool=True)
@@ -383,7 +382,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 )
             ]
             members = []
-            for member in allocator._flush_targets():
+            for member in allocator.members:
                 members.append(
                     (
                         member.ids.virtual_to_physical.tolist(),
@@ -398,7 +397,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         before = snapshot()
         for gate in (False, True):
-            for member in allocator._flush_targets():
+            for member in allocator.members:
                 release_band(member)
                 if not gate:
                     hold_band(member)
@@ -406,7 +405,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 # The reclaim walks' stop predicate.
                 allocator.ensure_capacity(4, 4)
             self.assertEqual(snapshot(), before)
-        for member in allocator._flush_targets():
+        for member in allocator.members:
             release_band(member)
         self.assertTrue(evict_from_tree_cache(cache, 4))
         self.assertIsNotNone(allocator.alloc(4))
@@ -449,7 +448,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 96)
         self.assertEqual(allocator.available_size(), 3)
         kv = allocator.get_kvcache()
-        for layer, member in enumerate(allocator._flush_targets()):
+        for layer, member in enumerate(allocator.members):
             ids = member.ids.translate(slots[12:13])
             kv.get_key_buffer(layer)[ids] = 17 + layer
             kv.get_value_buffer(layer)[ids] = 117 + layer
@@ -484,7 +483,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             ).last_device_node
         )
         torch.testing.assert_close(actual, slots[12:13])
-        for layer, member in enumerate(allocator._flush_targets()):
+        for layer, member in enumerate(allocator.members):
             ids = member.ids.translate(actual)
             self.assertTrue(torch.all(kv.get_key_buffer(layer)[ids] == 17 + layer))
             self.assertTrue(torch.all(kv.get_value_buffer(layer)[ids] == 117 + layer))

@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import (
     ChainRoles,
     take_new_pages,
 )
-from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, float_fit, plan
+from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, plan
 from sglang.srt.mem_cache.kv.alloc.signals import wait_signals
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -59,8 +59,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeUnifiedSWAKVPool,
     arena_of,
     build_test_unified_pools,
-    chain_snapshot,
-    float_chain,
+    open_float_side,
     setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
@@ -187,8 +186,16 @@ class TestUnifiedTriPool(_PoolTestCase):
                     _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
                     full = allocator.full_attn_allocator
                     length = allocator.available_size() + 4
-                    self.assertFalse(allocator.can_reserve(length, length))
-                    self.assertTrue(allocator.can_reserve(length, tail_len))
+                    self.assertFalse(
+                        allocator.admits(
+                            length, allocator._window_demand(length, length)
+                        )
+                    )
+                    self.assertTrue(
+                        allocator.admits(
+                            length, allocator._window_demand(length, tail_len)
+                        )
+                    )
                     prefix = torch.tensor([0], dtype=torch.int64)
                     seq = torch.tensor([length], dtype=torch.int64)
                     with patch(_TAKE_NEW_PAGES, side_effect=_take_new_pages_on_host):
@@ -367,9 +374,11 @@ class TestUnifiedTriPool(_PoolTestCase):
         sa = allocator.swa_attn_allocator
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
-        from sglang.srt.mem_cache.kv.alloc.band import relieve_for_alloc
-
-        relieve_for_alloc(allocator, 1)
+        # A layout that compacts the ends leaves the float's holes in place.
+        demands = {n: d for n, d in allocator.page_demands(1, 1).items() if d}
+        layout = plan(allocator.pricing_snapshot(), demands, FLUSH_ENDS)
+        self.assertNotIn(sa.sub_pool_name, layout.flush)
+        allocator._lay_out(layout)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
     def test_state_target_stops_after_float_exposes_state_capacity(self):
@@ -606,11 +615,10 @@ class TestTriFreeSwaNoHostSync(_PoolTestCase):
         self.assertEqual(a2.verify_byte_accounting(), [])
 
 
-class TestGeneralizedRebalance(_PoolTestCase):
-    """The float must yield to WHICHEVER end is short, with the direction
-    derived from the caller's growth direction rather than hard-coded to the
-    token path's side. `make_room` was always side-agnostic; these pin the
-    POLICY in `_ask_float_for_room`."""
+class TestShortEndRelief(_PoolTestCase):
+    """A band short on its own take has its chain lay itself out for it: the
+    float yields to whichever end is short, and nothing moves when no layout
+    could serve the take."""
 
     PS = 4
 
@@ -620,228 +628,50 @@ class TestGeneralizedRebalance(_PoolTestCase):
         )
         return inst._build_paged(page_size=self.PS)[1]
 
-    def test_direction_is_derived_from_growth_on_both_ends(self):
-        """Either growth direction opens the float side facing that end."""
-        from test_multi_ended_allocator import TestFloatBand
-
+    def test_the_float_yields_to_either_short_end(self):
+        """Either end, short where it stands, has the float move away from it."""
         for side in ("low", "high"):
             with self.subTest(side=side):
-                inst = TestFloatBand("test_make_room_boundary_relocation")
-                _, up_end, fla, down_end, _ = inst._build_tri()
-                self.assertIsNotNone(fla.alloc(8))
-                end = up_end if side == "low" else down_end
-                gap = (
-                    fla._byte_low_frontier() - up_end._byte_high_frontier()
+                alloc = self._tri()
+                flt = alloc.swa_attn_allocator
+                self.assertIsNotNone(alloc.alloc(8 * self.PS))
+                end = (
+                    alloc.mamba_allocator
                     if side == "low"
-                    else down_end._byte_low_frontier() - fla._byte_high_frontier()
+                    else alloc.full_attn_allocator
                 )
-                fit = gap // end.entry_bytes_per_page
+                fit = end.available_size() // end.page_size
                 if fit:
                     self.assertIsNotNone(end.alloc(fit * end.page_size))
-                before = fla.low_wm_page if side == "low" else fla.high_wm_page
+                before = flt.low_wm_page if side == "low" else flt.high_wm_page
                 self.assertIsNotNone(end.alloc(end.page_size))
                 if side == "low":
-                    self.assertGreater(fla.low_wm_page, before)
+                    self.assertGreater(flt.low_wm_page, before)
                 else:
-                    self.assertLess(fla.high_wm_page, before)
+                    self.assertLess(flt.high_wm_page, before)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
 
-    def test_two_pool_chain_rebalance_is_a_noop(self):
-        from test_multi_ended_allocator import TestPagedBand as _PagedFixture
-
-        inst = _PagedFixture(
-            [m for m in dir(_PagedFixture) if m.startswith("test_")][0]
-        )
-        _pool, full, swa, _fkv, _skv = inst._build()
-        v = full.alloc(full.page_size * 2)
-        self.assertIsNotNone(v)
-        wm = full.watermark_physical
-        full._ask_float_for_room(full.page_size * 1000)  # absurd ask
-        self.assertEqual(full.watermark_physical, wm)  # untouched
-
-    def test_index_cap_guard_never_moves_data_uselessly(self):
-        """When the caller's own INDEX space binds, no amount of float
-        movement helps -- make_room must not be called (poisoned)."""
-        from unittest import mock
-
+    def test_a_take_beyond_any_layout_moves_nothing(self):
+        """When the band's own index space binds, no layout serves the take:
+        it is refused and no page moves."""
         alloc = self._tri()
-        alloc.alloc(4 * self.PS)
+        self.assertIsNotNone(alloc.alloc(4 * self.PS))
         ma = alloc.mamba_allocator
         sa = alloc.swa_attn_allocator
         huge = (ma.num_pages + 10) * ma.page_size  # beyond index space
-        with mock.patch.object(
-            sa, "make_room", side_effect=AssertionError("useless make_room")
+        with patch.object(
+            sa, "relocate_into", side_effect=AssertionError("useless move")
         ):
-            ma._ask_float_for_room(huge)
-
-
-class TestComputedShortSide(_PoolTestCase):
-    """`_ask_float_for_room` must open the side that MEASURES short -- never
-    "the side facing full" -- including the shape with coupled ends on BOTH
-    sides of the float.
-    """
-
-    PS = 4
-
-    def _tri(self):
-        inst = TestTriPagedFreeGroup(
-            [m for m in dir(TestTriPagedFreeGroup) if m.startswith("test_")][0]
-        )
-        return inst._build_paged(page_size=self.PS)[1]
-
-    def _sides(self, alloc):
-        sa = alloc.swa_attn_allocator
-        low = max(0, sa._byte_low_frontier() - sa._chain_high_frontier_below_bytes())
-        high = max(0, sa._chain_low_frontier_above_bytes() - sa._byte_high_frontier())
-        return low, high
-
-    def test_float_share_short_opens_the_state_side(self):
-        """RED-LINE: full's demand fits its band, the float's own share fits
-        NEITHER band, and the state side has the larger surplus -- so the
-        policy must open the STATE side, i.e. slide the float toward full
-        during a TOKEN alloc.
-        """
-        from unittest import mock
-
-        alloc = self._tri()
-        v = alloc.alloc(6 * self.PS)  # places the float mid-region
-        self.assertIsNotNone(v)
-        sa = alloc.swa_attn_allocator
-        fa = alloc.full_attn_allocator
-        e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
-
-        # Position: slide the float LOW (setup uses the mechanism directly),
-        # so the low band is small and the geometry below is expressible.
-        b_low0, b_high0 = self._sides(alloc)
-        # Pack the float low, then reopen LOW
-        # to ~2 full-pages: F must outgrow it, yet the need_n window below
-        # must stay non-empty.
-        sa.make_room(side="high", min_bytes=b_low0 + b_high0 - 2 * e_f)
-        sa.make_room(side="low", min_bytes=2 * e_f)
-
-        # Find a need_n where: D_high = need_n*e_f fits band_high, F =
-        # need_n*e_s exceeds BOTH surpluses, and low has the larger surplus.
-        chosen = None
-        for need_n in range(1, 64):
-            b_low, b_high = self._sides(alloc)
-            s_low = b_low  # no coupled end on the low side
-            s_high = b_high - need_n * e_f
-            if s_high < 0:
-                break
-            F = need_n * e_s
-            if F > s_low and F > s_high and s_low >= s_high:
-                chosen = need_n
-                break
-        self.assertIsNotNone(chosen, "fixture cannot express the geometry")
-
-        calls = []
-        real = sa.make_room
-        with mock.patch.object(
-            sa, "make_room", side_effect=lambda **kw: calls.append(kw) or real(**kw)
-        ):
-            alloc._ask_float_for_room(chosen * self.PS)
-        self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(calls[0]["side"], "low")  # the STATE side
-
-    def test_full_side_short_target_matches_aligned_demand(self):
-        """The ask covers joint demand on the float grid without extra slack."""
-        from unittest import mock
-
-        alloc = self._tri()
-        v = alloc.alloc(4 * self.PS)
-        self.assertIsNotNone(v)
-        sa, fa = alloc.swa_attn_allocator, alloc.full_attn_allocator
-        e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
-        chosen = None
-        for need_n in range(1, 256):
-            b_low, b_high = self._sides(alloc)
-            if b_high - need_n * e_f < 0 and b_low >= 0:
-                chosen = need_n
-                break
-        self.assertIsNotNone(chosen)
-        b_low, b_high = self._sides(alloc)
-        F = max(0, chosen - sa._hole_pages()) * e_s
-        raw_gap = chosen * e_f + max(0, F - b_low)
-        frontier = sa._chain_low_frontier_above_bytes()
-        _, hi = sa._region_bounds_pages()
-        want = (hi - (frontier - raw_gap) // e_s) * e_s
-        calls = []
-        with mock.patch.object(
-            sa, "make_room", side_effect=lambda **kw: calls.append(kw)
-        ):
-            alloc._ask_float_for_room(chosen * self.PS)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["side"], "high")
-        self.assertEqual(calls[0]["min_bytes"], want)
-
-    def test_two_coupled_ends_lands_demand_on_both_sides(self):
-        """A coupled set with ends on BOTH sides of the float: one-side-short
-        must open that side; BOTH-sides-short must not move at all
-        (relocation is zero-sum between the bands)."""
-        from unittest import mock
-
-        alloc = self._tri()
-        v = alloc.alloc(6 * self.PS)
-        self.assertIsNotNone(v)
-        sa, fa, ma = (
-            alloc.swa_attn_allocator,
-            alloc.full_attn_allocator,
-            alloc.mamba_allocator,
-        )
-        # Synthetic coupling: the state end joins the demand vector, the
-        # override a composite with ends on both sides would ship.
-        need = lambda self, c, t: {
-            fa: -(-t // c.page_size),
-            sa: -(-t // c.page_size),
-            ma: -(-t // c.page_size),
-        }
-        with mock.patch.object(type(alloc._policy), "_alloc_demand", need):
-            # (a) both sides short: absurd need -> both demands exceed their
-            # bands -> make_room must NOT be called.
-            with mock.patch.object(
-                sa, "make_room", side_effect=AssertionError("zero-sum move")
-            ):
-                alloc._ask_float_for_room(10_000 * self.PS)
-
-            # (b) one side short: find a need where the HIGH side (full) is
-            # short while the LOW side (mamba demand) still fits.
-            e_f, e_m = fa.entry_bytes_per_page, ma.entry_bytes_per_page
-            chosen = None
-            for need_n in range(1, 256):
-                b_low, b_high = self._sides(alloc)
-                if b_high - need_n * e_f < 0 and b_low - need_n * e_m >= 0:
-                    chosen = need_n
-                    break
-            if chosen is not None:
-                calls = []
-                with mock.patch.object(
-                    sa, "make_room", side_effect=lambda **kw: calls.append(kw)
-                ):
-                    alloc._ask_float_for_room(chosen * self.PS)
-                self.assertEqual(len(calls), 1)
-                self.assertEqual(calls[0]["side"], "high")
-
-    def test_nothing_short_means_no_relocation(self):
-        """Everything fits -> no page moves. The tri's token vector carries
-        {mamba: 0}: a zero entry must not move the float either."""
-        from unittest import mock
-
-        alloc = self._tri()
-        alloc.alloc(4 * self.PS)
-        demand = alloc._policy._alloc_demand(alloc, 2 * self.PS)
-        self.assertEqual(demand[alloc.mamba_allocator], 0)
-        sa = alloc.swa_attn_allocator
-        with mock.patch.object(
-            sa, "make_room", side_effect=AssertionError("needless move")
-        ):
-            alloc._ask_float_for_room(1)
+            self.assertIsNone(ma.alloc(huge))
 
 
 class TestFloatPolicyTotalTarget(_PoolTestCase):
-    """`make_room`'s min_bytes is a TARGET for the whole band, not a delta.
+    """A short end's relief serves its whole take, not the part beyond the
+    gap it has.
 
-    Regression: an ask shaped as `deficit + one page` lands BELOW the current
-    gap when the band is only PARTIALLY free, so `make_room` no-ops and the
-    allocation fails though the float had room to slide.
+    Regression: an ask shaped as `deficit + one page` landed BELOW the current
+    gap when the band was only PARTIALLY free, so the float did not move and
+    the allocation failed though the float had room to slide.
     """
 
     PS = 4
@@ -893,21 +723,6 @@ class TestTriDeferredAbsorption(_PoolTestCase):
         self.assertGreater(moved, 0)
         self.assertLess(sa._span_pages(), span)
         self.assertEqual(alloc.verify_byte_accounting(), [])
-
-    def test_shortfall_ladder_absorbs_before_the_deficit_math(self):
-        """The zero-copy rung must run FIRST: a stale-wide span inflates the
-        rebalance deficit and buys a relocation the shrink already covers."""
-        alloc = self._tri()
-        v = alloc.alloc(8 * self.PS)
-        sa = alloc.swa_attn_allocator
-        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
-        self.assertGreater(sa._hole_pages(), 0)
-        moves_before = len(sa._inverse_history)
-        from sglang.srt.mem_cache.kv.alloc.band import relieve_for_alloc
-
-        relieve_for_alloc(alloc, 1)  # the ladder
-        self.assertEqual(sa._hole_pages(), 0)  # rung 0 ran
-        self.assertEqual(len(sa._inverse_history), moves_before)  # zero copies
 
     def test_deferral_is_conservative_never_over_reports(self):
         """Availability with a stale-wide span must never EXCEED the absorbed
@@ -1635,13 +1450,14 @@ class TestJointCapacityIsHonoured(_PoolTestCase):
 
 
 class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
-    """Float relocation must settle the in-flight forward BEFORE its first copy.
+    """Float relocation must order itself after the in-flight forward's
+    writes to the pages it moves BEFORE its first copy.
 
-    REGRESSION: `make_room` / `compact_holes` issued `move_kv_cache` and
-    rebound `virtual_to_physical` with no ordering against the running
-    forward, so a copy could carry pre-write bytes and every later reader saw
-    a destination that never received those writes -- silently wrong KV, no
-    crash. The END pools guard the same hazard via `_settle_inflight_forward`.
+    REGRESSION: float moves issued `move_kv_cache` and rebound
+    `virtual_to_physical` with no ordering against the running forward, so a
+    copy could carry pre-write bytes and every later reader saw a destination
+    that never received those writes -- silently wrong KV, no crash. The END
+    pools guard the same hazard via `_settle_inflight_forward`.
     """
 
     def _tri(self, lazy=True):
@@ -1675,56 +1491,40 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         return pool, alloc, kvcache
 
     def _trace(self, flt):
-        """Record the order of (settle, move) on the float."""
+        """Record the order of (wait, move) on the float."""
         order = []
-        real_settle = flt._settle_inflight_forward
+        real_wait = flt._wait_writers
         real_move = flt._move_pages_and_rebind
 
-        def settle():
-            order.append("settle")
-            return real_settle()
+        def wait(*args, **kwargs):
+            order.append("wait")
+            return real_wait(*args, **kwargs)
 
         def move(src, dst):
             order.append("move")
             return real_move(src, dst)
 
-        flt._settle_inflight_forward = settle
+        flt._wait_writers = wait
         flt._move_pages_and_rebind = move
         return order
 
-    def test_make_room_settles_before_the_first_move(self):
+    def test_a_float_move_waits_the_writers_before_the_first_copy(self):
         _pool, alloc, _kv = self._tri()
         flt = alloc.swa_attn_allocator
-        # Occupy the float, then free an interior page so a relocation has
-        # something to move and somewhere to move it.
+        # Occupy the float, then free a page so a relocation has something to
+        # move and somewhere to move it.
         v = alloc.alloc(12)
         self.assertIsNotNone(v)
         alloc.free(v[:4])
         order = self._trace(flt)
-        flt.make_room(side="low", min_bytes=flt.entry_bytes_per_page)
-        # No copy, no wait: a settle with nothing to order would hold later
-        # schedule-stream work behind the forward for nothing.
-        if "move" in order:
-            self.assertIn("settle", order, "make_room never settled the forward")
-            self.assertLess(
-                order.index("settle"),
-                order.index("move"),
-                f"a copy was issued before the settle: {order}",
-            )
-        else:
-            self.assertEqual(order, [])
-
-    def test_compact_holes_settles_before_the_first_move(self):
-        _pool, alloc, _kv = self._tri()
-        flt = alloc.swa_attn_allocator
-        v = alloc.alloc(12)
-        self.assertIsNotNone(v)
-        alloc.free(v[2:6])  # interior holes, so compact_holes has work
-        order = self._trace(flt)
-        flt.compact_holes(retreat_side="high")
-        if not order:
-            self.skipTest("no holes reached compact_holes in this geometry")
-        self.assertEqual(order[0], "settle", f"first action was not a settle: {order}")
+        open_float_side(flt, "low", flt._gap_pages()[0] * flt.entry_bytes_per_page + 1)
+        self.assertIn("move", order, "the geometry asked for no relocation")
+        self.assertIn("wait", order, "the move never waited the writers")
+        self.assertLess(
+            order.index("wait"),
+            order.index("move"),
+            f"a copy was issued before the wait: {order}",
+        )
 
     def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
         """The settle before a float move must be a stream wait: a host sync
@@ -1841,14 +1641,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         self.assertLessEqual(full_demand, allocator.full_available_size())
         self.assertLessEqual(swa_demand, allocator.swa_available_size())
         # ... yet the two draw on the same bytes, so the grid refuses the pair.
-        self.assertFalse(
-            float_fit(
-                chain_snapshot(allocator),
-                float_chain(allocator),
-                -(-full_demand // allocator.page_size),
-                -(-swa_demand // allocator.page_size),
-            )
-        )
+        self.assertFalse(allocator.ensure_capacity(full_demand, swa_demand))
         self.assertFalse(
             allocator.prealloc_fits(
                 self._empty_tree(),

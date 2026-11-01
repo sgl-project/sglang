@@ -241,7 +241,9 @@ class BuilderAdapter:
 
     def prepare_state(self, n: int) -> None:
         self._sync_hold()
-        self.allocator.prepare_mamba_allocation(n)
+        # Lay the chain out so ``n`` state slots then fit in place.
+        state = self.allocator.mamba_allocator.sub_pool_name
+        self.allocator.lay_out_for({state: n})
 
     def gate(self, open_: bool) -> None:
         self.gate_open = open_

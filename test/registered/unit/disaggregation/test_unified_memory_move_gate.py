@@ -224,7 +224,7 @@ class TestNetworkTransfers(CustomTestCase):
 class TestFixedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
     release. While a peer holds a fixed page that flush relocates nothing, so
-    crediting them lets the scheduler admit work `relieve_for_alloc` cannot
+    crediting them lets the scheduler admit work the band's relief cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """
