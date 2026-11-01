@@ -526,6 +526,65 @@ class TestThreeWindowTree(CustomTestCase):
         self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
         self.assertEqual(storage.accounting_violations(), [])
 
+    def test_first_window_is_one_window_among_others(self):
+        """The tree's first window is read, evicted and reclaimed through the
+        same per-slot interface as every further window."""
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            AllocDemand,
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        lengths = {"window_16": 16, "window_8": 8, "window_4": 4}
+        for victim in range(3):
+            with self.subTest(victim=victim):
+                storage, cache = self._cache()
+                a = storage.allocator
+                slots = cache.window_slots()
+                names = [name for name, _, _, _ in a.admission_windows(cache)]
+                for (name, ct, _, evictable), slot in zip(
+                    a.admission_windows(cache), slots
+                ):
+                    self.assertEqual(ct, slot)
+                    self.assertEqual(evictable, cache.window_evictable_size(ct))
+                key = RadixKey(array("q", range(32)))
+                cache.insert(InsertParams(key=key, value=a.alloc(32).clone()))
+                match = cache.match_prefix(MatchPrefixParams(key=key))
+                lock = cache.lock(match.last_device_node)
+                # A lock holds each window's own trailing window: the rest of
+                # the prefix is each window's evictable history.
+                self.assertEqual(
+                    [cache.window_evictable_size(ct) for ct in slots],
+                    [32 - lengths[name] for name in names],
+                )
+                for ct, name in zip(slots, names):
+                    self.assertEqual(
+                        cache.window_available_size(ct), a.units_available(name)
+                    )
+                ct, name = slots[victim], names[victim]
+                before = {c: cache.window_evictable_size(c) for c in slots}
+                result = cache.evict(EvictParams(window_num_tokens={ct: 64}))
+                self.assertEqual(result.num_tokens_evicted, 0)
+                # The victim's whole history goes; another window's entries
+                # on the same nodes go with it (up to that window's own
+                # history), whichever window is the victim.
+                self.assertEqual(
+                    result.window_num_tokens_evicted,
+                    {c: min(before[c], before[ct]) for c in slots},
+                )
+                self.assertEqual(cache.window_evictable_size(ct), 0)
+                cache.unlock(lock)
+                # A demand on this window alone is reclaimed for it alone.
+                held = {b.sub_pool_name: b.allocated_count() for b in a.bands}
+                pages = -(-a.units_available(name) // 4) + 1
+                cache.evict_for_alloc(AllocDemand(window_num_tokens={ct: pages * 4}))
+                self.assertTrue(a._units_fit({name: pages}))
+                after = {b.sub_pool_name: b.allocated_count() for b in a.bands}
+                self.assertLess(after[name], held[name])
+                self.assertEqual(storage.accounting_violations(), [])
+
     def test_reclaim_evicts_a_further_window_for_its_own_demand(self):
         from sglang.srt.mem_cache.base_prefix_cache import InsertParams
         from sglang.srt.mem_cache.radix_cache import RadixKey

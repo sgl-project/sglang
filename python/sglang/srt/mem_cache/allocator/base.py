@@ -215,6 +215,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
+    def window_available_size(self, component) -> int:
+        """What a take from the window pool of prefix-tree slot ``component``
+        can serve now; a pool keeping one window serves every window slot."""
+        return self.swa_available_size()
+
     def reclaim_for_demand(self, tree_cache, demand: AllocDemand) -> EvictResult | None:
         """Evict until ``demand`` (what an allocation will take) can be served, when this allocator's pools share their memory;
         None when each pool is its own, so the prefix tree evicts each pool's

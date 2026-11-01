@@ -420,6 +420,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                     ComponentType.MAMBA,
                 )
                 index_slots(cache, cache.tree_components)
+                cache.components = dict.fromkeys(cache.tree_components)
                 cache.is_swa_enabled = True
                 cache.is_mamba_enabled = True
                 cache.cache_controller = None
@@ -433,7 +434,9 @@ class TestUnifiedTriPool(_PoolTestCase):
                 tree_core.full_evictable_size.return_value = len(full_leaves)
                 tree_core.mamba_evictable_size.return_value = 0
                 tree_core.swa_evictable_size.return_value = 0
-                tree_core.window_evictable_size.return_value = 0
+                tree_core.component_evictable_size.side_effect = lambda ct: (
+                    len(full_leaves) if ct == ComponentType.FULL else 0
+                )
                 walk = {"request_cnt": 0, "freed_leaves": 0}
 
                 def start(component_type, request_cnt):
