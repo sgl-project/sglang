@@ -4,11 +4,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers import mm_utils, schedule_batch
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.multimodal.modality import Modality
 
 
 def _make_proxy_with_reconstruct_result(tensor: torch.Tensor):

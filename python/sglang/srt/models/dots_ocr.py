@@ -8,7 +8,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs import DotsOCRConfig
+from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -16,7 +16,8 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dots_vlm_vit import DotsVisionTransformer

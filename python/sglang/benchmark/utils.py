@@ -13,6 +13,11 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.srt.utils.hf_transformers_patches import apply_all
+
+# This module loads tokenizers and processors straight from transformers.
+apply_all()
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text

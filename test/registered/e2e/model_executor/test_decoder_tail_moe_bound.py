@@ -8,12 +8,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
     _Graph,

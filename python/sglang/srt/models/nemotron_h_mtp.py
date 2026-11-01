@@ -17,7 +17,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack

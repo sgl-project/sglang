@@ -13,7 +13,7 @@ import torch
 from sglang.srt.layers.layer_boundary import UnreducedOutput
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_attn_input
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.communicator_patch import patch_communicator

@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")

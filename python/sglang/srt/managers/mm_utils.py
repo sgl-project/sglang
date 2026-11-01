@@ -35,17 +35,15 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.mm_schedule import (
     init_mm_embedding_cache as init_mm_embedding_cache,
 )
-from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
-    Modality,
-    MultimodalInputs,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,

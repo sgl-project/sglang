@@ -11,7 +11,7 @@ from sglang.srt.lora.backend.base_backend import (
 )
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import (
     register_amd_ci,

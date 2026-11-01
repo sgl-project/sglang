@@ -3,7 +3,7 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.glm_image_vl import GlmImageForConditionalGeneration
 
 logger = logging.getLogger(__name__)
@@ -206,7 +206,7 @@ class GlmImageProcessor(SGLangBaseProcessor):
                         items = self.collect_mm_items_from_processor_output(img)
                         for item in items:
                             if img.get("format") == "processor_output":
-                                from sglang.srt.managers.schedule_batch import (
+                                from sglang.srt.multimodal.modality import (
                                     MultimodalInputFormat,
                                 )
 

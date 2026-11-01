@@ -19,7 +19,7 @@ from sglang.srt.lora.dense.plan import (  # noqa: E402
     DensePlan,
     Overlap,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.model_executor.runner_utils.capture_mode import (  # noqa: E402
     capture_lora_variant,
     model_capture_mode,

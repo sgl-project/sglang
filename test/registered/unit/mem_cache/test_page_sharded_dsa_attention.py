@@ -754,7 +754,7 @@ class _MetadataShardPool(PageInterleaveKVPoolMixin):
 class TestShardedDSAMetadata(unittest.TestCase):
     def test_cp_request_filtering_keeps_both_address_spaces_aligned(self):
         from sglang.srt.layers.attention import dsa_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         lengths = torch.tensor([129, 65, 193])
         req_ids = torch.tensor([2, 0, 4])
@@ -878,7 +878,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_backend):
     from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     device = check.device
     lengths = [length for _, _, length in requests]

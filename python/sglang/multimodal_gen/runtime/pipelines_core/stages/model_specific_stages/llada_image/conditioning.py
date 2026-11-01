@@ -232,10 +232,8 @@ class LLaDAImageTextEncoderRunner:
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
         from sglang.srt.mem_cache.common import release_kv_cache
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.sampling.sampling_params import (
             SamplingParams as SRTSamplingParams,
         )

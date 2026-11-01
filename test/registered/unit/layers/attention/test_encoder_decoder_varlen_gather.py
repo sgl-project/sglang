@@ -176,7 +176,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         # slice encoder KV per request. It must also skip the //page_size stride
         # for enc-dec (token-slot indices feed the varlen kernel). Fails on the old
         # scalar-max-offset slice (row0 would start at col 5, not 3).
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
         backend.page_size = 128  # >1: also exercises the enc-dec stride-skip

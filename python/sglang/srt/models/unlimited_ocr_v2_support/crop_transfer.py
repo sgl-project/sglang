@@ -117,10 +117,8 @@ def iter_crop_sources(requests) -> list[torch.Tensor]:
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
-    from sglang.srt.managers.schedule_batch import (
-        MultimodalInputs,
-        MultimodalProcessorOutput,
-    )
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.managers.schedule_batch import MultimodalInputs
 
     sources = []
     for request in requests:

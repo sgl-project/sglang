@@ -16,7 +16,8 @@
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.utils import logger
 
 from .evs_core import tokens_per_frame

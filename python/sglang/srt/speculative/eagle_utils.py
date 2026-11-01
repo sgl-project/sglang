@@ -351,9 +351,9 @@ def eagle_prepare_for_verify(
         from sglang.kernels.ops.speculative.cache_locs import (
             assign_extend_cache_locs_uniform_func,
         )
-        from sglang.srt.model_executor.forward_batch_info import (
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import (
             CaptureHiddenMode,
-            ForwardBatch,
             ForwardMode,
         )
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify

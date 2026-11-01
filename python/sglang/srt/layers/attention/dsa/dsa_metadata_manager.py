@@ -22,7 +22,7 @@ if TYPE_CHECKING:
         DeepseekSparseAttnBackend,
         DSAMetadata,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_hip = is_hip()
 

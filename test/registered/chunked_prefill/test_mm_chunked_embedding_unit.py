@@ -16,7 +16,8 @@ import pytest
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,

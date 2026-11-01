@@ -93,13 +93,13 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -219,10 +219,10 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
-    MultimodalProcessorOutput,
     NextBatchPlan,
     Req,
     ScheduleBatch,

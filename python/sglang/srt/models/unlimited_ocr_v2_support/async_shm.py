@@ -17,10 +17,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.mm_utils import ShmPointerMMData
-from sglang.srt.managers.schedule_batch import (
-    MultimodalInputs,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 # Received values (SHM-backed or not) queued for in-order publication.

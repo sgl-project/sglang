@@ -341,7 +341,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
     def _make_scheduler(self, *, ingest_steps, events):
         from collections import deque
 
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )

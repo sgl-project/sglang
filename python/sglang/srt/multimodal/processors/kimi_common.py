@@ -13,12 +13,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
     build_artifact_key,
@@ -26,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 
 _KIMI_IMAGE_IDENTITY_TAG = b"sglang-kimi-image-identity-v1"
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")

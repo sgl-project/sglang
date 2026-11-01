@@ -3,7 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,

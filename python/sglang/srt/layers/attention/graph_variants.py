@@ -115,7 +115,7 @@ def create_dsv41_candidate_graph_variants(
 ) -> Optional[Dsv41CandidateGraphVariants]:
     import torch
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config

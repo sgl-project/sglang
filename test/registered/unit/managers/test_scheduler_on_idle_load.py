@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
 from sglang.srt.observability.scheduler_stage_metrics import (
