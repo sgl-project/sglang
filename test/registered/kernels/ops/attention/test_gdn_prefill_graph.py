@@ -65,6 +65,7 @@ def _layer():
 def _backend(conv_pool, ssm_pool):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
+    backend.state_pool = None
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.req_to_token_pool = SimpleNamespace(
         get_mamba_indices=lambda req_pool_indices: (req_pool_indices + 1).to(
@@ -73,7 +74,7 @@ def _backend(conv_pool, ssm_pool):
     )
     backend._state_ids = IdSpace(key=("state", None))
     pool = SimpleNamespace(layer_transfer_counter=None, start_layer=0)
-    pool.layer_router = KVLayerRouter.from_layer_maps(pool, ())
+    pool.layer_router = KVLayerRouter.from_layer_maps(pool, (), owner="state")
     pool.layer_router.bind_part(
         sub_pool="state",
         part=STATE_PART,

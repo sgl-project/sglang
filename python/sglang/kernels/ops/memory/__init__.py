@@ -43,6 +43,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="memory.gpu_tensor_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensor_blake3",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="memory.memcpy_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",
@@ -51,15 +59,14 @@ register_kernel(
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
-for _fn in ("gpu_tensor_blake3", "gpu_tensors_blake3"):
-    register_kernel(
-        KernelSpec(
-            op=f"memory.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.memory.gpu_tensor_hash_blake3:{_fn}",
-        )
+register_kernel(
+    KernelSpec(
+        op="memory.gpu_tensors_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensors_blake3",
+        capabilities=CUDA_ONLY,
     )
-del _fn
+)
 
 register_kernel(
     KernelSpec(
