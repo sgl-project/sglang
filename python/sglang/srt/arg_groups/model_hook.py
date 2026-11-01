@@ -184,6 +184,28 @@ def handle_model_specific_adjustments(server_args: Any):
                 "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
             )
 
+    # load_tp_by_experts requires DeepseekV2WeightLoaderMixin.load_weights()
+    # to call _ep_to_tp_transform_all_layers() after loading. Fail early if
+    # the architecture doesn't use that code path.
+    extra_config = cfg.model_loader_extra_config or {}
+    if isinstance(extra_config, str):
+        extra_config = json.loads(extra_config)
+    if extra_config.get("load_tp_by_experts", False):
+        _SUPPORTED_EP_LOAD_ARCHS = {
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+            "MistralLarge3ForCausalLM",
+        }
+        assert model_arch in _SUPPORTED_EP_LOAD_ARCHS, (
+            f"load_tp_by_experts is only supported for models using "
+            f"DeepseekV2WeightLoaderMixin ({_SUPPORTED_EP_LOAD_ARCHS}), "
+            f"but got architecture {model_arch!r}"
+        )
+
     if cfg.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
         raise ValueError(
             "--enable-dsa-cache-layer-split is only supported for DSA "
