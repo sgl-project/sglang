@@ -171,7 +171,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
-        self.uocr_doc_hooks = None
+        self.uocr_runtime = None
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False

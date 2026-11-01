@@ -21,8 +21,14 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as r
+from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -527,6 +533,38 @@ class TestMemoryPressure(CustomTestCase):
             input_ids=[1],
             output_ids=[],
         )
+
+    def _model_adder(self, cache, *, running):
+        adder = object.__new__(UocrPrefillAdder)
+        adder.tree_cache = SimpleNamespace(uocr_doc_reuse=cache.reuse)
+        adder.running_batch = ScheduleBatch(reqs=[self._blocked()] if running else [])
+        adder.memory_budget = SimpleNamespace(remaining_total=0)
+        adder.can_run_list = []
+        return adder
+
+    def test_reclaim_after_rejection_reopens_admission(self):
+        """reclaimed retained KV must clear a full batch or the scheduler never retries"""
+        cache = _FakeCache()
+        for i in range(4):
+            self._retain(cache, f"doc{i}", 640)
+        adder = self._model_adder(cache, running=True)
+        req = self._blocked(pending=torch.arange(64))
+        self.assertFalse(adder.batch_is_full_after_rejection(req))
+        self.assertEqual(list(cache.reuse.docs), ["doc2", "doc3"])
+        self.assertEqual(len(cache.freed_rows), 2)
+        self.assertEqual(len(cache.freed_req_slots), 2)
+        # no useful victim remains: running work must now make room
+        cache.reuse.docs.clear()
+        self.assertTrue(adder.batch_is_full_after_rejection(req))
+
+    def test_new_document_defers_without_consuming_retained_windows(self):
+        """new documents wait for follow-ups while running work can release capacity"""
+        cache = _FakeCache()
+        self._retain(cache, "doc0", 640)
+        adder = self._model_adder(cache, running=True)
+        self.assertTrue(adder.should_defer(self._blocked()))
+        self.assertEqual(list(cache.reuse.docs), ["doc0"])
+        self.assertEqual(cache.freed_rows, [])
 
     def test_frees_oldest_windows_until_request_fits(self):
         cache = _FakeCache()

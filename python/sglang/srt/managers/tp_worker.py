@@ -634,7 +634,7 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
-        uocr_graph_io_deferred: bool = False,
+        input_ids_from_graph: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -661,7 +661,7 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
-                uocr_graph_io_deferred=uocr_graph_io_deferred,
+                input_ids_from_graph=input_ids_from_graph,
                 pp_loras=pp_loras,
             )
             if folded is not None:

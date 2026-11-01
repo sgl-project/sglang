@@ -1,14 +1,14 @@
-"""Scheduler hooks for Unlimited-OCR v2 split-document windows and decode graph I/O.
-
-The scheduler builds ``UocrDocHooks`` only for Unlimited-OCR v2 and guards every
-call site with a ``None`` check, so other models never enter the document modules.
-"""
+"""Unlimited-OCR v2 scheduler resources and document-window lifecycle"""
 
 from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Callable, List, Optional
 
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
+    create_async_shm_materializer,
+)
 from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import (
     DocPrefetch,
     EarlyEmbeddings,
@@ -18,6 +18,12 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     DocReuse,
     forced_len,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.overlap_release import (
+    DeferredOverlapRelease,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
+    UocrRequestReceiver,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -25,7 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
@@ -50,7 +55,7 @@ def _v2_backend(attn_backend: AttentionBackend):
     return None
 
 
-class UocrDocHooks:
+class UocrSchedulerRuntime:
     """Route scheduler events to Unlimited-OCR v2 document KV reuse and prefetch.
 
     Owns the scheduler's ``DocReuse`` and ``DocPrefetch`` state; the radix cache
@@ -67,7 +72,11 @@ class UocrDocHooks:
         forward_stream: Optional[torch.cuda.Stream],
         tp_size: int,
         decode_graph_io: Callable[[], Optional[UOCRDecodeGraphIO]],
+        crop_transfer,
+        enable_overlap: bool,
     ):
+        self._crop_transfer = crop_transfer
+        self.overlap_release = DeferredOverlapRelease() if enable_overlap else None
         self._prefetch = DocPrefetch(
             early=early_embeddings,
             device=device,
@@ -89,46 +98,14 @@ class UocrDocHooks:
 
     # -- Waiting queue and admission --
 
-    def park(self, req: Req, *, is_retracted: bool) -> bool:
-        """Hold a split document's next window off-queue; True if parked."""
-        return not is_retracted and self._prefetch.park(req)
-
     def take_released(self) -> List[Req]:
         """Parked windows whose predecessor finished, to queue in this order."""
         return self._prefetch.take_released()
-
-    def on_retracted(self, req: Req) -> None:
-        """Restore a retracted window's original prompt before it is re-queued."""
-        self._reuse.on_retracted(req)
-
-    def queue_position(self, waiting_queue: List[Req], req: Req) -> Optional[int]:
-        """Waiting-queue index for a follow-up window, or None to append."""
-        return self._reuse.queue_position(waiting_queue, req)
 
     def on_req_dropped(self, req: Req) -> None:
         """Release reuse and prefetch state of a request aborted before running."""
         self._reuse.on_req_dropped(req)
         self._prefetch.release_early(req.rid)
-
-    def free_rows_for_admission(self, waiting_queue: List[Req]) -> None:
-        """Free a retained window when retained windows hold every request row."""
-        self._reuse.free_for_admission(waiting_queue)
-
-    def defer_new_document(
-        self, *, req: Req, adder: PrefillAdder, nothing_running: bool
-    ) -> bool:
-        """Whether a new document must wait so retained windows' follow-ups fit."""
-        return self._reuse.defer_new_document(
-            req=req, adder=adder, nothing_running=nothing_running
-        )
-
-    def on_no_token(
-        self, *, req: Req, adder: PrefillAdder, nothing_running: bool
-    ) -> bool:
-        """Evict retained windows for a rejected request; True if memory was freed."""
-        return self._reuse.on_no_token(
-            req=req, adder=adder, nothing_running=nothing_running
-        )
 
     def free_for_decode(self, batch: ScheduleBatch) -> None:
         """Evict retained windows before the decode batch would retract."""
@@ -182,7 +159,7 @@ class UocrDocHooks:
             self._last_graph_io = io
         return io
 
-    def prepare_forward_inputs(
+    def resolve_forward_inputs(
         self, batch: ScheduleBatch, future_map: FutureMap
     ) -> bool:
         """Apply forced decode inputs; True if the decode graph loads the inputs."""
@@ -196,7 +173,9 @@ class UocrDocHooks:
             relay=graph_io.relay if graph_io is not None else None,
         )
         self._reuse.note_prompt_lens(batch)
-        return graph_io is not None and graph_io.can_defer(batch)
+        if graph_io is not None and graph_io.can_defer(batch):
+            return True
+        return resolve_forward_inputs(batch, future_map)
 
     def relay_result(
         self,
@@ -238,10 +217,45 @@ class UocrDocHooks:
             META_FORCED_TOKENS: [[n] for n in forced],
         }
 
-    def held_tokens(self) -> int:
-        """KV tokens retained windows hold outside any session record."""
-        return self._reuse.held_tokens()
-
     def held_req_count(self) -> int:
         """Request rows retained windows hold."""
         return len(self._reuse.held_slots())
+
+    def enqueue(
+        self, waiting_queue: List[Req], req: Req, *, is_retracted: bool
+    ) -> bool:
+        """queue a follow-up in reuse order, or keep it parked until its source finishes"""
+        if is_retracted:
+            self._reuse.on_retracted(req)
+        if not is_retracted and self._prefetch.park(req):
+            return False
+        pos = self._reuse.queue_position(waiting_queue, req)
+        if pos is None:
+            waiting_queue.append(req)
+        else:
+            waiting_queue.insert(pos, req)
+        return True
+
+    def close(self) -> None:
+        self._crop_transfer.close()
+
+    def create_request_receiver(
+        self, *, parallel, attn_dp_enabled: bool, mm_feature_transport: str, **kwargs
+    ) -> UocrRequestReceiver:
+        materializer = create_async_shm_materializer(
+            max_recv_per_poll=kwargs["max_recv_per_poll"],
+            tp_size=parallel.tp_size,
+            pp_size=parallel.pp_size,
+            dp_size=parallel.num_dp_ranks,
+            attn_cp_size=parallel.attn_cp_size if attn_dp_enabled else 1,
+            nnodes=parallel.nnodes,
+            mm_feature_transport=mm_feature_transport,
+            scripted_runtime=kwargs["scripted_scheduler_hook"] is not None,
+            rust_server=kwargs["rust_server_mode"],
+            is_unlimited_ocr=True,
+        )
+        return UocrRequestReceiver(
+            **kwargs,
+            async_shm_materializer=materializer,
+            submit_crop_prefetch=self._crop_transfer.prefetch_requests,
+        )
