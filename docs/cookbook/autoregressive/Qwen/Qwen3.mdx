@@ -52,6 +52,7 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
   - `--speculative-eagle-topk 1`: Top-k sampling for draft tokens
   - `--speculative-num-draft-tokens 4`: Number of draft tokens per step
   - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan`](https://huggingface.co/lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan).
+- **Intel Arc Pro B-Series (BMG):** The BMG command enables XPU graphs (`--cuda-graph-backend-decode full --cuda-graph-backend-prefill breakable`), which need an XPU image built from the current [XPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xpu.Dockerfile) (oneAPI 2026.1.3). On `lmsysorg/sglang:v0.5.22-xpu` these two flags produce corrupted output; leave them out there, at the cost of much slower decode. See [XPU Graph](../../../docs/hardware-platforms/xpu#xpu-graph-experimental) for details.
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
