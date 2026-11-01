@@ -870,6 +870,7 @@ class TestNixlNodeFailure(CustomTestCase):
             "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1"}],
             "10.0.0.1:8998_0_0_1": [{"rank_ip": "10.0.0.1"}],
             "10.0.0.2:8998_0_0_0": [{"rank_ip": "10.0.0.2"}],
+            "10.0.0.1:89981_0_0_0": [{"rank_ip": "10.0.0.1"}],
         }
         mgr.prefill_info_table = {
             "10.0.0.1:8998": object(),
@@ -900,6 +901,7 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool)
         self.assertIn("10.0.0.2:8998_0_0_0", mgr.connection_pool)
+        self.assertIn("10.0.0.1:89981_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998", mgr.prefill_info_table)
         self.assertNotIn("10.0.0.1:8998", mgr.addr_to_rooms_tracker)
         self.assertEqual(mgr.request_status[3], KVPoll.Failed)
