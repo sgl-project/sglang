@@ -63,8 +63,8 @@ prefill result, giving decode admission its own budget. On decode,
 then starts afresh for admission and again when destination indices are sent
 for transfer.
 
-The option does not support staging buffers, runtime PD role switching, PD
-multiplexing, encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
+The option does not support staging buffers, runtime PD role switching,
+encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
 HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
 `write_back` and no storage backend. Unsupported configurations fail validation.
 
