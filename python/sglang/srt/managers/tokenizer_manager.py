@@ -139,6 +139,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.frontend_request_timing import (
+    FrontendRequestTiming,
+    FrontendTimingGroup,
+    bind_frontend_timing,
+    measure_frontend_stage,
+)
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
@@ -156,6 +162,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
+from sglang.srt.observability.tokenizer_encode_metrics import measure_tokenizer_encode
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
@@ -883,6 +890,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
             )
 
+            if self.async_dynamic_batch_tokenizer is not None:
+                self.async_dynamic_batch_tokenizer.metrics_collector = (
+                    self.metrics_collector
+                )
+
             start_cpu_monitor_thread("tokenizer")
 
         if get_observability().gc_warning_threshold_secs > 0.0:
@@ -937,6 +949,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        if self.enable_metrics and not hasattr(obj, "_frontend_request_timing"):
+            start = (
+                request.scope.get("frontend_received_time", time.perf_counter())
+                if request is not None
+                else time.perf_counter()
+            )
+            obj._frontend_request_timing = FrontendRequestTiming(started_at=start)
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
@@ -985,7 +1005,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
+                    timing = getattr(obj, "_frontend_request_timing", None)
+                    with bind_frontend_timing(timing):
+                        tokenized_obj = await self._tokenize_one_request(obj)
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
@@ -1104,10 +1126,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                input_ids = []
+                for text in tokenizer_input:
+                    with measure_tokenizer_encode(
+                        getattr(self, "metrics_collector", None), source="manager"
+                    ):
+                        input_ids.append(self.tokenizer.encode(text))
                 token_type_ids = None
             else:
-                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                with measure_tokenizer_encode(
+                    getattr(self, "metrics_collector", None),
+                    source="manager",
+                    batch_size=len(tokenizer_input),
+                ):
+                    encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
                 input_ids = encoded["input_ids"]
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
@@ -1138,6 +1170,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ):
+        with bind_frontend_timing(getattr(obj, "_frontend_request_timing", None)):
+            return await self._tokenize_one_request_impl(obj)
+
+    async def _tokenize_one_request_impl(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Tokenize one request."""
         # Tokenize
@@ -1241,13 +1279,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    with measure_frontend_stage(
+                        getattr(obj, "_frontend_request_timing", None), "multimodal"
+                    ):
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=mm_processor_input,
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 get_disagg().language_only
                 and get_disagg().encoder_transfer_backend
@@ -1256,13 +1297,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                with measure_frontend_stage(
+                    getattr(obj, "_frontend_request_timing", None), "multimodal"
+                ):
+                    mm_inputs = await self.mm_processor.process_mm_data_async(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text=mm_processor_input,
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
@@ -1745,9 +1789,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
-        input_ids_list, token_type_ids_list = await self._tokenize_texts(
-            texts, is_cross_encoder_request
+        timings = FrontendTimingGroup(
+            getattr(req, "_frontend_request_timing", None) for req in requests
         )
+        with bind_frontend_timing(timings):
+            input_ids_list, token_type_ids_list = await self._tokenize_texts(
+                texts, is_cross_encoder_request
+            )
 
         # Process all requests
         tokenized_objs = []
@@ -1838,8 +1886,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
+            dispatched_at = time.perf_counter()
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            self._observe_frontend_request(tokenized_obj.rid, dispatched_at)
             dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()
@@ -1914,6 +1964,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
 
+    def _observe_frontend_request(self, rid: str, dispatched_at: float):
+        if not self.enable_metrics:
+            return
+        state = self.rid_to_state.get(rid)
+        timing = getattr(state.obj, "_frontend_request_timing", None) if state else None
+        if timing is not None:
+            try:
+                durations = timing.finish(dispatched_at)
+                if durations is not None:
+                    self.metrics_collector.observe_frontend_request_timing(durations)
+            except Exception:
+                logger.exception("Failed to observe frontend request timing")
+
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
 
@@ -1963,9 +2026,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
             self._dispatch_to_scheduler(batch_req)
+            dispatched_at = time.perf_counter()
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
+            if self.enable_metrics:
+                for tokenized_obj in tokenized_objs:
+                    self._observe_frontend_request(tokenized_obj.rid, dispatched_at)
             for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
                 tokenized_obj.time_stats = time_stat
             set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
@@ -2261,6 +2328,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # them. Keep LoRA on tokenized_obj for the correct prefix-cache key.
                 tmp_obj.lora_path = None
                 tmp_obj.lora_id = None
+                # This is an internal cache warmup, not a user request sample.
+                tmp_obj._frontend_request_timing = None
                 tokenized_obj = copy.copy(tokenized_objs[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
@@ -3925,6 +3994,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         new_states = {}
         for rid, sub_obj, bootstrap_room in items:
+            parent_timing = getattr(obj, "_frontend_request_timing", None)
+            if sub_obj is not obj and parent_timing is not None:
+                sub_obj._frontend_request_timing = parent_timing.fork()
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             if self.enable_trace:

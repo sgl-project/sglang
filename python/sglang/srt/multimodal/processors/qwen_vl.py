@@ -51,6 +51,10 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.observability.frontend_request_timing import (
+    current_frontend_timing,
+    measure_frontend_stage,
+)
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -416,7 +420,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Build input_ids with timestamps for qwen3_vl models.
         """
         if not isinstance(prompt, list):
-            prompt = self._processor.tokenizer.encode(prompt)
+            with measure_frontend_stage(current_frontend_timing.get(), "text"):
+                prompt = self._processor.tokenizer.encode(prompt)
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
@@ -459,9 +464,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                         modality_list.append(Modality.VIDEO)
                     curr_time = curr_timestamps[frame_idx]
                     timestamp_text = f"<{curr_time:.1f} seconds>"
-                    timestamp_tokens = self._processor.tokenizer.encode(
-                        timestamp_text, add_special_tokens=False
-                    )
+                    with measure_frontend_stage(current_frontend_timing.get(), "text"):
+                        timestamp_tokens = self._processor.tokenizer.encode(
+                            timestamp_text, add_special_tokens=False
+                        )
                     video_tokens.extend(timestamp_tokens)
                     _current_offset += len(timestamp_tokens)
                     if vision_start_token_id is not None:

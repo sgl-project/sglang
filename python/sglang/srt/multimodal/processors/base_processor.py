@@ -46,6 +46,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.observability.frontend_request_timing import (
+    current_frontend_timing,
+    measure_frontend_stage,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -591,7 +595,8 @@ class BaseMultimodalProcessor(ABC):
         Supports image, video, and audio tokens.
         """
         if not isinstance(prompt, list):
-            prompt = self._tokenizer.encode(prompt)
+            with measure_frontend_stage(current_frontend_timing.get(), "text"):
+                prompt = self._tokenizer.encode(prompt)
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
@@ -1871,11 +1876,12 @@ class BaseMultimodalProcessor(ABC):
         all_loaded_data = base_output.organize_results()
         # Handle text-only case
         if not all_loaded_data:
-            input_ids = tokenizer(
-                base_output.input_text,
-                return_tensors="pt",
-                add_special_tokens=True,
-            ).input_ids.flatten()
+            with measure_frontend_stage(current_frontend_timing.get(), "text"):
+                input_ids = tokenizer(
+                    base_output.input_text,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                ).input_ids.flatten()
             return [], input_ids, {}
 
         dict_items, raw_images, raw_audios, raw_videos = [], [], [], []
@@ -1990,11 +1996,12 @@ class BaseMultimodalProcessor(ABC):
                     break
 
         if input_ids is None:
-            input_ids = tokenizer(
-                base_output.input_text,
-                return_tensors="pt",
-                add_special_tokens=True,
-            ).input_ids.flatten()
+            with measure_frontend_stage(current_frontend_timing.get(), "text"):
+                input_ids = tokenizer(
+                    base_output.input_text,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                ).input_ids.flatten()
 
         # Add offsets to all items
         for mm_item in all_collected_items:

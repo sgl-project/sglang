@@ -111,6 +111,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
+from sglang.srt.observability.tokenizer_encode_metrics import measure_tokenizer_encode
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -585,7 +586,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 spaces_between_special_tokens=False,
             )
             assistant_prefix = detector.answer_opener(prompt) + assistant_prefix
-        encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        with measure_tokenizer_encode(
+            getattr(self.tokenizer_manager, "metrics_collector", None), source="chat"
+        ):
+            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
@@ -812,14 +816,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=request_tools,
-                return_dict=False,
-                **template_kwargs,
-            )
+            with measure_tokenizer_encode(
+                getattr(self.tokenizer_manager, "metrics_collector", None),
+                source="chat",
+                operation="chat_template",
+            ):
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=request_tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
@@ -2137,7 +2146,11 @@ class OpenAIServingChat(OpenAIServingBase):
             real_input = encoding_dsv32.encode_messages(
                 messages, thinking_mode=thinking_mode
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            with measure_tokenizer_encode(
+                getattr(self.tokenizer_manager, "metrics_collector", None),
+                source="chat",
+            ):
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
@@ -2319,14 +2332,19 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
+            with measure_tokenizer_encode(
+                getattr(self.tokenizer_manager, "metrics_collector", None),
+                source="chat",
+                operation="chat_template",
+            ):
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=add_generation_prompt,
+                    tools=tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
         else:
             segments = None
             if self.template_manager.python_chat_template is not None:
@@ -2339,9 +2357,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=template_kwargs,
                 )
             if segments is not None:
-                prompt_ids = encode_prompt_segments(
-                    self.tokenizer_manager.tokenizer, segments, encode_kwargs
-                )
+                with measure_tokenizer_encode(
+                    getattr(self.tokenizer_manager, "metrics_collector", None),
+                    source="chat",
+                ):
+                    prompt_ids = encode_prompt_segments(
+                        self.tokenizer_manager.tokenizer, segments, encode_kwargs
+                    )
             else:
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     messages,
@@ -2351,9 +2373,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
-                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-                )
+                with measure_tokenizer_encode(
+                    getattr(self.tokenizer_manager, "metrics_collector", None),
+                    source="chat",
+                ):
+                    prompt_ids = parallel_prompt_encode(
+                        self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                    )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
@@ -2426,7 +2452,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop.extend(request.stop)
 
         if not is_multimodal:
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+            with measure_tokenizer_encode(
+                getattr(self.tokenizer_manager, "metrics_collector", None),
+                source="chat",
+            ):
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(
             prompt=prompt,
