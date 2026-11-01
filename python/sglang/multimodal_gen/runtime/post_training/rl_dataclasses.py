@@ -59,14 +59,33 @@ def _slice_dim(
     return tensor[start:end]
 
 
+# Conditioning entries that are NOT [B, ...] tensors. RoPE caches (Qwen-Image's
+# ``freqs_cis``/``freqs_complex``) are [seq, channels] tables shared by the whole
+# batch, so they must never be sliced or concatenated along dim 0.
+_SHARED_COND_KEYS = frozenset({"freqs_cis", "freqs_complex"})
+# Python lists holding one entry per batch row (e.g. Qwen's ``txt_seq_lens`` and
+# ``img_shapes``).
+_PER_ROW_LIST_KEYS = frozenset({"txt_seq_lens", "img_shapes"})
+
+
 def _tensor_tree_cat(values: list[Any]) -> Any:
     """Recursively concatenate aligned conditioning trees (dict/list/tuple/Tensor)
-    along the batch dimension, mirroring ``rollout_hooks._kwargs_to_cpu``'s shape."""
+    along the batch dimension, mirroring ``rollout_hooks._kwargs_to_cpu``'s shape.
+    Shared caches keep the first request's value; per-row lists are joined."""
     first = values[0]
     if isinstance(first, torch.Tensor):
         return torch.cat(values, dim=0)
     if isinstance(first, dict):
-        return {k: _tensor_tree_cat([v[k] for v in values]) for k in first}
+        out = {}
+        for k in first:
+            column = [v[k] for v in values]
+            if k in _SHARED_COND_KEYS:
+                out[k] = column[0]
+            elif k in _PER_ROW_LIST_KEYS and isinstance(column[0], list):
+                out[k] = [row for entry in column for row in entry]
+            else:
+                out[k] = _tensor_tree_cat(column)
+        return out
     if isinstance(first, (list, tuple)):
         items = [_tensor_tree_cat([v[i] for v in values]) for i in range(len(first))]
         return type(first)(items)
@@ -78,7 +97,15 @@ def _tensor_tree_slice(value: Any, start: int, end: int) -> Any:
     if isinstance(value, torch.Tensor):
         return _slice_dim(value, start, end)
     if isinstance(value, dict):
-        return {k: _tensor_tree_slice(v, start, end) for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            if k in _SHARED_COND_KEYS:
+                out[k] = v
+            elif k in _PER_ROW_LIST_KEYS and isinstance(v, list):
+                out[k] = v[start:end] if start < len(v) else v
+            else:
+                out[k] = _tensor_tree_slice(v, start, end)
+        return out
     if isinstance(value, (list, tuple)):
         items = [_tensor_tree_slice(v, start, end) for v in value]
         return type(value)(items)

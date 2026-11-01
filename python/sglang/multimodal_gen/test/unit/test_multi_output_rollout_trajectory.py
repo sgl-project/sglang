@@ -21,7 +21,14 @@ def _per_output_trajectory(
     env = None
     if with_env:
         env = RolloutDenoisingEnv(
-            pos_cond_kwargs={"encoder_hidden_states": torch.full((1, 3), tag)},
+            pos_cond_kwargs={
+                "encoder_hidden_states": torch.full((1, 3), tag),
+                # Qwen-Image layout: shared [seq, ch] RoPE caches + per-row lists.
+                "freqs_cis": (torch.full((5, 4), tag), torch.full((6, 4), tag)),
+                "freqs_complex": (torch.full((5, 2), tag), torch.full((6, 2), tag)),
+                "txt_seq_lens": [3],
+                "img_shapes": [[(1, 2, 2)]],
+            },
             guidance=torch.full((1,), tag),
         )
     return RolloutTrajectoryData(
@@ -135,6 +142,39 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             [entry.denoising_env.guidance.item() for entry in selected],
             [1.0, 2.0, 3.0],
         )
+
+
+
+class TestQwenImageSharedConditioning(unittest.TestCase):
+    def _merged(self):
+        return concat_rollout_trajectory_data(
+            [_per_output_trajectory(i, with_env=True) for i in range(3)]
+        )
+
+    def test_concat_keeps_rope_caches_unbatched(self):
+        kw = self._merged().denoising_env.pos_cond_kwargs
+        self.assertEqual(tuple(kw["freqs_cis"][0].shape), (5, 4))
+        self.assertEqual(tuple(kw["freqs_cis"][1].shape), (6, 4))
+        self.assertEqual(tuple(kw["freqs_complex"][0].shape), (5, 2))
+        self.assertEqual(kw["txt_seq_lens"], [3, 3, 3])
+        self.assertEqual(len(kw["img_shapes"]), 3)
+
+    def test_select_keeps_rope_caches_whole(self):
+        for index in range(3):
+            kw = select_output_rollout_trajectory(
+                self._merged(), index
+            ).denoising_env.pos_cond_kwargs
+            self.assertEqual(tuple(kw["freqs_cis"][0].shape), (5, 4))
+            self.assertEqual(tuple(kw["freqs_cis"][1].shape), (6, 4))
+            self.assertEqual(tuple(kw["freqs_complex"][1].shape), (6, 2))
+            self.assertEqual(kw["txt_seq_lens"], [3])
+            self.assertEqual(len(kw["img_shapes"]), 1)
+            self.assertEqual(tuple(kw["encoder_hidden_states"].shape), (1, 3))
+
+    def test_single_output_with_env_keeps_rope_caches(self):
+        only = _per_output_trajectory(0, with_env=True)
+        kw = select_output_rollout_trajectory(only, 0).denoising_env.pos_cond_kwargs
+        self.assertEqual(tuple(kw["freqs_cis"][0].shape), (5, 4))
 
 
 if __name__ == "__main__":
