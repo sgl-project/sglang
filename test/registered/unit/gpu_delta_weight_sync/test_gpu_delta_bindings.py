@@ -294,6 +294,7 @@ def test_layout_admission_rejects_conversion_and_unsupported_pairs():
     nv = layer(
         "ModelOptNvFp4FusedMoEMethod",
         _is_cutedsl_v2_standard=True,
+        load_up_proj_weight_first=True,
         quant_config=SimpleNamespace(is_checkpoint_nvfp4_serialized=True),
     )
     assert fi.identify_layout(nv, "flashinfer_trtllm") == fi.identify_layout(
@@ -302,9 +303,22 @@ def test_layout_admission_rejects_conversion_and_unsupported_pairs():
     assert fi.identify_layout(nv, "flashinfer_cutedsl") == fi.FlashInferLayout(
         "nvfp4", "cutedsl", True, "w4a4", True
     )
+    assert fi.identify_layout(nv, "flashinfer_trtllm").up_first
+    nv._flashinfer_megamoe_layer = SimpleNamespace(
+        _megakernel_config=type(
+            "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig", (), {}
+        )()
+    )
     assert fi.identify_layout(nv, "flashinfer_megamoe") == fi.FlashInferLayout(
         "nvfp4", "megamoe", True, "w4a4", False
     )
+    nv._flashinfer_megamoe_layer._megakernel_config = type(
+        "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig", (), {}
+    )()
+    assert fi.identify_layout(nv, "flashinfer_megamoe").quant_mode == "w4a16"
+    nv._flashinfer_megamoe_layer._megakernel_config = object()
+    with pytest.raises(ValueError, match="unsupported FlashInfer NVFP4 MegaMoE"):
+        fi.identify_layout(nv, "flashinfer_megamoe")
     nv._cutedsl_wrapper.quant_mode = "w4a16"
     assert fi.identify_layout(nv, "flashinfer_cutedsl").quant_mode == "w4a16"
     nv.quant_config.is_checkpoint_nvfp4_serialized = False
