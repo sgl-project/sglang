@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -18,10 +19,9 @@ _SKIP_REASON = "requires mlx"
 if _HAS_MLX:
     import mlx.core as mx
     import mlx.nn as nn
+    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
     import torch
     from mlx_lm.models.cache import ArraysCache
-
-    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
     from sglang.srt.hardware_backend.mlx.aot import (
         MlxAOTKernelSet,
         MlxAOTRoPEKernel,
@@ -968,11 +968,18 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_seqlen = 64
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
-        )
+        with get_context().override_server_args(mamba_max_states_per_path=-1):
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of(
+                    (ComponentType.MAMBA,),
+                    checkpoint_interval=64,
+                )[0],
+            )
         insert_params = InsertParams()
 
         cache_len = component.prepare_for_caching_req(
@@ -1009,11 +1016,15 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_seqlen = 64
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
-        )
+        with get_context().override_server_args(mamba_max_states_per_path=-1):
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            )
         insert_params = InsertParams()
 
         cache_len = component.prepare_for_caching_req(
@@ -1050,11 +1061,15 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         pool.alloc([req])
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
-        )
+        with get_context().override_server_args(mamba_max_states_per_path=-1):
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            )
         insert_params = InsertParams()
 
         cache_len = component.prepare_for_caching_req(
@@ -1088,11 +1103,15 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
-        )
+        with get_context().override_server_args(mamba_max_states_per_path=-1):
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            )
         insert_params = InsertParams()
 
         component.prepare_for_caching_req(
@@ -1110,6 +1129,33 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertIsNone(req.kv.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 4)
+
+    def test_auxiliary_state_initializes_mamba_cache_fields(self):
+
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+
+        with get_context().override_server_args(mamba_max_states_per_path=-1):
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of(
+                    (ComponentType.MAMBA,),
+                    checkpoint_interval=64,
+                )[0],
+            )
+
+        self.assertEqual(component.mamba_cache_chunk_size, 64)
+        self.assertEqual(component.mamba_checkpoint_grid, 64)
+        self.assertEqual(component.mamba_max_states_per_path, -1)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -1269,7 +1315,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
         # The lazy predicate reads the published bags; publish the non-lazy
         # strategy instead of stubbing the accessor.
-        from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(
             mamba_radix_cache_strategy="extra_buffer"

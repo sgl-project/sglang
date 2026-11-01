@@ -9,12 +9,12 @@ storing model-agnostic native cache snapshots.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Optional
 
 import mlx.core as mx
 import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
+from sglang.srt.runtime_context import get_exec
 
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()
@@ -340,6 +341,15 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 f"got {type(pool)}"
             )
         TreeComponent.__init__(self, cache, params, slot)
+
+        # Initialize fields required by inherited MambaComponent methods.
+        # MambaComponent.__init__ cannot be called directly for the MLX pool.
+        self.mamba_cache_chunk_size = slot.checkpoint_interval
+        self.mamba_checkpoint_grid = math.lcm(
+            slot.checkpoint_interval,
+            params.page_size,
+        )
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
