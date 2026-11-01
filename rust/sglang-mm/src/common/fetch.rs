@@ -38,6 +38,27 @@ impl ByteBudget {
             .map_err(|_| ())
     }
 
+    /// Atomically reserve up to `max` available bytes. Unlike loading
+    /// [`Self::remaining`] and then calling [`Self::claim`], this never races
+    /// another source for the same allowance.
+    fn claim_up_to(&self, max: u64) -> u64 {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut left = self.0.load(Acquire);
+        loop {
+            let claimed = left.min(max);
+            if claimed == 0 {
+                return 0;
+            }
+            match self
+                .0
+                .compare_exchange_weak(left, left - claimed, AcqRel, Acquire)
+            {
+                Ok(_) => return claimed,
+                Err(actual) => left = actual,
+            }
+        }
+    }
+
     fn remaining(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -170,23 +191,47 @@ fn read_file(path: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
 fn read_capped(mut reader: impl Read, what: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     let too_big = || format!("media fetch: {what}: exceeds {MAX_FETCH_BYTES} bytes");
     let mut buf = Vec::new();
-    loop {
-        // `+ 1`: read one byte past the cap, so oversized is detected, not truncated.
+    'read: loop {
+        // `+ 1`: reserve room for one byte past the per-source cap, so an
+        // oversized source is rejected rather than silently truncated.
         let want = CHUNK_BYTES.min(MAX_FETCH_BYTES + 1 - buf.len() as u64);
-        if want == 0 {
-            return Err(too_big());
+        let reserved = budget.claim_up_to(want);
+        if reserved == 0 {
+            // The budget is payload capacity, so an exact-fit payload can
+            // leave no room for another reservation. Probe one stack byte to
+            // distinguish EOF from overflow. A returned byte is charged
+            // before appending, and the transient probe is bounded to one
+            // byte per active reader.
+            let mut probe = [0u8; 1];
+            loop {
+                match reader.read(&mut probe) {
+                    Ok(0) => return Ok(buf),
+                    Ok(_) => {
+                        if buf.len() as u64 >= MAX_FETCH_BYTES {
+                            return Err(too_big());
+                        }
+                        budget.claim(1).map_err(|()| over_budget(what))?;
+                        buf.push(probe[0]);
+                        continue 'read;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(format!("media fetch: read {what}: {error}")),
+                }
+            }
         }
-        budget.claim(want).map_err(|()| over_budget(what))?;
         let read = reader
             .by_ref()
-            .take(want)
+            .take(reserved)
             .read_to_end(&mut buf)
             .map_err(|e| format!("media fetch: read {what}: {e}"))? as u64;
-        budget.release(want - read);
+        // Read errors retain the reservation until this request fails, matching
+        // the existing budget lifetime. Successful short reads refund the part
+        // that never became payload.
+        budget.release(reserved - read);
         if buf.len() as u64 > MAX_FETCH_BYTES {
             return Err(too_big());
         }
-        if read < want {
+        if read < reserved {
             return Ok(buf); // short read == EOF
         }
     }
@@ -302,6 +347,73 @@ fn http_get(url: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    struct ShortReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        max_read: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.max_read);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    struct ErrorAfterPartialRead {
+        sent: bool,
+    }
+
+    impl Read for ErrorAfterPartialRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            self.sent = true;
+            let n = buf.len().min(3);
+            buf[..n].fill(7);
+            Ok(n)
+        }
+    }
+
+    struct BarrierReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        barrier: std::sync::Arc<std::sync::Barrier>,
+        waited: bool,
+    }
+
+    impl Read for BarrierReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.waited {
+                self.waited = true;
+                self.barrier.wait();
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sglang-mm-budget-{}-{id}", std::process::id()));
+            std::fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn data_url_and_bare_base64_decode() {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello");
@@ -371,6 +483,254 @@ mod tests {
         assert_eq!(fetch_bytes_budgeted(&payload, &budget).unwrap().len(), 4096);
         let err = fetch_bytes_budgeted(&payload, &budget).err().unwrap();
         assert!(err.contains("request media byte budget"), "{err}");
+    }
+
+    #[test]
+    fn read_capped_accepts_empty_input_with_zero_budget() {
+        assert!(
+            read_capped(std::io::Cursor::new([]), "empty", &ByteBudget::new(0))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_capped_rejects_nonempty_input_with_zero_budget() {
+        let err =
+            read_capped(std::io::Cursor::new(b"x"), "nonempty", &ByteBudget::new(0)).unwrap_err();
+        assert!(err.contains("request media byte budget"), "{err}");
+    }
+
+    #[test]
+    fn read_capped_accepts_small_input_at_exact_budget() {
+        assert_eq!(
+            read_capped(std::io::Cursor::new(b"hello"), "small", &ByteBudget::new(5)).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn read_capped_rejects_one_byte_over_shared_budget() {
+        let err = read_capped(
+            std::io::Cursor::new(b"123456"),
+            "over-budget",
+            &ByteBudget::new(5),
+        )
+        .unwrap_err();
+        assert!(err.contains("request media byte budget"), "{err}");
+    }
+
+    #[test]
+    fn read_capped_accepts_exact_budgets_at_chunk_boundaries() {
+        for size in [CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1] {
+            let bytes = read_capped(
+                std::io::repeat(7).take(size),
+                "chunk-boundary",
+                &ByteBudget::new(size),
+            )
+            .unwrap_or_else(|err| panic!("{size} bytes at exact budget: {err}"));
+            assert_eq!(bytes.len() as u64, size);
+        }
+    }
+
+    #[test]
+    fn read_capped_accepts_exact_per_source_cap_at_eof() {
+        let bytes = read_capped(
+            std::io::repeat(7).take(MAX_FETCH_BYTES),
+            "at-source-cap",
+            &ByteBudget::new(MAX_FETCH_BYTES),
+        )
+        .expect("exact per-source-cap EOF is accepted");
+        assert_eq!(bytes.len() as u64, MAX_FETCH_BYTES);
+    }
+
+    #[test]
+    fn read_capped_rejects_one_byte_over_per_source_cap() {
+        let err = read_capped(
+            std::io::repeat(7).take(MAX_FETCH_BYTES + 1),
+            "over-source-cap",
+            &ByteBudget::new(MAX_FETCH_BYTES + 1),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&format!("exceeds {MAX_FETCH_BYTES} bytes")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shared_budget_accepts_multiple_sources_that_exactly_fit() {
+        let first = TempFile::new(b"ab");
+        let second = TempFile::new(b"cde");
+        let budget = ByteBudget::new(5);
+
+        assert_eq!(
+            fetch_bytes_budgeted(first.path().to_str().unwrap(), &budget).unwrap(),
+            b"ab"
+        );
+        assert_eq!(
+            fetch_bytes_budgeted(second.path().to_str().unwrap(), &budget).unwrap(),
+            b"cde"
+        );
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn read_capped_short_reads_fit_the_exact_budget() {
+        let reader = ShortReader {
+            inner: std::io::Cursor::new(b"hello".to_vec()),
+            max_read: 1,
+        };
+        assert_eq!(
+            read_capped(reader, "short-reader", &ByteBudget::new(5)).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn read_capped_propagates_injected_read_errors() {
+        let err = read_capped(
+            ErrorAfterPartialRead { sent: false },
+            "error-reader",
+            &ByteBudget::new(16),
+        )
+        .unwrap_err();
+        assert!(err.contains("injected read failure"), "{err}");
+    }
+
+    #[test]
+    fn read_capped_contention_observes_atomic_chunk_reservations() {
+        let budget = std::sync::Arc::new(ByteBudget::new(2));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for payload in [b"ab".as_slice(), b"c".as_slice()] {
+            let budget = budget.clone();
+            let barrier = barrier.clone();
+            let payload = payload.to_vec();
+            threads.push(std::thread::spawn(move || {
+                read_capped(
+                    BarrierReader {
+                        inner: std::io::Cursor::new(payload),
+                        barrier,
+                        waited: false,
+                    },
+                    "contended-source",
+                    &budget,
+                )
+            }));
+        }
+
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let err = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(err.contains("request media byte budget"), "{err}");
+    }
+
+    #[test]
+    fn read_capped_accepts_probe_byte_after_another_reader_refunds() {
+        use std::sync::mpsc::{self, Receiver, Sender};
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        struct FirstReader {
+            started: Sender<()>,
+            wait_for_probe: Receiver<()>,
+            sent_byte: bool,
+        }
+
+        impl Read for FirstReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent_byte {
+                    return Ok(0);
+                }
+                self.started.send(()).map_err(std::io::Error::other)?;
+                self.wait_for_probe
+                    .recv_timeout(TIMEOUT)
+                    .map_err(std::io::Error::other)?;
+                self.sent_byte = true;
+                buf[0] = b'a';
+                Ok(1)
+            }
+        }
+
+        struct ProbeReader {
+            entered: Sender<()>,
+            notify_first_reader: Sender<()>,
+            wait_for_first_reader: Receiver<()>,
+            sent_byte: bool,
+        }
+
+        impl Read for ProbeReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent_byte {
+                    return Ok(0);
+                }
+                self.entered.send(()).map_err(std::io::Error::other)?;
+                self.notify_first_reader
+                    .send(())
+                    .map_err(std::io::Error::other)?;
+                self.wait_for_first_reader
+                    .recv_timeout(TIMEOUT)
+                    .map_err(std::io::Error::other)?;
+                self.sent_byte = true;
+                buf[0] = b'b';
+                Ok(1)
+            }
+        }
+
+        let budget = std::sync::Arc::new(ByteBudget::new(2));
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (probe_entered_tx, probe_entered_rx) = mpsc::channel();
+        let (probe_to_first_tx, probe_to_first_rx) = mpsc::channel();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+
+        let first_budget = budget.clone();
+        let first = std::thread::spawn(move || {
+            let result = read_capped(
+                FirstReader {
+                    started: first_started_tx,
+                    wait_for_probe: probe_to_first_rx,
+                    sent_byte: false,
+                },
+                "first-source",
+                &first_budget,
+            );
+            first_done_tx.send(()).unwrap();
+            result
+        });
+
+        // The first read starts only after A has reserved both request bytes.
+        first_started_rx.recv_timeout(TIMEOUT).unwrap();
+
+        let second_budget = budget.clone();
+        let second = std::thread::spawn(move || {
+            read_capped(
+                ProbeReader {
+                    entered: probe_entered_tx,
+                    notify_first_reader: probe_to_first_tx,
+                    wait_for_first_reader: first_done_rx,
+                    sent_byte: false,
+                },
+                "second-source",
+                &second_budget,
+            )
+        });
+
+        // B has failed to reserve while A holds both bytes and is now in its
+        // one-byte probe. Let A reach EOF, refund one byte, and finish before
+        // allowing B's probe read to return its byte.
+        probe_entered_rx.recv_timeout(TIMEOUT).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap(), b"a");
+        assert_eq!(second.join().unwrap().unwrap(), b"b");
+        assert_eq!(budget.remaining(), 0);
     }
 
     /// Unused claims come back, so small sources fit in a budget their
@@ -488,7 +848,7 @@ mod tests {
 
         let (addr, handle) = serve(b"tiny image".to_vec(), 10);
         assert_eq!(
-            fetch_bytes(&format!("http://{addr}/img.png")).unwrap(),
+            fetch_bytes_budgeted(&format!("http://{addr}/img.png"), &ByteBudget::new(10)).unwrap(),
             b"tiny image"
         );
         handle.join().unwrap();
