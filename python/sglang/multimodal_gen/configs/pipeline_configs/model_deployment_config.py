@@ -31,6 +31,7 @@ class ModelDeploymentConfig:
     # modes enable BCG for them unless a gate in ServerArgs rules it out
     bcg_default_pipeline_class_names: tuple[str, ...] = ()
     supports_cfg_parallel: bool = True
+    supports_expert_parallel: bool = False
 
     def get_auto_cfg_parallel_degree(self, num_gpus: int) -> int:
         for candidate_num_gpus, cfg_degree in self.auto_cfg_parallel_degree_by_num_gpus:

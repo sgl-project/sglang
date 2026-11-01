@@ -1406,6 +1406,27 @@ TWO_GPU_CASES = [
     ),
 ]
 
+TWO_GPU_CASES.append(
+    DiffusionTestCase(
+        "lingbot_video_moe_ep2_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            ep_size=2,
+            text_encoder_cpu_offload=True,
+        ),
+        replace(
+            LINGBOT_VIDEO_T2V_CI_sampling_params,
+            extras={"num_inference_steps": 2, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+)
+
 if not current_platform.is_hip():
     # Flux2 multi-image edit with cache-dit, regression test
     ONE_GPU_CASES.append(
@@ -1690,6 +1711,7 @@ STANDALONE_FILES = {
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
+        "../single_test_file/test_moe_expert_parallel_2_gpu.py",
     ],
 }
 
@@ -1757,6 +1779,8 @@ STANDALONE_FILE_EST_TIMES = {
         # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
         "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
+        # measured 37-61 s on 2xH100
+        "../single_test_file/test_moe_expert_parallel_2_gpu.py": 90.0,
     },
 }
 
