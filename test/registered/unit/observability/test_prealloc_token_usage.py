@@ -56,11 +56,24 @@ class TestPreAllocatedTokenCounts(CustomTestCase):
             ]
         )
         self.assertEqual(
-            queue.pre_allocated_token_counts(), (5 * PAGE, 2 * PAGE + PAGE)
+            queue.pre_allocated_token_counts((ComponentType.SWA,)),
+            (5 * PAGE, {ComponentType.SWA: 2 * PAGE + PAGE}),
+        )
+
+    def test_each_window_is_charged_by_its_own_cursor(self):
+        further = ComponentType.of("WINDOW_64")
+        req = _transfer_req(PAGE * 4, swa_tail_len=PAGE * 2)
+        req.req.kv.set_evicted_seqlen(further, PAGE * 3)
+        self.assertEqual(
+            _queue([req]).pre_allocated_token_counts((ComponentType.SWA, further)),
+            (4 * PAGE, {ComponentType.SWA: 2 * PAGE, further: PAGE}),
         )
 
     def test_empty_transfer_queue_holds_nothing(self):
-        self.assertEqual(_queue([]).pre_allocated_token_counts(), (0, 0))
+        self.assertEqual(
+            _queue([]).pre_allocated_token_counts((ComponentType.SWA,)),
+            (0, {ComponentType.SWA: 0}),
+        )
 
 
 def _reporter(*, counts, pool_stats):
@@ -68,7 +81,7 @@ def _reporter(*, counts, pool_stats):
     reporter.stats = SchedulerStats()
     reporter.scheduler = SimpleNamespace(
         disagg_decode_prealloc_queue=SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: counts
+            queue=[], pre_allocated_token_counts=lambda windows: counts
         ),
         disagg_decode_transfer_queue=SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
@@ -78,10 +91,11 @@ def _reporter(*, counts, pool_stats):
     return reporter
 
 
-def _window(name, capacity):
+def _window(name, capacity, component=ComponentType.SWA):
     return WindowPoolStats(
         name=name,
         sub_pool=name,
+        component=component,
         capacity=capacity,
         available_size=0,
         evictable_size=0,
@@ -112,23 +126,27 @@ class TestDecodeQueueStats(CustomTestCase):
             reporter._update_decode_queue_stats(False)
 
     def test_hybrid_swa_ratios_use_each_pool_capacity(self):
-        reporter = _reporter(counts=(250, 40), pool_stats=_swa_pool_stats(1000, 200))
+        reporter = _reporter(
+            counts=(250, {ComponentType.SWA: 40}), pool_stats=_swa_pool_stats(1000, 200)
+        )
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.25)
         self.assertEqual(
             reporter.stats.prealloc_window_token_usage, {"window_128": 0.2}
         )
 
-    def test_window_share_is_the_tree_first_window(self):
-        """The pending requests' window rows are the first window's: only it
-        is charged, a further window reports nothing."""
+    def test_each_window_share_uses_its_own_rows(self):
+        """Every window is charged its own pending rows against its own
+        capacity."""
+        further = ComponentType.of("WINDOW_64")
         reporter = _reporter(
-            counts=(250, 40),
-            pool_stats=_swa_pool_stats(1000, 200, _window("window_64", 100)),
+            counts=(250, {ComponentType.SWA: 40, further: 10}),
+            pool_stats=_swa_pool_stats(1000, 200, _window("window_64", 100, further)),
         )
         self._update(reporter)
         self.assertEqual(
-            reporter.stats.prealloc_window_token_usage, {"window_128": 0.2}
+            reporter.stats.prealloc_window_token_usage,
+            {"window_128": 0.2, "window_64": 0.1},
         )
 
     def test_plain_pool_reports_no_swa_share(self):
@@ -139,13 +157,15 @@ class TestDecodeQueueStats(CustomTestCase):
             full_evictable_size=200,
             full_capacity=1000,
         )
-        reporter = _reporter(counts=(100, 100), pool_stats=pool_stats)
+        reporter = _reporter(counts=(100, {}), pool_stats=pool_stats)
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.1)
         self.assertEqual(reporter.stats.prealloc_window_token_usage, {})
 
     def test_zero_capacity_reports_zero_like_token_usage(self):
-        reporter = _reporter(counts=(0, 0), pool_stats=_swa_pool_stats(0, 0))
+        reporter = _reporter(
+            counts=(0, {ComponentType.SWA: 0}), pool_stats=_swa_pool_stats(0, 0)
+        )
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.0)
         self.assertEqual(
