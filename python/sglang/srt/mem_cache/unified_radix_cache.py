@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
@@ -211,6 +212,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Unlimited-OCR v2 split-document KV reuse; None for every other model.
+    uocr_doc_reuse: Optional[DocReuse] = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -4051,6 +4055,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
+    def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
+        """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""
+        self.uocr_doc_reuse = doc_reuse
+        self.session.uocr_doc_reuse = doc_reuse
+
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 
@@ -4206,6 +4215,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return node_handle
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        if self.uocr_doc_reuse is not None:
+            # A reused window's prefix was copied into fresh slots on no tree
+            # path; the match only reported its length.
+            indices = self.uocr_doc_reuse.prefix_device_indices(req)
+            if indices is not None:
+                return indices
         root = self.root_node_handle(req.extra_key)
         path = self.tree_core.collect_full_device_indices(req.last_node, root)
         if self.linker is not None:

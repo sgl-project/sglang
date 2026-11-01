@@ -1082,6 +1082,9 @@ class Envs:
     # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
     SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
+    # instead of `topk_gating`.
+    SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
@@ -1716,6 +1719,24 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+
+    # ===================================================================
+    # Unlimited-OCR v2
+    # ===================================================================
+    # Send a split document's next window while the current one decodes.
+    SGLANG_ENABLE_UOCR_DOC_PREFETCH = EnvBool(True)
+    # GPU memory for early-encoded follow-up pages; past it they encode at prefill.
+    SGLANG_UOCR_DOC_PREFETCH_MAX_MB = EnvInt(1024)
+    # Stage Unlimited-OCR crops in pinned host memory ahead of the forward.
+    SGLANG_ENABLE_UOCR_CROP_PREFETCH = EnvBool(True)
+    # Pinned host memory for prefetched crops; past it crops stage inline.
+    SGLANG_UOCR_CROP_PREFETCH_MAX_MB = EnvInt(1024)
+    # Materialize multimodal SHM segments off the scheduler thread.
+    SGLANG_ENABLE_UOCR_ASYNC_SHM_MATERIALIZATION = EnvBool(True)
+    # SHM bytes materializing at once; past it a request materializes inline.
+    SGLANG_UOCR_ASYNC_SHM_MAX_MB = EnvInt(4096)
+    # Send processor-owned model_specific_data tensors (crops) through SHM.
+    SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA = EnvBool(True)
 
     # ===================================================================
     # Multimodal CUDA IPC transport
