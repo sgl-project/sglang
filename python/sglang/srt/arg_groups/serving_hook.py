@@ -12,7 +12,6 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
-    model_config_of,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -23,7 +22,6 @@ from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
     is_gfx95_supported,
-    is_mnnvl_fabric_device,
 )
 from sglang.utils import is_in_ci
 
@@ -800,10 +798,10 @@ def handle_tokenizer_batching(server_args: Any):
 def handle_multimodal_feature_transport(server_args: Any):
     """Resolve multimodal feature transport before tokenizer workers start.
 
-    CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
-    memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
-    remains supported so existing deployments map to this policy.
+    GPU transports are opt-in: their pools consume HBM and pool exhaustion
+    requires a device-to-host copy. Fabric availability alone must not enable
+    this path. The legacy CUDA IPC environment variable remains an explicit
+    opt-in for existing deployments.
     """
 
     cfg = resolving_view(server_args)
@@ -826,47 +824,6 @@ def handle_multimodal_feature_transport(server_args: Any):
                 "encoder-only serving; encoder outputs use "
                 "--encoder-transfer-backend instead."
             )
-        elif (
-            model_config_of(server_args).is_multimodal
-            and get_platform().is_cuda
-            and cfg.disaggregation_mode == "null"
-        ):
-            # A full GPU pool always degrades to CPU transport per tensor.
-            # Keep CUDA IPC opt-in because even an idle pool consumes HBM
-            # that would otherwise back the KV cache. Multi-node
-            # auto-selection is limited to GB200/GB300 systems where the
-            # runtime already enables the MNNVL/IMEX communication stack.
-            if cfg.nnodes == 1:
-                requested_transport = "cpu"
-            elif is_mnnvl_fabric_device() and os.path.exists(
-                "/dev/nvidia-caps-imex-channels/channel0"
-            ):
-                from sglang.srt.model_loader.utils import (
-                    supports_cuda_vmm_feature_transport,
-                )
-
-                if supports_cuda_vmm_feature_transport(model_config_of(server_args)):
-                    requested_transport = "cuda_vmm"
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to "
-                        "cuda_vmm (multi-node GB200/GB300 MNNVL). Pass "
-                        "--mm-feature-transport=cpu to opt out."
-                    )
-                else:
-                    requested_transport = "cpu"
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to cpu: "
-                        "the model has not opted into CUDA VMM transport."
-                    )
-            else:
-                requested_transport = "cpu"
-                if is_mnnvl_fabric_device():
-                    logger.info(
-                        "Multimodal feature transport auto-resolved to cpu: "
-                        "GB200/GB300 was detected but no IMEX channel is "
-                        "mounted. Configure the MNNVL compute domain or pass "
-                        "--mm-feature-transport=cuda_vmm after doing so."
-                    )
         else:
             requested_transport = "cpu"
     elif legacy_ipc_is_set and legacy_ipc_enabled != (

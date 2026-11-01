@@ -366,20 +366,27 @@ processor rejects video and audio input.
 
 #### VLM feature transport
 
-Use **VLM Transport** in the command picker. `Auto` is a topology-aware starting
-point, not a claim that one configuration is fastest for every workload.
+The command picker defaults to **CPU** transport on all topologies, including
+GB200/GB300. This avoids reserving a GPU feature pool; it is a memory-oriented
+default, not a claim of best throughput. Select **CPU (save HBM)** to emit
+`--mm-feature-transport cpu` explicitly, including on older builds.
 
-| Picker selection | Processor-to-scheduler feature path |
+| Transport | Processor-to-scheduler feature path |
 |---|---|
-| Auto · single-node Unified CUDA | CUDA IPC |
-| Auto · Unified GB200/GB300 | CUDA VMM when IMEX is available; CPU otherwise |
-| Auto · PD or other topologies | CPU |
-| CPU | CPU, with no GPU feature pool |
+| Default / `cpu` | CPU, with no GPU feature pool |
+| Explicit `cuda_ipc` | GPU pool shared within one CUDA node |
+| Explicit `cuda_vmm` | GPU pool; cross-node sharing requires configured MNNVL/IMEX |
 
 CUDA IPC and CUDA VMM reserve up to `SGLANG_MM_FEATURE_CACHE_MB` (1 GiB by
-default) on the base GPU and fall back to CPU per tensor when full. This setting
-does not control EPD encoder output or PD KV/KDA transfer. K3 already defaults to
-2 processor workers and 16 I/O workers; leave those flags unset unless tuning.
+default) on the base GPU and fall back to CPU per tensor when full. The budget
+does **not** cap GPU decode/preprocessing peak memory. Benchmark GPU transport
+before opting in; for pool-exhaustion hangs such as [#43402](https://github.com/sgl-project/sglang/issues/43402),
+use explicit CPU transport rather than increasing the pool as a fix.
+
+This setting does not control EPD encoder output or PD KV/KDA transfer, and does
+not force CPU-only preprocessing. The legacy `SGLANG_USE_CUDA_IPC_TRANSPORT=1`
+still opts into IPC unless overridden by the flag. K3 defaults to 2 processor
+workers and 16 I/O workers; leave those flags unset unless tuning.
 
 #### VLM compatibility
 
