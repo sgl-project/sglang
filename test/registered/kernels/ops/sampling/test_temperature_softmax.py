@@ -8,6 +8,7 @@ register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import unittest
 from itertools import product
+from unittest.mock import patch
 
 import torch
 
@@ -56,6 +57,18 @@ class TestTemperatureSoftmax(CustomTestCase):
                 )
                 self.assert_matches_torch(logits, None)
                 self.assert_matches_torch(logits, self.temperatures(rows))
+
+    def test_sm100_uses_cake_for_eligible_logits(self):
+        if torch.version.cuda is None or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("The Cake route assertion applies only to SM100 on CUDA.")
+        import flashinfer.sampling
+
+        logits = torch.randn((4, 154880), dtype=torch.float32, device="cuda")
+        with patch.object(
+            flashinfer.sampling, "softmax", wraps=flashinfer.sampling.softmax
+        ) as cake:
+            softmax(logits)
+        cake.assert_called_once()
 
     def test_noncontiguous_logits_fall_back(self):
         logits = torch.randn((4096, 3), dtype=torch.float32, device="cuda").T

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -602,6 +601,7 @@ def eagle_sample(
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
         generate_simulated_accept_index_device,
+        spec_softmax,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
@@ -785,7 +785,7 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = sampling_softmax(
+        target_probs = spec_softmax(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")

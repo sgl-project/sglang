@@ -206,6 +206,22 @@ def fast_sample(
     return sample_p, sample_index
 
 
+def spec_softmax(
+    logits: torch.Tensor, temperatures: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Softmax for speculative draft and verify distributions.
+
+    Deterministic inference uses torch.softmax, as the sampler does.
+    ``sampling.softmax`` selects its kernel from the batch shape, so one row can
+    get different bits in different batches.
+    """
+    if get_exec().deterministic.enable_deterministic_inference:
+        if temperatures is not None:
+            logits = logits / temperatures
+        return torch.softmax(logits, dim=-1)
+    return sampling_softmax(logits, temperatures=temperatures)
+
+
 def renorm_draft_probs(
     next_token_logits: torch.Tensor,
     sampling_info,
@@ -218,8 +234,8 @@ def renorm_draft_probs(
     temperature (higher acceptance; correctness holds for any q).
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
-        return sampling_softmax(next_token_logits)
-    return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
+        return spec_softmax(next_token_logits)
+    return spec_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
 def sample_draft_proposal(
@@ -251,7 +267,7 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
-    probs = sampling_softmax(next_token_logits, temperatures=temperatures)
+    probs = spec_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(
         probs,
         num_samples=1,

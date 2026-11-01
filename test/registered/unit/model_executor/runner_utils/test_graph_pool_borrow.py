@@ -18,7 +18,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils import pool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -217,6 +217,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         tp_group = SimpleNamespace(world_size=1)
 
         with (
+            get_context().override_server_args(),
             patch.object(pool, "borrow_graph_pool") as borrow_graph_pool,
             patch.object(eagle_utils, "get_spec", return_value=spec_config),
             patch(
