@@ -1043,8 +1043,8 @@ def _fp8_linear(in_features, out_features, device=None):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
-    reason="requires SM89+ FP8 tensor cores",
+    not is_nvidia_cuda or torch.cuda.get_device_capability() < (8, 9),
+    reason="requires NVIDIA SM89+ FP8 tensor cores",
 )
 @pytest.mark.parametrize("tokens", [1, 127, 128, 129, 257])
 @torch.inference_mode()
