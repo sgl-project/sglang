@@ -95,6 +95,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     # The TreeCore owns the tree member-var state the component reads through.
     component.tree_core = cache
     component.component_type = ComponentType.MAMBA
+    component.host_only_checkpoint = False
 
     owned = [cache.allocator.alloc(1) for _ in range(N)]
     assert all(s is not None for s in owned)
