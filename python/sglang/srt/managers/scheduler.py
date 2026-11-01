@@ -670,6 +670,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self.maybe_init_kv_zero_on_free()
 
         if (
             get_disagg().disaggregation_mode == "decode"
@@ -1363,6 +1364,23 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def maybe_init_kv_zero_on_free(self) -> None:
+        if not envs.SGLANG_ENABLE_ZERO_KV_ON_FREE.get():
+            return
+        from sglang.srt.mem_cache.kv_page_zeroer import KVPageZeroer
+
+        # Draft pools share the target allocator's page ids.
+        draft_runners = (
+            self.draft_worker._draft_model_runners()
+            if self.draft_worker is not None
+            else ()
+        )
+        pools = [self.token_to_kv_pool_allocator.get_kvcache()]
+        pools += [r.token_to_kv_pool for r in draft_runners]
+        self.token_to_kv_pool_allocator.enable_zero_on_free(
+            KVPageZeroer.from_pools(pools, wait_streams=[self.forward_stream])
+        )
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
