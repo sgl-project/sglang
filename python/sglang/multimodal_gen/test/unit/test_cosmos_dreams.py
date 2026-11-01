@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos_dreams import (
     CosmosDreamsSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
@@ -79,6 +80,8 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
+from sglang.srt.environ import envs
+from sglang.test.test_utils import CustomTestCase
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
@@ -1102,6 +1105,27 @@ class TestCosmosDreamsUnifiedContract(unittest.TestCase):
 
 
 class TestCosmosDreamsRuntime(unittest.TestCase):
+    def test_pre_encoded_video_keeps_action_prediction(self):
+        stage = object.__new__(Cosmos3DecodingStage)
+        batch = SimpleNamespace(
+            action_latents=torch.tensor([[[1.0, 2.0, 3.0]]]),
+            data_type=DataType.VIDEO,
+            extra={
+                "streamed_video_output_file_paths": ["video.mp4"],
+                "raw_action_dim": 2,
+            },
+            sampling_params=SimpleNamespace(
+                action_mode="forward_dynamics", action_stats_path=None
+            ),
+            metrics=None,
+            rollout_trajectory_data=None,
+        )
+        with mock.patch.object(stage, "log_info"):
+            result = stage.forward(batch, server_args=None)
+        self.assertEqual(result.output_file_paths, ["video.mp4"])
+        torch.testing.assert_close(result.action_pred, batch.action_latents[..., :2])
+        self.assertEqual(result.action_mode, "forward_dynamics")
+
     def test_scalar_domain_tensor_is_reused_across_chunks(self):
         domains = torch.tensor([2], dtype=torch.long)
         context = _RolloutContext(
@@ -1186,6 +1210,101 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
             [use.component_name for use in stage.component_uses(args)],
             ["transformer", "vae"],
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
+class TestCosmosDreamsEncodedDecode(CustomTestCase):
+    def test_enabled_nvenc_creates_causal_decode_encoder(self):
+        """The NVENC flag must reach the Bimanual decode queue at runtime."""
+        vae = torch.nn.Linear(1, 1, device="cuda")
+        vae.config = SimpleNamespace(latents_mean=[0], latents_std=[1])
+        vae.reset_causal_decode_state = lambda: None
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.vae = vae
+        stage.overlap_vae_decode = True
+        stage.server_args = SimpleNamespace(
+            should_start_component_on_cpu=lambda _: False
+        )
+        batch = SimpleNamespace(fps=24, num_frames=1, output_compression=None)
+        with (
+            envs.SGLANG_USE_NVENC.override(True),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.cosmos3_simulation.dreams.streamed_video_output_path",
+                return_value="/tmp/bimanual.mp4",
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder."
+                "supports_nvenc",
+                return_value=True,
+            ),
+        ):
+            with stage._decode_queue(torch.device("cuda"), batch) as queue:
+                self.assertIsNotNone(queue.encoder)
+                self.assertTrue(queue.encoder._use_nvenc)
+        with (
+            envs.SGLANG_USE_NVENC.override(True),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.cosmos3_simulation.dreams.streamed_video_output_path",
+                return_value="/tmp/bimanual.mp4",
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder."
+                "supports_nvenc",
+                return_value=False,
+            ),
+        ):
+            with stage._decode_queue(torch.device("cuda"), batch) as queue:
+                self.assertIsNone(queue.encoder)
+
+    def test_encoder_sees_final_gpu_frames_and_keeps_cpu_fallback(self):
+        class IdentityVAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1, device="cuda"))
+                self.config = SimpleNamespace(
+                    latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+                )
+
+            def reset_causal_decode_state(self):
+                pass
+
+            def causal_decode(self, latents):
+                return latents.clamp(-1, 1)
+
+        class Collector:
+            def __init__(self):
+                self.frames = []
+                self.aborted = False
+
+            def __call__(self, frames):
+                self.frames.append(frames.clone())
+
+            def abort(self):
+                self.aborted = True
+
+        vae = IdentityVAE()
+        latents = torch.linspace(-1, 1, 96, device="cuda").reshape(1, 3, 2, 4, 4)
+        collector = Collector()
+        with CausalDecodeQueue(
+            vae, device=torch.device("cuda"), encoder=collector
+        ) as queue:
+            for chunk in latents.split(1, dim=2):
+                queue.submit(chunk)
+        torch.testing.assert_close(
+            torch.cat(collector.frames, dim=2).cpu(), queue.finish(), rtol=0, atol=0
+        )
+        self.assertFalse(collector.aborted)
+
+        with self.assertRaisesRegex(RuntimeError, "injected failure"):
+            with CausalDecodeQueue(
+                vae, device=torch.device("cuda"), encoder=collector
+            ) as queue:
+                queue.submit(latents[:, :, :1])
+                raise RuntimeError("injected failure")
+        self.assertTrue(collector.aborted)
+        self.assertEqual(queue.outputs, [])
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):
