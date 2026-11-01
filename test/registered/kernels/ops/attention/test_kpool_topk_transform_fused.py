@@ -98,6 +98,14 @@ class TestKpoolTopkTransformFused(CustomTestCase):
         )
         self._assert_pooled_columns(score, out.cpu(), topk=2048)
 
+    def test_group_topk_512_long_rows_match_reference(self):
+        # ROCm scans rows 4 x 1024 elements at a time, then finishes element by element;
+        # 70K tokens is about 17.5K groups. 5000 and 12289 take both loops in one row.
+        for groups in (5000, 12289):
+            with self.subTest(groups=groups):
+                score, out = self._run(rows=2, groups=groups, topk=2048)
+                self._assert_pooled_columns(score, out, topk=2048)
+
     def test_group_topk_128_matches_reference(self):
         score, out = self._run(rows=2, groups=512, topk=512)
         self._assert_pooled_columns(score, out, topk=512)
