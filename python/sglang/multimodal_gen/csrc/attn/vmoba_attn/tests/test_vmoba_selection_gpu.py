@@ -6,7 +6,7 @@ import pathlib
 
 import pytest
 import torch
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_xpu
 
 _VMOBA_PATH = pathlib.Path(__file__).resolve().parents[1] / "vmoba" / "vmoba.py"
 _spec = importlib.util.spec_from_file_location("vmoba_under_test", _VMOBA_PATH)
@@ -21,8 +21,9 @@ requires_attention = pytest.mark.skipif(
     _NO_ATTENTION, reason="no varlen attention backend available"
 )
 
-# head_dim 64 rather than 32: the XPU varlen kernel rejects 32.
-HEADS, HEAD_DIM = 2, 64
+# The XPU varlen kernel rejects head_dim 32 ("Unsupported head size for
+# non-paged prefill attention: 32"); flash-attn accepts it, so CUDA keeps it.
+HEAD_DIMS = (64,) if is_xpu() else (32, 64)
 
 
 def _layout(seqlens, chunk_size):
@@ -81,10 +82,11 @@ def _reference_topk_attention(q, k, v, seqlens, chunk_size, topk):
 
 
 @requires_attention
-def test_gpu_mixed_sparse_selection_matches_torch_reference():
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_gpu_mixed_sparse_selection_matches_torch_reference(head_dim):
     device = get_device()
     torch.manual_seed(0)
-    seqlens, chunk_size, heads, head_dim = [128, 128], 32, HEADS, HEAD_DIM
+    seqlens, chunk_size, heads = [128, 128], 32, 2
     q, k, v = (
         torch.randn(256, heads, head_dim, device=device, dtype=torch.float16)
         for _ in range(3)
@@ -108,10 +110,11 @@ def test_gpu_mixed_sparse_selection_matches_torch_reference():
 
 
 @requires_attention
-def test_gpu_self_chunk_only_fallback_matches_flash_attention():
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_gpu_self_chunk_only_fallback_matches_flash_attention(head_dim):
     device = get_device()
     torch.manual_seed(1)
-    seqlens, chunk_size, heads, head_dim = [128, 128], 32, HEADS, HEAD_DIM
+    seqlens, chunk_size, heads = [128, 128], 32, 2
     q, k, v = (
         torch.randn(256, heads, head_dim, device=device, dtype=torch.float16)
         for _ in range(3)
