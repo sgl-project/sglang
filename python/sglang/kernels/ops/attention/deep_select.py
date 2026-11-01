@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     KERNEL_PATH,
     aligned_new_empty,
@@ -201,10 +202,8 @@ def get_output_stride_alignment_bytes() -> int:
 @cache_once
 def is_deep_select_supported() -> bool:
     """Return whether DeepSelect JIT supports a CUDA device."""
-    if torch.version.cuda is None or not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return (major, minor) in SUPPORTED_CUDA_ARCHS
+    cuda = current_arch().cuda
+    return cuda is not None and cuda.capability in SUPPORTED_CUDA_ARCHS
 
 
 class _CachedModuleDispatch:

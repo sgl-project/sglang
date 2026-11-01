@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import aligned_new_empty
 from sglang.kernels.ops.attention.deep_select import get_input_stride_alignment_bytes
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
@@ -646,7 +647,7 @@ def fp4_index_logits_paged(
             ratio,
         )
         return out
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = current_arch().num_sms
     workers = min(triton.cdiv(max_len, 64), triton.cdiv(num_sms * 4, batch))
     _fp4_index_logits_paged_kernel[(batch, workers)](
         q,
@@ -849,7 +850,7 @@ def _launch_fp4_index_logits_paged_balanced(
     block_l=128,
 ):
     batch, heads, _ = q.shape
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = current_arch().num_sms
     _fp4_index_logits_paged_balanced_kernel[(num_sms * programs_per_sm,)](
         q,
         weights,

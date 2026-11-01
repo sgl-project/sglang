@@ -8,6 +8,7 @@ from dataclasses import replace
 import torch
 from flashinfer.prims_ts import gemm as prims_ts_gemm
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion.gemm.flux3_prims_ts_config import (
     delta_kwargs,
     flux3_prims_ts_config,
@@ -172,9 +173,9 @@ def flux3_clustered_fp8_qkv_qknorm_rope(
     )
     if separate_qkv_output:
         if config is None:
-            major, minor = torch.cuda.get_device_capability(x.device)
+            cuda = current_arch().cuda
             config = prims_ts_gemm.PrimsTsGemmConfig(
-                arch=major * 10 + minor,
+                arch=cuda.sm_version,
                 operand_format="fp8_e4m3",
                 output_format="bf16",
                 epilogue="qkv_qknorm_rope",

@@ -1,9 +1,8 @@
-import functools
-
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.lora.dense.trtllm_lora_temp.kernel_utils import (
     _resolve_token_positions,
     get_pdl_launch_metadata,
@@ -150,11 +149,6 @@ def _sgemm_lora_a_kernel(
         )
 
 
-@functools.lru_cache(maxsize=None)
-def _num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def sgemm_lora_a_fwd(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -208,7 +202,7 @@ def sgemm_lora_a_fwd(
     if lora_envs.SGLANG_ENABLE_LORA_SHRINK_SPLIT_K.get() and x.is_cuda:
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         base_grid = batch_info.bs * num_s_tiles
-        num_sms = _num_sms(x.device.index)
+        num_sms = current_arch().num_sms
         if base_grid < num_sms and num_k_tiles >= 16:
             split_k = max(1, min(2 * num_sms // base_grid, num_k_tiles, 16))
 

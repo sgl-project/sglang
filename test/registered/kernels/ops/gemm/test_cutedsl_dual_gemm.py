@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.gemm import fp8_scaled_mm
 from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
@@ -116,7 +116,7 @@ def _float_reference(x, gate_up_weight):
 class TestCuteDSLDualGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def _check(

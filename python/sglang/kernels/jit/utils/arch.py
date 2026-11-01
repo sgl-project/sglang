@@ -1,4 +1,8 @@
-"""CUDA/ROCm architecture detection and default compile target flags."""
+"""JIT compile target and default compile flags.
+
+Runtime decisions (capability, SM count, feature support) read
+`sglang.kernels.arch`; this module only decides what nvcc/hipcc compiles for.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +11,12 @@ import os
 import re
 import shutil
 import subprocess
-from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import List
 
+import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
@@ -24,11 +28,15 @@ from sglang.srt.utils.common import is_cuda
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ArchInfo:
+class CompileArch(msgspec.Struct, frozen=True):
     major: int
     minor: int
     suffix: str
+
+    @classmethod
+    def for_capability(cls, major: int, minor: int) -> CompileArch:
+        """The CUDA target for an explicitly requested capability."""
+        return cls(major, minor, _cuda_arch_suffix(major, minor))
 
     @property
     def target_name(self) -> str:
@@ -102,11 +110,18 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
 
 
 @cache_once
-def _init_jit_cuda_arch_once():
-    global _CUDA_ARCH
+def get_compile_arch() -> CompileArch:
+    """The target JIT builds compile for: the local GPU, with its a/f suffix.
+
+    Only the build pipeline reads this; kernels branch on `sglang.kernels.arch`.
+    """
+    cuda = current_arch().cuda
     try:
-        device = torch.cuda.current_device()
-        major, minor = torch.cuda.get_device_capability(device)
+        major, minor = (
+            cuda.capability
+            if cuda is not None
+            else torch.cuda.get_device_capability()
+        )
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
@@ -125,10 +140,10 @@ def _init_jit_cuda_arch_once():
             if not cutlass_supports_sm107():
                 major, minor, suffix = 10, 0, "f"
 
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    return CompileArch(major, minor, suffix)
 
 
-def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
+def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
     """Default compile flags for `arch`, defaulting to the detected local GPU."""
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
@@ -145,7 +160,7 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         return flags
     else:
         if arch is None:
-            arch = get_jit_cuda_arch()
+            arch = get_compile_arch()
         return [
             arch.jit_flag,
             "-std=c++20",
@@ -154,48 +169,9 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
         ]
 
 
-def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:
-    """Build the JIT target for an explicitly requested capability."""
-    return ArchInfo(major, minor, _cuda_arch_suffix(major, minor))
-
-
-@contextmanager
-def override_jit_cuda_arch(major: int, minor: int, suffix: str | None = None):
-    """A context manager to temporarily override CUDA architecture.
-
-    `suffix` defaults to the arch-specific target detection would pick for that
-    capability; pass it explicitly only to force a different one (an unsuffixed
-    target loses the arch-only instructions CUTLASS needs, see
-    `_cuda_arch_suffix`).
-
-    Kernels do not need this to reach an arch-specific target: `get_jit_cuda_arch`
-    already resolves the local GPU to its a/f target. Reach for it only to compile
-    for an arch the local GPU is not.
-    """
-    global _CUDA_ARCH
-    old_value = get_jit_cuda_arch()
-    _CUDA_ARCH = (
-        make_jit_cuda_arch(major, minor)
-        if suffix is None
-        else ArchInfo(major, minor, suffix)
-    )
-    try:
-        yield
-    finally:
-        _CUDA_ARCH = old_value
-
-
-def get_jit_cuda_arch() -> ArchInfo:
-    """Get the current CUDA architecture info."""
-    _init_jit_cuda_arch_once()
-    return _CUDA_ARCH
-
-
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
-        return False
-    return get_jit_cuda_arch().major >= 9
+    return current_arch().supports_pdl
 
 
 def get_activation_cuda_cflags() -> list[str]:

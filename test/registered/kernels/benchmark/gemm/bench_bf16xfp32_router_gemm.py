@@ -17,7 +17,7 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.bf16_fp32 import (
     _linear_bf16_fp32_hpc,
     mark_hpc_bf16xfp32_gemm_enabled,
@@ -60,7 +60,7 @@ def benchmark(m, n, k, provider):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major != 9:
+    if not current_arch().is_sm(9):
         print(
             "The HPC-Ops bf16xfp32 GEMM requires a Hopper (sm90a) CUDA GPU. Skipping."
         )

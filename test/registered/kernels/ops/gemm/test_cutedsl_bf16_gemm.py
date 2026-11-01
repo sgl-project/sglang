@@ -6,11 +6,8 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.jit.utils import (
-    get_ci_test_range,
-    get_jit_cuda_arch,
-    is_hip_runtime,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import get_ci_test_range, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -34,7 +31,7 @@ NUM_TOKENS = get_ci_test_range(list(range(1, 33)), [1, 15, 16, 32])
 @pytest.mark.parametrize("n,k", SHAPES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+    if not current_arch().is_sm(10):
         pytest.skip("SM10x required")
 
     torch.manual_seed(num_tokens)
@@ -67,7 +64,7 @@ def test_empty_batch_not_tgv_eligible(n, k):
 def test_cutedsl_bf16_gemm_empty_batch(has_bias):
     """Empty input must yield the empty [0, N] output, mirroring F.linear —
     launching TGV with a 0-CTA grid fails with CUDA_ERROR_INVALID_VALUE."""
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+    if not current_arch().is_sm(10):
         pytest.skip("SM10x required")
 
     n, k = 6144, 2048

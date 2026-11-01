@@ -16,6 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 SAGE_FP8_SM90_QUERY_BLOCK_SIZE = 64
 SAGE_FP8_SM90_KEY_BLOCK_SIZE = 128
 
@@ -157,7 +159,7 @@ def subblock_sage_fp8_sm90_attention(
 
     if q.device.type != "cuda":
         raise ValueError("SubBlock Sage FP8 requires CUDA tensors.")
-    if torch.cuda.get_device_capability(q.device) != (9, 0):
+    if not current_arch().is_sm(9, 0):
         raise ValueError("This SubBlock Sage FP8 implementation requires SM90.")
     if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
         raise ValueError("SubBlock Sage FP8 requires BF16 Q, K, and V.")

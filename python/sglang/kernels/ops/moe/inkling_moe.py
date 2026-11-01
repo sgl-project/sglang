@@ -2,8 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils.common import is_sm121
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
@@ -352,9 +352,7 @@ def silu_and_mul_triton(
     NUM_STAGES = 2
     max_grid_size = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
     # Use ~512 SMs worth of blocks, capped to actual work
-    num_sms = torch.cuda.get_device_properties(
-        gateup_output.device
-    ).multi_processor_count
+    num_sms = current_arch().num_sms
     grid_size = min(num_sms * 4, max_grid_size)
 
     _silu_and_mul_triton_kernel[(grid_size,)](
@@ -972,7 +970,9 @@ def grouped_gemm_triton(
             # sm_121 (GB10 / DGX Spark) caps shared memory at 99 KB per block and
             # num_stages=4 needs 108 KB. The BLOCK_SIZE_M=128 branch below fits at
             # its default 3 (96 KB) and needs no gate.
-            "num_stages": 3 if is_sm121() else 4,
+            "num_stages": (
+                3 if current_arch().is_sm(12, 1) else 4
+            ),
         }
     else:
         assert block_size_m == BLOCK_SIZE_M, f"{block_size_m=}"

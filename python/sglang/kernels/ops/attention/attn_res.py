@@ -6,12 +6,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    load_jit,
-    make_cpp_args,
-    override_jit_cuda_arch,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -32,7 +29,8 @@ def _jit_fused_tma_module(
     bulk copies into chunk slots; chunk_rows / occupancy / consumer_regs are
     tuning knobs). The smem ring is frozen at 2 chunk slots and PDL is always
     on: the kernel targets SM100+ except SM12x."""
-    major, minor = torch.cuda.get_device_capability()
+    cuda = current_arch().cuda
+    major, minor = cuda.capability if cuda is not None else (0, 0)
     if major < 10 or major == 12:
         raise RuntimeError(
             "attn_res_fused_tma requires SM100+ excluding SM12x; "
@@ -45,18 +43,17 @@ def _jit_fused_tma_module(
         occupancy,
         consumer_regs,
     )
-    with override_jit_cuda_arch(major, minor, suffix="a"):
-        return load_jit(
-            _make_name("fused_tma"),
-            *args,
-            cuda_files=["kimi_k3/attn_res/fused_tma.cuh"],
-            cuda_wrappers=[
-                ("run", f"AttnResFusedTmaKernel<{args}>::run"),
-                ("run_pull_rs", f"AttnResFusedTmaKernel<{args}>::run_pull_rs"),
-                ("run_direct_ag", f"AttnResFusedTmaKernel<{args}>::run_direct_ag"),
-            ],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
-        )
+    return load_jit(
+        _make_name("fused_tma"),
+        *args,
+        cuda_files=["kimi_k3/attn_res/fused_tma.cuh"],
+        cuda_wrappers=[
+            ("run", f"AttnResFusedTmaKernel<{args}>::run"),
+            ("run_pull_rs", f"AttnResFusedTmaKernel<{args}>::run_pull_rs"),
+            ("run_direct_ag", f"AttnResFusedTmaKernel<{args}>::run_direct_ag"),
+        ],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+    )
 
 
 # Benchmarked-best (chunk_rows, occupancy, consumer_regs) per nvb

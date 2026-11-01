@@ -30,7 +30,6 @@ from sglang.kernels.registry import registry
 from sglang.kernels.spec import KernelBackend, KernelSpec, PlatformInfo
 
 
-@lru_cache(maxsize=1)
 def _platform() -> PlatformInfo:
     return PlatformInfo.detect()
 
