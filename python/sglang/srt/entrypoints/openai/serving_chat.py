@@ -2453,7 +2453,7 @@ class OpenAIServingChat(OpenAIServingBase):
         try:
             first_chunk = await generator.__anext__()
         except ValueError as e:
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -2827,7 +2827,7 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             if not stream_started:
                 raise
-            error = self.create_streaming_error_response(str(e))
+            error = self.create_streaming_error_response(e)
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -2839,12 +2839,9 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming chat completion request"""
-        try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
-        except ValueError as e:
-            return self.create_error_response(str(e))
+        ret = await self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
 
         if not isinstance(ret, list):
             ret = [ret]

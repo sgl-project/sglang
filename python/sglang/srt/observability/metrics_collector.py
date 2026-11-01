@@ -2078,6 +2078,83 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["is_streaming"],
             buckets=bucket_e2e_request_latency,
         )
+        self._mm_metric_factories = Counter, Gauge, Histogram
+
+    def init_mm_publication_metrics(self):
+        """Register metrics only for tokenizer-owned guarded GPU publishers."""
+        Counter, Gauge, Histogram = self._mm_metric_factories
+        mm_labels = [*self.labels.keys(), "transport"]
+        self.mm_publication_requests = Counter(
+            "sglang:mm_publication_requests_total",
+            "GPU publication admission outcomes",
+            labelnames=[*mm_labels, "outcome"],
+        )
+        self.mm_publication_wait = Histogram(
+            "sglang:mm_publication_wait_seconds",
+            "Time waiting for atomic GPU pool admission",
+            labelnames=mm_labels,
+        )
+        self.mm_publication_state = Gauge(
+            "sglang:mm_publication_state",
+            "GPU publication queue and allocator state (bytes or counts as named)",
+            labelnames=[*mm_labels, "quantity"],
+            multiprocess_mode="livesum",
+        )
+        self.mm_publication_oldest_lease = Gauge(
+            "sglang:mm_publication_oldest_lease_seconds",
+            "Age of the oldest unreclaimed GPU feature slice",
+            labelnames=mm_labels,
+            multiprocess_mode="livemax",
+        )
+        self.mm_publication_reclaimed = Counter(
+            "sglang:mm_publication_reclaimed_total",
+            "GPU feature slices returned to the pool, including rollback",
+            labelnames=mm_labels,
+        )
+        self.mm_publication_reclaimed_seconds = Counter(
+            "sglang:mm_publication_reclaimed_lifetime_seconds_total",
+            "Sum of GPU feature slice lifetimes at reclamation",
+            labelnames=mm_labels,
+        )
+        self.mm_publication_cpu_spills = Counter(
+            "sglang:mm_publication_cpu_spills_total",
+            "Legacy feature pool exhaustion falling back to CPU transport",
+            labelnames=mm_labels,
+        )
+        self._mm_publication_totals = {}
+
+    def observe_mm_publication(
+        self, transport, pool, outcome, wait_seconds, pending_count, pending_bytes
+    ):
+        labels = {**self.labels, "transport": transport}
+        if outcome is not None:
+            self.mm_publication_requests.labels(**labels, outcome=outcome).inc()
+        if wait_seconds is not None:
+            self.mm_publication_wait.labels(**labels).observe(wait_seconds)
+        state = pool.capacity_snapshot()
+        self.mm_publication_oldest_lease.labels(**labels).set(
+            state.pop("oldest_lease_seconds")
+        )
+        totals = tuple(
+            state.pop(name)
+            for name in ("reclaimed_count", "reclaimed_seconds", "cpu_spills")
+        )
+        previous = self._mm_publication_totals.get(transport, (0, 0.0, 0))
+        for counter, value, old in zip(
+            (
+                self.mm_publication_reclaimed,
+                self.mm_publication_reclaimed_seconds,
+                self.mm_publication_cpu_spills,
+            ),
+            totals,
+            previous,
+            strict=True,
+        ):
+            counter.labels(**labels).inc(value - old)
+        self._mm_publication_totals[transport] = totals
+        state.update(pending_count=pending_count, pending_bytes=pending_bytes)
+        for quantity, value in state.items():
+            self.mm_publication_state.labels(**labels, quantity=quantity).set(value)
 
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
         for phase in (

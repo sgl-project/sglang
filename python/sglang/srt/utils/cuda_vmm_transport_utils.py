@@ -7,8 +7,9 @@ import os
 import secrets
 import socket
 import threading
+import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -17,7 +18,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
@@ -124,6 +127,7 @@ def _receive_posix_fd(socket_path: str) -> int:
 class _CudaVmmMemoryChunk:
     start: int
     end: int
+    reserved_at: float = field(default=0.0, compare=False)
 
     @property
     def size(self) -> int:
@@ -199,6 +203,11 @@ def get_vmm_feature_consumer_count() -> int:
 class CudaVmmMemoryPool:
     """Bounded CUDA VMM pool shared through FABRIC or a local POSIX FD."""
 
+    on_capacity_change = None
+    reclaimed_count = 0
+    reclaimed_seconds = 0.0
+    cpu_spills = 0
+
     def __init__(
         self,
         memory_size: int,
@@ -226,6 +235,7 @@ class CudaVmmMemoryPool:
         self._stop_recycler = threading.Event()
         self._pool_error: BaseException | None = None
         self._closed = False
+        self.on_capacity_change = None
 
         self._allocation: VmmReservation | None = None
         self.allocation_size = 0
@@ -388,12 +398,118 @@ class CudaVmmMemoryPool:
             if self._active_publishers == 0:
                 self._publisher_condition.notify_all()
 
-    def wrap_tensor(self, tensor: torch.Tensor):
-        self._raise_if_failed()
+    def reservation_size(self, nbytes: int) -> int:
+        return align_up(self.control_size + nbytes, _CONTROL_ALIGNMENT)
+
+    def publication_data_size(self, tensors):
+        if len(tensors) == 1:
+            return tensors[0].numel() * tensors[0].element_size()
+        _, nbytes = _build_packed_tensor_layout(tensors)
+        return nbytes
+
+    @property
+    def publication_capacity(self):
+        return self.allocation_size
+
+    @property
+    def publication_device_id(self):
+        return self.device_index
+
+    def set_capacity_callback(self, callback):
+        self.on_capacity_change = callback
+
+    def capacity_snapshot(self):
+        with self._lock:
+            free = sum(chunk.size for chunk in self.available_chunks)
+            return {
+                "occupied_bytes": self.allocation_size - free,
+                "free_bytes": free,
+                "largest_free_bytes": max(
+                    (chunk.size for chunk in self.available_chunks), default=0
+                ),
+                "oldest_lease_seconds": max(
+                    (
+                        time.monotonic() - chunk.reserved_at
+                        for chunk in self.occupied_chunks
+                    ),
+                    default=0.0,
+                ),
+                "reclaimed_count": self.reclaimed_count,
+                "reclaimed_seconds": self.reclaimed_seconds,
+                "cpu_spills": self.cpu_spills,
+            }
+
+    def try_reserve_batch(self, sizes: list[int]):
+        required = [self.reservation_size(size) for size in sizes]
+        if sum(required) > self.allocation_size:
+            raise MmMemoryRequestTooLarge(
+                f"CUDA VMM publication needs {sum(required)} bytes; "
+                f"capacity is {self.allocation_size} bytes"
+            )
+        with self._publisher_condition:
+            self._raise_if_failed()
+            if self._closing or self._closed:
+                raise RuntimeError("CUDA VMM multimodal pool is closing")
+            chunks = []
+            complete = False
+            try:
+                for size in required:
+                    chunk = self._reserve_chunk(size)
+                    if chunk is None:
+                        return None
+                    chunks.append(chunk)
+                self._active_publishers += len(chunks)
+                complete = True
+                return chunks
+            finally:
+                if not complete:
+                    for reserved in chunks:
+                        self._release_reserved_chunk(reserved)
+
+    def release_reserved_batch(self, chunks) -> None:
+        with self._publisher_condition:
+            for chunk in chunks:
+                self._release_reserved_chunk(chunk)
+            self._active_publishers -= len(chunks)
+            self._publisher_condition.notify_all()
+
+    def publish_reserved_batch(self, tensor_groups, chunks):
+        proxies = []
+        index = 0
+        try:
+            for index, (tensors, chunk) in enumerate(
+                zip(tensor_groups, chunks, strict=True)
+            ):
+                if len(tensors) == 1:
+                    proxies.append(self.wrap_tensor(tensors[0], reserved_chunk=chunk))
+                else:
+                    proxies.extend(self.wrap_tensors(tensors, reserved_chunk=chunk))
+            return proxies
+        except BaseException as error:
+            # the failed wrapping call owns its slice; later slices never saw CUDA
+            self.release_reserved_batch(chunks[index + 1 :])
+            rollback_errors = []
+            for proxy in proxies:
+                try:
+                    self.cancel_proxy(proxy)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                error.add_note(
+                    f"{len(rollback_errors)} VMM rollback operation(s) also failed"
+                )
+                raise error from rollback_errors[0]
+            raise
+
+    def wrap_tensor(self, tensor: torch.Tensor, *, reserved_chunk=None):
+        if reserved_chunk is None:
+            self._raise_if_failed()
         data_nbytes = tensor.numel() * tensor.element_size()
         required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
 
-        chunk = self._reserve_for_publish(required_size)
+        chunk = reserved_chunk
+        if chunk is None:
+            chunk = self._reserve_for_publish(required_size)
         if chunk is None:
             self._warn_pool_full_once(data_nbytes)
             return tensor.cpu()
@@ -401,6 +517,7 @@ class CudaVmmMemoryPool:
         producer_stream = None
         copy_synchronized = False
         try:
+            self._raise_if_failed()
             if tensor.is_cuda:
                 self._publish_stream.wait_stream(
                     torch.cuda.current_stream(tensor.device)
@@ -456,6 +573,8 @@ class CudaVmmMemoryPool:
     def wrap_tensors(
         self,
         tensors: Sequence[torch.Tensor],
+        *,
+        reserved_chunk=None,
     ) -> list[CudaVmmPackedTensorTransportProxy] | None:
         """Publish tensors through one shared VMM chunk.
 
@@ -464,7 +583,8 @@ class CudaVmmMemoryPool:
         ``None`` means that no contiguous pool chunk was available. No tensor is
         published in that case, so the caller can use another transport path.
         """
-        self._raise_if_failed()
+        if reserved_chunk is None:
+            self._raise_if_failed()
         tensors = list(tensors)
         if not tensors:
             return []
@@ -473,13 +593,16 @@ class CudaVmmMemoryPool:
         required_size = align_up(
             self.control_size + packed_data_nbytes, _CONTROL_ALIGNMENT
         )
-        chunk = self._reserve_for_publish(required_size)
+        chunk = reserved_chunk
+        if chunk is None:
+            chunk = self._reserve_for_publish(required_size)
         if chunk is None:
             return None
 
         producer_stream = None
         copy_synchronized = False
         try:
+            self._raise_if_failed()
             for device in {tensor.device for tensor in tensors if tensor.is_cuda}:
                 self._publish_stream.wait_stream(torch.cuda.current_stream(device))
             with (
@@ -557,6 +680,7 @@ class CudaVmmMemoryPool:
         occupied = _CudaVmmMemoryChunk(
             start=available.start,
             end=available.start + required_size,
+            reserved_at=time.monotonic(),
         )
         if occupied.end < available.end:
             self.available_chunks.append(
@@ -565,10 +689,14 @@ class CudaVmmMemoryPool:
         return occupied
 
     def _release_reserved_chunk(self, chunk: _CudaVmmMemoryChunk) -> None:
+        self.reclaimed_count += 1
+        self.reclaimed_seconds += time.monotonic() - chunk.reserved_at
         if chunk in self.occupied_chunks:
             self.occupied_chunks.remove(chunk)
         self.available_chunks.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
         self._merge_chunks()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _cancel_control_offset(self, control_offset: int) -> None:
         with self._lock:
@@ -595,6 +723,8 @@ class CudaVmmMemoryPool:
         self._cancel_control_offset(proxy.control_offset)
 
     def _warn_pool_full_once(self, data_nbytes: int) -> None:
+        with self._lock:
+            self.cpu_spills += 1
         if self._pool_full_warned:
             return
         self._pool_full_warned = True
@@ -645,10 +775,14 @@ class CudaVmmMemoryPool:
                 # cancellation may have freed and republished the same offset
                 if count == self.consumer_count and live.get(chunk.start) is chunk:
                     self.occupied_chunks.remove(chunk)
+                    self.reclaimed_count += 1
+                    self.reclaimed_seconds += time.monotonic() - chunk.reserved_at
                     self.available_chunks.append(
                         _CudaVmmMemoryChunk(chunk.start, chunk.end)
                     )
             self._merge_chunks()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _merge_chunks(self) -> None:
         merged = []
@@ -1002,6 +1136,8 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
 class CudaVmmFeatureTransport:
     """Tokenizer-owned VMM transport for one tokenizer worker."""
 
+    _guarded_publisher = None
+
     def __init__(self, server_args, mm_processor) -> None:
         self.pool: CudaVmmMemoryPool | None = None
         self._publisher_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -1027,6 +1163,13 @@ class CudaVmmFeatureTransport:
             max_workers=1,
             thread_name_prefix="cuda-vmm-publisher",
         )
+        if get_mm().mm_admission_timeout_ms is not None:
+            self._guarded_publisher = BoundedFeaturePublisher(
+                self.pool,
+                get_mm().mm_admission_timeout_ms,
+                cpu_tensors=True,
+                pack_features=True,
+            )
 
     async def prepare_for_dispatch_async(
         self,
@@ -1034,6 +1177,8 @@ class CudaVmmFeatureTransport:
     ) -> list[MultimodalDataItem]:
         """Publish features without blocking the tokenizer event loop."""
         mm_inputs_batch = tuple(mm_inputs_batch)
+        if self._guarded_publisher is not None:
+            return await self._guarded_publisher.prepare(mm_inputs_batch)
         if self.pool is None or not any(
             mm_inputs is not None and mm_inputs.mm_items
             for mm_inputs in mm_inputs_batch
@@ -1194,6 +1339,8 @@ class CudaVmmFeatureTransport:
     def shutdown(self) -> None:
         if self.pool is None:
             return
+        if self._guarded_publisher is not None:
+            self._guarded_publisher.shutdown()
         publisher_executor = self._publisher_executor
         if publisher_executor is not None:
             publisher_executor.shutdown(wait=True, cancel_futures=True)

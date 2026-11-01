@@ -3397,6 +3397,14 @@ This option does not disable required attention or MoE collectives, including ex
 </table>
 
 ## For Multi-Modal
+
+`--mm-admission-timeout-ms` optionally bounds waiting for CUDA IPC/VMM feature-pool
+capacity in normal serving. Unset preserves CPU fallback; `0` rejects immediately;
+a positive integer waits at most that many milliseconds. Oversized batches return
+413 and temporary pressure returns 429. This adds no fixed HBM reservation and
+does not bound GPU decode/preprocessing memory. See [GPU feature-pool admission](/docs/supported-models/multimodal_language_models#gpu-feature-pool-admission)
+for queue limits, streaming errors, and metrics.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
