@@ -493,7 +493,7 @@ class TestStaticMambaSlotBudget(CustomTestCase):
 
     def _adder(self, static: bool, lazy: bool = False):
         adder = SimpleNamespace(
-            _mamba_slot_cost=0,
+            memory_budget=SimpleNamespace(state_slot_cost=0),
             _system_prompt_budget=True,
             _static_mamba_slots=static,
             tree_cache=SimpleNamespace(
@@ -595,14 +595,14 @@ class TestStaticMambaSlotBudget(CustomTestCase):
             PrefillAdder._mamba_match_headroom(self._adder(static=True, lazy=True)), 2
         )
         no_mamba = SimpleNamespace(
-            _mamba_slot_cost=0,
+            memory_budget=SimpleNamespace(state_slot_cost=0),
             _system_prompt_budget=True,
             _static_mamba_slots=False,
             tree_cache=None,
         )
         self.assertEqual(PrefillAdder._mamba_match_headroom(no_mamba), 0)
         shared = SimpleNamespace(
-            _mamba_slot_cost=64,
+            memory_budget=SimpleNamespace(state_slot_cost=64),
             _system_prompt_budget=True,
             _static_mamba_slots=False,
             tree_cache=self._adder(static=True).tree_cache,
@@ -626,7 +626,7 @@ class TestStaticMambaSlotBudget(CustomTestCase):
         self.assertEqual(PrefillAdder._mamba_match_headroom(adder), 0)
         # Even the shared pool's pre-check headroom is 0 with the flag off.
         shared = SimpleNamespace(
-            _mamba_slot_cost=64,
+            memory_budget=SimpleNamespace(state_slot_cost=64),
             _system_prompt_budget=False,
             _static_mamba_slots=False,
             tree_cache=adder.tree_cache,
@@ -635,16 +635,17 @@ class TestStaticMambaSlotBudget(CustomTestCase):
 
 
 class TestMambaGapBudget(CustomTestCase):
-    """Shared-pool gap budget (`_mamba_gap_budget_for_req`, `_mamba_slot_cost > 0`
-    under --enable-unified-memory). Regression for the crash class: the body
-    referenced is_system_prefix_warm/cold_factor without importing them, and no
-    test covered the shared-pool path until now. On main the request fields live
-    on req.kv (ReqKvInfo), and the cold factor derives from the pool's
-    mamba_initial_tracking_slots."""
+    """Shared-pool state-slot budget (`_state_slot_reserve_for_req`,
+    `memory_budget.state_slot_cost > 0` under --enable-unified-memory).
+    Regression for the crash class: the body referenced
+    is_system_prefix_warm/cold_factor without importing them, and no test
+    covered the shared-pool path until now. On main the request fields live on
+    req.kv (ReqKvInfo), the cost lives on the memory budget, and the cold
+    factor derives from the pool's mamba_initial_tracking_slots."""
 
     def _adder(self, lazy: bool = False):
         return SimpleNamespace(
-            _mamba_slot_cost=64,
+            memory_budget=SimpleNamespace(state_slot_cost=64),
             _system_prompt_budget=True,
             _static_mamba_slots=False,
             tree_cache=SimpleNamespace(
@@ -666,7 +667,9 @@ class TestMambaGapBudget(CustomTestCase):
     def _budget(self, adder, req, fresh_cow=False):
         from sglang.srt.managers.schedule_policy import PrefillAdder
 
-        return PrefillAdder._mamba_gap_budget_for_req(adder, req, fresh_cow=fresh_cow)
+        return PrefillAdder._state_slot_reserve_for_req(
+            adder, req, fresh_cow=fresh_cow
+        )
 
     def test_warm_charged_single_slot(self):
         # Boundary covered, no branching: running slot only -> 1 x cost.
@@ -703,7 +706,7 @@ class TestMambaGapBudget(CustomTestCase):
 
     def test_zero_without_shared_pool(self):
         adder = SimpleNamespace(
-            _mamba_slot_cost=0,
+            memory_budget=SimpleNamespace(state_slot_cost=0),
             _system_prompt_budget=True,
             _static_mamba_slots=True,
             tree_cache=None,
@@ -776,6 +779,22 @@ class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):
         )
 
     def _req(self, boundary, protected):
+        # Mirrors ReqKvInfo's bookkeeping methods (record_insert /
+        # protect_prefix) so the checkpoint path can advance them like the
+        # real record.
+        class _FakeKv:
+            def __init__(self, protected):
+                self.req_pool_idx = 0
+                self.swa_evict_floor = 0
+                self.cache_inserted_len = 0
+                self.cache_protected_len = protected
+
+            def record_insert(self, length):
+                self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+            def protect_prefix(self, length):
+                self.cache_protected_len = length
+
         return SimpleNamespace(
             origin_input_ids=array("q", [1, 2, 3, 4, 5, 6, 7, 8]),
             full_untruncated_fill_ids=array("q", [1, 2, 3, 4, 5, 6, 7, 8]),
@@ -785,12 +804,7 @@ class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):
             cache_salt=None,
             lock=None,
             last_node=None,
-            kv=SimpleNamespace(
-                req_pool_idx=0,
-                swa_evict_floor=0,
-                cache_inserted_len=0,
-                cache_protected_len=protected,
-            ),
+            kv=_FakeKv(protected),
         )
 
     def test_match_past_boundary_keeps_tree_pages(self):
