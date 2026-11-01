@@ -31,6 +31,9 @@ class ForwardMetadata:
     mamba_cache_indices: torch.Tensor
     conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None
+    # query_start_loc on the host when the extend lengths are known there, so
+    # kernels can plan without reading query_start_loc back (a device sync).
+    query_start_loc_cpu: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated

@@ -2130,6 +2130,11 @@ class Envs:
     # ROCm gfx950 only: fused Conv1D + QKV + gate producer for Qwen3.8 GDN prefill.
     SGLANG_QWEN38_GDN_PREFILL_PROLOGUE_FUSION = EnvBool(False)
 
+    # GDN prefill: run the chunk scan of one long sequence (>= 8192 tokens) as up
+    # to 4 parts, with the per-chunk kernels on a side stream beside the serial
+    # chunk_h recurrence. Bit-identical to one pass.
+    SGLANG_GDN_CHUNK_PIPELINE = EnvBool(False)
+
     # ===================================================================
     # Plugin system
     # ===================================================================

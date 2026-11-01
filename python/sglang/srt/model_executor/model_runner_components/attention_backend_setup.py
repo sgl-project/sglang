@@ -52,6 +52,12 @@ def configure_aux_hidden_state_capture(
     include aux hidden state output paths.
     """
     if eagle_use_aux_hidden_state:
+        if not hasattr(model, "set_eagle3_layers_to_capture"):
+            raise ValueError(
+                f"Model {model.__class__.__name__} does not implement "
+                "set_eagle3_layers_to_capture, which EAGLE3 aux hidden-state "
+                "capture requires."
+            )
         model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
     if dflash_use_aux_hidden_state:
         if is_dspark and hasattr(model, "set_dspark_layers_to_capture"):
