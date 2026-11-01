@@ -247,6 +247,35 @@ class TestHipblasltRows(CustomTestCase):
                     self.assertFalse((out["libtype"] == "hipblaslt").any())
 
 
+class TestFlydslRows(CustomTestCase):
+    def test_an_aiter_without_flydsl_skips_the_flydsl_rows(self):
+        """aiter builds a FlyDSL row's kernel at the first GEMM or fused-MoE call, so an
+        aiter that cannot import FlyDSL keeps every table's other rows only."""
+        for spec in m31.M31_TABLES:
+            rows = pd.read_csv(spec.csv)
+            flydsl = it._uses_flydsl(rows, spec.kernel_cols)
+            for has_flydsl, kept in ((True, len(rows)), (False, int((~flydsl).sum()))):
+                with (
+                    self.subTest(table=spec.stem, flydsl=has_flydsl),
+                    mock.patch.object(it, "_aiter_has_flydsl", return_value=has_flydsl),
+                    mock.patch(
+                        "sglang.srt.utils.common.get_hip_version",
+                        return_value=(*(spec.hipblaslt_rocm or (7, 2)), 0),
+                    ),
+                ):
+                    out = it.read_intree_rows(spec)
+                    self.assertEqual(len(out), kept)
+                    self.assertEqual(
+                        it._uses_flydsl(out, spec.kernel_cols).any(),
+                        False if not has_flydsl else bool(flydsl.any()),
+                    )
+        # the M3.1 rowwise-fp8 and fused-MoE tables do carry FlyDSL rows
+        fp8 = next(
+            t for t in m31.M31_TABLES if t.env == "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE"
+        )
+        self.assertTrue(it._uses_flydsl(pd.read_csv(fp8.csv), fp8.kernel_cols).any())
+
+
 def _aiter_commit() -> str:
     try:
         version = importlib.metadata.version("amd-aiter")

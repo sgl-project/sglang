@@ -228,15 +228,45 @@ class IntreeTable(msgspec.Struct, frozen=True):
     hipblaslt_rocm: Optional[tuple] = None
 
 
+@functools.cache
+def _aiter_has_flydsl() -> bool:
+    try:
+        import aiter.ops.flydsl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _uses_flydsl(rows, kernel_cols):
+    """Rows whose kernel aiter builds with FlyDSL: libtype flydsl, or a flydsl_ kernel name."""
+    flydsl = (
+        rows["libtype"] == "flydsl" if "libtype" in rows.columns else rows.index < 0
+    )
+    for c in kernel_cols:
+        if "kernelName" in c and c in rows.columns:
+            flydsl = flydsl | rows[c].astype(str).str.startswith("flydsl_")
+    return flydsl
+
+
 def read_intree_rows(spec: IntreeTable):
     """``spec``'s in-tree rows this runtime can use: hipBLASLt solution indices belong to
     one hipBLASLt build, and another build rejects them, so a ROCm other than
-    ``spec.hipblaslt_rocm`` drops the hipBLASLt rows."""
+    ``spec.hipblaslt_rocm`` drops the hipBLASLt rows; an aiter that cannot import its
+    FlyDSL kernels would fail on a FlyDSL row at the first GEMM, so it drops those."""
     import pandas as pd
 
     from sglang.srt.utils.common import get_hip_version
 
     rows = pd.read_csv(spec.csv)
+    if not _aiter_has_flydsl():
+        flydsl = _uses_flydsl(rows, spec.kernel_cols)
+        if flydsl.any():
+            logger.info(
+                "%s: %d FlyDSL rows skipped; this aiter cannot import FlyDSL",
+                spec.stem,
+                int(flydsl.sum()),
+            )
+            rows = rows[~flydsl]
     rocm = get_hip_version()[:2]
     if spec.hipblaslt_rocm is None or rocm == tuple(spec.hipblaslt_rocm):
         return rows
