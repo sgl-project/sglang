@@ -942,6 +942,49 @@ class TestRustServerExtension(CustomTestCase):
                     ]
                     self.assertEqual(tables, [expected, expected])
 
+    def test_gather_frontend_cpu_share_counts_only_listeners_on_this_mask(self):
+        """Every serving rank joins the collective, a non-listener contributes
+        no key, this rank's position is taken at its own index of the gathered
+        list, and an elastic-EP joiner stays out of it."""
+        gathered = []
+        other_mask = ("node", tuple(range(64, 128)))
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj, None, other_mask, obj]
+
+        world_group = SimpleNamespace(
+            all_gather_object=all_gather_object, rank_in_group=3
+        )
+
+        def moe(is_ep_joiner):
+            return SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=is_ep_joiner))
+
+        with (
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(world_group=world_group),
+            ),
+            patch.object(server_module, "get_exec", return_value=moe(False)),
+            patch.object(
+                server_module,
+                "_frontend_cpu_key",
+                return_value=("node", tuple(range(64))),
+            ),
+        ):
+            share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+            RustServer.gather_frontend_cpu_share(hosts_listener=False)
+            with patch.object(server_module, "get_exec", return_value=moe(True)):
+                joiner_share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+
+        self.assertEqual(share, (1, 2))
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        # An elastic-EP joiner never enters the collective the serving ranks
+        # left behind at startup (the same rule as gather_server_endpoints).
+        self.assertEqual(joiner_share, (0, 1))
+        self.assertEqual(len(gathered), 2, "a joiner entered the gather")
+
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
         host and rendezvous address, unless the nodes rendezvous on loopback
