@@ -1352,6 +1352,12 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # Device FULL tokens past prefix_len that an SWA replay makes
+        # reusable, and the key they were matched with.
+        self.swa_recompute_hit_length = 0
+        self.swa_recompute_key = None
+        # Replay owed by this request's next forward (SWARecompute), or None.
+        self.swa_recompute = None
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
@@ -2216,6 +2222,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock = None
         self.swa_branching_seqlen = None
+        self.swa_recompute_hit_length = 0
+        self.swa_recompute_key = None
         self.extend_end = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -2693,6 +2701,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Per engram layer, the rows the scheduler staged (EngramRowStager).
     engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
+    # Per request: first prefix position whose SWA rows the worker rebuilds
+    # before this extend, or None.
+    swa_recompute_starts: Optional[List[Optional[int]]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -3062,6 +3073,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "positional_embed_overrides"
                     )
             self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
+        if any(r.swa_recompute is not None for r in reqs):
+            self.swa_recompute_starts = [
+                None if r.swa_recompute is None else r.swa_recompute.take_start()
+                for r in reqs
+            ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
@@ -3892,6 +3908,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_embeds = None
         self.replace_embeds = None
         self.replace_positions = None
+        # The replay belongs to the prefill this batch just ran.
+        self.swa_recompute_starts = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

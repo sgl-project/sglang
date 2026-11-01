@@ -182,6 +182,12 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_swa_recompute: A[
+        bool,
+        "DeepSeek-V4 SWA recompute: when a cached prefix kept its full KV but lost "
+        "its sliding-window state, replay only the trailing dependency window "
+        "instead of prefilling the prefix again. Experimental; CUDA.",
+    ] = False
     enable_prefill_weight_versions: A[
         bool,
         "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",

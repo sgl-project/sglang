@@ -325,6 +325,9 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    # Device FULL tokens past the SWA boundary that a trailing-window replay
+    # makes reusable.
+    swa_recompute_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
     # Deepest non-root node visited, including nodes rejected by validators.
@@ -351,6 +354,7 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        swa_recompute_hit_length=0,
         last_visited_node_id=None,
         full_device_match_len=None,
     )

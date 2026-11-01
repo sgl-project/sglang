@@ -85,6 +85,7 @@ class CompressorBackendMixin:
         kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
+        store: bool = True,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -119,6 +120,9 @@ class CompressorBackendMixin:
             out=compress_out,
             is_online=is_online,
         )
+
+        if not store:
+            return
 
         # The AITER FP4 writer takes BF16; the compressor mirrors its FP32 norm
         # weight so the conversion stays out of the per-layer forward.
@@ -160,6 +164,11 @@ class CompressorBackendMixin:
         compressor: Compressor,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
+            return
+        # A replay keeps the cached pools and rebuilds only the 4x state, which
+        # lives beside the SWA rows.
+        store = not forward_batch.swa_recompute
+        if not store and not is_overlap_compress(compressor.ratio):
             return
 
         token_to_kv_pool = self.token_to_kv_pool
@@ -250,6 +259,7 @@ class CompressorBackendMixin:
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
             ),
+            store=store,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
