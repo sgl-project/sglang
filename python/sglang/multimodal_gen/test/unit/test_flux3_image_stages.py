@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
@@ -23,6 +29,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     load_references,
     noise_tokens,
     output_size,
+    resolve_sequential_cfg,
     scaled_ids,
     validate_generation,
 )
@@ -49,7 +56,60 @@ def _text_mean_velocity(packed):
     }
 
 
+def _sequential_cfg_worker(mode):
+    if mode == "tp":
+        maybe_init_distributed_environment_and_model_parallel(tp_size=2, sp_size=1)
+    else:
+        maybe_init_distributed_environment_and_model_parallel(
+            tp_size=1, sp_size=2, ulysses_degree=2
+        )
+    rank = dist.get_rank()
+    packed = _pack(
+        (torch.zeros(2, 2), torch.zeros(2, 4)),
+        [(torch.zeros(1, 3), torch.zeros(1, 4))] * 2,
+    )
+    free = (1 << 30, 1 << 20)[rank]
+    with (
+        mock.patch.object(torch.cuda, "is_available", return_value=True),
+        mock.patch.object(torch.cuda, "mem_get_info", return_value=(free, free)),
+    ):
+        sequential = resolve_sequential_cfg(packed, guidance=3.5)
+    decisions = [None, None]
+    dist.all_gather_object(decisions, sequential)
+    assert decisions == [True, True], decisions
+    dist.destroy_process_group()
+
+
 class TestFlux3PackedConditioning(unittest.TestCase):
+    @unittest.skipIf(
+        torch.version.hip is not None,
+        "ROCm builds query GPU 0 while importing sglang, which fails with the "
+        "GPUs hidden for these CPU workers",
+    )
+    def test_sequential_cfg_is_agreed_across_ranks(self):
+        for mode in ("tp", "sp"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "torch.distributed.run",
+                        "--standalone",
+                        "--nproc-per-node=2",
+                        __file__,
+                    ],
+                    env={
+                        **os.environ,
+                        "CUDA_VISIBLE_DEVICES": "",
+                        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu",
+                        "FLUX3_SEQUENTIAL_CFG_WORKER": mode,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_image_ids_use_zero_time_and_sequence_axes(self):
         ids = latent_ids(2, 3)
         self.assertTrue(torch.equal(ids[:, 0], torch.zeros(6)))
@@ -248,4 +308,7 @@ class TestFlux3PackedSampler(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if mode := os.environ.get("FLUX3_SEQUENTIAL_CFG_WORKER"):
+        _sequential_cfg_worker(mode)
+    else:
+        unittest.main()
