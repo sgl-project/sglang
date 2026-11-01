@@ -7,7 +7,7 @@
 # production. This Dockerfile builds just the Rust binary in ~5 min on a
 # warm cache.
 
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     libssl-dev pkg-config protobuf-compiler cmake \
