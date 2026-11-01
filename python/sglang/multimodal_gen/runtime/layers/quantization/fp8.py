@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
+from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
 from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
@@ -331,6 +332,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale.data = weight_scale
                 if input_scale is not None:
                     layer.input_scale.data = input_scale
+            # apply_fp8_linear routes dynamic rowwise to aiter's
+            # gemm_a8w8_bpreshuffle whenever use_aiter_bpreshuffle_gemm(N) holds,
+            # and that kernel reads a (16, 16)-shuffled weight. Use the same
+            # predicate so load-time layout and apply-time kernel always agree.
+            if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
             layer.weight.data = weight.t()
             return
 

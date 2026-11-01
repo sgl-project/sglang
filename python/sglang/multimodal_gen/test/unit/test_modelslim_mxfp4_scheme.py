@@ -7,6 +7,9 @@ CPU.
 """
 
 import unittest
+from unittest import mock
+
+import torch
 
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
     ModelSlimMXFP4Scheme,
@@ -58,6 +61,36 @@ class TestHasMulScaleAcceptsEitherKey(unittest.TestCase):
             quant_type="W4A4_MXFP4_DUALSCALE",
         )
         self.assertFalse(scheme.has_mul_scale)
+
+
+class TestMulScaleTPSharding(unittest.TestCase):
+    def _param(self, size):
+        from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
+            _MulScaleParameter,
+        )
+
+        return _MulScaleParameter(
+            data=torch.empty(size, dtype=torch.float32),
+            input_dim=0,
+            weight_loader=lambda *a, **k: None,
+        )
+
+    def test_row_parallel_shards_input_dim_on_both_ranks(self):
+        full = torch.arange(8, dtype=torch.float32)
+        for rank in (0, 1):
+            p = self._param(4)
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.models.parameter.get_tp_rank",
+                return_value=rank,
+            ):
+                p.load_row_parallel_weight(full)
+            self.assertTrue(torch.equal(p.data, full[rank * 4 : rank * 4 + 4]))
+
+    def test_column_parallel_loads_full_vector(self):
+        full = torch.arange(8, dtype=torch.float32)
+        p = self._param(8)
+        p.load_column_parallel_weight(full)
+        self.assertTrue(torch.equal(p.data, full))
 
 
 if __name__ == "__main__":
