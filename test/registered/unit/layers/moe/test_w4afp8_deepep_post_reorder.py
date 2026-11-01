@@ -19,6 +19,12 @@ _sgl_kernel_stub = ModuleType("sgl_kernel")
 _sgl_kernel_stub.cutlass_w4a8_moe_mm = Mock()
 _sgl_kernel_stub.get_cutlass_w4a8_moe_mm_data = Mock()
 _sgl_kernel_stub.silu_and_mul = Mock()
+# patch.dict drops every module first imported inside it, while their global
+# registrations (e.g. torch inductor's cache artifacts) stay, so a later
+# re-import fails. Load the shared stack first; only the module under test is
+# imported against the stub.
+import sglang.srt.layers.moe  # noqa: E402, F401
+
 with patch.dict(sys.modules, {"sgl_kernel": _sgl_kernel_stub}):
     from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8_moe
 

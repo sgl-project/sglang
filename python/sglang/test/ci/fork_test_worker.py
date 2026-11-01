@@ -1,6 +1,7 @@
 """Execute test files in isolated fork children of a preloaded interpreter."""
 
 import argparse
+import ctypes
 import importlib
 import json
 import os
@@ -11,8 +12,31 @@ import time
 import traceback
 
 
+def _has_cuda_driver() -> bool:
+    try:
+        ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return False
+    return True
+
+
 def _preload_common_modules(extra_modules: list[str]) -> None:
     """Load the expensive common stack without creating a CUDA context."""
+    if _has_cuda_driver():
+        # A child forked after the parent called cuInit or loaded a CUDA kernel
+        # library (flashinfer, sgl_kernel) crashes on its first driver call.
+        # Keep the parent off the driver: torch.cuda.is_available() asks NVML
+        # instead of calling cuInit, and the extra modules, which may load
+        # kernel libraries, are left to the children.
+        os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+        if extra_modules:
+            print(
+                f"fork test worker: CUDA driver found, not preloading {extra_modules}",
+                file=sys.stderr,
+                flush=True,
+            )
+            extra_modules = []
+
     import numpy  # noqa: F401
     import pytest  # noqa: F401
     import scipy  # noqa: F401
