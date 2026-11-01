@@ -1682,6 +1682,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_lingbot_video_moe_sequence_parallel_2_gpu.py",
         "../single_test_file/test_cosmos3_action_sp_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
@@ -1745,6 +1746,8 @@ STANDALONE_FILE_EST_TIMES = {
         # two spawned ranks on a tiny random-init transformer, no model load;
         # measured 48 s in CI
         "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
+        # Ulysses, Ring, and K/V-gather; measured 110 s on 2xH100
+        "../single_test_file/test_lingbot_video_moe_sequence_parallel_2_gpu.py": 150.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
