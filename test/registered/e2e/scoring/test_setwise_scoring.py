@@ -50,9 +50,6 @@ class TestSetwiseScoringHFParity(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._hf_reference_model = None
-        cls.addClassCleanup(cls._cleanup_hf_reference_model)
-
         cls.tokenizer = AutoTokenizer.from_pretrained(_SEQCLS_MODEL)
         cls.anchor_id = cls.tokenizer.convert_tokens_to_ids(_ANCHOR_TOKEN)
         assert (
@@ -67,27 +64,15 @@ class TestSetwiseScoringHFParity(CustomTestCase):
             dtype=_DTYPE,
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def _get_hf_reference_model(cls):
-        if cls._hf_reference_model is None:
-            cls._hf_reference_model = (
-                AutoModelForSequenceClassification.from_pretrained(
-                    _SEQCLS_MODEL, torch_dtype=torch.float32
-                )
-            )
-        return cls._hf_reference_model.eval()
-
-    @classmethod
-    def _cleanup_hf_reference_model(cls):
-        if cls._hf_reference_model is not None:
-            cls._hf_reference_model.cpu()
-            cls._hf_reference_model = None
+        cls.hf_reference_model = AutoModelForSequenceClassification.from_pretrained(
+            _SEQCLS_MODEL, torch_dtype=torch.float32
+        ).eval()
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
+        cls.hf_reference_model = None
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -105,7 +90,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = self._get_hf_reference_model()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
@@ -130,7 +115,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = self._get_hf_reference_model()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
@@ -327,9 +312,6 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._hf_reference_model = None
-        cls.addClassCleanup(cls._cleanup_hf_reference_model)
-
         cls.tokenizer = AutoTokenizer.from_pretrained(_CAUSAL_MODEL)
         cls.anchor_id = cls.tokenizer.convert_tokens_to_ids(_ANCHOR_TOKEN)
         assert (
@@ -348,25 +330,15 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
             dtype=_DTYPE,
             mem_fraction_static=0.15,
         )
-
-    @classmethod
-    def _get_hf_reference_model(cls):
-        if cls._hf_reference_model is None:
-            cls._hf_reference_model = AutoModelForCausalLM.from_pretrained(
-                _CAUSAL_MODEL, torch_dtype=torch.float32
-            )
-        return cls._hf_reference_model.eval()
-
-    @classmethod
-    def _cleanup_hf_reference_model(cls):
-        if cls._hf_reference_model is not None:
-            cls._hf_reference_model.cpu()
-            cls._hf_reference_model = None
+        cls.hf_reference_model = AutoModelForCausalLM.from_pretrained(
+            _CAUSAL_MODEL, torch_dtype=torch.float32
+        ).eval()
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
+        cls.hf_reference_model = None
         torch.cuda.empty_cache()
 
     def _build_prompt(self, n_anchors: int) -> str:
@@ -381,7 +353,7 @@ class TestGenerationSetwiseScoringHFParity(CustomTestCase):
         anchor_positions = [i for i, t in enumerate(input_ids) if t == self.anchor_id]
         self.assertGreater(len(anchor_positions), 0, "prompt has no anchor tokens")
 
-        model = self._get_hf_reference_model()
+        model = self.hf_reference_model
         try:
             ids = torch.tensor([input_ids], dtype=torch.long)
             with torch.no_grad():
