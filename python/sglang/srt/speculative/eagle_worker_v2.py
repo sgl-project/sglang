@@ -2056,7 +2056,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
-        # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
+        # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
