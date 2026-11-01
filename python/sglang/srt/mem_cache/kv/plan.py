@@ -143,15 +143,16 @@ class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def tree_slot_ids(slots: Sequence[TreeSlot]) -> Dict[str, ComponentType]:
-    """Each slot's component id inside the tree: the tree's first window slot
-    plays the window role (`ComponentType.SWA`); every other slot goes by its
-    component name."""
-    first_window = next((s.component for s in slots if s.family == TREE_WINDOW), None)
+    """Each slot's component id inside the tree, by its component name. A tree
+    with a single window slot gives it the window role (`ComponentType.SWA`):
+    the id the native tree core, the external cache linker and LMCache address,
+    each of which keeps one window. With several window slots none plays the
+    role; each goes by its own name."""
+    windows = [s.component for s in slots if s.family == TREE_WINDOW]
+    role = windows[0] if len(windows) == 1 else None
     return {
         s.component: (
-            ComponentType.SWA
-            if s.component == first_window
-            else ComponentType.of(s.component)
+            ComponentType.SWA if s.component == role else ComponentType.of(s.component)
         )
         for s in slots
     }
