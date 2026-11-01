@@ -339,11 +339,11 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE="static"),
         ):
             os.environ.pop(block, None)
-            os.environ[level] = "INT8"
+            os.environ.pop(level, None)
             spec = dict(speculative_algorithm="DSPARK")
             m3 = _minimax_m3_overrides(rocm_server_args(**spec), QUARK_M3)
             self.assertNotIn(block, os.environ)
-            self.assertEqual(os.environ[level], "INT8")
+            self.assertNotIn(level, os.environ)
             m31 = _minimax_m3_overrides(rocm_server_args(**spec), QUARK_M31)
             self.assertTrue(envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
             self.assertEqual(os.environ[level], "INT4")
@@ -409,15 +409,14 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 "minimax_m3_nvfp4", speculative_algorithm="DSPARK"
             )
 
-    def test_gfx950_quick_all_reduce_takes_int4_over_the_image_default(self):
-        """ROCm images export INT8 for every model: M3.1 still gets INT4, while another
-        level the user chose (FP, INT6, NONE) survives, and so does INT8 when the user
-        turns the INT4 default off."""
+    def test_gfx950_quick_all_reduce_takes_int4_only_where_unset(self):
+        """M3.1 gets INT4 when no level is set; a level already set stays, INT8 included,
+        since the ROCm images' INT8 cannot be told from one the user chose."""
         level = "ROCM_QUICK_REDUCE_QUANTIZATION"
         int4 = envs.SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4
         cases = (
             (None, True, "INT4"),
-            ("INT8", True, "INT4"),
+            ("INT8", True, "INT8"),
             ("FP", True, "FP"),
             ("INT8", False, "INT8"),
             (None, False, None),
@@ -434,16 +433,15 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                     os.environ[level] = preset
                 _minimax_m3_overrides(rocm_server_args(), NVFP4)
                 self.assertEqual(os.environ.get(level), resolved)
-        # only TP4 was measured: at TP2 the image's level stays
+        # only TP4 was measured: at TP2 an unset level stays unset
         with gfx950(), patch.dict("os.environ"), int4.override(True):
-            os.environ[level] = "INT8"
+            os.environ.pop(level, None)
             _minimax_m3_overrides(rocm_server_args(tp_size=2), NVFP4)
-            self.assertEqual(os.environ[level], "INT8")
+            self.assertNotIn(level, os.environ)
 
-    def test_gfx950_jit_quick_reduce_takes_mid_sizes_only_under_int4(self):
-        """The JIT quick-reduce replaces only the INT4 one the override turns on at TP4, and
-        only then takes the mid-size all-reduces off custom all-reduce; a build or a cap the
-        user set stays."""
+    def test_gfx950_jit_quick_reduce_takes_mid_sizes_only_under_int4_or_int8(self):
+        """The JIT quick-reduce replaces an INT4 or INT8 one at TP4, and only then takes the
+        mid-size all-reduces off custom all-reduce; a build or a cap the user set stays."""
         cap, jit = "AITER_CUSTOM_AR_MAX_SIZE", "SGLANG_ROCM_QUICK_ALL_REDUCE_JIT"
         level = "ROCM_QUICK_REDUCE_QUANTIZATION"
         with gfx950(), patch.dict("os.environ"):
@@ -453,6 +451,11 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             _minimax_m3_overrides(rocm_server_args(), NVFP4)
             self.assertNotIn(jit, os.environ)
             self.assertNotIn(cap, os.environ)
+            os.environ[level] = "INT8"
+            _minimax_m3_overrides(rocm_server_args(), NVFP4)
+            self.assertTrue(envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get())
+            self.assertEqual(os.environ[cap], "2516582")
+            del os.environ[cap], os.environ[jit]
             os.environ.pop(level)
             os.environ[jit] = "0"
             _minimax_m3_overrides(rocm_server_args(), NVFP4)
@@ -478,6 +481,30 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 _minimax_m3_overrides(rocm_server_args(dtype=dtype), NVFP4)
                 self.assertNotIn(jit, os.environ)
                 self.assertNotIn(cap, os.environ)
+
+    def test_quick_all_reduce_hands_dtypes_its_handle_lacks_elsewhere(self):
+        """A float16 tensor on a JIT quick all-reduce handle (bf16 only) goes to the next
+        all-reduce instead of raising mid-forward."""
+        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+            QuickAllReduce,
+            QuickReduceRegime,
+        )
+
+        qr = QuickAllReduce.__new__(QuickAllReduce)
+        qr.disabled, qr._ptr, qr.world_size = False, 7, 4
+        qr.use_fp16_kernels, qr.qr_quant_level = True, QuickReduceRegime.INT4
+        qr.qr_max_size = 1 << 31
+        inp = torch.empty(64 << 20, dtype=torch.bfloat16)
+        with patch.object(
+            custom_all_reduce_ops,
+            "qr_supports",
+            side_effect=lambda fa, dtype: dtype == torch.bfloat16,
+            create=True,
+        ):
+            self.assertTrue(qr.should_quick_allreduce(inp))
+            self.assertFalse(qr.should_quick_allreduce(inp.view(torch.float16)))
+        # no communicator was opened, so teardown has nothing to destroy
+        qr._ptr, qr.disabled = 0, True
 
     def test_jit_quick_reduce_is_gfx950_only(self):
         """The JIT build is validated on gfx950 only; a user-set flag elsewhere keeps

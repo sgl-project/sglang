@@ -125,27 +125,30 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
     """The quick all-reduce both M3.1 checkpoints take at TP4, where it was measured."""
     if cfg.tp_size != 4:
         return
-    # INT4 measured faster on the long-prefill all-reduce with GSM8K unchanged; ROCm images
-    # export INT8 for every model, so only another level the user set stays
+    # INT4 measured faster on the long-prefill all-reduce with GSM8K unchanged. A level
+    # already set stays: an INT8 the ROCm images export reads the same as one the user chose
     level = "ROCM_QUICK_REDUCE_QUANTIZATION"
+    if envs.SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4.get():
+        if level not in os.environ:
+            os.environ[level] = "INT4"
+            logger.info(
+                "MiniMax-M3.1: quick all-reduce INT4; "
+                "SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4=0 leaves it off"
+            )
+        elif os.environ[level] == "INT8":
+            logger.info(
+                "MiniMax-M3.1: keeping %s=INT8; INT4 measured faster on long prefills",
+                level,
+            )
     if (
-        os.environ.get(level, "INT8") == "INT8"
-        and envs.SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4.get()
-    ):
-        os.environ[level] = "INT4"
-        logger.info(
-            "MiniMax-M3.1: quick all-reduce INT4 (from INT8 or unset); "
-            "SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4=0 keeps INT8"
-        )
-    if (
-        os.environ.get(level) != "INT4"
+        os.environ.get(level) not in ("INT4", "INT8")
         # the JIT build reduces bf16 cast to fp16 only, as QuickAllReduce sets it up
         or cfg.dtype not in ("auto", "bfloat16")
         or int(os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)) == 0
     ):
         return
     # the JIT build is faster at TP4; it matches sgl-kernel's bitwise at the level it runs,
-    # which for INT4 is INT8 below 64 MiB
+    # which for INT4 is INT8 below SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB
     if not envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.is_set():
         envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.set(True)
     if envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get():

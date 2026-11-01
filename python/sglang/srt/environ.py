@@ -2186,8 +2186,9 @@ class Envs:
     # gfx950 M3.1 main K/V and index-K cache layout: auto (the packed NVFP4 MSA-v1 pool
     # under DSPARK, fp8 otherwise) or fp8 (e4m3) everywhere
     SGLANG_MINIMAX_M3_AMD_KV_FORMAT = EnvStr("auto")
-    # gfx950 M3.1 at TP4 raises ROCM_QUICK_REDUCE_QUANTIZATION from INT8 (the ROCm images'
-    # default for every model) to INT4, measured faster at equal GSM8K; 0 leaves the level alone
+    # gfx950 M3.1 at TP4 sets ROCM_QUICK_REDUCE_QUANTIZATION=INT4 when it is unset, measured
+    # faster at equal GSM8K; a level already set (the ROCm images export INT8) stays, and 0
+    # leaves an unset level unset
     SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4 = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
