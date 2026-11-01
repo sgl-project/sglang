@@ -1,5 +1,5 @@
-"""prealloc_{full,swa}_token_usage: KV held by PD decode requests whose
-transfer is pending, on the capacity basis of full/swa_token_usage."""
+"""prealloc_{full,window}_token_usage: KV held by PD decode requests whose
+transfer is pending, on the capacity basis of full/window_token_usage."""
 
 import unittest
 from functools import partial
@@ -13,7 +13,10 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
-from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    PoolStats,
+    WindowPoolStats,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -75,15 +78,26 @@ def _reporter(*, counts, pool_stats):
     return reporter
 
 
-def _swa_pool_stats(full_capacity, swa_capacity):
+def _window(name, capacity):
+    return WindowPoolStats(
+        name=name,
+        sub_pool=name,
+        capacity=capacity,
+        available_size=0,
+        evictable_size=0,
+        num_used=0,
+        token_usage=0.0,
+    )
+
+
+def _swa_pool_stats(full_capacity, swa_capacity, *further):
     return PoolStats(
         full_num_used=0,
         full_token_usage=0.0,
         full_available_size=0,
         full_evictable_size=0,
-        is_hybrid_swa=True,
         full_capacity=full_capacity,
-        swa_capacity=swa_capacity,
+        windows=(_window("window_128", swa_capacity), *further),
     )
 
 
@@ -101,7 +115,21 @@ class TestDecodeQueueStats(CustomTestCase):
         reporter = _reporter(counts=(250, 40), pool_stats=_swa_pool_stats(1000, 200))
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.25)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.2)
+        self.assertEqual(
+            reporter.stats.prealloc_window_token_usage, {"window_128": 0.2}
+        )
+
+    def test_window_share_is_the_tree_first_window(self):
+        """The pending requests' window rows are the first window's: only it
+        is charged, a further window reports nothing."""
+        reporter = _reporter(
+            counts=(250, 40),
+            pool_stats=_swa_pool_stats(1000, 200, _window("window_64", 100)),
+        )
+        self._update(reporter)
+        self.assertEqual(
+            reporter.stats.prealloc_window_token_usage, {"window_128": 0.2}
+        )
 
     def test_plain_pool_reports_no_swa_share(self):
         pool_stats = PoolStats(
@@ -114,13 +142,15 @@ class TestDecodeQueueStats(CustomTestCase):
         reporter = _reporter(counts=(100, 100), pool_stats=pool_stats)
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.1)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.0)
+        self.assertEqual(reporter.stats.prealloc_window_token_usage, {})
 
     def test_zero_capacity_reports_zero_like_token_usage(self):
         reporter = _reporter(counts=(0, 0), pool_stats=_swa_pool_stats(0, 0))
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.0)
-        self.assertEqual(reporter.stats.prealloc_swa_token_usage, 0.0)
+        self.assertEqual(
+            reporter.stats.prealloc_window_token_usage, {"window_128": 0.0}
+        )
 
 
 class TestCollectorExport(CustomTestCase):
@@ -153,16 +183,19 @@ class TestCollectorExport(CustomTestCase):
                 labels={"model_name": "test", "moe_ep_rank": 1}, server_args=None
             )
         stats = SchedulerStats(
-            prealloc_full_token_usage=0.25, prealloc_swa_token_usage=0.125
+            prealloc_full_token_usage=0.25,
+            prealloc_window_token_usage={"window_128": 0.125},
         )
         collector.log_stats(stats)
         samples = {
-            sample.name: sample.value
+            (sample.name, sample.labels.get("window")): sample.value
             for family in registry.collect()
             for sample in family.samples
         }
-        self.assertEqual(samples["sglang:prealloc_full_token_usage"], 0.25)
-        self.assertEqual(samples["sglang:prealloc_swa_token_usage"], 0.125)
+        self.assertEqual(samples[("sglang:prealloc_full_token_usage", None)], 0.25)
+        self.assertEqual(
+            samples[("sglang:prealloc_window_token_usage", "window_128")], 0.125
+        )
 
 
 if __name__ == "__main__":

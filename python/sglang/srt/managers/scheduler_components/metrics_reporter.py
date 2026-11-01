@@ -1467,11 +1467,12 @@ class SchedulerMetricsReporter:
         self.stats.prealloc_full_token_usage = (
             full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
         )
-        self.stats.prealloc_swa_token_usage = (
-            swa_tokens / pool_stats.swa_capacity
-            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
-            else 0.0
-        )
+        # The pending requests' window rows are counted for the tree's first
+        # window, the one their window cursors track.
+        self.stats.prealloc_window_token_usage = {
+            window.name: (swa_tokens / window.capacity if window.capacity else 0.0)
+            for window in pool_stats.windows[:1]
+        }
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""

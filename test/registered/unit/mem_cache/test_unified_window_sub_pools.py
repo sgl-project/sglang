@@ -107,7 +107,7 @@ class TestWindowNames(CustomTestCase):
         first = SubPoolExternal(
             host_pool="window_16",
             tree_component="WINDOW_16",
-            metrics="swa",
+            metrics="window",
             wire="swa",
         )
         self.assertEqual(_plan((16,)).sub_pool("window_16").external, first)
@@ -117,7 +117,7 @@ class TestWindowNames(CustomTestCase):
             SubPoolExternal(
                 host_pool="window_64",
                 tree_component="WINDOW_64",
-                metrics="swa",
+                metrics="window",
                 wire="swa",
             ),
         )
@@ -126,7 +126,7 @@ class TestWindowNames(CustomTestCase):
             SubPoolExternal(
                 host_pool="window_16",
                 tree_component="WINDOW_16",
-                metrics="swa",
+                metrics="window",
                 wire="swa",
             ),
         )

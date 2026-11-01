@@ -91,13 +91,13 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
-        if ps.is_hybrid_swa and not ps.full_capacity:
+        if ps.windows and not ps.full_capacity:
             return False, ""
         # The token sub-pool's capacity as the stats report it: the sized cap
         # with a window, the schedulable token count with state.
         total = ps.full_capacity
         session_held = self.pool_stats_observer.session_held_tokens()
-        if ps.is_hybrid_swa or ps.is_hybrid_ssm:
+        if ps.windows or ps.is_hybrid_ssm:
             protected = self.tree_cache.full_protected_size()
         else:
             protected = self.tree_cache.protected_size()
@@ -159,24 +159,27 @@ class SchedulerInvariantChecker:
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
-    def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+    def _check_window_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        """Conservation of the tree's first window, the window whose protected,
+        transient and session-held counts the tree reports."""
+        window = ps.windows[0]
         allocator = self.token_to_kv_pool_allocator
         if is_swa_req_ring(allocator):
-            # Per-request SWA ring: there is no token pool to conserve; ring-slot
-            # leaks are caught by the req_to_token check instead.
+            # Per-request window ring: there is no token pool to conserve;
+            # ring-slot leaks are caught by the req_to_token check instead.
             return False, (
-                "[swa] unified ring (leak-check skipped): "
-                f"available={ps.swa_available_size}, "
-                f"evictable={ps.swa_evictable_size}, "
-                f"total={ps.swa_capacity}"
+                f"[{window.name}] unified ring (leak-check skipped): "
+                f"available={window.available_size}, "
+                f"evictable={window.evictable_size}, "
+                f"total={window.capacity}"
             )
         return self._check_pool_invariant(
-            "swa",
-            ps.swa_available_size,
-            ps.swa_evictable_size,
+            window.name,
+            window.available_size,
+            window.evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),
-            ps.swa_capacity,
+            window.capacity,
             uncached,
         )
 
@@ -302,13 +305,13 @@ class SchedulerInvariantChecker:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes(ps.is_hybrid_swa)
+        full_uncached, swa_uncached = self._get_total_uncached_sizes(bool(ps.windows))
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
         swa_leak, swa_msg = False, ""
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
+        if ps.windows:
+            swa_leak, swa_msg = self._check_window_pool(ps, uncached=swa_uncached)
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
         full_line = f"[Mem Check (BUSY)] {full_msg}"
@@ -329,7 +332,7 @@ class SchedulerInvariantChecker:
                     logger.info(msg)
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
-        assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
+        assert not swa_leak, f"Window Pool Mem Leak Detected! {swa_msg}"
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
@@ -456,8 +459,8 @@ class SchedulerInvariantChecker:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
+        if ps.windows:
+            swa_leak, swa_msg = self._check_window_pool(ps)
             has_leak |= swa_leak
             messages.append(swa_msg)
 
@@ -473,7 +476,7 @@ class SchedulerInvariantChecker:
             return
         ps = self.pool_stats_observer.get_pool_stats()
         if self.tree_cache.supports_prefix_sharing() and (
-            (ps.is_hybrid_swa and self.tree_cache.supports_swa())
+            (ps.windows and self.tree_cache.supports_swa())
             or (ps.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()

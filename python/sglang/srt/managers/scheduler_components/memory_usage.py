@@ -18,7 +18,7 @@ def build_memory_usage(
     kv_cache_gb: float,
     startup_available_gb: float,
     token_capacity: int,
-    token_capacity_swa: int | None,
+    token_capacity_window: Mapping[str, int],
     target_graph_memory_usage: Mapping[str, float] | None,
     draft_graph_memory_usage: Mapping[str, float] | None,
 ) -> dict:
@@ -31,9 +31,10 @@ def build_memory_usage(
         "kvcache": round(kv_cache_gb, 3),
         "startup_available": round(startup_available_gb, 3),
         "token_capacity": int(token_capacity),
-        "token_capacity_swa": (
-            None if token_capacity_swa is None else int(token_capacity_swa)
-        ),
+        # Each sliding-window pool's capacity, by the window's name.
+        "token_capacity_window": {
+            name: int(capacity) for name, capacity in token_capacity_window.items()
+        },
         "graph": {
             phase: round(memory_gb, 3)
             for phase, memory_gb in graph_memory_usage.items()

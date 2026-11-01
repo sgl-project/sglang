@@ -89,14 +89,15 @@ class SchedulerStats:
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
     #
-    # token_usage:      max(full, swa, mamba) — the bottleneck across all pools.
-    #                   FIXME: misleadingly named "token_usage"; rename requires API deprecation.
-    # full_token_usage: full-attention KV cache pool usage (always active).
-    # swa_token_usage:  sliding-window attention KV cache pool usage (hybrid SWA models only, e.g. Gemma2).
-    # mamba_usage:      Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    # token_usage:        max(full, every window, mamba) — the bottleneck across all pools.
+    #                     FIXME: misleadingly named "token_usage"; rename requires API deprecation.
+    # full_token_usage:   full-attention KV cache pool usage (always active).
+    # window_token_usage: each sliding-window KV pool's usage, by the window's
+    #                     name (`window_<length>`); empty without window layers.
+    # mamba_usage:        Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
     token_usage: float = 0.0
     full_token_usage: float = 0.0
-    swa_token_usage: float = 0.0
+    window_token_usage: Dict[str, float] = field(default_factory=dict)
     mamba_usage: float = 0.0
 
     # Absolute token counts for the full-attention KV cache pool.
@@ -107,16 +108,17 @@ class SchedulerStats:
     # kv_available_tokens:  free (unallocated) slots in the pool.
     # kv_evictable_tokens:  slots holding radix-cached KV data that can be evicted for new requests.
     # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
-    # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
-    #                       Does NOT include the mamba pool.
+    # num_used_tokens:      max(full_num_used, every window's num_used); full_num_used
+    #                       without windows. Does NOT include the mamba pool.
     num_used_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
 
-    swa_available_tokens: int = 0
-    swa_evictable_tokens: int = 0
-    swa_used_tokens: int = 0
+    # The same three counts for each window pool, by the window's name.
+    window_available_tokens: Dict[str, int] = field(default_factory=dict)
+    window_evictable_tokens: Dict[str, int] = field(default_factory=dict)
+    window_used_tokens: Dict[str, int] = field(default_factory=dict)
     mamba_available_tokens: int = 0
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
@@ -144,11 +146,12 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
-    # Share of the full / SWA KV pool held by decode requests whose KV transfer
-    # is still pending (preallocated, not yet running), on the capacity basis of
-    # full_token_usage / swa_token_usage; the difference is the running batch's share.
+    # Share of the full / each window KV pool held by decode requests whose KV
+    # transfer is still pending (preallocated, not yet running), on the capacity
+    # basis of full_token_usage / window_token_usage; the difference is the
+    # running batch's share.
     prealloc_full_token_usage: float = 0.0
-    prealloc_swa_token_usage: float = 0.0
+    prealloc_window_token_usage: Dict[str, float] = field(default_factory=dict)
 
     # Utilization
     utilization: float = 0.0
@@ -357,6 +360,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
+        # Window pool series carry the window's name (`window_<length>`).
+        window_labelnames = list(labels.keys()) + ["window"]
 
         # =================================================================
         # Basics
@@ -413,10 +418,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.swa_token_usage = Gauge(
-            name="sglang:swa_token_usage",
-            documentation="The token usage for SWA layers.",
-            labelnames=labels.keys(),
+        self.window_token_usage = Gauge(
+            name="sglang:window_token_usage",
+            documentation="The token usage of each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.mamba_usage = Gauge(
@@ -453,22 +458,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.swa_available_tokens = Gauge(
-            name="sglang:swa_available_tokens",
-            documentation="Number of free token slots in the SWA pool (hybrid-SWA only).",
-            labelnames=labels.keys(),
+        self.window_available_tokens = Gauge(
+            name="sglang:window_available_tokens",
+            documentation="Number of free token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
-        self.swa_evictable_tokens = Gauge(
-            name="sglang:swa_evictable_tokens",
-            documentation="Number of evictable (radix-cached) token slots in the SWA pool.",
-            labelnames=labels.keys(),
+        self.window_evictable_tokens = Gauge(
+            name="sglang:window_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
-        self.swa_used_tokens = Gauge(
-            name="sglang:swa_used_tokens",
-            documentation="Number of actively used token slots in the SWA pool.",
-            labelnames=labels.keys(),
+        self.window_used_tokens = Gauge(
+            name="sglang:window_used_tokens",
+            documentation="Number of actively used token slots in each sliding-window KV pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.mamba_available_tokens = Gauge(
@@ -658,10 +663,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.prealloc_swa_token_usage = Gauge(
-            name="sglang:prealloc_swa_token_usage",
-            documentation="Share of the SWA KV pool held by decode requests whose KV transfer is pending; same capacity basis as sglang:swa_token_usage.",
-            labelnames=labels.keys(),
+        self.prealloc_window_token_usage = Gauge(
+            name="sglang:prealloc_window_token_usage",
+            documentation="Share of each sliding-window KV pool held by decode requests whose KV transfer is pending, by window; same capacity basis as sglang:window_token_usage.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.num_bootstrap_failed_reqs = Counter(
@@ -1292,10 +1297,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.max_total_num_tokens_swa = Gauge(
-            name="sglang:max_total_num_tokens_swa",
-            documentation="Maximum total number of tokens in the SWA KV cache pool.",
-            labelnames=labels.keys(),
+        self.max_total_num_tokens_window = Gauge(
+            name="sglang:max_total_num_tokens_window",
+            documentation="Maximum total number of tokens in each sliding-window KV cache pool, by window.",
+            labelnames=window_labelnames,
             multiprocess_mode="mostrecent",
         )
         self.weight_memory_usage_gb = Gauge(
@@ -1413,6 +1418,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def _log_window_gauge(self, gauge: Gauge, data: Mapping[str, float]) -> None:
+        # One sample per window pool, under the window's name.
+        for window, value in data.items():
+            gauge.labels(**self.labels, window=window).set(value)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
         # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
@@ -1655,7 +1665,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Memory pool usage ratios
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
-        self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
+        self._log_window_gauge(self.window_token_usage, stats.window_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
 
         # Absolute token counts
@@ -1663,9 +1673,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
-        self._log_gauge(self.swa_available_tokens, stats.swa_available_tokens)
-        self._log_gauge(self.swa_evictable_tokens, stats.swa_evictable_tokens)
-        self._log_gauge(self.swa_used_tokens, stats.swa_used_tokens)
+        self._log_window_gauge(
+            self.window_available_tokens, stats.window_available_tokens
+        )
+        self._log_window_gauge(
+            self.window_evictable_tokens, stats.window_evictable_tokens
+        )
+        self._log_window_gauge(self.window_used_tokens, stats.window_used_tokens)
         self._log_gauge(self.mamba_available_tokens, stats.mamba_available_tokens)
         self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
         self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
@@ -1708,7 +1722,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
         self._log_gauge(self.prealloc_full_token_usage, stats.prealloc_full_token_usage)
-        self._log_gauge(self.prealloc_swa_token_usage, stats.prealloc_swa_token_usage)
+        self._log_window_gauge(
+            self.prealloc_window_token_usage, stats.prealloc_window_token_usage
+        )
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1769,7 +1785,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def emit_constants(
         self,
         max_total_num_tokens: int,
-        max_total_num_tokens_swa: Optional[int],
+        max_total_num_tokens_window: Mapping[str, int],
         weight_memory_usage_gb: float,
         kv_cache_memory_usage_gb: float,
         graph_memory_usage_gb: Mapping[str, float],
@@ -1780,8 +1796,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         startup_available_gpu_memory_gb: float,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
-        if max_total_num_tokens_swa is not None:
-            self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
+        self._log_window_gauge(
+            self.max_total_num_tokens_window, max_total_num_tokens_window
+        )
         self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
         self._log_gauge(self.kv_cache_memory_usage_gb, kv_cache_memory_usage_gb)
         for phase, memory_usage_gb in graph_memory_usage_gb.items():
@@ -2552,7 +2569,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.load_back_num_tokens = Counter(
             name="sglang:load_back_tokens_total",
             documentation="The number of tokens loaded back from local host "
-            "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...). Every TP "
+            "DRAM (L2) to GPU, by host pool (kv, mamba, each window's, ...). Every TP "
             "rank reports the same logical count under its own rank labels; "
             "read one rank rather than summing ranks.",
             labelnames=list(labels.keys()) + ["pool"],
@@ -2595,7 +2612,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.backup_num_tokens = Counter(
             name="sglang:hicache_backup_tokens_total",
             documentation="The number of tokens backed up from GPU to local "
-            "host DRAM (L2), by host pool (kv, swa, mamba, ...). Covers all "
+            "host DRAM (L2), by host pool (kv, mamba, each window's, ...). Covers all "
             "D->H backups regardless of --hicache-write-policy. Distinct from "
             "the host-to-storage (L3) sglang:backuped_tokens_total. Every TP "
             "rank reports the same logical count under its own rank labels; "

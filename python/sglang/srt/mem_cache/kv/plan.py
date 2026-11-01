@@ -87,7 +87,7 @@ def _window_external(name: str) -> SubPoolExternal:
     return SubPoolExternal(
         host_pool=name,
         tree_component=window_tree_component(name),
-        metrics="swa",
+        metrics="window",
         wire=WINDOW_WIRE,
     )
 
