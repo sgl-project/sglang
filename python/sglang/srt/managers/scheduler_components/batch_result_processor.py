@@ -1672,7 +1672,11 @@ class SchedulerBatchResultProcessor:
         # index. Warm requests don't track at all — the prefill/decode masks
         # already skip them.
         buf = req.kv.mamba_ping_pong_track_buffer
-        if buf[0].item() == 0 and buf[1].item() == 0:
+        # Warm sentinel: an all-zero buffer means "warm request, nothing
+        # tracked". With overlap scheduling off the buffer is 1-element
+        # (memory_pool sizes it 2 only under overlap), so a zero buf[0] alone
+        # is the sentinel there — indexing buf[1] would raise IndexError.
+        if buf[0].item() == 0 and (buf.numel() == 1 or buf[1].item() == 0):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

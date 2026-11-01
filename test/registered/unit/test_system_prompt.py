@@ -440,7 +440,8 @@ class TestStartupProbeGate(CustomTestCase):
         args = self._args(chunk=8)
         tok = _StubTokenizer(top_bos=False)
         with patch(
-            "transformers.AutoTokenizer.from_pretrained", return_value=tok
+            "sglang.srt.system_prompt.system_prompt._load_probe_tokenizer",
+            return_value=tok,
         ):
             probe_system_prefix_or_disable(args)
         self.assertIsNotNone(args.system_prompt)
@@ -451,7 +452,8 @@ class TestStartupProbeGate(CustomTestCase):
         args = self._args(chunk=64)
         tok = _StubTokenizer(top_bos=False)
         with patch(
-            "transformers.AutoTokenizer.from_pretrained", return_value=tok
+            "sglang.srt.system_prompt.system_prompt._load_probe_tokenizer",
+            return_value=tok,
         ):
             probe_system_prefix_or_disable(args)
         self.assertIsNone(args.system_prompt)
@@ -461,10 +463,17 @@ class TestStartupProbeGate(CustomTestCase):
         # native path rather than risk the half-enabled state.
         args = self._args()
         with patch(
-            "transformers.AutoTokenizer.from_pretrained",
+            "sglang.srt.system_prompt.system_prompt._load_probe_tokenizer",
             side_effect=RuntimeError("boom"),
         ):
             probe_system_prefix_or_disable(args)
+        self.assertIsNone(args.system_prompt)
+
+    def test_skip_tokenizer_init_clears_flag(self):
+        # No tokenizer at runtime -> the feature can never be live; the gate
+        # must clear the flag so pool sizing stays consistent.
+        args = _FakeArgs("SYS-TEXT", skip_tokenizer_init=True)
+        probe_system_prefix_or_disable(args)
         self.assertIsNone(args.system_prompt)
 
     def test_unset_flag_is_noop(self):
@@ -595,6 +604,79 @@ class TestStaticMambaSlotBudget(CustomTestCase):
         self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 1)
 
 
+class TestMambaGapBudget(CustomTestCase):
+    """Shared-pool gap budget (`_mamba_gap_budget_for_req`, `_mamba_slot_cost > 0`
+    under --enable-unified-memory). Regression for the crash class: the body
+    referenced is_system_prefix_warm/cold_factor without importing them, and no
+    test covered the shared-pool path until now. On main the request fields live
+    on req.kv (ReqKvInfo), and the cold factor derives from the pool's
+    mamba_initial_tracking_slots."""
+
+    def _adder(self, lazy: bool = False):
+        return SimpleNamespace(
+            _mamba_slot_cost=64,
+            _static_mamba_slots=False,
+            tree_cache=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(
+                    mamba_initial_tracking_slots=1 if lazy else 2
+                )
+            ),
+        )
+
+    def _req(self, boundary, prefix_len=0, branching=None, holds_mamba=False):
+        return SimpleNamespace(
+            system_prefix_boundary=boundary,
+            prefix_len=prefix_len,
+            mamba_branching_seqlen=branching,
+            mamba_host_hit_length=0,
+            kv=SimpleNamespace(holds_mamba=holds_mamba),
+        )
+
+    def _budget(self, adder, req, fresh_cow=False):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        return PrefillAdder._mamba_gap_budget_for_req(adder, req, fresh_cow=fresh_cow)
+
+    def test_warm_charged_single_slot(self):
+        # Boundary covered, no branching: running slot only -> 1 x cost.
+        self.assertEqual(self._budget(self._adder(), self._req(64, 64, None)), 64)
+
+    def test_cold_charged_full_factor(self):
+        # No boundary coverage -> running + ping-pong (3, or 2 lazy) x cost.
+        self.assertEqual(self._budget(self._adder(), self._req(64, 0, None)), 192)
+        self.assertEqual(self._budget(self._adder(), self._req(None, 0, None)), 192)
+        self.assertEqual(self._budget(self._adder(lazy=True), self._req(64, 0, None)), 128)
+
+    def test_zero_when_state_held(self):
+        # Already holds a slot and no fresh COW -> no new gap to reserve.
+        self.assertEqual(
+            self._budget(self._adder(), self._req(64, 0, None, holds_mamba=True)), 0
+        )
+
+    def test_fresh_cow_charged_despite_state_held(self):
+        # The match COW binds the request's slot before the budget runs;
+        # fresh_cow must still charge (warm 1x, cold 3x) — the shared-pool
+        # twin of the fresh_cow budget fix.
+        self.assertEqual(
+            self._budget(
+                self._adder(), self._req(64, 64, None, holds_mamba=True), fresh_cow=True
+            ),
+            64,
+        )
+        self.assertEqual(
+            self._budget(
+                self._adder(), self._req(64, 100, 64, holds_mamba=True), fresh_cow=True
+            ),
+            192,
+        )
+
+    def test_zero_without_shared_pool(self):
+        adder = SimpleNamespace(
+            _mamba_slot_cost=0, _static_mamba_slots=True, tree_cache=None
+        )
+        self.assertEqual(self._budget(adder, self._req(None, 0, None)), 0)
+
+
 class TestMambaAuditWithBareTreeCache(CustomTestCase):
     """Regression (A800 --disable-radix-cache crash): the [MambaAudit] slot
     audit calls tree_cache.mamba_evictable_size(), which only the mamba-aware
@@ -665,12 +747,14 @@ class _FakeArgs:
         tokenizer_path=None,
         trust_remote_code=True,
         mamba_cache_chunk_size=64,
+        skip_tokenizer_init=False,
     ):
         self.system_prompt = system_prompt
         self.model_path = model_path
         self.tokenizer_path = tokenizer_path
         self.trust_remote_code = trust_remote_code
         self.mamba_cache_chunk_size = mamba_cache_chunk_size
+        self.skip_tokenizer_init = skip_tokenizer_init
 
 
 if __name__ == "__main__":

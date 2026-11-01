@@ -4351,9 +4351,11 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    # Module-level throttle timestamp for the periodic mamba slot audit (kept
-    # out of __init__ on purpose): one [MambaAudit] line per 30s per scheduler.
+    # Module-level throttle timestamps for the periodic mamba slot audit and
+    # the match pre-check notice (kept out of __init__ on purpose): one
+    # [MambaAudit] line per 30s per scheduler each.
     _mamba_audit_last_ts: float = 0.0
+    _mamba_precheck_log_ts: float = 0.0
 
     def _maybe_audit_mamba_slots(self, adder, running_batch) -> None:
         """Periodic slot-accounting snapshot for the fixed-system-prompt mamba
@@ -4634,7 +4636,14 @@ class Scheduler(
                 adder.rem_mamba_slots is not None
                 and adder.rem_mamba_slots < adder._mamba_match_headroom()
             ):
-                if mamba_allocator is not None:
+                # Throttled like the [MambaAudit] line: the pre-check can trip
+                # on every scheduling pass while the pool hovers near empty,
+                # and the periodic audit line already carries rem/queue.
+                if (
+                    mamba_allocator is not None
+                    and time.monotonic() - self._mamba_precheck_log_ts >= 30.0
+                ):
+                    self._mamba_precheck_log_ts = time.monotonic()
                     logger.info(
                         "[MambaAudit] match pre-check stopped pulling: "
                         "rem=%d headroom=%d free=%d queue=%d can_run=%d running=%d",

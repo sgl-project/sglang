@@ -53,6 +53,47 @@ def aligned_prefix_len_down(prefix_len: int, chunk: int) -> int:
     return (prefix_len // chunk) * chunk
 
 
+def _load_probe_tokenizer(server_args):
+    """Load the tokenizer exactly as ``TokenizerManager.init_tokenizer_and_processor``
+    will (same helpers, same kwargs), so the startup probe's verdict cannot
+    diverge from the runtime probe in serving_chat. A probe that passed on a
+    differently-loaded tokenizer would leave the mamba pool sized for the warm
+    steady state while every request stays cold."""
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.utils.hf_transformers import (
+        get_tokenizer,
+        get_tokenizer_from_processor,
+    )
+
+    if ModelConfig.from_server_args(server_args).is_multimodal:
+        # Multimodal: the runtime tokenizer is the processor's tokenizer.
+        # Replicate get_processor_wrapper's call from the raw record fields —
+        # the probe runs BEFORE the config is published, so the get_*()
+        # context accessors are not up yet.
+        from sglang.srt.utils.hf_transformers.processor import (
+            get_processor,
+            resolve_image_processor_backend,
+        )
+
+        processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            image_processor_backend=resolve_image_processor_backend(server_args),
+            tokenizer_backend=server_args.tokenizer_backend,
+            model_name=server_args.model_path,
+        )
+        return get_tokenizer_from_processor(processor)
+    return get_tokenizer(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        tokenizer_backend=server_args.tokenizer_backend,
+    )
+
+
 def probe_system_prefix_or_disable(server_args) -> None:
     """Early gate for ``--system-prompt``: probe before any subprocess spawns.
 
@@ -74,20 +115,28 @@ def probe_system_prefix_or_disable(server_args) -> None:
     """
     if server_args.system_prompt is None:
         return
+    if server_args.skip_tokenizer_init:
+        # No tokenizer at runtime either — the serving-chat probe could never
+        # run, so disable here to keep pool sizing consistent with behavior.
+        logger.error(
+            "--system-prompt: skip_tokenizer_init leaves no tokenizer to render "
+            "the fixed system prompt; disabling (native path, no prefix reuse)"
+        )
+        server_args.system_prompt = None
+        return
     system_text = resolve_system_prompt(server_args)
     try:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            server_args.tokenizer_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-        )
+        tokenizer = _load_probe_tokenizer(server_args)
     except Exception as e:
         logger.error(
             "--system-prompt: startup probe could not load the tokenizer (%s); "
             "disabling the fixed system prompt (native path, no prefix reuse)",
             e,
         )
+        # Bare assignment is the sanctioned mutation here: the probe runs in
+        # Engine init BEFORE the config is published (and before the
+        # subprocesses fork), so runtime_context.override() is not available
+        # yet and the record is not frozen.
         server_args.system_prompt = None
         return
     # Mirror serving_chat's special-token detection so this probe sees the same
