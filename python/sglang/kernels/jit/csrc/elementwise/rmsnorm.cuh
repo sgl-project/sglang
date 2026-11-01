@@ -319,13 +319,17 @@ struct RMSNormKernel {
           .with_device(device_sym)
           .ensure_alignment(kVecBytes / 2)
           .verify(output.value());
-      TensorMatcher({1})  // scale
-          .with_dtype<fp32_t>()
-          .with_device(device_sym)
-          .verify(scale.value());
+      // Static FP8 loaders produce the per-tensor scale as either [1] or 0-D.
+      const auto& scale_value = scale.value();
+      CHECK_HOST(scale_value.numel() == 1 && is_type<fp32_t>(scale_value.dtype()))
+          << "`scale` must hold a single fp32 element";
+      CHECK_HOST(
+          scale_value.device().device_type == input.device().device_type &&
+          scale_value.device().device_id == input.device().device_id)
+          << "`scale` must be on the same device as `input`";
       params.output = output.value().data_ptr();
       params.output_stride = output.value().stride(0);
-      params.scale = static_cast<const float*>(scale.value().data_ptr());
+      params.scale = static_cast<const float*>(scale_value.data_ptr());
     } else if constexpr (!kFusedAdd) {
       CHECK_HOST(output.has_value()) << "rmsnorm needs `output`";
       TensorMatcher({N, D})  // output

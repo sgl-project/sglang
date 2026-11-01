@@ -175,10 +175,14 @@ def test_rmsnorm_hf(batch_size: int, hidden_size: int, dtype: torch.dtype) -> No
 @pytest.mark.skipif(is_hip(), reason="fp8 e4m3 quant modes are CUDA-only")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("fused", [False, True])
-def test_rmsnorm_quant(batch_size: int, hidden_size: int, fused: bool) -> None:
+# [1] and 0-D (``input_scale.max()``) are both produced by static FP8 loaders.
+@pytest.mark.parametrize("scale_shape", [(1,), ()])
+def test_rmsnorm_quant(
+    batch_size: int, hidden_size: int, fused: bool, scale_shape: tuple
+) -> None:
     dtype = torch.bfloat16
     x, w, res = _inputs(batch_size, hidden_size, dtype, residual=fused)
-    scale = torch.full((1,), 0.05, device=DEVICE, dtype=torch.float32)
+    scale = torch.full(scale_shape, 0.05, device=DEVICE, dtype=torch.float32)
     ref, ref_res = _reference(x, w, res, scale.item(), hf=False)
     out = torch.empty(batch_size, hidden_size, device=DEVICE, dtype=torch.float8_e4m3fn)
     if fused:
