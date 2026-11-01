@@ -146,6 +146,23 @@ class DeepSeekRecipe:
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
         raises ValueError. `image_urls` receives the images in placeholder order."""
+        conversation = self.convert(body, effort_budget=effort_budget)
+        prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
+        if image_urls is not None:
+            rendered = self._encoding.render_conversation(conversation)
+            image_urls.extend(
+                source.url or source.data_url for source in rendered.image_sources
+            )
+        if task is not None:
+            prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
+        return prompt_ids
+
+    def convert(
+        self, body: dict[str, Any], *, effort_budget: Optional[int] = None
+    ) -> Any:
+        """Recipe's `Conversation` for `body` (see `pre_normalize`); a request recipe
+        rejects raises ValueError. Pass the same `effort_budget` to
+        `encode_conversation`, which rewrites the effort line this renders."""
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
@@ -155,16 +172,16 @@ class DeepSeekRecipe:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        prompt_ids = self._encoding.encode(converted.conversation)
-        if image_urls is not None:
-            rendered = self._encoding.render_conversation(converted.conversation)
-            image_urls.extend(
-                source.url or source.data_url for source in rendered.image_sources
-            )
-        if effort_budget is not None and body["thinking"]:
+        return converted.conversation
+
+    def encode_conversation(
+        self, conversation: Any, *, effort_budget: Optional[int] = None
+    ) -> list[int]:
+        """Prompt ids for a recipe `Conversation`, such as one `convert` returns or a
+        prefix of its messages."""
+        prompt_ids = self._encoding.encode(conversation)
+        if effort_budget is not None and conversation.thinking_mode:
             prompt_ids = self._replace_effort_budget(prompt_ids, effort_budget)
-        if task is not None:
-            prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
     def parse_start(
