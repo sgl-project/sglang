@@ -173,6 +173,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
             )
         if server_args.warmup_resolutions is not None:
+            # Warm up at the canvas the flag names, short edge included.
+            target["short_edge"] = min(int(req.width), int(req.height))
             ratio = req.width / req.height
 
             def distance(name: str) -> float:
@@ -408,8 +410,35 @@ class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
             )
 
 
+@dataclass
+class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
+    """Pika H3 Flex: six re-noising steps on the adapters' fixed knots."""
+
+    num_inference_steps: int = 6
+    quality: str = "lossless"
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps != 6:
+            raise ValueError(
+                "Pika H3 Flex adapters run a fixed six-step schedule (knots "
+                "1000/750/500/250/100/40); got "
+                f"num_inference_steps={self.num_inference_steps}. "
+                "Use MiniMaxAI/MiniMax-H3 for other schedules."
+            )
+        # the adapters were trained at video shift 12 / audio shift 3
+        for name, trained in (("flow_shift", 12.0), ("audio_flow_shift", 3.0)):
+            value = getattr(self, name)
+            if value is not None and float(value) != trained:
+                raise ValueError(
+                    f"Pika H3 Flex adapters were trained at {name}={trained:g}; "
+                    f"got {value}"
+                )
+
+
 __all__ = [
     "FastH3OmniSamplingParams",
     "FastH3SamplingParams",
     "MiniMaxH3SamplingParams",
+    "PikaH3FlexSamplingParams",
 ]

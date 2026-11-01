@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.mem_cache_utils import routed
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
@@ -223,7 +224,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
                 on_set(args, kwargs)
                 raise _StopForward
 
-        return _Pool()
+        return routed(_Pool())
 
     def test_decode_uses_fused_and_v_scale_falls_back_to_self(self):
         """Standard FP8 decode takes the fused path; with layer.v_scale=None,
