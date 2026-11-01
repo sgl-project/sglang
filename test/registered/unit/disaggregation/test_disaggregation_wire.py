@@ -1672,6 +1672,45 @@ class TestStagingWatermark(unittest.TestCase):
 
 class TestStagingScatterLifecycle(CustomTestCase):
     @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_late_staging_req_after_scatter_does_not_reallocate(self, _make_event):
+        """A STAGING_REQ that arrives after its chunk scattered must not allocate."""
+        room = 7
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[(5, 4096, 0, 8192, 3)],
+            _connect_to_bootstrap_server=Mock(),
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._room_to_decode_req = {room: SimpleNamespace(_chunk_events=[])}
+        handler._room_to_receiver = {room: receiver}
+        handler._staging_lifecycle = threading.Condition()
+        handler._room_tokens = {room: object()}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._scatter_region = Mock(return_value=True)
+        self.assertTrue(handler.submit_chunk_scatter(room, 0, 0, 3))
+
+        allocator = SimpleNamespace(assign=Mock(return_value=(6, 0, 1)))
+        kv_args = SimpleNamespace(
+            page_size=64, kv_item_lens=[4096, 4096], total_kv_head_num=4, engine_rank=0
+        )
+        handle_staging_req(
+            [b"STAGING_REQ", str(room).encode(), b"0", b"3", b"peer"],
+            allocator,
+            kv_args,
+            attn_tp_size=2,
+            prefill_attn_tp_size=4,
+            kv_buffer_tensors=None,
+            room_receivers={room: receiver},
+            room_bootstrap={room: [{"pp_rank": 0}]},
+        )
+
+        allocator.assign.assert_not_called()
+        self.assertFalse(any(info[0] >= 0 for info in receiver.chunk_staging_infos))
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
     def test_unregister_waits_for_submit_to_publish_its_event(self, make_event):
         """Room teardown must not release a slot before its scatter is enqueued."""
         room = 7

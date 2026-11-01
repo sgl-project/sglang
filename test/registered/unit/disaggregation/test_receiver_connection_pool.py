@@ -21,6 +21,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
 )
@@ -303,9 +304,13 @@ class TestReceiverControlMessages(CustomTestCase):
             with self.subTest(backend=backend, customized_info=enabled):
                 receiver, sent = self._make_receiver(backend)
                 receiver.kv_mgr.customized_info_enabled = enabled
-                expected_frames = expected[backend]
-                if enabled and backend != "mori":
-                    expected_frames = expected_frames + [struct.pack("Q", 64)]
+                expected_frames = list(expected[backend])
+                if backend != "mori":
+                    # aux_item_lens follows aux_ptrs; empty when disabled.
+                    expected_frames.insert(
+                        expected_frames.index(aux) + 1,
+                        struct.pack("Q", 64) if enabled else b"",
+                    )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
@@ -497,6 +502,16 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
         self.assertEqual(manager.prefill_response_tracker, {})
+
+    def test_staging_release_before_send_metadata(self):
+        """Overlap decode can fail a request before its held send_metadata runs;
+        releasing its staging room must still work."""
+        receiver, _ = self._make_receiver()
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        decode_req = SimpleNamespace(_chunk_events=[])
+        handler.release_room(17, decode_req, receiver)
+        self.assertEqual(receiver.chunk_staging_infos, [])
 
 
 if __name__ == "__main__":

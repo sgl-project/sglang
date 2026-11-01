@@ -735,6 +735,13 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
+    # Write the forward's small metadata (DP token counts, extend lengths, the
+    # non-padded token count) with one kernel launch per array instead of pinned
+    # host-to-device copies. Where other host-to-device DMA can be queued ahead of
+    # these small copies on the copy engine, they wait behind it and stall the
+    # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
+    # copy kernel, so as not to disturb persistent kernels.
+    SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -2236,7 +2243,7 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one

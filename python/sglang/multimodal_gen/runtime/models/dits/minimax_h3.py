@@ -24,6 +24,10 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
+    BitExactFusionGate,
+    aten_head_rmsnorm,
+    can_use_aten_head_rmsnorm,
+    can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
@@ -39,6 +43,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
+    tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -507,6 +512,10 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     return nn.functional.silu(gate) * up
 
 
+# ROCm: replays aten's rms_norm reduction, so the first call checks it against eager
+_ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
+
+
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -533,6 +542,22 @@ def _apply_qk_norm(
             head_dim=head_dim,
         )
         return q, k
+    if (
+        q_norm.eps is not None
+        and k_norm.eps is not None
+        and not torch.compiler.is_compiling()
+        and can_use_aten_head_rmsnorm(q, q_norm.weight)
+        and can_use_aten_head_rmsnorm(k, k_norm.weight)
+    ):
+        return _ATEN_HEAD_RMSNORM.run(
+            lambda: (
+                aten_head_rmsnorm(q, q_norm.weight, q_norm.eps),
+                aten_head_rmsnorm(k, k_norm.weight, k_norm.eps),
+            ),
+            lambda: (q_norm(q), k_norm(k)),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return q_norm(q), k_norm(k)
 
 
@@ -617,6 +642,47 @@ def _apply_rope_qk(
         True,
     )
     return q, k
+
+
+# ROCm: also replays the bf16 rotary_embedding kernel in the norm's pass
+_ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE")
+
+
+def _apply_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: nn.RMSNorm,
+    k_norm: nn.RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    def unfused():
+        normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
+
+    if (
+        q_norm.eps is not None
+        and k_norm.eps is not None
+        and not torch.compiler.is_compiling()
+        and can_use_aten_head_rmsnorm(q, q_norm.weight)
+        and can_use_aten_head_rmsnorm(k, k_norm.weight)
+        and can_use_aten_head_rmsnorm_rope(q, cos_sin_cache, positions)
+    ):
+        return _ATEN_HEAD_RMSNORM_ROPE.run(
+            lambda: (
+                aten_head_rmsnorm(
+                    q, q_norm.weight, q_norm.eps, cos_sin_cache, positions
+                ),
+                aten_head_rmsnorm(
+                    k, k_norm.weight, k_norm.eps, cos_sin_cache, positions
+                ),
+            ),
+            unfused,
+            equal=tensors_equal,
+            logger=logger,
+        )
+    return unfused()
 
 
 def _apply_rope(
@@ -1448,14 +1514,15 @@ class MiniMaxH3Attention(nn.Module):
                     round_norm_before_rope=True,
                 )
             else:
-                q, k = _apply_qk_norm(
+                q, k = _apply_qk_norm_rope(
                     q,
                     k,
                     self.q_norm,
                     self.k_norm,
                     self.head_dim,
+                    cos_sin_cache,
+                    positions,
                 )
-                q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
         gate_compress = None
         if (
