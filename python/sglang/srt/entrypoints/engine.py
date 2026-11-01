@@ -1928,12 +1928,17 @@ def _set_envs_and_config(server_args: ServerArgs):
     # window, which requires cuMem-backed NCCL memory. The pool keeps torch
     # memory under the memory saver or a custom mem pool. Multi-node
     # deployments keep NCCL's setting (MNNVL fabrics default it on above).
+    from sglang.srt.mem_cache.fabric_mem_pool import (
+        nixl_fabric_custom_mem_pool_planned,
+    )
+
     kv_shard_symmetric_scratch = (
         cfg.enable_kv_cache_sharding
         and cfg.nnodes == 1
         and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
         and not cfg.enable_memory_saver
         and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+        and not nixl_fabric_custom_mem_pool_planned(cfg)
     )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
         if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
