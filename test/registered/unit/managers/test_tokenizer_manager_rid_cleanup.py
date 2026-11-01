@@ -159,6 +159,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.return_logprob = False
     obj.lora_path = None
     obj.log_metrics = False
+    obj._cache_write_reporting_suffix_tokens = 0
     return ReqState(
         out_list=[],
         finished=False,

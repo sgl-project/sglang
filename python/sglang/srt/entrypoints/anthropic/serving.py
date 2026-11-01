@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -90,10 +91,22 @@ def _cached_prompt_tokens(usage) -> int:
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
 
-def _anthropic_input_tokens(usage) -> int:
+def _cache_creation_prompt_tokens(usage) -> Optional[int]:
+    details = getattr(usage, "prompt_tokens_details", None)
+    return UsageProcessor.cache_write_tokens(
+        getattr(details, "cache_write_tokens", None),
+        getattr(usage, "prompt_tokens", 0) or 0,
+        _cached_prompt_tokens(usage),
+    )
+
+
+def _anthropic_input_tokens(usage, *, include_cache_creation: bool = True) -> int:
     prompt = getattr(usage, "prompt_tokens", 0) or 0
     cached = _cached_prompt_tokens(usage)
-    if cached > prompt:
+    written = (
+        (_cache_creation_prompt_tokens(usage) or 0) if include_cache_creation else 0
+    )
+    if cached + written > prompt:
         # Upstream telemetry bug: cached cannot exceed the prompt it caches.
         # Clamping silently here would hide the discrepancy from billing
         # dashboards, so make it visible at WARNING level.
@@ -104,7 +117,7 @@ def _anthropic_input_tokens(usage) -> int:
             cached,
             prompt,
         )
-    return max(prompt - cached, 0)
+    return max(prompt - cached - written, 0)
 
 
 def _anthropic_usage_from_openai(
@@ -113,6 +126,7 @@ def _anthropic_usage_from_openai(
     include_input: bool,
     include_output: bool,
     force_zero_output: bool = False,
+    include_cache_creation: bool = True,
 ) -> AnthropicUsage:
     if usage is None:
         return AnthropicUsage(
@@ -123,9 +137,14 @@ def _anthropic_usage_from_openai(
     usage_fields: dict[str, int] = {}
     cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
-        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+        usage_fields["input_tokens"] = _anthropic_input_tokens(
+            usage, include_cache_creation=include_cache_creation
+        )
         if cached_tokens:
             usage_fields["cache_read_input_tokens"] = cached_tokens
+        written_tokens = _cache_creation_prompt_tokens(usage)
+        if include_cache_creation and written_tokens is not None:
+            usage_fields["cache_creation_input_tokens"] = written_tokens
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -894,6 +913,9 @@ class AnthropicServing:
                         include_input=True,
                         include_output=True,
                         force_zero_output=True,
+                        # Intermediate write counts can grow or become
+                        # unknown. Publish only a consistent terminal snapshot.
+                        include_cache_creation=False,
                     ),
                 ),
             )
@@ -1142,7 +1164,10 @@ class AnthropicServing:
             if chunk.usage is not None:
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
-                    include_input=False,
+                    # A measured cache write can grow after message_start.
+                    # Update the complete input snapshot only when measured.
+                    include_input=_cache_creation_prompt_tokens(chunk.usage)
+                    is not None,
                     include_output=True,
                 )
 
@@ -1484,6 +1509,12 @@ class AnthropicServing:
                 # prompt_ids is a string (multimodal case) — tokenize it
                 tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
                 input_tokens = len(tokenizer.encode(processed.prompt_ids))
+
+            # Reuse generation's public input boundary, excluding any
+            # model-owned assistant generation stub from the reported count.
+            input_tokens = self.openai_serving_chat._reported_prompt_tokens(
+                {"prompt_tokens": input_tokens}
+            )
 
             return JSONResponse(
                 content=AnthropicCountTokensResponse(

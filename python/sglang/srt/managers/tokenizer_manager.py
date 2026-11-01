@@ -1667,6 +1667,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                cache_write_reporting_suffix_tokens=(
+                    obj._cache_write_reporting_suffix_tokens
+                ),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2700,11 +2703,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                # Keep physical request stats for metrics; only API metadata
+                # uses the server-selected public input window.
+                reporting_suffix = getattr(
+                    state.obj, "_cache_write_reporting_suffix_tokens", 0
+                )
+                reported_cached_tokens = min(
+                    request_stats.cached_tokens,
+                    max(0, request_stats.prompt_tokens - reporting_suffix),
+                )
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": request_stats.cached_tokens,
+                        "cached_tokens": reported_cached_tokens,
                     }
                 )
                 if (
@@ -2722,7 +2734,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
                         prefill_spans
                     )
-                meta_info["cached_tokens_details"] = request_stats.cached_tokens_details
+                # Unknown accounting must not look like a measured zero.
+                cache_write_tokens = recv_obj.cache_write_tokens
+                if cache_write_tokens is not None and cache_write_tokens[i] is not None:
+                    meta_info["cache_write_tokens"] = cache_write_tokens[i]
+                # A clipped total has no trustworthy physical-tier split.
+                meta_info["cached_tokens_details"] = (
+                    request_stats.cached_tokens_details
+                    if reported_cached_tokens == request_stats.cached_tokens
+                    else None
+                )
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,

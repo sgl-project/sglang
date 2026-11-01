@@ -205,6 +205,7 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             request_stats=_extract_field_by_index(output, "request_stats", i),
+            cache_write_tokens=_extract_field_by_index(output, "cache_write_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -320,6 +321,7 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             request_stats=_extract_field_by_index(output, "request_stats", i),
+            cache_write_tokens=_extract_field_by_index(output, "cache_write_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),

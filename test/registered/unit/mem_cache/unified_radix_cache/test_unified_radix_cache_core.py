@@ -2020,7 +2020,10 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         indices = torch.tensor([4, 5])
         for names in (("swa", "full", "mamba"), ("mamba", "swa", "full")):
             cache._components_tuple = tuple(getattr(order, name) for name in names)
-            for req in (SimpleNamespace(rid="first"), SimpleNamespace(rid="second")):
+            for req in (
+                SimpleNamespace(rid="first", origin_input_ids=array("q", [1, 2])),
+                SimpleNamespace(rid="second", origin_input_ids=array("q", [1, 2])),
+            ):
                 with self.subTest(components=names, req=req.rid):
                     order.reset_mock()
                     params = MatchPrefixParams(
