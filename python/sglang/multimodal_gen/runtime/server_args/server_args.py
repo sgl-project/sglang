@@ -4216,7 +4216,13 @@ class ServerArgs(DisaggServerArgsMixin):
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
         if current_platform.is_rocm():
-            default_backend = AttentionBackendEnum.AITER.name.lower()
+            # AITER's CK attention kernels are built for CDNA / gfx1250; Radeon
+            # (RDNA) GPUs fail with "invalid argument for fmha_fwd".
+            arch = current_platform.get_gcn_arch_name()
+            if arch.startswith(("gfx9", "gfx125")):
+                default_backend = AttentionBackendEnum.AITER.name.lower()
+            else:
+                default_backend = AttentionBackendEnum.TORCH_SDPA.name.lower()
             self.attention_backend = default_backend
             logger.info(
                 "Attention backend not specified. Using '%s' by default on ROCm "
