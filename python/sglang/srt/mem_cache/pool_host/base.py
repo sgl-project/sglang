@@ -135,12 +135,19 @@ def host_memory_budget_bytes(
     can fall back to checking host availability when discovery fails.
 
     Inside host_memory_budget_scope, requested_bytes is booked against the
-    snapshot when it fits; the allowance before booking is returned.
+    snapshot when it fits; the allowance before booking is returned. It never
+    exceeds what the host has free now, so pinned memory that books nothing
+    still counts.
     """
-    available = _host_memory_budget.get()
-    if available is not None:
+    budget = _host_memory_budget.get()
+    if budget is not None:
+        free_now = (
+            available_host_memory_bytes(allow_cgroup_fallback=True)
+            - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
+        available = min(budget, free_now)
         if requested_bytes <= available:
-            _host_memory_budget.set(available - requested_bytes)
+            _host_memory_budget.set(budget - requested_bytes)
         return available
 
     free = (
