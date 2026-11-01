@@ -46,6 +46,7 @@ from sglang.srt.lora.utils import (
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.model_executor.cuda_graph_config import decode_capture_max_bs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -1234,6 +1235,12 @@ def init_lora_cuda_graph_moe_buffers(
             max_bs,
             max(1, max_running_requests // get_parallel().attn_dp_size),
         )
+    # The padded decode top bucket can exceed both caps above.
+    max_bs = decode_capture_max_bs(
+        max_bs,
+        tp_size=get_parallel().tp_size,
+        enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+    )
     # With spec on, the decode graph captures TARGET_VERIFY batches of
     # num_draft_tokens per request, and the buffers below are per-token, so
     # they must be sized in tokens rather than requests.

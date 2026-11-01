@@ -65,7 +65,9 @@ def _make_chain_lists(num_steps: int, bs: int):
     return score_list, token_list, parents_list
 
 
-def _make_worker(num_steps: int, num_draft_tokens: int):
+def _make_worker(
+    num_steps: int, num_draft_tokens: int, tp_size: int = 1, tbo: bool = False
+):
     worker = object.__new__(EagleDraftWorker)
     worker.topk = 1
     worker.device = DEVICE
@@ -74,6 +76,8 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     worker.server_args = _fake_server_args(
         cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=8)),
         max_running_requests=8,
+        tp_size=tp_size,
+        enable_two_batch_overlap=tbo,
     )
     return worker
 
@@ -130,6 +134,31 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_chain_capacity_covers_padded_batches(self):
+        # Graph buckets and eager DP padding round the batch up to the TP
+        # alignment (x2 under TBO); the fast path must own a constant row for
+        # every padded request.
+        for tbo, max_requests, capacity in [
+            (False, 15, 16),
+            (False, 12, 12),
+            (True, 12, 16),
+        ]:
+            with self.subTest(tbo=tbo, max_requests=max_requests):
+                worker = _make_worker(
+                    num_steps=3, num_draft_tokens=4, tp_size=4, tbo=tbo
+                )
+                with get_context().override_server_args(
+                    max_running_requests=max_requests
+                ):
+                    worker._rebuild_topk1_chain_buffers()
+                self.assertEqual(worker._topk1_parents_prealloc.shape, (capacity, 3))
+                self.assertEqual(
+                    worker._topk1_score_indices_prealloc.shape, (capacity, 3)
+                )
+                self.assertEqual(
+                    worker._topk1_parents_prealloc[capacity - 1].tolist(), [-1, 0, 1]
+                )
 
     def test_idle_verify_input_keeps_required_layout_tensors(self):
         verify_input = EagleVerifyInput.create_idle_input(
