@@ -104,9 +104,7 @@ class TestDeepSeekV4FP8WoA(CustomTestCase):
             for G in (2, 16):
                 with self.subTest(T=T, G=G):
                     D = 4096
-                    x = self._strided_tgd(
-                        T, G, D, torch.bfloat16, torch.device("cuda")
-                    )
+                    x = self._strided_tgd(T, G, D, torch.bfloat16, torch.device("cuda"))
                     angles = torch.randn(128, 32, device="cuda")
                     freqs = torch.polar(torch.ones_like(angles), angles)
                     positions = torch.randint(128, (T,), device="cuda")
