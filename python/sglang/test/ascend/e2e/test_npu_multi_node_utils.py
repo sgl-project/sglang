@@ -834,12 +834,19 @@ def launch_router(model_config):
         raise RuntimeError(f"Failed to start router process: {e}")
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def wait_server_ready(url, timeout=LOCAL_TIMEOUT, deep_url=None):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        deep_url (str): Optional URL that must return 200 with a JSON body
+            before the server counts as ready. /health alone can be answered
+            200 by something else in the cluster before the sglang process
+            even starts listening (run 40705231433 saw an instant 200 while
+            the weights were still loading), which releases the benchmark
+            far too early; a second endpoint returning real JSON gates on
+            the actual sglang HTTP server.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -848,10 +855,22 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     start_time = time.perf_counter()
     check_interval = 10
 
+    def _deep_check_ok() -> bool:
+        if deep_url is None:
+            return True
+        try:
+            resp = requests.get(deep_url, timeout=30)
+            if resp.status_code == 200:
+                resp.json()
+                return True
+        except Exception:
+            pass
+        return False
+
     while True:
         try:
             response = requests.get(url, timeout=30)
-            if response.status_code == 200:
+            if response.status_code == 200 and _deep_check_ok():
                 logger.info(f"Server {url} is ready!")
                 return
             else:
