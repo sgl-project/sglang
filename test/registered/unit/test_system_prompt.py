@@ -494,6 +494,7 @@ class TestStaticMambaSlotBudget(CustomTestCase):
     def _adder(self, static: bool, lazy: bool = False):
         adder = SimpleNamespace(
             _mamba_slot_cost=0,
+            _system_prompt_budget=True,
             _static_mamba_slots=static,
             tree_cache=SimpleNamespace(
                 req_to_token_pool=SimpleNamespace(
@@ -594,15 +595,43 @@ class TestStaticMambaSlotBudget(CustomTestCase):
             PrefillAdder._mamba_match_headroom(self._adder(static=True, lazy=True)), 2
         )
         no_mamba = SimpleNamespace(
-            _mamba_slot_cost=0, _static_mamba_slots=False, tree_cache=None
+            _mamba_slot_cost=0,
+            _system_prompt_budget=True,
+            _static_mamba_slots=False,
+            tree_cache=None,
         )
         self.assertEqual(PrefillAdder._mamba_match_headroom(no_mamba), 0)
         shared = SimpleNamespace(
             _mamba_slot_cost=64,
+            _system_prompt_budget=True,
             _static_mamba_slots=False,
             tree_cache=self._adder(static=True).tree_cache,
         )
         self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 1)
+
+    def test_feature_off_disables_budget_and_precheck(self):
+        # H4 gating: without --system-prompt the slot budget, the headroom
+        # pre-check, and the warm/cold charging must all be inert — the
+        # unpatched baseline has none of them (it admitted and evicted on
+        # demand). Otherwise every hybrid-mamba deployment pays a cold-factor
+        # admission throttle it never opted into.
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        adder = self._adder(static=True)
+        adder._system_prompt_budget = False
+        adder._static_mamba_slots = False
+        self.assertEqual(
+            PrefillAdder._mamba_slot_budget_for_req(adder, self._req(64, 0, None)), 0
+        )
+        self.assertEqual(PrefillAdder._mamba_match_headroom(adder), 0)
+        # Even the shared pool's pre-check headroom is 0 with the flag off.
+        shared = SimpleNamespace(
+            _mamba_slot_cost=64,
+            _system_prompt_budget=False,
+            _static_mamba_slots=False,
+            tree_cache=adder.tree_cache,
+        )
+        self.assertEqual(PrefillAdder._mamba_match_headroom(shared), 0)
 
 
 class TestMambaGapBudget(CustomTestCase):
@@ -616,6 +645,7 @@ class TestMambaGapBudget(CustomTestCase):
     def _adder(self, lazy: bool = False):
         return SimpleNamespace(
             _mamba_slot_cost=64,
+            _system_prompt_budget=True,
             _static_mamba_slots=False,
             tree_cache=SimpleNamespace(
                 req_to_token_pool=SimpleNamespace(
@@ -673,9 +703,31 @@ class TestMambaGapBudget(CustomTestCase):
 
     def test_zero_without_shared_pool(self):
         adder = SimpleNamespace(
-            _mamba_slot_cost=0, _static_mamba_slots=True, tree_cache=None
+            _mamba_slot_cost=0,
+            _system_prompt_budget=True,
+            _static_mamba_slots=True,
+            tree_cache=None,
         )
         self.assertEqual(self._budget(adder, self._req(None, 0, None)), 0)
+
+    def test_feature_off_is_exact_baseline(self):
+        # H4 gating: with the flag off the gap budget must reproduce the
+        # unpatched baseline — flat cost for a slot-less request, 0 for one
+        # that already holds a slot (no fresh_cow extension, no cold factor).
+        adder = self._adder()
+        adder._system_prompt_budget = False
+        self.assertEqual(self._budget(adder, self._req(64, 0, None)), 64)
+        self.assertEqual(self._budget(adder, self._req(None, 0, None)), 64)
+        # Held slot: baseline guard returns 0 even with fresh_cow set.
+        self.assertEqual(
+            self._budget(adder, self._req(64, 0, None, holds_mamba=True)), 0
+        )
+        self.assertEqual(
+            self._budget(
+                adder, self._req(64, 0, None, holds_mamba=True), fresh_cow=True
+            ),
+            0,
+        )
 
 
 class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):

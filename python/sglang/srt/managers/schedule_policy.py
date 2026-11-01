@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_server_args,
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -689,6 +690,15 @@ class PrefillAdder:
 
         self.is_hybrid_swa = self.token_to_kv_pool_allocator.has_window_pool
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        # Fixed system prompt (--system-prompt): the slot budget, its warm/cold
+        # charging, and the waiting-queue headroom pre-check exist to protect
+        # the warm-steady-state pool sizing THIS feature creates. Without the
+        # flag every request is charged the full cold factor and the budget
+        # only throttles admission below the unpatched baseline (and can
+        # livelock once evictable slots accumulate), so the whole budget
+        # machinery is feature-gated: flag off -> exact baseline behavior.
+        self._system_prompt_budget = bool(get_server_args().system_prompt)
+
         # Static (non-shared) hybrid mamba pool: no shared-gap token coupling
         # (memory_budget.state_slot_cost == 0), but its slots are still
         # exhaustible by ping-pong allocations. Track a slot-only admission
@@ -698,8 +708,11 @@ class PrefillAdder:
         # SHARED pool (state_slot_cost > 0) is budgeted by the memory_budget
         # itself (rem_state_slots); the static pool needs this adder-level
         # count because its slots couple to no token budget at all.
+        # Only under --system-prompt (see above).
         self._static_mamba_slots = (
-            self.memory_budget.state_slot_cost == 0 and self.is_hybrid_ssm_cache
+            self.memory_budget.state_slot_cost == 0
+            and self.is_hybrid_ssm_cache
+            and self._system_prompt_budget
         )
         self.rem_mamba_slots = None
         if self._static_mamba_slots:
@@ -861,6 +874,14 @@ class PrefillAdder:
         cost = self.memory_budget.state_slot_cost
         if not cost:
             return 0
+        if not self._system_prompt_budget:
+            # Feature off: exact baseline — flat cost, plain holds_mamba guard.
+            # The warm/cold factor and the fresh_cow extension only make sense
+            # for the fixed-system-prompt pool sizing.
+            slots = int(not req.kv.holds_mamba)
+            if include_host_hit:
+                slots += req.mamba_host_hit_length
+            return slots * cost
         slots = int(fresh_cow or not req.kv.holds_mamba)
         host_slots = req.mamba_host_hit_length if include_host_hit else 0
         if slots == 0:
@@ -942,8 +963,11 @@ class PrefillAdder:
         have answered NO_TOKEN one request later. The scheduler calls this
         before pulling each new request: stop once the remaining slot budget
         can't cover a worst-case (cold) request. 0 disables the pre-check
-        (no mamba pool).
+        (no mamba pool, or --system-prompt off: the pre-check is part of the
+        feature's budget machinery and the unpatched baseline has none).
         """
+        if not self._system_prompt_budget:
+            return 0
         if not (self.memory_budget.state_slot_cost or self._static_mamba_slots):
             return 0
         if self.memory_budget.state_slot_cost:
