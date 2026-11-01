@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=135, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=91, stage="base-a", runner_config="1-gpu-small")
 # backend-specific: SAIL DFLASH verification kernels, decode graphs, and sampling masks.
 register_ppu_ci(est_time=450, suite="stage-a-test-1-gpu-ppu")
 

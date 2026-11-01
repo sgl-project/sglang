@@ -15,6 +15,7 @@ Gotchas vs the dense ``SanaWMDenoisingStage`` (one-shot bidirectional):
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -77,6 +78,7 @@ def self_forcing_denoise_chunk(
     target_dtype: torch.dtype,
     device,
     forward_ctx=None,
+    on_step: Callable[[], None] | None = None,
 ) -> list:
     """Self-forcing denoise of ONE chunk + the clean t=0 KV pass; returns the chunk's updated per-block KV cache.
 
@@ -92,7 +94,15 @@ def self_forcing_denoise_chunk(
     ctx = forward_ctx if forward_ctx is not None else (lambda _ts: nullcontext())
 
     scheduler.set_timesteps(sigmas=sigmas, device=device)
-    for t in scheduler.timesteps:
+    # the per-token update reads no step index; 0 skips the index lookup sync
+    scheduler.set_begin_index(0)
+    # only the batch path's forward context reads timestep values: copy them once
+    timestep_values = (
+        scheduler.timesteps.cpu().tolist()
+        if forward_ctx is not None
+        else [0] * len(scheduler.timesteps)
+    )
+    for step_index, t in enumerate(scheduler.timesteps):
         chunk_lat = get_chunk()
         B, C = chunk_lat.shape[0], chunk_lat.shape[1]
         lat_in = torch.cat([chunk_lat, chunk_lat], dim=0) if do_cfg else chunk_lat
@@ -102,7 +112,7 @@ def self_forcing_denoise_chunk(
         ts_in = torch.cat([ts_tensor, ts_tensor], dim=0) if do_cfg else ts_tensor
         model_ts = ts_in[:, :1, :, 0, 0]  # (B|2B, chunk_frames)
 
-        with ctx(int(t.item()) if t.ndim == 0 else 0):
+        with ctx(int(timestep_values[step_index]) if t.ndim == 0 else 0):
             noise_pred, _ = transformer.forward_long(
                 hidden_states=lat_in.to(target_dtype),
                 encoder_hidden_states=embeds,
@@ -128,6 +138,8 @@ def self_forcing_denoise_chunk(
             return_dict=False,
         )[0]
         set_chunk(denoised.transpose(1, 2).reshape(chunk_lat.shape))
+        if on_step is not None:
+            on_step()
 
     # Clean pass (t=0) to write this chunk's KV for the next chunk.
     chunk_lat = get_chunk()
@@ -610,6 +622,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                     target_dtype=target_dtype,
                     device=device,
                     forward_ctx=_forward_ctx,
+                    on_step=lambda: self.check_cancelled(batch),
                 )
 
         log_sana_wm_tensor_stats("stream.output_latents", latents)

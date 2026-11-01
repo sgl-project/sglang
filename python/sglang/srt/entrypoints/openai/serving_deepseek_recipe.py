@@ -4,10 +4,12 @@ request semantics."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    ADAPTER_OUTPUT_PARSERS,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -21,6 +23,7 @@ from sglang.srt.parser.deepseek_recipe_output import (
     DeepSeekRecipeOutputParser,
     RecipeToolCall,
     RecipeToolCallDelta,
+    parse_output_text,
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
@@ -35,15 +38,12 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
+        Tool,
     )
 
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
     "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
-}
-PARSERS = {
-    "dsv4": ("deepseek-v4", "deepseekv4"),
-    "dsv41": ("deepseek-v41", "deepseekv41"),
 }
 JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 
@@ -68,7 +68,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             chat_encoding_spec, tokenizer
         )
         raw = (DEFAULT_EFFORT_ENVS[chat_encoding_spec].get() or "").strip()
-        self._default_effort = int(raw) if raw.isdigit() else raw or None
+        self._default_effort = _numeric_effort(raw) if raw else None
         # Encoded at boot, so a bad server default fails startup, not requests.
         defaults = default_chat_template_kwargs or {}
         self._encode(
@@ -77,7 +77,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         )
         # recipe parses the output once a DeepSeek parser is configured; other
         # parsers keep the text path.
-        reasoning_name, tool_name = PARSERS[chat_encoding_spec]
+        reasoning_name, tool_name = ADAPTER_OUTPUT_PARSERS[chat_encoding_spec]
         self._token_output = (
             reasoning_parser == reasoning_name or tool_call_parser == tool_name
         )
@@ -108,7 +108,7 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> list[int]:
         # The wire request: the handler's message dumps carry None for unset fields.
         wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
-        wire_messages = wire["messages"]
+        wire_messages = _null_content_as_empty(wire["messages"])
         continue_final = request.continue_final_message
         task_prefix = None
         last = _trailing_assistant_turn(wire_messages)
@@ -119,6 +119,8 @@ class DeepSeekRecipeChatEncodingAdapter:
                 # A task renders its own tail, so the prefix follows it.
                 task_prefix = wire_messages.pop()["content"]
                 continue_final = False
+            else:
+                wire_messages[-1] = last
         body = {
             "messages": wire_messages,
             "thinking": thinking,
@@ -158,6 +160,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         task: Optional[str] = None,
         image_urls: Optional[list[str]] = None,
     ) -> list[int]:
+        effort = _numeric_effort(effort)
         if effort is None or effort == "none":
             effort = self._default_effort
         budget = None
@@ -293,16 +296,44 @@ class DeepSeekRecipeChatEncodingAdapter:
             )
         )
 
+    def separate_reasoning_text(self, text: str) -> tuple[str, str]:
+        delta = parse_output_text(self.deepseek_recipe, text, parse_tool_calls=False)
+        return delta.reasoning, delta.content
+
+    def parse_function_call_text(
+        self, text: str, tools: list[Tool]
+    ) -> tuple[str, list[ToolCallItem]]:
+        if not tools:
+            return text, []  # as the text parsers: nothing to call
+        delta = parse_output_text(
+            self.deepseek_recipe, text, parse_tool_calls=True, thinking=False
+        )
+        # As in chat, a call to a tool outside `tools` is returned, at index -1.
+        indices = {tool.function.name: i for i, tool in enumerate(tools)}
+        calls = [
+            ToolCallItem(
+                tool_index=indices.get(call.name, -1),
+                name=call.name,
+                parameters=call.arguments,
+            )
+            for call in whole_tool_calls(delta)
+        ]
+        return delta.content, calls
+
     def _new_output_parser(
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
         continued = (
             _trailing_assistant_turn(
-                [
-                    message.model_dump(exclude_unset=True, by_alias=True, mode="json")
-                    for message in request.messages[-1:]
-                ]
+                _null_content_as_empty(
+                    [
+                        message.model_dump(
+                            exclude_unset=True, by_alias=True, mode="json"
+                        )
+                        for message in request.messages[-1:]
+                    ]
+                )
             )
             if request.continue_final_message
             else None
@@ -367,15 +398,33 @@ class DeepSeekRecipeResponsesStream:
         return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
 
 
+def _null_content_as_empty(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """As `_process_messages` renders them: a null content is ""."""
+    return [
+        message if message.get("content") is not None else {**message, "content": ""}
+        for message in messages
+    ]
+
+
 def _trailing_assistant_turn(
     messages: list[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
     """The trailing text turn SGLang continues or, without continue_final_message,
-    re-sends as a user turn (as `_handle_last_assistant_message`)."""
+    re-sends as a user turn (as `_handle_last_assistant_message`), without the
+    tool calls SGLang discards."""
     last = messages[-1] if messages else None
     if last and last["role"] == "assistant" and isinstance(last.get("content"), str):
-        return last
+        return {key: value for key, value in last.items() if key != "tool_calls"}
     return None
+
+
+def _numeric_effort(
+    effort: Union[str, int, float, None],
+) -> Union[str, int, float, None]:
+    """A numeric string effort ("30", "0.3") as the number it spells."""
+    if isinstance(effort, str) and re.fullmatch(r"\d+(\.\d+)?", effort.strip()):
+        return float(effort) if "." in effort else int(effort)
+    return effort
 
 
 def _stop_strings(stop: Union[str, list[str], None]) -> list[str]:

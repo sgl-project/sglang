@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -15,8 +16,9 @@ import sglang.kernels.selector as sel
 from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
@@ -167,6 +169,101 @@ def test_capabilities_or_semantics():
     assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
 
 
+class TestCakeSoftmaxCapability(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.kernels.cake_kernels import sampling as cake_sampling
+
+        self.cake_sampling = cake_sampling
+        self.cake_sampling._device_supported.cache_clear()
+
+    def tearDown(self):
+        self.cake_sampling._device_supported.cache_clear()
+        super().tearDown()
+
+    @staticmethod
+    def _logits(shape, dtype):
+        return SimpleNamespace(
+            is_cuda=True,
+            dtype=dtype,
+            ndim=len(shape),
+            shape=shape,
+            is_contiguous=lambda: True,
+            device=SimpleNamespace(index=0),
+        )
+
+    def test_sampling_softmax_uses_cake_for_qualified_sm100_inputs(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        logits = self._logits((1, 131072), torch.float32)
+        cake_result = object()
+        fallback_result = object()
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch.object(self.cake_sampling, "find_spec", return_value=object()),
+            patch.object(torch.version, "cuda", "13.0"),
+            patch.object(sampling_ops, "cake_softmax", return_value=cake_result),
+            patch.object(torch, "softmax", return_value=fallback_result) as fallback,
+        ):
+            result = sampling_ops.softmax(logits)
+
+        self.assertIs(result, cake_result)
+        fallback.assert_not_called()
+
+    def test_sampling_softmax_falls_back_outside_qualified_domain(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        for arch, shape in (
+            ((10, 2), (1, 131072)),
+            ((10, 0), (65, 131072)),
+        ):
+            with self.subTest(arch=arch, shape=shape):
+                self.cake_sampling._device_supported.cache_clear()
+                logits = self._logits(shape, torch.float32)
+                cake_result = object()
+                fallback_result = object()
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=arch),
+                    patch.object(
+                        self.cake_sampling, "find_spec", return_value=object()
+                    ),
+                    patch.object(torch.version, "cuda", "13.0"),
+                    patch.object(
+                        sampling_ops, "cake_softmax", return_value=cake_result
+                    ) as cake,
+                    patch.object(
+                        torch, "softmax", return_value=fallback_result
+                    ) as fallback,
+                ):
+                    result = sampling_ops.softmax(logits)
+
+                self.assertIs(result, fallback_result)
+                cake.assert_not_called()
+                fallback.assert_called_once_with(logits, dim=-1)
+
+    def test_sampling_softmax_registry_matches_supported_architectures(self):
+        spec = K.select_kernel("sampling.softmax", backend=KernelBackend.CAKE)
+        supported = ((10, 0), (10, 3))
+        unsupported = ((9, 0), (10, 1), (10, 2), (12, 0))
+
+        for arch in supported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertTrue(spec.is_available(platform), arch)
+        for arch in unsupported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertFalse(spec.is_available(platform), arch)
+        self.assertFalse(spec.is_available(_CPU))
+        self.assertFalse(spec.is_available(_HIP))
+
+
 @pytest.mark.parametrize(
     "relative_path",
     (
@@ -249,6 +346,14 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_router_gemv_is_inventoried_for_cuda_and_hip():
+    """CUDA serves FP32 gates and ROCm gfx950 BF16 gates through one Triton GEMV."""
+    spec = K.select_kernel("gemm.router_gemv", backend=KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 def _readme() -> str:
     return (Path(K.__file__).resolve().parent / "README.md").read_text()
 
@@ -283,17 +388,19 @@ def test_operator_and_test_groups_agree():
         assert actual <= groups, actual - groups
 
 
-def test_agent_kernels_register_their_backend():
-    """Agent-generated kernels are listed by backend, so directory and backend must agree."""
-    agent_backends = {
+def test_backend_directories_register_their_backend():
+    """Kernels in a backend directory are listed by backend, so the two must agree."""
+    directory_backends = {
         "sglang.kernels.kda_kernels.": KernelBackend.KDA,
         "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
+        "sglang.kernels.plugin_kernels.": KernelBackend.PLUGIN,
     }
     for spec in K.registry.all_specs():
         expected = next(
-            (b for p, b in agent_backends.items() if spec.target.startswith(p)), None
+            (b for p, b in directory_backends.items() if spec.target.startswith(p)),
+            None,
         )
-        if expected is not None or spec.backend in agent_backends.values():
+        if expected is not None or spec.backend in directory_backends.values():
             assert spec.backend is expected, spec
 
 

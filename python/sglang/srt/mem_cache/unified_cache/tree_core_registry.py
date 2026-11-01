@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
@@ -40,15 +41,16 @@ _RUST_TREE_CORE_MANIFEST = (
 )
 logger = logging.getLogger(__name__)
 
+# The slots the native core stores, and the family it keeps each by.
+NATIVE_SLOTS = {"FULL": TREE_TOKEN, "SWA": TREE_WINDOW, "MAMBA": TREE_STATE}
+
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
-    if params.tree_components is not None and set(params.tree_components) - {
-        ComponentType.FULL,
-        ComponentType.SWA,
-        ComponentType.MAMBA,
-    }:
+    if params.tree_slots is not None and any(
+        NATIVE_SLOTS.get(slot.component) != slot.family for slot in params.tree_slots
+    ):
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"

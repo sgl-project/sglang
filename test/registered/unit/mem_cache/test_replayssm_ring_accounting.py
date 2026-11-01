@@ -21,11 +21,12 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: F401
     _pp_local_per_request_bytes,
+    replayssm_ring_memory_charge,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
 # 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
@@ -81,6 +82,29 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         self.assertEqual(
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
             3200 * len(LAYERS),
+        )
+
+    def test_kda_host_only_ring_follows_requests(self):
+        per_req = _kda_params().replayssm_ring_bytes_per_req(record_len=RL)
+        # A slot-scoped ring charges every mamba slot.
+        self.assertEqual(
+            replayssm_ring_memory_charge(
+                per_req,
+                request_scoped=False,
+                max_running_requests=96,
+                attn_dp_size=1,
+            ),
+            (0, per_req),
+        )
+        # Host-only: 96 live requests plus the pool padding slot.
+        self.assertEqual(
+            replayssm_ring_memory_charge(
+                per_req,
+                request_scoped=True,
+                max_running_requests=96,
+                attn_dp_size=1,
+            ),
+            (per_req * 97, 0),
         )
 
     def test_zero_len_ring(self):
