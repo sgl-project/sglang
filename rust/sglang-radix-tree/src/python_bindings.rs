@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -75,6 +75,12 @@ fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
             "unknown component type: {other}"
         ))),
     }
+}
+
+/// Map a tree slot's family name onto the Rust enum.
+fn parse_family(family: &str) -> PyResult<Family> {
+    Family::parse(family)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown tree slot family: {family}")))
 }
 
 /// Map the Python EvictLayer IntFlag value onto the Rust enum.
@@ -440,6 +446,7 @@ pub struct TreeCoreInitParamsBinding {
     pub dynamo_kv_event_format: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
+    pub mamba_host_only_checkpoint: bool,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -463,6 +470,7 @@ impl TreeCoreInitParamsBinding {
             dynamo_kv_event_format: self.dynamo_kv_event_format,
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
+            mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
         })
     }
 }
@@ -470,7 +478,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -487,6 +495,7 @@ impl TreeCoreInitParamsBinding {
         tlru_tail_budget: usize,
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
+        mamba_host_only_checkpoint: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -504,6 +513,7 @@ impl TreeCoreInitParamsBinding {
             dynamo_kv_event_format,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
+            mamba_host_only_checkpoint,
         }
     }
 }
@@ -546,6 +556,8 @@ pub struct InsertParamsBinding {
     pub cache_salt: Option<String>,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
+    pub mamba_host_value: Option<Py<PyAny>>,
+    pub allow_missing_mamba: bool,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
@@ -557,7 +569,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -573,6 +585,8 @@ impl InsertParamsBinding {
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
         rotation_base: Option<i64>,
+        mamba_host_value: Option<Py<PyAny>>,
+        allow_missing_mamba: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -582,6 +596,8 @@ impl InsertParamsBinding {
             cache_salt,
             session_id,
             mamba_value,
+            mamba_host_value,
+            allow_missing_mamba,
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
@@ -973,20 +989,20 @@ struct TreeCoreBinding<Core> {
 macro_rules! tree_core_methods {
     ($core:ident) => {
         impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                let component_types = component_types
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
+                let slots = slots
                     .into_iter()
-                    .map(parse_component_type)
+                    .map(|(slot, family)| Ok((parse_component_type(slot)?, parse_family(&family)?)))
                     .collect::<PyResult<Vec<_>>>()?;
                 let params = init_params.to_cache_init_params()?;
-                $core::<K>::validate_init_params(&params, &component_types)
+                $core::<K>::validate_init_params(&params, &slots)
                     .map_err(PyValueError::new_err)?;
                 let device = params.device;
                 let page_size = params.page_size;
                 Ok(TreeCoreBinding {
-                    core: Mutex::new($core::new(params, component_types)),
+                    core: Mutex::new($core::new_with_slots(params, slots)),
                     device,
                     page_size,
                 })
@@ -1134,6 +1150,12 @@ macro_rules! tree_core_methods {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
                     None => None,
                 };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
+                    None => None,
+                };
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
@@ -1144,6 +1166,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1172,6 +1196,12 @@ macro_rules! tree_core_methods {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
                     None => None,
                 };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
+                    None => None,
+                };
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
@@ -1182,6 +1212,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -2739,13 +2771,13 @@ macro_rules! tree_core_binding {
 
         #[pymethods]
         impl $name {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
             #[new]
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, component_types)?,
+                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, slots)?,
                     })
                 })
             }

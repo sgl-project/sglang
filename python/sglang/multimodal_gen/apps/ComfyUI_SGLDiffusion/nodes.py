@@ -1063,6 +1063,44 @@ class SGLDiffusionServerUnsetLora:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
 
 
+class SGLDWorkerStatus:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+            },
+            "optional": {
+                # Connect the sampler output when the status should be shown
+                # after that sampler. Leaving it disconnected lets users
+                # inspect loader/worker state before starting generation.
+                "after_sampling": (
+                    "LATENT",
+                    {"tooltip": "The sampler output; the status is read after it."},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = "SGLDiffusion"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # NaN never equals itself, so ComfyUI does not serve a cached status.
+        return float("nan")
+
+    def show(self, model, after_sampling=None):
+        try:
+            text = SGLDiffusionGenerator.shared().status_text()
+        except Exception as e:
+            text = f"SGLD Worker Status: failed to collect ({e!r})"
+        print(text)
+        return {"ui": {"text": (text,)}, "result": (text,)}
+
+
 # Register nodes
 NODE_CLASS_MAPPINGS = {
     "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
@@ -1076,6 +1114,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDNativeModelLoader": SGLDNativeModelLoader,
     "SGLDOptions": SGLDOptions,
     "SGLDLoraLoader": SGLDLoraLoader,
+    "SGLDWorkerStatus": SGLDWorkerStatus,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1089,4 +1128,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDNativeModelLoader": "SGLDiffusion Native Model Loader",
     "SGLDOptions": "SGLDiffusion Options",
     "SGLDLoraLoader": "SGLDiffusion LoRA Loader",
+    "SGLDWorkerStatus": "SGLDiffusion Worker Status",
 }

@@ -71,9 +71,6 @@ elif _is_musa:
     _musa_apply_gguf_moe_weights = resolve_gguf_moe_weights("musa")
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
-else:
-    if not _is_hip:
-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +91,10 @@ class GGUFConfig(QuantizationConfig):
 
     def __init__(self, modules_to_not_convert: list[str] | None = None) -> None:
         super().__init__()
-        if _is_hip:
-            warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
+        if _is_hip or not (_is_cuda or _is_musa or _is_npu):
+            warnings.warn(
+                f"Only CUDA, MUSA and NPU support GGUF quantization currently."
+            )
         self.modules_to_not_convert = modules_to_not_convert or []
 
     def __repr__(self) -> str:
