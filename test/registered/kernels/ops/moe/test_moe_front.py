@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -83,6 +84,103 @@ class TestMoeFront(CustomTestCase):
                 merged[:, NUM_EXPERTS:].to(torch.bfloat16),
             )
         )
+
+    def test_kimi_front_applies_placement_and_batch_padding(self):
+        from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+        from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.srt.models.kimi_k3 import KimiK3MoE
+        from sglang.srt.runtime_context import get_context, get_exec, get_resources
+
+        torch.manual_seed(42)
+        tokens, latent = 4, 128
+        hidden = (
+            torch.randn(tokens, _HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / 32
+        )
+        weight = (
+            torch.randn(
+                NUM_EXPERTS + latent, _HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+            )
+            / 32
+        )
+        bias = torch.randn(NUM_EXPERTS, device="cuda")
+        physical_to_logical = torch.randperm(NUM_EXPERTS, device="cuda").unsqueeze(0)
+        logical_to_physical = physical_to_logical.argsort(dim=-1)
+        with get_context().override_server_args(
+            ep_dispatch_algorithm="static",
+            init_expert_location="permuted.json",
+            moe_a2a_backend="megamoe",
+        ):
+            metadata = ExpertLocationMetadata._init_raw(
+                ep_size=1,
+                physical_to_logical_map=physical_to_logical,
+                logical_to_all_physical_map=logical_to_physical.unsqueeze(-1),
+                moe_ep_rank=0,
+            )
+            previous = get_resources().expert_location_metadata
+            get_resources().expert_location_metadata = metadata
+            try:
+                router = TopK(
+                    top_k=TOPK,
+                    layer_id=0,
+                    renormalize=True,
+                    use_grouped_topk=True,
+                    num_expert_group=1,
+                    topk_group=1,
+                    correction_bias=bias,
+                    scoring_func="sigmoid",
+                    output_format=TopKOutputFormat.STANDARD,
+                )
+                # Exercise the model method and actual merged GEMM/router with
+                # only the state that method reads; no checkpoint is needed.
+                layer = SimpleNamespace(
+                    _ep_front_eligible=True,
+                    _eligible_for_fused_front=False,
+                    topk=router,
+                    gate=SimpleNamespace(e_score_correction_bias=bias),
+                    _front_w=weight,
+                    moe_hidden_size=latent,
+                    layer_idx=0,
+                )
+                self.assertTrue(KimiK3MoE._routing_contract_ok.func(layer))
+                with get_exec().moe.override(ep_dispatch_algorithm="fake"):
+                    self.assertFalse(KimiK3MoE._routing_contract_ok.func(layer))
+                empty = torch.empty(0, dtype=torch.int32, device="cuda")
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.arange(tokens, device="cuda"),
+                    req_pool_indices=empty,
+                    seq_lens=empty,
+                    out_cache_loc=empty,
+                    seq_lens_sum=0,
+                )
+                batch.num_token_non_padded = torch.tensor(
+                    3, device="cuda", dtype=torch.int32
+                )
+                with forward_context(
+                    ForwardContext(attn_backend=object()), forward_batch=batch
+                ):
+                    actual, routed = KimiK3MoE._ep_front(layer, hidden)
+                weights, logical_ids, ref_routed = fused_front(
+                    hidden, weight, bias, latent
+                )
+                expected = logical_to_physical[0, logical_ids.long()].to(
+                    logical_ids.dtype
+                )
+                expected[3:] = -1
+                torch.testing.assert_close(actual.topk_ids, expected, rtol=0, atol=0)
+                torch.testing.assert_close(actual.topk_weights, weights, rtol=0, atol=0)
+                torch.testing.assert_close(routed, ref_routed, rtol=0, atol=0)
+            finally:
+                get_resources().expert_location_metadata = previous
 
 
 if __name__ == "__main__":
