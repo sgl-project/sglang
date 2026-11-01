@@ -40,8 +40,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
         phase: str,
     ) -> None:
         # q8 prefill consumes the tail columns as ragged ids, like the history
-        # picks. Only over a bfloat16 pool: gathering packed fp8 rows through
-        # kpool tail columns is untested, so that combination keeps the guard.
+        # picks. Only over a bf16 or raw NoPE fp8 pool: gathering packed fp8
+        # rows through KPool tail columns is untested, so that combination keeps
+        # the guard.
         if (
             dsa_impl == "flashmla_sparse_q8"
             and phase == "prefill"
