@@ -100,9 +100,6 @@ class ForwardMode(IntEnum):
     def is_cpu_graph(self):
         return self == ForwardMode.DECODE
 
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
     def is_extend_without_speculative(self):
         return self.is_extend() and not self.is_target_verify()
 
