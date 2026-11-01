@@ -2378,7 +2378,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            # A rid another worker holds: the router forwards this abort to the
+            # scheduler and broadcasts it so the owning worker aborts locally.
+            forward=not abort_all and state is None,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
