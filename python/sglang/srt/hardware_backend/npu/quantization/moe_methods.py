@@ -292,7 +292,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 
     # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
     # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
-    # dispatch stays BF16 because A5 MXFP8 normal dispatch is intranode-only,
+    # dispatch stays BF16 because Ascend 950 MXFP8 normal dispatch is intranode-only,
     # which also preserves multi-node prefill when ``deepep-mode=auto``.
     DISPATCHER_QUANT_CONFIG = {
         "normal_dispatcher_output_dtype": "bf16",
