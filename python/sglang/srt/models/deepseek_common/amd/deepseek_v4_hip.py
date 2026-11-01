@@ -182,9 +182,25 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
+    # Whether the layer can take the fused boundary; fused_boundary_this_step picks
+    # the step's path. The AMD monokernel checks this at attach.
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+
+
+def fused_boundary_this_step(forward_batch) -> bool:
+    """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
+
+    Mega-mHC runs the seam from forward_hc_pre_from_prev instead; running both would
+    apply the same post twice. It replaces the fused boundary on every step, except
+    under the AMD monokernel, where only prefill takes it: the monokernel's kernels
+    follow the fused boundary, so the decode steps it leaves to SGLang keep that path.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
+        return True
+    prefill = forward_batch.forward_mode.is_extend_without_speculative()
+    return get_exec().kernel.enable_amd_monokernel and not prefill
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
