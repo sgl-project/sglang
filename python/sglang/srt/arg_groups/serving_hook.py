@@ -143,6 +143,13 @@ def handle_multimodal(server_args: Any):
         and cfg.mm_preprocess_cache_size_mb < 0
     ):
         raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
+    if cfg.mm_preprocess_cache_dir is not None:
+        if not cfg.mm_preprocess_cache_dir.strip():
+            raise ValueError("mm_preprocess_cache_dir must not be empty")
+        if not cfg.mm_preprocess_cache_size_mb or cfg.mm_preprocess_cache_size_mb <= 0:
+            raise ValueError(
+                "A shared preprocessing cache requires a positive explicit size budget"
+            )
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):
             raise TypeError(

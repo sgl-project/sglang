@@ -105,7 +105,7 @@ def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
 
 def _snapshot_tensor(tensor: torch.Tensor) -> MediaSnapshot:
     snapshot = tensor.detach().to("cpu").contiguous().clone()
-    payload = snapshot.view(torch.uint8).numpy().tobytes()
+    payload = snapshot.reshape(-1).view(torch.uint8).numpy().tobytes()
     digest = _hash_parts(
         b"torch",
         str(snapshot.dtype).encode(),
@@ -218,14 +218,18 @@ def _canonical_sort_key(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _canonicalize(value: Any) -> Any:
+def _canonicalize(value: Any, *, exact: bool = False) -> Any:
     """Encode cache-key inputs without collapsing distinct Python values."""
+
+    def encode(item):
+        return _canonicalize(item, exact=exact)
+
     if dataclasses.is_dataclass(value):
         return {
             "type": "dataclass",
             "class": _qualified_type_name(value),
             "fields": [
-                [field.name, _canonicalize(field_value)]
+                [field.name, encode(field_value)]
                 for field, field_value in zip(
                     dataclasses.fields(value), dataclasses.astuple(value)
                 )
@@ -235,7 +239,7 @@ def _canonicalize(value: Any) -> Any:
         return {
             "type": "enum",
             "class": _qualified_type_name(value),
-            "value": _canonicalize(value.value),
+            "value": encode(value.value),
         }
     if isinstance(value, Path):
         return {"type": "path", "value": str(value)}
@@ -255,12 +259,14 @@ def _canonicalize(value: Any) -> Any:
         return {"type": "torch_dtype", "value": str(value)}
     if isinstance(value, torch.Tensor):
         snapshot = value.detach().to("cpu").contiguous()
-        payload = snapshot.view(torch.uint8).numpy().tobytes()
+        payload = snapshot.reshape(-1).view(torch.uint8).numpy().tobytes()
         return {
             "type": "torch_tensor",
             "dtype": str(snapshot.dtype),
             "shape": list(snapshot.shape),
-            "digest": _digest_bytes(payload),
+            ("data" if exact else "digest"): payload.hex()
+            if exact
+            else _digest_bytes(payload),
         }
     if isinstance(value, np.generic):
         scalar = np.asarray(value)
@@ -275,23 +281,23 @@ def _canonicalize(value: Any) -> Any:
             "type": "numpy_array",
             "dtype": snapshot.dtype.str,
             "shape": list(snapshot.shape),
-            "digest": _digest_bytes(snapshot.view(np.uint8).tobytes()),
+            ("data" if exact else "digest"): snapshot.tobytes().hex()
+            if exact
+            else _digest_bytes(snapshot.view(np.uint8).tobytes()),
         }
     if isinstance(value, Mapping):
-        items = [
-            [_canonicalize(key), _canonicalize(item)] for key, item in value.items()
-        ]
+        items = [[encode(key), encode(item)] for key, item in value.items()]
         items.sort(key=lambda pair: _canonical_sort_key(pair[0]))
         return {
             "type": "mapping",
             "items": items,
         }
     if isinstance(value, list):
-        return {"type": "list", "items": [_canonicalize(item) for item in value]}
+        return {"type": "list", "items": [encode(item) for item in value]}
     if isinstance(value, tuple):
-        return {"type": "tuple", "items": [_canonicalize(item) for item in value]}
+        return {"type": "tuple", "items": [encode(item) for item in value]}
     if isinstance(value, (set, frozenset)):
-        items = [_canonicalize(item) for item in value]
+        items = [encode(item) for item in value]
         items.sort(key=_canonical_sort_key)
         return {
             "type": "frozenset" if isinstance(value, frozenset) else "set",
@@ -302,9 +308,9 @@ def _canonicalize(value: Any) -> Any:
     )
 
 
-def _canonical_json(value: Any) -> bytes:
+def _canonical_json(value: Any, *, exact: bool = False) -> bytes:
     return json.dumps(
-        _canonicalize(value), sort_keys=True, separators=(",", ":")
+        _canonicalize(value, exact=exact), sort_keys=True, separators=(",", ":")
     ).encode()
 
 
@@ -377,13 +383,14 @@ def resolve_multimodal_item_hash(
     )
 
 
-def build_processor_fingerprint(
+def build_processor_description(
     processor: Any,
     hf_config: Any,
     *,
     extra: Optional[Mapping[str, Any]] = None,
-) -> str:
-    """Fingerprint preprocessing choices that can change processor output.
+    exact: bool = False,
+) -> bytes:
+    """Describe preprocessing choices that can change processor output.
 
     Every config value comes from the published bags, which is the only source
     that answers the *effective* preprocessing config. Taking any of them from
@@ -409,4 +416,52 @@ def build_processor_fingerprint(
         "processor": processor_payload,
         "extra": extra or {},
     }
-    return _digest_bytes(_canonical_json(payload))
+    return _canonical_json(payload, exact=exact)
+
+
+def build_processor_fingerprint(
+    processor: Any, hf_config: Any, *, extra: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Fingerprint the canonical processor description."""
+    return _digest_bytes(build_processor_description(processor, hf_config, extra=extra))
+
+
+def snapshot_witness(snapshot: MediaSnapshot) -> bytes:
+    """Encode actual media values, without relying on a content digest."""
+    data = snapshot.data
+    if isinstance(data, bytes):
+        parts = (b"bytes", data)
+    elif isinstance(data, Image.Image):
+        palette = data.palette
+        parts = (
+            b"pil",
+            data.mode.encode(),
+            _canonical_json(data.size),
+            _canonical_json(data.info.get("transparency")),
+            palette.mode.encode() if palette else b"",
+            palette.tobytes() if palette else b"",
+            data.tobytes(),
+        )
+    elif isinstance(data, torch.Tensor):
+        parts = (
+            b"torch",
+            str(data.dtype).encode(),
+            _canonical_json(list(data.shape)),
+            data.reshape(-1).view(torch.uint8).numpy().tobytes(),
+        )
+    elif isinstance(data, np.ndarray):
+        parts = (
+            b"numpy",
+            data.dtype.str.encode(),
+            _canonical_json(list(data.shape)),
+            data.tobytes(),
+        )
+    else:
+        raise TypeError(f"Unsupported shared media snapshot: {type(data).__name__}")
+    return b"".join(len(part).to_bytes(8, "big") + part for part in parts)
+
+
+def build_artifact_configuration(
+    description: bytes, modality: str, options: Mapping
+) -> bytes:
+    return _canonical_json((description, modality, options), exact=True)
