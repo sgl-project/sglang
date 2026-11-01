@@ -32,7 +32,7 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Split-K is opt-in (SGLANG_ENABLE_LORA_CSGMV_SPLIT_K defaults to False).
-register_cuda_ci(est_time=25, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="nightly", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

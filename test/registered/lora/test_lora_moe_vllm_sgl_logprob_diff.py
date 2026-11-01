@@ -18,7 +18,7 @@ from sglang.test.runners import SRTRunner
 
 register_cuda_ci(
     est_time=100,
-    stage="base-b",
+    stage="nightly",
     runner_config="1-gpu-large",
 )
 

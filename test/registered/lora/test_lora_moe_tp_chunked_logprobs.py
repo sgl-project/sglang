@@ -27,7 +27,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=130, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=130, stage="nightly", runner_config="2-gpu-large")
 
 # Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
 # chunks vs one full pass), which shifts bf16 rounding slightly.

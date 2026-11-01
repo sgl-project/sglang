@@ -15,7 +15,7 @@
 """TP-sharded LoRA with the opt-in overlap loader must still match HF.
 
 The overlap loader is the only difference from test_lora_tp.py, which keeps
-the per-PR TP coverage; this arm runs in the extra tier.
+the per-PR TP coverage; this arm runs nightly.
 """
 
 import multiprocessing as mp
@@ -30,7 +30,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=115, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=115, stage="nightly", runner_config="2-gpu-large")
 # backend-specific: ROCm's Triton build of the chunked-SGMV LoRA kernels on
 # TP-sharded adapter weights.
 register_amd_ci(
