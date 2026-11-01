@@ -390,7 +390,9 @@ def _lower_getitem(mx, args, kwargs):
     return args[0][args[1]]
 
 
-@_lowering("add", aten=(torch.ops.aten.add.Tensor,), functions=(operator.add,))
+@_lowering(
+    "add", aten=(torch.ops.aten.add.Tensor,), functions=(operator.add, torch.add)
+)
 def _lower_add(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:
@@ -398,12 +400,16 @@ def _lower_add(mx, args, kwargs):
     return args[0] + args[1] * alpha
 
 
-@_lowering("multiply", aten=(torch.ops.aten.mul.Tensor,), functions=(operator.mul,))
+@_lowering(
+    "multiply", aten=(torch.ops.aten.mul.Tensor,), functions=(operator.mul, torch.mul)
+)
 def _lower_multiply(mx, args, kwargs):
     return args[0] * args[1]
 
 
-@_lowering("subtract", aten=(torch.ops.aten.sub.Tensor,))
+@_lowering(
+    "subtract", aten=(torch.ops.aten.sub.Tensor,), functions=(operator.sub, torch.sub)
+)
 def _lower_subtract(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:

@@ -489,6 +489,47 @@ def test_review_flagged_ops_match_eager_through_the_export_path():
         )
 
 
+@pytest.mark.skipif(
+    not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
+    reason="requires Torch 2.13 and MLX on MPS",
+)
+def test_eager_spellings_lower_through_the_dynamo_path():
+    """``a - b`` and ``torch.add/sub/mul`` as Dynamo spells them.
+
+    Dynamo emits the eager functions rather than ATen overloads, so a
+    residual subtraction must not make the whole region decline.
+    """
+
+    class EagerOps(torch.nn.Module):
+        def forward(self, x, y):
+            return (
+                x - y,
+                torch.sub(x, y, alpha=2),
+                torch.add(x, y, alpha=0.5),
+                torch.mul(x, y),
+            )
+
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    model = EagerOps().eval()
+    x = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
+    y = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
+    expected = model(x, y)
+
+    backend = MlxFxCaptureBackend(executor_factory=make_mlx_fx_executor)
+    actual = torch.compile(model, backend=backend, fullgraph=True)(x, y)
+
+    torch.mps.synchronize()
+    assert backend.plans[0].fully_supported
+    assert {"subtract", "add", "multiply"} <= {
+        node.lowering for node in backend.plans[0].nodes
+    }
+    for actual_item, expected_item in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_item.cpu(), expected_item.cpu(), atol=0.03, rtol=0.03
+        )
+
+
 if __name__ == "__main__":
     import sys
 
