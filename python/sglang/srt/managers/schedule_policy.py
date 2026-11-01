@@ -1124,7 +1124,11 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = self.memory_budget.available_chunk_tokens(
-                self.rem_chunk_tokens
+                self.rem_chunk_tokens,
+                # A running decode can free pages (finish or retract) while the
+                # continuation waits a step.
+                can_wait=self.running_batch is not None
+                and not self.running_batch.is_empty(),
             )
             if _rem_tokens is None:
                 return req
