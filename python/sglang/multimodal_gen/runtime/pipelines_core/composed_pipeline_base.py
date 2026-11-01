@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay import is_model_overlay
 
 logger = init_logger(__name__)
 
@@ -219,11 +220,19 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
                 )
-            model_root = maybe_download_model(
-                self.model_path,
-                allow_patterns=[f"{model_subfolder}/**"],
-                revision=self.server_args.revision,
-            )
+            if is_model_overlay(self.model_path):
+                # an overlay materializes every partition under one root
+                model_root = maybe_download_model(
+                    self.model_path,
+                    force_diffusers_model=True,
+                    revision=self.server_args.revision,
+                )
+            else:
+                model_root = maybe_download_model(
+                    self.model_path,
+                    allow_patterns=[f"{model_subfolder}/**"],
+                    revision=self.server_args.revision,
+                )
             model_path = os.path.join(model_root, model_subfolder)
 
         self.model_path = model_path
@@ -271,7 +280,10 @@ class ComposedPipelineBase(ABC):
 
     def validate_disagg_role(self, role: RoleType) -> None:
         """Validate whether the requested disaggregation role is supported."""
-        return
+        if role in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            raise ValueError(
+                f"{self.pipeline_name} does not support separate prompt/image encoder roles"
+            )
 
     def _get_extra_allowed_modules_for_role(
         self, role: RoleType, task_name: str
@@ -703,9 +715,7 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
-        if self._disagg_role == RoleType.MONOLITHIC:
-            return True
-        if role_affinity == self._disagg_role:
+        if self._disagg_role.includes_stage(role_affinity):
             return True
 
         logger.info(

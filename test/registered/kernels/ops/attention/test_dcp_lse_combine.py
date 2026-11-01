@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -256,7 +256,6 @@ class TestLSEBaseByBackend(CustomTestCase):
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
 

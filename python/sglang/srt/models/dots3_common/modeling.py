@@ -51,7 +51,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
@@ -103,11 +102,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    get_token_to_kv_pool,
+    get_kv_layers,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
@@ -322,6 +322,7 @@ class Dots3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -466,14 +467,10 @@ class Dots3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
         final_hidden_states = self.experts(
@@ -884,8 +881,8 @@ class Dots3AttentionMLA(nn.Module):
                     )
                 else:
                     out_cache_loc = forward_batch.out_cache_loc
-                swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
-                    out_cache_loc
+                swa_loc = backend.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
         return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
 
@@ -985,7 +982,7 @@ class Dots3AttentionMLA(nn.Module):
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store(
             self.attn_mha,
             self._get_kv_write_loc(forward_batch),
             latent_cache,
@@ -1098,7 +1095,7 @@ class Dots3AttentionMLA(nn.Module):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1114,7 +1111,7 @@ class Dots3AttentionMLA(nn.Module):
                 or topk_indices is not None
                 or forward_batch.forward_mode.is_idle()
             ), "NSA attention requires topk_indices from indexer."
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1135,7 +1132,7 @@ class Dots3AttentionMLA(nn.Module):
             k_input = torch.cat([k_nope, k_pe], dim=-1)
             v_input = k_nope.contiguous()
 
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store_mla(
                 self.attn_mqa,
                 self._get_kv_write_loc(forward_batch),
                 k_nope,
@@ -1171,9 +1168,7 @@ class Dots3AttentionMLA(nn.Module):
             forward_batch.set_prefix_chunk_idx(i)
 
             # Fetch latent cache from memory pool with precomputed chunked kv indices
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
 
             latent_cache = latent_cache_buf[
                 forward_batch.prefix_chunk_kv_indices[i]
@@ -1292,7 +1287,7 @@ class Dots3AttentionMLA(nn.Module):
         latent_cache[..., self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store(
             self.attn_mha,
             self._get_kv_write_loc(forward_batch),
             latent_cache,
