@@ -1,5 +1,8 @@
 """One-warp-per-token CUDA MoE router (sigmoid / sqrtsoftplus + bias, softmax).
 
+Softmax with a correction bias ranks and weighs ``softmax(logits + bias)``, as
+the Triton router in ``moe_fused_gate``.
+
 Same contract as the router in ``moe_fused_gate`` for the inputs ``covered``
 accepts: fp32 weights and int32 ids in descending ranking order, lowest expert
 id wins ties, rows past ``num_token_non_padded`` get zero weights and id -1,
@@ -51,6 +54,7 @@ def _jit_route_warp_module(
     scoring_func: str,
     dtype: torch.dtype,
     bias_dtype: torch.dtype,
+    has_bias: bool,
     muse_spark: bool,
     token_bias: bool,
 ) -> Module:
@@ -62,6 +66,7 @@ def _jit_route_warp_module(
         Scoring(scoring_func).cpp_name,
         dtype,
         bias_dtype,
+        has_bias,
         is_arch_support_pdl(),
         muse_spark,
         token_bias,
@@ -137,13 +142,13 @@ def moe_route_warp(
     bias_alt_token_id: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Returns (weights [T, topk] fp32, ids [T, topk] int32); ``topk`` counts the
-    fused shared-expert slots. ``num_token_non_padded`` is an int32 device
-    scalar. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
+    fused shared-expert slots. ``bias`` is optional for softmax, which then
+    ranks and weighs ``logits + bias``. ``num_token_non_padded`` is an int32
+    device scalar. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
     bf16_bits(weight)``. Rows whose ``input_ids`` equal ``bias_alt_token_id``
     rank with ``bias_alt`` instead of ``bias``. Caller must have checked
     :func:`covered`."""
     num_tokens, num_experts = scores.shape
-    softmax = scoring_func == Scoring.SOFTMAX
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
     grouped = num_expert_group > 1
@@ -154,7 +159,8 @@ def moe_route_warp(
         topk_group if grouped else 1,
         scoring_func,
         scores.dtype,
-        torch.float32 if softmax else bias.dtype,
+        torch.float32 if bias is None else bias.dtype,
+        has_bias=bias is not None,
         muse_spark=False,
         token_bias=input_ids is not None,
     )
@@ -162,7 +168,7 @@ def moe_route_warp(
     out_i = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
     module.run(
         scores,
-        None if softmax else bias,
+        bias,
         out_w,
         out_i,
         packed_out,
@@ -221,6 +227,7 @@ def muse_spark_route_warp(
         Scoring.SIGMOID.value,
         scores.dtype,
         bias.dtype,
+        has_bias=True,
         muse_spark=True,
         token_bias=False,
     )
