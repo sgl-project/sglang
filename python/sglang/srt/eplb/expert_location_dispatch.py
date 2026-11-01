@@ -17,6 +17,8 @@ from typing import Literal, Optional
 
 import torch
 
+from sglang.kernels.ops.moe.eplb_map_record import eplb_map_and_record
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.runtime_context import get_exec
 
@@ -37,15 +39,20 @@ class ExpertLocationDispatchInfo:
     # logical expert several times. With one, each rank dispatches only its own
     # tokens and is free to disagree.
     rank_invariant: bool = False
+    # This layer's MegaGate int32 (physical map, replica count); None casts per call.
+    mega_gate_maps: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @classmethod
-    def init_new(cls, layer_id: int):
+    def init_new(cls, layer_id: int, *, is_draft: bool = False):
+        if is_draft:
+            return None
         ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
-        expert_location_metadata = get_global_expert_location_metadata()
-        assert expert_location_metadata is not None
-
         if ep_dispatch_algorithm is None:
             return None
+        expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None, (
+            "Expert dispatch requires placement metadata"
+        )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -65,6 +72,17 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            mega_gate_maps=(
+                tuple(
+                    m[layer_id]
+                    for m in expert_location_metadata.mega_gate_maps(
+                        ep_dispatch_algorithm
+                    )
+                )
+                if envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+                and ep_dispatch_algorithm in ("static", "dynamic")
+                else None
+            ),
         )
 
 
@@ -100,6 +118,20 @@ def topk_ids_logical_to_physical(
             )
         return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+
+def topk_ids_logical_to_physical_and_record(
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    load_buffer: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if info is not None and info.ep_dispatch_algorithm != "static":
+        return None
+    dispatch = (
+        info.partial_logical_to_rank_dispatch_physical_map if info is not None else None
+    )
+    return eplb_map_and_record(topk_ids, dispatch, load_buffer, num_token_non_padded)
 
 
 def _topk_ids_logical_to_physical_static(
