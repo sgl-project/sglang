@@ -387,6 +387,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -422,6 +425,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -440,6 +446,13 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
+    if get_platform().is_xpu:
+        return False
+    if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
+        # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
+        return False
+    if get_platform().is_xpu:
+        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer

@@ -241,6 +241,7 @@ def _forget_parent_executor_wakeups():
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_video_decode = True
     smart_rgb_conversion = False
     video_preprocessing_device = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -1042,7 +1043,11 @@ class BaseMultimodalProcessor(ABC):
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, use_gpu=cls.video_preprocessing_device != "cpu")
+                return load_video(
+                    data,
+                    use_gpu=cls.gpu_video_decode
+                    and cls.video_preprocessing_device != "cpu",
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 

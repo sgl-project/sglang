@@ -4273,6 +4273,37 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestLfm3SpeculativeDecoding(CustomTestCase):
+    def test_speculative_decoding_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = SimpleNamespace(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "speculative decoding"):
+                    _lfm3_overrides(args, None)
+
+    def test_dp_attention_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(speculative_algorithm=None, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "DP attention"):
+            _lfm3_overrides(args, None)
+
+    def test_explicit_ragged_flashinfer_prefill_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(
+            speculative_algorithm=None,
+            attn_dp_size=1,
+            attention_backend="flashinfer",
+            prefill_attention_backend=None,
+        )
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            with self.assertRaisesRegex(ValueError, "paged prefill"):
+                _lfm3_overrides(args, None)
+
+
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
     """The deterministic fallback must not hand XPU a CUDA-only backend.
 
