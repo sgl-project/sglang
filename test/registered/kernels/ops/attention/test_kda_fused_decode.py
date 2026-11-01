@@ -368,6 +368,8 @@ def _assert_fused_args_match(attn, ckpt, heads: int):
     assert attn._kda_fused_decode_max_tokens == (
         2048 // heads if hopper else float("inf")
     )
+    # Direct-format updates skip both loading hooks and must be rejected.
+    assert attn._direct_weight_update_error is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -484,6 +486,7 @@ def test_glm5_next_keeps_unfused_decode_on_other_archs(
         _load(model, _kda_checkpoint(8, seed=1), through_load_weights=True)
     assert attn.attn._k3_fused_decode_args is None
     assert attn._kda_fused_decode_max_tokens == 0
+    assert attn._direct_weight_update_error is None
 
 
 if __name__ == "__main__":

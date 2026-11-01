@@ -605,6 +605,7 @@ class Glm5NextLinearAttention(nn.Module):
         # below the cap offer the fused KDA kernel, 0 keeps the unfused chain.
         self.attn._k3_fused_decode_args = None
         self._kda_fused_decode_max_tokens = 0
+        self._direct_weight_update_error = None
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs of the fused KDA decode kernel, stashed on the attention
@@ -651,6 +652,10 @@ class Glm5NextLinearAttention(nn.Module):
             _KDA_FUSED_DECODE_MAX_BLOCKS_SM90 // self.local_num_heads
             if _device_sm // 10 == 9
             else math.inf
+        )
+        self._direct_weight_update_error = (
+            "load_format='direct' does not refresh the GLM-5.3-Flash fused KDA "
+            "decode buffers; update weights with the default load format."
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
