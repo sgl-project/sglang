@@ -1313,7 +1313,7 @@ class Scheduler(
 
         self.metrics_collector.emit_constants(
             max_total_num_tokens=self.max_total_num_tokens,
-            max_total_num_tokens_swa=self.swa_tokens_per_layer,
+            max_total_num_tokens_window=self.window_token_capacities(),
             weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_memory_usage_gb=(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage
@@ -2581,11 +2581,13 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
-    def init_pool_stats_observer(self) -> None:
+    def _observed_storage(self):
+        """The sub-pools the pool observers report: a unified pool's own
+        storage, else the static pools described by their sizing."""
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
-        storage = kv_storage_of(
+        return kv_storage_of(
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             shape=StaticPoolShape(
@@ -2595,11 +2597,25 @@ class Scheduler(
                 token_capacity=global_tokens,
                 full_tokens_per_layer=self.full_tokens_per_layer,
                 swa_tokens_per_layer=self.swa_tokens_per_layer,
+                window=self.sliding_window_size,
             ),
         )
+
+    def window_token_capacities(self) -> Dict[str, int]:
+        """Each window pool's sized token capacity, by the window's name; every
+        window is sized to the same token count."""
+        if self.swa_tokens_per_layer is None:
+            return {}
+        return {
+            usage.label: self.swa_tokens_per_layer
+            for usage in self._observed_storage().usage()
+            if usage.metrics == "window"
+        }
+
+    def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
-            storage=storage,
+            storage=self._observed_storage(),
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,

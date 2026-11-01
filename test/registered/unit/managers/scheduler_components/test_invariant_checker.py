@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    WindowPoolStats,
     kv_private_swa_tokens,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -56,7 +57,21 @@ class TestCheckTreeCacheGate(CustomTestCase):
             full_token_usage=0.0,
             full_available_size=1024,
             full_evictable_size=0,
-            is_hybrid_swa=hybrid_swa,
+            windows=(
+                (
+                    WindowPoolStats(
+                        name="window_128",
+                        sub_pool="window_128",
+                        capacity=1024,
+                        available_size=1024,
+                        evictable_size=0,
+                        num_used=0,
+                        token_usage=0.0,
+                    ),
+                )
+                if hybrid_swa
+                else ()
+            ),
             is_hybrid_ssm=hybrid_ssm,
         )
         return SchedulerInvariantChecker(

@@ -291,7 +291,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -375,7 +375,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     get_decode_usage_msg_parts=lambda: [],
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,

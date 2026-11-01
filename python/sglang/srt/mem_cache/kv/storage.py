@@ -62,10 +62,12 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
     or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under."""
+    numbers are published under (``full``, ``window`` or ``mamba``), and
+    ``label`` the name that tells one window's numbers from another's."""
 
     name: str
     metrics: str
+    label: str
     capacity: int
     available: int
 
@@ -663,6 +665,7 @@ class KVStorage:
             SubPoolUsage(
                 name=s.name,
                 metrics=s.external.metrics,
+                label=s.name,
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )

@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
@@ -562,12 +563,16 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="full",
                     metrics="full",
+                    label="full",
                     capacity=full_capacity,
                     available=full_available,
                 ),
+                # Published under the name a unified pool's window of this
+                # length goes by.
                 SubPoolUsage(
                     name="swa",
-                    metrics="swa",
+                    metrics="window",
+                    label=window_sub_pool_name(shape.window),
                     capacity=swa_capacity,
                     available=swa_available,
                 ),
@@ -583,6 +588,7 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="full",
                     metrics="full",
+                    label="full",
                     capacity=capacity,
                     available=allocator.available_size(),
                 )
@@ -592,6 +598,7 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="mamba",
                     metrics="mamba",
+                    label="mamba",
                     capacity=allocator.state.pool.size,
                     available=allocator.state_slots.available_size(),
                 )
