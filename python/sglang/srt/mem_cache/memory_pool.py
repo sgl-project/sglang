@@ -3117,6 +3117,16 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             )
 
         if prepare_workspace:
+            if (
+                req_pool_indices_cpu is None
+                or extend_prefix_lens_cpu is None
+                or extend_seq_lens_cpu is None
+            ):
+                raise RuntimeError(
+                    "FlashInfer FP4 extend workspace preparation requires CPU "
+                    "request indices, prefix lengths, and extend lengths. Fixed-width "
+                    "speculative forwards must use the GPU-resident workspace path."
+                )
             transfer_cur_kv = not use_ragged
             k_cur_fp8 = (
                 k_cur.to(torch.float8_e4m3fn)
@@ -3173,6 +3183,72 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim),
         )
 
+    def get_flashinfer_speculative_dequant_workspace_kv_buffer(
+        self,
+        layer: RadixAttention,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        current_locs: torch.Tensor,
+        num_current_tokens_per_req: int,
+        prefix_len_delta: int,
+        *,
+        layer_id_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build a graph-safe FP8 workspace for a speculative extend.
+
+        FlashInfer metadata indexes regular physical KV slots. The quant method
+        dequantizes cached prefixes directly into their physical workspace slots
+        and writes current-token K/V to the same slots, using only GPU-resident
+        request metadata for speculative forwards.
+        """
+        if not self.is_quantized_kv_cache:
+            raise RuntimeError(
+                "FlashInfer speculative dequant workspace requested from a "
+                "non-quantized KV pool."
+            )
+
+        local_layer_id = (
+            layer.layer_id if layer_id_override is None else layer_id_override
+        )
+        k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(local_layer_id)
+        dq_k, dq_v = self.get_dequant_workspace()
+        expected_k_row_elements = layer.tp_k_head_num * layer.head_dim
+        expected_v_row_elements = layer.tp_v_head_num * layer.head_dim
+        if (
+            dq_k[0].numel() != expected_k_row_elements
+            or dq_v[0].numel() != expected_v_row_elements
+        ):
+            raise RuntimeError(
+                "NVFP4 dequant workspace rows must match this tensor-parallel "
+                "rank's KV heads * head_dim: "
+                f"K expected {expected_k_row_elements}, got {dq_k[0].numel()}; "
+                f"V expected {expected_v_row_elements}, got {dq_v[0].numel()}."
+            )
+        self.quant_method.dequantize_speculative_prefix_to_workspace(
+            k_fp4,
+            v_fp4,
+            k_scales,
+            v_scales,
+            k_current,
+            v_current,
+            dq_k,
+            dq_v,
+            req_to_token,
+            req_pool_indices,
+            prefix_lens,
+            current_locs,
+            num_current_tokens_per_req,
+            prefix_len_delta,
+            layer.layer_id,
+        )
+        return (
+            dq_k.view(-1, layer.tp_k_head_num, layer.head_dim),
+            dq_v.view(-1, layer.tp_v_head_num, layer.head_dim),
+        )
+
     @staticmethod
     def _to_cpu_int_list(values) -> list[int]:
         if isinstance(values, list):
@@ -3196,15 +3272,15 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         """Build the shared FP8 workspace used by FlashInfer extend attention.
 
         Cached prefix tokens are stored as packed FP4 plus per-block scales, so
-        paged prefill dequantizes those prefix tokens into the FP8 workspace.
-        The current extend chunk can already be FP8 and is copied into the same
-        workspace after the prefix region.
+        paged prefill dequantizes those prefix tokens into their physical slots
+        in the FP8 workspace. Current tokens use the same physical mapping. This
+        preserves shared prefixes without duplicating them into a compact layout
+        whose logical token count can exceed the physical KV pool capacity.
         """
         k_fp4, v_fp4, k_scales, v_scales = self.get_raw_kv_buffer(layer_id)
         dq_k, dq_v = self.get_dequant_workspace()
 
         cur_batch_start_loc_cpu = 0
-        cur_token_idx_dq = page_size
 
         for i in range(len(req_pool_indices_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
@@ -3220,23 +3296,17 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     v_scales[prev_indices],
                     global_layer_id,
                 )
-                dq_k[cur_token_idx_dq : cur_token_idx_dq + prev_len] = k_prev_fp8
-                dq_v[cur_token_idx_dq : cur_token_idx_dq + prev_len] = v_prev_fp8
+                dq_k[prev_indices] = k_prev_fp8
+                dq_v[prev_indices] = v_prev_fp8
 
             if k_cur_fp8 is not None:
                 cur_end = cur_batch_start_loc_cpu + extend_len
-                dst_start = cur_token_idx_dq + prev_len
-                dst_end = dst_start + extend_len
-                dq_k[dst_start:dst_end] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
-                dq_v[dst_start:dst_end] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                current_indices = req_to_token[
+                    req_idx, prev_len : prev_len + extend_len
+                ]
+                dq_k[current_indices] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                dq_v[current_indices] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
                 cur_batch_start_loc_cpu = cur_end
-
-            workspace_len = prev_len + (extend_len if k_cur_fp8 is not None else 0)
-            cur_token_idx_dq = (
-                (cur_token_idx_dq + workspace_len + page_size - 1)
-                // page_size
-                * page_size
-            )
 
         return dq_k, dq_v
 
@@ -4396,6 +4466,15 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer.layer_id)
         local_layer_id = self._transfer_full_attention_id(layer.layer_id)
         return self.full_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
+            layer, *args, layer_id_override=local_layer_id, **kwargs
+        )
+
+    def get_flashinfer_speculative_dequant_workspace_kv_buffer(
+        self, layer, *args, **kwargs
+    ):
+        self._wait_for_layer(layer.layer_id)
+        local_layer_id = self._transfer_full_attention_id(layer.layer_id)
+        return self.full_kv_pool.get_flashinfer_speculative_dequant_workspace_kv_buffer(
             layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 

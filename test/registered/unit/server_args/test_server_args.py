@@ -1606,6 +1606,62 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
         handle_kv4_compatibility(args)
 
+    @staticmethod
+    def _make_sm120_padding_args(arch="Qwen3_5ForConditionalGeneration", **updates):
+        options = dict(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            attention_backend="trtllm_mha",
+            speculative_algorithm="NEXTN",
+            cuda_graph_backend_decode="full",
+            cuda_graph_backend_prefill="disabled",
+            cuda_graph_bs_decode=[1, 4, 8, 16],
+        )
+        options.update(updates)
+        args = ServerArgs(**options)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch])
+        )
+        handle_cuda_graph_config(args)
+        return args
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_sm120_qwen35_nvfp4_nextn_rejects_padded_graphs(self):
+        for algorithm in ("NEXTN", "nextn"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_sm120_padding_args(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "--disable-cuda-graph-padding"):
+                    handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_sm120_qwen35_nvfp4_exact_graphs_preserve_sparse_capture_list(self):
+        args = self._make_sm120_padding_args(disable_cuda_graph_padding=True)
+        handle_kv4_compatibility(args)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").decode.bs, [1, 4, 8, 16]
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_sm120_qwen35_nvfp4_nextn_allows_eager_decode(self):
+        args = self._make_sm120_padding_args(cuda_graph_backend_decode="disabled")
+        handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_padding_guard_does_not_change_other_combinations(self):
+        for options in (
+            {"kv_cache_dtype": "fp8_e4m3"},
+            {"speculative_algorithm": None},
+            {"speculative_algorithm": "EAGLE"},
+            {"arch": "LlamaForCausalLM"},
+            {"arch": "Qwen3_5MoeForConditionalGeneration"},
+        ):
+            with self.subTest(options=options):
+                handle_kv4_compatibility(self._make_sm120_padding_args(**options))
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_padding_guard_does_not_change_sm100(self):
+        handle_kv4_compatibility(self._make_sm120_padding_args())
+
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_sm100_native_nvfp4_allows_monolithic_non_speculative_inference(self):
         args = self._make_nvfp4_args()
