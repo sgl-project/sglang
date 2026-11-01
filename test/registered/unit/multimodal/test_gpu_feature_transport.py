@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import json
 import threading
 import unittest
 from contextlib import nullcontext
@@ -9,14 +10,18 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.srt.entrypoints import http_server
 from sglang.srt.managers import tokenizer_manager
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
+from sglang.srt.multimodal.transport.admission import (
+    FeaturePublicationAdmission,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
@@ -32,6 +37,49 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestGuardedDispatchCleanup(CustomTestCase):
+    def test_native_http_preserves_admission_errors_including_sse(self):
+        """Pool exhaustion is retryable overload, not malformed input or a 500."""
+
+        async def run():
+            for nbytes, status, kind in (
+                (2, 413, "mm_memory_request_too_large"),
+                (1, 429, "mm_memory_overloaded"),
+            ):
+
+                async def generate(*args):
+                    await FeaturePublicationAdmission(1, 0).acquire(
+                        nbytes, lambda: None
+                    )
+                    yield
+
+                manager = SimpleNamespace(
+                    generate_request=generate, create_abort_task=lambda obj: None
+                )
+                for stream in (False, True):
+                    with (
+                        self.subTest(status=status, stream=stream),
+                        patch.object(
+                            http_server,
+                            "_global_state",
+                            SimpleNamespace(tokenizer_manager=manager),
+                        ),
+                    ):
+                        response = await http_server.serve_generate_request(
+                            GenerateReqInput(text="hello", stream=stream), None
+                        )
+                        if stream:
+                            chunks = [chunk async for chunk in response.body_iterator]
+                            self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+                            payload = json.loads(chunks[0][len(b"data: ") :])
+                        else:
+                            self.assertEqual(response.status_code, status)
+                            payload = json.loads(response.body)
+                        self.assertEqual(payload["error"]["type"], kind)
+                        self.assertEqual(payload["error"]["code"], status)
+                        self.assertEqual(payload["error"]["retryable"], status == 429)
+
+        asyncio.run(run())
+
     def test_serialized_dispatch_failure_still_releases_ipc(self):
         """Pickling must not hide unpublished leases from failure cleanup."""
         for batch in (False, True):
