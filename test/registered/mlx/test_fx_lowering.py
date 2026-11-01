@@ -189,31 +189,52 @@ def test_generic_mlx_executor_reuses_one_torch_graph_across_token_counts():
     assert len(backend.plans) == 1
 
 
+def _exported_executor(model, args):
+    """The executor over a non-strict export, the way serving builds it."""
+    graph_module = torch.export.export(model, args, strict=False).module()
+    # The export guard submodule is dead weight the consumer erases before
+    # planning; do the same here.
+    for node in tuple(graph_module.graph.nodes):
+        if node.op == "call_module" and str(node.target) == "_guards_fn":
+            assert not node.users
+            graph_module.graph.erase_node(node)
+    graph_module.recompile()
+    plan = build_mlx_fx_plan(
+        graph_module, MlxFxLoweringRegistry.standard_export_decoder()
+    )
+    plan.require_fully_supported()
+    return graph_module, make_mlx_fx_executor(plan, list(args))
+
+
 @pytest.mark.skipif(
     not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
     reason="requires Torch 2.13 and MLX on MPS",
 )
-def test_generic_mlx_executor_observes_weight_mutation_and_replacement():
-    torch._dynamo.reset()
+def test_executor_observes_weight_mutation_and_replacement_through_its_views():
+    # Called directly, so no Dynamo recapture can hide a stale borrowed view:
+    # an in-place update is seen through the existing view, and a parameter
+    # replaced with new storage on the graph the executor was built from is
+    # re-borrowed on the next call.
     torch.manual_seed(0)
     model = _TinyMlp().to(device="mps", dtype=torch.bfloat16).eval()
-    backend = MlxFxCaptureBackend(executor_factory=make_mlx_fx_executor)
-    compiled = torch.compile(model, backend=backend, fullgraph=True)
     value = torch.randn(4, 8, device="mps", dtype=torch.bfloat16)
+    graph_module, executor = _exported_executor(model, (value,))
 
-    first = compiled(value)
+    (first,) = executor(value)
     with torch.no_grad():
-        model.gate_up.weight.add_(0.25)
+        graph_module.gate_up.weight.add_(0.25)
+        model.gate_up.weight.copy_(graph_module.gate_up.weight)
     mutated_expected = model(value)
-    mutated_actual = compiled(value)
+    (mutated_actual,) = executor(value)
 
     replacement = torch.nn.Parameter(
         torch.randn_like(model.gate_up.weight) * 0.05,
         requires_grad=False,
     )
+    graph_module.gate_up.weight = replacement
     model.gate_up.weight = replacement
     replaced_expected = model(value)
-    replaced_actual = compiled(value)
+    (replaced_actual,) = executor(value)
 
     torch.mps.synchronize()
     assert not torch.allclose(first.cpu(), mutated_actual.cpu())
