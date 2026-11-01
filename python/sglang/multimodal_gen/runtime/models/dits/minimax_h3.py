@@ -1193,15 +1193,14 @@ class MiniMaxH3Attention(nn.Module):
         # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
         # are torch nn.RMSNorm, so the fused kernel is called directly.
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
-            )
+            current_platform.is_cuda() or current_platform.is_xpu()
+        ) and can_use_fused_inplace_qknorm_rope(
+            arch.attention_head_dim,
+            rope_dim,
+            True,
+            _BF16_DTYPE,
+            cache_dtype=_BF16_DTYPE,
+            round_norm_before_rope=True,
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
