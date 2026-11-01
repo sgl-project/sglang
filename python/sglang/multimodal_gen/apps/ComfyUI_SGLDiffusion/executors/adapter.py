@@ -46,6 +46,9 @@ class ComfyUIModelAdapter:
     # Conditioning apply_model kwargs this adapter forwards to the worker;
     # the executor rejects the other content kwargs instead of dropping them.
     applied_conditioning: tuple[str, ...] = ()
+    # Checked on GPU to match the per-row path when one worker request carries
+    # the whole ComfyUI batch; SGLDOptions.native_batching is refused otherwise.
+    supports_native_batching: bool = False
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

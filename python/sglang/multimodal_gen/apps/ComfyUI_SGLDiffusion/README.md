@@ -48,6 +48,7 @@ decode on the worker).
 2. **Configure Options** (optional): connect `SGLDiffusion Options` to the loader. Without it the worker uses auto-detection and defaults.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+5. **Batching**: ComfyUI calls the model with CFG cond/uncond (and `batch_size` > 1) as one batch. `native_batching=off` (default) sends each row as its own request. `cfg_only` sends each image's cond/uncond rows as one request, `full` the whole batch; both use more activation memory and step down a mode for the rest of the run if the worker runs out of memory. Batching helped at 512px (about 8% faster on an L40S) and was about 5% slower at 1024px; results are not bit-identical to per-row (bf16 rounding). Verified on one GPU for Z-Image (`lumina2`) and FLUX.1 (`flux`); other models are refused.
 
 ### Options
 
