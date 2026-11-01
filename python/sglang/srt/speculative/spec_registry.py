@@ -111,6 +111,11 @@ class CustomSpecAlgo:
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
+    def supports_mixed_grammar_barrier(self) -> bool:
+        # Whether the worker runs the grammar barrier between a mixed batch's
+        # target extend forward and its sampling.
+        return False
+
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True

@@ -360,6 +360,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,
+        _verify_argmax=lambda logits: torch.argmax(logits, dim=-1),
         block_size=2,
     )
 
@@ -380,6 +381,61 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert out_tokens.tolist() == [[7, 0]]
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
+class _FakeTpSync:
+    """Stands in for a TP group whose rank 0 holds ``rank0``'s tensors."""
+
+    def __init__(self, rank0):
+        self.rank0 = list(rank0)
+        self.sites = []
+
+    def sync(self, site, values):
+        self.sites.append(site)
+        assert values.is_contiguous()
+        values.copy_(self.rank0.pop(0))
+        return values
+
+
+def test_selector_draft_is_broadcast_from_rank0():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    rank0_tokens = torch.tensor([[5, 6, 7]])
+    rank0_candidates = torch.tensor([[[5, 1], [6, 2], [7, 3]]])
+    rank0_q = torch.tensor([[[0.6, 0.4], [0.9, 0.1], [0.5, 0.5]]])
+    tp_sync = _FakeTpSync([rank0_tokens, rank0_candidates, rank0_q])
+    worker = SimpleNamespace(
+        _tp_sync=tp_sync,
+        _selector_sample=(
+            torch.tensor([[[5, 1], [6, 2], [7, 3]]]),
+            torch.tensor([[[0.3, 0.7], [0.9, 0.1], [0.5, 0.5]]]),
+        ),
+    )
+
+    draft_next = worker_mod.DFlashWorkerV2._broadcast_selector_draft(
+        worker, torch.tensor([[1, 6, 7]])
+    )
+
+    assert draft_next.tolist() == rank0_tokens.tolist()
+    candidate_ids, q_rows = worker._selector_sample
+    assert candidate_ids.tolist() == rank0_candidates.tolist()
+    torch.testing.assert_close(q_rows, rank0_q)
+    assert tp_sync.sites == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 3
+
+
+def test_greedy_selector_draft_broadcasts_tokens_only():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    tp_sync = _FakeTpSync([torch.tensor([[4, 2]])])
+    worker = SimpleNamespace(_tp_sync=tp_sync, _selector_sample=None)
+
+    draft_next = worker_mod.DFlashWorkerV2._broadcast_selector_draft(
+        worker, torch.tensor([[4, 3]])
+    )
+
+    assert draft_next.tolist() == [[4, 2]]
+    assert worker._selector_sample is None
+    assert tp_sync.sites == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR]
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
@@ -415,3 +471,72 @@ def test_grouped_conv_supports_runtime_block_sizes():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# The renorm kernels the fix replaces only run on GPU.
+_VERIFY_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _sampler_target_probs(logits, top_ks, top_ps):
+    from sglang.srt.layers.sampler import top_k_top_p_filter_probs_torch
+
+    n = logits.shape[0]
+    sorted_probs, sorted_idx = top_k_top_p_filter_probs_torch(
+        torch.softmax(logits.to(_VERIFY_DEVICE), -1),
+        top_ks.repeat(n).to(_VERIFY_DEVICE),
+        top_ps.repeat(n).to(_VERIFY_DEVICE),
+    )
+    expected = torch.zeros_like(sorted_probs).scatter_(-1, sorted_idx, sorted_probs)
+    return (expected / expected.sum(-1, keepdim=True)).cpu()
+
+
+def _verify_target_probs(backend, logits, top_ks, top_ps):
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.speculative.dflash_utils import (
+        build_speculative_verify_target_probs,
+    )
+
+    device = _VERIFY_DEVICE
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones(1, 1, device=device),
+        top_ks=top_ks.to(device),
+        top_ps=top_ps.to(device),
+        need_top_k_sampling=bool((top_ks < logits.shape[-1]).any()),
+        need_top_p_sampling=bool((top_ps < 1.0).any()),
+    )
+    with get_context().override_server_args(sampling_backend=backend):
+        return (
+            build_speculative_verify_target_probs(
+                next_token_logits=logits.to(device),
+                sampling_info=sampling_info,
+                draft_token_num=logits.shape[0],
+                bs=1,
+            )
+            .view(logits.shape)
+            .cpu()
+        )
+
+
+def test_verify_target_probs_match_the_pytorch_sampler_at_a_top_p_tie():
+    # Tokens 1 and 2 tie and the cutoff falls between them: the sampler keeps
+    # exactly one, while a pivot threshold would keep both.
+    probs = torch.tensor([[0.6, 0.2, 0.2, 0.0]]).clamp_min(1e-9)
+    logits = probs.log().repeat(2, 1)
+    top_ks = torch.tensor([1 << 30], dtype=torch.int32)
+    top_ps = torch.tensor([0.7])
+
+    target = _verify_target_probs("pytorch", logits, top_ks, top_ps)
+
+    assert torch.equal(target, _sampler_target_probs(logits, top_ks, top_ps))
+    assert (target > 0).sum(-1).tolist() == [2, 2]
+
+
+def test_verify_target_probs_match_the_pytorch_sampler_under_top_k():
+    torch.manual_seed(0)
+    logits = torch.randn(3, 64) * 3
+    top_ks = torch.tensor([5], dtype=torch.int32)
+    top_ps = torch.tensor([0.9])
+
+    target = _verify_target_probs("pytorch", logits, top_ks, top_ps)
+
+    assert torch.equal(target, _sampler_target_probs(logits, top_ks, top_ps))
