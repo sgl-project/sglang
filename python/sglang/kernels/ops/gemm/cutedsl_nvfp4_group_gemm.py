@@ -575,8 +575,9 @@ class Sm100Nvfp4GroupGemm1CTA:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, sub_i)], tTR_rAcc)
                 {store_expr_1cta}
                 cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, sub_i)])
-            tmem.free(acc_tmem_ptr)
+            cute.arch.fence_view_async_tmem_load()
             self.epilog_sync_barrier.arrive_and_wait()
+            tmem.free(acc_tmem_ptr)
             if warp_idx == 0:
                 cute.arch.fence_view_async_shared()
 {epi_pdl_wait}                {"".join(epi_branches)}
@@ -1108,8 +1109,9 @@ class Sm100Nvfp4GroupGemm2CTA:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, sub_i)], tTR_rAcc)
                 {store_expr_2cta}
                 cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, sub_i)])
-            tmem.free(acc_tmem_ptr)
+            cute.arch.fence_view_async_tmem_load()
             self.epilog_sync_barrier.arrive_and_wait()
+            tmem.free(acc_tmem_ptr)
             if warp_idx == 0:
                 cute.arch.fence_view_async_shared()
 {epi_pdl_wait}                {"".join(epi_branches)}
@@ -2122,8 +2124,9 @@ class Sm100Nvfp4MaskedGroupGemm1CTA:
                     cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, sub_i)], tTR_rAcc)
                     tRS_rC.store((tTR_rAcc.load() * alpha_val).to(self.c_dtype))
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, sub_i)])
-                tmem.free(acc_tmem_ptr)
+                cute.arch.fence_view_async_tmem_load()
                 self.epilog_sync_barrier.arrive_and_wait()
+                tmem.free(acc_tmem_ptr)
                 if warp_idx == 0:
                     cute.arch.fence_view_async_shared()
 {"".join(epi_branches)}
@@ -2285,7 +2288,7 @@ class Sm100Nvfp4MaskedGroupGemmPersistent:
         self.iter_acc_early_release = self.num_sf_tmem_cols // 64
         self.num_tmem_alloc_cols = 512
         self.pdl_safe = pdl_safe
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = min(utils.get_smem_capacity_in_bytes("sm_100"), 196 * 1024)
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=160)
         self.sched_sync_barrier = pipeline.NamedBarrier(barrier_id=3, num_threads=192)

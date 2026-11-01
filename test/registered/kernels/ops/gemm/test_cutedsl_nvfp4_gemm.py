@@ -305,6 +305,129 @@ class TestCuteDSLNvfp4Gemm(CustomTestCase):
             else:
                 os.environ["SGLANG_USE_CUTEDSL_NVFP4_GEMM"] = old_gemm
 
+    def test_same_process_grouped_gemm_then_persistent_2cta_layer(self):
+        import torch.nn.functional as F
+
+        from sglang.kernels.ops.gemm import (
+            nvfp4_dual_gemm_swiglu,
+            nvfp4_grouped_gemm,
+        )
+        from sglang.kernels.ops.gemm.cutedsl_nvfp4_dual_gemm import (
+            permute_nvfp4_scale as permute_dual_scale,
+        )
+        from sglang.kernels.ops.gemm.cutedsl_nvfp4_group_gemm import (
+            permute_nvfp4_scale as permute_group_scale,
+        )
+
+        def make_fp4(rows: int, cols: int) -> torch.Tensor:
+            raw = (
+                torch.randint(
+                    255, size=(rows, cols // 2), dtype=torch.uint8, device="cuda"
+                )
+                & 0xBB
+            )
+            return raw.view(torch.float4_e2m1fn_x2)
+
+        def make_sf(rows: int, cols: int, perm_fn):
+            raw = (
+                torch.randint(
+                    1, 3, (rows, _ceil_div(cols, 16)), dtype=torch.int8, device="cuda"
+                ).float()
+                * 0.125
+            ).to(torch.float8_e4m3fn)
+            return perm_fn(raw)
+
+        d_model, d_ff = 7168, 4096
+        for m in (256, 1024):
+            torch.manual_seed(42 + m)
+            ms_up = [
+                max(32, ((m0 * m) // 256 // 8) * 8)
+                for m0 in (80, 176, 128, 72, 64, 248, 96, 160)
+            ]
+            abc_up, sf_up = [], []
+            for mg in ms_up:
+                m_pad = _ceil_div(mg, 128) * 128
+                a_pad = make_fp4(m_pad, d_model)
+                b_grp = make_fp4(d_ff, d_model)
+                c_grp = torch.empty((mg, d_ff), dtype=torch.float16, device="cuda")
+                sfa_pad = make_sf(m_pad, d_model, lambda t: t)
+                abc_up.append((a_pad[:mg], b_grp, c_grp))
+                sf_up.append(
+                    (
+                        permute_group_scale(sfa_pad[:mg].contiguous()),
+                        make_sf(d_ff, d_model, permute_group_scale),
+                    )
+                )
+            ps_up = [(mg, d_ff, d_model, 1) for mg in ms_up]
+            for _ in range(5):
+                nvfp4_grouped_gemm(abc_up, sf_up, ps_up, swizzled_scales=True)
+            torch.cuda.synchronize()
+
+            x = torch.randn((m, d_model), dtype=torch.float16, device="cuda")
+            w = torch.ones((d_model,), dtype=torch.float16, device="cuda")
+            q = torch.randn((1, 32, m, 128), dtype=torch.float16, device="cuda")
+            k = torch.randn((1, 8, m, 128), dtype=torch.float16, device="cuda")
+            v = torch.randn_like(k)
+            a_qkv, b_qkv = make_fp4(m, d_model), make_fp4(d_ff, d_model)
+            sa_qkv = make_sf(m, d_model, permute_nvfp4_scale)
+            sb_qkv = make_sf(d_ff, d_model, permute_nvfp4_scale)
+            a_o, b_o = make_fp4(m, d_ff), make_fp4(d_model, d_ff)
+            sa_o = make_sf(m, d_ff, permute_nvfp4_scale)
+            sb_o = make_sf(d_model, d_ff, permute_nvfp4_scale)
+            a_mlp = make_fp4(m, d_model)
+            b1, b2 = make_fp4(d_ff, d_model), make_fp4(d_ff, d_model)
+            sa_mlp = make_sf(m, d_model, permute_dual_scale)
+            sb1 = make_sf(d_ff, d_model, permute_dual_scale)
+            sb2 = make_sf(d_ff, d_model, permute_dual_scale)
+            c_qkv = torch.empty((m, d_ff), dtype=torch.float16, device="cuda")
+            c_o = torch.empty((m, d_model), dtype=torch.float16, device="cuda")
+            c_mlp = torch.empty((m, d_ff), dtype=torch.float16, device="cuda")
+            c_dn = torch.empty((m, d_model), dtype=torch.float16, device="cuda")
+
+            def run_layer():
+                F.rms_norm(x, (d_model,), w, 1e-6)
+                nvfp4_gemm_pdl_safe(
+                    a_qkv, b_qkv, sa_qkv, sb_qkv, out=c_qkv, swizzled_scales=True
+                )
+                F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+                nvfp4_gemm_pdl_safe(a_o, b_o, sa_o, sb_o, out=c_o, swizzled_scales=True)
+                F.rms_norm(x, (d_model,), w, 1e-6)
+                nvfp4_dual_gemm_swiglu(
+                    a_mlp,
+                    b1,
+                    b2,
+                    sa_mlp,
+                    sb1,
+                    sb2,
+                    out=c_mlp,
+                    swizzled_scales=True,
+                    enable_pdl=True,
+                    pdl_safe=True,
+                )
+                nvfp4_gemm_pdl_safe(
+                    a_o, b_o, sa_o, sb_o, out=c_dn, swizzled_scales=True
+                )
+
+            for _ in range(10):
+                run_layer()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                run_layer()
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                for _ in range(10):
+                    run_layer()
+            for _ in range(5):
+                graph.replay()
+            torch.cuda.synchronize()
+            for out_t in (c_qkv, c_o, c_mlp, c_dn):
+                self.assertTrue(torch.isfinite(out_t.float()).all().item())
+                self.assertGreater(out_t.float().abs().sum().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3384,7 +3384,7 @@ class Sm100Nvfp4GemmPersistent2CTA:
         self.num_tmem_alloc_cols = 512
         self.pdl_safe = pdl_safe
         self.prefetch_dist_param = prefetch_dist
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = min(utils.get_smem_capacity_in_bytes("sm_100"), 196 * 1024)
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=160)
 

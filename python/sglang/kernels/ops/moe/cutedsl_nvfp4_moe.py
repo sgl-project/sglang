@@ -535,8 +535,9 @@ class Sm100Nvfp4MaskedDualGemmSwiGLU1CTA:
                     denom = cutlass.Float32(1.0) + cute.math.exp2(g_val * cutlass.Float32(-1.4426950408889634), fastmath=True)
                     tRS_rC.store(((g_val / denom) * u_val).to(self.c_dtype))
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, sub_i)])
-                tmem.free(acc1_tmem_ptr)
+                cute.arch.fence_view_async_tmem_load()
                 self.epilog_sync_barrier.arrive_and_wait()
+                tmem.free(acc1_tmem_ptr)
                 if warp_idx == 0:
                     cute.arch.fence_view_async_shared()
 {"".join(epi_branches)}
