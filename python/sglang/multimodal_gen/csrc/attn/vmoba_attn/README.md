@@ -8,10 +8,11 @@ Please ensure that you have installed FlashAttention version **2.7.1 or higher**
 ### Intel XPU
 
 On Intel XPU, VMoBA uses `sgl-kernel-xpu` rather than the CUDA FlashAttention
-package. This path is inference-only and requires Battlemage (BMG) or later,
-FP16 or BF16, and a kernel build that returns correct multi-query
-`softmax_lse`. Version `0.1.8` alone does not identify a compatible build;
-the adapter checks LSE on first use for each device and dtype.
+package. This path is inference-only and requires FP16 or BF16, plus a kernel
+build that honours K/V row strides and returns correct multi-query
+`softmax_lse`. `sgl_kernel` enforces Battlemage (BMG) or later on every call;
+the two contracts are covered by
+`test/unit/test_vmoba_xpu_integration.py::TestVMoBAXpuKernelContract`.
 
 Select `--attention-backend vmoba_attn` and provide the six chunking parameters
 under `moba_config` in `--attention-backend-config`. For example, for a video
@@ -27,14 +28,12 @@ Spatial and spatiotemporal chunk dimensions must divide the corresponding
 video patch dimensions. The denoising stage builds VMoBA metadata from this
 configuration, the current step, and the model's latent shape and patch size.
 Explicit VMoBA selection rejects unsupported dtypes or missing XPU attention
-dependencies instead of silently selecting dense attention. Hardware and LSE
-capability checks run when attention first executes.
+dependencies instead of silently selecting dense attention.
 
-Backend selection does not by itself establish end-to-end support for a
-particular Wan model on XPU. Validate the target pipeline separately. This
-compatibility path still copies strided K/V, gathers tensors, and merges
-attention outputs; no speedup or peak-memory parity with dense attention is
-guaranteed.
+Wan 2.1 T2V-1.3B has been generated end to end on this path at 77x448x832.
+Other pipelines and resolutions are unvalidated; peak memory is far above
+dense attention's, and the spatiotemporal layer exhausts a 24 GiB card at
+480x832, so validate the target pipeline before relying on it.
 
 ### Usage
 
