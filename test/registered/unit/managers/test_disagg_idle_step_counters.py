@@ -238,9 +238,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler._mlx_batch_chain_safe = MethodType(
                     mixin._mlx_batch_chain_safe, scheduler
                 )
-                scheduler.profiler_manager = SimpleNamespace(
-                    _profile_batch_predicate=Mock()
-                )
                 launch = SimpleNamespace(
                     mode="decode" if chained else "extend",
                     decode=object() if chained else None,
@@ -258,7 +255,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         return_value=SimpleNamespace(mlx_enable_sampling=False),
                     ),
                     patch.object(
-                        module.time, "monotonic", side_effect=LAUNCH_TIMESTAMPS
+                        scheduler_module.time,
+                        "monotonic",
+                        side_effect=LAUNCH_TIMESTAMPS,
                     ),
                 ):
                     self.run_and_check(
@@ -426,7 +425,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
-            reqs=[SimpleNamespace(rid="request", finished=Mock(return_value=False))],
+            reqs=[
+                SimpleNamespace(
+                    rid="request", finished=Mock(return_value=False), inflight_steps=0
+                )
+            ],
             forward_mode=mode,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             launch_ts=launch_ts,
@@ -556,6 +559,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
+        scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6

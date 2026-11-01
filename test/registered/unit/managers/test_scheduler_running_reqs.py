@@ -1,4 +1,5 @@
-"""The scheduler's running-request owner and the hooks that keep it."""
+"""The scheduler's running-request owner, the launched-step count, and the
+hooks that keep them."""
 
 import unittest
 from array import array
@@ -330,6 +331,47 @@ class TestRunningReqsHooks(CustomTestCase):
         self.assertIsNone(new_batch)
         s._add_request_to_queue.assert_called_once_with(victim)
         self.assertEqual(list(s.running_reqs), [other])
+
+
+class TestInflightSteps(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology())
+
+    def _scheduler(self):
+        s = _scheduler()
+        # process_batch_result around the mode-specific processing
+        s._deferred_responses = None
+        s.publish_load_snapshot = Mock()
+        s.load_publisher = MagicMock()
+        s.load_inquirer = MagicMock()
+        s.batch_result_processor = MagicMock()
+        s.tree_cache = MagicMock()
+        s._record_step_counters = Mock()
+        s.enable_fpm = False
+        s._maybe_clear_mm_inputs = Mock()
+        s.maybe_send_health_check_signal = Mock()
+        return s
+
+    def test_launch_counts_and_processing_uncounts(self):
+        s = self._scheduler()
+        a, b = _req("a"), _req("b")
+        first = _batch([a, b], ForwardMode.DECODE)
+        second = _batch([a], ForwardMode.DECODE)
+
+        _launch(s, first)
+        _launch(s, second)
+        self.assertEqual((a.inflight_steps, b.inflight_steps), (2, 1))
+
+        s.process_batch_result(first, MagicMock())
+        self.assertEqual((a.inflight_steps, b.inflight_steps), (1, 0))
+        s.process_batch_result(second, MagicMock())
+        self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
+
+    def test_processing_a_step_never_launched_asserts(self):
+        s = self._scheduler()
+        with self.assertRaisesRegex(AssertionError, "not launched"):
+            s.process_batch_result(_batch([_req("a")], ForwardMode.DECODE), MagicMock())
 
 
 if __name__ == "__main__":
