@@ -10,7 +10,12 @@ from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_memory,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -48,6 +53,8 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
+    if draft_backend == "aiter" and _aiter_serves_draft():
+        return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:
@@ -61,6 +68,26 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
             )
         return fallback
     return draft_backend
+
+
+def _aiter_serves_draft() -> bool:
+    # A DSpark MHA draft attends to its block bidirectionally; AITER's
+    # unified_attention runs that only once it accepts causal=False. The aiter
+    # MLA verify is causal-only, and the aiter backend reads neither a SHUFFLE
+    # 5D pool through unified_attention nor a unified-memory pool.
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative.dspark_components.dspark_config import draft_is_mla
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils.aiter import aiter_unified_attention_supports_non_causal
+
+    spec_algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+    return (
+        spec_algo.is_dspark()
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "nhd"
+        and not get_memory().enable_unified_memory
+        and aiter_unified_attention_supports_non_causal()
+        and not draft_is_mla()
+    )
 
 
 def build_draft_tp_worker(
