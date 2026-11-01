@@ -538,6 +538,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         *,
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
+        state_slots: int = 0,
     ) -> bool:
         return self.token_to_kv_pool_allocator.prealloc_fits(
             self.tree_cache,
@@ -545,10 +546,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_tokens,
             full_budget_tokens=full_allocatable_tokens,
             swa_budget_tokens=swa_allocatable_tokens,
+            state_slots=state_slots,
         )
 
+    def _pending_state_slots(self, req: Req) -> int:
+        """State slots the preallocation takes for ``req`` beside its tokens:
+        its working state unless it already holds one, and the tracking slots
+        of the extra buffer."""
+        state = self.token_to_kv_pool_allocator.state
+        if state is None or not self.req_to_token_pool.holds_state_slots:
+            return 0
+        return state.pending_request_slots(self.req_to_token_pool, req)
+
     def _reclaim_swa_tail_capacity(
-        self, swa_tail_len: int, req_id: str, *, full_len: int = 0
+        self,
+        swa_tail_len: int,
+        req_id: str,
+        *,
+        full_len: int = 0,
+        state_slots: int = 0,
     ) -> Optional[str]:
         allocator = self.token_to_kv_pool_allocator
         page_size = allocator.page_size
@@ -556,6 +572,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache,
             ceil_align(full_len, page_size),
             ceil_align(swa_tail_len, page_size),
+            state_slots=state_slots,
         )
         return None if shortfall is None else f"{shortfall}, req={req_id}"
 
@@ -1078,18 +1095,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             full_required, swa_required = self._prealloc_required_tokens(req)
+            state_slots = self._pending_state_slots(req)
             if not self._prealloc_reservation_fits(
                 full_required,
                 swa_required,
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
+                state_slots=state_slots,
             ):
                 break
 
             if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
                 full_len, swa_len = self._prealloc_kv_lens(req)
                 if (
-                    self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
+                    self._reclaim_swa_tail_capacity(
+                        swa_len, req.rid, full_len=full_len, state_slots=state_slots
+                    )
                     is not None
                 ):
                     break
@@ -1600,11 +1621,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif swa_allocatable_tokens is not None:
                 swa_required_for_admission = full_required_for_admission
 
+            state_slots = self._pending_state_slots(decode_req.req)
             if not self._prealloc_reservation_fits(
                 full_required_for_admission,
                 swa_required_for_admission,
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
+                state_slots=state_slots,
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
@@ -1616,6 +1639,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     swa_len,
                     decode_req.req.rid,
                     full_len=required_alloc_tokens,
+                    state_slots=state_slots,
                 )
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
@@ -2041,13 +2065,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
+        state_slots = self._pending_state_slots(req)
         if not self._prealloc_reservation_fits(
             required_tokens,
             swa_required_tokens,
             full_allocatable_tokens=full_allocatable_tokens,
             swa_allocatable_tokens=swa_allocatable_tokens,
+            state_slots=state_slots,
         ):
             return False
+        if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
+            # The request's state slots are taken before its tokens: reclaim
+            # what admission credited for both first.
+            full_len, swa_len = self._prealloc_kv_lens(req)
+            if (
+                self._reclaim_swa_tail_capacity(
+                    swa_len, req.rid, full_len=full_len, state_slots=state_slots
+                )
+                is not None
+            ):
+                return False
         self._pre_alloc(req)
         decode_req.host_staged = False
         return True

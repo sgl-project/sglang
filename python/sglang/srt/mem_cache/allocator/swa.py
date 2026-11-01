@@ -184,14 +184,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
+        self, tree_cache, full_tokens: int, swa_tokens: int, *, state_slots: int = 0
     ) -> str | None:
         """Free room for a decode-node preallocation; None means it is ready.
 
         Returns a description of the shortfall when it cannot be met, for the
         caller to attach to whichever request it was admitting. Separate
         buffers make the sliding-window side the only one that needs
-        reclaiming here, since the full side is priced by the caller's budget.
+        reclaiming here, since the full side is priced by the caller's budget
+        and state slots (in a pool of their own) by the caller's state check.
         """
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 

@@ -150,6 +150,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         *,
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
+        state_slots: int = 0,
     ) -> bool:
         """Whether a decode-node preallocation of this size fits.
 
@@ -157,9 +158,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         decode headroom and retraction are reserved. Separate buffers make the
         two sides independent, so each is checked against its own budget and
         ``tree_cache`` is never read -- what it could reclaim is already
-        inside that budget. A pool that cuts both sides from one buffer
-        overrides this to price them together, since a per-side token budget
-        cannot express a shared byte envelope.
+        inside that budget. ``state_slots`` live in a pool of their own here,
+        which the caller has already made room in. A pool that cuts both sides
+        (and state slots) from one buffer overrides this to price them
+        together, since a per-side budget cannot express a shared byte
+        envelope.
         """
         return full_tokens <= full_budget_tokens and (
             swa_budget_tokens is None or swa_tokens <= swa_budget_tokens

@@ -423,11 +423,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.logical_attn_allocator.swa_available_size()
 
     def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
+        self, tree_cache, full_tokens: int, swa_tokens: int, *, state_slots: int = 0
     ) -> str | None:
         # C4 needs no reclaim here: full_available_size prices it into the budget.
         return self.logical_attn_allocator.reclaim_for_prealloc(
-            tree_cache, full_tokens, swa_tokens
+            tree_cache, full_tokens, swa_tokens, state_slots=state_slots
         )
 
     def free_swa(self, free_indices: torch.Tensor):
