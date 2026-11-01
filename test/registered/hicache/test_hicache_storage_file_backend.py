@@ -30,8 +30,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=160, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=790, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=500, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=1050, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -321,6 +321,26 @@ class TestHiCacheStorageRandomDelay(HiCacheStorageBaseMixin, CustomTestCase):
                 700,
                 "Delayed storage IO must not turn a stored prefix into a miss",
             )
+
+
+class TestHiCacheStorageBufferOnlyRandomDelay(TestHiCacheStorageRandomDelay):
+    """buffer_only host memory on TP2 with skewed storage IO timing: the
+    outcome of every storage operation is agreed on the scheduler thread, so
+    every rank publishes the same outcome in the same tick (the rank
+    consensus checker fails the server otherwise) and the skew changes only
+    latency, never hit semantics. The first multi-rank buffer_only + storage
+    e2e: the TP1 ones on main cannot see a rank disagreement."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args.update(
+            {
+                "--hicache-host-memory-mode": "buffer_only",
+                "--hicache-write-policy": "write_through",
+            }
+        )
+        return server_args, env_vars
 
 
 class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):

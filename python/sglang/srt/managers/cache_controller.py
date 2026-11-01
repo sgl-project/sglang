@@ -15,6 +15,8 @@ limitations under the License.
 
 
 import logging
+import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -271,6 +273,32 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 # write window dynamically into whatever load staging is not using.
 HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 
+# Bound on waiting for the storage workers to stop. After the stop event a
+# worker finishes only the backend call it is inside (the backlog is answered
+# without touching the backend), so the bound covers one slow call, not a
+# queue. Still-running workers are logged every STORAGE_STOP_LOG_EVERY_S.
+STORAGE_STOP_JOIN_S = 60.0
+STORAGE_STOP_LOG_EVERY_S = 10.0
+
+
+def _describe_thread(thread: threading.Thread) -> str:
+    """The thread's name and, when its stack is available, the call it is in."""
+    frame = sys._current_frames().get(thread.ident)
+    if frame is None:
+        return thread.name
+    innermost = frame
+    own = None
+    while frame is not None:
+        if own is None and os.sep + "sglang" + os.sep in frame.f_code.co_filename:
+            own = frame
+        frame = frame.f_back
+    calls = [
+        f"{f.f_code.co_name} ({os.path.basename(f.f_code.co_filename)}:{f.f_lineno})"
+        for f in (own, innermost)
+        if f is not None
+    ]
+    return f"{thread.name} in " + " -> ".join(dict.fromkeys(calls))
+
 
 class PrefetchOperation(StorageOperation):
     def __init__(
@@ -286,6 +314,10 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Transfer acks this rank published so far and the completed prefix
+        # the last one carried (see HiCacheController._put_transfer_ack).
+        self.published_transfer_acks = 0
+        self.published_transfer_tokens = 0
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -351,6 +383,12 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        # The storage workers this controller started: None until started and
+        # again once stopped. A native controller starts none.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_sync_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
 
         # Storage control queues, (re)created whenever the storage threads start.
         self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
@@ -460,18 +498,6 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
-        self.prefetch_thread = threading.Thread(
-            target=self.prefetch_thread_func, daemon=True
-        )
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_sync_thread = threading.Thread(
-            target=self.prefetch_sync_thread_func, daemon=True
-        )
-        self.backup_thread = threading.Thread(
-            target=self.backup_thread_func, daemon=True
-        )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
         self.prefetch_buffer = Queue()
@@ -480,11 +506,80 @@ class HiCacheController:
         self.ack_prefetch_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
+        self._start_storage_worker_threads()
 
+    def _start_storage_worker_threads(self) -> None:
+        """Create and start the four storage workers; their queues must exist."""
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, name="hicache-prefetch", daemon=True
+        )
+        self.prefetch_io_aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, name="hicache-prefetch-io", daemon=True
+        )
+        self.prefetch_sync_thread = threading.Thread(
+            target=self.prefetch_sync_thread_func,
+            name="hicache-prefetch-sync",
+            daemon=True,
+        )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, name="hicache-backup", daemon=True
+        )
         self.prefetch_thread.start()
         self.prefetch_io_aux_thread.start()
         self.prefetch_sync_thread.start()
         self.backup_thread.start()
+
+    def _storage_worker_threads(self) -> List[threading.Thread]:
+        """The storage workers started and not yet stopped."""
+        return [
+            thread
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.prefetch_sync_thread,
+                self.backup_thread,
+            )
+            if thread is not None
+        ]
+
+    def dead_storage_workers(self) -> List[str]:
+        """Names of started workers that exited without being told to stop.
+
+        A worker leaves its loop only on an exception or on the stop event.
+        While the event is set a finished worker did what it was asked: a stop
+        that hit its bound leaves the threads in the started set, and the
+        retried stop joins them (the event is cleared only after a stop that
+        succeeded, on the scheduler thread, so this reads the same on every
+        rank in a tick)."""
+        if self.storage_stop_event.is_set():
+            return []
+        return [t.name for t in self._storage_worker_threads() if not t.is_alive()]
+
+    def storage_workers_alive(self) -> bool:
+        """Every started storage worker is alive; a controller that started
+        none reports alive. The tree folds this word into its per-tick count
+        exchange (MIN), so a death on any rank raises on every rank at once."""
+        return not self.dead_storage_workers()
+
+    def _join_storage_threads(self, threads: List[threading.Thread]) -> None:
+        """Wait up to STORAGE_STOP_JOIN_S for threads to exit, logging the ones
+        still running, and the call each is inside, every STORAGE_STOP_LOG_EVERY_S."""
+        start = time.monotonic()
+        deadline = start + STORAGE_STOP_JOIN_S
+        next_log = start + STORAGE_STOP_LOG_EVERY_S
+        while True:
+            alive = [t for t in threads if t.is_alive()]
+            now = time.monotonic()
+            if not alive or now >= deadline:
+                return
+            alive[0].join(timeout=max(0.0, min(next_log, deadline) - now))
+            if time.monotonic() >= next_log:
+                logger.warning(
+                    "HiCache storage threads still running %.0fs after stop: %s",
+                    time.monotonic() - start,
+                    "; ".join(_describe_thread(t) for t in threads if t.is_alive()),
+                )
+                next_log = time.monotonic() + STORAGE_STOP_LOG_EVERY_S
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -511,30 +606,22 @@ class HiCacheController:
         except Exception:
             pass
 
-        # Best-effort joins (threads are daemon, but join keeps state clean).
-        threads = []
-        if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
-        if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
-        if hasattr(self, "prefetch_sync_thread"):
-            threads.append(self.prefetch_sync_thread)
+        # Bounded joins (threads are daemon, but join keeps state clean).
+        threads = self._storage_worker_threads()
+        self._join_storage_threads(threads)
 
-        for t in threads:
-            try:
-                t.join(timeout=10)
-            except Exception:
-                pass
-
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [t for t in threads if t.is_alive()]
         if alive:
             logger.error(
                 "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                [_describe_thread(t) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        # Stopped workers leave the started set: liveness is over started threads.
+        self.prefetch_thread = None
+        self.prefetch_io_aux_thread = None
+        self.prefetch_sync_thread = None
+        self.backup_thread = None
 
     # A subclass whose attach continues registering host pools after super()
     # returns fires on_host_pools_registered() itself, once.
@@ -932,22 +1019,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.prefetch_io_aux_thread = threading.Thread(
-                target=self.prefetch_io_aux_func, daemon=True
-            )
-            self.prefetch_sync_thread = threading.Thread(
-                target=self.prefetch_sync_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.prefetch_io_aux_thread.start()
-            self.prefetch_sync_thread.start()
-            self.backup_thread.start()
+            self._start_storage_worker_threads()
 
     def has_inflight_device_transfers(self) -> bool:
         """Whether queued or unacknowledged L2 transfers still use device rows."""
@@ -1294,13 +1366,56 @@ class HiCacheController:
                 if prefix_keys is not None:
                     prefix_keys = prefix_keys + batch_hashes
                 completed_pages += hit_pages
-            ack = PrefetchAck(
-                rid=operation.request_id,
-                completed_tokens=completed_pages * self.page_size,
-                operation=operation,
+            self._put_transfer_ack(
+                operation, completed_tokens=completed_pages * self.page_size
             )
-            self.prefetch_sync_queue.put(ack)
         return completed_pages
+
+    def _put_transfer_ack(
+        self,
+        operation: PrefetchOperation,
+        completed_tokens: Optional[int] = None,
+        pool_hits: Optional[dict[str, int]] = None,
+    ) -> None:
+        """Publish one of the acks the sync thread reduces with the peers.
+
+        Counted on the operation so that a transfer that raised can still
+        publish the acks it did not reach (_publish_missing_transfer_acks):
+        every rank must publish ceil(pages / STORAGE_BATCH_SIZE) batch acks,
+        the sidecar ack when the operation carries pool transfers, then the
+        completed_req ack, or the peers' next reduce pairs with the wrong ack.
+        """
+        operation.published_transfer_acks += 1
+        if completed_tokens is not None:
+            operation.published_transfer_tokens = completed_tokens
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id,
+                operation=operation,
+                completed_tokens=completed_tokens,
+                pool_hits=pool_hits,
+            )
+        )
+
+    @staticmethod
+    def _transfer_batch_count(operation: PrefetchOperation) -> int:
+        """Batch acks _page_transfer publishes for the operation."""
+        return -(-len(operation.hash_value) // STORAGE_BATCH_SIZE)
+
+    def _publish_missing_transfer_acks(self, operation: PrefetchOperation) -> None:
+        """After a transfer raised, publish the batch acks it did not reach.
+
+        They carry the completed prefix this rank last published (never less:
+        the scheduler drain asserts the reduced prefix is monotone), so the
+        request keeps the prefix this rank really has.
+        """
+        missing = (
+            self._transfer_batch_count(operation) - operation.published_transfer_acks
+        )
+        for _ in range(missing):
+            self._put_transfer_ack(
+                operation, completed_tokens=operation.published_transfer_tokens
+            )
 
     def _page_transfer_kv_batch(
         self,
@@ -1354,6 +1469,16 @@ class HiCacheController:
                 continue
             try:
                 self._page_transfer(operation)
+            except Exception:
+                # The worker stays up (without it the hit path's host bounces
+                # are never freed) and publishes the acks the transfer did not
+                # reach, each carrying the prefix this rank completed, so the
+                # per-operation ack sequence is the same on every rank.
+                logger.exception(
+                    "HiCache prefetch transfer failed for request %s",
+                    operation.request_id,
+                )
+                self._publish_missing_transfer_acks(operation)
             finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1434,36 +1559,36 @@ class HiCacheController:
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                try:
-                    if operation.is_terminated():
-                        hash_value, storage_hit_count = [], 0
-                    else:
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
-                        )
-                except Exception:
-                    logger.exception(
-                        "HiCache storage query failed for request %s",
-                        operation.request_id,
-                    )
-                    hash_value, storage_hit_count = [], 0
-
-                storage_hit_count = self._sync_prefetch_hit_query(
-                    operation, storage_hit_count
-                )
-
-                # Record the TP-synced hit count; the scheduler thread decides
-                # at drain time whether to revoke (below threshold) or allocate.
-                operation.hash_value = hash_value[
-                    : (storage_hit_count // self.page_size)
-                ]
-                operation.storage_hit_count = storage_hit_count
-                self.prefetch_hit_queue.put(operation)
-
             except Empty:
                 continue
+            if operation is None:
+                continue
+            # Everything before the reduce is guarded: the peers are inside
+            # that collective, so a failure here answers with 0 hits and still
+            # joins it. After the stop event every queued query is answered
+            # as a miss without a backend call (MIN agrees on 0 even when a
+            # peer's worker queried before it saw the stop).
+            try:
+                if operation.is_terminated() or self.storage_stop_event.is_set():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+            except Exception:
+                logger.exception(
+                    "HiCache storage query failed for request %s",
+                    operation.request_id,
+                )
+                hash_value, storage_hit_count = [], 0
+
+            storage_hit_count = self._sync_prefetch_hit_query(
+                operation, storage_hit_count
+            )
+
+            # Record the TP-synced hit count; the scheduler thread decides
+            # at drain time whether to revoke (below threshold) or allocate.
+            operation.hash_value = hash_value[: (storage_hit_count // self.page_size)]
+            operation.storage_hit_count = storage_hit_count
+            self.prefetch_hit_queue.put(operation)
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
@@ -1514,6 +1639,9 @@ class HiCacheController:
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            if self.storage_stop_event.is_set():
+                # Stopping: no new backend writes; the ack carries what completed.
+                break
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size

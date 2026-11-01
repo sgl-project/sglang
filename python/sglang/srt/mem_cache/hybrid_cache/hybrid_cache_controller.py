@@ -163,6 +163,10 @@ class PrefetchOperation(StorageOperation):
         self.prefetch_kv_page_offset = 0
         self.group_skip_pages = 0
         self.start_time = time.monotonic()
+        # Transfer acks this rank published so far and the completed prefix
+        # the last one carried (see HiCacheController._put_transfer_ack).
+        self.published_transfer_acks = 0
+        self.published_transfer_tokens = 0
         # Take the whole span as present instead of querying for it; the read
         # itself is fail-soft, so a wrong guess shortens the fetch.
         self.assume_stored = assume_stored
@@ -281,7 +285,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
-                target=self.pp_prefetch_command_thread_func, daemon=True
+                target=self.pp_prefetch_command_thread_func,
+                name="hicache-pp-ticket",
+                daemon=True,
             )
             self.pp_prefetch_command_thread.start()
 
@@ -291,7 +297,7 @@ class HybridCacheController(BaseHiCacheController):
             return
         if thread.is_alive() and getattr(self, "pp_rank", 0) == 0:
             self.pp_prefetch_command_queue.put(None)
-        thread.join(timeout=10)
+        self._join_storage_threads([thread])
         if thread.is_alive():
             raise RuntimeError("Failed to stop PP HiCache ticket thread cleanly.")
         self.pp_prefetch_command_thread = None
@@ -299,6 +305,12 @@ class HybridCacheController(BaseHiCacheController):
     def _stop_storage_threads(self):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
+
+    # The PP ticket thread is deliberately not a liveness-set worker: on a
+    # flush PP0 stops it one relay step before PP1+ processes the same request,
+    # and PP1+'s copy exits on PP0's None ticket while PP1+ still ticks its
+    # current iteration (per-stage reduce in buffer_only), which would raise
+    # falsely there. is_pp_prefetch_ready() keeps checking it on the request path.
 
     @staticmethod
     def supports_page_envelope_host(storage_backend: str | None) -> bool:
@@ -505,7 +517,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.enable_storage and self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
-                target=self.pp_prefetch_command_thread_func, daemon=True
+                target=self.pp_prefetch_command_thread_func,
+                name="hicache-pp-ticket",
+                daemon=True,
             )
             self.pp_prefetch_command_thread.start()
         if self.enable_storage:
@@ -1630,25 +1644,27 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
-        ):
-            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
-            # Only handle non-KV-derived sidecar pools here.
-            transfers_nonkv = [
-                transfer
-                for transfer in operation.pool_transfers
-                if transfer.indices_from_pool != PoolName.KV
-            ]
-            sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
-            sidecar_hit_pages = (
-                operation.sidecar_hit_pages
-                if operation.sidecar_hash_values is not None
-                else kv_completed_pages
-            )
-            self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
-            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            try:
+        try:
+            if not operation.is_terminated() and kv_completed_pages == len(
+                operation.hash_value
+            ):
+                # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
+                # Only handle non-KV-derived sidecar pools here.
+                transfers_nonkv = [
+                    transfer
+                    for transfer in operation.pool_transfers
+                    if transfer.indices_from_pool != PoolName.KV
+                ]
+                sidecar_hashes = operation.sidecar_hash_values or operation.hash_value
+                sidecar_hit_pages = (
+                    operation.sidecar_hit_pages
+                    if operation.sidecar_hash_values is not None
+                    else kv_completed_pages
+                )
+                self._sync_trailing_keys(
+                    transfers_nonkv, sidecar_hashes, sidecar_hit_pages
+                )
+                self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
                 results = {}
                 for extra_info, transfers in _trailing_chain_groups(
                     operation.prefix_keys,
@@ -1661,22 +1677,30 @@ class HybridCacheController(BaseHiCacheController):
                         )
                     )
                 pool_hits = count_pool_hits(results)
-            except Exception:
-                logger.exception(
-                    "HiCache sidecar prefetch failed for request %s",
-                    operation.request_id,
-                )
+        except Exception:
+            # The sidecar ack below is still published (empty: zero hits on
+            # every pool after the MIN), so the per-operation ack sequence
+            # stays identical across ranks and the worker stays up.
+            pool_hits = {}
+            logger.exception(
+                "HiCache sidecar prefetch failed for request %s",
+                operation.request_id,
+            )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
-        self.prefetch_sync_queue.put(
-            PrefetchAck(
-                rid=operation.request_id,
-                operation=operation,
-                pool_hits=pool_hits,
-            )
-        )
-        return
+        self._put_transfer_ack(operation, pool_hits=pool_hits)
+
+    def _publish_missing_transfer_acks(self, operation: PrefetchOperation) -> None:
+        super()._publish_missing_transfer_acks(operation)
+        # The sidecar ack follows the batch acks; a transfer that raised before
+        # reaching _page_transfer_sidecar still owes it (zero hits after the MIN).
+        if (
+            operation.pool_transfers is not None
+            and operation.published_transfer_acks
+            == self._transfer_batch_count(operation)
+        ):
+            self._put_transfer_ack(operation, pool_hits={})
 
     def trim_prefetch_full_head(self, operation, trim_tokens: int) -> None:
         """Drop a device-resident FULL head after the availability query;
@@ -1700,6 +1724,11 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
+        if self.storage_stop_event.is_set():
+            # Stopping: no new backend writes. The sidecar write below is one
+            # backend call the base loop's own stop check does not see; the
+            # ack carries what completed (nothing).
+            return
         # Write primary KV only on its selected shard writer. Rank-sharded
         # sidecars can still need every TP rank.
         backup_transfers = [
