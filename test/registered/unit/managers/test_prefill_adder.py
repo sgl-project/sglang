@@ -74,6 +74,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
+        tree_cache.window_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
@@ -443,11 +444,11 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_shared_adder()
         self.assertIsNotNone(adder.token_to_kv_pool_allocator.alloc(24))
         self.mock_tree_cache.full_evictable_size.return_value = 24
-        self.mock_tree_cache.swa_evictable_size.return_value = 24
+        self.mock_tree_cache.window_evictable_size.return_value = 24
 
         def lock_prefix(_):
             self.mock_tree_cache.full_evictable_size.return_value = 0
-            self.mock_tree_cache.swa_evictable_size.return_value = 0
+            self.mock_tree_cache.window_evictable_size.return_value = 0
             return IncLockRefResult()
 
         self.mock_tree_cache.inc_lock_ref.side_effect = lock_prefix

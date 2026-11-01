@@ -532,6 +532,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             raise AttributeError("a chain without a window has no window tokens")
         return self.units_available(self.swa_attn_allocator.sub_pool_name)
 
+    def window_available_size(self, component: ComponentType) -> int:
+        """What a take from the window sub-pool of prefix-tree slot
+        ``component`` can serve now."""
+        for window in self._windows:
+            if self.window_component(window) == component:
+                return self.units_available(window.sub_pool_name)
+        raise KeyError(f"no window sub-pool for tree slot {component}")
+
     def state_slots_available(self) -> int:
         return self.units_available(self.mamba_allocator.sub_pool_name)
 
@@ -663,11 +671,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     window.sub_pool_name,
                     component,
                     tree_cache.window_retain_size(component),
-                    (
-                        tree_cache.swa_evictable_size()
-                        if component == ComponentType.SWA
-                        else tree_cache.window_evictable_size(component)
-                    ),
+                    tree_cache.window_evictable_size(component),
                 )
             )
         return tuple(windows)

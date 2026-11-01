@@ -588,7 +588,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def window_available_size(self, component: ComponentType) -> int:
         """What the pool of window slot ``component`` can serve now."""
-        return self.token_to_kv_pool_allocator.swa_available_size()
+        return self.token_to_kv_pool_allocator.window_available_size(component)
 
     def all_windows(self, tokens: int) -> dict[ComponentType, int]:
         """``tokens`` for every window slot of this tree: the window part of a

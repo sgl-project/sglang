@@ -4019,8 +4019,8 @@ class UnifiedRadixCache(BasePrefixCache):
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
                 continue
-            if ct.is_swa:
-                available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            if ct in self.window_slots():
+                available_size = self.window_available_size(ct)
             elif ct.is_mamba:
                 available_size = (
                     self.token_to_kv_pool_allocator.state_slots.available_size()
