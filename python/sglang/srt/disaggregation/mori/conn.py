@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     is_elided_entry,
@@ -1650,6 +1651,9 @@ class MoriKVManager(CommonKVManager):
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
+        src_state_indices = align_window_tails(
+            self.kv_args, src_state_indices, dst_state_indices
+        )
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 

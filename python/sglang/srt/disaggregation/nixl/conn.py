@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -3039,6 +3040,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"NIXL state layout rejected for {peer_name}: {rejection}"
             )
         state_types = getattr(self.kv_args, "state_types", []) or []
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, dst_state_indices
+        )
         src_state_data_ptrs = self.kv_args.state_data_ptrs or []
         src_state_item_lens = self.kv_args.state_item_lens or []
         src_state_dim_per_tensor = (

@@ -132,9 +132,9 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
-    # The state entries every prefill rank registers, as (state type, sub-pool)
-    # pairs; None when pipeline stages register different ones (stages that
-    # hold different sub-pools) or the ranks do not report them.
+    # The state entries every prefill rank registers, as (state type, sub-pool,
+    # window tail) entries; None when pipeline stages register different ones
+    # (stages that hold different sub-pools) or the ranks do not report them.
     state_wire: Optional[List[List[Optional[str]]]] = None
     # Each pipeline stage's entries, by stage, when the stages differ.
     state_wires: Optional[List[Optional[List[List[Optional[str]]]]]] = None

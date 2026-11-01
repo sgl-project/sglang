@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -1958,6 +1959,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, req.dst_state_indices
+        )
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None

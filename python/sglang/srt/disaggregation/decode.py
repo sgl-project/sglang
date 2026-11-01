@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     prepare_abort,
     record_network_transfer,
+    retained_window_lengths,
     setup_state_kv_args,
     state_indices_per_entry,
 )
@@ -621,31 +622,54 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
+    def _window_reaches(self) -> Optional[Dict[str, int]]:
+        """How far back readers beyond the windows' own layers (a fused
+        draft's front rows) read each window sub-pool, by name."""
+        return getattr(self.tree_cache, "draft_window_reaches", None)
+
+    def _target_window_tail(self) -> Optional[int]:
+        """The tail a request keeps of the target's window: its length, widened
+        by a reader reaching further back."""
+        window = self.scheduler.sliding_window_size
+        if window is None:
+            return None
+        return retained_window_lengths(
+            self.token_to_kv_pool_allocator, self._window_reaches(), window
+        ).get(window_sub_pool_of(self.token_to_kv_pool_allocator), window)
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc():
             return max(seq_len, 0)
         return window_tail_len(
             seq_len,
-            self.scheduler.sliding_window_size,
+            self._target_window_tail(),
             self.token_to_kv_pool_allocator.page_size,
             keep_insert_boundary=get_disagg().disaggregation_decode_enable_radix_cache,
         )
 
     @staticmethod
-    def _window_lengths_of(storage, unstated: Optional[int]) -> Dict[str, int]:
-        """Every window sub-pool's own length, by name, of a unified pool; a
-        static pool's single window goes by the scheduler's window alone."""
+    def _window_lengths_of(
+        storage, unstated: Optional[int], reaches: Optional[Dict[str, int]] = None
+    ) -> Dict[str, int]:
+        """Every window sub-pool's kept tail, by name, of a unified pool: its
+        own length, widened by ``reaches``; a static pool's single window goes
+        by the target's tail alone."""
         if isinstance(storage, StaticKVStorage):
             return {}
-        return storage.window_lengths(unstated)
+        return retained_window_lengths(storage.allocator, reaches, unstated)
 
     @staticmethod
     def _window_tails_of(
-        storage, unstated: Optional[int], seq_len: int, *, keep_insert_boundary: bool
+        storage,
+        unstated: Optional[int],
+        seq_len: int,
+        *,
+        keep_insert_boundary: bool,
+        reaches: Optional[Dict[str, int]] = None,
     ) -> Dict[str, int]:
         """The tail each window sub-pool keeps of ``seq_len`` tokens, by its
-        own length: what the prefill sends of it and the decode binds."""
-        lengths = DecodePreallocQueue._window_lengths_of(storage, unstated)
+        own kept length: what the prefill sends of it and the decode binds."""
+        lengths = DecodePreallocQueue._window_lengths_of(storage, unstated, reaches)
         if not lengths:
             return {}
         page_size = storage.allocator.page_size
@@ -666,7 +690,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
         )
-        lengths = self._window_lengths_of(storage, self.scheduler.sliding_window_size)
+        lengths = self._window_lengths_of(
+            storage, self.scheduler.sliding_window_size, self._window_reaches()
+        )
         if lengths:
             # The target's window goes by the scheduler's tail (`_swa_tail_len`).
             lengths.pop(storage.allocator.swa_attn_allocator.sub_pool_name, None)
@@ -808,6 +834,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             storage,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
+            window_tails=retained_window_lengths(
+                self.token_to_kv_pool_allocator,
+                self._window_reaches(),
+                self.scheduler.sliding_window_size,
+            ),
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -882,7 +913,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # the window's own length), one per window state entry, in state
             # entry order.
             window_lengths = self._window_lengths_of(
-                storage, self.scheduler.sliding_window_size
+                storage, self.scheduler.sliding_window_size, self._window_reaches()
             )
             self.host_window_entries = []
             host_state = ([], [], [])
@@ -890,9 +921,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 zip(window_sub_pools, window_host_pools)
             ):
                 host_pool = group.get_pool(name)
-                window = window_lengths.get(
-                    sub_pool, self.scheduler.sliding_window_size
-                )
+                window = window_lengths.get(sub_pool, self._target_window_tail())
                 reserved = min(
                     decode_retraction_max_tokens(
                         self.req_to_token_pool, storage.view(sub_pool)
@@ -1878,6 +1907,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     token_start=total_prefix_len,
                     token_boundary=seq_len,
                     window=window,
+                    retain=retained_window_lengths(
+                        self.token_to_kv_pool_allocator, self._window_reaches(), window
+                    ).get(sub_pool),
                 )
                 return resume.unit_ids.cpu().numpy()
 
