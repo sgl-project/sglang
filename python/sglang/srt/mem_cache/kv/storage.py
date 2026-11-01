@@ -10,7 +10,17 @@ code outside the KV package loops over them instead of naming a combination.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -240,12 +250,14 @@ class KVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
+        window_tails: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Owner token ids for ``[prefix_len, seq_len)`` of each request's
         ``rows`` entry, by page, continuing each request's last page from
         ``last_loc``; None when they do not fit. With ``window_tail`` (one
-        request whose KV a peer sends), a window binds pages for its last
-        ``window_tail`` tokens only."""
+        request whose KV a peer sends), the target's window binds pages for
+        its last ``window_tail`` tokens only, and each window ``window_tails``
+        names (by sub-pool) for its own last tokens."""
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -263,6 +275,7 @@ class KVStorage:
                 last_loc=last_loc,
                 extend_num_tokens=num_tokens,
                 swa_tail_len=window_tail,
+                window_tail_lens=window_tails,
             )
         return self._allocator.alloc_extend(
             prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, num_tokens
@@ -666,6 +679,21 @@ class KVStorage:
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
+
+    def window_lengths(self, unstated: Optional[int] = None) -> Dict[str, int]:
+        """Each window sub-pool's retention length, by name: the window its
+        layers declare, or ``unstated`` for a window the model does not state.
+        What a peer sends of a window (`resume_units`) is this long."""
+        lengths = {}
+        for s in self._plan.sub_pools:
+            if isinstance(s.lifetime, WindowLifetime):
+                window = (
+                    s.lifetime.window if s.lifetime.window is not None else unstated
+                )
+                if window is None:
+                    raise ValueError(f"window {s.name!r} states no retention length")
+                lengths[s.name] = window
+        return lengths
 
     def resume_units(
         self,
