@@ -224,7 +224,8 @@ class _Workload:
         key = session.key()
         match = cache.match_prefix(MatchPrefixParams(key=key))
         device_len, host_len = match.device_prefix_len, match.host_hit_length
-        swa_host_len = match.swa_host_hit_length if self.swa else 0
+        window_hits = dict(match.window_host_hit_lengths) if self.swa else {}
+        swa_host_len = max(window_hits.values(), default=0)
         # Lock the hit first: it is not evictable room for the request itself.
         admit_lock = cache.lock(match.last_device_node)
         extend = session.prompt_len - device_len + batch_extend
@@ -243,8 +244,7 @@ class _Workload:
             req = SimpleNamespace(
                 rid=f"s{session.sid}",
                 last_node=last_node,
-                swa_host_hit_length=swa_host_len,
-                window_host_hit_lengths={},
+                window_host_hit_lengths=window_hits,
                 mamba_host_hit_length=0,
                 kv=SimpleNamespace(mamba_pool_idx=None),
             )
