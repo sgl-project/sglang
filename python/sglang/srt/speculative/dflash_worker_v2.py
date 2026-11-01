@@ -264,7 +264,8 @@ class _SelectorDraftSampler:
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
-        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        self.max_bs = int(max_bs)
+        max_bs, gamma, top_k = self.max_bs, self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -881,6 +882,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+    def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
+        # A batch past the sampler's static buffers has no captured bucket,
+        # so its draft runs eager and the eager head reads none of them.
+        if self._draft_sampler is not None and bs <= self._draft_sampler.max_bs:
+            self._draft_sampler.stage_sampling_params(
+                bs=bs, sampling_info=sampling_info
+            )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -2696,11 +2705,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
+            # Consumed by the in-graph sample; must be staged before the replay.
+            self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         with (
             torch.inference_mode(),
