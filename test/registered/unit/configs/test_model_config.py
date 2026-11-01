@@ -365,6 +365,41 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                     load_decision_config(checkpoint, None)
 
 
+class TestAudioUnderstandableFlag(CustomTestCase):
+    """is_audio_understandable_model must key on the value, not attribute
+    presence. Non-audio variants of multimodal families ship audio_config:
+    null in config.json; a presence check (hasattr) reads that as
+    audio-capable and /model_info misreports has_audio_understanding. The
+    flag must be True only when an audio config value is present.
+    """
+
+    def _build(self, **config_kwargs):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+                **config_kwargs,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(ServerArgs(model_path=checkpoint))
+
+    def test_missing_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build().is_audio_understandable_model)
+
+    def test_null_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build(audio_config=None).is_audio_understandable_model)
+
+    def test_present_audio_config_is_understandable(self):
+        self.assertTrue(
+            self._build(
+                audio_config={"num_mel_bins": 128}
+            ).is_audio_understandable_model
+        )
+
+
 class TestDefaultContextLength(CustomTestCase):
     """The default context sizes one window, never the document."""
 
