@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -400,6 +401,8 @@ def install_triton_json(report: IntreeReport):
 
 def make_mhc_tile_m16_config(orig: Callable) -> Callable:
     """aiter#6030: FP32 fn (not packed BF16) decode M <= 1024 uses tile_m=16."""
+    # an aiter older than the preshuffled weight / residual layouts takes (m, hidden_size)
+    preshuffle_args = "w_preshuffle_bf16" in inspect.signature(orig).parameters
 
     @functools.lru_cache(maxsize=1024)
     def get_mhc_fused_post_pre_config(
@@ -408,12 +411,18 @@ def make_mhc_tile_m16_config(orig: Callable) -> Callable:
         w_preshuffle_bf16: bool = False,
         res_preshuffle: bool = False,
     ):
-        split_k, tile_m, tile_n, tile_k = orig(
-            m,
-            hidden_size,
-            w_preshuffle_bf16=w_preshuffle_bf16,
-            res_preshuffle=res_preshuffle,
-        )
+        if preshuffle_args:
+            config = orig(
+                m,
+                hidden_size,
+                w_preshuffle_bf16=w_preshuffle_bf16,
+                res_preshuffle=res_preshuffle,
+            )
+        elif w_preshuffle_bf16 or res_preshuffle:
+            raise TypeError("this aiter's mHC config has no preshuffled layouts")
+        else:
+            config = orig(m, hidden_size)
+        split_k, tile_m, tile_n, tile_k = config
         if not w_preshuffle_bf16 and m <= MHC_TILE_M16_MAX_M:
             tile_m = 16
         return split_k, tile_m, tile_n, tile_k
