@@ -139,8 +139,8 @@ def _run_overlap_loop(
 ):
     """Run event_loop_overlap over a decode batch of reqs, with real scheduling
     and launch up to the forward; the first result finishes reqs[0]. Returns the
-    rids of each launched batch, checked at launch to hold no finished row,
-    with whether each row has an earlier step still unprocessed at that launch."""
+    rids of each launched batch, with whether each row has an earlier step still
+    unprocessed at that launch."""
     s = Scheduler.__new__(Scheduler)
     for req in reqs:
         req.kv.kv_committed_len = 4

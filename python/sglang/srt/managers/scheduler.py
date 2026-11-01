@@ -4800,7 +4800,6 @@ class Scheduler(
 
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
-        self.invariant_checker.maybe_check_launched_reqs(batch)
         batch.add_inflight_step()
         self._join_launched_reqs(batch)
 

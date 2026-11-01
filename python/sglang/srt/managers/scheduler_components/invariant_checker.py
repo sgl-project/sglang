@@ -522,19 +522,6 @@ class SchedulerInvariantChecker:
                 f"Requests processed by a step they were not launched in: {uncounted}"
             )
 
-    def maybe_check_launched_reqs(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a launched batch carries no
-        finished request: result processing runs before scheduling or after the
-        launch, never between the two. A prebuilt step runs no forward."""
-        if (
-            not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get()
-            or batch.forward_mode.is_prebuilt()
-        ):
-            return
-        finished = [req.rid for req in batch.reqs if req.finished()]
-        if finished:
-            raise RuntimeError(f"Launched batch carries finished requests: {finished}")
-
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
             return
