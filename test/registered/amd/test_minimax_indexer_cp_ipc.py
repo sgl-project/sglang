@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # backend-specific: the exchange is gfx950 HIP IPC; the suite's MI35x box supplies 4 GPUs
-register_amd_ci(est_time=60, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 WORLD = 4
 NUM_DRAFT, SM_SCALE, K_SCALE = 8, 0.07, 0.5
@@ -125,6 +125,53 @@ def _run_exchange(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _run_missing_peer(rank: int, port: int) -> None:
+    """Rank WORLD - 1 never delivers its candidates; the others must trap, not spin."""
+    import time
+
+    from test_minimax_indexer_cp import BLOCK, TOPK, _nvfp4_verify_inputs
+
+    from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
+        CpExchange,
+        cp_verify_exchange,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=WORLD,
+    )
+    group = types.SimpleNamespace(
+        world_size=WORLD, rank_in_group=rank, cpu_group=dist.group.WORLD
+    )
+    exchange = CpExchange(group, device)
+    if rank == WORLD - 1:
+        # keep the receive buffer mapped while the peers write into it and give up
+        time.sleep(60)
+        return
+    exchange.max_spins = 1 << 16
+    q, cache, table, slots, lengths, _ = _nvfp4_verify_inputs(
+        [4000] * 8, NUM_DRAFT, seed=0
+    )
+    q_heads = q.permute(1, 0, 2).contiguous()
+    cp_verify_exchange(
+        q_heads, cache, table, lengths, table.shape[1], slots, NUM_DRAFT,
+        BLOCK, TOPK, 0, 1, SM_SCALE * K_SCALE, exchange,
+    )  # fmt: skip
+    torch.cuda.synchronize()
+
+
+def _spawn(target, port):
+    context = multiprocessing.get_context("spawn")
+    procs = [context.Process(target=target, args=(rank, port)) for rank in range(WORLD)]
+    for proc in procs:
+        proc.start()
+    return procs
+
+
 @unittest.skipUnless(
     is_hip() and is_gfx95_supported(), "MiniMax indexer CP is gfx950-only"
 )
@@ -148,6 +195,20 @@ class TestMiniMaxIndexerCPExchange(CustomTestCase):
             proc.kill()
         self.assertFalse(hung, "an exchange rank hung")
         self.assertEqual([proc.exitcode for proc in procs], [0] * WORLD)
+
+    def test_a_missing_peer_traps_instead_of_hanging(self):
+        if torch.cuda.device_count() < WORLD:
+            self.skipTest(f"needs {WORLD} GPUs")
+        procs = _spawn(_run_missing_peer, get_open_port())
+        for proc in procs:
+            proc.join(timeout=300)
+        hung = [proc for proc in procs if proc.is_alive()]
+        for proc in hung:
+            proc.kill()
+        self.assertFalse(hung, "a rank waiting on the missing peer hung")
+        exitcodes = [proc.exitcode for proc in procs]
+        self.assertTrue(all(code != 0 for code in exitcodes[:-1]), exitcodes)
+        self.assertEqual(exitcodes[-1], 0)
 
 
 if __name__ == "__main__":

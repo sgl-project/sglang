@@ -1024,6 +1024,10 @@ def cp_verify_merge(
 # no peer can still be reading call n's slots.
 CP_PARITIES = 2
 CP_MAX_ROWS = 4096
+# About 2.5 minutes of 150 ns polls: far past any lag between healthy ranks, which run the
+# same launches in step, and under the scheduler watchdog's 300 s, so a peer that died or
+# took another path ends in a device error naming the exchange rather than a silent hang.
+CP_MAX_SPINS = 1 << 30
 
 
 @triton.jit
@@ -1099,11 +1103,12 @@ def _cp_merge_ipc_kernel(
     BLOCK_N: tl.constexpr,
     KT: tl.constexpr,
     MAX_ROWS: tl.constexpr,
+    MAX_SPINS: tl.constexpr,
 ):
     """_cp_merge_kernel over the words every rank delivered for this row.
 
     Waits until all WORLD * KP carry this call's tag, then selects exactly as the
-    native merge.
+    native merge. A wait past MAX_SPINS polls traps the kernel.
     """
     r = tl.program_id(0)
     n = tl.load(counters_ptr + r)
@@ -1114,8 +1119,21 @@ def _cp_merge_ipc_kernel(
     src, j = c // KP, c % KP
     ptrs = recv_ptr + ((parity * WORLD + src) * MAX_ROWS + r).to(tl.int64) * KP + j
     word = tl.load(ptrs, cache_modifier=".cv", volatile=True)
+    spins = 0
     while tl.min((((word >> 24) & 0xFF) == tag).to(tl.int32), axis=0) == 0:
         word = tl.load(ptrs, cache_modifier=".cv", volatile=True)
+        spins += 1
+        if spins >= MAX_SPINS:
+            if r == 0:
+                tl.device_print(
+                    "indexer CP exchange: a peer's candidates never came; row, tag",
+                    r,
+                    tag,
+                )
+            tl.inline_asm_elementwise(
+                "s_trap 2", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+            )
+            spins = 0
     # back to the native key order: ordered score, then the lower block id
     blk_field = word & 0xFFFFFF
     blk = 0xFFFFFF - blk_field
@@ -1168,6 +1186,7 @@ class CpExchange:
             (self.world, CP_MAX_ROWS), dtype=torch.int32, device=device
         )
         self.merge_calls = torch.zeros(CP_MAX_ROWS, dtype=torch.int32, device=device)
+        self.max_spins = CP_MAX_SPINS
         torch.cuda.synchronize(device)
         dist.barrier(group=group.cpu_group)
 
@@ -1319,6 +1338,7 @@ def cp_verify_exchange(
         BLOCK_N=block_size,
         KT=triton.next_power_of_2(topk),
         MAX_ROWS=CP_MAX_ROWS,
+        MAX_SPINS=exchange.max_spins,
         num_warps=1,
     )
     return out
