@@ -191,6 +191,7 @@ class SanaWMBlock(nn.Module):
         chunk_size: Optional[int] = None,
         chunk_split_strategy: Optional[str] = None,
         chunk_index: Optional[List[int]] = None,
+        context_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         B = x.shape[0]
         num_frames, modulation = self._prepare_modulation(t, B)
@@ -228,7 +229,7 @@ class SanaWMBlock(nn.Module):
             x = x + self.plucker_proj(plucker_emb)
 
         # Cross-attention
-        x = x + self.cross_attn(x, y, mask=mask)
+        x = x + self.cross_attn(x, y, mask=mask, context_kv=context_kv)
 
         # FFN
         if num_frames is None:
@@ -256,6 +257,7 @@ class SanaWMBlock(nn.Module):
         *,
         kv_cache: list,
         save_kv_cache: bool,
+        context_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, list]:
         """Streaming counterpart of ``forward``: threads the per-block 10-slot ``kv_cache`` through cached attention + FFN."""
         B = x.shape[0]
@@ -287,7 +289,7 @@ class SanaWMBlock(nn.Module):
         if self.plucker_proj is not None and plucker_emb is not None:
             x = x + self.plucker_proj(plucker_emb)
 
-        x = x + self.cross_attn(x, y, mask=mask)
+        x = x + self.cross_attn(x, y, mask=mask, context_kv=context_kv)
 
         if num_frames is None:
             x_in = self._modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -595,6 +597,38 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self._plucker_emb_cache = (key, chunk_plucker, plucker_emb)
         return plucker_emb
 
+    def _context_kvs(self, y):
+        """Every block's cross-attn K/V, projected once per request.
+
+        Done here rather than inside the (compiled) blocks. Under layerwise
+        offload the block weights are not resident yet, so the blocks project
+        inline instead.
+        """
+        if self.layerwise_offload_managers:
+            return [None] * len(self.blocks)
+        return self._cached_per_request(
+            "sana_wm_cross_attn_kv",
+            (y,),
+            lambda: [block.cross_attn.project_kv(y) for block in self.blocks],
+        )
+
+    def _text_context(self, encoder_hidden_states, B):
+        # Text context depends only on the prompt: once per request.
+        def compute():
+            y = encoder_hidden_states
+            if y.dim() == 3:
+                y = y.unsqueeze(1)
+            y = self.y_embedder(y).squeeze(1)  # (B, L, D)
+            if y.shape[0] != B:
+                y = y.expand(B, -1, -1).contiguous()
+            if self.y_norm:
+                y = self.attention_y_norm(y)
+            return y
+
+        return self._cached_per_request(
+            "sana_wm_text", (encoder_hidden_states,), compute
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -648,14 +682,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         if isinstance(encoder_attention_mask, (list, tuple)):
             encoder_attention_mask = encoder_attention_mask[0]
-        y = encoder_hidden_states
-        if y.dim() == 3:
-            y = y.unsqueeze(1)
-        y = self.y_embedder(y).squeeze(1)  # (B, L, D)
-        if y.shape[0] != B:
-            y = y.expand(B, -1, -1).contiguous()
-        if self.y_norm:
-            y = self.attention_y_norm(y)
+        y = self._text_context(encoder_hidden_states, B)
         if encoder_attention_mask is not None and encoder_attention_mask.shape[0] != B:
             encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
 
@@ -697,7 +724,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # --- 6. Transformer blocks ---
         HW = (T, H, W)
-        for block in self.blocks:
+        for block, context_kv in zip(self.blocks, self._context_kvs(y)):
             x = block(
                 x,
                 y=y,
@@ -710,6 +737,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 chunk_size=chunk_size,
                 chunk_split_strategy=chunk_split_strategy,
                 chunk_index=chunk_index,
+                context_kv=context_kv,
             )
 
         x = self.final_layer(x, t_emb)  # (B, N, p_t*p_h*p_w*C_out)
@@ -780,14 +808,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         if isinstance(encoder_attention_mask, (list, tuple)):
             encoder_attention_mask = encoder_attention_mask[0]
-        y = encoder_hidden_states
-        if y.dim() == 3:
-            y = y.unsqueeze(1)
-        y = self.y_embedder(y).squeeze(1)
-        if y.shape[0] != B:
-            y = y.expand(B, -1, -1).contiguous()
-        if self.y_norm:
-            y = self.attention_y_norm(y)
+        y = self._text_context(encoder_hidden_states, B)
         if encoder_attention_mask is not None and encoder_attention_mask.shape[0] != B:
             encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
 
@@ -854,6 +875,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         HW = (T, H, W)
         new_cache = []
+        context_kvs = self._context_kvs(y)
         for i, block in enumerate(self.blocks):
             x, block_cache = block.forward_long(
                 x,
@@ -866,6 +888,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 encoder_attention_mask,
                 kv_cache=kv_cache[i],
                 save_kv_cache=save_kv_cache,
+                context_kv=context_kvs[i],
             )
             new_cache.append(block_cache)
 

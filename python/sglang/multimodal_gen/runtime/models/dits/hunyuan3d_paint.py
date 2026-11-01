@@ -13,6 +13,7 @@ from torch import nn
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import cached_per_request
 from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     BasicTransformerBlock,
     CrossAttnDownBlock2D,
@@ -113,11 +114,23 @@ class Hunyuan3DPaintTransformerBlock(nn.Module):
         if mode is not None and "r" in mode and self.use_reference_attention:
             if self.attn_refview is None:
                 raise RuntimeError("Reference attention was not initialized.")
-            reference = condition_embeddings[self.layer_name]
-            reference = reference.unsqueeze(1).repeat(1, num_views, 1, 1)
-            reference = rearrange(reference, "b n l c -> (b n) l c")
+            stored_reference = condition_embeddings[self.layer_name]
+
+            def project_reference_kv():
+                reference = stored_reference.unsqueeze(1).repeat(1, num_views, 1, 1)
+                reference = rearrange(reference, "b n l c -> (b n) l c")
+                return self.attn_refview.project_kv(reference, reference.shape[0])
+
+            # The reference is written once per request and read every step:
+            # project its K/V once per request.
             reference_output = self.attn_refview(
-                normalized, encoder_hidden_states=reference
+                normalized,
+                encoder_hidden_states=stored_reference,
+                context_kv=cached_per_request(
+                    f"hunyuan3d_ref_kv_{id(self)}",
+                    (stored_reference,),
+                    project_reference_kv,
+                ),
             )
             reference_scale = self._broadcast_scale(
                 1.0 if self.is_turbo else options.get("ref_scale", 1.0),

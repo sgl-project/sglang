@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 # For backwards compatibility, re-export from the new location
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -147,6 +150,56 @@ class BaseDiT(nn.Module, ABC):
     def device(self) -> torch.device:
         """Get the device of the model."""
         return next(self.parameters()).device
+
+    @staticmethod
+    def _request_cache(forward_batch, name):
+        """Per-request cache dict on ``forward_batch.extra``; None disables caching."""
+        if forward_batch is None or torch.is_grad_enabled():
+            return None
+        return forward_batch.extra.setdefault(name, {})
+
+    @staticmethod
+    def _tensor_key(t):
+        """Identity key for ``t``; equal only for the same underlying tensor."""
+        if t is None:
+            return None
+        if not isinstance(t, torch.Tensor):
+            return ("id", id(t))
+        return (
+            t.data_ptr(),
+            tuple(t.shape),
+            tuple(t.stride()),
+            t.dtype,
+            t.device.type,
+            t.device.index,
+        )
+
+    def _cached_per_request(self, name, inputs, compute):
+        return cached_per_request(name, inputs, compute)
+
+
+_REQUEST_CACHE_MAX = 4
+
+
+def cached_per_request(name, inputs, compute):
+    """``compute()`` once per request for the same ``inputs`` tensors.
+
+    Falls back to calling ``compute()`` every time when there is no forward
+    context or grad is enabled. The entry keeps ``inputs`` alive so their
+    data_ptr cannot be reused by another tensor within the request.
+    """
+    ctx = get_forward_context_or_none()
+    cache = BaseDiT._request_cache(ctx.forward_batch if ctx is not None else None, name)
+    if cache is None:
+        return compute()
+    key = tuple(BaseDiT._tensor_key(t) for t in inputs)
+    hit = cache.get(key)
+    if hit is None:
+        if len(cache) >= _REQUEST_CACHE_MAX:
+            # inputs that change every step would otherwise pile up
+            cache.clear()
+        hit = cache[key] = (inputs, compute())
+    return hit[1]
 
 
 class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):

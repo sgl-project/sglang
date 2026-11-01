@@ -170,19 +170,29 @@ class StableDiffusionAttention(nn.Module):
             f"Expected a 2D, 3D, or 4D attention mask, got {attention_mask.ndim}D."
         )
 
+    def project_kv(
+        self, context: torch.Tensor, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.to_k(context).view(batch_size, -1, self.heads, self.head_dim),
+            self.to_v(context).view(batch_size, -1, self.heads, self.head_dim),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         context = (
             hidden_states if encoder_hidden_states is None else encoder_hidden_states
         )
         batch_size = hidden_states.shape[0]
         query = self.to_q(hidden_states).view(batch_size, -1, self.heads, self.head_dim)
-        key = self.to_k(context).view(batch_size, -1, self.heads, self.head_dim)
-        value = self.to_v(context).view(batch_size, -1, self.heads, self.head_dim)
+        key, value = (
+            self.project_kv(context, batch_size) if context_kv is None else context_kv
+        )
         output = F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),

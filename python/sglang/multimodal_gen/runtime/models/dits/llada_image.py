@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import cached_per_request
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 ADALN_EMBED_DIM = 256
@@ -923,11 +924,25 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
                 **adaln,
             )
 
-        cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise = (
-            self._embed_sequence(cap_sequence, self.cap_embedder, self.cap_pad_token)
-        )
-        for layer in self.context_refiner:
-            cap_features = layer(cap_features, cap_mask, cap_frequencies)
+        def _refine_caption():
+            cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise = (
+                self._embed_sequence(
+                    cap_sequence, self.cap_embedder, self.cap_pad_token
+                )
+            )
+            for layer in self.context_refiner:
+                cap_features = layer(cap_features, cap_mask, cap_frequencies)
+            return cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise
+
+        # T2I caption tokens depend only on the prompt: once per request. Editing
+        # sequences are built together with the source latents, so stay uncached.
+        if is_editing:
+            refined = _refine_caption()
+        else:
+            refined = cached_per_request(
+                "llada_context_refiner", tuple(cap_feats), _refine_caption
+            )
+        cap_features, cap_frequencies, cap_mask, cap_lengths, cap_noise = refined
 
         if is_editing:
             (
