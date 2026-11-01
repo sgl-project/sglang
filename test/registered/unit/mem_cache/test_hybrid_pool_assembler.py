@@ -176,6 +176,7 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         hicache_mem_layout="layer_first",
                         hicache_write_policy="write_through",
                         hicache_io_backend="kernel",
+                        hicache_host_memory_mode="cache",
                         hicache_size=0,
                     )
                     group, _ = hybrid_pool_assembler.build_minimax_sparse_hicache_stack(
@@ -741,6 +742,16 @@ def _kv_pool_stub(*, layer_num: int, size: int = 4096):
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
     pool.layer_shard_enabled = False
+    pool.page_size = 64
+    pool.model_layer_ids = tuple(range(layer_num))
+    pool.kv_buffer = [
+        torch.empty((128, 1, 576), dtype=pool.store_dtype) for _ in range(layer_num)
+    ]
+    pool.data_ptrs = torch.tensor(
+        [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+    )
+    pool.kv_scale_buffer = None
+    pool.dsa_kv_cache_store_fp8 = False
     return pool
 
 
