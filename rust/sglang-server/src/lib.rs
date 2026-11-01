@@ -17,10 +17,14 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
     GenerateTerminal,
 };
+pub use api_server::http::pre_generate::abortable_before_generate;
+#[cfg(feature = "test-support")]
+pub use api_server::http::pre_generate::test_support;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
@@ -296,6 +300,42 @@ impl Server {
             .map_err(|e| value_error("mm spec", e))
     }
 
+    /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
+    /// health answers 503 at once, requests are still admitted, and the
+    /// listeners close once none is left in flight (see [`Server::drain_complete`]).
+    /// `force` (Python's `SGL_FORCE_SHUTDOWN`) closes them without waiting, as
+    /// does a failed last health probe. Idempotent.
+    #[pyo3(signature = (force = false))]
+    pub fn begin_drain(&self, force: bool) {
+        self.rt.begin_drain(force);
+    }
+
+    /// Whether a drain has begun and every listener has closed since: the
+    /// scheduler may stop.
+    pub fn drain_complete(&self) -> bool {
+        self.rt.drain_complete()
+    }
+
+    /// Begin the drain from a runtime thread whenever signal `signum` is
+    /// caught: returns a non-blocking fd for `signal.set_wakeup_fd`, which
+    /// stays open for the life of the process. Unlike a Python signal handler,
+    /// this does not wait for the scheduler thread. Once the drain's listeners
+    /// have closed, a datagram goes to the abstract Unix socket `notify`.
+    #[pyo3(signature = (signum, force = false, notify = None))]
+    pub fn drain_signal_fd(
+        &self,
+        signum: u8,
+        force: bool,
+        notify: Option<String>,
+    ) -> PyResult<i32> {
+        use std::os::fd::IntoRawFd;
+
+        self.rt
+            .drain_signal_fd(signum, force, notify)
+            .map(IntoRawFd::into_raw_fd)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
     /// Signal all threads to stop (best effort).
     pub fn shutdown(&self) {
         self.rt.request_shutdown();
@@ -341,6 +381,7 @@ impl Server {
                 stage_channel_cap,
                 cores,
                 metrics_listener: port_offset.unwrap_or(0) == 0,
+                ..Default::default()
             },
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
