@@ -26,19 +26,42 @@ def _get_yes_no_token_ids(tokenizer) -> tuple[int, int]:
 
     Different model sizes may have different token IDs, so we look them up dynamically.
     """
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    if not isinstance(unk_token_id, int) or isinstance(unk_token_id, bool):
+        unk_token_id = None
+
+    def _is_valid_token_pair(yes_id: Any, no_id: Any) -> bool:
+        return (
+            isinstance(yes_id, int)
+            and not isinstance(yes_id, bool)
+            and isinstance(no_id, int)
+            and not isinstance(no_id, bool)
+            and yes_id >= 0
+            and no_id >= 0
+            and yes_id != no_id
+            and (
+                unk_token_id is None
+                or (yes_id != unk_token_id and no_id != unk_token_id)
+            )
+        )
+
     # Try to encode 'yes' and 'no' to get their token IDs
     # The tokenizer should return a single token for these common words
     try:
         yes_tokens = tokenizer.encode("yes", add_special_tokens=False)
         no_tokens = tokenizer.encode("no", add_special_tokens=False)
 
-        if len(yes_tokens) == 1 and len(no_tokens) == 1:
+        if (
+            len(yes_tokens) == 1
+            and len(no_tokens) == 1
+            and _is_valid_token_pair(yes_tokens[0], no_tokens[0])
+        ):
             return yes_tokens[0], no_tokens[0]
 
         # Fallback: try convert_tokens_to_ids
         yes_id = tokenizer.convert_tokens_to_ids("yes")
         no_id = tokenizer.convert_tokens_to_ids("no")
-        if yes_id is not None and no_id is not None:
+        if _is_valid_token_pair(yes_id, no_id):
             return yes_id, no_id
 
     except Exception as e:
