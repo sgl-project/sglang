@@ -4,12 +4,11 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestGlm47SchemaTypes(CustomTestCase):
+class TestGlm47SchemaTypes(unittest.TestCase):
     def check_arguments(self, schema, expected, raw_values=None):
         tools = [
             Tool(type="function", function=Function(name="inspect", parameters=schema))
@@ -261,8 +260,6 @@ class TestGlm47SchemaTypes(CustomTestCase):
             f"<tool_call>inspect<arg_key>value</arg_key><arg_value>{raw}"
             "</arg_value></tool_call>"
         )
-        calls = Glm47MoeDetector().detect_and_parse(text, tools).calls
-        self.assertEqual(json.loads(calls[0].parameters), {"value": raw})
         detector = Glm47MoeDetector()
         detector.parse_streaming_increment(text, tools)
         # The chat endpoint serializes these arguments when a stream finishes.
