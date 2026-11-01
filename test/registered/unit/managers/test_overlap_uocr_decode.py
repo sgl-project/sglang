@@ -44,6 +44,7 @@ def _decode_batch():
     batch.sampling_info = sampling
     batch.prefill_input_ids_cpu = None
     batch.uocr_graph_io_deferred = False
+    batch.penalty_update_pending = False
     return batch
 
 
