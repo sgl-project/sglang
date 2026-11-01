@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.incremental_detokenize import DetokenizeState
 from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
     RequestOutputStats,
@@ -34,6 +35,11 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
+    hide_forced_text,
+    req_state,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1131,6 +1137,31 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         self.assertIsNone(output())
         req.reset_for_retract()
         self.assertIsNone(output())
+
+    def test_skipped_output_prefix_becomes_detokenizer_context(self):
+        outputs = []
+        streamer = _streamer(outputs)
+        streamer.uocr_doc_hooks = object.__new__(UocrDocHooks)
+        req = self._req()
+        req.output_ids.extend(array("q", [900, 901]))
+        req_state(req).forced_len = 2
+        hide_forced_text(req)
+        req.output_ids.append(800)
+        streamer.stream_output([req], False)
+        [payload] = outputs
+        [header] = payload.detokenize_headers
+        self.assertEqual(list(header.prompt_tail_ids), [2, 3, 4, 5, 6, 900, 901])
+        self.assertEqual(list(row_output_ids(payload, 0)), [800])
+        self.assertEqual(payload.completion_tokens, [1])
+        state = DetokenizeState.from_header(header=header, vocab_size=1000)
+        state.append_row(
+            rid=req.rid,
+            output_ids=list(row_output_ids(payload, 0)),
+            completion_tokens=payload.completion_tokens[0],
+            is_beam=False,
+            vocab_size=1000,
+        )
+        self.assertEqual(state.decode_ids[state.read_offset :], [800])
 
     def test_release_follows_a_sent_header_only(self):
         outputs = []
