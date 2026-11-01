@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -230,7 +231,6 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     total_tokens=reserved_tokens,
                     max_new_tokens=0,
                     input_tokens=prompt_tokens,
-                    swa_host_hit_length=0,
                     chunk_limit=None,
                     state_slots=slots_per_request,
                 )
@@ -327,7 +327,6 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     full_tokens=12,
                     extend_input_len=8,
                     max_new_tokens=0,
-                    swa_host_hit_length=0,
                     chunk_limit=None,
                     state_slots=2,
                 )
@@ -345,7 +344,6 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
             total_tokens=20,
             max_new_tokens=4,
             input_tokens=12,
-            swa_host_hit_length=0,
             chunk_limit=16,
         )
 
@@ -408,7 +406,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
     def test_host_swa_load_is_part_of_joint_demand(self):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
-        request = {**self.request, "swa_host_hit_length": 32}
+        request = {**self.request, "window_host_hit_lengths": {ComponentType.SWA: 32}}
         # The restored window rows count against every chunk of the request.
         self.assertEqual(
             self.budget.check_prefill(**{**request, "chunk_limit": None}),
@@ -602,7 +600,6 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
                 total_tokens=12,
                 max_new_tokens=4,
                 input_tokens=4,
-                swa_host_hit_length=0,
                 chunk_limit=16,
             ),
             (True, 16),

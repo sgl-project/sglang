@@ -145,11 +145,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 last_host_node=result.last_device_node,
                 best_match_node=result.last_device_node,
                 host_hit_length=external_hit,
-                swa_host_hit_length=(
-                    min(
-                        external_hit,
-                        self.lmcache_connector.aligned_swa_window_size(),
-                    )
+                window_host_hit_lengths=self.all_windows(
+                    min(external_hit, self.lmcache_connector.aligned_swa_window_size())
                     if self.is_swa_enabled
                     else 0
                 ),
@@ -165,7 +162,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             last_host_node=result.last_device_node,
             best_match_node=result.last_device_node,
             host_hit_length=0,
-            swa_host_hit_length=0,
+            window_host_hit_lengths={},
             mamba_host_hit_length=0,
             mamba_branching_seqlen=None,
             full_kv_hit_length=max(result.full_kv_hit_length, total_hit),
@@ -362,7 +359,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if loaded_len is None:
             req.storage_hit_length = 0
             req.host_hit_length = 0
-            req.swa_host_hit_length = 0
+            req.matched_window_host_hit_lengths = {}
             req.mamba_host_hit_length = 0
             self.prefetch_loaded_tokens_by_reqid.pop(req.cache_request_handle, None)
             self.prefetch_loaded_storage_start_by_reqid.pop(

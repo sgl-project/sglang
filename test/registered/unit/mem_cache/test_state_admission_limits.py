@@ -99,7 +99,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
                         total_tokens=3,
                         max_new_tokens=1,
                         input_tokens=1,
-                        swa_host_hit_length=0,
                         chunk_limit=None,
                         state_slots=1,
                     )
@@ -212,7 +211,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
             total_tokens=12,
             max_new_tokens=0,
             input_tokens=11,
-            swa_host_hit_length=0,
             chunk_limit=None,
             state_slots=12,
         )[0]
@@ -237,7 +235,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
                         total_tokens=3,
                         max_new_tokens=1,
                         input_tokens=1,
-                        swa_host_hit_length=0,
                         chunk_limit=None,
                         state_slots=slots,
                     )[0]
