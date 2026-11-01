@@ -138,8 +138,10 @@ def _moe_sort_quant_kernel(
     before = tl.zeros((E,), tl.int32)  # pairs of each expert ahead of this CTA's
     for c in range(0, P, HCHUNK):
         offs = c + tl.arange(0, HCHUNK)
-        m = offs < P
-        e = tl.load(topk_ids_ptr + offs, mask=m, other=0)
+        e = tl.load(topk_ids_ptr + offs, mask=offs < P, other=0)
+        # an id outside [0, E), such as a padded row's -1, routes nowhere
+        m = (offs < P) & (e >= 0) & (e < E)
+        e = tl.where(m, e, 0)
         h = tl.histogram(e, E, mask=m)
         hist += h
         if c + HCHUNK <= p0:
@@ -151,8 +153,9 @@ def _moe_sort_quant_kernel(
 
     if is_tok:
         offs_q = p0 + tl.arange(0, TB * TOPK)
-        mq = offs_q < P
-        eq = tl.load(topk_ids_ptr + offs_q, mask=mq, other=E)
+        eq = tl.load(topk_ids_ptr + offs_q, mask=offs_q < P, other=E)
+        mq = (offs_q < P) & (eq >= 0) & (eq < E)
+        eq = tl.where(mq, eq, E)
         wq = tl.load(topk_w_ptr + offs_q, mask=mq, other=0.0)
         # aiter's order within an expert is the pair order: rank among earlier pairs
         same = (eq[:, None] == eq[None, :]) & (offs_q[None, :] < offs_q[:, None])
@@ -180,7 +183,7 @@ def _moe_sort_quant_kernel(
             tl.store(
                 a1s_ptr + addr,
                 tl.where(zero_w, 0, ex[:, None, :]).to(tl.uint8),
-                mask=mt[:, None, None] & (y < D // 32),
+                mask=tl.reshape(mq, (TB, TOPK))[:, :, None] & (y < D // 32),
             )
     else:
         offs_x = (pid - num_tok_cta) * E_PER + tl.arange(0, E_PER)

@@ -31,12 +31,16 @@ class TestMoeSortQuantLarge(CustomTestCase):
         )
         cls.dev = torch.device("cuda", 0)
 
-    def _inputs(self, m, num_experts, topk, dim, seed):
+    def _inputs(self, m, num_experts, topk, dim, seed, padded=0):
         g = torch.Generator(device="cpu").manual_seed(seed)
         ids = torch.stack(
             [torch.randperm(num_experts, generator=g)[:topk] for _ in range(m)]
         )
         w = torch.rand(m, topk, generator=g) + 0.05
+        # graph-padded rows past moe_num_token_non_padded: -1 ids, zero weights
+        if padded:
+            ids[m - padded :] = -1
+            w[m - padded :] = 0.0
         x = torch.randn(m, dim, generator=g).to(torch.bfloat16)
         return (
             ids.to(torch.int32).to(self.dev),
@@ -84,12 +88,13 @@ class TestMoeSortQuantLarge(CustomTestCase):
         from sglang.kernels.ops.moe.moe_sort_quant_large import moe_sort_quant_large
 
         cases = (
-            (1025, 128, 4, 6144, 64),
-            (4096, 128, 4, 6144, 128),
+            (1025, 128, 4, 6144, 64, 0),
+            (4096, 128, 4, 6144, 128, 0),
+            (2048, 128, 4, 6144, 64, 300),
         )
-        for m, num_experts, topk, dim, bs in cases:
-            msg = f"m={m} E={num_experts} topk={topk} dim={dim} bs={bs}"
-            ids, w, x = self._inputs(m, num_experts, topk, dim, m + bs)
+        for m, num_experts, topk, dim, bs, padded in cases:
+            msg = f"m={m} padded={padded} E={num_experts} topk={topk} dim={dim} bs={bs}"
+            ids, w, x = self._inputs(m, num_experts, topk, dim, m + bs, padded)
             ref = self._aiter(ids, w, x, num_experts, bs)
             moe_buf = torch.ones(m, 128, dtype=torch.bfloat16, device=self.dev)
             out = moe_sort_quant_large(ids, w, num_experts, bs, moe_buf, x)
