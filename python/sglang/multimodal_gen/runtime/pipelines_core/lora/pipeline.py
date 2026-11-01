@@ -1404,9 +1404,12 @@ class LoRAPipeline(ComposedPipelineBase):
             # Cache entries are CPU mappings. Rebinding a resident accelerator
             # parameter to one would leave the module split across devices.
             return None
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            # Sharded weights would need per-rank stores; not worth it until a
-            # multi-GPU consumer deployment exists.
+        if self.server_args.tp_size > 1 or self.server_args.use_fsdp_inference:
+            # Sharded weights differ per rank, so one entry per module name
+            # would be wrong for all but one of them. Sequence- and
+            # data-parallel replicas hold the same full weights on every rank;
+            # those ranks can share one entry, because the merge is
+            # deterministic and each file is written through an atomic rename.
             return None
         # The effective alpha and PEFT config change the merged delta too. Use the
         # config snapshotted at load, since the weights were normalized with it.
