@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available, print_warning_once
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -111,6 +111,36 @@ class DFlashDraftInputV2(SpecInput):
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
         )
 
+    @staticmethod
+    def _top_up_decode_alloc_lens(
+        batch: ScheduleBatch,
+        nxt_kv_lens: List[int],
+        num_needed_tokens: int,
+        *,
+        reserve: int,
+        page_size: int,
+        pages: int,
+    ) -> tuple[List[int], int]:
+        row_cap = batch.req_to_token_pool.req_to_token.shape[1] // page_size * page_size
+        lens = list(nxt_kv_lens)
+        extra = 0
+        for i, req in enumerate(batch.reqs):
+            need = req.kv.kv_committed_len + reserve
+            target = min(
+                row_cap,
+                (need + page_size - 1) // page_size * page_size + pages * page_size,
+            )
+            if target > lens[i]:
+                extra += target - lens[i]
+                lens[i] = target
+        if extra == 0:
+            return nxt_kv_lens, num_needed_tokens
+        # Paged extend evicts up to needed + bs pages; stay clear of that demand.
+        free = batch.token_to_kv_pool_allocator.available_size()
+        if free < num_needed_tokens + len(lens) * page_size + 4 * extra:
+            return nxt_kv_lens, num_needed_tokens
+        return lens, num_needed_tokens + extra
+
     def prepare_for_decode(self, batch: ScheduleBatch):
         """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
 
@@ -152,6 +182,21 @@ class DFlashDraftInputV2(SpecInput):
             reserve=reserve,
             page_size=page_size,
         )
+        topup_pages = min(envs.SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES.get(), 8)
+        if topup_pages > 0 and batch.hisparse_coordinator is not None:
+            print_warning_once(
+                "SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES is ignored under HiSparse."
+            )
+            topup_pages = 0
+        if topup_pages > 0 and num_needed_tokens > 0 and page_size > 1:
+            nxt_kv_lens, num_needed_tokens = self._top_up_decode_alloc_lens(
+                batch,
+                nxt_kv_lens,
+                num_needed_tokens,
+                reserve=reserve,
+                page_size=page_size,
+                pages=topup_pages,
+            )
 
         max_top_k = 1
         uniform_top_k_value = None

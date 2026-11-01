@@ -2049,6 +2049,10 @@ class Envs:
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DFlash-family decode prep: when a step must allocate KV pages, also top every
+    # request up to this many pages of headroom (capped at 8) in the same allocation
+    # (0 = off). Skipped when free pages are low and under HiSparse.
+    SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES = EnvInt(0)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
