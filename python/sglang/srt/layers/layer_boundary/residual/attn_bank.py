@@ -328,9 +328,11 @@ class AttnBankOutputRead:
         bank = self.bank.require()
         rows = _bank_rows(bank, hidden_states)
         read_args = (hidden_states, residual, self.score_proj, self.score_norm)
+        # NCCL-only carry has no custom gather. Skip fusion preparation there,
+        # which can materialize a pending residual add before declining.
         read = (
             None
-            if rows is None
+            if rows is None or self.attn_tp_gather is None
             else bank.forward_sp_all_gather(*read_args, self.norm, rows=rows)
         )
         if read is None:

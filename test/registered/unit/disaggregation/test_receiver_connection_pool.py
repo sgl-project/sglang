@@ -21,6 +21,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
 )
@@ -501,6 +502,16 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
         self.assertEqual(manager.prefill_response_tracker, {})
+
+    def test_staging_release_before_send_metadata(self):
+        """Overlap decode can fail a request before its held send_metadata runs;
+        releasing its staging room must still work."""
+        receiver, _ = self._make_receiver()
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        decode_req = SimpleNamespace(_chunk_events=[])
+        handler.release_room(17, decode_req, receiver)
+        self.assertEqual(receiver.chunk_staging_infos, [])
 
 
 if __name__ == "__main__":
