@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
     release_band,
@@ -634,10 +635,10 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 if cap is not None:
                     self.assertLessEqual(a.size_full, cap)
-                    self.assertFalse(a.admits(1500, a._window_demand(1500, 20)))
+                    self.assertFalse(a.admits(1500, demand_windows(a, 1500, 20)))
                     continue
                 self.assertGreaterEqual(a.size_full, 1500)
-                self.assertTrue(a.admits(1500, a._window_demand(1500, 20)))
+                self.assertTrue(a.admits(1500, demand_windows(a, 1500, 20)))
                 chunks = []
                 for i in range(375):
                     if i >= 5:
@@ -974,7 +975,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 states = a.alloc_state_slots(16)
                 chunks = []
-                while a.ensure_capacity(4, 4):
+                while a.ensure_capacity(token_demand(a, 4, 4)):
                     chunks.append(a.alloc(4))
                 cache = UnifiedRadixCache(
                     CacheInitParams(
@@ -1050,10 +1051,9 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertIsNone(
                     a.reclaim_for_prealloc(
                         cache,
-                        248,
-                        20,
-                        window_tokens={"draft_swa": 244},
-                        state_slots=1,
+                        token_demand(
+                            a, 248, 20, windows={"draft_swa": 244}, state_slots=1
+                        ),
                     )
                 )
                 incoming_state = a.alloc_state_slots(1)
@@ -1107,7 +1107,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 states = a.state_slots.alloc(16)
                 chunks = []
-                while a.ensure_capacity(4, 4):
+                while a.ensure_capacity(token_demand(a, 4, 4)):
                     chunks.append(a.alloc(4))
                 cache = UnifiedRadixCache(
                     CacheInitParams(
@@ -1225,15 +1225,17 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertTrue(
                         a.admits(
                             4,
-                            a._window_demand(4, 4),
+                            demand_windows(a, 4, 4),
                             evictable={
                                 a.full_attn_allocator.sub_pool_name: cache.full_evictable_size(),
                                 a.swa_attn_allocator.sub_pool_name: cache.swa_evictable_size(),
                             },
                         )
                     )
-                self.assertFalse(a.admits(20, a._window_demand(20, 4), empty_pool=True))
-                self.assertFalse(a.ensure_capacity(1, 1))
+                self.assertFalse(
+                    a.admits(20, demand_windows(a, 20, 4), empty_pool=True)
+                )
+                self.assertFalse(a.ensure_capacity(token_demand(a, 1, 1)))
                 self.assertTrue(a.evict_to_free_tokens(cache, 4))
                 self.assertLessEqual(a.full_attn_allocator.allocated_count(), 12)
                 self.assertIsNotNone(a.alloc(4))
@@ -1626,7 +1628,7 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertIsNotNone(first)
                 self.assertEqual(alloc.available_size(), 16 * dcp)
                 self.assertFalse(
-                    alloc.admits(20 * dcp, alloc._window_demand(20 * dcp, 0))
+                    alloc.admits(20 * dcp, demand_windows(alloc, 20 * dcp, 0))
                 )
                 second = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(second)
@@ -1885,15 +1887,14 @@ class TestDeclaredParts(CustomTestCase):
                 tree_core_backend="python",
             )
         )
-        self.assertTrue(a.admits(400, a._window_demand(400, 16)))
-        self.assertFalse(a.admits(400, a._window_demand(400, 400)))
+        self.assertTrue(a.admits(400, demand_windows(a, 400, 16)))
+        self.assertFalse(a.admits(400, demand_windows(a, 400, 400)))
         full_budget = a.full_available_size()
         swa_budget = a.conserve_swa_available_size()
         self.assertTrue(
             a.prealloc_fits(
                 cache,
-                400,
-                16,
+                token_demand(a, 400, 16),
                 full_budget_tokens=full_budget,
                 swa_budget_tokens=swa_budget,
             )
@@ -1901,7 +1902,7 @@ class TestDeclaredParts(CustomTestCase):
         # Pending requests and decode headroom are deducted from these budgets.
         # They must still be charged to the joint byte demand, not just compared
         # with this request's individual token counts.
-        self.assertFalse(a.admits(full_budget, a._window_demand(full_budget, 16)))
+        self.assertFalse(a.admits(full_budget, demand_windows(a, full_budget, 16)))
         for full_reserved, swa_reserved, fits in (
             (4, 4, True),
             (full_budget - 400, 0, False),
@@ -1912,15 +1913,14 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertEqual(
                     a.prealloc_fits(
                         cache,
-                        400,
-                        16,
+                        token_demand(a, 400, 16),
                         full_budget_tokens=full_budget - full_reserved,
                         swa_budget_tokens=swa_budget - swa_reserved,
                     ),
                     fits,
                 )
-        self.assertIsNone(a.reclaim_for_prealloc(cache, 400, 16))
-        self.assertTrue(a.ensure_capacity(400, 16))
+        self.assertIsNone(a.reclaim_for_prealloc(cache, token_demand(a, 400, 16)))
+        self.assertTrue(a.ensure_capacity(token_demand(a, 400, 16)))
 
     def test_multiwindow_reclaim_uses_one_window_as_joint_byte_donor(self):
         """A reclaimable window can fund a page in every locked companion band."""
@@ -1990,7 +1990,7 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(cache.full_evictable_size(), 0)
                     self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
                     self.assertEqual(cache.swa_evictable_size(), 144)
-                    self.assertFalse(a.ensure_capacity(4, 4))
+                    self.assertFalse(a.ensure_capacity(token_demand(a, 4, 4)))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
                     original = cache.evict_until
                     evicted = []
@@ -2145,16 +2145,19 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertEqual(budget.window_offsets["draft_swa"], 16)
                 # A later request includes both selected work and restored pages,
                 # each priced with this band's own retention and page size.
-                full, primary, demand = budget._load_back_demand(
+                demand = budget._load_back_demand(
                     full_tokens=8,
                     extend_input_len=1,
                     max_new_tokens=400,
                     window_host_hit_lengths={ComponentType.SWA: 5, DRAFT_WINDOW: 9},
                     chunk_limit=8,
                 )
-                self.assertEqual(full, 416)
-                self.assertEqual(demand["window_tokens"]["draft_swa"], 44)
-                self.assertGreater(primary, budget.window_offsets["window_16"])
+                self.assertEqual(demand.full_tokens, 416)
+                self.assertEqual(demand.window_tokens["draft_swa"], 44)
+                self.assertGreater(
+                    demand.window_tokens["window_16"],
+                    budget.window_offsets["window_16"],
+                )
                 self.assertEqual(storage.accounting_violations(), [])
 
     def test_auxiliary_restore_reserves_prefill_and_pending_demand(self):
@@ -2301,10 +2304,10 @@ class TestDeclaredParts(CustomTestCase):
         storage, _, _ = _build(fused_draft=placement)
         a = storage.allocator
         empty_demands = [
-            n for n in range(8, 128, 4) if a.admits(n, a._window_demand(n, n))
+            n for n in range(8, 128, 4) if a.admits(n, demand_windows(a, n, n))
         ]
         ids = []
-        while a.admits(4, a._window_demand(4, 4)):
+        while a.admits(4, demand_windows(a, 4, 4)):
             allocation = a.alloc(4)
             self.assertIsNotNone(allocation)
             ids.append(allocation)
@@ -2322,7 +2325,9 @@ class TestDeclaredParts(CustomTestCase):
         )
         key = RadixKey(array("q", range(ids.numel())))
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        need = next(n for n in empty_demands if not a.ensure_capacity(n, n))
+        need = next(
+            n for n in empty_demands if not a.ensure_capacity(token_demand(a, n, n))
+        )
         budget = a.create_prefill_budget(cache)
         before = a.pricing_snapshot()
         self.assertTrue(
@@ -2375,8 +2380,7 @@ class TestDeclaredParts(CustomTestCase):
         ):
             self.assertEqual(
                 queue._prealloc_reservation_fits(
-                    need,
-                    need,
+                    token_demand(a, need, need),
                     full_allocatable_tokens=full,
                     swa_allocatable_tokens=swa,
                 ),
@@ -2384,7 +2388,7 @@ class TestDeclaredParts(CustomTestCase):
             )
         self.assertTrue(a.prealloc_fits_assumes_reclaim())
         self.assertIsNone(
-            queue._reclaim_swa_tail_capacity(need, "resume", full_len=need)
+            queue._reclaim_prealloc_capacity(token_demand(a, need, need), "resume")
         )
         fresh = a.alloc(need)
         self.assertIsNotNone(fresh)
@@ -2485,10 +2489,10 @@ class TestDeclaredParts(CustomTestCase):
         )
         # The evicted end holes are credited before any flush: the planned
         # take compacts the ends.
-        self.assertTrue(a.admits(8, a._window_demand(8, 8)))
+        self.assertTrue(a.admits(8, demand_windows(a, 8, 8)))
         for band in (a.full_attn_allocator, a.swa_attn_allocator):
             band.flush_for_allocation()
-        self.assertTrue(a.admits(8, a._window_demand(8, 8)))
+        self.assertTrue(a.admits(8, demand_windows(a, 8, 8)))
         fresh = a.alloc(8)
         self.assertIsNotNone(fresh)
         a.free(fresh)

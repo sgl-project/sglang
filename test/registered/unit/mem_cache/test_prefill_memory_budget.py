@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     setup_allocator_context,
@@ -251,8 +252,10 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 self.assertTrue(
                     allocator.admits(
                         admitted * reserved_tokens,
-                        allocator._window_demand(
-                            admitted * reserved_tokens, admitted * reserved_tokens
+                        demand_windows(
+                            allocator,
+                            admitted * reserved_tokens,
+                            admitted * reserved_tokens,
                         ),
                         slots,
                     )
@@ -260,7 +263,8 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 self.assertFalse(
                     allocator.admits(
                         (admitted + 1) * reserved_tokens,
-                        allocator._window_demand(
+                        demand_windows(
+                            allocator,
                             (admitted + 1) * reserved_tokens,
                             (admitted + 1) * reserved_tokens,
                         ),
@@ -269,9 +273,12 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 )
                 self.assertTrue(
                     allocator.ensure_capacity(
-                        admitted * reserved_tokens,
-                        admitted * reserved_tokens,
-                        state_slots=slots,
+                        token_demand(
+                            allocator,
+                            admitted * reserved_tokens,
+                            admitted * reserved_tokens,
+                            state_slots=slots,
+                        )
                     )
                 )
                 # Real request acquisition takes working AND initial tracking
@@ -331,7 +338,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     state_slots=2,
                 )
             )
-            self.assertEqual(reclaim.call_args.kwargs["state_slots"], 3)
+            self.assertEqual(reclaim.call_args.args[1].state_slots, 3)
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):
@@ -495,7 +502,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 self.assertTrue(
                     allocator.admits(
                         page_size + 2,
-                        allocator._window_demand(page_size + 2, page_size + 2),
+                        demand_windows(allocator, page_size + 2, page_size + 2),
                     )
                 )
 
@@ -513,7 +520,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 self.assertTrue(
                     allocator.admits(
                         2 * page_size + 2,
-                        allocator._window_demand(2 * page_size + 2, 2 * page_size),
+                        demand_windows(allocator, 2 * page_size + 2, 2 * page_size),
                     )
                 )
 

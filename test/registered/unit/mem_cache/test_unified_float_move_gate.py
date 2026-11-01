@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
@@ -154,14 +155,14 @@ class TestFloatMovementGate(CustomTestCase):
                 with patch.object(
                     a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
-                    a.ensure_capacity(demand, demand)
+                    a.ensure_capacity(token_demand(a, demand, demand))
                     got = a.alloc(demand)
                 self.assertEqual(copies.call_count, 0)
                 self.check_saved(a, saved)
                 if got is None:
                     for member in a.members:
                         release_band(member)
-                    a.ensure_capacity(demand, demand)
+                    a.ensure_capacity(token_demand(a, demand, demand))
                     self.assertIsNotNone(a.alloc(demand))
                     self.check_saved(a, saved)
         a, kv, mk = build_geometry(1, (1, 1), True, "paired", True)

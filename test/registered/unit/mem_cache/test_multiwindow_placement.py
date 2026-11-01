@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
@@ -340,7 +341,9 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 window = allocator.window_allocators["draft_swa"]
                 take_host, cancel_host = allocator.storage.host_load_alloc("draft_swa")
                 with allocator.scoped_physical_takes(
-                    8, 8, window_tokens={"draft_swa": 16}, state_slots=2
+                    token_demand(
+                        allocator, 8, 8, windows={"draft_swa": 16}, state_slots=2
+                    )
                 ):
                     # H2D may allocate an empty float before the pending state
                     # and token work. Its midpoint heuristic must not consume
@@ -378,12 +381,14 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     allocator = _build(state=state, lazy=lazy, draft_dim=8)
                     for tokens in (8, 20, 20):
                         self.assertIsNotNone(allocator.alloc(tokens))
-                    args = (demand["full"], demand["swa"])
-                    kwargs = dict(
-                        window_tokens={"draft_swa": demand["draft_swa"]},
+                    request = token_demand(
+                        allocator,
+                        demand["full"],
+                        demand["swa"],
+                        windows={"draft_swa": demand["draft_swa"]},
                         state_slots=demand["state_slots"],
                     )
-                    pages = allocator.page_demands(*args, **kwargs).items()
+                    pages = allocator.page_demands(request).items()
                     # Only a relayout serves it: no layout in place does.
                     self.assertIsNone(
                         plan(
@@ -392,14 +397,13 @@ class TestMultiwindowPlacement(unittest.TestCase):
                             NO_MOVE,
                         )
                     )
-                    self.assertIsNone(
-                        allocator.reclaim_for_prealloc(None, *args, **kwargs)
-                    )
-                    with allocator.scoped_physical_takes(*args, **kwargs):
+                    self.assertIsNone(allocator.reclaim_for_prealloc(None, request))
+                    with allocator.scoped_physical_takes(request):
                         refused, reserved = _load_back(
                             allocator,
                             random.Random(0),
-                            *args,
+                            demand["full"],
+                            demand["swa"],
                             demand["draft_swa"],
                             demand["state_slots"],
                         )
@@ -424,20 +428,21 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     state_slots = rng.randint(0, 2) if state else 0
                     if not (full or swa or aux or state_slots):
                         continue
-                    args = (full, swa)
-                    kwargs = dict(
-                        window_tokens={"draft_swa": aux}, state_slots=state_slots
+                    request = token_demand(
+                        allocator,
+                        full,
+                        swa,
+                        windows={"draft_swa": aux},
+                        state_slots=state_slots,
                     )
                     # Nothing is cached, so reclaim is ready exactly when the
                     # demand fits.
-                    if not allocator.ensure_capacity(*args, **kwargs):
+                    if not allocator.ensure_capacity(request):
                         continue
-                    self.assertIsNone(
-                        allocator.reclaim_for_prealloc(None, *args, **kwargs)
-                    )
+                    self.assertIsNone(allocator.reclaim_for_prealloc(None, request))
                     histories += 1
                     with self.subTest(device=device, seed=seed, state=state, lazy=lazy):
-                        with allocator.scoped_physical_takes(*args, **kwargs):
+                        with allocator.scoped_physical_takes(request):
                             refused, reserved = _load_back(
                                 allocator, rng, full, swa, aux, state_slots
                             )
@@ -450,7 +455,9 @@ class TestMultiwindowPlacement(unittest.TestCase):
         allocator = _build(state=False, lazy=True, draft_dim=8)
         window = allocator.window_allocators["draft_swa"]
         with self.assertRaisesRegex(RuntimeError, "after H2D"):
-            with allocator.scoped_physical_takes(4, 4, window_tokens={"draft_swa": 4}):
+            with allocator.scoped_physical_takes(
+                token_demand(allocator, 4, 4, windows={"draft_swa": 4})
+            ):
                 self.assertIsNotNone(window.alloc_physical(4))
                 raise RuntimeError("after H2D")
         self.assertTrue(all(b._physical_take_scope is None for b in allocator.members))
