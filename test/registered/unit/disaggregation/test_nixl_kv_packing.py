@@ -40,7 +40,9 @@ class TestPackedPageIndices(CustomTestCase):
         src_token_bytes = src_heads * head_bytes
         rng = np.random.default_rng(0)
         src_pools = [
-            rng.integers(0, 256, num_pages * page_size * src_token_bytes, dtype=np.uint8)
+            rng.integers(
+                0, 256, num_pages * page_size * src_token_bytes, dtype=np.uint8
+            )
             for _ in range(num_tensors)
         ]
         src_pages = np.array([5, 1, 6], dtype=np.int64)
@@ -73,7 +75,9 @@ class TestPackedPageIndices(CustomTestCase):
             for s_addr, d_addr in zip(
                 _slot_addrs(src_runs, src_idx), _slot_addrs(dst_runs, dst_idx)
             ):
-                dst[d_addr : d_addr + page_bytes] = staging[s_addr : s_addr + page_bytes]
+                dst[d_addr : d_addr + page_bytes] = staging[
+                    s_addr : s_addr + page_bytes
+                ]
 
             for t in range(num_tensors):
                 got = dst[t * pool_bytes : (t + 1) * pool_bytes].reshape(
@@ -93,10 +97,14 @@ def _packer(buffer_bytes, transfer_results, failed_handles=()):
     packer = object.__new__(PackedKVSender)
     packer.gpu_id = 0
     packer.inflight = None
-    packer.buffer = SimpleNamespace(get_size=lambda: buffer_bytes, get_ptr=lambda: 0x1000)
+    packer.buffer = SimpleNamespace(
+        get_size=lambda: buffer_bytes, get_ptr=lambda: 0x1000
+    )
     packer._gather = Mock()
     packer._src_handles, packer._dst_handles = {}, {}
-    packer.prep_dlist = Mock(side_effect=lambda peer, runs, mem: f"dlist-{peer or 'local'}")
+    packer.prep_dlist = Mock(
+        side_effect=lambda peer, runs, mem: f"dlist-{peer or 'local'}"
+    )
     posted = []
     results = iter(transfer_results)
 

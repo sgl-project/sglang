@@ -1485,12 +1485,15 @@ def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:
     if draft_token_to_kv_pool is not None or not isinstance(owner_view, SWAKVPool):
         return False
     pools = (owner_view.full_kv_pool, owner_view.swa_kv_pool)
-    return all(
-        type(pool) is MHATokenToKVPool
-        and pool.kv_cache_layout == "nhd"
-        and pool.head_dim == pool.v_head_dim
-        for pool in pools
-    ) and pools[0].head_num == pools[1].head_num
+    return (
+        all(
+            type(pool) is MHATokenToKVPool
+            and pool.kv_cache_layout == "nhd"
+            and pool.head_dim == pool.v_head_dim
+            for pool in pools
+        )
+        and pools[0].head_num == pools[1].head_num
+    )
 
 
 def setup_state_kv_args(

@@ -588,7 +588,10 @@ class TestNixlTransferWorker(CustomTestCase):
         )
         queue = SimpleNamespace(
             get=MagicMock(
-                side_effect=[self._make_chunk(room, [1], is_last_chunk=True), SystemExit()]
+                side_effect=[
+                    self._make_chunk(room, [1], is_last_chunk=True),
+                    SystemExit(),
+                ]
             )
         )
         with self.assertRaises(SystemExit):

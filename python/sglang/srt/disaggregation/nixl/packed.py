@@ -98,7 +98,10 @@ class PackedKVSender:
         handle = self._dst_handles.get(key)
         if handle is None:
             runs = np.array(
-                [(p, page_bytes, dst_gpu_id, page_bytes, dst_num_slots) for p in dst_ptrs],
+                [
+                    (p, page_bytes, dst_gpu_id, page_bytes, dst_num_slots)
+                    for p in dst_ptrs
+                ],
                 dtype=np.uint64,
             )
             handle = self._dst_handles[key] = self.prep_dlist(peer_name, runs, "VRAM")
