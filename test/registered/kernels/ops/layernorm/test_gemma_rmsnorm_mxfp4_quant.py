@@ -15,6 +15,7 @@ if not (is_hip() and torch.cuda.is_available() and is_gfx95_supported()):
 
 from aiter import per_1x32_f4_quant_hip  # noqa: E402
 
+import sglang.kernels.ops.layernorm.minimax_m3_rmsnorm as norm_ops  # noqa: E402
 from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (  # noqa: E402
     gemma_fused_add_rmsnorm,
     gemma_fused_add_rmsnorm_mxfp4_quant,
@@ -95,6 +96,27 @@ def test_edge_blocks(m):
     x[-1, 64:96] *= 1e4  # large blocks
     weight[96:128] = -1.0  # (1 + weight) == 0: all-zero output blocks
     _check_kernel(x, residual, weight)
+
+
+@pytest.mark.parametrize("programs", [1, 3, 7, 64])
+@pytest.mark.parametrize("m", [1, 7, 33, 257, 870])
+@torch.inference_mode()
+def test_row_loop_matches_one_program_per_row(m, programs, monkeypatch):
+    """Programs walk the rows with a grid stride and prefetch the next row;
+    any number of programs gives the bytes of one program per row."""
+    x, residual, weight = _inputs(m, HIDDEN, seed=m + programs)
+    monkeypatch.setattr(norm_ops, "_num_row_programs", lambda rows, device: rows)
+    ref_q, ref_scales, ref_residual = gemma_fused_add_rmsnorm_mxfp4_quant(
+        x, residual, weight, EPS
+    )
+    monkeypatch.setattr(
+        norm_ops, "_num_row_programs", lambda rows, device: min(rows, programs)
+    )
+    q, scales, residual_out = gemma_fused_add_rmsnorm_mxfp4_quant(
+        x, residual, weight, EPS
+    )
+    _assert_same_mxfp4(q, scales, ref_q, ref_scales, m)
+    assert torch.equal(residual_out, ref_residual)
 
 
 @pytest.mark.skipif(
