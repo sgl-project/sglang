@@ -16,6 +16,7 @@ from sglang.srt.utils.common import ceil_align, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,9 @@ class StreamingSession:
     cache whether to run its own path.
     """
 
+    # Set by UnifiedRadixCache.enable_uocr_doc_reuse for Unlimited-OCR v2.
+    uocr_doc_reuse: Optional[DocReuse] = None
+
     def __init__(self, cache: UnifiedRadixCache):
         self.cache = cache
         self.slots: Dict[str, SessionSlot] = {}
@@ -98,6 +102,10 @@ class StreamingSession:
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
         otherwise None (caller falls back to its raw match)."""
+        if self.uocr_doc_reuse is not None:
+            reuse = self.uocr_doc_reuse.try_match_prefix(params)
+            if reuse is not None:
+                return reuse
         slot = self.find_active_slot(params.req)
         if slot is None:
             return None
@@ -142,7 +150,7 @@ class StreamingSession:
             is_npu() or req.kv.max_evicted_seqlen > prefix_len
         ):
             prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
-            req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
+            req.kv.truncate_committed(prefix_len)
 
         self._free_tail(req.kv, prefix_len)
 
@@ -159,6 +167,11 @@ class StreamingSession:
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
         last finished request next turn."""
+        if (
+            self.uocr_doc_reuse is not None
+            and self.uocr_doc_reuse.on_cache_finished_req(req)
+        ):
+            return True
         if not _is_streaming(req):
             return False
 
@@ -185,7 +198,7 @@ class StreamingSession:
         slot.publishes_prompt = False
         # Use the finished length, not the req clock (it lags an in-flight verify
         # by ~1 under overlap); clamp so committed <= allocated.
-        slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
+        slot.kv.commit_finished(target)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
@@ -277,9 +290,7 @@ class StreamingSession:
         """Free [prefix_len, allocated) before alloc_for_extend overwrites it:
         spec decoding or a retract retry leaves stale indices there."""
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
-        kv.kv_allocated_len = prefix_len
-        kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
-        kv.clamp_evicted_seqlens(prefix_len)
+        kv.truncate(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Spec v2 can commit past max_new_tokens; the next turn's input is
@@ -290,9 +301,7 @@ class StreamingSession:
             # page-aligned; the partial page is re-prefilled next turn.
             target = (target // self.cache.page_size) * self.cache.page_size
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
-        req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
-        req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
-        req.kv.clamp_evicted_seqlens(target)
+        req.kv.truncate(target)
         req.output_ids = req.output_ids[:finished_len]
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:

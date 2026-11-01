@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    MetadataBuffers,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
@@ -55,6 +56,7 @@ from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_memory,
     get_observability,
     get_parallel,
     get_schedule,
@@ -132,6 +134,7 @@ class PrefillServerInfo:
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
+    stores_to_linker: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -158,6 +161,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.stores_to_linker = bool(self.stores_to_linker)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -321,6 +325,9 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.customized_info_enabled = (
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
@@ -649,6 +656,38 @@ class CommonKVManager(BaseKVManager):
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> List[bytes]:
         raise NotImplementedError
+
+    def validate_aux_buffers(
+        self, dst_aux_ptrs: List[int], dst_aux_item_lens: Optional[List[int]]
+    ) -> None:
+        if not self.customized_info_enabled and dst_aux_item_lens is None:
+            return
+
+        src_ptrs = self.kv_args.aux_data_ptrs
+        src_item_lens = self.kv_args.aux_item_lens
+        required_buffers = len(src_ptrs) - int(
+            get_disagg().disaggregation_enable_kv_checksum
+        )
+        slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
+        if not (
+            self.customized_info_enabled
+            and dst_aux_item_lens is not None
+            and len(src_ptrs) == len(src_item_lens)
+            and len(dst_aux_ptrs) == len(dst_aux_item_lens)
+            and len(dst_aux_ptrs) in (required_buffers, required_buffers + 1)
+            and (len(dst_aux_ptrs) == required_buffers or dst_aux_item_lens[-1] == 64)
+            and min(len(src_item_lens), len(dst_aux_item_lens)) >= slots.stop
+            and src_item_lens[slots] == dst_aux_item_lens[slots]
+            and all(src <= dst for src, dst in zip(src_item_lens, dst_aux_item_lens))
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: "
+                f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
+                f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
+                "Both servers must support and enable customized-info transfer "
+                "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES and "
+                "compatible metadata buffers."
+            )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -1601,6 +1640,7 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
+            "stores_to_linker": get_memory().enable_unified_cache_external_linker,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -2061,7 +2101,9 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k
+                for k in self.connection_pool
+                if k.startswith(f"{failed_bootstrap_addr}_")
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
@@ -2492,6 +2534,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self._lifecycle_lock = threading.RLock()
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        # Filled by send_metadata; staging cleanup can run before it under overlap.
+        self.chunk_staging_infos: List[Tuple[int, int, int, int, int]] = []
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
@@ -3034,6 +3078,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
+        self.stores_to_linker: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3046,6 +3091,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3159,6 +3206,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_kv_cache_sharding", False)
             )
 
+        if self.stores_to_linker is None:
+            self.stores_to_linker = bool(data.get("stores_to_linker", False))
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -3226,6 +3276,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
+                stores_to_linker=bool(self.stores_to_linker),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
@@ -3326,8 +3377,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            if self._loop is not None:
+                if self._runner is not None:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                self._loop.close()
 
     def close(self):
         """Shutdown"""

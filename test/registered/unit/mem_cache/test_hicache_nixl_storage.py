@@ -571,9 +571,12 @@ class TestNixlUnified(CustomTestCase):
 
     def test_dsa_indexer_bounce_round_trip_preserves_every_byte(self):
         """Index pages must survive copy fallback when the main KV dtype is bf16."""
+        from sglang.srt.mem_cache.device_pool_info import (
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
         from sglang.srt.mem_cache.pool_host.dsa import (
             DSAIndexerPoolHost,
-            make_dsa_indexer_pool_decl,
         )
 
         pool = SimpleNamespace(
@@ -592,18 +595,24 @@ class TestNixlUnified(CustomTestCase):
                 torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
             ],
         )
-        # The indexer host mirrors the anchor's widened slot space, so the
-        # stub needs the DCP accounting a real MLATokenToKVPoolHost carries.
         anchor = SimpleNamespace(
-            page_size=64,
-            layout="page_first",
-            size=256,
-            page_num=4,
-            logical_size=256,
-            dcp_size=1,
+            page_size=64, layout="page_first", size=256, page_num=4
         )
         host = DSAIndexerPoolHost(
-            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+            IndexKeyBufferInfo(
+                page_size=64,
+                compress_ratio=1,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                buffers=tuple(pool.index_k_with_scale_buffer),
+            ),
+            layer_mapping={0: 0, 1: 1},
+            target_device_layer_num=pool.layer_num,
+            num_host_pages=anchor.page_num,
+            transfer_page_size=anchor.page_size,
+            layout=anchor.layout,
+            buffer_device=pool.device,
+            dtype=pool.store_dtype,
+            pin_memory=False,
         )
         self.addCleanup(host.destroy)
         with mock.patch.object(
