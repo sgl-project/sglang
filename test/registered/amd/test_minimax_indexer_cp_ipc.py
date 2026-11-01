@@ -1,5 +1,6 @@
 """The IPC candidate exchange must deliver each head's native NVFP4 verify selection
-on four ranks, across call counters, row-count changes and CUDA-graph replay."""
+on four ranks, across call counters and their wrap, row-count changes and
+CUDA-graph replay."""
 
 import multiprocessing
 import types
@@ -85,6 +86,15 @@ def _run_exchange(rank: int, port: int) -> None:
                     BLOCK, TOPK, 0, 1, SM_SCALE * K_SCALE, exchange,
                 )  # fmt: skip
 
+            # seed 1 starts two calls short of the counters' wrap at 510; seed 2
+            # two calls short of the int32 maximum an unwrapped count would pass
+            start = {1: 508, 2: 2**31 - 3}.get(seed)
+            if start is not None:
+                dist.barrier()
+                exchange.write_calls.fill_(start)
+                exchange.merge_calls.fill_(start)
+                torch.cuda.synchronize()
+                dist.barrier()
             # more calls than parities, so a stale parity or tag would be read back
             for call, (query, native) in enumerate(zip(queries, natives)):
                 q_heads.copy_(query.permute(1, 0, 2))

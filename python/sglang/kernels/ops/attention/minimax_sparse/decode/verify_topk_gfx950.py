@@ -1016,7 +1016,9 @@ def cp_verify_merge(
 # reads them where they land. Each word carries the writing call's tag, so it is
 # its own arrival flag; the tag of a row's n-th call is n % 255 + 1 (0 is never
 # written, so the zeroed buffer reads as "not arrived"), counted per row by the
-# kernels themselves so graph replay keeps every rank's count in step. Slots
+# kernels themselves so graph replay keeps every rank's count in step. The count
+# wraps at 510, where tag and parity both repeat, so the int32 never overflows
+# into a negative parity on a long-running server. Slots
 # alternate by call parity: a rank's writes for call n + 2 can only start after
 # its own merge of call n + 1, which needed every peer's call n + 1 writes, so
 # no peer can still be reading call n's slots.
@@ -1074,7 +1076,7 @@ def _cp_local_keys_ipc_kernel(
     key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
     best = tl.topk(key, KP)
     n = tl.load(counters_ptr + head * MAX_ROWS + r)
-    tl.store(counters_ptr + head * MAX_ROWS + r, n + 1)
+    tl.store(counters_ptr + head * MAX_ROWS + r, (n + 1) % 510)
     tag = n % 255 + 1
     parity = n % 2
     dst = tl.load(peer_ptrs + head).to(tl.pointer_type(tl.int64))
@@ -1105,7 +1107,7 @@ def _cp_merge_ipc_kernel(
     """
     r = tl.program_id(0)
     n = tl.load(counters_ptr + r)
-    tl.store(counters_ptr + r, n + 1)
+    tl.store(counters_ptr + r, (n + 1) % 510)
     tag = (n % 255 + 1).to(tl.int64)
     parity = n % 2
     c = tl.arange(0, WORLD * KP)
