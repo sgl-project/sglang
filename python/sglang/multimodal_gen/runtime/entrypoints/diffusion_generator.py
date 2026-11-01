@@ -616,17 +616,22 @@ class DiffGenerator:
                 f"Expected {request_count} outputs, got {output_count} from scheduler"
             )
 
-    def _send_to_scheduler_and_wait_for_response(self, batch: Any) -> OutputBatch:
+    def _send_to_scheduler_and_wait_for_response(
+        self, batch: Any, *, replica: int | None = None
+    ) -> OutputBatch:
         """Send a request without reusing a failed inference runtime."""
         self._raise_if_unavailable()
+        forward_kwargs = {"replica": replica} if replica is not None else {}
         try:
             if self.local_scheduler_process:
                 self._check_worker_health()
                 output_batch = sync_scheduler_client.forward(
-                    batch, check_worker_health=self._check_worker_health
+                    batch,
+                    check_worker_health=self._check_worker_health,
+                    **forward_kwargs,
                 )
             else:
-                output_batch = sync_scheduler_client.forward(batch)
+                output_batch = sync_scheduler_client.forward(batch, **forward_kwargs)
             if output_batch.error and is_unrecoverable_device_error(output_batch.error):
                 raise DiffusionRuntimeError(output_batch.error)
             return output_batch

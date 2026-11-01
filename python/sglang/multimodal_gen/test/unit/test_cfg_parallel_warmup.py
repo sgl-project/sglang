@@ -357,6 +357,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             generator._run_client_warmup_if_needed()
 
         forward.assert_called_once()
+        self.assertEqual(forward.call_args.kwargs, {"replica": 0})
         req = forward.call_args.args[0]
         self.assertTrue(req.is_warmup)
         self.assertEqual((req.width, req.height), (832, 480))

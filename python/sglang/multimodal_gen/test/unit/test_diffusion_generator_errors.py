@@ -178,11 +178,62 @@ def test_client_warmup_uses_worker_health_checks(generator, monkeypatch):
     generator.local_scheduler_process = [process]
     monkeypatch.setattr(dg, "should_run_explicit_client_warmup", lambda _: True)
     monkeypatch.setattr(
-        dg, "run_sync_client_warmup", lambda args, forward: forward(object())
+        dg, "run_sync_client_warmup", lambda args, forward: forward(object(), replica=0)
     )
     with pytest.raises(DiffusionRuntimeError, match="exited with code 1"):
         generator._run_client_warmup_if_needed()
     client.forward.assert_not_called()
+
+
+@pytest.mark.parametrize("local_mode", [False, True])
+def test_client_warmup_preserves_replica_routing_and_worker_health(
+    generator, monkeypatch, local_mode
+):
+    generator, _ = generator
+    endpoints = ["tcp://replica-0", "tcp://replica-1"]
+    generator.server_args.scheduler_endpoints = endpoints
+    generator.server_args.scheduler_rpc_timeout = None
+    if local_mode:
+        process = Mock(pid=123, exitcode=None)
+        process.is_alive.return_value = True
+        generator.local_scheduler_process = [process]
+
+    scheduler = SchedulerClient()
+    scheduler.server_args = generator.server_args
+    scheduler.request_logger = Mock()
+    scheduler._forward_one = Mock(return_value=dg.OutputBatch())
+    monkeypatch.setattr(dg, "sync_scheduler_client", scheduler)
+    monkeypatch.setattr(dg, "should_run_explicit_client_warmup", lambda _: True)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_image",
+        lambda *args, **kwargs: False,
+    )
+    warmup_req = dg.Req(prompt="warmup", is_warmup=True)
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.build_client_warmup_reqs",
+        lambda *args, **kwargs: [warmup_req],
+    )
+
+    generator._run_client_warmup_if_needed()
+
+    calls = scheduler._forward_one.call_args_list
+    assert sorted(call.args[0] for call in calls) == endpoints
+    expected_kwargs = (
+        {"check_worker_health": generator._check_worker_health} if local_mode else {}
+    )
+    for call in calls:
+        assert call.args[1:] == (warmup_req, None)
+        assert call.kwargs == expected_kwargs
+    if local_mode:
+        assert process.is_alive.call_count == len(endpoints)
+
+    # Explicit warmup routing must leave round-robin real traffic at replica 0.
+    scheduler._forward_one.reset_mock()
+    request = dg.Req(prompt="real")
+    generator._send_to_scheduler_and_wait_for_response(request)
+    scheduler._forward_one.assert_called_once_with(
+        endpoints[0], request, None, **expected_kwargs
+    )
 
 
 def test_fatal_lora_error_rejects_later_generation(generator):
