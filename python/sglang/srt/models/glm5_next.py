@@ -1,3 +1,4 @@
+import functools
 import logging
 from array import array
 from contextlib import nullcontext
@@ -128,6 +129,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_exec,
     get_lora,
     get_mm,
     get_model,
@@ -209,7 +211,24 @@ def _kda_fp8_modules() -> frozenset:
             "--remote-instance-weight-loader-start-seed-via-transfer-engine: "
             "the KDA projections are quantized at load"
         )
+    # Elastic EP reloads lost experts with update_weights_from_disk, which these
+    # projections refuse, and it does not check the refusal.
+    if modules and get_exec().moe.elastic_ep_backend is not None:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--elastic-ep-backend: the KDA projections are quantized at load"
+        )
+    if modules:
+        _warn_kda_fp8_experimental()
     return modules
+
+
+@functools.cache  # once per process; the check runs for every KDA layer
+def _warn_kda_fp8_experimental() -> None:
+    logger.warning(
+        "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is experimental: "
+        "accuracy is not validated across workloads."
+    )
 
 
 class _KdaFp8Config(Fp8Config):

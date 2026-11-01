@@ -35,7 +35,8 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# H100 runs the default path of a Hopper GPU without tuned tables, in the per-commit stage.
+# base-b, not the kernel stage: its path filter misses srt/ changes, so an srt-only PR
+# still runs this on H100 (a Hopper GPU without tuned tables) and on H20 (base-c).
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h20")

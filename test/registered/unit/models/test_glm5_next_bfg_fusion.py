@@ -368,7 +368,7 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "needs a BF16 o_proj"):
             self.build("o_proj", MockFp8Config(QKV + BFG))
 
-    def test_processed_state_loads_and_transfer_engine_seed_are_rejected(self):
+    def test_processed_state_loads_seed_and_elastic_ep_are_rejected(self):
         # These load formats copy processed tensors into parameters built from the
         # checkpoint; a transfer-engine seed serves its FP8 tensors to such peers.
         cases = [
@@ -381,6 +381,8 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
                 "transfer-engine",
             )
         )
+        # Elastic EP reloads lost experts from disk and ignores the update's refusal.
+        cases.append(({"elastic_ep_backend": "mooncake"}, "elastic-ep-backend"))
         for args, error in cases:
             with self.subTest(**args):
                 override = get_context().override_server_args(
