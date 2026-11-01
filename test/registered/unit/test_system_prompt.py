@@ -12,6 +12,7 @@ server / engine is launched.
 import os
 import tempfile
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -675,6 +676,107 @@ class TestMambaGapBudget(CustomTestCase):
             _mamba_slot_cost=0, _static_mamba_slots=True, tree_cache=None
         )
         self.assertEqual(self._budget(adder, self._req(None, 0, None)), 0)
+
+
+class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):
+    """Regression (H3 silent KV corruption): with --system-prompt a request's
+    donated key is capped at system_prefix_boundary, but its MATCH can extend
+    past the boundary when deeper keys exist in the tree (deep keys inserted by
+    boundary-less requests extend the shared system node). The finish-time free
+    starts at req.kv.cache_protected_len, so the capped checkpoint must not
+    shrink it below the matched extent — otherwise release_kv_cache would
+    free [boundary, protected) pages that belong to the matched tree node
+    (later matches would read recycled pages)."""
+
+    def _make_cache(self, row):
+        import torch
+
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        freed = []
+        cache = RadixCache.create_simulated(page_size=1)
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([row]),
+            write=lambda key, val: None,
+        )
+
+        def capture_free(seg, start_pos):
+            freed.append((seg.tolist(), start_pos))
+
+        cache.token_to_kv_pool_allocator = SimpleNamespace(
+            free_segment=capture_free
+        )
+        return cache, freed
+
+    def _seed_deep_key(self, cache):
+        # A boundary-less request donated its full key: 6 tokens deep, holding
+        # the tree's own pages [10..15].
+        import torch
+
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 6])),
+                value=torch.tensor([10, 11, 12, 13, 14, 15]),
+            )
+        )
+
+    def _req(self, boundary, protected):
+        return SimpleNamespace(
+            origin_input_ids=array("q", [1, 2, 3, 4, 5, 6, 7, 8]),
+            full_untruncated_fill_ids=array("q", [1, 2, 3, 4, 5, 6, 7, 8]),
+            system_prefix_boundary=boundary,
+            priority=0,
+            extra_key=None,
+            cache_salt=None,
+            lock=None,
+            last_node=None,
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                swa_evict_floor=0,
+                cache_inserted_len=0,
+                cache_protected_len=protected,
+            ),
+        )
+
+    def test_match_past_boundary_keeps_tree_pages(self):
+        # boundary=4 -> key capped at 4, but the request matched 6 tokens of
+        # the deep node: pages [14, 15] belong to the split child and must
+        # stay out of the release free; only the true suffix [20, 21] is.
+        row = [10, 11, 12, 13, 14, 15, 20, 21]
+        cache, _ = self._make_cache(row)
+        self._seed_deep_key(cache)
+        req = self._req(boundary=4, protected=6)
+        cache.checkpoint(req, up_to=8)
+        self.assertEqual(req.kv.cache_protected_len, 6)
+        would_free = row[req.kv.cache_protected_len :]
+        self.assertNotIn(14, would_free)
+        self.assertNotIn(15, would_free)
+        self.assertEqual(would_free, [20, 21])
+
+    def test_match_within_boundary_advances_normally(self):
+        # protected (2) < the capped key (4): normal advance to the insert
+        # boundary; the request's duplicate pages [30, 31] free as duplicates.
+        row = [10, 11, 30, 31, 32, 33, 34, 35]
+        cache, freed = self._make_cache(row)
+        self._seed_deep_key(cache)
+        req = self._req(boundary=4, protected=2)
+        cache.checkpoint(req, up_to=8)
+        self.assertEqual(req.kv.cache_protected_len, 4)
+        freed_flat = [p for seg, _ in freed for p in seg]
+        self.assertEqual(freed_flat, [30, 31])
+
+    def test_no_boundary_uncapped(self):
+        # Without the feature the protected extent advances over the whole
+        # donated key (byte-identical default behavior).
+        row = [10, 11, 12, 13, 14, 15, 20, 21]
+        cache, _ = self._make_cache(row)
+        self._seed_deep_key(cache)
+        req = self._req(boundary=None, protected=6)
+        cache.checkpoint(req, up_to=8)
+        self.assertEqual(req.kv.cache_protected_len, 8)
 
 
 class TestMambaAuditWithBareTreeCache(CustomTestCase):
