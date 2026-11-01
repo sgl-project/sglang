@@ -2572,7 +2572,9 @@ class DeepseekV2AttentionMLA(
                 self.has_fused_proj
                 and not get_exec().deterministic.enable_deterministic_inference
                 and not self.is_packed_weight
-                and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+                and fused_a_gemm_weight_eligible(
+                    self.fused_qkv_a_proj_with_mqa, backend=self.fused_a_gemm_backend
+                )
             )
         if self._use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(
@@ -2593,7 +2595,9 @@ class DeepseekV2AttentionMLA(
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
-                and fused_a_gemm_weight_eligible(self.q_b_proj)
+                and fused_a_gemm_weight_eligible(
+                    self.q_b_proj, backend=self.fused_a_gemm_backend
+                )
             )
         if self._use_min_latency_q_b_gemm:
             q = linear_with_fused_a_gemm(

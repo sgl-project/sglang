@@ -28,15 +28,30 @@ _AUTO_BACKEND = (
     FusedAGemmBackend.CUTEDSL if is_sm120_supported() else FusedAGemmBackend.JIT
 )
 
+# Mirrors the K asserts in each backend's _dsv3_fused_a_gemm_run.
+_K_ALIGNMENT = {
+    FusedAGemmBackend.JIT: 256,
+    FusedAGemmBackend.CUTEDSL: 1024,
+}
+
 _IS_CUDA = is_cuda()
 _DEVICE_SM = get_device_sm()
 
 
-def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
+def _resolve_backend(backend: FusedAGemmBackend | str) -> FusedAGemmBackend:
+    backend = FusedAGemmBackend(backend)
+    return _AUTO_BACKEND if backend == FusedAGemmBackend.AUTO else backend
+
+
+def fused_a_gemm_weight_eligible(
+    layer: torch.nn.Module,
+    *,
+    backend: FusedAGemmBackend | str = FusedAGemmBackend.AUTO,
+) -> bool:
     return (
         layer.weight.dtype == torch.bfloat16
         and layer.weight.shape[0] % 16 == 0
-        and layer.weight.shape[1] % 256 == 0
+        and layer.weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
         and _IS_CUDA
         and _DEVICE_SM >= 90
     )
@@ -64,11 +79,7 @@ def dsv3_fused_a_gemm(
     output: torch.Tensor | None = None,
     backend: FusedAGemmBackend | str = FusedAGemmBackend.AUTO,
 ) -> torch.Tensor:
-    backend = FusedAGemmBackend(backend)
-    if backend == FusedAGemmBackend.AUTO:
-        backend = _AUTO_BACKEND
-
-    if backend == FusedAGemmBackend.JIT:
+    if _resolve_backend(backend) == FusedAGemmBackend.JIT:
         from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm as impl
     else:
         from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
