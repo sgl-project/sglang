@@ -254,16 +254,32 @@ where
         request: Request<ApplyExternalKvBatchRequest>,
     ) -> Result<Response<ApplyExternalKvBatchResponse>, Status> {
         let request = request.into_inner();
-        validate_worker_id(&request.worker_id)?;
+        validate_owner(&request)?;
         validate_actions(&request.actions)?;
         let response = self.backend.apply_external_kv_batch(request).await?;
         Ok(Response::new(response))
     }
 }
 
-fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
-    if worker_id.is_empty() {
-        return Err(Status::invalid_argument("worker_id must not be empty"));
+fn validate_owner(request: &ApplyExternalKvBatchRequest) -> Result<(), Status> {
+    if !request.worker_id.is_empty() {
+        return Ok(());
+    }
+    if request.dram_pool_id.is_empty() || !request.worker_address.is_empty() {
+        return Err(Status::invalid_argument(
+            "set a worker identity or a DRAM pool id",
+        ));
+    }
+    for action in &request.actions {
+        let n = action.hashes.len();
+        if action.tier != TierType::TierDram as i32
+            || (action.r#type == ExternalKvActionType::ActionReport as i32
+                && (action.component_masks.len() != n || action.block_sizes.len() != n))
+        {
+            return Err(Status::invalid_argument(
+                "pool owners report DRAM with component masks and token counts",
+            ));
+        }
     }
     Ok(())
 }
@@ -301,8 +317,8 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
 }
 
 fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
-    // An empty actions list is a no-op that only refreshes the worker's recorded
-    // address. Non-empty batches still have every action validated below.
+    // An empty actions list only refreshes identity/spec metadata and bindings.
+    // Non-empty batches still have every action validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
         return Err(Status::resource_exhausted(format!(
             "batch contains {} actions; maximum is {MAX_ACTIONS_PER_BATCH}",
@@ -525,7 +541,12 @@ impl WorkerPrefixScanner {
                 contiguous: true,
                 saw_components: false,
             },
-            Some(spec) if spec.components == 0 || spec.version > SUPPORTED_SPEC_VERSION => {
+            Some(spec)
+                if spec.components & COMPONENT_FULL == 0
+                    || spec.components & !(COMPONENT_FULL | COMPONENT_SWA | COMPONENT_MAMBA)
+                        != 0
+                    || spec.version > SUPPORTED_SPEC_VERSION =>
+            {
                 PrefixScanState::Invalid
             }
             Some(spec) if spec.components & COMPONENT_SWA != 0 && spec.swa_window_tokens == 0 => {
@@ -892,8 +913,12 @@ mod tests {
 
     #[test]
     fn validate_worker_id_rejects_empty_value() {
-        assert!(validate_worker_id("").is_err());
-        assert!(validate_worker_id("worker-1").is_ok());
+        assert!(validate_owner(&ApplyExternalKvBatchRequest::default()).is_err());
+        assert!(validate_owner(&ApplyExternalKvBatchRequest {
+            worker_id: "worker-1".into(),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     // --- component-aware prefix rule engine ---
@@ -1031,13 +1056,14 @@ mod tests {
     #[test]
     fn unusable_specs_are_excluded() {
         // Each of these declared specs is unusable and must fail closed: an empty
-        // component set, a future/unsupported version, and SWA without a window.
+        // component set, an unsupported component/version, and SWA without a window.
         let blocks = vec![blk(&[(hbm(), COMPONENT_FULL | COMPONENT_SWA)], 16)];
         let empty = spec(0, 0, &[hbm()], &[], &[]);
         let mut future = spec(COMPONENT_FULL, 0, &[hbm()], &[], &[]);
         future.version = SUPPORTED_SPEC_VERSION + 1;
         let swa_no_window = spec(COMPONENT_FULL | COMPONENT_SWA, 0, &[hbm()], &[hbm()], &[]);
-        for s in [empty, future, swa_no_window] {
+        let unknown_component = spec(COMPONENT_FULL | 8, 0, &[hbm()], &[], &[]);
+        for s in [empty, future, swa_no_window, unknown_component] {
             assert_eq!(compute_worker_prefix(Some(&s), &blocks), 0);
         }
     }
