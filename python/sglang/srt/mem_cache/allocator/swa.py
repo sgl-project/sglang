@@ -198,9 +198,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         available = self.swa_available_size()
         if available < swa_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
-            )
+            tree_cache.evict_for_alloc(EvictParams(swa_num_tokens=swa_tokens))
             available = self.swa_available_size()
         if available < swa_tokens:
             return (
@@ -219,11 +217,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        full_shortfall = max(0, num_tokens - self.full_available_size())
-        swa_shortfall = max(0, num_tokens - self.swa_available_size())
-        if full_shortfall or swa_shortfall:
+        if (
+            self.full_available_size() < num_tokens
+            or self.swa_available_size() < num_tokens
+        ):
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+                EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens)
             )
 
     def full_available_size(self):

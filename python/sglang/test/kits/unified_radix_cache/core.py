@@ -184,7 +184,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}
-        real_available_size = cache._component_available_size
+        real_available_size = cache._pool_available
         real_free_values = cache._free_values
 
         def available_size(requested_type):
@@ -205,9 +205,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
             else EvictParams(mamba_num=self._SHORTFALL)
         )
         with (
-            mock.patch.object(
-                cache, "_component_available_size", side_effect=available_size
-            ),
+            mock.patch.object(cache, "_pool_available", side_effect=available_size),
             mock.patch.object(cache, "_free_values", side_effect=free_values),
         ):
             result = cache.evict_for_alloc(params)

@@ -85,14 +85,14 @@ class TestReclaimVictimLoop(CustomTestCase):
                 demand = {owner: allocator.full_available_size() + 2}
                 self.assertFalse(allocator._units_fit(demand))
                 walks = []
-                original = cache.evict_for_alloc
+                original = cache.evict_until
 
                 def walk(params, **kwargs):
                     result = original(params, **kwargs)
                     walks.append((params, result))
                     return result
 
-                with patch.object(cache, "evict_for_alloc", side_effect=walk):
+                with patch.object(cache, "evict_until", side_effect=walk):
                     self.assertTrue(allocator.reclaim(cache, demand))
                 first = walks[0][0]
                 self.assertGreater(first.num_tokens, 0)
@@ -156,12 +156,11 @@ class TestReclaimVictimLoop(CustomTestCase):
                     cache.dec_lock_ref(node, receipt.to_dec_params())
         self.assertEqual(outcomes, {False, True})
 
-    def test_component_shortfall_reclaims_the_demand(self):
-        # Callers that make room for one component's take name its shortfall
-        # against that component's capacity read (the state slot check before
-        # binding a request, a host load's device rows). On unified memory the
-        # shortfall is the component's demand less its read, so the reclaim
-        # answers exactly as the demand's own admission and reclaim do.
+    def test_component_demand_reclaims_as_admission_decides(self):
+        # Callers that make room for one component's take (the state slots
+        # before binding a request, a host load's device rows) ask the cache
+        # for that demand; the reclaim answers exactly as the demand's own
+        # admission does, and evicts nothing for a demand admission refuses.
         rng = random.Random(20261101)
         outcomes = set()
         for seed in range(150):
@@ -173,8 +172,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                 component = rng.choice(("owner", "window", "state"))
                 if component == "state":
                     need = rng.randint(1, 3)
-                    read = allocator.state_slots_available()
-                    params = EvictParams(mamba_num=need - read)
+                    params = EvictParams(mamba_num=need)
                     demand = {state: need}
                     admitted = allocator.admits(
                         0,
@@ -186,11 +184,10 @@ class TestReclaimVictimLoop(CustomTestCase):
                     page = allocator.page_size
                     need = rng.randint(1, 48)
                     name = owner if component == "owner" else window
-                    read = allocator.units_available(name)
                     if component == "owner":
-                        params = EvictParams(num_tokens=need - read)
+                        params = EvictParams(num_tokens=need)
                     else:
-                        params = EvictParams(swa_num_tokens=need - read)
+                        params = EvictParams(swa_num_tokens=need)
                     demand = {name: -(-need // page)}
                     admitted = allocator.admits(
                         need if component == "owner" else 0,
@@ -198,8 +195,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                         evictable=allocator.admission_evictable(cache),
                     )
                 before = _evictable(cache)
-                if need > read:
-                    cache.evict_for_alloc(params)
+                cache.evict_for_alloc(params)
                 self.assertEqual(allocator._units_fit(demand), admitted)
                 outcomes.add(admitted)
                 if not admitted:
