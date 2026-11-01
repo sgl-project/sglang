@@ -6,12 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    get_jit_cuda_arch,
-    load_jit,
-    make_cpp_args,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
@@ -45,9 +41,9 @@ def _jit_gguf_moe_vec_module(dtype: torch.dtype, quant_type: int) -> Module:
     ):
         raise ValueError(f"Unsupported GGUF vector quantization type: {quant_type}")
     args = make_cpp_args(dtype, quant_type)
-    arch = get_jit_cuda_arch()
     # Match the AOT common_ops SM90 fast-math build; its other build is precise.
-    flags = ["--use_fast_math"] if (arch.major, arch.minor) == (9, 0) else []
+    sm90 = current_arch().is_sm(9, 0)
+    flags = ["--use_fast_math"] if sm90 else []
     return load_jit(
         "gguf_moe_vec",
         *args,

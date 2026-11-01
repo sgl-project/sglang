@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -14,7 +15,8 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_dequant_module() -> Module:
-    major, minor = torch.cuda.get_device_capability()
+    cuda = current_arch().cuda
+    major, minor = cuda.capability if cuda is not None else (0, 0)
     if major != 10:
         raise RuntimeError(
             f"MSA-v1 compact NVFP4 dequant requires SM100/SM103, got sm{major}{minor}"

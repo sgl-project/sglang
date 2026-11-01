@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -48,7 +49,7 @@ def can_use_set_mla_kv_concat_q(nope_bytes: int, rope_bytes: int) -> bool:
     filling whole int4 warp rounds and rope dim exactly one int warp round
     for the concat side — 1024/128 bytes i.e. 512/64 bf16 satisfies both).
     """
-    if torch.cuda.get_device_capability()[0] < 9:
+    if not current_arch().is_sm_at_least(9):
         return False
     if nope_bytes % 4 != 0 or rope_bytes % 4 != 0:
         return False
@@ -182,7 +183,7 @@ def set_mla_kv_concat_q_fp8_module(use_pdl: bool) -> Module:
 def can_use_set_mla_kv_concat_q_fp8() -> bool:
     """SM90+ (TMA bulk store) and the module compiles. Row widths are fixed
     at 512/64 (the MLA absorb layout) inside the kernel."""
-    if torch.cuda.get_device_capability()[0] < 9:
+    if not current_arch().is_sm_at_least(9):
         return False
     try:
         set_mla_kv_concat_q_fp8_module(is_arch_support_pdl())

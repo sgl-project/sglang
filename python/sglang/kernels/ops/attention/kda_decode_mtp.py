@@ -13,6 +13,7 @@ from cutlass import cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 
 WARP_SIZE = 32
@@ -933,11 +934,7 @@ def _block_threads(*, H: int, N: int) -> int:
     Measured on GB300 (152 SMs, H=12, num_spec=5): N=1 -8.8%, N=8 -11.3%,
     but N=64 +47.3%.
     """
-    import torch
-
-    num_sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    num_sms = current_arch().num_sms
     return BLOCK_THREADS_WIDE if H * N <= num_sms else BLOCK_THREADS_NARROW
 
 
@@ -1161,8 +1158,9 @@ def fused_kda_decode_mtp_dspark(
         onorm_weight if apply_onorm else dt_bias,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
+    cuda_arch = current_arch().cuda
     key = (
-        torch.cuda.get_device_capability(),
+        cuda_arch.capability,
         H,
         N,
         num_spec,

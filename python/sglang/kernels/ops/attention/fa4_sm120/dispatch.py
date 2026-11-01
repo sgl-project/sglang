@@ -7,6 +7,8 @@ implementation and its launch state remain outside ``flash_attn/cute``.
 
 from functools import lru_cache
 
+from sglang.kernels.arch import current_arch
+
 
 @lru_cache(maxsize=None)
 def get_forward_host(arch: int):
@@ -39,10 +41,10 @@ def resolve_runtime_policy(
 @lru_cache(maxsize=None)
 def get_forward_arch(device) -> int | None:
     """Return the device arch when it has an architecture-owned forward host."""
-    import torch
-
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = major * 10 + minor
+    cuda = current_arch().cuda
+    if cuda is None:
+        return None
+    arch = cuda.sm_version
     return arch if get_forward_host(arch) is not None else None
 
 

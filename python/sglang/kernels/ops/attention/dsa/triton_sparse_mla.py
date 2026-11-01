@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported
@@ -71,13 +72,6 @@ def _validate_input_dtypes(
     return kv_dtype != torch.bfloat16
 
 
-@functools.lru_cache(maxsize=None)
-def _async_copy_is_harmful_on_device(device: int) -> bool:
-    properties = torch.cuda.get_device_properties(device)
-    arch = getattr(properties, "gcnArchName", "") or ""
-    return arch.split(":", 1)[0] in _ASYNC_COPY_OFF_ARCHES
-
-
 def _async_copy_is_harmful() -> bool:
     try:
         from triton import knobs
@@ -94,7 +88,8 @@ def _async_copy_is_harmful() -> bool:
     if not torch.cuda.is_available():
         return False
 
-    return _async_copy_is_harmful_on_device(torch.cuda.current_device())
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch in _ASYNC_COPY_OFF_ARCHES
 
 
 @contextlib.contextmanager

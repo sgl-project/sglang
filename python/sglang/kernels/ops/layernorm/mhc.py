@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -818,7 +819,7 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
 
-    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    n_sms = current_arch().num_sms
 
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
