@@ -122,6 +122,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_rocm_moe import TunedFrontGemm, build_tuned_front_gemm
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -475,6 +476,8 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
+        # AITER tuned BF16 GEMM for the three-way merged front; set at merge time.
+        self._tuned_front: Optional[TunedFrontGemm] = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -748,6 +751,8 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
+        if _is_hip and not self._front_is_ep_pair:
+            self._tuned_front = build_tuned_front_gemm(weight=self._front_w)
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
@@ -1383,11 +1388,15 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        # The tuned GEMM writes bf16; _front_fp32 is always False on HIP.
+        if self._tuned_front is not None and self._tuned_front.covers(num_tokens):
+            fused = self._tuned_front(hidden_states, self._front_w)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
