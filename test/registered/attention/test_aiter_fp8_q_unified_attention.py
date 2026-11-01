@@ -316,6 +316,8 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
     def test_cuda_graph_decode_copies_page_size_one_table(self):
         backend = object.__new__(AiterAttnBackend)
         backend.use_triton_unified_attention = True
+        # As __init__ sets it for unified attention (page_size 1 included).
+        backend.decode_uses_page_table = True
         backend.use_mla = False
         backend.use_sliding_window_kv_pool = False
         backend.dcp_world_size = 1
