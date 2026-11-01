@@ -1144,20 +1144,11 @@ class ServingChatTestCase(CustomTestCase):
             ("response_template", "auto", stopped, []),
         ):
             self._use_delimited_response_template(parser, tool_call_parser=parser)
-            for stream, incremental in ((False, False), (True, False), (True, True)):
-                with self.subTest(
-                    choice=tool_choice, stream=stream, incremental=incremental
-                ):
-                    self.assertEqual(
-                        self._served(
-                            output,
-                            stream,
-                            incremental=incremental,
-                            tools=[_WEATHER_TOOL],
-                            tool_choice=tool_choice,
-                        ),
-                        ("Plan", "", expected),
-                    )
+            self._assert_served_in_every_stream_mode(
+                output=output,
+                expected=("Plan", "", expected),
+                tool_choice=tool_choice,
+            )
 
     def test_tool_call_is_parsed_under_delimited_template(self):
         """A call must not be lost when it ends on the tool closer that detokenization
@@ -1365,6 +1356,53 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(finishes, [expected_finish])
         return served
+
+    def _assert_served_in_every_stream_mode(self, *, output, expected, tool_choice):
+        for stream, incremental in ((False, False), (True, False), (True, True)):
+            with self.subTest(
+                choice=tool_choice, stream=stream, incremental=incremental
+            ):
+                self.assertEqual(
+                    self._served(
+                        output=output,
+                        stream=stream,
+                        incremental=incremental,
+                        tools=[_WEATHER_TOOL],
+                        tool_choice=tool_choice,
+                    ),
+                    expected,
+                )
+
+    def test_forced_tool_call_without_parser_is_returned_as_tool_calls(self):
+        """Without a parser, the forced JSON array must come back as tool calls."""
+        self.chat.tool_call_parser = None
+        output = _spec_result(0)
+        output["text"] = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+        for tool_choice in (
+            "required",
+            {"type": "function", "function": {"name": "get_weather"}},
+        ):
+            adapted, _ = self._convert_rendered_as(
+                "<assistant>", tools=[_WEATHER_TOOL], tool_choice=tool_choice
+            )
+            self.assertIn("json_schema", adapted.sampling_params)
+            self._assert_served_in_every_stream_mode(
+                output=output,
+                expected=("", "", [("get_weather", {"city": "Paris"})]),
+                tool_choice=tool_choice,
+            )
+
+    def test_unforced_tool_choice_without_parser_keeps_json_as_content(self):
+        """Without a parser, unforced choices leave the model's JSON in content."""
+        self.chat.tool_call_parser = None
+        output = _spec_result(0)
+        output["text"] = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+        for tool_choice in ("auto", "none"):
+            self._assert_served_in_every_stream_mode(
+                output=output,
+                expected=("", output["text"], []),
+                tool_choice=tool_choice,
+            )
 
     def test_markers_in_call_arguments_under_json_answer_stay_arguments(self):
         """Answer or thinking markers in call arguments must not open a region before a
@@ -4487,6 +4525,26 @@ class ServingChatTestCase(CustomTestCase):
             chunks.append(chunk)
         return chunks
 
+    def _one_token_stream_content(self, text):
+        content = {
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-tool",
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.3, 9, text)],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 1,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content=content, n_prev_token=0, total_output_logprobs=1
+        ).model_dump()
+        return content, choice_logprobs
+
     def test_streaming_top_logprobs_follow_each_token_in_chunk(self):
         """Each token of a multi-token streaming chunk keeps its own alternatives."""
         content = {
@@ -4569,23 +4627,7 @@ class ServingChatTestCase(CustomTestCase):
         """Logprobs must be flushed on a standalone chunk when the tool parser emits no content delta."""
         self.chat.tool_call_parser = "hermes"
 
-        content = {
-            "text": "(<",
-            "meta_info": {
-                "id": "chatcmpl-tool",
-                "prompt_tokens": 5,
-                "completion_tokens": 1,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [(0.3, 9, "(<")],
-                "output_top_logprobs": [],
-                "output_token_logprobs_length": 1,
-            },
-            "index": 0,
-        }
-        choice_logprobs = self.chat._process_streaming_logprobs(
-            content, 0, 1
-        ).model_dump()
+        content, choice_logprobs = self._one_token_stream_content("(<")
 
         req = ChatCompletionRequest(
             model="x",
@@ -4611,6 +4653,38 @@ class ServingChatTestCase(CustomTestCase):
         self.assertTrue(
             logprob_chunks,
             "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
+        )
+
+    def test_streaming_logprobs_flushed_when_forced_json_call_buffers_delta(self):
+        """With no parser, a delta a forced call holds back must keep its logprobs."""
+        self.chat.tool_call_parser = None
+
+        content, choice_logprobs = self._one_token_stream_content('[{"na')
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[_WEATHER_TOOL],
+            tool_choice="required",
+            stream=True,
+            logprobs=True,
+        )
+
+        chunks = get_or_create_event_loop().run_until_complete(
+            self._collect_stream_content(
+                content=content, choice_logprobs=choice_logprobs, req=req
+            )
+        )
+
+        choices = [c["choices"][0] for c in self._parse_chunks(chunks)]
+        self.assertFalse(any(c["delta"].get("content") for c in choices))
+        self.assertEqual(
+            [
+                token["token"]
+                for c in choices
+                for token in (c.get("logprobs") or {}).get("content") or []
+            ],
+            ['[{"na'],
         )
 
     def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):

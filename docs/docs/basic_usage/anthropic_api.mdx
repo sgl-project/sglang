@@ -50,8 +50,9 @@ sglang serve \
   `ANTHROPIC_DEFAULT_*_MODEL` env vars below.
 - **`--reasoning-parser` / `--tool-call-parser` are optional.** Add them when the model emits reasoning
   content (GLM-5.2, Qwen3, DeepSeek-R1, …) or when you want tool calls parsed into structured `tool_use`
-  blocks. Without a tool-call parser, tool schemas are still accepted but the model's tool calls come back
-  as raw text, and Claude Code cannot execute them.
+  blocks. Without a tool-call parser, tool schemas are still accepted, but with `tool_choice` `auto` the
+  model's tool calls come back as raw text, and Claude Code cannot execute them. `tool_choice` `any` or a
+  named tool still returns `tool_use`.
 - **Context length** defaults to the model's own (1M for GLM-5.2); pass `--context-length` only to cap it.
 </Note>
 
@@ -264,9 +265,9 @@ serves whatever model was loaded at startup, so a 404 usually means the request 
 that the server finished loading.
 
 **Tool calls not working / returned as raw text** — Launch the server with the correct
-`--tool-call-parser` for your model (e.g. `glm47`, `qwen3`). Without it the `tools` field is still accepted
-but the model's tool calls come back as text instead of `tool_use` blocks, and Claude Code cannot execute
-them.
+`--tool-call-parser` for your model (e.g. `glm47`, `qwen3`). Without it the `tools` field is still accepted,
+but with `tool_choice` `auto` the model's tool calls come back as text instead of `tool_use` blocks, and
+Claude Code cannot execute them.
 
 **Slow / re-prefills the whole history every turn** — You are missing
 `CLAUDE_CODE_ATTRIBUTION_HEADER=0`. Claude Code's per-request attribution hash in the system prompt
