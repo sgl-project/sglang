@@ -363,6 +363,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            decoding_req_ids = None
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 should_commit_output = (
@@ -437,10 +438,16 @@ class SchedulerBatchResultProcessor:
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
+                    if decoding_req_ids is None:
+                        decoding_req_ids = (
+                            {id(r) for r in batch.decoding_reqs}
+                            if batch.decoding_reqs
+                            else ()
+                        )
+                    is_decoding_req = id(req) in decoding_req_ids
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and is_decoding_req
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.commit_decode(1)
@@ -450,7 +457,7 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_indexer_topk(req)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.request_finished(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                        if is_decoding_req:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
@@ -458,7 +465,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not is_decoding_req:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
