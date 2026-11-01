@@ -84,7 +84,9 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                             else torch.tensor([-1], device="cuda")
                         ),
                         extend_num_tokens=seq_len - prefix_len,
-                        swa_tail_len=tail_len,
+                        window_tail_lens=dict.fromkeys(
+                            allocator.window_pool_names(), tail_len
+                        ),
                     )
                     self.assertIsNotNone(extended)
                     self.assertEqual(extended.numel(), seq_len - prefix_len)
