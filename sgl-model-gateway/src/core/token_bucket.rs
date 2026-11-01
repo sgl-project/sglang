@@ -106,12 +106,17 @@ impl TokenBucket {
             );
 
             loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
-
+                // Register the waiter before re-checking the bucket. Without this
+                // ordering, a token returned between the failed check above and
+                // `notified().await` can be missed because `notify_waiters()` does
+                // not retain a permit for future waiters.
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.try_acquire(tokens).await.is_ok() {
                     return Ok(());
                 }
+                notified.await;
             }
         }
 
@@ -275,5 +280,44 @@ mod tests {
         // Use sync return
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    // Regression stress test for the refill=0 lost-wakeup race. Tokens return only
+    // via return_tokens_sync -> notify_waiters(), which wakes only already-registered
+    // waiters. Registering the waiter before re-checking the bucket guarantees a
+    // returned token is never missed; the buggy await-then-check ordering can leave a
+    // token unclaimed until the acquire times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stress test; run explicitly with --ignored"]
+    async fn refill_zero_does_not_lose_wakeups_under_stress() {
+        const ROUNDS: usize = 200_000;
+        for round in 0..ROUNDS {
+            let bucket = Arc::new(TokenBucket::new(1, 0));
+            // Drain to empty so the waiter must block on a returned token.
+            bucket
+                .try_acquire(1.0)
+                .await
+                .expect("initial capacity should be available");
+
+            // Waiter and returner race on separate worker threads so the single
+            // returned token can land in the waiter's registration window.
+            let waiter_bucket = bucket.clone();
+            let waiter = tokio::spawn(async move {
+                waiter_bucket
+                    .acquire_timeout(1.0, Duration::from_secs(2))
+                    .await
+            });
+            let returner_bucket = bucket.clone();
+            let returner = tokio::spawn(async move {
+                returner_bucket.return_tokens_sync(1.0);
+            });
+
+            returner.await.expect("returner task panicked");
+            let acquired = waiter.await.expect("waiter task panicked");
+            assert!(
+                acquired.is_ok(),
+                "lost wakeup: a returned token did not wake the waiter (round {round})"
+            );
+        }
     }
 }
