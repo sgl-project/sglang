@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.runtime_context import get_context, get_parallel
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -124,6 +125,7 @@ class TestAllPPLoras(CustomTestCase):
         scheduler.__dict__.update(
             running_mbs=[first, second],
             mbs=[first, second],
+            running_reqs=RunningReqs(),
             waiting_queue=[waiting],
             lora_drainer=LoRADrainer(max_loras_per_batch=2, max_wait_time_secs=3),
             enable_lora=True,

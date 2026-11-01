@@ -1320,6 +1320,9 @@ def commit_mamba_states_after_verify(
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        ring_indices = None
+        if mamba_pool.replayssm_request_ring:
+            ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
         # extra_buffer: the same fold also snapshots the interval-crossing step
         # into the track slot, so `temporal` stays current without a flush.
         commit_kda_replayssm_after_verify(
@@ -1331,6 +1334,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            ring_indices=ring_indices,
         )
         return
 
