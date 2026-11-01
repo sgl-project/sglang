@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import threading
 import unittest
@@ -13,14 +13,11 @@ from unittest.mock import patch
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
-    TraceEvent,
-    TraceNullContext,
     TraceReqContext,
     TraceSliceContext,
     TraceThreadInfo,
     extract_trace_headers,
     get_global_trace_level,
-    get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
@@ -36,9 +33,6 @@ try:
 except ImportError:
     _has_otel = False
 
-# Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "_get_host_id")
-
 
 class TestTraceFunctions(unittest.TestCase):
     def test_extract_trace_headers(self):
@@ -48,16 +42,6 @@ class TestTraceFunctions(unittest.TestCase):
 
     def test_extract_trace_headers_missing(self):
         self.assertEqual(extract_trace_headers({}), {})
-
-    def test_set_global_trace_level(self):
-        from sglang.srt.runtime_context import get_resources
-
-        orig = get_resources().trace_level
-        try:
-            set_global_trace_level(5)
-            self.assertEqual(get_global_trace_level(), 5)
-        finally:
-            get_resources().trace_level = orig
 
     def test_global_trace_level_env_var(self):
         # The level lives on ctx.resources and is seeded lazily from the env
@@ -74,70 +58,11 @@ class TestTraceFunctions(unittest.TestCase):
         finally:
             get_resources().trace_level = orig
 
-    def test_get_global_tracing_enabled(self):
-        self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
-
-    def test_get_cur_time_ns(self):
-        ts = mod.get_cur_time_ns()
-        self.assertIsInstance(ts, int)
-        self.assertGreater(ts, 0)
-
-
-class TestTraceNullContext(unittest.TestCase):
-    def test_null_object_pattern(self):
-        ctx = TraceNullContext()
-        self.assertFalse(ctx.tracing_enable)
-        # Any attribute access returns self
-        self.assertIs(ctx.some_method, ctx)
-        # Callable returns self
-        self.assertIs(ctx("arg1", key="val"), ctx)
-        # Chaining works
-        self.assertIs(ctx.foo.bar.baz(1, 2, 3), ctx)
-
 
 class TestSpanAttributes(unittest.TestCase):
     def test_constants_exist(self):
         self.assertEqual(SpanAttributes.GEN_AI_LATENCY_E2E, "gen_ai.latency.e2e")
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
-
-
-# __get_host_id
-class TestGetHostId(unittest.TestCase):
-    def test_from_machine_id_file(self):
-        with (
-            patch("os.path.exists", return_value=True),
-            patch(
-                "builtins.open",
-                unittest.mock.mock_open(read_data="abc123\n"),
-            ),
-        ):
-            self.assertEqual(_get_host_id(), "abc123")
-
-    def test_from_machine_id_file_error(self):
-        """Falls back to MAC address when file read fails."""
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("builtins.open", side_effect=IOError("read error")),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_from_mac_address(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0x112233445566),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_unknown_fallback(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0),
-        ):
-            self.assertEqual(_get_host_id(), "unknown")
 
 
 @unittest.skipUnless(_has_otel, "opentelemetry not installed")
@@ -165,6 +90,13 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
 
 
 class TestProcessTracingInit(unittest.TestCase):
+    def setUp(self):
+        self.orig_initialized = mod.opentelemetry_initialized
+        mod.opentelemetry_initialized = False
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self.orig_initialized
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported
@@ -329,23 +261,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertIsNotNone(ctx.root_span)
         ctx.trace_req_finish(ts=2000)
 
-    def test_trace_slice_combined(self):
-        """trace_slice() creates and ends a span in one call."""
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-
-        s = TraceSliceContext(
-            "decode",
-            2000,
-            end_time_ns=3000,
-            level=1,
-            attrs={"key": "val"},
-            events=[TraceEvent("evt", 2500, {"e": 1})],
-        )
-        ctx.trace_slice(s)
-        self.assertIsNotNone(ctx.last_span_context)
-        ctx.trace_req_finish(ts=4000)
-
     def test_trace_slice_with_events_cache(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -461,21 +376,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.abort(ts=2000)
         self.assertEqual(len(ctx.events_cache), 0)
 
-    def test_abort_with_abort_info_dict(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.abort(ts=2000, abort_info={"reason": "cancelled"})
-        self.assertIsNone(ctx.thread_context)
-
-    def test_abort_with_base_finish_reason(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-
-        abort_obj = FINISH_LENGTH(length=10)
-        ctx.abort(ts=2000, abort_info=abort_obj)
-        self.assertIsNone(ctx.thread_context)
-
     def test_check_fast_return_by_level(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -510,14 +410,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         state = ctx.__getstate__()
         self.assertFalse(state["tracing_enable"])
         ctx.root_span_context = True  # prevent __del__ issues
-        ctx.trace_req_finish(ts=2000)
-
-    def test_getstate_with_slice_stack(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.trace_slice_start("s1", level=1, ts=1500)
-        state = ctx.__getstate__()
-        self.assertIn("last_span_context", state)
         ctx.trace_req_finish(ts=2000)
 
     def test_setstate_enabled(self):

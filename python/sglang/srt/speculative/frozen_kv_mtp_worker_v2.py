@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -45,12 +46,12 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
-    get_parallel,
     get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -69,6 +70,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -78,7 +80,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import empty_context, get_available_gpu_memory
+from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -130,7 +132,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         self.hot_token_id = None
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.parallel_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+        )
+
         with (
+            draft_tp_context(self.parallel_layout),
             draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -148,8 +156,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
+            target_runner = self.target_worker.model_runner
+            embed, head = resolve_draft_embed_and_head(
+                target_model=target_runner.model,
+                draft_model=self.draft_model_runner.model,
+                model_path=target_runner.model_config.model_path,
+                revision=target_runner.model_config.revision,
+                load_config=target_runner.load_config,
+            )
             self.draft_model_runner.model.set_embed_and_head(embed, head)
         else:
             logger.debug(
@@ -159,12 +174,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             )
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
-
-        # Retain the target's attention topology when swapping TP groups.
-        self.draft_owns_attention = False
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
 
         self.draft_attn_backend = None
         self.cuda_graph_runner = None
@@ -202,10 +211,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -216,10 +222,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_model_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -355,6 +358,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=forward_batch.req_pool_indices[:bs],
             seq_lens=forward_batch.seq_lens[:bs],
@@ -366,13 +370,17 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             ),
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _capture_cuda_graphs(self) -> None:
-        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
+        # Even a one-step frozen draft runs the assistant seed forward.
+        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 0:
             return
         if self.target_worker.device != "cuda":
             logger.info(
@@ -564,7 +572,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         with (
             self._target_kv_pool_view(forward_batch),
-            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+            forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ),
         ):
             seed_output = self.draft_model_runner.forward(forward_batch).logits_output
 
@@ -607,7 +618,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
             with (
                 self._target_kv_pool_view(forward_batch),
-                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+                forward_context(
+                    ForwardContext(attn_backend=self.draft_attn_backend),
+                    forward_batch=forward_batch,
+                ),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch
@@ -766,10 +780,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
             # Draft prefill seed (no forward).
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group,
-                    owns_attention=self.draft_worker.draft_owns_attention,
-                ),
+                draft_tp_context(self.draft_worker.parallel_layout),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
                 spec_stage_span("draft_extend"),
@@ -789,10 +800,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group,
-                    owns_attention=self.draft_worker.draft_owns_attention,
-                ),
+                draft_tp_context(self.draft_worker.parallel_layout),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
                 spec_stage_span("draft"),
@@ -805,14 +813,14 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group,
-                    owns_attention=self.draft_worker.draft_owns_attention,
-                ),
+                draft_tp_context(self.draft_worker.parallel_layout),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            if self._post_verify_graphs is not None:
+                # The mamba state commit may still run on a side stream.
+                self._post_verify_graphs.join()
 
             return batch_output

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path, PurePosixPath
+from stat import S_ISDIR
 
 import psutil
 
@@ -13,6 +14,34 @@ logger = logging.getLogger(__name__)
 
 def _unescape_mount_path(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
+
+
+def _memory_stat(directory: Path) -> dict[str, int]:
+    lines = (directory / "memory.stat").read_text().splitlines()
+    return {key: int(value) for key, value in map(str.split, lines)}
+
+
+def _protected_children_bytes(directory: Path) -> int | None:
+    """Usage that reclaim at ``directory`` must leave to its children's memory.min.
+
+    The kernel caps a child's protection at its usage, and a deeper cgroup's at
+    its ancestors', so only direct children count. A child without memory.min
+    has no memory controller and no protection. None when a value is unreadable.
+    """
+    protected = 0
+    try:
+        for child in directory.iterdir():
+            if not S_ISDIR(child.stat().st_mode):
+                continue
+            try:
+                minimum = (child / "memory.min").read_text().strip()
+            except FileNotFoundError:
+                continue
+            usage = int((child / "memory.current").read_text())
+            protected += usage if minimum == "max" else min(int(minimum), usage)
+    except (OSError, ValueError):
+        return None
+    return protected
 
 
 def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
@@ -65,7 +94,15 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         usage_name = (
             "memory.current" if filesystem == "cgroup2" else "memory.usage_in_bytes"
         )
+        # File LRU pages, as MemAvailable counts; shmem sits on the anon LRU.
+        # v1's unprefixed counters omit descendants, unlike its usage.
+        page_cache_keys = (
+            ("active_file", "inactive_file")
+            if filesystem == "cgroup2"
+            else ("total_active_file", "total_inactive_file")
+        )
         while True:
+            usage = None
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
@@ -77,7 +114,19 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 limit = int(value)
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
-                usage = int((directory / usage_name).read_text())
+                if usage is None:
+                    usage = int((directory / usage_name).read_text())
+                    stat = _memory_stat(directory)
+                    page_cache = sum(stat[key] for key in page_cache_keys)
+                    # Protection is relative to the reclaim target: its own min
+                    # does not prevent reclaim, but its children's min can.
+                    # Unknown protection only disables cache credit.
+                    if filesystem == "cgroup2" and page_cache > 0:
+                        protected = _protected_children_bytes(directory)
+                        page_cache = (
+                            0 if protected is None else max(0, page_cache - protected)
+                        )
+                    usage = max(0, usage - page_cache)
                 remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
@@ -90,10 +139,25 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
     return headroom
 
 
-def available_host_memory_bytes() -> int:
-    """Conservative allocatable RAM; charged file cache is not assumed reclaimable."""
+def available_host_memory_bytes(*, allow_cgroup_fallback: bool = False) -> int:
+    """Allocatable RAM, counting reclaimable page cache as free."""
     available = psutil.virtual_memory().available
-    cgroup_headroom = _cgroup_memory_headroom()
+    try:
+        cgroup_headroom = _cgroup_memory_headroom()
+    except (OSError, RuntimeError) as exc:
+        if not allow_cgroup_fallback:
+            raise RuntimeError(
+                "Cannot automatically size HiCache host memory; "
+                "set --hicache-size explicitly (GB per rank), leaving room "
+                "for other memory use within the container limit."
+            ) from exc
+        logger.warning(
+            "Cannot determine cgroup memory headroom: %s. Checking explicitly "
+            "sized HiCache pools against host available memory; ensure all "
+            "local ranks' pools fit within the container memory limit.",
+            exc,
+        )
+        return available
     if cgroup_headroom is not None:
         logger.info(
             "HiCache memory headroom: host %.1f GiB, cgroup %.1f GiB",

@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    DisallowedTokensLogitsProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
@@ -94,15 +97,33 @@ class TestMergeBiasTensor(CustomTestCase):
         self.assertEqual(result[2, 0].item(), 1.0)
 
 
-# SamplingBatchInfo.__len__
-class TestSamplingBatchInfoLen(CustomTestCase):
-    def test_len_matches_batch_size(self):
-        """Test that __len__ returns batch size (number of temperature rows)."""
-        info = _make_info(batch_size=5)
-        self.assertEqual(len(info), 5)
-
-
 class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_and_merge_preserve_support_logprob_modes(self):
+        info = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, True, False],
+            return_sampling_support_logprobs=[False, True, False],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.filter_batch([1, 2], torch.tensor([1, 2]))
+        self.assertEqual(info.return_sampling_support_logprobs, [True, False])
+        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
+
+        other = _make_info(
+            batch_size=2,
+            return_sampling_masks=[True, True],
+            return_sampling_support_logprobs=[False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(
+            info.return_sampling_support_logprobs,
+            [True, False, False, True],
+        )
+        self.assertEqual(
+            info.sampling_support_logprobs_capture_indices.tolist(), [0, 2]
+        )
+
     def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
         info = _make_info(
             batch_size=2,
@@ -442,6 +463,16 @@ class TestFilterBatch(CustomTestCase):
         # logit_bias should also be filtered
         self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
 
+    def test_filter_keeps_max_top_k_as_upper_bound(self):
+        info = _make_info(
+            batch_size=3,
+            top_ks=torch.tensor([10, 50, 30], dtype=torch.int32),
+            max_top_k=50,
+        )
+        info.filter_batch([0, 2], torch.tensor([0, 2]))
+        self.assertEqual(info.max_top_k, 50)
+        self.assertGreaterEqual(info.max_top_k, int(info.top_ks.max()))
+
     def test_filter_with_custom_logit_processor(self):
         proc = MagicMock()
         info = _make_info(batch_size=3)
@@ -585,6 +616,14 @@ class TestMergeBatch(CustomTestCase):
         self.assertTrue(info1.need_top_k_sampling)  # OR semantics
         self.assertTrue(info1.need_min_p_sampling)  # OR semantics
         self.assertFalse(info1.npu_top_k_top_p_eligible)  # AND semantics
+
+    def test_merge_max_top_k(self):
+        cases = (((20, 50), 50), ((50, 20), 50), ((20, None), None), ((None, 20), None))
+        for (lhs, rhs), expected in cases:
+            with self.subTest(lhs=lhs, rhs=rhs):
+                info1 = _make_info(max_top_k=lhs)
+                info1.merge_batch(_make_info(max_top_k=rhs))
+                self.assertEqual(info1.max_top_k, expected)
 
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
@@ -774,6 +813,22 @@ class TestFromScheduleBatch(CustomTestCase):
 
                 self.assertEqual(info.npu_top_k_top_p_eligible, expected)
 
+    def test_max_top_k_uses_request_params(self):
+        cases = (
+            ((20, 50), 50),
+            ((1, 20), 20),
+            ((20, TOP_K_ALL), None),
+        )
+        for top_ks, expected in cases:
+            with self.subTest(top_ks=top_ks):
+                batch = MagicMock()
+                batch.reqs = [self._make_req(top_k=top_k) for top_k in top_ks]
+                batch.device = DEVICE
+
+                info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+                self.assertEqual(info.max_top_k, expected)
+
     def test_no_logit_bias_when_all_none(self):
         """Test that logit_bias stays None when no request has logit_bias set."""
 
@@ -805,6 +860,39 @@ class TestFromScheduleBatch(CustomTestCase):
         entry = left.custom_logit_processor[hash(processor_str)]
         self.assertEqual(entry.rows, [2])
         self.assertEqual(entry.indices.tolist(), [2])
+
+    def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
+        from array import array
+
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        req = self._make_req()
+        req.origin_input_ids = array("q", [7, 20])
+        req.output_ids = array("q", [7, 10, 11, 12, 13])
+        req.uocr_doc = None
+        req.page_guard_state = None
+        req.custom_logit_processor = UOCR_PAGE_GUARD_PROCESSOR
+        req.sampling_params.custom_params = dict(
+            __req__=req,
+            page_token_id=7,
+            eos_token_id=1,
+            max_page_tokens=3,
+        )
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.has_custom_logit_processor)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        apply_custom_logit_processor(logits, info)
+        self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
+        self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+
+    def test_external_processor_still_requires_the_enable_flag(self):
+        req = self._make_req()
+        req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor)
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""

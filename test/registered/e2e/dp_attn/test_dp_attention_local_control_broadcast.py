@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-h100")
 
 _INPUT_IDS = list(range(10, 30))
 _REQUEST_TIMEOUT = 120
@@ -49,9 +49,8 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--enable-dp-attention-local-control-broadcast",
             ],
         )

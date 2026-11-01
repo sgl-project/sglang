@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=140, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=109, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
@@ -54,9 +54,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             str(cls.PREFILL_DP_SIZE),
-            "--dp",
+            "--attn-dp-size",
             str(cls.PREFILL_DP_SIZE),
-            "--enable-dp-attention",
             "--load-balance-method",
             cls.LOAD_BALANCE_METHOD,
         ]
@@ -80,9 +79,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             str(cls.DECODE_DP_SIZE),
-            "--dp",
+            "--attn-dp-size",
             str(cls.DECODE_DP_SIZE),
-            "--enable-dp-attention",
             "--base-gpu-id",
             str(cls.PREFILL_DP_SIZE),
             "--load-balance-method",

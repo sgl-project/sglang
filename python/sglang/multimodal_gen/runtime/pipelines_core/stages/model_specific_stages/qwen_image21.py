@@ -1,15 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+from collections import OrderedDict
 
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_group,
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    get_or_create_run_state,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     calculate_linear_shift,
 )
@@ -18,7 +28,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import Denois
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.utils.common import upload_without_sync
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
@@ -50,7 +64,91 @@ class QwenImage21InputValidationStage(InputValidationStage):
         batch = super().forward(batch, server_args)
         if batch.height % 32 or batch.width % 32:
             raise ValueError("Qwen-Image 2.1 height and width must be divisible by 32")
+        batch.sigmas = server_args.pipeline_config.prepare_sigmas(
+            batch.sigmas, batch.num_inference_steps
+        )
+        if not batch.sigmas:
+            raise ValueError("Qwen-Image 2.1 requires a non-empty sigma schedule")
+        # the preset or explicit sigma grid determines the denoising step count
+        batch.num_inference_steps = len(batch.sigmas)
         return batch
+
+
+class TextEncoderGraphs:
+    """CUDA graphs of the text-only encoder forward, one per prompt length.
+
+    The eager forward launches ~2600 small kernels and is host-bound; a replay
+    runs the same kernels, so the output is bit-identical. A length is captured
+    on its second request; moved or replaced weights drop every graph.
+    """
+
+    max_graphs = 8
+
+    def __init__(self):
+        self.graphs = OrderedDict()
+        self.seen = set()
+        self.weights = None
+        self.pool = None
+        self.disabled = False
+
+    def __call__(self, encoder, inputs, run):
+        ids = inputs["input_ids"]
+        if (
+            self.disabled
+            or ids.shape[0] != 1
+            or "pixel_values" in inputs
+            or not all(torch.is_tensor(v) and v.is_cuda for v in inputs.values())
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or (model_parallel_is_initialized() and get_tp_group().world_size > 1)
+        ):
+            return run(inputs)
+        tensors = [*encoder.parameters(), *encoder.buffers()]
+        if not all(t.is_cuda for t in tensors):
+            return run(inputs)
+        # graphs read weights by address; offload, reload or replacement moves them
+        weights = tuple(t.data_ptr() for t in tensors)
+        if weights != self.weights:
+            self.graphs.clear()
+            self.seen.clear()
+            self.weights = weights
+        key = ids.shape[1]
+        entry = self.graphs.get(key)
+        if entry is None:
+            if key not in self.seen:
+                self.seen.add(key)
+                return run(inputs)
+            try:
+                entry = self._capture(inputs, run)
+            except Exception as e:
+                logger.warning("Text encoder CUDA graph disabled: %s", e)
+                self.disabled = True
+                return run(inputs)
+            self.graphs[key] = entry
+            if len(self.graphs) > self.max_graphs:
+                self.graphs.popitem(last=False)
+        self.graphs.move_to_end(key)
+        graph, static_inputs, output = entry
+        for name, tensor in static_inputs.items():
+            tensor.copy_(inputs[name])
+        graph.replay()
+        return output
+
+    def _capture(self, inputs, run):
+        static_inputs = {name: tensor.clone() for name, tensor in inputs.items()}
+        # the side-stream warmup settles lazy allocations before capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(static_inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        if self.pool is None:
+            self.pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: an async output-save thread may use CUDA during capture
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+            output = run(static_inputs)
+        return graph, static_inputs, output
 
 
 class QwenImage21EncodingStage(PipelineStage):
@@ -64,7 +162,11 @@ class QwenImage21EncodingStage(PipelineStage):
         )
         self.text_encoder.model.visual.fp32_position_interpolation = False
         self.text_encoder.model.visual.rotary_pos_emb.recompute_on_device_change = True
+        # (dtype, device) -> latent mean/std, uploaded once: a per-request upload
+        # blocks the host on the VAE encode it should overlap with prompt prep
+        self.latent_stats = {}
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.text_graphs = TextEncoderGraphs()
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
         ]
@@ -83,6 +185,24 @@ class QwenImage21EncodingStage(PipelineStage):
         ]
 
     def encode_prompt(self, prompt, images, device):
+        cache_group = self.text_encoder._encoder_tp_group
+        if cache_group is None and model_parallel_is_initialized():
+            cache_group = get_tp_group()
+        conditioning = cached_encoder_call(
+            self.text_encoder,
+            (prompt, images),
+            {"device": str(device)},
+            lambda: self._encode_prompt(prompt, images, device),
+            cache_group,
+            namespace=self,
+            share_in_group=True,
+        )
+        self.finish_unused_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        )
+        return conditioning
+
+    def _encode_prompt(self, prompt, images, device):
         prefix = " ".join(
             f"<image{i + 1}><|vision_start|><|image_pad|><|vision_end|>"
             for i in range(len(images))
@@ -104,15 +224,22 @@ class QwenImage21EncodingStage(PipelineStage):
                     image = white
                 vision_images.append(image)
             kwargs["images"] = vision_images
-        inputs = self.processor(**kwargs).to(device)
+        inputs = upload_without_sync(self.processor(**kwargs), device)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
-            outputs = encoder(
-                **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
-            )
-            # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
-            final_hidden = outputs.hidden_states[-1]
+
+            def run(encoder_inputs):
+                outputs = encoder(
+                    **encoder_inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    logits_to_keep=1,
+                )
+                # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
+                return outputs.hidden_states[-1]
+
+            final_hidden = self.text_graphs(encoder, inputs, run)
         valid = inputs.attention_mask[0].bool()
         hidden = final_hidden[0, valid][self.drop_idx :]
         ids = inputs.input_ids[0, valid][self.drop_idx :]
@@ -161,8 +288,13 @@ class QwenImage21EncodingStage(PipelineStage):
                     )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
                     latent = vae.encode(pixels).mode()
-                    mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
-                    std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+                    stats_key = (latent.dtype, latent.device)
+                    if stats_key not in self.latent_stats:
+                        self.latent_stats[stats_key] = tuple(
+                            latent.new_tensor(values).view(1, ac.z_dim, 1, 1, 1)
+                            for values in (ac.latents_mean, ac.latents_std)
+                        )
+                    mean, std = self.latent_stats[stats_key]
                     conditions.append(
                         ((latent - mean) / std).flatten(2).transpose(1, 2)
                     )
@@ -234,13 +366,6 @@ def prepare_qwen21_mu(batch, server_args):
 
 
 class QwenImage21DenoisingStage(DenoisingStage):
-    def _bcg_pad_prompt_kwargs(
-        self, call_kwargs, current_model=None, force_bucket=None
-    ):
-        # Prefill runs eagerly. Later steps use exact-length prefix KV, so text
-        # padding only creates duplicate graphs without enabling more replay.
-        return call_kwargs
-
     def _predict_noise(
         self,
         current_model,
@@ -263,4 +388,117 @@ class QwenImage21DenoisingStage(DenoisingStage):
             target_dtype,
             guidance,
             **kwargs,
+        )
+
+
+# ComfyUI integrated mode. Must match COND_EXTRA_KEY in the plugin's
+# executors/qwen_image21.py.
+COMFYUI_COND_EXTRA_KEY = "qwen21_cond"
+
+
+def insert_image_placeholders(context, image_slots, num_refs):
+    """Context with a zero token at each ComfyUI image slot, and the native flags."""
+    text_len = context.shape[1]
+    # Same slot padding as ComfyUI's build_sequence.
+    slots = (list(image_slots) + [text_len] * num_refs)[:num_refs]
+    flags = torch.zeros(text_len + num_refs, dtype=torch.bool, device=context.device)
+    flags[[slot + i for i, slot in enumerate(slots)]] = True
+    out = context.new_zeros(context.shape[0], len(flags), context.shape[2])
+    out[:, ~flags] = context
+    return out, flags.tolist()
+
+
+def comfyui_layout(image_slots, image_shapes, axes_dims, device):
+    """Native ``build_layout`` plus ComfyUI's half-token centring of references.
+
+    ComfyUI shifts a reference by ``0.5 * (h % 2 - target_h % 2)`` per axis; native
+    sizes are multiples of 32 px so parity never differs there.
+    """
+    layout = build_layout(image_slots, image_shapes, axes_dims, device)
+    _, target_h, target_w = image_shapes[-1]
+    refs = [(s, e) for s, e, is_image in layout["segments"] if is_image]
+    for (start, stop), (_, h, w) in zip(refs, image_shapes[:-1]):
+        shifts = (0.0, 0.5 * (h % 2 - target_h % 2), 0.5 * (w % 2 - target_w % 2))
+        if not any(shifts):
+            continue
+        delta = torch.cat(
+            [
+                shift
+                * (10000.0 ** (-torch.arange(0, dim, 2, device=device).float() / dim))
+                for shift, dim in zip(shifts, axes_dims)
+            ]
+        )
+        layout["prefix_rope"][start:stop] *= torch.polar(torch.ones_like(delta), delta)
+    return layout
+
+
+def _cache_fits(need_bytes, device) -> bool:
+    free = 0
+    if device.type == "cuda":
+        # Blocks freed by an earlier run stay in PyTorch's cache, not in mem_get_info.
+        free = torch.cuda.mem_get_info(device)[0]
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    free = torch.tensor([free], dtype=torch.int64)
+    # Ranks running one call must agree: under TP an uncached prefix runs
+    # extra all-reduces, so a split decision would hang.
+    for group in (get_tp_group(), get_sp_group()):
+        if group.world_size > 1:
+            torch.distributed.all_reduce(
+                free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
+    return int(free) > 2 * need_bytes
+
+
+class QwenImage21ComfyUIConditionStage(PipelineStage):
+    """Turn one single-row ComfyUI ``apply_model`` call into native denoising inputs.
+
+    ComfyUI's text encoder drops the vision tokens and reports ``image_slots``:
+    the text positions of the reference latents. A placeholder token at each
+    slot gives the native layout input; the DiT overwrites those rows with
+    ``img_in(condition_latents)``. Conditioning and its prefix K/V cache are
+    built once per cond for the sampler run.
+    """
+
+    def forward(self, batch, server_args):
+        _, _, height, width = batch.latents.shape
+        batch.latents = batch.latents.flatten(2).transpose(1, 2).contiguous()
+        payload = batch.extra[COMFYUI_COND_EXTRA_KEY]
+        conds = get_or_create_run_state(batch, dict)
+        key = (batch.extra["comfyui_cond_key"], height, width)
+        if key not in conds:
+            conds[key] = self._new_cond(batch, server_args, payload, height, width)
+        batch.prompt_embeds, batch.extra["qwen21_positive"] = conds[key]
+        # Drop the cond at the sampler's last call so its K/V cache (GiBs) is freed
+        # with this request, not at the next run; timesteps carry sigma * 1000.
+        final_sigma = payload["final_sigma"]
+        if (
+            final_sigma is not None
+            and batch.timesteps.item() <= final_sigma * 1e3 + 1e-3
+        ):
+            del conds[key]
+        return batch
+
+    def _new_cond(self, batch, server_args, payload, height, width):
+        arch = server_args.pipeline_config.dit_config.arch_config
+        device, dtype = batch.latents.device, torch.bfloat16
+        refs = [r.to(device=device, dtype=dtype) for r in payload["ref_latents"]]
+        context, flags = insert_image_placeholders(
+            batch.prompt_embeds[0].to(device=device, dtype=dtype),
+            payload["image_slots"],
+            len(refs),
+        )
+        shapes = [(1, r.shape[-2], r.shape[-1]) for r in refs] + [(1, height, width)]
+        layout = comfyui_layout(flags, shapes, arch.axes_dims_rope, device)
+        condition_latents = None
+        if refs:
+            condition_latents = torch.cat(
+                [r.flatten(2).transpose(1, 2) for r in refs], dim=1
+            )
+        # K and V of every layer, bf16.
+        need = 4 * arch.num_layers * layout["prefix_rope"].shape[0] * arch.hidden_size
+        caches = None
+        if _cache_fits(need, device):
+            caches = [[{} for _ in range(arch.num_layers)]]
+        return [context], dict(
+            layouts=[layout], condition_latents=condition_latents, prefix_caches=caches
         )

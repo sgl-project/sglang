@@ -1,4 +1,6 @@
+import copy
 import gc
+import glob
 import os
 import pickle
 import sys
@@ -8,17 +10,18 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed
 import torch.multiprocessing
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchTokenizedEmbeddingReqInput,
     MMInputsProcessError,
@@ -40,9 +43,13 @@ from sglang.srt.managers.scheduler import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
+from sglang.srt.multimodal.processors.unlimited_ocr_v2 import (  # noqa: E402
+    UnlimitedOCRV2ProcessorOutput,
+)
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=33, suite="base-a-test-cpu")
+register_cpu_ci(est_time=55, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -92,25 +99,18 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
 
 
 def _receiver() -> SchedulerRequestReceiver:
-    group = SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        tp_group=group,
-        tp_cpu_group=group,
-        attn_tp_group=group,
-        attn_tp_cpu_group=group,
-        attn_cp_group=group,
-        attn_cp_cpu_group=group,
-        world_group=group,
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=True),
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
+        rust_server_mode=False,
     )
 
 
@@ -123,9 +123,12 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=world_size)
+        parallel = SimpleNamespace(
+            attn_dp_enabled=False,
+            tp_size=world_size,
+            tp_group=SimpleNamespace(cpu_group=torch.distributed.group.WORLD),
+        )
         receiver = _receiver()
-        object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         with (
             patch(
                 "sglang.srt.managers.mm_utils._get_is_default_transport",
@@ -154,7 +157,6 @@ def _run_image_receiver(rank, init_file, pipe):
     )
     try:
         receiver = _receiver()
-        object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         torch.distributed.barrier()
         torch.distributed.all_reduce(torch.zeros(1))
         initial_fds = len(os.listdir("/proc/self/fd"))
@@ -171,7 +173,11 @@ def _run_image_receiver(rank, init_file, pipe):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
-                return_value=SimpleNamespace(enable_dp_attention=False, tp_size=2),
+                return_value=SimpleNamespace(
+                    attn_dp_enabled=False,
+                    tp_size=2,
+                    tp_group=SimpleNamespace(cpu_group=torch.distributed.group.WORLD),
+                ),
             ),
         ):
             for base in [30, 90]:
@@ -289,7 +295,7 @@ class TestShmStorageOwnership(unittest.TestCase):
                     pointer.close_and_unlink()
 
 
-class TestShmPointerFailureCleanup(unittest.TestCase):
+class TestShmPointerFailureCleanup(CustomTestCase):
     def test_nonlinux_clone_failure_still_unlinks_and_closes(self):
         pointer = object.__new__(ShmPointerMMData)
         handle = _Handle()
@@ -361,7 +367,199 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
             shared_memory.SharedMemory(name=name)
 
 
-class TestShmRequestFailureConsensus(unittest.TestCase):
+class TestModelSpecificDataShmWrap(CustomTestCase):
+    """The opt-in SHM wrap of ``model_specific_data`` (crop tiles).
+
+    The switch is read in the tokenizer process only; the scheduler detects
+    pointers by type, so a request wrapped here is always unwrapped there.
+    """
+
+    def setUp(self):
+        from sglang.srt.managers import mm_utils
+
+        self.mm_utils = mm_utils
+        self._saved_default = mm_utils._is_default_tensor_transport
+        self._pointers = []
+        self.addCleanup(self._restore)
+        mm_utils._is_default_tensor_transport = False
+        self.enterContext(get_context().override_server_args(skip_tokenizer_init=False))
+
+    def _gate(self, enabled):
+        self.enterContext(envs.SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA.override(enabled))
+
+    def _restore(self):
+        self.mm_utils._is_default_tensor_transport = self._saved_default
+        for pointer in self._pointers:
+            try:
+                pointer.close_and_unlink()
+            except Exception:
+                pass
+
+    def _track(self, item):
+        """Release the segments a test wraps, so /dev/shm does not accumulate."""
+        for _key, value in list(item.model_specific_data.items()):
+            if isinstance(value, ShmPointerMMData):
+                self._pointers.append(value)
+        return item
+
+    def _item(self, crop_pages=3):
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.set("feature", torch.zeros(1))
+        item.set("images_crop", torch.zeros((crop_pages, 1, 3, 8, 8)))
+        return item
+
+    def _req(self, item):
+        return TokenizedEmbeddingReqInput(
+            rid="r",
+            input_text="x",
+            input_ids=array("q", [1]),
+            mm_inputs=MultimodalProcessorOutput(mm_items=[item]),
+            token_type_ids=None,
+            sampling_params=MagicMock(),
+        )
+
+    def _wrap(self, item, output_cls=None):
+        output_cls = output_cls or UnlimitedOCRV2ProcessorOutput
+        obj = SimpleNamespace(mm_inputs=output_cls(mm_items=[item]))
+        return self.mm_utils.wrap_shm_features(obj)
+
+    def test_wraps_only_large_tensors_when_enabled(self):
+        self._gate(True)
+        item = self._item()
+        item.set("tiny", torch.zeros(16))  # 64 bytes, below the threshold
+        small = item.model_specific_data["images_crop"]  # 3*3*8*8*4 = 2304 bytes
+
+        self._wrap(item)
+        self._track(item)
+
+        self.assertIsInstance(item.model_specific_data["images_crop"], torch.Tensor)
+        self.assertIs(
+            item.model_specific_data["tiny"], item.model_specific_data["tiny"]
+        )
+        self.assertEqual(small.shape, item.model_specific_data["images_crop"].shape)
+
+    def test_gate_off_leaves_other_models_untouched(self):
+        """Only an output that opts in is wrapped, and the env switch can veto it."""
+        for output_cls, enabled in (
+            (MultimodalProcessorOutput, True),
+            (UnlimitedOCRV2ProcessorOutput, False),
+        ):
+            with self.subTest(output=output_cls.__name__, enabled=enabled):
+                self._gate(enabled)
+                item = self._item()
+                item.set("big", torch.zeros((1024, 1024)))  # 4 MB, past the floor
+                before = item.model_specific_data["big"]
+
+                self._wrap(item, output_cls)
+                self._track(item)
+
+                for key, value in item.model_specific_data.items():
+                    self.assertIsInstance(
+                        value, torch.Tensor, f"{key} was wrapped with the gate off"
+                    )
+                self.assertIs(item.model_specific_data["big"], before)
+
+    def test_has_shm_features_sees_the_wrapped_crop(self):
+        self._gate(True)
+        item = self._item()
+        item.set("big", torch.zeros((1024, 1024)))
+
+        self._wrap(item)
+        self._track(item)
+
+        self.assertIsInstance(item.model_specific_data["big"], ShmPointerMMData)
+        self.assertTrue(self.mm_utils.has_shm_features([self._req(item)]))
+
+    def test_copy_shares_the_dict_so_wrap_must_not_mutate_in_place(self):
+        self._gate(True)
+        item = self._item()
+        item.set("big", torch.zeros((1024, 1024)))
+        clone = copy.copy(item)
+
+        self._wrap(item)
+        self._wrap(clone)
+        self._track(item)
+        self._track(clone)
+
+        first = item.model_specific_data["big"]
+        second = clone.model_specific_data["big"]
+        self.assertIsInstance(first, ShmPointerMMData)
+        self.assertIsInstance(second, ShmPointerMMData)
+        self.assertNotEqual(
+            first.shm_name, second.shm_name, "the two requests share a segment"
+        )
+
+    def test_discard_releases_the_crop_segment(self):
+        self._gate(True)
+        item = self._item()
+        item.set("big", torch.zeros((1024, 1024)))
+        self._wrap(item)
+        pointer = item.model_specific_data["big"]
+        handle = _Handle()
+        pointer._shm_handle = handle
+
+        self.mm_utils.discard_shm_features(self._req(item))
+
+        self.assertTrue(handle.unlinked)
+
+    def test_only_crops_past_the_size_floor_go_through_shm(self):
+        self._gate(True)
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.set("feature", torch.zeros(1))
+        item.set("images_crop", torch.zeros((1, 1, 3, 512, 512)))  # 3 MB
+        item.set("has_local_crops", [True])
+        self._wrap(item)
+        self._track(item)
+        self.assertIsInstance(item.model_specific_data["images_crop"], ShmPointerMMData)
+
+        small = MultimodalDataItem(modality=Modality.IMAGE)
+        small.set("feature", torch.zeros(1))
+        small.set("images_crop", torch.zeros((1, 1, 3, 64, 64)))  # 48 KB
+        small.set("has_local_crops", [True])
+        self._wrap(small)
+        self._track(small)
+        self.assertIsInstance(small.model_specific_data["images_crop"], torch.Tensor)
+        self.assertNotIsInstance(
+            small.model_specific_data["images_crop"], ShmPointerMMData
+        )
+
+    def test_placeholder_crop_ships_as_a_shape_only_view(self):
+        """A crop-free page publishes no segment and no bulk bytes."""
+        self._gate(True)
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.set("feature", torch.zeros(1))
+        item.set("images_crop", torch.zeros((1, 1, 3, 1024, 1024)))
+        item.set("has_local_crops", [False])
+        before = len(glob.glob("/dev/shm/sgl_shm_mm_*"))
+
+        self._wrap(item)
+        self._track(item)
+        after = len(glob.glob("/dev/shm/sgl_shm_mm_*"))
+
+        crop = item.model_specific_data["images_crop"]
+        self.assertIsInstance(crop, torch.Tensor)
+        self.assertNotIsInstance(crop, ShmPointerMMData)
+        self.assertEqual(crop.numel(), 1 * 1 * 3 * 1024 * 1024, "shape must survive")
+        self.assertLess(crop.untyped_storage().nbytes(), 1024, "must be a small view")
+        self.assertEqual(after - before, 1, "only the feature segment is allocated")
+        self.assertTrue(bool((crop == 0).all()))
+
+    def test_real_crops_are_not_treated_as_placeholders(self):
+        self._gate(True)
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.set("feature", torch.zeros(1))
+        item.set("images_crop", torch.rand((1, 4, 3, 640, 640)))
+        item.set("has_local_crops", [True])
+
+        self._wrap(item)
+        self._track(item)
+
+        crop = item.model_specific_data["images_crop"]
+        self.assertIsInstance(crop, ShmPointerMMData, "real tiles must use a segment")
+        self.assertFalse(self.mm_utils._is_placeholder_crop(item))
+
+
+class TestShmRequestFailureConsensus(CustomTestCase):
     def test_real_gloo_group_propagates_one_rank_failure(self):
         with TemporaryDirectory() as directory:
             init_file = str(Path(directory) / "gloo-init")
@@ -374,7 +572,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_local_materialization_failure_becomes_request_error(self):
         req = _request(_failed_pointer())
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=1)
 
         with (
             patch(
@@ -398,7 +596,11 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=2)
+        parallel = SimpleNamespace(
+            attn_dp_enabled=False,
+            tp_size=2,
+            tp_group=SimpleNamespace(cpu_group=object()),
+        )
 
         def inject_peer_failure(mask, **kwargs):
             mask.fill_(1)
@@ -430,7 +632,7 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
         failed_req = _request(torch.zeros(1), rid="failed")
         healthy_req = _request(torch.zeros(1), rid="healthy")
         batch = BatchTokenizedEmbeddingReqInput(batch=[failed_req, healthy_req])
-        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=1)
 
         def materialize(req):
             if req.rid == "failed":

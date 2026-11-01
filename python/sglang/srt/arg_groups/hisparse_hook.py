@@ -20,18 +20,23 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
+HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if get_platform().is_hip:
         return "tilelang"
+    if get_platform().is_xpu:
+        return "intel_xpu"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
+    if get_platform().is_xpu:
+        return HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE.get(kv_cache_dtype, set())
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
         kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
     )
@@ -51,6 +56,20 @@ def validate_hisparse_dsa_backend(
     backend = getattr(view, attr)
     kv_cache_dtype = view.kv_cache_dtype
     allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
+    if not allowed_backends:
+        # No backend reads this KV layout here, so naming the (empty) allow-set
+        # or suggesting the user omit the option would both be dead ends: the
+        # dtype is the thing to change.
+        usable = " or ".join(
+            f"--kv-cache-dtype={dtype}"
+            for dtype in HISPARSE_KV_CACHE_DTYPES
+            if _hisparse_allowed_backends(dtype)
+        )
+        raise ValueError(
+            f"HiSparse does not support --kv-cache-dtype={kv_cache_dtype} on this "
+            f"platform: no DSA {label} backend reads that KV cache layout. "
+            f"Please use {usable}."
+        )
     if backend is not None and backend not in allowed_backends:
         raise ValueError(
             f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
@@ -74,6 +93,14 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
         f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
         f"but got --kv-cache-dtype={kv_cache_dtype}. Please use {choices}."
     )
+
+
+def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
+
+    cfg = resolving_view(server_args)
+    # A mixed batch cannot merge the HiSparse decode batch.
+    if cfg.enable_mixed_chunk:
+        raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
@@ -101,6 +128,22 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     assert cfg.disable_radix_cache, (
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
+    validate_hisparse_feature_combos(server_args)
+
+    enable_spec = (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_algorithm.upper() != "NONE"
+    )
+    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
+        raise ValueError(
+            "The minimal HiSparse spec integration supports linear speculation "
+            "only; use --speculative-eagle-topk 1."
+        )
+    if enable_spec and cfg.speculative_adaptive:
+        raise ValueError(
+            "HiSparse speculative decoding uses statically sized swap state; "
+            "--speculative-adaptive is not supported."
+        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
@@ -109,7 +152,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
         # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

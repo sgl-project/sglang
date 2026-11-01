@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=283, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=278, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestHybridDPTP(CustomTestCase):
@@ -29,8 +29,7 @@ class TestHybridDPTP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--moe-a2a-backend",
                 "deepep",

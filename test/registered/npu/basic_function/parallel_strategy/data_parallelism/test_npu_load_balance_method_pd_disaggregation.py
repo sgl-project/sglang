@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_npu_ci(est_time=3600, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=3600, suite="nightly-4-npu-a3", nightly=True)
 
 load_balance_method_options = [
     "auto",
@@ -70,8 +70,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             "prefill",
             "--tp-size",
             "2",
-            "--enable-dp-attention",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--load-balance-method",
             cls.prefill_load_balance_method,
@@ -84,8 +83,9 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             0.8,
             "--dist-init-addr",
             "127.0.0.1:10100",
+            # Use cards 0-1 here and 2-3 for decode, so the test fits 4 cards.
             "--base-gpu-id",
-            4,
+            0,
         ]
 
         cls.process_prefill = popen_launch_pd_server(
@@ -107,8 +107,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             2,
             "--tp-size",
             "2",
-            "--enable-dp-attention",
-            "--dp",
+            "--attn-dp-size",
             "2",
             "--load-balance-method",
             cls.decode_load_balance_method,

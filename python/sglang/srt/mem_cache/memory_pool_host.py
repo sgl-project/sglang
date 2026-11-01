@@ -12,6 +12,13 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+    unavailable_stub,
+)
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -19,12 +26,33 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+_dsv4_mla_unavailable_reason: Optional[str] = None
 if _is_xpu:
-    from sgl_kernel import transfer_cache_dsv4_mla
+    try:
+        from sgl_kernel import transfer_cache_dsv4_mla
+    except ImportError as e:
+        # Only DSV4 needs this op; a wheel without it must not break scheduler import.
+        _dsv4_mla_unavailable_reason = (
+            f"sgl_kernel.transfer_cache_dsv4_mla failed to import ({e}); XPU "
+            "takes it from the out-of-tree sgl-kernel-xpu wheel"
+        )
+        transfer_cache_dsv4_mla = unavailable_stub(
+            "transfer_cache_dsv4_mla", _dsv4_mla_unavailable_reason
+        )
 else:
     from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -40,6 +68,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -62,6 +91,10 @@ class LogicalHostPool:
     The pool manages page-aligned token slots but holds no KV tensor. V4
     compressed side pools use these logical FULL indices as stable page anchors.
     """
+
+    shared_allocation_domain = None
+    stores_page_envelope = False
+    storage_format_tag = None
 
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
@@ -150,6 +183,26 @@ class LogicalHostPool:
     ):
         pass
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        return host_indices, device_indices
+
+    def backup_from_device_all_layer_physical(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer_physical(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        pass
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -174,6 +227,9 @@ class LogicalHostPool:
     def get_page_buffer_meta(self, indices):
         return None
 
+    def get_page_buffer_element_size(self, split_factor: int = 1):
+        return None
+
     def get_ksize_per_token(self):
         return 0
 
@@ -194,6 +250,18 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         allocator_type: str = "default",
         page_aligned_only: bool = False,
     ):
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
+            # Token-granular transfers go through transfer_cache_dsv4_mla whatever
+            # the io backend and layout, so it is checked here, not in the table.
+            if not page_aligned_only and _dsv4_mla_unavailable_reason is not None:
+                raise ValueError(
+                    f"HiCache cannot build the {type(self).__name__} host pool here: "
+                    f"{_dsv4_mla_unavailable_reason}. Launch without HiCache "
+                    "(--enable-hierarchical-cache)."
+                )
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
@@ -303,7 +371,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -423,6 +494,27 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.num_release_slots += len(indices_cpu)
         return len(indices)
 
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+
+    def backup_tokens_from_device_all_layer(self, host_indices, device_indices):
+        """Copy individual tokens; the page path below would copy whole pages."""
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        # Token-granular DSV4 C4 copy needs this helper because a token is
+        # not one contiguous byte range in the paged row:
+        # [value0..value63][scale0..scale63].
+        if self.page_aligned_only:
+            raise self._unaligned_transfer_error(host_indices, device_indices)
+        transfer_cache_dsv4_mla(
+            src_ptrs=self.device_ptrs,
+            dst_ptrs=self.data_ptrs,
+            src_indices=device_indices.to(dtype=torch.int64),
+            dst_indices=host_indices.to(dtype=torch.int64),
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -432,19 +524,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            # Whole C4 pages can use the normal HiCache page-row copy below.
-            # Token-granular DSV4 C4 copy needs this helper because a token is
-            # not one contiguous byte range in the paged row:
-            # [value0..value63][scale0..scale63].
-            if self.page_aligned_only:
-                raise self._unaligned_transfer_error(host_indices, device_indices)
-            transfer_cache_dsv4_mla(
-                src_ptrs=self.device_ptrs,
-                dst_ptrs=self.data_ptrs,
-                src_indices=device_indices.to(dtype=torch.int64),
-                dst_indices=host_indices.to(dtype=torch.int64),
-            )
+            self.backup_tokens_from_device_all_layer(host_indices, device_indices)
             return
+        # Whole C4 pages can use the normal HiCache page-row copy below.
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":
@@ -692,7 +774,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
     def __init__(
         self,
         pool_name: str,
-        state_pools: list,
+        state_infos: list[DSV4StateBufferInfo],
         num_host_pages: int,
         swa_page_size: int,
         layout: str = "layer_first",
@@ -700,12 +782,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
     ):
-        if any(pool is None for pool in state_pools):
-            raise ValueError(f"{pool_name} state_pools must not contain None")
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
 
         self.pool_name = pool_name
-        self.state_pools = state_pools
-        self.layer_num = len(state_pools)
+        self.state_infos = tuple(state_infos)
+        self.layer_num = len(state_infos)
         self.num_host_pages = num_host_pages
         self.swa_page_size = swa_page_size
         self.dtype = torch.uint8
@@ -723,7 +807,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.state_page_bytes = 0
         self.device_page_views = []
         self.gpu_device = device
-        self._init_device_page_views()
+        self._bind_state_buffers()
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
@@ -804,20 +888,16 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
 
-    def _init_device_page_views(self) -> None:
+    def _bind_state_buffers(self) -> None:
         expected_ring_size = None
         expected_state_page_bytes = None
-        for pool in self.state_pools:
-            state_tensor = pool.kv_score_buffer.kv_score
-            if not state_tensor.is_contiguous():
-                raise ValueError(f"{self.pool_name} state tensor must be contiguous")
-            ring_size = pool.ring_size
-            slot_bytes = state_tensor[0].nbytes
-            state_page_bytes = ring_size * slot_bytes
+        for info in self.state_infos:
+            ring_size = info.ring_size
+            state_page_bytes = info.pages.shape[1]
             if expected_ring_size is None:
                 expected_ring_size = ring_size
                 expected_state_page_bytes = state_page_bytes
-                self.gpu_device = state_tensor.device
+                self.gpu_device = info.pages.device
             elif (
                 expected_ring_size != ring_size
                 or expected_state_page_bytes != state_page_bytes
@@ -826,20 +906,17 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     f"{self.pool_name} state pools must share ring size and slot bytes"
                 )
 
-            state_bytes = state_tensor.view(torch.uint8).reshape(
-                state_tensor.shape[0], -1
-            )
-            usable_slots = (state_tensor.shape[0] // ring_size) * ring_size
-            self.device_page_views.append(
-                state_bytes[:usable_slots].reshape(-1, state_page_bytes)
-            )
+            self.device_page_views.append(info.pages)
 
         self.ring_size = expected_ring_size or 0
         self.state_page_bytes = expected_state_page_bytes or 0
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -871,7 +948,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         """View host state layer ``l`` as ``[pages, 1, R, 1, last_dim]``.
 
         ``last_dim = state_page_bytes // R // state_dtype.itemsize``."""
-        state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
+        state_dtype = self.state_infos[l].dtype
         last_dim = self.state_page_bytes // self.ring_size // state_dtype.itemsize
         if self.layout == "layer_first":
             layer_buffer = self.kv_buffer[l]
@@ -920,6 +997,11 @@ class DeepSeekV4StateHostPool(HostKVCache):
         raise NotImplementedError(
             f"{self.pool_name} reuses SWA transfer indices and has no free list"
         )
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -981,7 +1063,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             dev_op_indices = self._ring_op_indices(device_rows)
             host_op_indices = self._ring_op_indices(host_rows)
             for l in range(self.layer_num):
-                state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
+                state_dtype = self.state_infos[l].dtype
                 last_dim = (
                     self.state_page_bytes // self.ring_size // state_dtype.itemsize
                 )
@@ -1066,7 +1148,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             R = self.ring_size
             dev_op_indices = self._ring_op_indices(device_rows)
             host_op_indices = self._ring_op_indices(host_rows)
-            state_dtype = self.state_pools[layer_id].kv_score_buffer.kv_score.dtype
+            state_dtype = self.state_infos[layer_id].dtype
             last_dim = self.state_page_bytes // R // state_dtype.itemsize
             num_dev_pages = self.device_page_views[layer_id].shape[0]
             dev_view = (

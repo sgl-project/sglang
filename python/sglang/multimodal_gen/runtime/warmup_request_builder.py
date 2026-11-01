@@ -127,11 +127,31 @@ def _resolve_default_warmup_resolution(
     """
     width = sampling_defaults.width
     height = sampling_defaults.height
+    two_stage = is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+    if two_stage and getattr(sampling_defaults, "two_stage_default_size", None):
+        # LTX-2.5's sampling default is its one-stage canvas (960x544), which
+        # the two-stage halve stage rejects; BCG warmup at it failed the start.
+        width, height = sampling_defaults.two_stage_default_size
     is_image_gen = server_args.pipeline_config.task_type.is_image_gen()
+    # Any other LTX-2 two-stage default the halve stage would reject falls
+    # through to the aligned representative shape instead of failing warmup.
+    alignment = _warmup_resolution_alignment(server_args) if two_stage else 1
+    servable_default = not (
+        two_stage
+        and width is not None
+        and height is not None
+        and (width % alignment or height % alignment)
+    )
+    # graphs replay only the captured shape, so BCG skips the video area cap
     if (
         width is not None
         and height is not None
-        and (not server_based_warmup or is_image_gen)
+        and servable_default
+        and (
+            not server_based_warmup
+            or is_image_gen
+            or server_args.enable_breakable_cuda_graph is True
+        )
     ):
         return width, height
 
@@ -614,6 +634,7 @@ def build_warmup_reqs(
     include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
+            task_type=task_type,
             data_type=task_type.data_type(),
             width=width,
             height=height,
@@ -628,7 +649,14 @@ def build_warmup_reqs(
             num_inference_steps=sampling_defaults.num_inference_steps,
             num_frames=num_frames,
         )
-        if include_warmup_image:
+        if (
+            server_args.enable_breakable_cuda_graph is True
+            and sampling_defaults.image_path
+        ):
+            # Optional image conditioning changes the captured signature. Use
+            # the configured references rather than capturing text-only inputs.
+            req_kwargs["image_path"] = sampling_defaults.image_path
+        elif include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"

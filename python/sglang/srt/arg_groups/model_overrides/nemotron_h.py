@@ -1,8 +1,4 @@
-"""Config-time override declarations for nemotron_h.
-
-Architectures: NemotronHForCausalLM, NemotronHPuzzleForCausalLM,
-NemotronH_Omni_Reasoning_V3.
-"""
+"""Config-time override declarations for nemotron_h."""
 
 import logging
 from typing import Any, Dict
@@ -13,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -58,6 +55,14 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
 
+    uses_expert_remap = (
+        cfg.enable_eplb
+        or cfg.ep_num_redundant_experts > 0
+        or cfg.init_expert_location != "trivial"
+    )
+    if uses_expert_remap:
+        _validate_expert_remap(cfg, hf_config, model_arch)
+
     has_w4a16_moe_layers = False
     if is_modelopt and quantization == "modelopt_mixed":
         has_w4a16_moe_layers = any(
@@ -70,9 +75,17 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     if has_w4a16_moe_layers:
         if cfg.moe_a2a_backend != "none":
             raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
-        if cfg.moe_runner_backend not in ("auto", "marlin"):
+        # CuTe DSL supports BF16 activations with NVFP4 weights when opted in.
+        use_cutedsl_w4a16 = (
+            cfg.moe_runner_backend == "flashinfer_cutedsl"
+            and get_platform().is_sm100
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if cfg.moe_runner_backend not in ("auto", "marlin") and not use_cutedsl_w4a16:
             raise ValueError(
-                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
+                "or flashinfer_cutedsl on SM100-family GPUs with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
         if cfg.moe_runner_backend == "auto":
             overrides["moe_runner_backend"] = "marlin"
@@ -80,6 +93,18 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend for "
                 f"{model_arch} with W4A16_NVFP4 MoE layers"
             )
+    elif (
+        uses_expert_remap
+        and cfg.moe_runner_backend == "auto"
+        and get_platform().is_sm100
+        and cfg.moe_a2a_backend == "none"
+    ):
+        # flashinfer_trtllm routes inside the kernel and cannot take the remap.
+        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+        logger.info(
+            "Use flashinfer_trtllm_routed as MoE runner backend on sm100 for "
+            f"{model_arch} with EPLB or redundant experts"
+        )
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
@@ -131,3 +156,34 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         elif get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
     return overrides
+
+
+def _validate_expert_remap(cfg: Any, hf_config: Any, model_arch: str) -> None:
+    if cfg.moe_runner_backend == "flashinfer_trtllm":
+        raise ValueError(
+            "flashinfer_trtllm routes inside the kernel and does not support EPLB or "
+            "redundant experts on Nemotron-H; use "
+            "--moe-runner-backend flashinfer_trtllm_routed."
+        )
+    if (
+        cfg.enable_eplb
+        and cfg.moe_runner_backend == "flashinfer_cutedsl"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        raise ValueError(
+            "flashinfer_cutedsl without an a2a backend does not migrate its expert "
+            "scales on EPLB rebalance; use --moe-runner-backend "
+            "flashinfer_trtllm_routed or set --moe-a2a-backend."
+        )
+    if model_arch == "NemotronHPuzzleForCausalLM":
+        num_routed_experts = {
+            block["n_routed_experts"]
+            for block in hf_config.block_configs
+            if block["block_type"] == "moe"
+        }
+        if len(num_routed_experts) > 1:
+            raise ValueError(
+                "EPLB and redundant experts need the same routed expert count on "
+                "every MoE layer, got "
+                f"{sorted(num_routed_experts)}."
+            )

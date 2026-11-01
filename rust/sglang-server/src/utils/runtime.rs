@@ -1,26 +1,29 @@
-//! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
-//! API server, and returns a handle the Python boundary uses for
+//! Runtime bootstrap: wires channels, pins the frontend threads, starts the
+//! tokio API server, and returns a handle the Python boundary uses for
 //! `recv_requests` and `push_decode_result_batch`.
 //!
-//! Thread layout:
-//!   * API server     — tokio multi-thread runtime (I/O bound), pinned core set A
-//!   * Tokenizer      — N pinned OS threads (CPU bound), core set B
-//!   * Detokenizer    — M pinned OS threads (CPU bound), core set C
-//!   * To_scheduler   — 1 thread driving the FSM
-//!   * From_scheduler — 1 thread draining the scheduler → detok shards
+//! Thread layout (every pinned thread shares one CPU set, see
+//! [`frontend_cpu_set`]):
+//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned
+//!   * Tokenizer      — N pinned OS threads (CPU bound)
+//!   * Detokenizer    — M pinned OS threads (CPU bound)
+//!   * To_scheduler   — 1 pinned thread driving the FSM
+//!   * From_scheduler — 1 pinned thread draining the scheduler → detok shards
 //!   * MM workers     — K unpinned OS threads, spawned late via
 //!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
-//! axum's worker threads.
+//! the HTTP/gRPC worker threads.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
-use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
+use super::threads::{frontend_cpu_set, join_all_with_timeout, pin_current, spawn_pool};
 use crate::tokenizer_manager::channel::{
     FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
@@ -41,15 +44,19 @@ pub trait Runnable: Send + 'static {
 pub struct Runtime {
     pub to_scheduler_rx: ToSchedulerRx,
     pub from_scheduler_tx: FromSchedulerTx,
-    /// MM results parked between a worker's `MmEncoded` and the scheduler drain
-    /// (`Server.take_mm_result`).
-    pub mm_results: crate::multi_modality::result_store::MmResultStore,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
+    /// The shared core, which runs the MM pool processor's media hooks.
+    core: crate::api_server::handlers::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
+    /// Set once the API listeners have stopped serving and closed.
+    listeners_closed: Arc<AtomicBool>,
+    /// Where to report a drain's listeners closing (see
+    /// [`Runtime::drain_signal_fd`]).
+    drain_notify: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Deadline for joining worker threads on shutdown. Past it we abandon the join
@@ -71,29 +78,34 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
-            spec,
-            self.mm_wiring.tokenizer.clone(),
-            self.mm_results.clone(),
-        )?);
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::new(spec)?
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
 
+    /// Start the shared worker pool with a processor supplied by an external
+    /// model package. `feature_shm` is that package's `_use_feature_shm`
+    /// answer: place feature tensors in POSIX shm for the TP broadcast.
     pub fn start_mm_workers_with_processor(
         &self,
         processor: Arc<dyn crate::multi_modality::worker::MmProcessor>,
         workers: usize,
+        feature_shm: bool,
     ) {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
-            processor,
-            self.mm_wiring.tokenizer.clone(),
-            self.mm_results.clone(),
-        ));
+        let ctx = Arc::new(
+            crate::multi_modality::worker::MmContext::with_processor(processor, feature_shm)
+                .with_limits(self.mm_wiring.limits.clone()),
+        );
         self.spawn_mm_pool(workers, ctx);
     }
 
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        if !self.core.set_mm_processor(ctx.processor.clone()) {
+            tracing::warn!("MM workers started again; admission keeps the first processor");
+        }
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
@@ -102,6 +114,70 @@ impl Runtime {
                 ctx.clone(),
             )
         });
+    }
+
+    /// Begin the graceful drain (see `CoreHandle::begin_drain`): health
+    /// answers 503, requests are still admitted, and the listeners close once
+    /// none is left in flight. `force` closes them without waiting.
+    pub fn begin_drain(&self, force: bool) {
+        self.core.begin_drain(force);
+    }
+
+    /// Whether a drain has begun and every listener has since closed: the
+    /// scheduler may stop. The other stages keep running until
+    /// [`Runtime::request_shutdown`].
+    pub fn drain_complete(&self) -> bool {
+        self.core.is_draining() && self.listeners_closed.load(Ordering::SeqCst)
+    }
+
+    /// A pipe whose write end the caller installs as its signal wakeup fd
+    /// (Python's `signal.set_wakeup_fd`, which writes each caught signal's
+    /// number as one byte): `signum` begins the drain from a thread of this
+    /// runtime, so a scheduler thread blocked in a GPU call or collective
+    /// cannot delay it. Returns the write end, which stays open for the life
+    /// of the process; the watcher thread is detached, since it may block
+    /// until then.
+    ///
+    /// When the drain's listeners have closed, a datagram goes to the
+    /// abstract Unix socket `notify`, if given: the launching process's
+    /// positive signal that the drain ended, even while the scheduler thread
+    /// is wedged.
+    pub fn drain_signal_fd(
+        &self,
+        signum: u8,
+        force: bool,
+        notify: Option<String>,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::io::Read;
+
+        if let Some(notify) = notify {
+            let _ = self.drain_notify.set(notify);
+        }
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        // Python requires a non-blocking wakeup fd.
+        rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
+        let core = self.core.clone();
+        std::thread::Builder::new()
+            .name("drain-signal".into())
+            .spawn(move || {
+                let mut read = std::fs::File::from(read);
+                let mut buf = [0u8; 64];
+                loop {
+                    match read.read(&mut buf) {
+                        Ok(0) => return, // every write end closed
+                        Ok(n) if buf[..n].contains(&signum) => core.begin_drain(force),
+                        Ok(_) => {}
+                        // Python's signal handlers are installed without
+                        // SA_RESTART, so any caught signal can interrupt this.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "drain signal watcher stopped");
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(write)
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).
@@ -123,12 +199,39 @@ impl Drop for Runtime {
     }
 }
 
-/// Boot the whole frontend. Returns once threads are spawned (non-blocking).
+/// Send the drain-ended datagram to the abstract Unix socket `name`; best
+/// effort, since the launching process falls back to scheduler exits.
+fn notify_drained(name: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    // Non-blocking: a full receive queue (EAGAIN) loses only this report.
+    let sent = SocketAddr::from_abstract_name(name).and_then(|addr| {
+        let socket = UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        socket.send_to_addr(b"drained", &addr)
+    });
+    if let Err(error) = sent {
+        tracing::warn!(%error, name, "could not report the drain's end");
+    }
+}
+
+/// Boot the whole frontend, `http_layer` wrapping the HTTP app (see
+/// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
-pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
+pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
-    let plan = plan_cores(&cfg);
+    let cpus = frontend_cpu_set(&cfg);
+    // Validated before anything is spawned, so a bad bucket list fails startup
+    // cleanly.
+    let metrics = match &cfg.server_args.metrics {
+        Some(config) => Some(Arc::new(crate::api_server::core::FrontendMetrics::new(
+            config,
+            cfg.server_args.disaggregation_mode,
+        )?)),
+        None => None,
+    };
 
     // --- rings (Rust ↔ Python) ---
     let (to_scheduler_tx, to_scheduler_rx): (ToSchedulerTx, ToSchedulerRx) =
@@ -143,9 +246,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
-    let (mm_worker_tx, mm_worker_rx) = flume::bounded::<crate::message::request::MmRequest>(
-        cfg.rust_server_args.stage_channel_cap,
-    );
+    let (mm_worker_tx, mm_worker_rx) =
+        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.stage_channel_cap);
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detokenizer_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detokenizer_rx = Vec::with_capacity(detokenizer_worker_num);
@@ -169,24 +271,34 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
-    // The same instance is shared by the tokenizer pool (encode) and the detok
-    // shards (decode); `None` only under `skip_tokenizer_init`.
-    let dyn_tokenizer = tokenizer::load_tokenizer(
+    // The same instance is shared by the tokenizer pool (encode), the OpenAI chat
+    // layer and the detok shards (decode); `None` only under `skip_tokenizer_init`.
+    let tokenizer = tokenizer::load_tokenizer(
         // Empty only in standalone (test) configs (the Python handoff always
         // resolves it); empty → no tokenizer, allowed only under
         // `skip_tokenizer_init`.
         (!cfg.server_args.tokenizer_path.is_empty()).then_some(&*cfg.server_args.tokenizer_path),
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
-    )?;
-    // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
-    // worker path (which encodes the placeholder-expanded prompt itself).
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    )?
+    .map(Arc::new);
+    let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
 
-    // Shared: MM workers park, the Python drain pops.
-    let mm_results: crate::multi_modality::result_store::MmResultStore = Default::default();
+    // The potentially slow/fallible tokenizer load above happens before the
+    // ports become visible. Own both sockets before starting any worker or
+    // transport thread, though, so startup remains all-or-nothing: if either
+    // configured port is unavailable, both local listeners are dropped and no
+    // partial runtime needs cleanup.
+    let http_addr = cfg.rust_server_args.http_addr;
+    let http_listener = bind_tcp_listener(http_addr)
+        .map_err(|e| format!("binding HTTP listener on {http_addr} failed: {e}"))?;
+    let grpc_listener = match cfg.rust_server_args.grpc_addr {
+        Some(addr) => Some(
+            bind_tcp_listener(addr)
+                .map_err(|e| format!("binding gRPC listener on {addr} failed: {e}"))?,
+        ),
+        None => None,
+    };
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -197,12 +309,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
             None => detokenizer::DetokenizerBackend::Skip,
         };
-        let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
         let mut detokenizer_rxs = detokenizer_rx.into_iter();
-        spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
+        spawn_pool("detokenizer", cpus, count, &mut threads, |i| {
             detokenizer::DetokenizerWorker::new(
                 i,
                 detokenizer_rxs.next().unwrap(),
@@ -215,15 +326,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Tokenizer pool (pinned, CPU bound) ---
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and request never routes to the pool, so we skip it.
-    if let Some(tokenizer) = &text_tokenizer {
+    if let Some(tokenizer) = &tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
         let tokenizer = tokenizer.clone();
-        let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
         spawn_pool(
             "tokenizer",
-            tok_cores,
+            cpus,
             cfg.server_args.tokenizer_worker_num,
             &mut threads,
             |_i| {
@@ -242,17 +352,13 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
-        // First TM core; from_scheduler is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
-        // `TM_CORES`) is just a larger count + per-shard receivers.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.first().copied())
-            .map(|c| vec![c]);
+        // The hotter router (every output token). One worker today via
+        // `spawn_pool`, so sharding by `Rid::shard` later is just a larger
+        // count + per-shard receivers.
         let mut from_scheduler_rx = Some(from_scheduler_rx); // moved into the single worker
         let activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("from-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("from-scheduler", cpus, 1, &mut threads, |_| {
             tokenizer_manager::from_scheduler::Dispatcher::new(
                 from_scheduler_rx.take().unwrap(),
                 senders.clone(),
@@ -264,21 +370,22 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // --- TokenizerManager to_scheduler loop ---
     {
-        // Second TM core when present, else share the first (1-core / API-set
-        // fallback) — still off the CPU-bound pool cores either way.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
-            .map(|c| vec![c]);
+        // TODO(tm-scaling): this thread and `from-scheduler` are single-consumer
+        // serialization points, each with its own ceiling. to-scheduler runs
+        // validate + `normalize_sampling_params` for *every* request before
+        // fanning out to the (pooled) tokenizer workers, so a high
+        // request-arrival / short-request workload is bounded by this one
+        // thread's per-request cost (kept O(fields), see
+        // `sampling::normalize_sampling_params`). Sharding it by rid — like the
+        // tokenizer/detok pools — lifts that ceiling.
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
         let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
-            results: mm_results.clone(),
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("to-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("to-scheduler", cpus, 1, &mut threads, |_| {
             let (tok_manager_rx, to_scheduler_tx) = parts.take().unwrap();
             tokenizer_manager::to_scheduler::Intake::new(
                 tok_manager_rx,
@@ -292,45 +399,97 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         });
     }
 
-    // --- API server (tokio, I/O bound) ---
+    // One transport-neutral entrance to the runtime. Each configured listener
+    // receives a clone; no listener owns or reconstructs scheduler wiring.
+    let core = crate::api_server::handlers::CoreHandle::new(
+        senders.tok_manager_tx.clone(),
+        senders.abort_tx.clone(),
+        crate::api_server::handlers::CoreConfig {
+            response_capacity: cfg.rust_server_args.stage_channel_cap,
+            response_activity: response_activity.clone(),
+            startup_ready: cfg.server_args.skip_server_warmup,
+            is_disaggregation: cfg.server_args.is_disaggregation(),
+            mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            multimodal: cfg.server_args.model_is_multimodal(),
+            peer_endpoints: crate::api_server::core::peer_endpoints(
+                &cfg.server_args.deployment_info,
+                cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+            )?,
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
+            metrics,
+        },
+    );
+    core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
+
+    // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
+    let listeners_closed = Arc::new(AtomicBool::new(false));
+    let drain_notify = Arc::new(std::sync::OnceLock::<String>::new());
     {
         let cfg = cfg.clone();
-        let api_cores = plan.as_ref().map(|p| p.api.clone());
-        let senders = senders.clone();
-        let response_activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
-        // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
-        // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
-        // launcher process.
-        let http_addr = cfg.rust_server_args.http_addr;
-        let listener = bind_tcp_listener(http_addr)
-            .map_err(|e| format!("binding API listener on {} failed: {e}", http_addr))?;
+        let core = core.clone();
+        let listeners_closed = listeners_closed.clone();
+        let drain_notify = drain_notify.clone();
+        let waker = to_scheduler_rx.waker();
+        let core_for_close = core.clone();
+        let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
+            core.clone(),
+            &cfg.server_args,
+        ));
+        let grpc_server = grpc_listener.map(|listener| {
+            let service = api_server::grpc::service::GrpcService::new(
+                core.clone(),
+                &cfg.server_args,
+                hicache_manager.clone(),
+            );
+            (listener, service)
+        });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
+                // This thread runs `block_on` (the listeners' accept loops);
+                // the runtime's worker and blocking threads pin on start.
+                pin_current(cpus.as_ref());
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
                     .worker_threads(cfg.rust_server_args.http_api_worker_num)
-                    .enable_all();
-                if let Some(cores) = api_cores {
-                    let next = std::sync::atomic::AtomicUsize::new(0);
-                    builder.on_thread_start(move || {
-                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(c) = cores.get(idx % cores.len()) {
-                            core_affinity::set_for_current(*c);
-                        }
-                    });
-                }
+                    .enable_all()
+                    .on_thread_start(move || pin_current(cpus.as_ref()));
                 let rt = builder.build().expect("build api runtime");
-                rt.block_on(api_server::app::serve(
-                    listener,
-                    senders,
-                    cfg.rust_server_args.stage_channel_cap,
-                    cfg.server_args.clone(),
-                    // Response heartbeat watched by `/health_generate`.
-                    response_activity,
-                    shutdown_rx,
-                ))
+                rt.block_on(async move {
+                    let http = api_server::http::app::serve(
+                        http_listener,
+                        core.clone(),
+                        cfg.server_args.clone(),
+                        cfg.rust_server_args.metrics_listener,
+                        http_layer,
+                        cfg.generate_hook.clone(),
+                        shutdown_rx.clone(),
+                        hicache_manager,
+                        tokenizer.clone(),
+                    );
+                    if let Some((listener, service)) = grpc_server {
+                        tokio::join!(
+                            http,
+                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
+                        );
+                    } else {
+                        http.await;
+                    }
+                });
+                // Every listener is closed: report it before dropping the
+                // runtime, whose drop waits for blocking tasks (media fetches)
+                // and ends the connections still open.
+                listeners_closed.store(true, Ordering::SeqCst);
+                if core_for_close.is_draining() {
+                    // The scheduler stops at once rather than at its next idle
+                    // wake-up, and the launching process learns the drain ended.
+                    let _ = waker.send(());
+                    if let Some(name) = drain_notify.get() {
+                        notify_drained(name);
+                    }
+                }
+                drop(rt);
             })
             .expect("spawn api runtime");
         threads.push(handle);
@@ -339,14 +498,16 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         to_scheduler_rx,
         from_scheduler_tx,
-        mm_results,
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
-            tokenizer: text_tokenizer,
+            limits: tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
         },
+        core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        listeners_closed,
+        drain_notify,
     })
 }
 
@@ -354,14 +515,391 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 mod tests {
     use super::*;
     use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::message::response::{BatchHeader, frame_decode_batch_cols};
+    use sglang_api_types::api::v1 as proto;
+    use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
+
+    fn free_loopback_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
+        // Hold both probes at once so the OS cannot return the same ephemeral
+        // port twice. Release them together immediately before runtime startup.
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addrs = (first.local_addr().unwrap(), second.local_addr().unwrap());
+        drop((first, second));
+        addrs
+    }
+
+    fn test_config(
+        http_addr: std::net::SocketAddr,
+        grpc_addr: Option<std::net::SocketAddr>,
+    ) -> RuntimeConfig {
+        RuntimeConfig {
+            rust_server_args: RustServerServerArgs {
+                http_addr,
+                grpc_addr,
+                http_api_worker_num: 1,
+                ..Default::default()
+            },
+            server_args: Arc::new(test_server_args()),
+            generate_hook: None,
+        }
+    }
+
+    async fn connect_grpc(
+        addr: std::net::SocketAddr,
+    ) -> SglangServiceClient<tonic::transport::Channel> {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect_timeout(std::time::Duration::from_secs(2));
+        SglangServiceClient::new(endpoint.connect().await.expect("connect gRPC client"))
+    }
+
+    fn grpc_ids_request(ids: &[i64], rid: &str) -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            input_ids: Some(proto::TokenIdsOrList {
+                value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+                    ids: ids.to_vec(),
+                })),
+            }),
+            rid: Some(proto::StringOrList {
+                value: Some(proto::string_or_list::Value::One(rid.into())),
+            }),
+            stream: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn scheduler_rid(header: &[u8]) -> String {
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(header)).unwrap();
+        value
+            .as_array()
+            .and_then(|fields| fields.get(1))
+            .and_then(rmpv::Value::as_str)
+            .expect("TokenizedGenerateReqInput rid")
+            .to_owned()
+    }
+
+    fn terminal_token_frame(rid: String, output_ids: &[i64]) -> bytes::Bytes {
+        token_frame(rid, output_ids, true)
+    }
+
+    /// One scheduler output frame for `rid`, final when `finished`.
+    fn token_frame(rid: String, output_ids: &[i64], finished: bool) -> bytes::Bytes {
+        let header = BatchHeader {
+            rids: vec![rid],
+            finish_reasons: vec![
+                finished
+                    .then(|| serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()),
+            ],
+            prompt_tokens: vec![3],
+            tok_lens: vec![output_ids.len() as u32],
+            cached_tokens: vec![0],
+            reasoning_tokens: vec![0],
+            ..Default::default()
+        };
+        let header = rmp_serde::to_vec(&header).unwrap();
+        let data = output_ids
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        frame_decode_batch_cols(&header, &[&data])
+    }
 
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
     /// `Default`), unified role.
     fn test_server_args() -> ServerArgs {
         ServerArgs {
             skip_tokenizer_init: true,
+            // No scheduler answers here, so a startup warmup would only
+            // occupy the scheduler ring that the tests inspect.
+            skip_server_warmup: true,
             ..Default::default()
         }
+    }
+
+    /// Write an HTTP/1.1 request on a fresh connection (closed after the
+    /// response), for the caller to read the response from.
+    fn send_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            conn,
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        conn
+    }
+
+    fn read_response(mut conn: std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut response = String::new();
+        conn.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    /// Wait for the next request on the scheduler ring and return its rid.
+    fn next_scheduler_rid(rt: &Runtime) -> String {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no request reached the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        scheduler_rid(&requests[0].header)
+    }
+
+    fn wait_drain_complete(rt: &Runtime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.drain_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The graceful drain, as Python's SIGTERM handling: health answers 503
+    /// at once without probing the scheduler, an in-flight stream runs to its
+    /// `[DONE]`, a request arriving during the drain is still admitted and
+    /// served, and the listener closes only once both finished.
+    #[test]
+    fn drain_answers_503_and_serves_in_flight_requests_before_closing() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let streaming_rid = next_scheduler_rid(&rt);
+        assert!(
+            rt.from_scheduler_tx
+                .push(token_frame(streaming_rid.clone(), &[7], false))
+        );
+
+        // A router's idle keep-alive connection: answered, left open.
+        let mut keep_alive = std::net::TcpStream::connect(addr).expect("connect");
+        keep_alive
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut keep_alive,
+            b"GET /model_info HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .unwrap();
+
+        rt.begin_drain(false);
+        for path in ["/health", "/health_generate"] {
+            let response = read_response(send_http(addr, "GET", path, ""));
+            assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
+        }
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "a draining server must not send a health probe"
+        );
+
+        // Admitted during the drain, as Python admits it.
+        let late = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[4,5],"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let late_rid = next_scheduler_rid(&rt);
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(streaming_rid, &[8]))
+        );
+        let stream = read_response(streaming);
+        assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+        assert!(stream.contains("data: [DONE]"), "stream cut: {stream}");
+
+        // The late request still holds the drain open.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.drain_complete());
+        assert!(std::net::TcpStream::connect(addr).is_ok());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(late_rid, &[9]))
+        );
+        let response = read_response(late);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("[9]"), "{response}");
+
+        wait_drain_complete(&rt);
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "listener still open after the drain completed"
+        );
+        // The idle keep-alive connection did not hold the close open.
+        let keep_alive = read_response(keep_alive);
+        assert!(keep_alive.starts_with("HTTP/1.1 200"), "{keep_alive}");
+        rt.request_shutdown();
+    }
+
+    /// A forced drain (`SGL_FORCE_SHUTDOWN`, or a failed last health probe)
+    /// does not wait: the listener closes with a request still in flight, and
+    /// that request is cut.
+    #[test]
+    fn forced_drain_closes_without_waiting() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        let in_flight = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        next_scheduler_rid(&rt);
+
+        rt.begin_drain(true);
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!read_response(in_flight).contains("[DONE]"));
+        rt.request_shutdown();
+    }
+
+    /// The signal wakeup fd begins the drain from a runtime thread: only the
+    /// drain signal's byte counts, as a wakeup fd carries every caught signal.
+    /// Once the listeners have closed, the scheduler's parked wait ends and
+    /// the launching process gets its datagram.
+    #[test]
+    fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
+        use std::io::Write;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        let mut wakeup = std::fs::File::from(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        wakeup.write_all(&[2]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.core.is_draining(), "another signal began the drain");
+
+        let parked = std::time::Instant::now();
+        wakeup.write_all(&[15]).unwrap();
+        assert!(rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)));
+        assert!(
+            parked.elapsed() < std::time::Duration::from_secs(4),
+            "the scheduler's wait was not woken"
+        );
+        assert!(rt.drain_complete());
+        let mut buf = [0u8; 16];
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    /// A response that never finishes (here a control request no scheduler
+    /// answers, which the drain does not count) holds the graceful close
+    /// only for the graceful-close timeout, so the scheduler's shutdown still
+    /// goes out.
+    #[test]
+    fn graceful_close_is_bounded() {
+        use std::time::{Duration, Instant};
+
+        let timeout = Duration::from_millis(500);
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.rust_server_args.graceful_close_timeout = timeout;
+        let rt = start(cfg, None).expect("start runtime");
+        let stuck = send_http(addr, "GET", "/server_info", "");
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
+
+        let begun = Instant::now();
+        rt.begin_drain(false);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !rt.drain_complete(),
+            "the open connection was not waited for"
+        );
+        while !rt.drain_complete() {
+            assert!(
+                begun.elapsed() < timeout + Duration::from_secs(3),
+                "the graceful close was not bounded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        rt.request_shutdown();
+        drop(stuck);
+    }
+
+    /// gRPC drains with HTTP: `HealthCheck` is UNAVAILABLE, an in-flight
+    /// `Generate` stream completes, and both listeners close afterwards.
+    #[test]
+    fn grpc_drains_with_http() {
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let client_runtime = // Multi-threaded, so the client's connection task keeps answering
+        // the server's HTTP/2 shutdown handshake between `block_on`s.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut client, mut stream) = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let stream = client
+                .generate(grpc_ids_request(&[1, 2, 3], "draining"))
+                .await
+                .expect("Generate RPC")
+                .into_inner();
+            (client, stream)
+        });
+        let rid = next_scheduler_rid(&rt);
+
+        rt.begin_drain(false);
+        let health = client_runtime
+            .block_on(client.health_check(proto::HealthCheckRequest {}))
+            .expect_err("a draining server must not report healthy");
+        assert_eq!(health.code(), tonic::Code::Unavailable);
+        assert!(!rt.drain_complete());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let item = client_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+            })
+            .expect("timed out waiting for the gRPC response")
+            .expect("gRPC stream error")
+            .expect("gRPC stream ended without a response");
+        assert!(matches!(
+            item.item,
+            Some(proto::generate_stream_item::Item::Frame(_))
+        ));
+        // The client keeps its connection open: the graceful close must not
+        // wait for an idle HTTP/2 connection.
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+        drop((client, stream));
+        rt.request_shutdown();
     }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins
@@ -383,9 +921,10 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         // Bind is synchronous in `start`, so the port is already accepting.
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
         assert!(
             std::net::TcpStream::connect(addr).is_ok(),
             "server not listening on {addr} after start returned",
@@ -394,6 +933,115 @@ mod tests {
         // Joins the api thread; the listener is closed by the time it returns.
         rt.request_shutdown();
 
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "port still accepting connections after shutdown",
+        );
+    }
+
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed, because admission runs the processor's media hooks; a
+    /// request sent earlier waits and is admitted once the pool starts. The
+    /// control routes serve from the start: `/health` answers 503, and the PD
+    /// bootstrap registry accepts a rank's registration, so other ranks can
+    /// register while the processor is still being built. A text model admits
+    /// at once, and a runtime shut down with a request still waiting exits.
+    #[test]
+    fn multimodal_admission_waits_for_the_mm_pool() {
+        use crate::message::config::DisaggregationMode;
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        struct NoMedia;
+        impl crate::multi_modality::worker::MmProcessor for NoMedia {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<
+                crate::multi_modality::worker::MmProcessOutput,
+                crate::multi_modality::worker::MediaError,
+            > {
+                unreachable!("no request carries media")
+            }
+        }
+        let start_prefill = |is_multimodal: bool| {
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            cfg.server_args = Arc::new(ServerArgs {
+                disaggregation_mode: DisaggregationMode::Prefill,
+                model_config: crate::message::config::ModelConfig {
+                    is_multimodal,
+                    ..Default::default()
+                },
+                ..test_server_args()
+            });
+            (start(cfg, None).expect("start runtime"), addr)
+        };
+        let send = |addr, method: &str, path: &str, body: &str| {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                conn,
+                "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            conn
+        };
+        let response = |mut conn: std::net::TcpStream| {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        };
+        let generate = r#"{"input_ids":[1,2,3],"sampling_params":{"max_new_tokens":8}}"#;
+        let registration = serde_json::json!({
+            "attn_tp_size": 2, "attn_tp_rank": 1,
+            "attn_cp_size": 1, "attn_cp_rank": 0,
+            "attn_dp_size": 1, "attn_dp_rank": 0,
+            "pp_size": 1, "pp_rank": 0,
+            "system_dp_size": 1, "system_dp_rank": 0,
+            "rank_ip": "10.0.0.1", "rank_port": 17000, "page_size": 64,
+        })
+        .to_string();
+
+        let (rt, addr) = start_prefill(false);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "a text model did not admit the request",
+        );
+        rt.request_shutdown();
+
+        let (rt, addr) = start_prefill(true);
+        let waiting = send(addr, "POST", "/generate", generate);
+        let registered = response(send(addr, "PUT", "/route", &registration));
+        assert!(registered.starts_with("HTTP/1.1 200"), "{registered}");
+        let health = response(send(addr, "GET", "/health", ""));
+        assert!(health.starts_with("HTTP/1.1 503"), "{health}");
+        assert!(
+            !rt.to_scheduler_rx.wait(Duration::from_millis(300)),
+            "admitted before the MM pool ran",
+        );
+        rt.start_mm_workers_with_processor(Arc::new(NoMedia), 1, false);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "not admitted once the MM pool ran",
+        );
+        rt.request_shutdown();
+        drop(waiting);
+
+        let (rt, addr) = start_prefill(true);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        rt.request_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?} with a request waiting for the MM pool",
+            started.elapsed(),
+        );
         assert!(
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",
@@ -419,8 +1067,9 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
 
         // Fire a request that will block (already-tokenized → valid → pushed to the
         // ring, then the handler awaits decode frames that never arrive).
@@ -446,6 +1095,35 @@ mod tests {
         drop(conn);
     }
 
+    /// Only the base listener serves the node's `/metrics`; a DP rank's
+    /// offset listener answers 404, as it would without metrics.
+    #[test]
+    fn only_the_metrics_listener_serves_metrics() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!("runtime-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (metrics_listener, expected) in [(true, "200"), (false, "404")] {
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            cfg.rust_server_args.metrics_listener = metrics_listener;
+            cfg.server_args = Arc::new(ServerArgs {
+                metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
+                ..test_server_args()
+            });
+            let rt = start(cfg, None).expect("start runtime");
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.write_all(b"GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            rt.request_shutdown();
+            let status = response.split(' ').nth(1).unwrap_or_default();
+            assert_eq!(status, expected, "metrics_listener={metrics_listener}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Regression: a >2MB body must reach the JSON layer and fail on its
     /// *content* (unknown field → 4xx), never on size (413).
     #[test]
@@ -464,8 +1142,9 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
-        let rt = start(cfg).expect("start runtime");
+        let rt = start(cfg, None).expect("start runtime");
 
         // ~3MB of input_ids plus a `text`, which is mutually exclusive with them:
         // the body parses in full and is then rejected by `into_requests` with a
@@ -509,6 +1188,115 @@ mod tests {
         rt.request_shutdown();
     }
 
+    /// Media the processor refuses fails `/generate` as the client's error with
+    /// the processor's message, as Python answers its processor's `ValueError`:
+    /// a 400, or for a stream an error event with code 400. The processor's own
+    /// failure (Python's `RuntimeError`, e.g. an allocation failure) stays a 500.
+    #[test]
+    fn refused_media_is_a_bad_request() {
+        use crate::multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+        use std::io::{Read, Write};
+
+        struct FailingProcessor(MediaError);
+        impl MmProcessor for FailingProcessor {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
+                Err(self.0.clone())
+            }
+        }
+
+        for (error, status) in [
+            (
+                MediaError::Client("image decode failed: CRC error".into()),
+                400,
+            ),
+            (
+                MediaError::Server("audio decode: Cannot allocate memory".into()),
+                500,
+            ),
+        ] {
+            let message = error.to_string();
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            let mut server_args = test_server_args();
+            server_args.model_config.is_multimodal = true;
+            cfg.server_args = Arc::new(server_args);
+            let rt = start(cfg, None).expect("start runtime");
+            rt.start_mm_workers_with_processor(Arc::new(FailingProcessor(error)), 1, false);
+            for stream in [false, true] {
+                let body = format!(
+                    r#"{{"input_ids":[1,2,3],"image_data":"data:image/png;base64,AAAA","stream":{stream}}}"#
+                );
+                let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+                conn.write_all(
+                    format!(
+                        "POST /generate HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let mut response = String::new();
+                conn.read_to_string(&mut response).unwrap();
+                let http_status = response.split(' ').nth(1).unwrap_or_default();
+                let expected = if stream { "200" } else { &status.to_string() };
+                assert_eq!(http_status, expected, "{response}");
+                assert!(
+                    response.contains(&format!(r#""message":"{message}""#))
+                        && response.contains(&format!(r#""code":{status}"#)),
+                    "{response}"
+                );
+            }
+            rt.request_shutdown();
+        }
+    }
+
+    /// An embedding package's `http_layer` wraps the served app: its own route
+    /// serves, and its middleware sees the built-in routes' responses.
+    #[test]
+    fn http_layer_wraps_the_served_app() {
+        use std::io::{Read, Write};
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let layer: HttpLayer = Arc::new(|app: axum::Router| {
+            app.route("/embedder", axum::routing::get(|| async { "embedded" }))
+                .layer(axum::middleware::map_response(
+                    |mut response: axum::response::Response| async move {
+                        response
+                            .headers_mut()
+                            .insert("x-embedder", axum::http::HeaderValue::from_static("1"));
+                        response
+                    },
+                ))
+        });
+        let rt = start(test_config(addr, None), Some(layer)).expect("start runtime");
+        let get = |path: &str| {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                conn,
+                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        };
+        let model_info = get("/model_info");
+        assert!(model_info.starts_with("HTTP/1.1 200"), "{model_info}");
+        assert!(model_info.contains("x-embedder: 1"), "{model_info}");
+        let embedded = get("/embedder");
+        assert!(embedded.starts_with("HTTP/1.1 200"), "{embedded}");
+        assert!(embedded.ends_with("\r\n\r\nembedded"), "{embedded}");
+
+        rt.request_shutdown();
+    }
+
     /// Regression: a port conflict must fail `start` (so the scheduler doesn't
     /// advertise ready), not return an `Ok` runtime whose listener never binds.
     #[test]
@@ -525,11 +1313,253 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
-        let err = match start(cfg) {
+        let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
             Err(e) => e,
         };
         assert!(err.contains("bind"), "error should mention bind: {err}");
+    }
+
+    /// A configured gRPC bind is part of startup, not a best-effort side task:
+    /// failure returns synchronously and releases the HTTP listener acquired
+    /// immediately before it.
+    #[test]
+    fn grpc_port_conflict_fails_startup_without_leaking_http_listener() {
+        let grpc_hog = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let grpc_addr = grpc_hog.local_addr().unwrap();
+        // Choose HTTP while the gRPC port remains occupied, guaranteeing that
+        // the two addresses differ.
+        let http_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_probe.local_addr().unwrap();
+        drop(http_probe);
+
+        let error = match start(test_config(http_addr, Some(grpc_addr)), None) {
+            Ok(_) => panic!("gRPC bind conflict must fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.contains("gRPC listener"), "unexpected error: {error}");
+        assert!(error.contains(&grpc_addr.to_string()));
+
+        let rebound = std::net::TcpListener::bind(http_addr)
+            .expect("failed startup must release its pre-bound HTTP listener");
+        drop(rebound);
+    }
+
+    /// End to end over the configured socket: the generated api.v1 client
+    /// reaches the existing scheduler ring, and an existing scheduler frame is
+    /// translated back into a protobuf frame. Shutdown then closes both
+    /// transport listeners.
+    #[test]
+    fn configured_grpc_serves_generation_and_closes_with_http() {
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        assert!(std::net::TcpStream::connect(http_addr).is_ok());
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.generate(grpc_ids_request(&[1, 2, 3], "network-generation")),
+            )
+            .await
+            .expect("timed out starting Generate RPC")
+            .expect("Generate RPC")
+            .into_inner()
+        });
+
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "gRPC request did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        let input = requests[0]
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "input_ids")
+            .expect("input token buffer");
+        assert_eq!(input.shape, vec![3]);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+
+        let item = client_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), stream.message()).await
+            })
+            .expect("timed out waiting for gRPC response")
+            .expect("gRPC stream error")
+            .expect("gRPC stream ended without a response");
+        let Some(proto::generate_stream_item::Item::Frame(response)) = item.item else {
+            panic!("expected a frame, got {item:?}");
+        };
+        assert_eq!(response.output_ids.map(|ids| ids.ids), Some(vec![9, 10]));
+        let meta_info = response.meta_info.expect("frame meta_info");
+        assert_eq!(meta_info.id, "network-generation");
+        assert!(meta_info.finish_reason.is_some());
+
+        rt.request_shutdown();
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// An HTTP attach reaches the scheduler ring; after a successful reply,
+    /// gRPC returns the updated HiCache configuration, verifying that both
+    /// transports share the same state.
+    #[test]
+    fn hicache_state_is_shared_between_http_and_grpc() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let request = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body =
+                r#"{"hicache_storage_backend":"file","hicache_write_policy":"write_through"}"#;
+            write!(conn,
+                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        });
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        let rid = scheduler_rid(&requests[0].header);
+        let payload = rmp_serde::to_vec_named(&serde_json::json!({
+            "success": true, "message": "attached",
+        }))
+        .unwrap();
+        assert!(
+            rt.from_scheduler_tx
+                .push(crate::message::response::frame_control_result(
+                    &rid, &payload
+                ))
+        );
+        let response = request.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"success": true, "message": "attached"})
+        );
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get_hi_cache_storage(proto::GetHiCacheStorageRequest {}),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner()
+        });
+        assert_eq!(
+            status,
+            proto::HiCacheStatus {
+                hicache_storage_backend: Some("file".into()),
+                hicache_write_policy: Some("write_through".into()),
+                ..Default::default()
+            }
+        );
+        rt.request_shutdown();
+    }
+
+    /// The Python-backed gRPC listener accepts bodies above Tonic's 4 MiB
+    /// default. Keep that transport policy on the Rust frontend; reaching
+    /// adapter validation proves the body decoded.
+    #[test]
+    fn grpc_listener_preserves_existing_large_message_limit() {
+        use tonic::Code;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = client_runtime.block_on(async {
+            let client = connect_grpc(grpc_addr).await;
+            let mut client = client.max_encoding_message_size(64 * 1024 * 1024);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.generate(proto::GenerateRequest {
+                    // `text` and `input_ids` together is a normalization
+                    // error: an INVALID_ARGUMENT status proves the >4 MiB
+                    // protobuf reached the adapter instead of Tonic rejecting
+                    // it on size.
+                    text: Some(proto::StringOrList {
+                        value: Some(proto::string_or_list::Value::One(
+                            "x".repeat(5 * 1024 * 1024),
+                        )),
+                    }),
+                    ..grpc_ids_request(&[1], "large")
+                }),
+            )
+            .await
+            .expect("timed out sending large Generate RPC")
+            .expect_err("text and input_ids together must fail")
+        });
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        rt.request_shutdown();
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// Tonic's unbounded graceful-drain API waits for open HTTP/2 connections.
+    /// Keep a generated response stream live to ensure the frontend's shared
+    /// shutdown remains bounded and cancels it instead.
+    #[test]
+    fn grpc_shutdown_returns_promptly_with_in_flight_generation() {
+        use std::time::{Duration, Instant};
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let client_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_client, _stream) = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.generate(grpc_ids_request(&[1, 2, 3], "in-flight")),
+            )
+            .await
+            .expect("timed out starting Generate RPC")
+            .expect("Generate RPC")
+            .into_inner();
+            (client, stream)
+        });
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(2)));
+
+        let started = Instant::now();
+        rt.request_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown waited for an open gRPC stream: {:?}",
+            started.elapsed()
+        );
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
     }
 }
