@@ -6,6 +6,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 import sglang as sgl
+from sglang.srt.utils import retry
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,9 +36,15 @@ class TestLoRALoadFromTensor(CustomTestCase):
             log_level="error",
         )
 
-        lora_adapter = snapshot_download(
-            repo_id=LORA_REPO,
-            allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
+        # The hub's API quota is shared by every CI runner, and a 429 asks for
+        # a wait of about a minute; a setUpClass failure is not retried by CI.
+        lora_adapter = retry(
+            lambda: snapshot_download(
+                repo_id=LORA_REPO,
+                allow_patterns=["adapter_model.safetensors", "adapter_config.json"],
+            ),
+            max_retry=3,
+            initial_delay=30,
         )
         # Load tensors and config from downloaded adapter
         cls.lora_tensors = load_file(
