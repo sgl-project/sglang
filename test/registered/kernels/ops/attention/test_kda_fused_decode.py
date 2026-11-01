@@ -235,6 +235,12 @@ _KDA_LAYER = 1
 _KDA_PREFIX = f"model.layers.{_KDA_LAYER}.self_attn"
 
 
+def _skip_unless_glm_fused_arch():
+    # GLM-5.3-Flash takes the fused decode on SM9x / SM10x only.
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("GLM fused KDA decode runs on SM90 / SM100 only")
+
+
 @pytest.fixture
 def glm5_next_runtime():
     from sglang.srt.runtime_context import get_context, get_parallel
@@ -372,6 +378,7 @@ def test_glm5_next_weight_loading_prepares_fused_decode(
 ):
     """Both weight-loading entry points must publish the fused decode inputs;
     without them every decode batch silently stays on the unfused chain."""
+    _skip_unless_glm_fused_arch()
     model, attn = _glm5_next_with_kda_layer(heads)
     assert attn.attn._k3_fused_decode_args is None
     ckpt = _kda_checkpoint(heads, seed=1)
@@ -387,6 +394,7 @@ def test_glm5_next_reload_refreshes_graph_held_fused_buffers(
     """Captured decode graphs hold the fused-decode buffers, so a weight reload
     must rewrite them in place: a graph captured before the reload replays
     with the new weights."""
+    _skip_unless_glm_fused_arch()
     model, attn = _glm5_next_with_kda_layer(heads)
     _load(model, _kda_checkpoint(heads, seed=1), through_load_weights=True)
     args = attn.attn._k3_fused_decode_args
@@ -458,6 +466,24 @@ def test_glm5_next_reload_refreshes_graph_held_fused_buffers(
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(state_pool, state_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(conv_pool, conv_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device_sm", [80, 120], ids=["sm80", "sm120"])
+def test_glm5_next_keeps_unfused_decode_on_other_archs(
+    glm5_next_runtime, device_sm: int
+):
+    """Off SM9x / SM10x GLM decode must stay on the unfused chain: below SM90
+    the fused kernel's TMA state staging traps, and SM12x is unmeasured."""
+    from unittest.mock import patch
+
+    from sglang.srt.models import glm5_next
+
+    model, attn = _glm5_next_with_kda_layer(8)
+    with patch.object(glm5_next, "_device_sm", device_sm):
+        _load(model, _kda_checkpoint(8, seed=1), through_load_weights=True)
+    assert attn.attn._k3_fused_decode_args is None
+    assert attn._kda_fused_decode_max_tokens == 0
 
 
 if __name__ == "__main__":

@@ -615,6 +615,9 @@ class Glm5NextLinearAttention(nn.Module):
         seg = self.local_num_heads * self.head_dim
         if (
             not _is_cuda
+            # The kernel stages the state with TMA (a trap below SM90) and was
+            # measured on Hopper and datacenter Blackwell only.
+            or _device_sm // 10 not in (9, 10)
             or self.local_num_heads not in kda_fused_decode.SUPPORTED_HEADS
             or self.head_dim != 128
             or self.conv_size != 4
