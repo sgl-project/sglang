@@ -43,10 +43,15 @@ def get_node_lock_ref(tree_cache: Any, node_handle: Any) -> int:
     if core is not None:
         if not core.contains_node(node_handle):
             return 0
+        if core.is_root(node_handle):
+            # The root's lock_ref is a permanent sentinel, never a req's lock.
+            return 0
         return sum(
             core.get_component_device_lock_ref(node_handle, component)
             for component in tree_cache.tree_components
         )
+    if node_handle is getattr(tree_cache, "root_node", None):
+        return 0
     return _node_lock_ref(node_handle)
 
 
