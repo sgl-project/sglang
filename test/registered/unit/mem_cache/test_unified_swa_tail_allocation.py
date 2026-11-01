@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -62,7 +63,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         seq_len = allocator.available_size() + page_size
                         self.assertFalse(
                             allocator.admits(
-                                seq_len, allocator._window_demand(seq_len, seq_len)
+                                seq_len, demand_windows(allocator, seq_len, seq_len)
                             )
                         )
                     prefix_capacity = -(-prefix_len // page_size) * page_size

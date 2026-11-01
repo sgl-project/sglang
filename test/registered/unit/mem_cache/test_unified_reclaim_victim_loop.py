@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_tri_cache,
     setup_allocator_context,
@@ -80,7 +81,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                 state_slots = bundle.token_to_kv_pool_allocator.state_slots
                 self._cache_prefixes(rng, allocator, cache, state_slots, 6, 0.0)
                 # Running requests fill the owner; their windows have retired.
-                while allocator.ensure_capacity(4, 4):
+                while allocator.ensure_capacity(token_demand(allocator, 4, 4)):
                     allocator.free_swa(allocator.alloc(4))
                 owner = allocator.full_attn_allocator.sub_pool_name
                 demand = {owner: allocator.full_available_size() + 2}
@@ -115,7 +116,9 @@ class TestReclaimVictimLoop(CustomTestCase):
         count = rng.randint(1, max(1, state_slots.available_size() - 3))
         receipts = self._cache_prefixes(rng, allocator, cache, state_slots, count, 0.3)
         # Running requests hold the rest of the token room.
-        while rng.random() < 0.8 and allocator.ensure_capacity(4, 4):
+        while rng.random() < 0.8 and allocator.ensure_capacity(
+            token_demand(allocator, 4, 4)
+        ):
             self.assertIsNotNone(allocator.alloc(4))
         return allocator, cache, receipts
 
@@ -132,13 +135,16 @@ class TestReclaimVictimLoop(CustomTestCase):
                 slots = rng.randint(0, 2)
                 admitted = allocator.admits(
                     tokens,
-                    allocator._window_demand(tokens, tokens),
+                    demand_windows(allocator, tokens, tokens),
                     slots,
                     evictable=allocator.admission_evictable(cache),
                 )
                 before = _evictable(cache)
                 ready = allocator.reclaim(
-                    cache, allocator.page_demands(tokens, tokens, state_slots=slots)
+                    cache,
+                    allocator.page_demands(
+                        token_demand(allocator, tokens, tokens, state_slots=slots)
+                    ),
                 )
                 self.assertEqual(ready, admitted)
                 outcomes.add(admitted)
@@ -173,7 +179,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                     demand = {state: need}
                     admitted = allocator.admits(
                         0,
-                        {},
+                        {window: 0},
                         need,
                         evictable=allocator.admission_evictable(cache),
                     )
@@ -190,7 +196,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                     demand = {name: -(-need // page)}
                     admitted = allocator.admits(
                         need if component == "owner" else 0,
-                        {} if component == "owner" else {window: need},
+                        {window: 0 if component == "owner" else need},
                         evictable=allocator.admission_evictable(cache),
                     )
                 before = _evictable(cache)

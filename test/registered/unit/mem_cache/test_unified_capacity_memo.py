@@ -33,6 +33,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -253,14 +254,16 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                         capacity = allocator.available_size()
                         self.assertTrue(
                             allocator.admits(
-                                capacity, allocator._window_demand(capacity, capacity)
+                                capacity, demand_windows(allocator, capacity, capacity)
                             )
                         )
                         # Admission may see room past the advertised capacity
                         # (a relayout opens it); whatever it admits, the take
                         # serves.
                         more = capacity + page_size
-                        if allocator.admits(more, allocator._window_demand(more, more)):
+                        if allocator.admits(
+                            more, demand_windows(allocator, more, more)
+                        ):
                             taken = allocator.alloc(more)
                             self.assertIsNotNone(taken)
                             allocator.free(taken)
