@@ -11,7 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVReceiver,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -97,6 +100,13 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
+
+
+class TestBootstrapServerClose(CustomTestCase):
+    def test_close_before_server_thread_runs(self):
+        with patch.object(threading.Thread, "start"):
+            server = CommonKVBootstrapServer("127.0.0.1", 0)
+        server.close()
 
 
 if __name__ == "__main__":
