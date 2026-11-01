@@ -164,7 +164,10 @@ class ExpertSlotSizing:
             kvc.mambaish_config.mamba2_cache_params.mamba_cache_per_req
             + kvc.extra_mamba_cache_bytes_per_req
         )
-        share = int(self.budget_before_kv * ratio / (1 + ratio) // per_slot)
+        # The pool allocates one padding slot beyond its size (SGLang charges size + 1).
+        share = int(
+            (self.budget_before_kv * ratio / (1 + ratio) - per_slot) // per_slot
+        )
         per_request = kvc._calculate_mamba_ratio()  # state slots one request needs
         requests = _requests_set()
         self.mamba_source = (
@@ -173,7 +176,7 @@ class ExpertSlotSizing:
         slots = max(per_request, min((requests or 1) * per_request, share))
         # One request fewer at a time until the KV cache's minimum fits next to them.
         while slots > per_request and (
-            _kv_tokens(kvc, self.budget_before_kv - slots * per_slot)
+            _kv_tokens(kvc, self.budget_before_kv - (slots + 1) * per_slot)
             < self.floor.minimum
         ):
             slots = max(per_request, slots - per_request)

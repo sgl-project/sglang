@@ -743,7 +743,7 @@ class TestSizing(CustomTestCase):
         self.assertEqual((f.tokens, f.requests), (4096 * 4, 4))
         resolved = dict(max_total_tokens=1000, max_running_requests=256)
         self.assertEqual(self._mamba_slots(10**6, requests_set=None, **resolved), [2])
-        self.assertEqual(self._mamba_slots(10**6, requests_set=256, **resolved), [473])
+        self.assertEqual(self._mamba_slots(10**6, requests_set=256, **resolved), [472])
 
     def test_kv_floor_promises_one_request_and_aims_for_the_rest(self):
         f = self._floor(262144, max_total_tokens=10240, max_running_requests=4)
@@ -969,32 +969,35 @@ class TestSizing(CustomTestCase):
 
     def test_mamba_state_holds_the_requests_the_kv_cache_aims_for(self):
         """2 state slots per request: one request by default, the --max-running-requests set
-        (8: 16 slots), capped at SGLang's share (0.9 / 1.9 of 19,000 B = 9 slots of 1000 B),
-        at least one request; nothing when --max-mamba-cache-size is set."""
+        (8: 16 slots), capped at SGLang's share (0.9 / 1.9 of 19,000 B = 9,000 B, less the
+        pool's padding slot: 8 slots of 1000 B), at least one request; nothing when
+        --max-mamba-cache-size is set."""
         self.assertEqual(self._mamba_slots(10**6), [2])
         self.assertEqual(self._mamba_slots(10**6, max_running_requests=8), [16])
-        self.assertEqual(self._mamba_slots(19_000, max_running_requests=8), [9])
+        self.assertEqual(self._mamba_slots(19_000, max_running_requests=8), [8])
         self.assertEqual(self._mamba_slots(100, max_running_requests=8), [2])
         self.assertEqual(self._mamba_slots(10**6, max_mamba_cache_size=5), [])
 
     def test_one_full_request_comes_before_more_mamba_state(self):
         """Near the limit, the Mamba state grows only as far as one full-length request still
-        fits next to it; more requests queue. 20,000 B, a share of 18 slots (ratio 9), 8
-        requests of 4096 tokens at 2 B: 16 slots would leave 4,000 B, short of the 8,192 one
-        request needs, so 10 (5 requests) leave 10,000 B. Control: in the old order, 16 slots
-        leave the KV cache short of one request, which startup rejects."""
+        fits next to it; more requests queue. The pool holds one padding slot beyond its size.
+        20,000 B, a share of 17 slots (ratio 9), 8 requests of 4096 tokens at 2 B: 16 slots
+        (17 with the padding) would leave 3,000 B, short of the 8,192 one request needs, so
+        10 (5 requests; 11 charged) leave 9,000 B. Control: in the old order, 16 slots leave
+        the KV cache short of one request, which startup rejects."""
         args = dict(context_length=4096, kv_bytes=2, max_running_requests=8)
         args["mamba_full_memory_ratio"] = 9
         self.assertEqual(self._mamba_slots(20_000, **args), [10])
-        self.assertLess((20_000 - 16 * 1000) // 2, 4096)
+        self.assertLess((20_000 - 17 * 1000) // 2, 4096)
         # Room for all 8 requests: no change. No room even for one: one request's state,
         # and startup names the context that does not fit.
         self.assertEqual(self._mamba_slots(10**6, **args), [16])
         self.assertEqual(self._mamba_slots(5_000, **args), [2])
-        # --max-total-tokens is the minimum when set.
+        # --max-total-tokens is the minimum when set. 2000 tokens: 16 slots fit only without
+        # the padding slot (4,000 B left vs 3,000 B with it), so 14.
         args = dict(kv_bytes=2, max_running_requests=8, mamba_full_memory_ratio=9)
-        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [16])
-        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [10])
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [14])
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [8])
 
 
 if __name__ == "__main__":
