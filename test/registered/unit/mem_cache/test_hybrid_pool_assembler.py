@@ -1351,7 +1351,7 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
                 placement = FusedDraftPlacement.from_counts(
                     counts={host: [1]},
                     regions={host: region},
-                    hosted={"window": "swa"} if host == "window" else None,
+                    hosted=None,
                 )
                 bundle = _build_unified_swa_pool(fused_draft=placement)
                 draft = DraftMHAView(

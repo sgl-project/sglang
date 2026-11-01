@@ -201,7 +201,7 @@ class TestDraftWindowFusesByLifetime(CustomTestCase):
                 ).placement
                 self.assertEqual(placement.hosts(), (host,))
                 self.assertEqual(host in placement.new_bands, new_band)
-                self.assertEqual(placement.host_kind(host).name, "swa")
+                self.assertEqual(placement.host_kind(host).name, "window")
                 plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
                 carriers = [
                     s.name for s in plan.sub_pools if s.spec.draft_region is not None
