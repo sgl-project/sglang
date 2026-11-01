@@ -3,7 +3,6 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
-    _NUM_COMPONENT_TYPES,
     CacheTransferPhase,
     ComponentData,
     EvictLayer,
@@ -16,6 +15,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
     get_and_increase_time_counter,
     next_component_uuid,
+    slot_width,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -37,7 +37,7 @@ __all__ = [
     "PreparePrefetchResult",
     "SWAComponent",
     "TreeComponent",
-    "_NUM_COMPONENT_TYPES",
     "next_component_uuid",
+    "slot_width",
     "get_and_increase_time_counter",
 ]

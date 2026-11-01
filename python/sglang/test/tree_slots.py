@@ -11,14 +11,15 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-# A separate family keeps the auxiliary window outside storage-window rules;
-# tests supply its driver through component_registry_override.
+# A separate family keeps a second window outside storage-window rules; tests
+# supply its driver through component_registry_override.
 CUSTOM_WINDOW = "custom_window"
+CUSTOM_WINDOW_COMPONENT = ComponentType.of("CUSTOM_WINDOW")
 
 FAMILY_OF = {
     ComponentType.FULL: TREE_TOKEN,
     ComponentType.SWA: TREE_WINDOW,
-    ComponentType.AUXILIARY_SWA: CUSTOM_WINDOW,
+    CUSTOM_WINDOW_COMPONENT: CUSTOM_WINDOW,
     ComponentType.MAMBA: TREE_STATE,
     ComponentType.C128: TREE_BLOCK,
 }

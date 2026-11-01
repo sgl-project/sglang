@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
     MLADraftRegion,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 # The draft placement and the id spaces name sub-pools by these; windows are
 # named by `window_sub_pool_name`.
@@ -70,26 +71,28 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
     ),
 }
 
-# A window's external names follow its window slot, the plan's windows in drive
-# order: the prefix tree, host pools and PD peers have two window entries.
-_WINDOW_SLOT_EXTERNALS = (
-    SubPoolExternal(host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"),
-    SubPoolExternal(
-        host_pool="auxiliary_swa",
-        tree_component="AUXILIARY_SWA",
-        metrics="swa",
-        wire="auxiliary_swa",
-    ),
-)
+# A window's prefix tree component is named by its sub-pool. Host pools and PD
+# peers name window entries by window slot, the plan's windows in `windows`
+# order, and have two window entries so far: a third window has none.
+_WINDOW_SLOT_HOST_AND_WIRE = ("swa", "auxiliary_swa")
+
+
+def window_tree_component(name: str) -> str:
+    """The prefix tree component a window sub-pool goes by."""
+    return name.upper()
 
 
 def _window_external(slot: int, name: str) -> SubPoolExternal:
-    """A window slot beyond the consumers' entries gets its sub-pool's name,
-    which the tree and the PD wire refuse."""
-    if slot < len(_WINDOW_SLOT_EXTERNALS):
-        return _WINDOW_SLOT_EXTERNALS[slot]
+    host_and_wire = (
+        _WINDOW_SLOT_HOST_AND_WIRE[slot]
+        if slot < len(_WINDOW_SLOT_HOST_AND_WIRE)
+        else name
+    )
     return SubPoolExternal(
-        host_pool=name, tree_component=name.upper(), metrics="swa", wire=name
+        host_pool=host_and_wire,
+        tree_component=window_tree_component(name),
+        metrics="swa",
+        wire=host_and_wire,
     )
 
 
@@ -139,6 +142,24 @@ class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
     window: Optional[int] = None
     # State family: a cached state is valid after a multiple of this many tokens.
     checkpoint_interval: Optional[int] = None
+    # The host pool keeping the slot's HiCache copies, by name; None means the
+    # family's own (the window host pool for a window).
+    host_pool: Optional[str] = None
+
+
+def tree_slot_ids(slots: Sequence[TreeSlot]) -> Dict[str, ComponentType]:
+    """Each slot's component id inside the tree: the tree's first window slot
+    plays the window role (`ComponentType.SWA`); every other slot goes by its
+    component name."""
+    first_window = next((s.component for s in slots if s.family == TREE_WINDOW), None)
+    return {
+        s.component: (
+            ComponentType.SWA
+            if s.component == first_window
+            else ComponentType.of(s.component)
+        )
+        for s in slots
+    }
 
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
@@ -254,14 +275,11 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     def tree_slots(
         self, *, window_reaches: Optional[Dict[str, int]] = None
     ) -> Tuple[TreeSlot, ...]:
-        """The prefix tree's slots, one per sub-pool, in drive order.
-        ``window_reaches`` names the storage sub-pools additional readers use,
-        and how far back from the committed length each reader needs them."""
-        if len(self.windows()) > len(_WINDOW_SLOT_EXTERNALS):
-            raise ValueError(
-                f"a prefix tree keeps at most {len(_WINDOW_SLOT_EXTERNALS)} windows; "
-                f"the plan has {[s.name for s in self.windows()]}"
-            )
+        """The prefix tree's slots, one per sub-pool, in drive order with the
+        windows in `windows` order: the tree's first window slot is the
+        target's window. ``window_reaches`` names the storage sub-pools
+        additional readers use, and how far back from the committed length
+        each reader needs them."""
         for sub_pool in self.sub_pools:
             lifetime = sub_pool.lifetime
             if isinstance(lifetime, StateLifetime) and (
@@ -287,7 +305,15 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                     if isinstance(s.lifetime, StateLifetime)
                     else None
                 ),
+                host_pool=s.external.host_pool,
             )
+            for s in self._tree_order()
+        )
+
+    def _tree_order(self) -> Tuple[PlannedSubPool, ...]:
+        windows = iter(self.windows())
+        return tuple(
+            next(windows) if isinstance(s.lifetime, WindowLifetime) else s
             for s in self.drive_order()
         )
 

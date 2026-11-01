@@ -20,7 +20,7 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
-from typing import Optional
+from typing import Mapping, Optional
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -30,6 +30,16 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_chunk_tokens,
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+
+def _host_hits(
+    swa_host_hit_length: int,
+    window_host_hit_lengths: Optional[Mapping[ComponentType, int]],
+) -> dict[ComponentType, int]:
+    """Host hit tokens per tree window slot: the first window's, then each
+    further window's."""
+    return {ComponentType.SWA: swa_host_hit_length, **(window_host_hit_lengths or {})}
 
 
 def estimate_swa_kv_tokens(
@@ -125,7 +135,7 @@ class PrefillBudget:
         max_new_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ) -> bool:
         """Prepare pools whose admission depends on movable shared space."""
@@ -181,7 +191,7 @@ class PrefillBudget:
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         """Return admission feasibility and a memory bound on the requested chunk."""
@@ -200,7 +210,7 @@ class PrefillBudget:
         chunk_limit: int | None,
         state_slots: int = 0,
         swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return paged_input + state_slots * self.state_slot_cost <= min(
             self.remaining_current, self.remaining_total
@@ -338,7 +348,7 @@ class SWAPrefillBudget(PrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         if total_tokens + state_slots * self.state_slot_cost >= self.remaining_total:
@@ -415,7 +425,7 @@ class SWAPrefillBudget(PrefillBudget):
         chunk_limit: int | None,
         state_slots: int = 0,
         swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return (
             super().can_allocate_prefill(
@@ -489,8 +499,8 @@ class ChainPrefillBudget(PrefillBudget):
         self.pending_state_slots = 0
         # (sub-pool, tree window slot, retained window) per window sub-pool.
         self.windows = tuple(
-            (name, slot, window)
-            for name, slot, window, _ in allocator.admission_windows(tree_cache)
+            (name, component, window)
+            for name, component, window, _ in allocator.admission_windows(tree_cache)
         )
         # A mixed decode token writes one row in every window too.
         self.window_offsets = {
@@ -506,7 +516,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        host_hit_lengths=(0, 0),
+        host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots=0,
         extra_tokens=0,
         new_window=False,
@@ -527,7 +537,7 @@ class ChainPrefillBudget(PrefillBudget):
             host_hit_lengths=host_hit_lengths,
         )
         if new_window:
-            hits = host_hit_lengths or (0, 0)
+            hits = host_hit_lengths or {}
             windows = {
                 name: new_window_peak(
                     windows[name],
@@ -535,9 +545,9 @@ class ChainPrefillBudget(PrefillBudget):
                     sliding_window_size=window,
                     page_size=self.page_size,
                     allocation_limit=chunk_limit,
-                    host_hit_length=hits[slot],
+                    host_hit_length=hits.get(component, 0),
                 )
-                for name, slot, window in self.windows
+                for name, component, window in self.windows
             }
         return (
             self.ceil_paged_tokens(extend_input_len)
@@ -554,10 +564,11 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        host_hit_lengths=(0, 0),
+        host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ):
         """The tokens one request reserves in each window sub-pool; host hits
         are given per tree window slot."""
+        host_hit_lengths = host_hit_lengths or {}
         return {
             name: estimate_swa_kv_tokens(
                 extend_input_len,
@@ -565,9 +576,9 @@ class ChainPrefillBudget(PrefillBudget):
                 sliding_window_size=window,
                 page_size=self.page_size,
                 allocation_limit=chunk_limit,
-                host_hit_length=host_hit_lengths[slot],
+                host_hit_length=host_hit_lengths.get(component, 0),
             )
-            for name, slot, window in self.windows
+            for name, component, window in self.windows
         }
 
     def request_state_slots(self, req) -> int:
@@ -626,7 +637,7 @@ class ChainPrefillBudget(PrefillBudget):
         # target window's reachable tokens less what is pending on it.
         if not self.windows:
             return 0
-        name = next(name for name, slot, _ in self.windows if slot == 0)
+        name = next(name for name, component, _ in self.windows if component.is_swa)
         return (
             self.allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
@@ -651,7 +662,7 @@ class ChainPrefillBudget(PrefillBudget):
         input_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         """Admit the whole request if it fits; otherwise, with chunking and
@@ -661,7 +672,7 @@ class ChainPrefillBudget(PrefillBudget):
         stream of tiny prefills starves them. Memory held only by parked rows
         (idle streaming sessions) is not transient: then the whole request is
         admitted with the largest chunk limit at which all of it fits now."""
-        host_hits = (swa_host_hit_length, auxiliary_swa_host_hit_length)
+        host_hits = _host_hits(swa_host_hit_length, window_host_hit_lengths)
 
         def demand_at(limit):
             # ``total_tokens`` is the caller's charge: the prompt, its decode and
@@ -782,7 +793,7 @@ class ChainPrefillBudget(PrefillBudget):
         candidate = min(extend_input_len, chunk_limit)
         fits = dict(
             chunk_limit=chunk_limit,
-            host_hit_lengths=(0, 0),
+            host_hit_lengths=None,
             state_slots=state_slots,
             now=True,
         )
@@ -802,7 +813,7 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit: int | None,
         state_slots: int = 0,
         swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
     ) -> bool:
         return self._fits(
             paged_input + max_new_tokens,
@@ -810,7 +821,9 @@ class ChainPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                host_hit_lengths=(swa_host_hit_length, auxiliary_swa_host_hit_length),
+                host_hit_lengths=_host_hits(
+                    swa_host_hit_length, window_host_hit_lengths
+                ),
             ),
             state_slots,
         )
@@ -860,7 +873,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
         state_slots: int = 0,
     ):
         # H2D pins the restored rows. Realize the selected budget while the
@@ -872,16 +885,19 @@ class ChainPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                host_hit_lengths=(swa_host_hit_length, auxiliary_swa_host_hit_length),
+                host_hit_lengths=_host_hits(
+                    swa_host_hit_length, window_host_hit_lengths
+                ),
             ).items()
         }
-        by_slot = {slot: windows[name] for name, slot, _ in self.windows}
-        demand = {}
+        demand = {"window_tokens": windows}
         if self.has_state_slots:
             demand["state_slots"] = state_slots + self.pending_state_slots
-        if 1 in by_slot:
-            demand["auxiliary_swa_tokens"] = by_slot[1]
-        return full_tokens, by_slot.get(0, 0), demand
+        swa_tokens = next(
+            (windows[name] for name, component, _ in self.windows if component.is_swa),
+            0,
+        )
+        return full_tokens, swa_tokens, demand
 
     def prepare_load_back(self, **kwargs) -> bool:
         full_tokens, swa_tokens, demand = self._load_back_demand(**kwargs)

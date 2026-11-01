@@ -99,7 +99,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                 self.assertEqual(
                     (
                         first.swa_num_tokens,
-                        first.auxiliary_swa_num_tokens,
+                        sum(first.window_num_tokens.values()),
                         first.mamba_num,
                     ),
                     (0, 0, 0),

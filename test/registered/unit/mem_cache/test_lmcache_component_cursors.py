@@ -17,6 +17,9 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
+# A further window slot, named by its sub-pool.
+SECOND_WINDOW = ComponentType.of("WINDOW_64")
+
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
@@ -62,7 +65,7 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
             req_pool_idx=0,
             kv_allocated_len=12,
             cache_protected_len=8,
-            component_evicted_seqlens={ComponentType.AUXILIARY_SWA: 6},
+            component_evicted_seqlens={SECOND_WINDOW: 6},
         ),
         priority=0,
         last_node=None,
@@ -85,7 +88,7 @@ def test_external_swa_load_preserves_independent_cursors(cache_class, swa_cursor
     assert req.kv.cache_protected_len == 2
     assert req.kv.component_evicted_seqlens == {
         ComponentType.SWA: max(swa_cursor, 4),
-        ComponentType.AUXILIARY_SWA: 6,
+        SECOND_WINDOW: 6,
     }
 
 
@@ -111,15 +114,15 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
         cache._publish_external_loaded_prefix(req, token_ids_len=12)
 
     insert_params = cache.insert.call_args.args[0]
-    expected = {ComponentType.AUXILIARY_SWA: 6}
+    expected = {SECOND_WINDOW: 6}
     if swa_enabled:
         expected[ComponentType.SWA] = 4
     assert insert_params.component_evicted_seqlens == expected
     assert (
         insert_params.component_evicted_seqlens is not req.kv.component_evicted_seqlens
     )
-    req.kv.set_evicted_seqlen(ComponentType.AUXILIARY_SWA, 99)
-    assert insert_params.get_evicted_seqlen(ComponentType.AUXILIARY_SWA) == 6
+    req.kv.set_evicted_seqlen(SECOND_WINDOW, 99)
+    assert insert_params.get_evicted_seqlen(SECOND_WINDOW) == 6
     assert req.kv.cache_protected_len == 8
     assert req.lock.receipt.node_id == 42
     assert flow.prefix_published

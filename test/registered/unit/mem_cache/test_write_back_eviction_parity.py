@@ -244,6 +244,7 @@ class _Workload:
                 rid=f"s{session.sid}",
                 last_node=last_node,
                 swa_host_hit_length=swa_host_len,
+                window_host_hit_lengths={},
                 mamba_host_hit_length=0,
                 kv=SimpleNamespace(mamba_pool_idx=None),
             )

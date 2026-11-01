@@ -106,7 +106,7 @@ def _staged_fixture(full_match=2):
         component_type=ComponentType.SWA,
         full_window_pages=2,
     )
-    pipeline._auxiliary_swa_component = None
+    pipeline._further_window_components = ()
     pipeline.reset()
     cache.buffer_pipeline = pipeline
     pipeline.staged_prefetches[_REQ] = _StagedPrefetch(
