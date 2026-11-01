@@ -61,11 +61,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
-from sglang.srt.runtime_context import get_device, get_exec
+from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
@@ -131,6 +132,22 @@ def _mqa_logits_row_chunks(
         slice(start, min(start + rows_per_chunk, num_rows))
         for start in range(0, num_rows, rows_per_chunk)
     )
+
+
+def shard_row_chunks(
+    row_chunks: Tuple[slice, ...], world_size: int, rank: int
+) -> Tuple[Tuple[slice, ...], int]:
+    """Clip row chunks to this rank's rows, and return the padded row total."""
+    num_rows = row_chunks[-1].stop
+    rows_per_rank = (num_rows + world_size - 1) // world_size
+    start = rank * rows_per_rank
+    end = min(start + rows_per_rank, num_rows)
+    chunks = tuple(
+        slice(max(start, chunk.start), min(end, chunk.stop))
+        for chunk in row_chunks
+        if max(start, chunk.start) < min(end, chunk.stop)
+    )
+    return chunks, rows_per_rank * world_size
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -1115,10 +1132,17 @@ class IndexerKPool(MultiPlatformOp):
         topk_row_starts: Optional[torch.Tensor],
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
+        tp_group: Optional[GroupCoordinator] = None,
     ) -> torch.Tensor:
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
-        single_chunk = len(row_chunks) == 1
+        gather_rows = row_chunks[-1].stop
+        num_out_rows = gather_rows if out_rows is None else out_rows
+        if tp_group is not None:
+            row_chunks, gather_rows = shard_row_chunks(
+                row_chunks, tp_group.world_size, tp_group.rank_in_group
+            )
+        single_chunk = tp_group is None and len(row_chunks) == 1
         topk_result = None
         for rows in row_chunks:
             if kv_fp8 is None:
@@ -1164,16 +1188,23 @@ class IndexerKPool(MultiPlatformOp):
             del logits
             if topk_result is None:
                 # Rows past the last chunk are padding, matching out_rows.
-                num_out_rows = row_chunks[-1].stop if out_rows is None else out_rows
                 topk_result = torch.full(
-                    (num_out_rows, topk_chunk.shape[1]),
+                    (max(num_out_rows, gather_rows), topk_chunk.shape[1]),
                     -1,
                     dtype=topk_chunk.dtype,
                     device=topk_chunk.device,
                 )
             topk_result[rows] = topk_chunk
         assert topk_result is not None
-        return topk_result
+        if tp_group is not None:
+            rows_per_rank = gather_rows // tp_group.world_size
+            local_start = tp_group.rank_in_group * rows_per_rank
+            # The local shard is already at its final offset for NCCL's in-place gather.
+            tp_group.all_gather_into_tensor(
+                topk_result[:gather_rows],
+                topk_result[local_start : local_start + rows_per_rank],
+            )
+        return topk_result[:num_out_rows]
 
     def _get_topk_ragged_kpool_plan(
         self,
@@ -1236,6 +1267,23 @@ class IndexerKPool(MultiPlatformOp):
         # The plan's table is req_to_token, indexed by request-pool ID.
         assert page_table_all is None or page_table_row_index_all is not None
 
+        tp_group = None
+        if (
+            envs.SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP.get()
+            and n_real >= 4096
+            # Small prefills lose more to the gather than sharding saves.
+            and n_real * total_k_rows >= 100_000_000
+            and q_fp8.is_cuda
+            and not dsa_use_prefill_cp(forward_batch)
+            and not get_forward().attn_input_scattered
+            and not capture_mode.is_capture_mode
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
+        ):
+            group = get_parallel().attn_tp_group
+            if group.world_size > 1:
+                tp_group = group
+
         return self._kpool_topk_by_row_chunks(
             q_fp8=q_fp8,
             weights=weights,
@@ -1252,6 +1300,7 @@ class IndexerKPool(MultiPlatformOp):
                 num_rows=n_real, num_cols=total_k_rows, device=device
             ),
             out_rows=total_q,
+            tp_group=tp_group,
         )
 
     def _get_topk_ragged_kpool(
