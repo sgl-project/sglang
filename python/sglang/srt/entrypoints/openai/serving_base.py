@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import uuid
@@ -14,6 +15,10 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.observability.frontend_request_timing import (
+    FrontendRequestTiming,
+    bind_frontend_timing,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -99,13 +104,25 @@ class OpenAIServingBase(ABC):
             # Convert off-loop: jinja render + full-prompt tokenization blocks
             # the loop on long prompts, and the rust tokenizer releases the GIL.
             loop = asyncio.get_running_loop()
-            adapted_request, processed_request = await loop.run_in_executor(
-                None, self._convert_to_internal_request, request, raw_request
+            timing = FrontendRequestTiming(
+                started_at=raw_request.scope.get(
+                    "frontend_received_time", received_time
+                )
             )
+            with bind_frontend_timing(timing):
+                context = contextvars.copy_context()
+                adapted_request, processed_request = await loop.run_in_executor(
+                    None,
+                    context.run,
+                    self._convert_to_internal_request,
+                    request,
+                    raw_request,
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+                adapted_request._frontend_request_timing = timing
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

@@ -485,6 +485,7 @@ class ORJSONRoute(APIRoute):
         original_handler = super().get_route_handler()
 
         async def custom_handler(request: Request):
+            request.scope.setdefault("frontend_received_time", time.perf_counter())
             return await original_handler(ORJSONRequest(request.scope, request.receive))
 
         return custom_handler
