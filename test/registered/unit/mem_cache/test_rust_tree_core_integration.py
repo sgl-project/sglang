@@ -84,7 +84,13 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.tree_slots import FAMILY_OF, index_slots, slot_of, tree_slots_of
+from sglang.test.tree_slots import (
+    CUSTOM_WINDOW_COMPONENT,
+    FAMILY_OF,
+    index_slots,
+    slot_of,
+    tree_slots_of,
+)
 
 
 def _slots(*components):
@@ -3686,7 +3692,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     class AuxiliarySWAComponent(SWAComponent):
-        component_type = ComponentType.AUXILIARY_SWA
+        component_type = CUSTOM_WINDOW_COMPONENT
 
         def _publish_window(self, node, cache_actions):
             cache_actions.append(
@@ -3706,10 +3712,10 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             page_size=1,
             sliding_window_size=4,
             tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.AUXILIARY_SWA), window=4
+                (ComponentType.FULL, CUSTOM_WINDOW_COMPONENT), window=4
             ),
             component_registry_override={
-                FAMILY_OF[ComponentType.AUXILIARY_SWA]: AuxiliarySWAComponent
+                FAMILY_OF[CUSTOM_WINDOW_COMPONENT]: AuxiliarySWAComponent
             },
             tree_core_backend="python",
         )
@@ -3723,7 +3729,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
         InsertParams(key=_key(list(range(6))), value=values, prev_prefix_len=2)
     ).last_device_node
     lock = cache.inc_lock_ref(leaf).to_dec_params()
-    component = ComponentType.AUXILIARY_SWA
+    component = CUSTOM_WINDOW_COMPONENT
     original = core.get_component_device_value(parent, component).clone()
     core.set_hicache_enabled()
     core.has_swa_host_pool = True

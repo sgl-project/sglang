@@ -79,9 +79,10 @@ class CacheInitParams:
         """The tree slots' ids, in drive order."""
         if self.tree_slots is None:
             return None
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.kv.plan import tree_slot_ids
 
-        return tuple(ComponentType[slot.component] for slot in self.tree_slots)
+        slot_ids = tree_slot_ids(self.tree_slots)
+        return tuple(slot_ids[slot.component] for slot in self.tree_slots)
 
     @property
     def swa_retain_window(self) -> Optional[int]:

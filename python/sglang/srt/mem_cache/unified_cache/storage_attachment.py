@@ -149,8 +149,8 @@ class StorageAttachment:
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
                     swa_component=cache.components.get(ComponentType.SWA),
-                    auxiliary_swa_component=cache.components.get(
-                        ComponentType.AUXILIARY_SWA
+                    further_window_components=tuple(
+                        cache.components[ct] for ct in cache.window_slots()[1:]
                     ),
                     storage_prefetch_threshold=prefetch_threshold,
                 )
@@ -305,12 +305,11 @@ class StorageAttachment:
         """Use the same complete-window minimum for every buffer-mode anchor."""
         cache = self._cache
         if cache.host_memory_mode == "buffer_only":
-            for ct in (ComponentType.SWA, ComponentType.AUXILIARY_SWA):
-                component = cache.components.get(ct)
-                if component is not None:
-                    configured = max(
-                        configured, component.full_window_pages * cache.page_size
-                    )
+            for ct in cache.window_slots():
+                configured = max(
+                    configured,
+                    cache.components[ct].full_window_pages * cache.page_size,
+                )
         return configured
 
     def _resolve_metrics_collector(

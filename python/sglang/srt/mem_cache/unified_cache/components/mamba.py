@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    family = TREE_STATE
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -560,7 +562,7 @@ class MambaComponent(TreeComponent):
         """The storage whose state this component's values are, and the
         sub-pool they are slots of."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type.name)
+        return storage, storage.tree_sub_pool(self.component_type, family=self.family)
 
     @property
     def quantizes_checkpoints(self) -> bool:

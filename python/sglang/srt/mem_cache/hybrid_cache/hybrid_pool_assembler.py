@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv import HostPoolOptions
+from sglang.srt.mem_cache.kv.plan import tree_slot_ids
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1551,12 +1552,11 @@ def _evict_for_host_load(
         return
     if component == ComponentType.SWA:
         cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+    elif component == ComponentType.MAMBA:
+        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
     else:
-        if component == ComponentType.AUXILIARY_SWA:
-            cache.evict_for_alloc(EvictParams(auxiliary_swa_num_tokens=shortfall))
-        else:
-            assert component == ComponentType.MAMBA, component
-            cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        assert component in cache.window_slots(), component
+        cache.evict_for_alloc(EvictParams(window_num_tokens={component: shortfall}))
 
 
 def build_unified_host_stack(
@@ -1579,7 +1579,8 @@ def build_unified_host_stack(
     page_size = params.page_size
     owner = storage.owner
     sub_pools = storage.sub_pools()
-    owner_component = ComponentType[sub_pools[0].external.tree_component]
+    slot_ids = tree_slot_ids(storage.plan.tree_slots())
+    owner_component = slot_ids[sub_pools[0].external.tree_component]
     layer_maps = {
         s.name: {
             layer_id - storage.start_layer: index
@@ -1690,7 +1691,12 @@ def build_unified_host_stack(
         if s.name == owner:
             continue
         view = storage.view(s.name)
-        component = ComponentType[s.external.tree_component]
+        component = slot_ids[s.external.tree_component]
+        if s.external.host_pool not in PoolName._value2member_map_:
+            raise ValueError(
+                f"host pools keep at most two window sub-pools; sub-pool "
+                f"{s.name!r} has no host pool"
+            )
         drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
         if s.name not in host_pools:
             host_pools[s.name] = build_host(s.name, drafts)
@@ -2081,7 +2087,6 @@ def build_hicache_draft_sidecars(
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
     ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
     ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
-    ComponentType.AUXILIARY_SWA: ("auxiliary_swa_kv_pool_host", "_swa_kv_pool_host"),
     ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
     ComponentType.C128: ("c128_kv_pool_host", "_c128_kv_pool_host"),
 }
@@ -2718,8 +2723,13 @@ def _apply_stack_result(
     cache.cache_controller = result.cache_controller
 
     for ct, host_pool in result.component_host_pools.items():
-        cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
-        setattr(cache, cache_attr, host_pool)
+        if ct in _COMPONENT_HOST_ATTR:
+            cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
+            setattr(cache, cache_attr, host_pool)
+        else:
+            # A further window slot's host pool lives on its component only.
+            assert ct in cache.window_slots(), ct
+            component_attr = "_swa_kv_pool_host"
         setattr(cache.components[ct], component_attr, host_pool)
 
     for sidecar in result.sidecars:

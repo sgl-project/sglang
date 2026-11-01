@@ -124,7 +124,7 @@ def _empty_tree():
     return SimpleNamespace(
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
-        auxiliary_swa_evictable_size=lambda: 0,
+        window_evictable_size=lambda component: 0,
         mamba_evictable_size=lambda: 0,
         supports_mamba=lambda: True,
         window_retain_size=lambda component: 32,

@@ -29,7 +29,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
     UnifiedTreeCoreInspectionInterface,
 )
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
+from sglang.test.tree_slots import CUSTOM_WINDOW_COMPONENT, FAMILY_OF, tree_slots_of
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -94,7 +94,7 @@ class _StubMambaComponent(_StubFullComponent):
 
 
 class _StubAuxiliarySWAComponent(_StubFullComponent):
-    component_type = ComponentType.AUXILIARY_SWA
+    component_type = CUSTOM_WINDOW_COMPONENT
 
 
 class TreeCoreRegistryTest(CustomTestCase):
@@ -245,22 +245,22 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def test_auxiliary_component_uses_its_own_node_storage(self):
         cache = UnifiedRadixCache(
             self._cache_params(
-                tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
+                tree_components=(ComponentType.FULL, CUSTOM_WINDOW_COMPONENT),
                 component_registry_override={
                     FAMILY_OF[ComponentType.FULL]: _StubFullComponent,
-                    FAMILY_OF[ComponentType.AUXILIARY_SWA]: _StubAuxiliarySWAComponent,
+                    FAMILY_OF[CUSTOM_WINDOW_COMPONENT]: _StubAuxiliarySWAComponent,
                 },
                 tree_core_backend="python",
             )
         )
         node = cache.tree_core.root_node
-        auxiliary = node.component_data[ComponentType.AUXILIARY_SWA]
+        auxiliary = node.component_data[CUSTOM_WINDOW_COMPONENT]
         full = node.component_data[ComponentType.FULL]
         self.assertIsNot(auxiliary, full)
         auxiliary.metadata["boundary"] = 7
         self.assertNotIn("boundary", full.metadata)
         self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA].tree_core, cache.tree_core
+            cache.components[CUSTOM_WINDOW_COMPONENT].tree_core, cache.tree_core
         )
 
     def test_supported_default_routes_to_rust(self):

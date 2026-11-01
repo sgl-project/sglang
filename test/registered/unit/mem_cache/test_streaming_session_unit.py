@@ -18,6 +18,9 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
+# A further window slot, named by its sub-pool.
+SECOND_WINDOW = ComponentType.of("WINDOW_64")
+
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
@@ -246,7 +249,7 @@ def test_free_kv_aligned_skips_a_range_inside_the_partial_page(target, end, free
 
 
 @pytest.mark.parametrize("operation", ["trim", "match"])
-@pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.AUXILIARY_SWA])
+@pytest.mark.parametrize("component", [ComponentType.SWA, SECOND_WINDOW])
 def test_session_rewind_keeps_component_cursors_page_aligned(operation, component):
     """Rewinding below any component cursor must free whole pages."""
     page_size = 16

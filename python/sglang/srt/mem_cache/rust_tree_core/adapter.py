@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW, tree_slot_ids
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -49,7 +49,10 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    non_native_slots,
+    several_window_slots,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -389,8 +392,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # Each family's slot id: the adapter names a slot by its family, never
         # by a kind.
         self._family_slot_ids: dict[str, ComponentType] = {}
+        slot_ids = tree_slot_ids(params.tree_slots)
         for slot in params.tree_slots:
-            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
+            self._family_slot_ids.setdefault(slot.family, slot_ids[slot.component])
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -400,11 +404,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # TODO(Jialin): Port custom component registration from #25754 and
         # C128 support from #33676.
-        unsupported_components = [
-            slot
-            for slot in params.tree_slots
-            if NATIVE_SLOTS.get(slot.component) != slot.family
-        ]
+        if several_window_slots(params.tree_slots):
+            raise ValueError(
+                "Rust TreeCore keeps one window slot; this tree has "
+                f"{[s.component for s in params.tree_slots if s.family == TREE_WINDOW]}"
+            )
+        unsupported_components = non_native_slots(params.tree_slots)
         if unsupported_components:
             names = ", ".join(
                 sorted(
@@ -502,7 +507,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.
             [
-                (int(ComponentType[slot.component]), slot.family)
+                (int(slot_ids[slot.component]), slot.family)
                 for slot in params.tree_slots
             ],
         )

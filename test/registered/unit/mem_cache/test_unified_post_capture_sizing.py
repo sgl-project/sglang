@@ -681,11 +681,12 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 a.free(destination)
                 self.assertEqual(bundle.storage.accounting_violations(), [])
 
-    def test_auxiliary_host_pool_attaches_to_its_own_cache_component(self):
+    def test_second_window_host_pool_attaches_to_its_own_cache_component(self):
         """A separately retained draft window must survive final HiCache attachment."""
         from unittest.mock import patch
 
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as host
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -728,18 +729,18 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             host.attach_hybrid_pool_to_unified_cache(
                 cache, params, None, load_cache_event=None
             )
+        second = cache.window_slots()[1]
         pools = (
             cache.full_kv_pool_host,
             cache.swa_kv_pool_host,
-            cache.auxiliary_swa_kv_pool_host,
+            cache.components[second]._swa_kv_pool_host,
         )
         for pool in pools:
             self.addCleanup(pool.destroy)
         self.assertIsNot(pools[1], pools[2])
+        self.assertIsNotNone(pools[2])
         self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
-        self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA]._swa_kv_pool_host, pools[2]
-        )
+        self.assertEqual(cache.components[second].pool_name, PoolName.AUXILIARY_SWA)
         ids = pools[2].alloc(4)
         self.assertIsNotNone(ids)
         pools[2].free(ids)

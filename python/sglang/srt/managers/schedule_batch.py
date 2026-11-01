@@ -70,6 +70,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     Optional,
     Set,
@@ -1238,7 +1239,9 @@ class Req(ReqDllmMixin):
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
-        self.matched_auxiliary_swa_host_hit_length = 0
+        # Host hit tokens per further window slot (beyond the first, whose
+        # hit is swa_host_hit_length), by tree component.
+        self.matched_window_host_hit_lengths: Mapping[ComponentType, int] = {}
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -1527,13 +1530,14 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     @property
-    def auxiliary_swa_host_hit_length(self) -> int:
+    def window_host_hit_lengths(self) -> Mapping[ComponentType, int]:
+        """Host hit tokens per further window slot, by tree component."""
         plan = self.staged_prefetch_plan
-        return (
-            plan.window_tokens(ComponentType.AUXILIARY_SWA)
-            if plan is not None
-            else self.matched_auxiliary_swa_host_hit_length
-        )
+        if plan is None:
+            return self.matched_window_host_hit_lengths
+        return {
+            ct: plan.window_tokens(ct) for ct in plan.windows if ct != ComponentType.SWA
+        }
 
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
@@ -1541,7 +1545,7 @@ class Req(ReqDllmMixin):
             self.host_hit_length > 0
             or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
-            or self.auxiliary_swa_host_hit_length > 0
+            or any(self.window_host_hit_lengths.values())
         )
 
     def materialized_host_hit_len(self) -> int:
@@ -4087,8 +4091,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             retain_window = self.tree_cache.swa_retain_window
-            # Auxiliary windows check their own cursors and prefix locks.
-            has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
+            # With several windows each checks its own cursors and prefix locks.
+            several_windows = len(self.tree_cache.window_slots()) > 1
 
             release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
                 self.tree_cache, "release_swa_prefix_lock"
@@ -4105,7 +4109,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
-                        and (has_auxiliary_swa or swa_evict_due(req))
+                        and (several_windows or swa_evict_due(req))
                     ):
                         # The scheduler already gated the primary window,
                         # including backends that use a forward-based cadence.
@@ -4113,14 +4117,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             req,
                             req.seqlen - 1,
                             eviction_interval=(
-                                eviction_interval if has_auxiliary_swa else 1
+                                eviction_interval if several_windows else 1
                             ),
                         )
 
                     # Past the retain window the request no longer reads its prefill's
                     # SWA; release that part of the tree lock so SWA LRU can reclaim it.
                     if release_leaf_lock and (
-                        has_auxiliary_swa or req.decode_batch_idx >= retain_window
+                        several_windows or req.decode_batch_idx >= retain_window
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (

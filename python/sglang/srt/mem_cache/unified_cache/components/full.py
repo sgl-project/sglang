@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+    family = TREE_TOKEN
 
     def __init__(self, cache, params, slot):
         super().__init__(cache, params, slot)

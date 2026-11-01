@@ -796,7 +796,7 @@ class PrefillAdder:
             input_tokens=len(req.full_untruncated_fill_ids),
             swa_host_hit_length=swa_host_hit_length,
             chunk_limit=chunk_limit,
-            auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+            window_host_hit_lengths=req.window_host_hit_lengths,
         )
 
     def _state_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
@@ -1470,7 +1470,7 @@ class PrefillAdder:
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
                         swa_host_hit_length=req.swa_host_hit_length,
-                        auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                        window_host_hit_lengths=req.window_host_hit_lengths,
                         chunk_limit=self.rem_chunk_tokens,
                     )
                     if not self.memory_budget.prepare_load_back(**load_budget):
@@ -1661,7 +1661,7 @@ class PrefillAdder:
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
                 swa_host_hit_length=swa_host_hit_length,
-                auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                window_host_hit_lengths=req.window_host_hit_lengths,
             )
         ):
             return AddReqResult.NO_TOKEN

@@ -371,7 +371,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             component_type=ComponentType.SWA,
             full_window_pages=1,
         )
-        pipeline._auxiliary_swa_component = None
+        pipeline._further_window_components = ()
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)

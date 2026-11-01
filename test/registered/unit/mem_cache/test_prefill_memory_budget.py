@@ -68,10 +68,10 @@ def _cache():
     return SimpleNamespace(
         sliding_window_size=8,
         # The target's window slot retains its own window; a draft window more.
-        window_retain_size=lambda component: 8 if component == "SWA" else 32,
+        window_retain_size=lambda component: 8 if component.is_swa else 32,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
-        auxiliary_swa_evictable_size=lambda: 0,
+        window_evictable_size=lambda component: 0,
         supports_prefix_sharing=lambda: True,
     )
 
@@ -474,7 +474,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
-            auxiliary_swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda component: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )

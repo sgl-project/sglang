@@ -49,21 +49,28 @@ if TYPE_CHECKING:
     )
 
 
-_NUM_COMPONENT_TYPES = len(ComponentType)
-
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
+# Each component's lock uuids come from a range of their own; a further window
+# slot's range follows its id.
 _COMPONENT_UUID_RANGE_SIZE = 100_000_000_000_000
-_COMPONENT_UUID_RANGE_INDEX = {
+_FIXED_UUID_RANGE_INDEX = {
     ComponentType.SWA: 0,
     ComponentType.FULL: 1,
     ComponentType.MAMBA: 2,
     ComponentType.C128: 3,
-    ComponentType.AUXILIARY_SWA: 4,
 }
-_COMPONENT_UUID_COUNTERS = {
-    component_type: (range_index + 1) * _COMPONENT_UUID_RANGE_SIZE
-    for component_type, range_index in _COMPONENT_UUID_RANGE_INDEX.items()
-}
+_COMPONENT_UUID_COUNTERS: dict[ComponentType, int] = {}
+
+
+def slot_width(tree_components: tuple[ComponentType, ...]) -> int:
+    """The length of a node's per-component storage: an entry per fixed id,
+    and per further id up to the tree's largest."""
+    return max(ComponentType.C128, *tree_components) + 1
+
+
+def _uuid_range_start(component_type: ComponentType) -> int:
+    index = _FIXED_UUID_RANGE_INDEX.get(component_type, int(component_type))
+    return (index + 1) * _COMPONENT_UUID_RANGE_SIZE
 
 
 @dataclasses.dataclass
@@ -167,18 +174,28 @@ def get_and_increase_time_counter() -> float64:
 
 
 def next_component_uuid(component_type: ComponentType) -> int:
-    _COMPONENT_UUID_COUNTERS[component_type] += 1
-    return _COMPONENT_UUID_COUNTERS[component_type]
+    uuid = (
+        _COMPONENT_UUID_COUNTERS.get(component_type)
+        or _uuid_range_start(component_type)
+    ) + 1
+    _COMPONENT_UUID_COUNTERS[component_type] = uuid
+    return uuid
 
 
 class TreeComponent(ABC):
+    # The slot family this class keeps (`kv.plan` TREE_*): what its values are
+    # rows of. None when it keeps none of the storage families.
+    family: Optional[str] = None
+
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
     ):
         self.cache = cache
         # The tree slot this component keeps: its id, family and numbers.
         self.slot = slot
-        self.component_type = ComponentType[slot.component]
+        from sglang.srt.mem_cache.kv.plan import tree_slot_ids
+
+        self.component_type = tree_slot_ids(params.tree_slots)[slot.component]
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
@@ -796,7 +813,7 @@ class TreeComponent(ABC):
         swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
         max_context_len: int = 0,
-        auxiliary_swa_component: Optional[SWAComponent] = None,
+        further_window_components: Sequence[SWAComponent] = (),
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
         from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -804,7 +821,7 @@ class TreeComponent(ABC):
         return BufferModePipeline(
             cache=self.cache,
             swa_component=swa_component,
-            auxiliary_swa_component=auxiliary_swa_component,
+            further_window_components=further_window_components,
             write_backlog_cap=write_backlog_cap,
             max_context_len=max_context_len,
         )
@@ -866,7 +883,7 @@ class TreeComponent(ABC):
         """The storage this component's values are rows of, and the sub-pool
         among them it holds."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type.name)
+        return storage, storage.tree_sub_pool(self.component_type, family=self.family)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""

@@ -412,7 +412,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                     storage.requests.req_to_token[0, :32] = ids
                     for name, ct, end in zip(
                         ("window_16", "draft_swa"),
-                        (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
+                        (ComponentType.SWA, ComponentType.of("DRAFT_SWA")),
                         cursors,
                     ):
                         start = 8 if ct == ComponentType.SWA and end else 0
@@ -508,7 +508,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                         value=ids,
                         component_evicted_seqlens={
                             ComponentType.SWA: primary,
-                            ComponentType.AUXILIARY_SWA: auxiliary,
+                            ComponentType.of("DRAFT_SWA"): auxiliary,
                         },
                     )
                 )
@@ -519,7 +519,9 @@ class TestIndependentWindowFree(unittest.TestCase):
             )
             cache.evict(
                 EvictParams(
-                    num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64
+                    num_tokens=64,
+                    swa_num_tokens=64,
+                    window_num_tokens={ComponentType.of("DRAFT_SWA"): 64},
                 )
             )
         self.assertEqual(recorder.hits, [])

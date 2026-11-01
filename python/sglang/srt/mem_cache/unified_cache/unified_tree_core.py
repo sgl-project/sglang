@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW, tree_slot_ids
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
-    _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentData,
@@ -67,6 +66,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache.components import slot_width as _slot_width
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -120,9 +120,11 @@ class UnifiedTreeNode:
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
         self.component_types = tree_components
-        # list indexed by ComponentType (int enum 0..N-1)
+        # list indexed by ComponentType (an int id); ids the tree lacks stay
+        # empty entries.
+        width = _slot_width(tree_components)
         self.component_data: list[ComponentData] = [
-            ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
+            ComponentData() for _ in range(width)
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
@@ -136,12 +138,8 @@ class UnifiedTreeNode:
         self._tlru_history_len = 0
         self.external_cache_stored = False
         self.priority = priority
-        self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
-            _NUM_COMPONENT_TYPES * 2
-        )
-        self.lru_next: list[UnifiedTreeNode | None] = [None] * (
-            _NUM_COMPONENT_TYPES * 2
-        )
+        self.lru_prev: list[UnifiedTreeNode | None] = [None] * (width * 2)
+        self.lru_next: list[UnifiedTreeNode | None] = [None] * (width * 2)
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
@@ -222,7 +220,9 @@ class UnifiedLRUList:
         self.component_type = component_type
         # Pointer slot: host LRU uses offset slots so device/host pointers
         # never collide on the same node.
-        self._pt: int = component_type + (_NUM_COMPONENT_TYPES if use_host_ptr else 0)
+        self._pt: int = component_type + (
+            _slot_width(tree_components) if use_host_ptr else 0
+        )
         self.head = UnifiedTreeNode(tree_components)
         self.tail = UnifiedTreeNode(tree_components)
         self.head.lru_next[self._pt] = self.tail
@@ -433,10 +433,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Each family's slot id: the tree names a slot by its family, never by
         # a kind (one slot per family; several windows would list more).
         self._family_slot_ids: dict[str, ComponentType] = {}
+        slot_ids = tree_slot_ids(params.tree_slots)
         for slot in params.tree_slots:
-            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
-            if slot.component == "SWA":
-                self._family_slot_ids[slot.family] = ComponentType.SWA
+            self._family_slot_ids.setdefault(slot.family, slot_ids[slot.component])
         self._independent_windows = (
             sum(slot.family == TREE_WINDOW for slot in params.tree_slots) > 1
         )

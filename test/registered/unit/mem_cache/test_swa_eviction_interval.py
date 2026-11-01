@@ -40,8 +40,10 @@ class _SwaCache(RadixCache):
     def supports_swa(self):
         return True
 
-    def supports_auxiliary_swa(self):
-        return self.auxiliary
+    def window_slots(self):
+        if not self.auxiliary:
+            return (ComponentType.SWA,)
+        return (ComponentType.SWA, ComponentType.of("WINDOW_64"))
 
     def swa_retain_floor(self, req):
         # Read once per window retirement the scheduler runs.
