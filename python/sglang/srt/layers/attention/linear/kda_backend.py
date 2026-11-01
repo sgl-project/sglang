@@ -1881,12 +1881,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The kernel owns all 128 output channels and can fold gated RMSNorm
         # into the recurrence.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        onorm_args = getattr(layer, "_k3_onorm_args", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
-        apply_onorm = onorm_gate is not None and fused_static is not None
+        if onorm_args is None and fused_static is not None:
+            onorm_args = fused_static[5:]
+        apply_onorm = onorm_gate is not None and onorm_args is not None
         if apply_onorm:
-            onorm_weight = fused_static[5]
-            onorm_eps = fused_static[6]
-            onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
+            onorm_weight, onorm_eps = onorm_args
+            onorm_gate = onorm_gate[:seq_len].reshape(1, seq_len, h, layer.head_v_dim)
         else:
             onorm_weight = None
             onorm_eps = None
