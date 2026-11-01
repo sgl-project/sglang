@@ -679,7 +679,13 @@ mod tests {
                 rmpv::Value::Map(vec![
                     (rmpv::Value::from("kvcache"), kvcache),
                     (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
-                    (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+                    (
+                        rmpv::Value::from("token_capacity_window"),
+                        rmpv::Value::Map(vec![(
+                            rmpv::Value::from("window_4096"),
+                            rmpv::Value::from(2048),
+                        )]),
+                    ),
                     (
                         rmpv::Value::from("future_uncontracted_metric"),
                         rmpv::Value::from(99),
@@ -756,8 +762,8 @@ mod tests {
             8192
         );
         assert_eq!(
-            body["internal_states"][0]["memory_usage"]["token_capacity_swa"],
-            serde_json::Value::Null
+            body["internal_states"][0]["memory_usage"]["token_capacity_window"],
+            serde_json::json!({"window_4096": 2048})
         );
         assert_eq!(
             body["internal_states"][0]["step_time_dict"]["4"],

@@ -1028,7 +1028,7 @@ class TestIdleMetrics(CustomTestCase):
                 get_pool_stats=lambda: types.SimpleNamespace(
                     update_scheduler_stats=lambda _: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -1074,7 +1074,7 @@ class TestIdleMetrics(CustomTestCase):
                                 stats, "token_usage", token_usage
                             ),
                             full_capacity=1,
-                            is_hybrid_swa=False,
+                            windows=(),
                         )
                     )
                     with patch(
