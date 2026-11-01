@@ -4793,11 +4793,20 @@ class Scheduler(
 
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
+        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_run_batch(batch)
+
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
@@ -4992,15 +5001,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self._on_step_launch(batch)
-
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
-            self.processed_tokens_counter += batch.extend_num_tokens
-
-        if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.on_run_batch(batch)
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
