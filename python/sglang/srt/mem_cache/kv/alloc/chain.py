@@ -766,12 +766,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         *,
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
+        state_slots: int = 0,
     ) -> bool:
-        """A decode-node preallocation on the admission rule. The budgets are
-        the scheduler's per-side token views after decode headroom and
-        retraction: the request stays within them, and what they hold back
-        from this side's reachable tokens is pending demand, charged alongside
-        the request."""
+        """A decode-node preallocation on the admission rule: its tokens and
+        the ``state_slots`` it takes with them, priced together since they
+        share bytes. The budgets are the scheduler's per-side token views
+        after decode headroom and retraction: the request stays within them,
+        and what they hold back from this side's reachable tokens is pending
+        demand, charged alongside the request."""
         if full_tokens > full_budget_tokens or (
             swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
         ):
@@ -790,7 +792,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             windows[name] += max(
                 0, self.swa_available_size() + evictable[name] - swa_budget_tokens
             )
-        return self.admits(full_tokens, windows, evictable=evictable)
+        return self.admits(full_tokens, windows, state_slots, evictable=evictable)
 
     def reclaim_for_load_back(
         self, tree_cache, full_tokens: int, swa_tokens: int, **demand

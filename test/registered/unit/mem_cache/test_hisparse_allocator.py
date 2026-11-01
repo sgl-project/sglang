@@ -198,7 +198,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         tree_cache = object()
         self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, 512, 256))
         logical_allocator.reclaim_for_prealloc.assert_called_once_with(
-            tree_cache, 512, 256
+            tree_cache, 512, 256, state_slots=0
         )
 
         logical_allocator.reclaim_for_prealloc.return_value = "SWA eviction short"
