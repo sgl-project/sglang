@@ -167,7 +167,10 @@ than the context; a warning says so.
 On hybrid models with Mamba layers and no `--max-mamba-cache-size`, the Mamba state pool holds
 the requests the KV cache aims for: the `--max-running-requests` you set, or one; never more
 than SGLang's own share of the budget (`--mamba-full-memory-ratio`), and never so many that one
-full-length request no longer fits in the KV cache next to it: the rest queue.
+full-length request no longer fits in the KV cache next to it: the rest queue. Each running
+request needs its own Mamba state however short it is, so these are the requests that run at a
+time: without `--max-running-requests`, one. SGLang's startup warning that requests are capped
+by the Mamba state refers to this; set `--max-running-requests` to run more.
 
 Ways to give the experts more memory:
 

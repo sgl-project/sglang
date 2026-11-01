@@ -1069,6 +1069,25 @@ class TestSizing(CustomTestCase):
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [14])
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [8])
 
+    def test_the_log_says_how_many_requests_run_and_how_to_run_more(self):
+        """Each running request needs its own Mamba state, so the log says how many run at a
+        time; without --max-running-requests it names that flag, with it it says how many of
+        them queue. Control: all requests set fit, no hint."""
+        self.assertEqual(
+            sizing._mamba_text(3, 3, None),
+            "Mamba state for 1 request(s) at a time (3 slot(s)); "
+            "set --max-running-requests to run more",
+        )
+        self.assertEqual(
+            sizing._mamba_text(9, 2, 8),
+            "Mamba state for 4 request(s) at a time (9 slot(s)) "
+            "of --max-running-requests 8; the rest queue",
+        )
+        self.assertEqual(
+            sizing._mamba_text(16, 2, 8),
+            "Mamba state for 8 request(s) at a time (16 slot(s))",
+        )
+
     def test_kv_minimum_by_size_rule_in_whole_pages(self):
         """A --max-total-tokens that is no page multiple: the KV cache can hold at most
         9,984 of 10,000 tokens at page size 64, which size() accepts, so the Mamba state

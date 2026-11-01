@@ -92,6 +92,18 @@ def _mamba_share(budget_bytes: int, ratio: float, per_slot: int) -> int:
     return int((budget_bytes * ratio / (1 + ratio) - per_slot) // per_slot)
 
 
+def _mamba_text(slots: int, per_request: int, requests: Optional[int]) -> str:
+    """The log's Mamba part: how many requests run at a time (each needs its own state,
+    whatever its length) and the flag that raises it."""
+    at_once = slots // per_request
+    text = f"Mamba state for {at_once} request(s) at a time ({slots} slot(s))"
+    if requests is None:
+        return text + "; set --max-running-requests to run more"
+    if at_once < requests:
+        return text + f" of --max-running-requests {requests}; the rest queue"
+    return text
+
+
 def _kv_tokens(kv_configurator, budget_bytes: int) -> int:
     """The tokens the KV cache holds in ``budget_bytes``, as SGLang's pool configurator sizes
     it."""
@@ -179,9 +191,6 @@ class ExpertSlotSizing:
         share = _mamba_share(self.budget_before_kv, ratio, per_slot)
         per_request = kvc._calculate_mamba_ratio()  # state slots one request needs
         requests = _requests_set()
-        self.mamba_source = (
-            f"--max-running-requests {requests}" if requests else "one request"
-        )
         slots = max(per_request, min((requests or 1) * per_request, share))
         # One request fewer at a time until the KV cache's minimum fits next to them, by
         # size()'s rule (the KV cache rounds down to whole pages).
@@ -193,6 +202,7 @@ class ExpertSlotSizing:
         ):
             slots = max(per_request, slots - per_request)
         get_context().override("paged_experts.sizing", max_mamba_cache_size=slots)
+        self.mamba_text = _mamba_text(slots, per_request, requests)
         return slots
 
     def size(self, kv_tokens: int) -> List[int]:
@@ -273,11 +283,7 @@ class ExpertSlotSizing:
             if floor.requests is None
             else f", {kv_tokens // floor.minimum} request(s) of {floor.minimum} at once"
         )
-        mamba = (
-            f"; Mamba state for {self.mamba_slots} slot(s) ({self.mamba_source})"
-            if self.mamba_slots
-            else ""
-        )
+        mamba = f"; {self.mamba_text}" if self.mamba_slots else ""
         logger.info(
             "Paged experts: K=%s of %d experts per MoE layer resident (%.2f GiB); KV cache "
             "%d tokens%s (aim %d: %s)%s. To pin: --paged-experts-num-resident %d",
