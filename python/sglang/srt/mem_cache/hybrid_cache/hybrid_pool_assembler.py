@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
     HostPoolConfig,
     HostPoolGroupConfig,
     check_packed_kv_rows,
-    collect_host_pool_infos,
     is_mla_pool,
     prepare_host_pool_config,
     with_packed_draft_layer_mapping,
@@ -306,49 +305,6 @@ def _build_cache_controller(
     )
 
 
-def build_kv_only_group(
-    *,
-    page_size: int,
-    kv_pool: Any,
-    full_layer_mapping: dict[int, int],
-    use_mla: bool,
-    override_kv_cache_dim: Optional[int] = None,
-    host_size: Optional[float] = None,
-    mtp_draft_device_pools: tuple[Any, ...] = (),
-) -> HostPoolGroup:
-    """Anchor-only host pool group for a flat MHA/MLA device pool."""
-    transfer_layer_id_max = len(full_layer_mapping)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=page_size,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        host_size=host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
-    )
-    if mtp_draft_device_pools:
-        full_layer_mapping = with_packed_draft_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
-    return HostPoolGroup(
-        [
-            build_pool_entry(
-                name=PoolName.KV,
-                host_pool=kv_host_pool,
-                device_pool=kv_pool,
-                layer_mapping=full_layer_mapping,
-                transfer_layer_id_max=transfer_layer_id_max
-                + len(mtp_draft_device_pools),
-                is_anchor=True,
-                packed_draft_device_pools=mtp_draft_device_pools,
-            )
-        ]
-    )
-
-
 def _swa_allocation_callbacks(allocator) -> dict:
     """Keep allocation and rollback in the same ID space for every SWA stack."""
     from sglang.srt.mem_cache.kv.alloc.band import Band
@@ -523,43 +479,6 @@ def _mtp_swa_sidecar_specs(group: HostPoolGroup) -> list[SidecarPoolSpec]:
     if PoolName.DRAFT_SWA not in group.entry_map:
         return []
     return [SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
-
-
-def build_kv_only_stack(
-    *,
-    params: CacheInitParams,
-    kv_pool: Any,
-    full_layer_mapping: dict[int, int],
-    load_cache_event,
-    storage_backend: Optional[str],
-    use_mla: bool,
-    override_kv_cache_dim: Optional[int] = None,
-    prefetch_threshold: int = 256,
-    model_name: Optional[str] = None,
-    storage_backend_extra_config: Optional[dict] = None,
-    enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_id_max = len(full_layer_mapping)
-    host_pool_group = build_kv_only_group(
-        page_size=params.page_size,
-        kv_pool=kv_pool,
-        full_layer_mapping=full_layer_mapping,
-        use_mla=use_mla,
-        override_kv_cache_dim=override_kv_cache_dim,
-        mtp_draft_device_pools=params.mtp_draft_device_pools,
-    )
-    cache_controller = _build_cache_controller(
-        params=params,
-        host_pool_group=host_pool_group,
-        transfer_layer_id_max=transfer_layer_id_max,
-        load_cache_event=load_cache_event,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        enable_storage_metrics=enable_storage_metrics,
-    )
-    return host_pool_group, cache_controller
 
 
 def build_hybrid_swa_stack(
@@ -1759,11 +1678,7 @@ def build_full_draft_pools(
         raise ValueError(
             f"{type(draft_kv_pool).__name__} draft does not describe its KV sub-pool"
         )
-    kv_info = config.pool_infos.get(PoolName.KV)
-    if kv_info is None:
-        # Only DSA KV is collected into the config; other KV keeps its own info.
-        kv_info = pool.get_device_pool_infos()[0]
-    buffer_info = kv_info.buffer_info
+    buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
@@ -2378,80 +2293,22 @@ class _MiniMaxSparseStrategy(StackStrategy):
         )
 
 
-class _PlainKvStrategy(StackStrategy):
-    def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.memory_pool import (
-            DSATokenToKVPool,
-            MiniMaxSparseKVPool,
-        )
+class _KvStrategy(StackStrategy):
+    """One KV pool plus the index sidecars its infos declare."""
 
+    def matches(self, kvcache, components):
         # A pool wrapping sub-pool views has a strategy of its own.
         router = kvcache.layer_router
         if len(router.sub_pools()) > 1 or router.wrapped_view() is not None:
             return False
-        if isinstance(
-            kvcache,
-            (DSATokenToKVPool, MiniMaxSparseKVPool, DeepSeekV4TokenToKVPool),
-        ):
-            return False
         return components == {ComponentType.FULL}
-
-    def build(
-        self,
-        *,
-        cache,
-        kvcache,
-        params,
-        server_args,
-        load_cache_event,
-        storage_backend=None,
-        storage_backend_extra_config=None,
-        prefetch_threshold=256,
-        model_name=None,
-        enable_storage_metrics=False,
-    ):
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-
-        full_kv_pool = kvcache
-        use_mla = isinstance(kvcache, MLATokenToKVPool)
-        full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
-        host_pool_group, cache_controller = build_kv_only_stack(
-            params=params,
-            kv_pool=full_kv_pool,
-            full_layer_mapping=full_layer_mapping,
-            load_cache_event=load_cache_event,
-            storage_backend=storage_backend,
-            use_mla=use_mla,
-            prefetch_threshold=prefetch_threshold,
-            model_name=model_name,
-            storage_backend_extra_config=storage_backend_extra_config,
-            enable_storage_metrics=enable_storage_metrics,
-        )
-        return StackBuildResult(
-            host_pool_group=host_pool_group,
-            cache_controller=cache_controller,
-            component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-            },
-            pools_desc="KV",
-        )
-
-
-class _DsaStrategy(StackStrategy):
-    def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-
-        return isinstance(kvcache, DSATokenToKVPool) and components == {
-            ComponentType.FULL
-        }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            _build_dsa_device_pool_group,
+            _build_kv_device_pool_group,
         )
 
-        return _build_dsa_device_pool_group(
+        return _build_kv_device_pool_group(
             kvcache, page_size, params.mtp_draft_device_pools
         )
 
@@ -2480,6 +2337,7 @@ class _DsaStrategy(StackStrategy):
         cache_controller = _build_cache_controller(
             params=params,
             host_pool_group=host_pool_group,
+            # The controller adds packed draft transfers after target layers.
             transfer_layer_id_max=kvcache.layer_num,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -2500,15 +2358,14 @@ class _DsaStrategy(StackStrategy):
         )
 
 
-# Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
+# Resolved first-to-last; _KvStrategy is the catch-all for single KV pools.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     _MambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
-    _DsaStrategy(),
     _MiniMaxSparseStrategy(),
-    _PlainKvStrategy(),
+    _KvStrategy(),
 ]
 
 
@@ -2528,30 +2385,21 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
     )
 
 
-_INFO_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
-
-
 def _check_device_pools_present(
     *, kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    names = result.device_pool_names
-    if names is None:
-        root = (
-            kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
-        )
-        infos = collect_host_pool_infos(root)
-        names = tuple(info.pool_name for info in infos) or (PoolName.KV,)
-    missing = [
-        name.value for name in names if name not in result.host_pool_group.entry_map
-    ]
-    if not missing:
+    if result.device_pool_names is None:
         return
-    msg = f"{type(kvcache).__name__} exposes device pools {missing} that {type(strategy).__name__} did not assemble"
-    if isinstance(strategy, _INFO_VERIFIED_STRATEGIES):
-        raise ValueError(msg)
-    logger.error("%s. Host restore of these pools is unsupported on this path", msg)
+    missing = [
+        name.value
+        for name in result.device_pool_names
+        if name not in result.host_pool_group.entry_map
+    ]
+    if missing:
+        raise ValueError(
+            f"{type(kvcache).__name__} exposes device pools {missing} that "
+            f"{type(strategy).__name__} did not assemble"
+        )
 
 
 def _apply_stack_result(

@@ -57,36 +57,26 @@ def with_packed_draft_layer_mapping(
     }
 
 
-def collect_host_pool_infos(root: Any) -> tuple[DevicePoolInfo, ...]:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-
-    # Other KV formats still use their existing host constructor.
-    return root.get_device_pool_infos() if isinstance(root, DSATokenToKVPool) else ()
-
-
 def _host_pool_infos(pool: Any) -> tuple[Any, dict[PoolName, DevicePoolInfo]]:
     """The KV device pool and the infos of every pool its host group carries."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if not isinstance(pool, HybridLinearKVPool):
-        return pool, _pool_infos_by_name(collect_host_pool_infos(pool))
-    kv_infos = collect_host_pool_infos(pool.full_kv_pool)
+        return pool, _pool_infos_by_name(pool.get_device_pool_infos())
     # A hybrid pool describes the sidecars it owns beside its full KV child.
-    infos = kv_infos + pool.get_device_pool_infos()
-    return pool.full_kv_pool, _pool_infos_by_name(infos, requires_kv=bool(kv_infos))
+    infos = pool.full_kv_pool.get_device_pool_infos() + pool.get_device_pool_infos()
+    return pool.full_kv_pool, _pool_infos_by_name(infos)
 
 
 def _pool_infos_by_name(
-    infos: tuple[DevicePoolInfo, ...], *, requires_kv: bool = True
+    infos: tuple[DevicePoolInfo, ...],
 ) -> dict[PoolName, DevicePoolInfo]:
     pools = {info.pool_name: info for info in infos}
     if len(pools) != len(infos):
         raise ValueError(
             f"duplicate device pool names: {[info.pool_name for info in infos]}"
         )
-    if not pools:
-        return pools
-    if requires_kv and PoolName.KV not in pools:
+    if PoolName.KV not in pools:
         raise ValueError(f"expected primary KV pool, got {tuple(pools)}")
     for info in infos:
         if info.indices_from_pool != PoolName.KV:

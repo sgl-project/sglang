@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     StackBuildResult,
     _check_device_pools_present,
-    _DsaStrategy,
+    _KvStrategy,
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
@@ -414,8 +414,6 @@ class TestMambaInfoRouting(CustomTestCase):
                                         full_kv_pool=kv,
                                         swa_kv_pool=kv,
                                         swa_layer_mapping={1: 0},
-                                        page_size=1,
-                                        tp_group=None,
                                     )
                                 )
                             else:
@@ -962,7 +960,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 ),
             ),
         ):
-            result = _DsaStrategy().build(
+            result = _KvStrategy().build(
                 cache=None,
                 kvcache=pool,
                 params=_target_params((draft,)),
@@ -1361,7 +1359,7 @@ class TestHostPoolPreflight(CustomTestCase):
                 patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
             ):
                 with self.assertRaisesRegex(ValueError, error):
-                    _DsaStrategy().build(
+                    _KvStrategy().build(
                         cache=None,
                         kvcache=target,
                         params=_target_params((draft,)),
@@ -1416,26 +1414,19 @@ class TestDeclaredPoolVerification(CustomTestCase):
     def _result_with(self, *names):
         group = SimpleNamespace(entry_map={n: object() for n in names})
         return StackBuildResult(
-            host_pool_group=group, cache_controller=None, component_host_pools={}
+            host_pool_group=group,
+            cache_controller=None,
+            component_host_pools={},
+            device_pool_names=(PoolName.KV, PoolName.INDEXER),
         )
 
-    def test_unmigrated_strategy_logs_missing_indexer(self):
-        pool = _dsa_pool_stub(layer_num=2)
-        with self.assertLogs(hybrid_pool_assembler.logger, level="ERROR") as logs:
-            _check_device_pools_present(
-                kvcache=pool,
-                result=self._result_with(PoolName.KV),
-                strategy=_SwaStrategy(),
-            )
-        self.assertIn("indexer", logs.output[0])
-
-    def test_migrated_strategy_raises_on_missing_indexer(self):
+    def test_missing_declared_indexer_raises(self):
         pool = _dsa_pool_stub(layer_num=2)
         with self.assertRaisesRegex(ValueError, "indexer"):
             _check_device_pools_present(
                 kvcache=pool,
                 result=self._result_with(PoolName.KV),
-                strategy=_DsaStrategy(),
+                strategy=_KvStrategy(),
             )
 
     def test_complete_stack_passes_silently(self):
@@ -1443,7 +1434,7 @@ class TestDeclaredPoolVerification(CustomTestCase):
         _check_device_pools_present(
             kvcache=pool,
             result=self._result_with(PoolName.KV, PoolName.INDEXER),
-            strategy=_DsaStrategy(),
+            strategy=_KvStrategy(),
         )
 
 
@@ -1936,40 +1927,44 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
 
 
 class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
-    """The full + window + state stack builds its controller and state host the
-    way the full + window and full + state stacks do."""
+    """Every stack builds its controller and state host the same way."""
 
-    def test_passes_the_attention_groups(self):
+    def test_controller_takes_groups_and_host_memory_mode(self):
+        """Stacks once dropped the attention groups or the host memory mode."""
         params = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(
-                state=SimpleNamespace(pool=object())
-            ),
+            token_to_kv_pool_allocator=object(),
+            page_size=1,
             tp_cache_group=object(),
             pp_cache_group=object(),
             attn_cp_cache_group=object(),
             attn_tp_cache_group=object(),
         )
-        kvcache = SimpleNamespace(
-            layers_mapping={0: (0, False), 1: (0, True)},
-            start_layer=0,
-            full_kv_pool=object(),
-            swa_kv_pool=object(),
+        memory = SimpleNamespace(
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="buffer_only",
         )
-        with patch.object(
-            hybrid_pool_assembler,
-            "build_hybrid_mamba_swa_stack",
-            return_value=(MagicMock(), MagicMock()),
-        ) as build:
-            _MambaSwaStrategy().build(
-                cache=SimpleNamespace(page_size=1),
-                kvcache=kvcache,
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(hybrid_pool_assembler, "HybridCacheController") as ctor,
+        ):
+            hybrid_pool_assembler._build_cache_controller(
                 params=params,
-                server_args=None,
+                host_pool_group=object(),
+                transfer_layer_id_max=2,
                 load_cache_event=None,
+                storage_backend=None,
+                prefetch_threshold=256,
+                model_name=None,
+                storage_backend_extra_config=None,
+                enable_storage_metrics=False,
             )
-        kwargs = build.call_args.kwargs
+        kwargs = ctor.call_args.kwargs
+        self.assertIs(ctor.call_args.args[3], params.tp_cache_group)
         self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
         self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
+        self.assertIs(kwargs["pp_group"], params.pp_cache_group)
+        self.assertEqual(kwargs["host_memory_mode"], "buffer_only")
 
     def test_state_host_has_no_kv_split(self):
         for layout, expected in (
