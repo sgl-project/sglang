@@ -24,6 +24,9 @@ def state():
     )
     context = Mock()
     args = SimpleNamespace(
+        disable_cuda_graph=False,
+        disable_prefill_cuda_graph=False,
+        disaggregation_mode="null",
         cuda_graph_backend_prefill=None,
         cuda_graph_bs_prefill=None,
         cuda_graph_config=None,
@@ -158,3 +161,16 @@ def test_non_cuda_stays_eager(state):
 def test_other_models_are_unchanged(state):
     with patch.object(policy, "is_deepseek_v4", return_value=False):
         assert not enable(state)
+
+
+@pytest.mark.parametrize("field", ["disable_cuda_graph", "disable_prefill_cuda_graph"])
+def test_legacy_disable_switches_are_preserved(state, field):
+    setattr(state.args, field, True)
+    assert not enable(state)
+    state.context.override.assert_not_called()
+
+
+def test_pd_decode_role_stays_eager(state):
+    state.args.disaggregation_mode = "decode"
+    assert not enable(state)
+    state.context.override.assert_not_called()

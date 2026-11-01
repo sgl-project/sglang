@@ -57,13 +57,17 @@ def maybe_enable_dsv4_prefill_cuda_graph(*, server_args: Any, hf_config: Any) ->
     """Re-enable breakable prefill capture for DeepSeek-V4 when only the auto rule disabled it.
 
     An explicit --cuda-graph-backend-prefill / --cuda-graph-bs-prefill /
-    --cuda-graph-config choice is left untouched.
+    --cuda-graph-config choice is left untouched. Legacy disable switches and
+    the PD decode role also retain their eager-prefill policy.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
     from sglang.srt.utils import is_cuda
 
     if (
-        server_args.cuda_graph_backend_prefill is not None
+        server_args.disable_cuda_graph
+        or server_args.disable_prefill_cuda_graph
+        or server_args.disaggregation_mode == "decode"
+        or server_args.cuda_graph_backend_prefill is not None
         or server_args.cuda_graph_bs_prefill is not None
         or server_args.cuda_graph_config is not None
     ):
