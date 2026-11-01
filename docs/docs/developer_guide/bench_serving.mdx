@@ -446,10 +446,12 @@ python3 -m sglang.bench_serving \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \
-  --mooncake-workload conversation|mooncake|agent|synthetic
-  --use-trace-timestamps true \
+  --mooncake-workload conversation \
+  --use-trace-timestamps \
   --random-output-len 256
 ```
+
+`--mooncake-workload` accepts `conversation`, `mooncake`, `synthetic`, or `toolagent`.
 
 10) Fake decode stress testing (PD disaggregation, decode-only):
 
