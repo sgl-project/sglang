@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -560,9 +561,14 @@ class HiCacheController:
                 "The page_unified host layout requires unified storage keys "
                 "to distinguish its byte order."
             )
-        if key_scheme == "unified" and storage_backend != "file":
+        if (
+            key_scheme == "unified"
+            and storage_backend not in UNIFIED_KEY_SCHEME_STORAGE_BACKENDS
+        ):
             raise NotImplementedError(
-                "The unified key scheme supports only the file storage backend."
+                f"The unified key scheme supports the "
+                f"{', '.join(UNIFIED_KEY_SCHEME_STORAGE_BACKENDS)} storage "
+                f"backends; got {storage_backend!r}."
             )
         if get_parallel().attn_dcp_size > 1:
             if self.host_memory_mode == "buffer_only":
@@ -813,11 +819,7 @@ class HiCacheController:
             # Keep each key paired with its byte span instead of slicing pages
             # consecutively in key order.
             layout = self.storage_host_pool.page_unified_layout
-            unified_chunk_spans = [
-                layout.chunk_span(layer_range, head_group)
-                for layer_range in unified_plan.layer_ranges
-                for head_group in range(unified_plan.head_group_num)
-            ]
+            unified_chunk_spans = unified_plan.chunk_spans(layout)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -894,14 +896,6 @@ class HiCacheController:
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
-        # The pool was sized from the same server arg before any backend
-        # attached; if the two disagree the objects would not match their keys.
-        pool_groups = getattr(host_pool, "head_group_num", 1)
-        if plan.head_group_num != pool_groups:
-            raise ValueError(
-                f"the unified plan cuts {plan.head_group_num} head groups but "
-                f"the host pool was allocated with {pool_groups}."
-            )
         logger.info(
             "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
