@@ -1093,7 +1093,7 @@ class TestKvHostPoolRow(CustomTestCase):
     store is wider than kv_lora_rank + qk_rope_head_dim) and refuses packed
     drafts whose KV rows differ from the target's."""
 
-    def _build(self, pool, drafts=()):
+    def _build(self, pool, drafts=(), host_cls=None):
         seen = {}
         for device_pool in (pool, *drafts):
             device_pool.model_layer_ids = tuple(range(device_pool.layer_num))
@@ -1121,7 +1121,9 @@ class TestKvHostPoolRow(CustomTestCase):
             return SimpleNamespace(layer_num=kwargs["target_layer_num"])
 
         with (
-            patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
+            patch.object(
+                hybrid_pool_assembler, "MLATokenToKVPoolHost", host_cls or fake_host
+            ),
             patch.object(
                 hybrid_pool_assembler,
                 "get_parallel",
@@ -1154,8 +1156,11 @@ class TestKvHostPoolRow(CustomTestCase):
         pool = _dsa_pool_stub(layer_num=2)
         draft = _dsa_pool_stub(layer_num=1)
         draft.store_dtype = torch.float8_e4m3fn
+        # The host rejects the draft before it allocates anything.
         with self.assertRaisesRegex(ValueError, "KV row"):
-            self._build(pool, (draft,))
+            self._build(
+                pool, (draft,), host_cls=hybrid_pool_assembler.MLATokenToKVPoolHost
+            )
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
 
 
@@ -1326,6 +1331,14 @@ class TestHostPoolPreflight(CustomTestCase):
                     for layers in (2, 1):
                         pool = object.__new__(MHATokenToKVPool)
                         pool.layer_num = layers
+                        pool.model_layer_ids = tuple(range(layers))
+                        pool.get_device_pool_infos = lambda: (
+                            SimpleNamespace(
+                                pool_name=PoolName.KV,
+                                indices_from_pool=PoolName.KV,
+                                buffer_info=object(),
+                            ),
+                        )
                         pool.layer_shard_enabled = False
                         pool.head_num = 1
                         pool.head_dim = pool.v_head_dim = 128
@@ -1349,15 +1362,13 @@ class TestHostPoolPreflight(CustomTestCase):
                 else:
                     self.assertEqual(config.sidecars, ())
 
-    def test_incompatible_packed_buffers_fail_before_allocation(self):
+    def test_incompatible_packed_index_fails_before_allocation(self):
         target = _dsa_pool_stub(layer_num=2)
-        bad_kv = _dsa_pool_stub(layer_num=1)
-        bad_kv.store_dtype = torch.float8_e4m3fn
         bad_index = _dsa_pool_stub(layer_num=1)
         # Same 132 bytes per row, different key/scale format.
         bad_index.index_head_dim = 132
         bad_index.quant_block_size = 256
-        for draft, error in ((bad_kv, "KV row"), (bad_index, "index key layout")):
+        for draft, error in ((bad_index, "index key layout"),):
             with (
                 self.subTest(error=error),
                 patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
