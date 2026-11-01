@@ -1578,29 +1578,9 @@ class KimiK3DeltaAttention(nn.Module):
         self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
-            # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
-            # and f_a (128, replicated) in skews the output dim and degrades
-            # GEMM kernel selection; they stay as separate tiny GEMVs. ROCm
-            # reverses this below the token threshold
-            # (_merge_kda_inproj_weights_hip).
-            self.fused_qkvg_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [
-                    projection_size,
-                    projection_size,
-                    projection_size,
-                    projection_size,
-                ],
-                bias=False,
-                quant_config=quant_config,
-                parallel_group="attn_tp",
-                prefix=f"{prefix}.fused_qkvg_proj",
-            )
-            self.split_sizes = [
-                3 * projection_size // self.attn_tp_size,
-                projection_size // self.attn_tp_size,
-            ]
-            self.b_proj = ColumnParallelLinear(
+            # Built before fused_qkvg_proj, which on ROCm may reserve room for
+            # their rows; registered after it to keep the module order.
+            b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
                 bias=False,
@@ -1610,14 +1590,14 @@ class KimiK3DeltaAttention(nn.Module):
                 # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
                 skip_block_quant_check=self._bfa_uses_block_fp8,
             )
-            self.f_a_proj = ReplicatedLinear(
+            f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_a_proj",
             )
-            self.f_b_proj = ColumnParallelLinear(
+            f_b_proj = ColumnParallelLinear(
                 self.head_dim,
                 projection_size,
                 bias=False,
@@ -1625,6 +1605,42 @@ class KimiK3DeltaAttention(nn.Module):
                 parallel_group="attn_tp",
                 prefix=f"{prefix}.f_b_proj",
             )
+            qkvg_output_sizes = [projection_size] * 4
+            if _is_hip:
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    k3_kda_inproj_fp8_tail_rows,
+                )
+
+                # Quark FP8: rows the post-load merge fills with [f_a | b | pad].
+                tail_rows = k3_kda_inproj_fp8_tail_rows(
+                    wide_rows=4 * projection_size // self.attn_tp_size,
+                    f_a_proj=f_a_proj,
+                    b_proj=b_proj,
+                    f_b_proj=f_b_proj,
+                )
+                if tail_rows:
+                    qkvg_output_sizes.append(tail_rows * self.attn_tp_size)
+            # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
+            # and f_a (128, replicated) in skews the output dim and degrades
+            # GEMM kernel selection; they stay as separate tiny GEMVs. ROCm
+            # reverses this below the token threshold
+            # (_merge_kda_inproj_weights_hip), or for Quark FP8 at every batch
+            # size (_merge_kda_inproj_fp8_hip).
+            self.fused_qkvg_proj = MergedColumnParallelLinear(
+                self.hidden_size,
+                qkvg_output_sizes,
+                bias=False,
+                quant_config=quant_config,
+                parallel_group="attn_tp",
+                prefix=f"{prefix}.fused_qkvg_proj",
+            )
+            self.split_sizes = [
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
+            ]
+            self.b_proj = b_proj
+            self.f_a_proj = f_a_proj
+            self.f_b_proj = f_b_proj
             # Merged [f_a | b] weight, built after weight loading by
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
@@ -1638,8 +1654,12 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_layer: Optional[SimpleNamespace] = None
                 self._qkvgbfa_sizes: Optional[list[int]] = None
                 self._qkvgbfa_bs_limit = (
-                    envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
+                    envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
+                # Quark FP8: fused_qkvg_proj's own weight holds the merged rows,
+                # so every batch size runs the merged GEMM and the limit is moot.
+                self._qkvgbfa_in_qkvg_proj = False
+                self._derived_weight_cache_error: Optional[str] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1843,6 +1863,8 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if _is_hip and self._merge_kda_inproj_fp8_hip():
+            return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
@@ -1868,6 +1890,37 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+
+    def _merge_kda_inproj_fp8_hip(self) -> bool:
+        """ROCm only: copy the Quark FP8 [f_a | b] rows into the tail that
+        fused_qkvg_proj reserved at init.
+
+        Leaves _bfa_w None. A re-run after weight processing keeps the merge,
+        since the weights no longer have the checkpoint layout it reads."""
+        if self._qkvgbfa_in_qkvg_proj:
+            return True
+        from sglang.srt.models.kimi_k3_rocm_quant import k3_merge_kda_inproj_fp8
+
+        merged = k3_merge_kda_inproj_fp8(
+            qkvg_proj=self.fused_qkvg_proj,
+            qkvg_sizes=self.split_sizes,
+            f_a_proj=self.f_a_proj,
+            b_proj=self.b_proj,
+            f_b_proj=self.f_b_proj,
+        )
+        if merged is None:
+            return False
+        # Rows were written in place, so the loader's process_weights_after_loading
+        # prepares the projection's only copy; f_a_proj/b_proj keep small unused ones.
+        self._qkvgbfa_sizes, self._bfa_f_b_w = merged
+        self._qkvgbfa_in_qkvg_proj = True
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported with the merged Quark FP8 "
+            "Kimi-K3 KDA input projection: f_a/b live inside fused_qkvg_proj and "
+            "f_b is cached in BF16. Restart with SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0 "
+            "before updating weights."
+        )
+        return True
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -1909,7 +1962,7 @@ class KimiK3DeltaAttention(nn.Module):
         plain unquantized 2-D tensors of one dtype and width -- the checkpoint
         keeps attention in bf16, but a quantized variant would carry scales
         that a raw row-cat would silently drop."""
-        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
+        if not (_is_hip and envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get()):
             return False
         if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
             return False
@@ -2039,28 +2092,39 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
+            if (
+                _is_hip
+                and self._qkvgbfa_sizes is not None
+                and (
+                    self._qkvgbfa_in_qkvg_proj
+                    or 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
+                )
+            ):
+                # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
+                # tail rides the wide projection's bandwidth (~30% of the
+                # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
+                fused_states = self.fused_qkvg_proj.quant_method.apply(
+                    (
+                        self.fused_qkvg_proj
+                        if self._qkvgbfa_in_qkvg_proj
+                        else self._qkvgbfa_layer
+                    ),
+                    hidden_states,
+                    None,
+                )
+                qkv, g_proj_states, f_a, beta, _pad = torch.split(
+                    fused_states, self._qkvgbfa_sizes, dim=-1
+                )
+                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+                # Fused KDA decode consumes f_a and applies f_b itself.
+                forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                return qkv, beta, forget_gate, g_proj_states
+
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
-
-                if (
-                    _is_hip
-                    and self._qkvgbfa_sizes is not None
-                    and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
-                ):
-                    # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
-                    # tail rides the wide projection's bandwidth (~30% of the
-                    # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
-                    fused_states = self.fused_qkvg_proj.quant_method.apply(
-                        self._qkvgbfa_layer, hidden_states, None
-                    )
-                    qkv, g_proj_states, f_a, beta, _pad = torch.split(
-                        fused_states, self._qkvgbfa_sizes, dim=-1
-                    )
-                    # Fused KDA decode consumes f_a and applies f_b itself.
-                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
-                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None
@@ -3359,6 +3423,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
             scale_folded_into_weight = False
+            kv_b_tensor_scale = None
             if _is_hip and kv_b_weight.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
@@ -3366,22 +3431,24 @@ class KimiK3LinearForCausalLM(nn.Module):
                 scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
                 if isinstance(scale, torch.Tensor) and scale.numel() > 1:
                     from sglang.srt.models.kimi_k3_rocm_quant import (
-                        _k3_channel_fp8_to_bf16,
+                        k3_kv_b_for_absorb,
                     )
 
                     # Fold the per-channel scale while dim 0 is still the
                     # channel axis it indexes, i.e. before the head split.
-                    kv_b_weight = _k3_channel_fp8_to_bf16(
-                        self_attn.kv_b_proj, kv_b_weight
+                    kv_b_weight, kv_b_tensor_scale = k3_kv_b_for_absorb(
+                        module=self_attn.kv_b_proj, weight=kv_b_weight
                     )
-                    scale_folded_into_weight = True
+                    scale_folded_into_weight = kv_b_tensor_scale is None
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
-            if _is_hip and (
+            if kv_b_tensor_scale is not None:
+                self_attn.w_scale = kv_b_tensor_scale
+            elif _is_hip and (
                 scale_folded_into_weight
                 or not (
                     isinstance(kv_b_scale, torch.Tensor) and kv_b_scale.numel() == 1
