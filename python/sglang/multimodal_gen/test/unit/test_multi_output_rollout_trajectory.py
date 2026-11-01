@@ -144,7 +144,6 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
         )
 
 
-
 class TestQwenImageSharedConditioning(unittest.TestCase):
     def _merged(self):
         return concat_rollout_trajectory_data(
