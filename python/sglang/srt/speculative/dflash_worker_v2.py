@@ -2473,6 +2473,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # idle rank would disagree with them on DP-gather segment
                 # offsets (padded bucket vs raw counts).
                 idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                idle_verify_forward_batch.can_reuse_lora_routing = False
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -2886,6 +2887,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):
             verify_forward_batch.can_run_decode_cuda_graph = False
+            verify_forward_batch.can_reuse_lora_routing = False
 
         # Mixed-round guard: an extend rank's raw token counts disagree with
         # the verify batch's spec-scaled counts on the DP-gather layout; run

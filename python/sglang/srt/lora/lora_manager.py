@@ -46,6 +46,7 @@ from sglang.srt.lora.utils import (
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -498,6 +499,15 @@ class LoRAManager:
 
     def reset_routing_cache(self) -> None:
         self.lora_backend.reset_routing_cache()
+
+    def can_reuse_dp_lora_routing(self, batch: Optional[ScheduleBatch]) -> bool:
+        """Vote that this rank's cached routing stays valid through preparation.
+
+        Cover adapter order, token layout and GPU slots; ``batch`` may be None.
+        Reuse requires unanimous votes and the same final graph/shape decision
+        on every rank in prepare_lora_batch.
+        """
+        return False
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # Some internal-only backends (currently UNO) use explicit token-row
