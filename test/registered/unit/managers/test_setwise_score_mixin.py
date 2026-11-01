@@ -9,12 +9,15 @@ as nested ``scores`` ``[num_items][Nᵢ x num_labels]``. These tests cover the
 grouping, validation, anchor bucketing, and the serialization round-trip on CPU.
 """
 
+import asyncio
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     ScoreResult,
@@ -129,6 +132,144 @@ class TestSingleItemScoringResults(CustomTestCase):
         self.assertEqual(len(res.pooled_hidden_states), 2)
         torch.testing.assert_close(res.pooled_hidden_states[0], phs[1])
         torch.testing.assert_close(res.pooled_hidden_states[1], phs[2])
+
+    def test_mis_rejects_misaligned_pooled_hidden_state_rows(self):
+        """Requested non-null hidden states must not silently disappear on a row mismatch."""
+        for actual_count in (0, 1, 2, 4):
+            with self.subTest(actual_count=actual_count):
+                result = self._result(
+                    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                    phs=torch.zeros(actual_count, 4),
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"Expected 3 pooled hidden state rows.*got {actual_count}.*"
+                    r"Request ID: rid-1",
+                ):
+                    self.h._process_multi_item_scoring_results(
+                        [result],
+                        items=["item0", "item1"],
+                        label_token_ids=None,
+                        apply_softmax=False,
+                        return_pooled_hidden_states=True,
+                    )
+
+    def test_mis_allows_absent_pooled_hidden_states(self):
+        for explicit_null in (False, True):
+            with self.subTest(explicit_null=explicit_null):
+                result = self._result([[0.0], [1.0], [2.0]])
+                if explicit_null:
+                    result["pooled_hidden_state"] = None
+                res = self.h._process_multi_item_scoring_results(
+                    [result],
+                    items=["item0", "item1"],
+                    label_token_ids=None,
+                    apply_softmax=False,
+                    return_pooled_hidden_states=True,
+                )
+                self.assertEqual(res.scores, [[1.0], [2.0]])
+                self.assertIsNone(res.pooled_hidden_states)
+
+    def test_mis_ignores_unrequested_misaligned_pooled_hidden_states(self):
+        res = self.h._process_multi_item_scoring_results(
+            [self._result([[0.0], [1.0], [2.0]], phs=torch.zeros(1, 4))],
+            items=["item0", "item1"],
+            label_token_ids=None,
+            apply_softmax=False,
+            return_pooled_hidden_states=False,
+        )
+        self.assertEqual(res.scores, [[1.0], [2.0]])
+        self.assertIsNone(res.pooled_hidden_states)
+
+    def test_score_request_text_item_embed_overrides(self):
+        """A bare string is one item, including tokenization and embedding injection."""
+        for enable_mis in (False, True):
+            for items in ("item", ["item", "next"]):
+                with self.subTest(enable_mis=enable_mis, items=items):
+                    self._publish(enable_mis=enable_mis)
+                    num_items = 1 if isinstance(items, str) else len(items)
+                    self.h.tokenizer = MagicMock(spec=["encode"])
+                    self.h.tokenizer.encode.side_effect = [
+                        [10, 11],
+                        *[[42, 12 + i] for i in range(num_items)],
+                    ]
+                    rows = [[float(i), 1.0] for i in range(num_items)]
+                    results = (
+                        [self._result([[0.0, 0.0], *rows])]
+                        if enable_mis
+                        else [self._result(row) for row in rows]
+                    )
+                    self.h.generate_request = MagicMock(
+                        return_value=SimpleNamespace(
+                            __anext__=AsyncMock(return_value=results)
+                        )
+                    )
+                    overrides = [torch.full((1, 4), float(i)) for i in range(num_items)]
+                    res = asyncio.run(
+                        self.h.score_request(
+                            query="query",
+                            items=items,
+                            embed_override_token_id=42,
+                            item_embed_overrides=[[tensor] for tensor in overrides],
+                        )
+                    )
+                    self.assertEqual(res.scores, rows)
+                    self.assertEqual(
+                        res.prompt_tokens, 7 if enable_mis else 7 * num_items
+                    )
+                    batch_request = self.h.generate_request.call_args.args[0]
+                    if enable_mis:
+                        expected_ids = [10, 11, MIS_DELIMITER_TOKEN_ID]
+                        for i in range(num_items):
+                            expected_ids.extend([42, 12 + i, MIS_DELIMITER_TOKEN_ID])
+                        self.assertEqual(batch_request.input_ids, [expected_ids])
+                        positional = batch_request.positional_embed_overrides[0]
+                        self.assertEqual(
+                            positional.positions, [3 + 3 * i for i in range(num_items)]
+                        )
+                        torch.testing.assert_close(
+                            positional.embeds, torch.cat(overrides)
+                        )
+                    else:
+                        self.assertEqual(
+                            batch_request.input_ids,
+                            [[10, 11, 42, 12 + i] for i in range(num_items)],
+                        )
+                        for positional, tensor in zip(
+                            batch_request.positional_embed_overrides, overrides
+                        ):
+                            self.assertEqual(positional.positions, [2])
+                            torch.testing.assert_close(positional.embeds, tensor)
+
+    def test_score_request_rejects_wrong_item_embed_override_count(self):
+        """Override count follows item count, not the character count of a bare string."""
+        self._publish(enable_mis=False)
+        self.h.tokenizer = MagicMock(spec=["encode"])
+        self.h.tokenizer.encode.return_value = [10]
+        self.h.generate_request = MagicMock(
+            return_value=SimpleNamespace(
+                __anext__=AsyncMock(return_value=[self._result([1.0])])
+            )
+        )
+        for items, num_items, invalid_counts in (
+            ("item", 1, (0, 2, 4)),
+            (["item", "next"], 2, (0, 1, 3)),
+        ):
+            for count in invalid_counts:
+                with self.subTest(items=items, count=count):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"item_embed_overrides length \({count}\) "
+                        rf"must match items length \({num_items}\)",
+                    ):
+                        asyncio.run(
+                            self.h.score_request(
+                                query="query",
+                                items=items,
+                                embed_override_token_id=42,
+                                item_embed_overrides=[None] * count,
+                            )
+                        )
 
     # ---- setwise: per_item_matrix=True ----------------------------------
 
