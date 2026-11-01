@@ -22,6 +22,7 @@
 #include <sgl_kernel/vec.cuh>
 
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -259,6 +260,8 @@ struct MoeFinalizeKernel {
         .route_before_wait = kUsePDL && route_before_wait,
     };
     const auto dev = device.unwrap();
+    // The stream comes from the inputs' device, which may differ from the current one.
+    const tvm::ffi::CUDADeviceGuard guard(dev.device_id);
     const uint32_t grid_x = div_ceil(params.num_chunks, kBlockSize);
     if (uint64_t{grid_x} * num_tokens <= resident_ctas<false>(dev.device_id)) {
       LaunchKernel(dim3{grid_x, num_tokens}, kBlockSize, dev)  //
