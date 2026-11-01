@@ -1645,6 +1645,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
+        # PP+MTP: the vision-injected embeddings are produced on
+        # PP0, while NextN prefill runs on the final pipeline stage.
+        if (
+            pp_proxy_tensors is not None
+            and "mm_input_embeds" in pp_proxy_tensors.tensors
+        ):
+            forward_batch.mm_input_embeds = pp_proxy_tensors["mm_input_embeds"]
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             if input_embeds is not None and not forward_batch.contains_mm_inputs():
                 # Preserve input_embeds / replace_embeds supplied by the runner.
@@ -1675,6 +1683,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_eagle()
+                and forward_batch.mm_input_embeds is not None
+            ):
+                hidden_states["mm_input_embeds"] = forward_batch.mm_input_embeds
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
