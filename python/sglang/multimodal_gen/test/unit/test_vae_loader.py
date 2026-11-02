@@ -412,6 +412,30 @@ class TestDirectGPUVAEState(unittest.TestCase):
                     self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
                     self.assertTrue(torch.equal(loaded.scale, expected_scale))
 
+    def test_auto_map_requires_trust_remote_code(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.trust_remote_code = False
+
+        with TemporaryDirectory() as root:
+            custom = pathlib.Path(root) / "custom.py"
+            custom.write_text("raise RuntimeError('custom code must not run')\n")
+            with (
+                patch.object(
+                    vae_loader,
+                    "get_diffusers_component_config",
+                    return_value={
+                        "_class_name": "TestVAE",
+                        "auto_map": {"AutoModel": "custom.TestVAE"},
+                    },
+                ),
+                patch.object(loader, "target_device", return_value=torch.device("cpu")),
+                self.assertRaisesRegex(
+                    ComponentCheckpointUnsupportedError, "trust-remote-code"
+                ),
+            ):
+                loader.load_customized(root, server_args, "vae")
+
     def test_quantized_checkpoint_does_not_fall_back_from_direct_loading(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())

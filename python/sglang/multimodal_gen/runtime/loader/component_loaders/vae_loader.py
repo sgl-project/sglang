@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import os
+import sys
 
 import torch
 import torch.nn as nn
@@ -631,11 +632,29 @@ class VAELoader(WeightOverrideComponentLoader):
                 "consume a weights-only override"
             )
         if auto_model_map and not native_only:
+            if not server_args.trust_remote_code:
+                raise ComponentCheckpointUnsupportedError(
+                    f"{component_name!r} uses custom Diffusers code (auto_map) "
+                    "which requires --trust-remote-code"
+                )
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
-            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+            module_name = (
+                "_custom_vae_"
+                + hashlib.sha256(
+                    os.path.abspath(custom_module_file).encode()
+                ).hexdigest()[:16]
+            )
+            spec = importlib.util.spec_from_file_location(
+                module_name, custom_module_file
+            )
             custom_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(custom_module)
+            sys.modules[module_name] = custom_module
+            try:
+                spec.loader.exec_module(custom_module)
+            except BaseException:
+                sys.modules.pop(module_name, None)
+                raise
             vae_cls = getattr(custom_module, cls_name)
             with set_default_torch_dtype(vae_dtype):
                 vae = vae_cls.from_pretrained(
