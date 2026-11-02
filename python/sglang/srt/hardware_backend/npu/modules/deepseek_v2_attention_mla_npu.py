@@ -201,12 +201,11 @@ def forward_mla_prepare_npu(
                     [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
                     dim=-1,
                 )
-                k_nope = latent_cache[..., : m.kv_lora_rank]
-
                 q = m.q_a_layernorm(q)
                 q = scattered_to_tp_attn_full(q, forward_batch)
                 latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
 
+                k_nope = latent_cache[..., : m.kv_lora_rank]
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
