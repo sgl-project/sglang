@@ -465,6 +465,17 @@ class TestV41KVPoolLayouts(CustomTestCase):
         )
         c4 = infos[PoolName.DEEPSEEK_V4_C4]
         self.assertEqual(c4.layer_ids, (1, 3))
+        # Each region binds transfers to the sub-pool owning its bytes.
+        devices = pool.device_pools_by_name()
+        self.assertEqual(devices.keys(), infos.keys())
+        for name, device_pool in (
+            (PoolName.SWA, pool.swa_kv_pool),
+            (PoolName.DEEPSEEK_V4_C4, pool.c4_kv_pool),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER, pool.c4_indexer_kv_pool),
+            (PoolName.DEEPSEEK_V4_C4_STATE, None),
+            (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, None),
+        ):
+            self.assertIs(devices[name], device_pool)
         attention = infos[PoolName.DEEPSEEK_V4_C4_STATE].buffer_info.states
         indexer = infos[PoolName.DEEPSEEK_V4_C4_INDEXER_STATE].buffer_info.states
         for index, layer in enumerate(c4.layer_ids):
@@ -514,6 +525,11 @@ class TestV41KVPoolLayouts(CustomTestCase):
         ):
             kv = infos[names[0]]
             index_pool = pool.index_pools[ratio]
+            devices = pool.device_pools_by_name()
+            self.assertIs(devices[names[0]], pool.kv_pools[ratio])
+            for name in names[1:]:
+                if name in infos:
+                    self.assertIs(devices[name], index_pool)
             regions = (
                 ((infos[names[1]], index_pool.index_k_with_scale_buffer),)
                 if names[2] not in infos

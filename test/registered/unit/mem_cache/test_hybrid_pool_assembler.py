@@ -230,12 +230,17 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         for name in ("full", "swa")
                         for layer, index in global_maps.get(name, {}).items()
                     }
+                    full_kv_pool, swa_kv_pool = object(), object()
                     kvcache = SimpleNamespace(
                         start_layer=start_layer,
                         full_attention_layer_id_mapping=global_maps["full"].copy(),
                         layers_mapping=layers_mapping.copy(),
-                        full_kv_pool=object(),
-                        swa_kv_pool=object(),
+                        full_kv_pool=full_kv_pool,
+                        swa_kv_pool=swa_kv_pool,
+                        device_pools_by_name=lambda: {
+                            PoolName.KV: full_kv_pool,
+                            PoolName.SWA: swa_kv_pool,
+                        },
                         use_mla=False,
                     )
                     state = SimpleNamespace(pool=object())
@@ -2048,6 +2053,10 @@ class TestPoolRolesInInfos(CustomTestCase):
                     (PoolName.KV, PoolName.KV),
                 )
                 self.assertEqual(swa.pool_name, PoolName.SWA)
+                self.assertEqual(
+                    pool.device_pools_by_name(),
+                    {PoolName.KV: pool.full_kv_pool, PoolName.SWA: pool.swa_kv_pool},
+                )
                 self.assertEqual(
                     swa.indices_from_pool,
                     PoolName.KV if full_indices else PoolName.SWA,

@@ -1540,6 +1540,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 infos.extend(self._compressed_pool_infos(ratio, tuple(sources)))
         return tuple(infos)
 
+    def device_pools_by_name(self) -> dict[PoolName, Optional[KVCache]]:
+        # Compressor rings have no device pool; their host pools move them.
+        owners = {
+            PoolName.SWA: self.swa_kv_pool,
+            PoolName.DEEPSEEK_V4_C4_STATE: None,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE: None,
+        }
+        for ratio, names in _DSV4_REGION_NAMES.items():
+            kv_pool, index_pool = self.kv_pools.get(ratio), self.index_pools.get(ratio)
+            for name, pool in zip(names, (kv_pool, kv_pool, index_pool, index_pool)):
+                if name is not None:
+                    owners[name] = pool
+        return {
+            info.pool_name: owners[info.pool_name]
+            for info in self.get_device_pool_infos()
+        }
+
     def _compressed_pool_infos(
         self, ratio: int, layer_ids: tuple[int, ...]
     ) -> list[DevicePoolInfo]:
