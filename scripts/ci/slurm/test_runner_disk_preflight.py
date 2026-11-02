@@ -54,13 +54,16 @@ class DiagnosticRetentionTest(unittest.TestCase):
             (root / "_diag").mkdir()
             (root / ".runner").write_text("{}")
             with (
-                patch.dict(os.environ, {
-                    "RUNNER_TEMP": str(temp), "GITHUB_WORKSPACE": str(temp)
-                }),
+                patch.dict(
+                    os.environ,
+                    {"RUNNER_TEMP": str(temp), "GITHUB_WORKSPACE": str(temp)},
+                ),
                 patch("runner_disk_preflight.shutil.which", return_value=None),
                 patch("runner_disk_preflight.shutil.disk_usage") as usage,
-                patch("runner_disk_preflight.tempfile.TemporaryFile",
-                      side_effect=OSError(122, "Disk quota exceeded")),
+                patch(
+                    "runner_disk_preflight.tempfile.TemporaryFile",
+                    side_effect=OSError(122, "Disk quota exceeded"),
+                ),
             ):
                 usage.return_value.free = 100 * 1024**3
                 with self.assertRaisesRegex(SystemExit, "Disk quota exceeded"):

@@ -61,7 +61,9 @@ def main() -> None:
                 probe.flush()
                 os.fsync(probe.fileno())
         except OSError as exc:
-            raise SystemExit(f"::error::Runner storage is not writable at {path}: {exc}")
+            raise SystemExit(
+                f"::error::Runner storage is not writable at {path}: {exc}"
+            )
 
 
 if __name__ == "__main__":
