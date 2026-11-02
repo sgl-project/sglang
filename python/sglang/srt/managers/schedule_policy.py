@@ -1983,6 +1983,7 @@ class PrefillAdder:
                     i,
                     len(self.running_batch.reqs) - release_counter,
                     self.request_retirer,
+                    requeue=True,
                 )
             else:
                 keep_indices.append(i)
