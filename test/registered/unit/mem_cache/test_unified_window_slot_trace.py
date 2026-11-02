@@ -163,6 +163,7 @@ def _tree_script(windows, backend):
                 "op": "match",
                 "device_prefix_len": match.device_prefix_len,
                 "host_hits": dict(match.window_host_hit_lengths),
+                "branching": match.swa_branching_seqlen,
             }
         )
         locks.append(cache.lock(match.last_device_node))
@@ -187,7 +188,13 @@ def _tree_script(windows, backend):
     steps.append({"op": "unlock", **_sizes(cache, storage)})
     for seq in seqs:
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        steps.append({"op": "rematch", "device_prefix_len": match.device_prefix_len})
+        steps.append(
+            {
+                "op": "rematch",
+                "device_prefix_len": match.device_prefix_len,
+                "branching": match.swa_branching_seqlen,
+            }
+        )
     result = cache.evict(
         EvictParams(num_tokens=1 << 20, window_num_tokens={n: 1 << 20 for n in names})
     )

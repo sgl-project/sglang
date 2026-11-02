@@ -755,6 +755,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "host_hits": {
      "window_16": 0
@@ -776,6 +777,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "host_hits": {
      "window_16": 0
@@ -797,6 +799,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "host_hits": {
      "window_16": 0
@@ -886,26 +889,32 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 32,
     "op": "rematch"
    },
    {
+    "branching": 40,
     "device_prefix_len": 32,
     "op": "rematch"
    },
    {
+    "branching": 24,
     "device_prefix_len": 16,
     "op": "rematch"
    },
@@ -1057,6 +1066,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "host_hits": {
      "window_16": 0,
@@ -1082,6 +1092,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "host_hits": {
      "window_16": 0,
@@ -1107,6 +1118,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "host_hits": {
      "window_16": 0,
@@ -1215,26 +1227,32 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "op": "rematch"
    },
    {
+    "branching": 32,
     "device_prefix_len": 16,
     "op": "rematch"
    },
    {
+    "branching": 40,
     "device_prefix_len": 16,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "op": "rematch"
    },
@@ -1373,6 +1391,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "host_hits": {
      "window_16": 0
@@ -1394,6 +1413,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "host_hits": {
      "window_16": 0
@@ -1415,6 +1435,7 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "host_hits": {
      "window_16": 0
@@ -1504,26 +1525,32 @@
     }
    },
    {
+    "branching": null,
     "device_prefix_len": 40,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 56,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 24,
     "op": "rematch"
    },
    {
+    "branching": null,
     "device_prefix_len": 32,
     "op": "rematch"
    },
    {
+    "branching": 40,
     "device_prefix_len": 32,
     "op": "rematch"
    },
    {
+    "branching": 24,
     "device_prefix_len": 16,
     "op": "rematch"
    },
