@@ -21,6 +21,7 @@ from sglang.srt.models.deepseek_ocr import (
     MlpProjector,
     build_clip_l,
     build_sam_vit_b,
+    clear_sam_rel_pos_cache,
     merge_multimodal_embeddings,
 )
 from sglang.srt.models.transformers import maybe_prefix
@@ -73,11 +74,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        self.model = DeepseekForCausalLM(
-            config=config.text_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language"),
-        )
+        self.model = self._build_language_model(config, quant_config, prefix)
 
         self.sam_model = build_sam_vit_b()
         self.vision_model = build_clip_l()
@@ -92,6 +89,13 @@ class UnlimitedOCRForCausalLM(nn.Module):
         )
 
         self.image_token_id = None
+
+    def _build_language_model(self, config, quant_config, prefix):
+        return DeepseekForCausalLM(
+            config=config.text_config,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "language"),
+        )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Return the sliding window size from the model config, or None."""
@@ -243,6 +247,27 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
         return images_in_this_batch
 
+    def _stack_crop_inputs(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        has_local_crops: Optional[List[bool]],
+        target_dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stack the items' local crops and their crop shapes, both on ``device``."""
+        images_crop = (
+            torch.stack([item.images_crop for item in mm_items], dim=0)
+            .type(target_dtype)
+            .to(device=device)
+        )
+        images_spatial_crop = (
+            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
+            .type(torch.long)
+            .to(device=device)
+        )
+        return images_crop, images_spatial_crop
+
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process multimodal data items into concatenated vision features."""
         target_dtype = self.vision_model.dtype
@@ -251,15 +276,11 @@ class UnlimitedOCRForCausalLM(nn.Module):
             target_dtype
         )
 
-        images_crop = (
-            torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(target_dtype)
-            .to(device=pixel_values.device)
-        )
-        images_spatial_crop = (
-            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(torch.long)
-            .to(device=pixel_values.device)
+        images_crop, images_spatial_crop = self._stack_crop_inputs(
+            mm_items,
+            has_local_crops=has_local_crops,
+            target_dtype=target_dtype,
+            device=pixel_values.device,
         )
         pixel_values = pixel_values.view(
             pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:]
@@ -340,6 +361,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load and remap checkpoint weights into the model parameters."""
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),

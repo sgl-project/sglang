@@ -543,7 +543,7 @@ struct HcBoundaryPrefillKernel {
     auto Sx = SymbolicSize{"x_stride"};
     auto Sw = SymbolicSize{"w_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, kHc, H}).with_strides({K, H, 1}).with_dtype<bf16_t>().with_device(device).verify(res);
     TensorMatcher({kMix, K}).with_strides({Sw, 1}).with_dtype<float>().with_device(device).verify(w);

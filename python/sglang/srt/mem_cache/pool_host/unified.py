@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -18,6 +20,17 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import transfer_kv_direct, transfer_kv_per_layer_mla
+
+
+def _capture_page_envelope(device_pool) -> PageEnvelopeBufferInfo:
+    (info,) = device_pool.get_device_pool_infos()
+    if not isinstance(info.buffer_info, MHABufferInfo):
+        raise TypeError("Page-envelope hosts require native MHA buffer information")
+    envelope = info.buffer_info.page_envelope
+    if envelope is None:
+        raise ValueError("Device pool has no native page-envelope description")
+    envelope.validate()
+    return envelope
 
 
 class _SharedPageEnvelopeHostBacking:
@@ -60,6 +73,7 @@ class _SharedPageEnvelopeHostBacking:
         *,
         device_pools: Sequence,
         pool_names: Sequence[str],
+        buffer_infos: Sequence[PageEnvelopeBufferInfo],
         host_to_device_ratio: float,
         host_size: float,
         pin_memory: bool,
@@ -73,14 +87,13 @@ class _SharedPageEnvelopeHostBacking:
         if len(set(pool_names)) != len(pool_names):
             raise ValueError(f"Unified host pool names must be unique: {pool_names}.")
 
-        device_buffers = [pool.get_page_envelope_buffer() for pool in device_pools]
-        registrations = [pool.get_contiguous_buf_infos() for pool in device_pools]
-        for ptrs, lens, item_lens in registrations:
-            if len(ptrs) != len(lens) or len(ptrs) != len(item_lens) or len(ptrs) != 1:
-                raise ValueError(
-                    "Unified page-envelope pools must expose one memory region."
-                )
-        shared_regions = {(ptrs[0], lens[0]) for ptrs, lens, _ in registrations}
+        if len(buffer_infos) != len(device_pools):
+            raise ValueError("Each unified pool requires one page-envelope description")
+        device_buffers = [info.pages for info in buffer_infos]
+        shared_regions = {
+            (info.allocation.data_ptr(), info.registration_bytes)
+            for info in buffer_infos
+        }
         if len(shared_regions) != 1:
             raise ValueError("Unified full and SWA pools must share one device region.")
 
@@ -120,6 +133,13 @@ class _SharedPageEnvelopeHostBacking:
                 int(device_total_bytes * host_to_device_ratio) + max(page_bytes),
                 *nominal_view_bytes,
             )
+        # Transfer backends register this backing in items of each sharing pool's
+        # page size, so keep it a whole number of pages of every pool.
+        page_multiple = math.lcm(*page_bytes)
+        if host_size == 0 and host_to_device_ratio == 0:
+            total_bytes -= total_bytes % page_multiple
+        else:
+            total_bytes += -total_bytes % page_multiple
         if total_bytes <= 0:
             raise ValueError(
                 f"Unified host backing size must be positive: {total_bytes}"
@@ -133,7 +153,7 @@ class _SharedPageEnvelopeHostBacking:
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        grow_directions = [pool.grow_direction for pool in device_pools]
+        grow_directions = [info.grow_direction for info in buffer_infos]
         if len(grow_directions) == 2 and set(grow_directions) != {"up", "down"}:
             raise ValueError(
                 "Unified full and SWA host pools must grow from opposite ends; "
@@ -194,6 +214,20 @@ class _SharedPageEnvelopeHostBacking:
         self._layout_lease_state = self._LayoutLeaseState()
         self._compacting = False
         self._pending_transfer_events = {}
+        # A transfer peer writing physical pages it was given holds no lease:
+        # this predicate is False while such a write may be in flight, and
+        # allocation then refuses to compact.
+        self._peer_write_gate: Callable[[], bool] | None = None
+
+    def set_peer_write_gate(self, gate: Callable[[], bool]) -> None:
+        self._peer_write_gate = gate
+
+    @property
+    def peer_writes_gated(self) -> bool:
+        return self._peer_write_gate is not None
+
+    def _peer_writes_quiescent(self) -> bool:
+        return self._peer_write_gate is None or self._peer_write_gate()
 
     def retain(self, name: str) -> None:
         if name in self._users:
@@ -512,6 +546,8 @@ class _SharedPageEnvelopeHostBacking:
             if not self._can_reserve_without_compaction(page_counts):
                 if not self._can_fit_packed(page_counts):
                     return None
+                if not self._peer_writes_quiescent():
+                    return None
                 self._compact()
             if not self._can_reserve_without_compaction(page_counts):
                 raise RuntimeError(
@@ -684,13 +720,19 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         mtp_draft_device_pools: Sequence = (),
         pool_label: str = "kv",
         _shared_backing: _SharedPageEnvelopeHostBacking | None = None,
+        _buffer_info: PageEnvelopeBufferInfo | None = None,
     ):
         if mtp_draft_device_pools:
             raise NotImplementedError(
                 "Unified page-envelope host pools do not support packed MTP draft pools."
             )
 
-        device_page_buffer = device_pool.get_page_envelope_buffer()
+        buffer_info = (
+            _capture_page_envelope(device_pool)
+            if _buffer_info is None
+            else _buffer_info
+        )
+        device_page_buffer = buffer_info.pages
         if device_page_buffer.ndim != 2:
             raise ValueError(
                 "Unified page-envelope buffers must have shape [pages, bytes]; "
@@ -702,10 +744,10 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
                 "Unified page-envelope bytes must be divisible by page_size; "
                 f"got page_bytes={page_bytes}, page_size={page_size}."
             )
-        if device_pool.page_size != page_size:
+        if buffer_info.page_size != page_size:
             raise ValueError(
                 "Unified device and host page sizes must match; "
-                f"got device={device_pool.page_size}, host={page_size}."
+                f"got device={buffer_info.page_size}, host={page_size}."
             )
         if layout not in {"layer_first", "page_first", "page_first_direct"}:
             raise ValueError(f"Unsupported layout: {layout}")
@@ -714,6 +756,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             _shared_backing = _SharedPageEnvelopeHostBacking(
                 device_pools=(device_pool,),
                 pool_names=(pool_label,),
+                buffer_infos=(buffer_info,),
                 host_to_device_ratio=host_to_device_ratio,
                 host_size=host_size,
                 pin_memory=pin_memory,
@@ -780,9 +823,11 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             raise ValueError("A hybrid-SWA host pool pair requires exactly two pools.")
 
         pool_names = tuple(pool_names)
+        buffer_infos = tuple(_capture_page_envelope(pool) for pool in device_pools)
         backing = _SharedPageEnvelopeHostBacking(
             device_pools=device_pools,
             pool_names=pool_names,
+            buffer_infos=buffer_infos,
             host_to_device_ratio=host_to_device_ratio,
             host_size=host_size,
             pin_memory=pin_memory,
@@ -791,7 +836,9 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         )
         host_pools = []
         try:
-            for device_pool, pool_name in zip(device_pools, pool_names, strict=True):
+            for device_pool, pool_name, buffer_info in zip(
+                device_pools, pool_names, buffer_infos, strict=True
+            ):
                 host_pools.append(
                     cls(
                         device_pool,
@@ -804,6 +851,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
                         allocator_type=allocator_type,
                         pool_label=pool_name,
                         _shared_backing=backing,
+                        _buffer_info=buffer_info,
                     )
                 )
         except Exception:
@@ -851,6 +899,11 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         )
         if io_backend == "kernel":
             if not host_indices.is_cuda:
+                if self._device_page_buffer.is_cuda:
+                    # The upload runs on the transfer stream; from pageable memory
+                    # it would block the caller until that stream's earlier copies
+                    # finish, so stage it through pinned memory.
+                    host_indices = host_indices.pin_memory()
                 host_indices = host_indices.to(
                     self._device_page_buffer.device, non_blocking=True
                 )
@@ -868,6 +921,27 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         raise ValueError(f"Unsupported io backend: {io_backend}")
+
+    def peer_write_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        # Physical ids stay valid only while the peer-write gate keeps the
+        # backing from compacting.
+        return self._shared_backing.translate_indices(self.pool_label, indices)
+
+    def set_peer_write_gate(self, gate) -> None:
+        self._shared_backing.set_peer_write_gate(gate)
+
+    @property
+    def peer_writes_gated(self) -> bool:
+        """Whether a peer-write gate keeps compaction from moving the pages
+        `peer_write_indices` names while a transfer peer may write them."""
+        return self._shared_backing.peer_writes_gated
+
+    def peer_write_buf_info(self) -> tuple[int, int, int]:
+        """(pointer, bytes, page bytes) of the region `peer_write_indices`
+        address: this pool's page view of the shared backing."""
+        side = self._shared_backing.sides[self.pool_label]
+        raw = self._shared_backing.raw
+        return raw.data_ptr(), raw.nbytes, side.page_bytes
 
     def destroy(self) -> None:
         if self._destroyed:

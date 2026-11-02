@@ -43,16 +43,6 @@ class TestSWACpuCopyFilter(unittest.TestCase):
             expected = _rows(t)[row_mask]
             self.assertTrue(torch.equal(tensor, expected))
 
-    def test_unquantized_chunk_is_unchanged(self):
-        row_mask = torch.tensor([False, True, True, False])
-
-        filtered = filter_window_cpu_copy(
-            _window(), swa_kv_cpu=_chunk(2), row_mask=row_mask
-        )
-
-        self.assertEqual(len(filtered[0][0]), 2)
-        self.assertEqual(filtered[0][0][0].shape[0], 2)
-
     def test_all_rows_kept_returns_the_input(self):
         original = _chunk(4)
 

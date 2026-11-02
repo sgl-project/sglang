@@ -23,7 +23,8 @@ from sglang.test.test_utils import (
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
 # fixtures (gemma-4-E2B); short prompts would never exercise the SWA-windowed
 # verify path. Token count is roughly 7k after BPE.
-_LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
+_PROMPT_SENTENCE = "The quick brown fox jumps over the lazy dog. "
+_LONG_PROMPT_BODY = (_PROMPT_SENTENCE * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
@@ -64,11 +65,12 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
 
 
 class CanaryE2EBase(CapturedServerE2EBase):
-    model_mode: ClassVar[Literal["mha", "swa", "dsv4"]]
+    model_mode: ClassVar[Literal["mha", "swa", "dsv4", "eagle"]]
     kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
+    prompt_repeat: ClassVar[int] = 700
     # SWA divergence assertions need slot recycling across batches; setting > 1 makes the
     # test methods send N sequential batches so the SWA allocator's full→swa index mapping
     # diverges from identity. Default 1 keeps MHA tests fast.
@@ -121,9 +123,10 @@ class CanaryE2EBase(CapturedServerE2EBase):
         )
 
     def make_prompts(self, n: int) -> list[str]:
+        body = (_PROMPT_SENTENCE * self.prompt_repeat).strip()
         if self.use_unique_prompts:
-            return _make_unique_prompts(n)
-        return [_LONG_PROMPT_BODY] * n
+            return _make_unique_prompts(n, body=body)
+        return [body] * n
 
     def send_parallel_requests(
         self,
@@ -234,7 +237,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
             )
 
 
-def _make_unique_prompts(n: int) -> list[str]:
+def _make_unique_prompts(n: int, *, body: str = _LONG_PROMPT_BODY) -> list[str]:
     if n > len(_UNIQUE_PROMPT_FIRST_CHARS):
         raise ValueError(
             f"unique prompt count {n} exceeds supported count "
@@ -245,7 +248,7 @@ def _make_unique_prompts(n: int) -> list[str]:
         (
             f"{_UNIQUE_PROMPT_FIRST_CHARS[i]}"
             f"{hex(i * 0x9E3779B1 & 0xFFFFFFFF)[2:]} "
-            f"{_LONG_PROMPT_BODY}"
+            f"{body}"
         )
         for i in range(n)
     ]

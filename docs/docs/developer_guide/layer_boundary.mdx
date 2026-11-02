@@ -254,7 +254,6 @@ Before you open a pull request for a new model, check each item:
 - The model gives `make_layers()` its shared declaration function (`stage_facts`), and each layer declares its stages with it: another pipeline rank binds the stages next to its own from that function alone.
 - The model forward calls `residual_batch.start()` before the first layer, and leaves the stack through `residual_batch.final_norm()`, `to_pp()`, or `take_output()`.
 - Pipeline reception calls `from_pp(tensors, forward_batch)` on the first local boundary.
-- Split prefill starts the stream only in the segment that runs the first layer and completes it only in the final segment.
 - Extra contributions such as deepstack embeddings go through `residual_batch.add_to_output()`, never an in-place add on the layer output.
 - Auxiliary capture uses `prepare(..., capture=...)` or `final_norm(..., capture=...)` with a callback that honours `owned`.
 
@@ -262,7 +261,7 @@ Common errors and their usual cause:
 
 | Error | Usual cause |
 | --- | --- |
-| `start the layer stack before entering a stage` | The forward path, a split-prefill segment, or an MTP head skipped `residual_batch.start()` |
+| `start the layer stack before entering a stage` | The forward path or an MTP head skipped `residual_batch.start()` |
 | `output does not belong to this residual stream; change layer outputs through boundary accessors` | The model replaced a layer's output object (for example rebinding it to a new tensor) or passed another microbatch's output. This check compares object identity, so it does not catch in-place changes; the interface still forbids modifying layer outputs in place |
 | `write the residual update before taking the final output` | `take_output()` ran while a contribution was still pending; fold or norm it first |
 | `no stage boundary path for the active <VARIANT> batch` | The active batch variant (CP, input-scattered, sequence parallel, unpadded) is not supported by this stage; add a server-argument check that rejects the configuration |

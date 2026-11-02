@@ -144,9 +144,9 @@ deployment commands and benchmark data, see
 
 ### Multi-node PD disaggregation deployment
 
-#### 256K long-sequence PD disaggregation on 2 x Ascend A3 Series nodes (without CP)
+#### 256K long-sequence PD disaggregation on 2 x A3 Series nodes (without CP)
 
-This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x Ascend A3 Series nodes with context parallel disabled.
+This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x A3 Series nodes with context parallel disabled.
 The following command is based on the **W8A8** quantized model.
 
 1. Set the shared environment variables on both prefill and decode nodes:
@@ -259,7 +259,7 @@ python3 -m sglang_router.launch_router \
     --port 6689
 ```
 
-#### Prefill Context Parallel (PCP) on 2 x Ascend A3 Series nodes
+#### Prefill Context Parallel (PCP) on 2 x A3 Series nodes
 
 This configuration enables **Prefill Context Parallel** (`--enable-prefill-cp`) to split the context
 across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.

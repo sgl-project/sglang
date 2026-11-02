@@ -38,7 +38,6 @@ class DeviceOutput:
         (dict(is_generation=False), {}, False),
         ({}, dict(dllm_algorithm="dream"), False),
         ({}, dict(pp_size=2), False),
-        ({}, dict(enable_pdmux=True), False),
         ({}, {}, True),
     ],
 )

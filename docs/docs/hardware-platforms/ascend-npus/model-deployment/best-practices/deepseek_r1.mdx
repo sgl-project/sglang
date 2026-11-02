@@ -19,18 +19,18 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-20ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Ascend A3 Series Products | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
-| DeepSeek-R1 | Ascend A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | A3 Series Products | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -38,7 +38,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -235,7 +235,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -341,7 +341,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -541,7 +541,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -745,7 +745,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -945,7 +945,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -1145,7 +1145,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-R1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 

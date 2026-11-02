@@ -15,6 +15,7 @@ from sglang.srt.layers.layer_boundary import (
     NORM_QUANT_READOUT,
     PLAIN_ADD,
     Layout,
+    OutputContract,
     StageKind,
     SumGroup,
     TokenAxis,
@@ -179,7 +180,12 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
     ):
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
-                incoming=SimpleNamespace(residual=Layout(frozenset()))
+                incoming=SimpleNamespace(
+                    residual=Layout(frozenset()),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
+                )
             )
         }
         fusions = ffn_input_fusions(comm)
@@ -192,7 +198,10 @@ def test_cutedsl_entries_come_before_the_base_fused_kernel():
         comm.edges = {
             BatchVariant.ORDINARY: SimpleNamespace(
                 incoming=SimpleNamespace(
-                    residual=Layout(frozenset({TokenAxis.ATTN_TP}))
+                    residual=Layout(frozenset({TokenAxis.ATTN_TP})),
+                    produced=OutputContract(
+                        Layout(frozenset()), group=SumGroup.ATTN_TP
+                    ),
                 )
             )
         }

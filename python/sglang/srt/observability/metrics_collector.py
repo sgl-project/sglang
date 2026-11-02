@@ -591,6 +591,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.scheduler_iterations = Counter(
+            name="sglang:scheduler_iterations_total",
+            documentation="Cumulative number of scheduler loop iterations.",
+            labelnames=labels.keys(),
+        )
         self.num_decode_prealloc_queue_reqs = Gauge(
             name="sglang:num_decode_prealloc_queue_reqs",
             documentation="The number of requests in the decode prealloc queue.",
@@ -1610,6 +1615,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 category=category,
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
+
+    def increment_scheduler_iterations(self) -> None:
+        self.scheduler_iterations.labels(**self.labels).inc()
 
     def increment_scheduler_idle_seconds(self, t: float) -> None:
         self.scheduler_idle_seconds_total.labels(**self.labels).inc(t)
