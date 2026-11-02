@@ -1,20 +1,26 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
@@ -197,6 +203,46 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    def test_hisparse_worker_capacity_preserves_long_request_generation(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.enable_hisparse = True
+        runner.is_hybrid_swa = False
+        runner.max_total_num_tokens = 128
+        runner.max_running_requests = 8
+        runner.token_to_kv_pool_allocator = SimpleNamespace(size_full=256)
+        runner.token_to_kv_pool = SimpleNamespace(size=128)
+        runner.forward_stream = None
+        runner.req_to_token_pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        runner.req_to_token_pool._aux_cache = None
+        runner.req_to_token_pool.size = 8
+        runner.req_to_token_pool.max_context_len = 1000
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.is_hybrid_swa = False
+        configurator.is_draft_worker = False
+        runner.kv_cache_configurator = configurator
+        worker = SimpleNamespace(
+            model_runner=runner,
+            model_config=SimpleNamespace(context_len=1000),
+            random_seed=0,
+            device="cpu",
+            dllm_algorithm=None,
+        )
+        schedule = SimpleNamespace(max_prefill_tokens=128, max_queued_requests=None)
+        with patch("sglang.srt.managers.tp_worker.get_schedule", return_value=schedule):
+            worker_info = TpModelWorker.get_worker_info(worker)
+
+        self.assertEqual(worker_info[0], 256)
+        self.assertEqual(worker_info[4], 255)
+        self.assertEqual(worker_info[5], 250)
+        for input_len, requested, expected in ((192, 10, 10), (240, 32, 14)):
+            with self.subTest(input_len=input_len):
+                scheduler = self._new_scheduler(
+                    max_req_len=worker_info[4],
+                    max_total_num_tokens=worker_info[0],
+                )
+                req = self._new_req(max_new_tokens=requested, input_len=input_len)
+                self.assertEqual(self._init_and_check(scheduler, req), expected)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(
