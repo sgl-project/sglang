@@ -65,6 +65,10 @@ class ExpertLocationUpdater:
             self._first_execution = False
             torch.get_device_module().empty_cache()
 
+        routed_experts_weights_of_layer = {
+            layer_id: [x for w in weights for x in _split_noncontiguous_experts(w)]
+            for layer_id, weights in routed_experts_weights_of_layer.items()
+        }
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
         topology_num_nodes = 1 if use_flat_topology else nnodes
@@ -83,6 +87,16 @@ class ExpertLocationUpdater:
         )
 
         return missing_logical_experts_by_layers
+
+
+def _split_noncontiguous_experts(weight: torch.Tensor) -> List[torch.Tensor]:
+    """P2P needs each expert's slice contiguous. An expert-major view whose
+    dim-1 slices live apart (e.g. Mega MoE weights localized across locality
+    domains) is moved as one tensor per dim-1 index."""
+    if weight.dim() < 3 or weight[0].is_contiguous():
+        return [weight]
+    parts = list(weight.unbind(1))
+    return parts if all(p[0].is_contiguous() for p in parts) else [weight]
 
 
 def _update_expert_weights(**kwargs):
