@@ -37,11 +37,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.tree_slots import index_slots
 
 
-def _window_hit(req, component=ComponentType.SWA):
-    """``Req.window_host_hit_lengths`` read off a stand-in request."""
+def _window_hit(req):
+    """The one window's ``Req.window_host_hit_lengths`` entry, read off a
+    stand-in request."""
     from sglang.srt.managers.schedule_batch import Req
 
-    return Req.window_host_hit_lengths.fget(req).get(component, 0)
+    return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
 
 
 register_cpu_ci(est_time=46, suite="base-a-test-cpu")
@@ -68,6 +69,8 @@ def _staged_fixture(full_match=2):
     )
     cache.host_memory_mode = "buffer_only"
     cache.linker = None
+    # The one window slot, by the sub-pool name its hits go by.
+    cache.__dict__["_window_slot_sub_pools"] = {ComponentType.SWA: "swa"}
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._storage_prefetch_wait = {}
     cache.prefetch_loaded_tokens_by_reqid = {_REQ: 6}

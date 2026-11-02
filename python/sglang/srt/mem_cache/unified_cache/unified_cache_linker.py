@@ -353,16 +353,14 @@ class UnifiedCacheLinkerWrapper:
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
+        window_hits = dict(result.window_host_hit_lengths)
+        if self._window is not None:
+            name = self._window.window_sub_pool
+            window_hits[name] = max(window_hits.get(name, 0), swa_host_hit_length)
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
-            window_host_hit_lengths={
-                **result.window_host_hit_lengths,
-                ComponentType.SWA: max(
-                    result.window_host_hit_lengths.get(ComponentType.SWA, 0),
-                    swa_host_hit_length,
-                ),
-            },
+            window_host_hit_lengths=window_hits,
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),

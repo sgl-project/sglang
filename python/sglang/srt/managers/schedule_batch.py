@@ -128,7 +128,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1353,7 +1352,7 @@ class Req(ReqDllmMixin):
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         # Host hit tokens per window slot, by tree component.
-        self.matched_window_host_hit_lengths: Mapping[ComponentType, int] = {}
+        self.matched_window_host_hit_lengths: Mapping[str, int] = {}
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -1666,12 +1665,12 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     @property
-    def window_host_hit_lengths(self) -> Mapping[ComponentType, int]:
-        """Host hit tokens per window slot, by tree component."""
+    def window_host_hit_lengths(self) -> Mapping[str, int]:
+        """Host hit tokens per window sub-pool."""
         plan = self.staged_prefetch_plan
         if plan is None:
             return self.matched_window_host_hit_lengths
-        return {ct: plan.window_tokens(ct) for ct in plan.windows}
+        return plan.window_host_hit_lengths()
 
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""

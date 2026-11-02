@@ -146,7 +146,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 best_match_node=result.last_device_node,
                 host_hit_length=external_hit,
                 window_host_hit_lengths=dict.fromkeys(
-                    self.window_slots(),
+                    (name for name, _ in self.window_sub_pools()),
                     min(external_hit, self.lmcache_connector.aligned_swa_window_size())
                     if self.is_swa_enabled
                     else 0,

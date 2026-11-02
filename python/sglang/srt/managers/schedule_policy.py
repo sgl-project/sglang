@@ -792,7 +792,7 @@ class PrefillAdder:
         extend_input_len: int,
         total_tokens: int,
         state_slots: int,
-        window_host_hit_lengths: Mapping[ComponentType, int],
+        window_host_hit_lengths: Mapping[str, int],
         chunk_limit: Optional[int],
     ) -> tuple[bool, Optional[int]]:
         return self.memory_budget.check_prefill(
@@ -1602,7 +1602,7 @@ class PrefillAdder:
         *,
         total_tokens: int,
         host_hit_length: int,
-        window_host_hit_lengths: Mapping[ComponentType, int],
+        window_host_hit_lengths: Mapping[str, int],
         truncation_align_size: Optional[int],
         has_chunked_req: bool = False,
         state_slots: int = 0,

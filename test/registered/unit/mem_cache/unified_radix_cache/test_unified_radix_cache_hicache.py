@@ -683,7 +683,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             "the full prefix stays servable",
         )
         self.assertGreaterEqual(
-            m.window_host_hit_lengths.get(ComponentType.SWA, 0),
+            max(m.window_host_hit_lengths.values(), default=0),
             1,
             "load-back armed for the host SWA KV",
         )
@@ -796,7 +796,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
         self.assertEqual(
-            result.window_host_hit_lengths.get(ComponentType.SWA, 0),
+            max(result.window_host_hit_lengths.values(), default=0),
             node_key_length(cache, leaf),
         )
 
@@ -819,7 +819,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(
-            result.window_host_hit_lengths.get(ComponentType.SWA, 0),
+            max(result.window_host_hit_lengths.values(), default=0),
             node_key_length(cache, leaf),
         )
 
@@ -898,7 +898,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
                 self.assertEqual(result.device_prefix_len, len(tokens) - host_tail)
                 self.assertEqual(result.host_hit_length, host_tail)
                 self.assertEqual(
-                    result.window_host_hit_lengths.get(ComponentType.SWA, 0), swa_host
+                    max(result.window_host_hit_lengths.values(), default=0), swa_host
                 )
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
@@ -921,7 +921,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         # SWA host hit goes to its window's entry; host_hit_length stays at 0.
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.window_host_hit_lengths.get(ComponentType.SWA, 0), ps)
+        self.assertEqual(max(result.window_host_hit_lengths.values(), default=0), ps)
 
     @requires_swa
     @requires(

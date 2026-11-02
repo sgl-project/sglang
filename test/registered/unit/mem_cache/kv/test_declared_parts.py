@@ -2106,6 +2106,10 @@ class TestDeclaredParts(CustomTestCase):
     def test_host_match_keeps_each_window_restore_length(self):
         from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.storage_prefetch import (
+            StagedPrefetchPlan,
+            WindowLoadBackPlan,
+        )
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
         root = object()
@@ -2141,22 +2145,29 @@ class TestDeclaredParts(CustomTestCase):
                     result.window_host_hit_lengths,
                     {TARGET_WINDOW: 4, DRAFT_WINDOW: 32},
                 )
+                # Outside the tree a request's hits go by sub-pool name.
                 req = Req.__new__(Req)
-                req.matched_window_host_hit_lengths = dict(
-                    result.window_host_hit_lengths
-                )
+                req.matched_window_host_hit_lengths = {"window_16": 4, "draft_swa": 32}
                 req.staged_prefetch_plan = None
                 self.assertEqual(
-                    req.window_host_hit_lengths,
-                    {TARGET_WINDOW: 4, DRAFT_WINDOW: 32},
+                    req.window_host_hit_lengths, {"window_16": 4, "draft_swa": 32}
                 )
-                req.staged_prefetch_plan = SimpleNamespace(
-                    windows={TARGET_WINDOW: None, DRAFT_WINDOW: None},
-                    window_tokens=lambda ct: 16,
+                req.staged_prefetch_plan = StagedPrefetchPlan(
+                    0,
+                    None,
+                    0,
+                    0,
+                    {
+                        TARGET_WINDOW: WindowLoadBackPlan(0, 16, ((0, 16),)),
+                        DRAFT_WINDOW: WindowLoadBackPlan(0, 16, ((0, 16),)),
+                    },
+                    window_sub_pools={
+                        TARGET_WINDOW: "window_16",
+                        DRAFT_WINDOW: "draft_swa",
+                    },
                 )
                 self.assertEqual(
-                    req.window_host_hit_lengths,
-                    {TARGET_WINDOW: 16, DRAFT_WINDOW: 16},
+                    req.window_host_hit_lengths, {"window_16": 16, "draft_swa": 16}
                 )
 
     def test_final_chunk_bounds_each_window_by_its_resolved_read_reach(self):
@@ -2236,7 +2247,7 @@ class TestDeclaredParts(CustomTestCase):
                     full_tokens=8,
                     extend_input_len=1,
                     max_new_tokens=400,
-                    window_host_hit_lengths={TARGET_WINDOW: 5, DRAFT_WINDOW: 9},
+                    window_host_hit_lengths={"window_16": 5, "draft_swa": 9},
                     chunk_limit=8,
                 )
                 self.assertEqual(demand.full_tokens, 416)
@@ -2273,9 +2284,6 @@ class TestDeclaredParts(CustomTestCase):
             sliding_window_size=16,
             # The target's window slot retains its own window; the draft's more.
             window_retain_size=lambda name: 16 if name == "window_16" else 32,
-            window_sub_pool_of_slot=lambda slot: (
-                "draft_swa" if slot == DRAFT_WINDOW else "window_16"
-            ),
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
@@ -2315,7 +2323,7 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(budget.check_prefill(**kwargs), (True, None))
         self.assertEqual(
             budget.check_prefill(
-                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: capacity}
+                **kwargs, window_host_hit_lengths={"draft_swa": capacity}
             ),
             (False, None),
         )
@@ -2327,34 +2335,34 @@ class TestDeclaredParts(CustomTestCase):
         )
         self.assertFalse(
             budget.prepare_load_back(
-                **prepare, window_host_hit_lengths={DRAFT_WINDOW: capacity}
+                **prepare, window_host_hit_lengths={"draft_swa": capacity}
             )
         )
         restore = min(32, capacity - 8)
         self.assertEqual(
             budget.check_prefill(
-                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: restore}
+                **kwargs, window_host_hit_lengths={"draft_swa": restore}
             ),
             (True, None),
         )
         budget.reserve(capacity, 0)
         self.assertEqual(
             budget.check_prefill(
-                **kwargs, window_host_hit_lengths={DRAFT_WINDOW: restore}
+                **kwargs, window_host_hit_lengths={"draft_swa": restore}
             ),
             (False, None),
         )
         budget = a.create_prefill_budget(cache)
         self.assertTrue(
             budget.prepare_load_back(
-                **prepare, window_host_hit_lengths={DRAFT_WINDOW: restore}
+                **prepare, window_host_hit_lengths={"draft_swa": restore}
             )
         )
         # Realize a window-only host restoration, then the promised joint
         # allocation. Admission must leave both in the same byte envelope.
         window = next(w for w in a._windows if w.sub_pool_name == "draft_swa")
         with budget.load_back_scope(
-            **prepare, window_host_hit_lengths={DRAFT_WINDOW: restore}
+            **prepare, window_host_hit_lengths={"draft_swa": restore}
         ):
             window.alloc_with_virtual(resident[:restore:4] // 4)
         self.assertIsNotNone(a.alloc(8))

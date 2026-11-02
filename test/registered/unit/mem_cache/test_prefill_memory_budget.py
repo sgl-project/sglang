@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -75,7 +74,6 @@ def _cache():
         sliding_window_size=8,
         # The target's window slot retains its own window; a draft window more.
         window_retain_size=lambda name: 8 if name == "window" else 32,
-        window_sub_pool_of_slot=lambda slot: "window",
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         window_evictable_size=lambda component: 0,
@@ -418,7 +416,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
     def test_host_swa_load_is_part_of_joint_demand(self):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
-        request = {**self.request, "window_host_hit_lengths": {ComponentType.SWA: 32}}
+        request = {**self.request, "window_host_hit_lengths": {"window": 32}}
         # The restored window rows count against every chunk of the request.
         self.assertEqual(
             self.budget.check_prefill(**{**request, "chunk_limit": None}),

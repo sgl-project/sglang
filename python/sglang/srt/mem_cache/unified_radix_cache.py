@@ -700,6 +700,14 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        # Outside the tree a window's host hit goes by its sub-pool's name.
+        if result.window_host_hit_lengths:
+            result = result._replace(
+                window_host_hit_lengths={
+                    self.window_sub_pool_of_slot(ct): n
+                    for ct, n in result.window_host_hit_lengths.items()
+                }
+            )
         # PD decode has no linker load-back path, so it only offloads.
         if (
             self.linker is not None

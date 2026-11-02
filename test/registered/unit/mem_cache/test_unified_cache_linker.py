@@ -696,7 +696,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.window_host_hit_lengths.get(ComponentType.SWA, 0), 2)
+        self.assertEqual(max(match.window_host_hit_lengths.values(), default=0), 2)
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])
@@ -1499,6 +1499,7 @@ def full_linker_component():
 def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )
