@@ -170,6 +170,14 @@ class TransferRelease:
         self.released = False
 
 
+class ReceiveHold(TransferRelease):
+    """Receive rows held in place until their destination is published: no
+    engine touches them yet, so nothing waits on them, but a relief keeps them
+    where they are when it can and an opportunistic compaction leaves them."""
+
+    __slots__ = ()
+
+
 def signals_of(key) -> Iterator:
     """The signals a wait or release key holds: a tuple holds several."""
     if isinstance(key, tuple):

@@ -322,6 +322,33 @@ def _local_reduce(flags, group, op):
     return flags
 
 
+class _HoldingStorage:
+    """The storage surface a deferred publish uses: the move count, the
+    receive-row hold, and network-transfer recording (none: no rows move)."""
+
+    owner = "full"
+
+    def __init__(self, epochs=(0,)):
+        self._epochs = iter(epochs)
+        self._epoch = 0
+        self.holds = {}
+        self.ended = []
+
+    def move_epoch(self):
+        self._epoch = next(self._epochs, self._epoch)
+        return self._epoch
+
+    def hold_receive_rows(self, req, *, token_start, token_end, signal):
+        self.holds[req.rid] = (token_start, token_end, signal)
+
+    def end_receive_hold(self, req):
+        self.holds.pop(req.rid, None)
+        self.ended.append(req.rid)
+
+    def record_network_transfer(self, *args, **kwargs):
+        return None
+
+
 class TestDeferredDestinationPublish(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -331,6 +358,13 @@ class TestDeferredDestinationPublish(CustomTestCase):
             patcher = patch(f"sglang.srt.disaggregation.decode.torch.cuda.{target}")
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.storage = _HoldingStorage()
+        patcher = patch(
+            "sglang.srt.disaggregation.decode.kv_storage_of",
+            side_effect=lambda *_: self.storage,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _deferring_queue(self, decode_reqs):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -365,9 +399,14 @@ class TestDeferredDestinationPublish(CustomTestCase):
             page_size=1,
             state=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
+            window_pool_names=lambda: (),
         )
-        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
+        queue.transfer_queue = SimpleNamespace(
+            queue=[], enable_staging=False, enable_deferred_kv_release=False
+        )
         queue.tree_cache = MagicMock()
         queue.scheduler = MagicMock(
             enable_priority_scheduling=False,
@@ -442,6 +481,28 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(queue._pending_publish, [])
         self.assertFalse(queue.has_published_destinations)
 
+    def test_deferred_publish_waits_for_a_page_move_since_its_allocation(self):
+        """A page move between the allocation and the deferred publish rebinds
+        the destination ids on the schedule stream, so the publish reads them
+        back after that stream instead of after the allocation alone."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        queue = self._deferring_queue([decode_req])
+        # A relief that could not keep the held rows moved pages in between.
+        self.storage = _HoldingStorage(epochs=(0, 1))
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        queue.note_destinations_queued(1)
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            queue.publish_pending_destinations()
+
+        queue._publish_stream.wait_event.assert_not_called()
+        queue._publish_stream.wait_stream.assert_called_once()
+        receiver.send_metadata.assert_called_once()
+        self.assertEqual(self.storage.ended, ["deferred"])
+
     def test_inline_publish_holds_the_send_until_the_forward_is_done(self):
         """Where the deferred publish is off (staging, HiSparse, no WAR
         barrier), overlap still reuses pages the in-flight forward may write, so
@@ -501,16 +562,30 @@ class TestDeferredDestinationPublish(CustomTestCase):
             transfer.publish_pending_metadata()
         queue._submit_prefill_recompute.assert_called_once_with(decode_req)
 
-    def test_deferred_destination_closes_the_move_gate_until_queued(self):
-        """A later allocation in the same pop must not let unified-memory compaction
-        move a deferred request's pages before its publish reads them back."""
+    def test_deferred_destination_holds_its_rows_until_published(self):
+        """A later allocation in the same pop must not move a deferred
+        request's rows before its publish reads their ids back. Unified memory
+        keeps no pool-wide move gate: the deferral holds the request's receive
+        rows in place, which a relief keeps whenever it can, until the publish
+        has recorded the rows' transfer. The destination still counts as
+        published until the transfer queue takes it."""
         queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
 
         queue.pop_preallocated()
 
         self.assertTrue(queue.has_published_destinations)
+        start, end, signal = self.storage.holds["deferred"]
+        self.assertEqual((start, end), (0, 5))
+        self.assertIs(signal, queue._pending_publish[0].allocated)
         queue.note_destinations_queued(1)
         self.assertFalse(queue.has_published_destinations)
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            queue.publish_pending_destinations()
+        self.assertEqual(self.storage.holds, {})
+        self.assertEqual(self.storage.ended, ["deferred"])
 
     def test_released_receiver_keeps_the_publish_reduction_aligned(self):
         """A pending request the transfer queue released keeps its slot in the
@@ -535,6 +610,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertIs(queue._publish_destination.call_args.kwargs["decode_req"], live)
         self.assertTrue(released.awaiting_publish)
         self.assertFalse(live.awaiting_publish)
+        # Both holds end: the released one unpublished, the live one published.
+        self.assertEqual(self.storage.ended, ["deferred", "deferred"])
 
 
 if __name__ == "__main__":

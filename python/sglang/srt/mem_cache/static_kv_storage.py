@@ -419,6 +419,10 @@ class StaticKVStorage:
         """See `KVStorage.record_forward`: static pools never move a row, so
         nothing races a forward."""
 
+    def move_epoch(self) -> int:
+        """See `KVStorage.move_epoch`: static pools never move a row."""
+        return 0
+
     def retire_forward(self, forward_done) -> None:
         """See `KVStorage.retire_forward`: nothing was recorded."""
 
@@ -434,6 +438,14 @@ class StaticKVStorage:
 
     def end_network_transfer(self, req: Req) -> None:
         """Rows of a static pool are not ordered against network transfers."""
+
+    def hold_receive_rows(
+        self, req: Req, *, token_start: int, token_end: int, signal
+    ) -> None:
+        """See `KVStorage.hold_receive_rows`: static rows never move."""
+
+    def end_receive_hold(self, req: Req) -> None:
+        """See `KVStorage.end_receive_hold`: nothing was held."""
 
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.

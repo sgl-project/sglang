@@ -1342,6 +1342,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     rows = band.network_rows()
                     if rows:
                         band.fix_pages(_NETWORK_ROWS, sorted(rows))
+                        band.holds_fixed = True
                         held = True
             found = (
                 first_plan(self.pricing_snapshot(), demands, growth=self._growth)
@@ -1351,6 +1352,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             if found is None and held:
                 for band in self.bands:
                     band.unfix_pages(_NETWORK_ROWS)
+                    band.holds_fixed = False
                 held = False
             if found is None:
                 found = first_plan(
@@ -1361,6 +1363,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             for band in self.bands:
                 if held:
                     band.unfix_pages(_NETWORK_ROWS)
+                band.holds_fixed = False
                 band.end_relief()
 
     def _lay_out(self, plan: TakePlan) -> None:

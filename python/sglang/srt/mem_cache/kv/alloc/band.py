@@ -54,6 +54,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.mem_cache.kv.alloc.signals import (
+    ReceiveHold,
     TransferRelease,
     signal_fired,
     wait_signals,
@@ -291,6 +292,13 @@ class Band:
         # transfers, and pages a move vacated while readers could still read
         # them (`PageUsage`).
         self.usage = PageUsage()
+        # Page-move batches issued; ids resolved off the schedule stream compare it.
+        self.moves = 0
+        # Move batches that may have moved a held receive row (one issued
+        # while a hold is open and not fixed in place), and whether a relief
+        # has the held rows fixed now.
+        self.held_row_moves = 0
+        self.holds_fixed = False
         # Cumulative observability counters (NOT reset at clear()).
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
@@ -1233,11 +1241,19 @@ class Band:
         """
         # Callers keep fixed pages out of `src_pages`.
         v_moved = self.ids.physical_to_virtual[src_pages].clone()  # read pre-wipe
+        self._count_move_batch()
         self._move_pages(src_pages, dst_pages)
         self.ids.virtual_to_physical[v_moved] = dst_pages
         self.ids.physical_to_virtual[dst_pages] = v_moved
         self._inverse_history.append((src_pages, dst_pages, v_moved))
         return v_moved
+
+    def _count_move_batch(self) -> None:
+        """Count a page-move batch, every path that rebinds moved pages."""
+        self.moves += 1
+        if not self.holds_fixed and self.usage.holds_receive_rows():
+            # A held receive row may be among the pages moved.
+            self.held_row_moves += 1
 
     def _move_pages(self, src_pages: torch.Tensor, dst_pages: torch.Tensor) -> None:
         # Whole page envelopes by physical page id, at most `_move_max_pages`
@@ -1383,7 +1399,13 @@ class Band:
         if self._relief_sets is not None:
             return list(self._relief_sets[1])
         self.usage.prune()
-        transfers = self.usage.transfers()
+        # Held receive rows: nothing touches them yet, so no copy or free
+        # waits on them; only a relief resolves them (`network_rows`).
+        transfers = [
+            use
+            for use in self.usage.transfers()
+            if not isinstance(use.release, ReceiveHold)
+        ]
         if not transfers:
             return []
         with record_function("Band._transfer_page_sets"):
@@ -1594,7 +1616,14 @@ class Band:
             if release is not None and not release.released:
                 rows.update(pages)
         rows.update(self.usage.network_held_pending())
-        return rows
+        # Receive rows held for a publish still to come: by id until now.
+        for use in self.usage.transfers():
+            if isinstance(use.release, ReceiveHold) and not use.release.released:
+                rows.update(self._physical_pages_of(use.ids, widened=False))
+        # Rows recorded by controller id that this band does not bind (a
+        # window's rows outside its tail) translate to the reserved pages
+        # below the band, which never move.
+        return {page for page in rows if page >= self.min_page_index}
 
     def has_network_rows(self) -> bool:
         """Whether a network transfer is unreleased on this band, or a page
@@ -1811,6 +1840,11 @@ class Band:
         if not self.lazy_compaction:
             return 0
         self.usage.prune()
+        if not urgent and self.usage.holds_receive_rows():
+            # Receive rows wait for their publish: leave them, and read
+            # nothing of them on the device, for the step until it.
+            self._drain_pending_reuse(urgent=False)
+            return 0
         # Read the transfers' pages and the recent holes on the host before
         # any stream wait below.
         transfer_sets = self._transfer_page_sets()
@@ -2081,6 +2115,7 @@ class Band:
                 (v_moveds_t >= 0).all(),
                 "invalid p2v mapping in Band._flush",
             )
+            self._count_move_batch()
             self._move_pages(src_pages_t, dst_pages_t)
             # ONE bulk remap (single-writer on schedule_stream), issued after the
             # copies on the same stream: work ordered after it sees moved pages.

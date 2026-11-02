@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.kv.advance import (
 from sglang.srt.mem_cache.kv.alloc.signals import (
     CompletionFlag,
     CompletionFlagPool,
+    ReceiveHold,
     TransferRelease,
 )
 from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
@@ -135,6 +136,9 @@ class KVStorage:
         # Network transfers in flight, per request: the completion flag a
         # stream waits on and the logical release every rank sets alike.
         self._network_transfers: Dict[str, Tuple[CompletionFlag, TransferRelease]] = {}
+        # Receive rows held for a destination publish still to come, per
+        # request: their logical release.
+        self._receive_holds: Dict[str, ReceiveHold] = {}
         self._network_flags: Optional[CompletionFlagPool] = None
         # Readers reaching a window further back than its own layers (a fused
         # draft's front rows), by sub-pool, and the length of a window the
@@ -908,9 +912,49 @@ class KVStorage:
         )
         return flag
 
+    def hold_receive_rows(
+        self, req: Req, *, token_start: int, token_end: int, signal
+    ) -> None:
+        """A decode node took ``req``'s receive rows (its tokens
+        ``[token_start, token_end)``, every window's rows among them, and its
+        state slots) and will publish their physical ids to the peer later,
+        reading them back off the schedule stream. Until `end_receive_hold`
+        the rows count as rows a network transfer writes: a relief keeps them
+        in place whenever a layout serves its demand that way, and an
+        opportunistic compaction stops at them. If a relief must move them
+        anyway, the move bumps `move_epoch` and the publish orders its
+        readback after the schedule stream. ``signal`` is the allocation's
+        event. The rows are recorded by id and resolved only when a relief
+        reads them, before its first wait, so nothing else pays a device
+        read for them."""
+        release = ReceiveHold()
+        self._receive_holds[req.rid] = release
+        tokens = self.requests.req_to_token[req.kv.req_pool_idx, token_start:token_end]
+        roles = self._allocator.roles
+        members = [roles.owner, *self._allocator.window_allocators]
+        for sub_pool in members:
+            self._member(sub_pool).record_transfer(
+                signal, tokens, writes=True, release=release
+            )
+        if roles.state is not None and req.kv.holds_mamba:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            self._member(roles.state).record_transfer(
+                signal, slots, writes=True, release=release
+            )
+
+    def end_receive_hold(self, req: Req) -> None:
+        """The hold `hold_receive_rows` took ends: the publish recorded the
+        rows' transfer itself, or the request left before publishing."""
+        release = self._receive_holds.pop(req.rid, None)
+        if release is not None:
+            release.released = True
+
     def end_network_transfer(self, req: Req) -> None:
         """The request's network transfers ended, or its row is released (main's
         release point for a failed transfer): every rank reaches this alike."""
+        self.end_receive_hold(req)
         transfer = self._network_transfers.pop(req.rid, None)
         if transfer is None:
             return
@@ -967,6 +1011,14 @@ class KVStorage:
             state,
             token_writes_unknown=token_writes_unknown,
         )
+
+    def move_epoch(self) -> int:
+        """How many page-move batches may have moved a held receive row (see
+        `hold_receive_rows`): ones issued while a hold was open and not fixed
+        in place. A held row's ids, resolved on another stream, stay valid
+        while it is unchanged; after such a move the reader must order itself
+        after the schedule stream."""
+        return sum(band.held_row_moves for band in self._allocator.bands)
 
     def retire_forward(self, forward_done: torch.cuda.Event) -> None:
         """The scheduler processed the result of the forward recorded with

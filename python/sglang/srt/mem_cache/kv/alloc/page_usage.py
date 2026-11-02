@@ -16,7 +16,11 @@ from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.kv.alloc.signals import TransferRelease, signal_fired
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    ReceiveHold,
+    TransferRelease,
+    signal_fired,
+)
 
 FORWARD = "forward"
 TRANSFER = "transfer"
@@ -284,6 +288,15 @@ class PageUsage:
 
     def transfers(self) -> List[PageUse]:
         return [use for use in self.uses if use.kind == TRANSFER]
+
+    def holds_receive_rows(self) -> bool:
+        """Whether receive rows are held for a publish still to come."""
+        return any(
+            use.kind == TRANSFER
+            and isinstance(use.release, ReceiveHold)
+            and not use.release.released
+            for use in self.uses
+        )
 
     def writes_unknown(self) -> bool:
         return any(use.kind == FORWARD and use.ids is None for use in self.uses)

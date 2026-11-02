@@ -421,6 +421,8 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
+    # The pool's page-move count at allocation (`move_epoch`).
+    move_epoch: int = 0
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1208,6 +1210,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        if self._pending_publish:
+            storage = self._storage()
+            for entry in self._pending_publish:
+                storage.end_receive_hold(entry.decode_req.req)
         self._pending_publish.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(
@@ -1869,11 +1875,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 assert decode_req.metadata_buffer_index is not None
                 decode_req.awaiting_publish = True
                 decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
-                # Counted as published until extend(): a later allocation in this
-                # loop must not compact (move) pages the publish will read back.
+                # Counted as published until extend().
                 self._num_published_destinations += 1
                 allocated = torch.cuda.Event()
                 allocated.record()
+                storage = self._storage()
+                # The publish reads these rows' ids back later, off the
+                # schedule stream: keep them in place until then whenever a
+                # relief can, and if one must move them, the publish orders
+                # its readback after the move (`move_epoch`).
+                storage.hold_receive_rows(
+                    decode_req.req,
+                    token_start=total_prefix_len,
+                    token_end=fill_len,
+                    signal=allocated,
+                )
+                move_epoch = storage.move_epoch()
                 self._pending_publish.append(
                     _PendingPublish(
                         allocated=allocated,
@@ -1882,6 +1899,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_len,
                         fill_len=fill_len,
+                        move_epoch=move_epoch,
                     )
                 )
             else:
@@ -1931,15 +1949,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             group=self.gloo_group,
             op=dist.ReduceOp.MIN,
         )
+        storage = self._storage()
         for entry, poll in zip(pending, polls):
             if poll == KVPoll.Failed:
                 # Aborted before its destination was published: nothing to send,
                 # the transfer queue releases it.
+                storage.end_receive_hold(entry.decode_req.req)
                 continue
             entry.decode_req.awaiting_publish = False
-            # Gate the readback on this allocation only, not on the forward the
-            # schedule stream has been fenced behind since.
-            self._publish_stream.wait_event(entry.allocated)
+            if storage.move_epoch() == entry.move_epoch:
+                # Gate the readback on this allocation only, not on the forward
+                # the schedule stream has been fenced behind since.
+                self._publish_stream.wait_event(entry.allocated)
+            else:
+                # A page move since the allocation rebinds these ids on the
+                # schedule stream: read them back after it.
+                self._publish_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
@@ -1949,6 +1974,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     fill_len=entry.fill_len,
                     metadata_buffer_preassigned=True,
                 )
+            # The publish recorded the rows' transfer: the hold has done its part.
+            storage.end_receive_hold(entry.decode_req.req)
             # The publish counted it again; the transfer queue has held it since.
             self.note_destinations_queued(1)
         # Order the publish stream's writes (e.g. request-state clears) before

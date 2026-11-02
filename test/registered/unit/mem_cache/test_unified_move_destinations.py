@@ -14,7 +14,11 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.signals import CompletionFlags, TransferRelease
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    CompletionFlags,
+    ReceiveHold,
+    TransferRelease,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -270,6 +274,64 @@ class TestReliefsAroundNetworkRows(_Chain):
         self.assertTrue(laid.query(), "the relief waited the send's flag")
         self.assertIn(row_page, full.usage.pending_pages)
         self.assertNotIn(row_page, full._free_pages_snapshot())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestReliefsAroundHeldReceiveRows(TestReliefsAroundNetworkRows):
+    """A decode node holds a request's receive rows from their allocation until
+    it publishes their ids, which it reads back off the schedule stream. A
+    relief keeps them in place when it can; one that must move them counts a
+    held-row move, after which the publish reads the ids back behind the
+    schedule stream and finds the rows' new pages."""
+
+    def _hold(self, full, row):
+        allocated = torch.cuda.Event()
+        allocated.record()
+        hold = ReceiveHold()
+        full.record_transfer(allocated, row, writes=True, release=hold)
+        return hold
+
+    @staticmethod
+    def _held_row_moves(alloc):
+        return sum(band.held_row_moves for band in alloc.bands)
+
+    def test_held_rows_stay_in_place_when_a_layout_allows(self):
+        pool, alloc, full, row, row_page, schedule, side = self._owner_with_holes()
+        hold = self._hold(full, row)
+        with torch.cuda.stream(schedule):
+            # An idle compaction leaves the rows until their publish.
+            self.assertEqual(full.flush_opportunistic(), 0)
+        laid = self._lay_out(alloc, schedule, self.AROUND_THE_ROW)
+        laid.synchronize()
+        self.assertEqual(int(full.ids.virtual_to_physical[row][0]), row_page)
+        # The publish needs no ordering behind the schedule stream.
+        self.assertEqual(self._held_row_moves(alloc), 0)
+        self.assertFalse(full.fixed_pages(), "the relief left the rows fixed")
+        hold.released = True
+        with torch.cuda.stream(schedule):
+            self.assertGreater(full.flush_opportunistic(), 0)
+
+    def test_held_rows_a_relief_must_move_are_read_back_at_their_new_pages(self):
+        pool, alloc, full, row, row_page, schedule, side = self._owner_with_holes()
+        epp = full.entry_bytes_per_page
+        pool.raw[row_page * epp : (row_page + 1) * epp].fill_(7)
+        torch.cuda.synchronize()
+        self._hold(full, row)
+        before = self._held_row_moves(alloc)
+        laid = self._lay_out(alloc, schedule, self.ONLY_WITH_THE_ROW_MOVED)
+        # Nothing writes held rows yet: the move waits on no peer.
+        laid.synchronize()
+        self.assertGreater(self._held_row_moves(alloc), before)
+        # The publish's readback, ordered behind the schedule stream.
+        with torch.cuda.stream(side):
+            side.wait_stream(schedule)
+            read_back = full.ids.virtual_to_physical[row].clone()
+        side.synchronize()
+        moved_to = int(read_back[0])
+        self.assertNotEqual(moved_to, row_page)
+        self.assertTrue(
+            bool((pool.raw[moved_to * epp : (moved_to + 1) * epp] == 7).all())
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
