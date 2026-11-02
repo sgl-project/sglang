@@ -39,6 +39,36 @@ const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 const MEDIA_PARTS: &[&str] = &["image_url", "input_image", "video_url", "audio_url"];
 
+/// Dynamo's HF formatter rewrites message contents (joining text parts or
+/// wrapping strings in lists). SGLang has already normalized them, so restore
+/// that context immediately before evaluating the template. Generic callers
+/// without this private context keep Dynamo's normal rendering path.
+pub(crate) fn preserve_messages(config: &mut Value) -> String {
+    let source = config["chat_template"].to_string();
+    let mut context = "__sglang_minimax_m3_messages".to_owned();
+    while source.contains(&context) {
+        context.push('_');
+    }
+    let wrap = |template: &mut Value| {
+        if let Some(source) = template.as_str() {
+            *template = format!(
+                "{{% if {context} is defined %}}{{% set messages = {context} %}}{{% endif +%}}{source}"
+            )
+            .into();
+        }
+    };
+    match &mut config["chat_template"] {
+        template @ Value::String(_) => wrap(template),
+        Value::Array(templates) => {
+            for templates in templates.iter_mut().filter_map(Value::as_object_mut) {
+                templates.values_mut().for_each(wrap);
+            }
+        }
+        _ => {}
+    }
+    context
+}
+
 /// `template_detection._is_minimax_m3`: M3's think tags or its tool-call namespace token.
 pub(crate) fn is_minimax_m3(template: &str) -> bool {
     template.contains("<mm:think>") || template.contains("]<]minimax[>[")
@@ -55,6 +85,8 @@ pub(crate) fn prints_arguments_as_xml(template: &str) -> bool {
 pub(crate) fn render(
     formatter: &PromptFormatter,
     xml_arguments: bool,
+    content_parts: Option<bool>,
+    message_context: &str,
     mut request: Value,
     defaults: &HashMap<String, Value>,
 ) -> Result<(String, String), RenderError> {
@@ -63,7 +95,7 @@ pub(crate) fn render(
     };
     let mut messages: Vec<Value> = messages.into_iter().map(engine_message).collect();
     validate(&request, &messages).map_err(RenderError::Failed)?;
-    let args = template_args(&request, defaults)?;
+    let mut args = template_args(&request, defaults)?;
     let tools = template_tools(&request)?;
     for message in &mut messages {
         parse_tool_arguments(message)?;
@@ -78,15 +110,25 @@ pub(crate) fn render(
     // The template renders tool results by position, not by `tool_call_id`.
     let mut messages = canonical_tool_order(messages)
         .into_iter()
-        .map(template_message)
+        .map(|message| template_message(message, content_parts))
         .collect::<Result<Vec<_>, _>>()?;
     let prefix = split_continuation(&mut messages, continues_final_message(&request)?);
     // `apply_chat_template` fails on an empty conversation.
     if messages.is_empty() {
         return Err("no messages to render".into());
     }
-    for message in &mut messages {
-        join_text_parts(message)?;
+    // Keep the existing fallback for non-empty lists containing only empty
+    // text. In particular, the system/root fixtures still differ on whether
+    // such a turn renders the default prompt or an empty block.
+    if messages.iter().any(|message| {
+        message["content"].as_array().is_some_and(|parts| {
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|part| part["text"].as_str().is_none_or(str::is_empty))
+        })
+    }) {
+        return Err(RenderError::Declined("content parts with no text".into()));
     }
     if messages
         .iter()
@@ -98,11 +140,12 @@ pub(crate) fn render(
         ));
     }
     let PromptFormatter::OAI(formatter) = formatter;
+    args.insert(message_context.into(), Value::Array(messages));
     let prompt = formatter
         .render(&TemplateRequest {
-            messages,
             tools,
             args,
+            message_context,
         })
         .map_err(|error| format!("{error:#}"))?;
     Ok((prompt, prefix))
@@ -389,9 +432,9 @@ fn canonical_tool_order(messages: Vec<Value>) -> Vec<Value> {
 }
 
 /// The message SGLang's Jinja path hands the template: content as
-/// `process_content_for_template_format` (the openai format) and
+/// `process_content_for_template_format` (the selected template's format) and
 /// `normalize_tool_content` leave it.
-fn template_message(mut message: Value) -> Result<Value, RenderError> {
+fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<Value, RenderError> {
     if let Some(fields) = message.as_object_mut() {
         // Only request tools reach the template; Dynamo rejects message-level ones.
         fields.remove("tools");
@@ -399,6 +442,9 @@ fn template_message(mut message: Value) -> Result<Value, RenderError> {
     let Some(parts) = message["content"].as_array() else {
         return Ok(message);
     };
+    let content_parts = content_parts.ok_or_else(|| {
+        RenderError::Declined("cannot determine the template's content format".into())
+    })?;
     let mut texts = Vec::new();
     let mut references = false;
     for part in parts {
@@ -413,10 +459,10 @@ fn template_message(mut message: Value) -> Result<Value, RenderError> {
     }
     // The template skips a `tool_reference` part, but prints one in a tool result as
     // a Python dict, and a turn of only references still counts as content.
-    if references && (message["role"] == "tool" || texts.is_empty()) {
+    if content_parts && references && (message["role"] == "tool" || texts.is_empty()) {
         return Err(RenderError::Declined("tool_reference parts".into()));
     }
-    message["content"] = if message["role"] == "tool" {
+    message["content"] = if !content_parts || message["role"] == "tool" {
         let texts: Vec<_> = texts.iter().filter_map(Value::as_str).collect();
         texts.join(" ").into()
     } else {
@@ -428,43 +474,20 @@ fn template_message(mut message: Value) -> Result<Value, RenderError> {
     Ok(message)
 }
 
-/// The template concatenates text parts, where Dynamo joins them with newlines.
-///
-/// A non-empty parts list whose texts join to `""` is truthy in the template's
-/// `{%- if message.content -%}` checks — Python hands it the list, so a system
-/// or root message renders an empty block rather than the default prompt.
-/// Joining it to `""` would be falsy, so decline instead of mis-rendering.
-fn join_text_parts(message: &mut Value) -> Result<(), RenderError> {
-    if let Some(parts) = message["content"]
-        .as_array()
-        .filter(|parts| !parts.is_empty())
-    {
-        let text: String = parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect();
-        if text.is_empty() {
-            return Err(RenderError::Declined("content parts with no text".into()));
-        }
-        message["content"] = text.into();
-    }
-    Ok(())
-}
-
 /// The template context SGLang builds, as the request Dynamo renders.
-struct TemplateRequest {
-    messages: Vec<Value>,
+struct TemplateRequest<'a> {
     tools: Option<Vec<Value>>,
     args: HashMap<String, Value>,
+    message_context: &'a str,
 }
 
-impl OAIChatLikeRequest for TemplateRequest {
+impl OAIChatLikeRequest for TemplateRequest<'_> {
     fn model(&self) -> String {
         String::new()
     }
 
     fn messages(&self) -> minijinja::Value {
-        minijinja::Value::from_serialize(&self.messages)
+        minijinja::Value::from_serialize(&self.args[self.message_context])
     }
 
     fn tools(&self) -> Option<minijinja::Value> {

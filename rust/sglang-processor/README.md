@@ -122,12 +122,22 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
 
+MiniMax template overrides retain the checkpoint's request rules, but
+`content_format.rs` detects the replacement template's content format as Python
+does. String templates receive text parts joined with spaces; OpenAI-format
+templates receive the individual parts. The renderer restores these prepared
+messages in the template context so Dynamo cannot flatten or wrap them again.
+Unknown content formats and non-empty parts lists containing only empty text
+retain the host fallback.
+
 **Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
 SGLang's Python serving path rendered and tokenized, written by
 `tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture. To
 add a model, follow the
 [`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
 skill.
+MiniMax cases can additionally carry `chat_template` to exercise a server-side
+template override with the same checkpoint tokenizer.
 
 ## parser
 

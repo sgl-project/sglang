@@ -144,7 +144,13 @@ impl ChatFormatter {
         );
         let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
         let thinking = ThinkingTemplates::from_config(config);
-        let template: ChatTemplate = serde_json::from_value(config.clone())
+        let mut render_config = config.clone();
+        let message_context = if minimax_m3 && !glm53 {
+            super::models::preserve_minimax_messages(&mut render_config)
+        } else {
+            String::new()
+        };
+        let template: ChatTemplate = serde_json::from_value(render_config)
             .map_err(|source| TemplateError::Config { source })?;
         if template.chat_template.is_none() {
             return Err(TemplateError::Missing);
@@ -162,9 +168,13 @@ impl ChatFormatter {
         } else if minimax_m3 {
             Self::MiniMaxM3 {
                 formatter,
+                message_context,
                 xml_arguments: config["chat_template"]
                     .as_str()
                     .is_some_and(prints_arguments_as_xml),
+                content_parts: config["chat_template"]
+                    .as_str()
+                    .and_then(super::content_format::takes_content_parts),
             }
         } else if let Some(template) = qwen38 {
             Self::Qwen38 {

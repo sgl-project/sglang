@@ -10,6 +10,7 @@ use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, R
 use serde_json::Value;
 use thiserror::Error;
 
+mod content_format;
 mod legacy;
 mod loader;
 mod models;
@@ -71,6 +72,10 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         /// The template prints tool-call argument scalars through M3's `to_xml`.
         xml_arguments: bool,
+        /// Python's content format; unknown formats decline parts-list requests.
+        content_parts: Option<bool>,
+        /// Private context key, chosen not to collide with template variables.
+        message_context: String,
     },
     /// Qwen3.8's Jinja template, which `render_request` renders as SGLang does.
     Qwen38 {
@@ -182,7 +187,17 @@ impl ChatFormatter {
             ChatFormatter::MiniMaxM3 {
                 formatter,
                 xml_arguments,
-            } => render_minimax_m3(formatter, *xml_arguments, request, default_kwargs).map(text),
+                content_parts,
+                message_context,
+            } => render_minimax_m3(
+                formatter,
+                *xml_arguments,
+                *content_parts,
+                message_context,
+                request,
+                default_kwargs,
+            )
+            .map(text),
             ChatFormatter::Qwen38 {
                 formatter,
                 content_parts,
