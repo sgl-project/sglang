@@ -4,8 +4,8 @@
 use anyhow::{Context, Result};
 use dynamo_tokenizers::{
     create_tokenizer_from_file, create_tokenizer_from_file_with_options, traits,
-    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, FastTokenizer, Tokenizer,
-    TokenizerOptions,
+    traits::DecodeResult, CacheTokenUsage, CachedTokenizer, EncodeSegment, Encoding,
+    FastTikTokenTokenizer, FastTokenizer, TokenIdType, Tokenizer, TokenizerOptions,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -216,19 +216,90 @@ fn with_l1(
         })))
 }
 
-/// Build the encoder for `backend`; `fast` falls back to HF when fastokens cannot load the file.
+/// fastokens over a tiktoken model, with tiktoken-rs for the one input fastokens
+/// encodes differently from the engine: U+017F (long s) right after an apostrophe,
+/// which tiktoken's `(?i:'s)` case-folds into the contraction and fastokens' scanner
+/// does not. Every other input encodes on fastokens.
+struct GuardedFastTiktoken {
+    fast: FastTikTokenTokenizer,
+    reference: Arc<dyn traits::Tokenizer>,
+}
+
+/// UTF-8 of U+017F.
+const LONG_S: [u8; 2] = [0xC5, 0xBF];
+
+fn has_long_s(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|w| w == LONG_S)
+}
+
+impl traits::Encoder for GuardedFastTiktoken {
+    fn encode(&self, input: &str) -> Result<Encoding> {
+        if has_long_s(input) {
+            self.reference.encode(input)
+        } else {
+            self.fast.encode(input)
+        }
+    }
+
+    fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
+        inputs.iter().map(|input| self.encode(input)).collect()
+    }
+
+    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<Encoding> {
+        if segments.iter().any(|segment| has_long_s(segment.text)) {
+            self.reference.encode_segments(segments)
+        } else {
+            self.fast.encode_segments(segments)
+        }
+    }
+}
+
+impl traits::Decoder for GuardedFastTiktoken {
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<DecodeResult> {
+        self.fast.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl traits::Tokenizer for GuardedFastTiktoken {
+    fn validate_prefix_cache(&self) -> Result<()> {
+        self.fast.validate_prefix_cache()
+    }
+
+    fn token_to_id(&self, token: &str) -> Result<Option<TokenIdType>> {
+        self.fast.token_to_id(token)
+    }
+
+    fn special_token_ids(&self) -> Result<Vec<TokenIdType>> {
+        self.fast.special_token_ids()
+    }
+
+    fn num_special_tokens_added(&self) -> Result<usize> {
+        self.fast.num_special_tokens_added()
+    }
+}
+
+/// Build the encoder for `backend`; `fast` falls back to the default backend for the
+/// file type when fastokens cannot load it.
 fn encoder(
     path: &str,
     backend: TokenizerBackend,
 ) -> Result<(Arc<dyn traits::Tokenizer>, EncodeBackend)> {
     if !path.ends_with(".json") {
-        if backend == TokenizerBackend::Fast {
-            tracing::warn!(
-                path,
-                "fastokens needs a tokenizer.json; encoding on tiktoken"
-            );
+        let reference = create_tokenizer_from_file(path)?;
+        if backend != TokenizerBackend::Fast {
+            return Ok((reference, EncodeBackend::Tiktoken));
         }
-        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+        return match FastTikTokenTokenizer::from_file_auto(path) {
+            Ok(fast) => Ok((
+                Arc::new(GuardedFastTiktoken { fast, reference }),
+                EncodeBackend::FastTiktoken,
+            )),
+            Err(e) => {
+                tracing::warn!(path, error = %format!("{e:#}"),
+                    "fastokens cannot load this tiktoken model; encoding on tiktoken");
+                Ok((reference, EncodeBackend::Tiktoken))
+            }
+        };
     }
     if backend == TokenizerBackend::Fast {
         match FastTokenizer::from_file(path) {

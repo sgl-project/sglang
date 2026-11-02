@@ -4,7 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported
@@ -115,7 +116,7 @@ def dequantize_k_cache_paged_v41(
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
-        supported = get_jit_cuda_arch().major >= 10
+        supported = current_arch().is_sm_at_least(10)
     if not supported:
         raise RuntimeError(
             "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer, or gfx950"
