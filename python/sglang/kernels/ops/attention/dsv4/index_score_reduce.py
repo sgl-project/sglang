@@ -50,8 +50,7 @@ def _reduce_32_heads(
     acc1 = tl.full((block,), 0.0, tl.float32)
     acc2 = tl.full((block,), 0.0, tl.float32)
     acc3 = tl.full((block,), 0.0, tl.float32)
-    # Torch Reduce.cuh uses vt0=4 independent accumulators for this strided sum.
-    # A generic parallel head reduction changes rare BF16 halfway rounding cases.
+    # Four interleaved accumulators match Torch Reduce.cuh (vt0=4) exactly.
     for group in tl.static_range(8):
         acc0 = acc0 + _head_product(
             scores,
@@ -112,9 +111,18 @@ def _reduce_32_heads(
 
 def reduce_head_scores(scores: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     assert scores.ndim == 3 and weights.shape == scores.shape[:2]
-    assert scores.dtype == weights.dtype == torch.bfloat16
     rows, heads, width = scores.shape
-    if heads != 32 or width <= 1:
+    # Width 1 uses a different Torch reduction order; width 0 has no columns.
+    if (
+        not scores.is_cuda
+        or torch.version.hip is not None
+        or scores.dtype != torch.bfloat16
+        or weights.dtype != torch.bfloat16
+        or heads != 32
+        or width <= 1
+        # Head-contiguous layouts also use Torch's parallel reduction order.
+        or scores.stride(1) <= scores.stride(2)
+    ):
         return (scores.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
     out = torch.empty((rows, width), device=scores.device, dtype=torch.float32)
     if rows:
