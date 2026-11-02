@@ -952,8 +952,7 @@ class MiniMaxM3Attention(nn.Module):
             and self.idx_head_dim == 128
             and self.rotary_emb.cos_sin_cache.dtype == torch.float32
         )
-        # Only the NVFP4 backend consumes FP8 Q; gate on the predicate that
-        # selects it and its KV pool, so the three cannot disagree.
+        # only the Blackwell NVFP4 backend consumes FP8 Q; gate on the predicate that selects it
         self._fp8_q_epilogue_ok = (
             self._combined_qknorm_ok
             and envs.SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE.get()

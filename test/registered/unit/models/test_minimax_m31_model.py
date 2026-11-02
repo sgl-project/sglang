@@ -303,6 +303,16 @@ class TestMiniMaxM31Rocm(CustomTestCase):
         with override_platform(is_blackwell=True, is_sm100=True, is_hip=False):
             _minimax_m3_overrides(rocm_server_args(tp_size=8), NVFP4)
 
+    def test_nvfp4_on_rocm_requires_gfx950(self):
+        """Off gfx950 the override would pick the CUDA-only Marlin and FA3 backends."""
+        with (
+            override_platform(
+                is_blackwell=False, is_sm100=False, is_hip=True, is_gfx95=False
+            ),
+            self.assertRaisesRegex(ValueError, "requires gfx950"),
+        ):
+            _minimax_m3_overrides(rocm_server_args(), NVFP4)
+
     def test_quark_mxfp4_keeps_custom_all_reduce(self):
         """RCCL slows the Quark path's decode on gfx950, where it was measured; MXFP8 and
         other ROCm GPUs keep the default."""

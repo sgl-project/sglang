@@ -136,7 +136,9 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         return overrides
 
     if get_platform().is_hip:
-        keeps_custom_ar = _hip.rocm_overrides(cfg, hf_config, quant_resolved, overrides)
+        keeps_custom_all_reduce = _hip.rocm_overrides(
+            cfg, hf_config, quant_resolved, overrides
+        )
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "triton"
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
@@ -159,7 +161,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         # accelerate the large prefill all-reduce.
         if not (
             aiter_fusion_resolved
-            or keeps_custom_ar
+            or keeps_custom_all_reduce
             or envs.SGLANG_M3_ALLOW_CUSTOM_AR.get()
         ):
             overrides["disable_custom_all_reduce"] = True

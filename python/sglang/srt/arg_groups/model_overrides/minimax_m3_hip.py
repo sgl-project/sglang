@@ -33,10 +33,11 @@ def uses_nvfp4_kv(
 
 def validate_nvfp4(cfg: Any) -> None:
     """The M3.1 NVFP4 checks of ROCm."""
-    algorithm = cfg.speculative_algorithm
-    if algorithm == "DFLASH" or (algorithm == "DSPARK" and not get_platform().is_gfx95):
-        supported = "Blackwell or AMD gfx950" if algorithm == "DSPARK" else "Blackwell"
-        raise ValueError(f"M3.1 NVFP4 {algorithm} requires {supported}")
+    # the ROCm stack is aiter's gfx950 MXFP4 experts; elsewhere the CUDA backends would load
+    if not get_platform().is_gfx95:
+        raise ValueError("M3.1 NVFP4 on ROCm requires gfx950 (MI350X / MI355X)")
+    if cfg.speculative_algorithm == "DFLASH":
+        raise ValueError("M3.1 NVFP4 DFLASH requires Blackwell")
     # TP8 with attention DP ran away on whitespace in GSM8K answers on MI350X
     if cfg.tp_size > 4:
         raise ValueError("M3.1 NVFP4 on ROCm is validated at --tp-size 4 or less")
@@ -143,7 +144,7 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
         os.environ.get(level) not in ("INT4", "INT8")
         # the JIT build reduces bf16 cast to fp16 only, as QuickAllReduce sets it up
         or cfg.dtype not in ("auto", "bfloat16")
-        or int(os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)) == 0
+        or os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "1") == "0"
     ):
         return
     # the JIT build is faster at TP4; it matches sgl-kernel's bitwise at the level it runs,
