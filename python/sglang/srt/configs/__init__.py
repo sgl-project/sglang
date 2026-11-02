@@ -1,4 +1,5 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
+from sglang.srt.configs.alice_ai import AliceAIConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig, BailingMoeV3VLConfig
 from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
 from sglang.srt.configs.beam import BeamConfig
@@ -98,6 +99,7 @@ from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
+    "AliceAIConfig",
     "BailingHybridConfig",
     "BailingMM2Config",
     "BailingMoeV3VLConfig",
