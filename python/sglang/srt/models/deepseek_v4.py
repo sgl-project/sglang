@@ -57,6 +57,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     Dsv4NpuRoPE,
+    get_npu_rope_cache_length,
     prime_rope_cos_sin,
     rope_cos_sin,
 )
@@ -1185,7 +1186,11 @@ class MqaAttentionBase(nn.Module):
         )
         self.rope_kwargs = dict(
             dim=self.qk_rope_head_dim,
-            seqlen=config.max_position_embeddings,
+            seqlen=(
+                get_npu_rope_cache_length(config)
+                if _is_npu
+                else config.max_position_embeddings
+            ),
             original_seq_len=original_seq_len,
             base=self.rope_base,
             factor=scaling.get("factor", 1.0),
@@ -1388,10 +1393,11 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio:
             active_rope_scaling = dict(self.rope_scaling or {})
             active_rope_scaling["rope_type"] = "deepseek_yarn"
+        # Keep the shared rotary owner keyed by the actual NPU table length.
         self.rotary_emb = get_rope_wrapper(
             head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=self.rope_kwargs["seqlen"],
             base=self.rope_base,
             rope_scaling=active_rope_scaling,
             is_neox_style=False,
