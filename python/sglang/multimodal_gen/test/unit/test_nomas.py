@@ -17,10 +17,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     NomasPipelineConfig,
     nomas_postprocess_text,
 )
-from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
     NomasAttentionPlan,
 )
+from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
