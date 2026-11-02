@@ -454,8 +454,10 @@ class TestUnifiedCacheLinkerPythonBackend(
                 consumer.path_device_indices(final_match.last_device_node), loaded
             )
         )
-        consumer_linker.complete_next_offload(True)
-        consumer.check_hicache_events()
+        self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertTrue(
+            consumer.tree_core.is_external_cache_stored(final_match.last_device_node)
+        )
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):

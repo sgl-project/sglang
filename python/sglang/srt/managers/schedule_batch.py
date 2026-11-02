@@ -1534,6 +1534,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_room: Optional[int] = bootstrap_room
         # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
         self.linker_offload_skip_prefix_len = 0
+        self.linker_restored_key_range: Optional[tuple[int, int]] = None
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -2222,6 +2223,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.lock = None
         self.swa_branching_seqlen = None
+        self.linker_restored_key_range = None
         self.extend_end = None
         self.dllm_initialized = False
         self.is_retracted = True

@@ -293,6 +293,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        self.offload_skip_restored_range: Optional[tuple[int, int]] = None
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -461,6 +462,7 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+        req.linker_restored_key_range = (device_hit_len, prefix_len)
 
         # Components omitted from the linker do not run their PREPARE hook.
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
@@ -518,20 +520,32 @@ class UnifiedCacheLinkerWrapper:
                 continue
             if self._skip_swa:
                 transfers = [t for t in transfers if t.name != PoolName.SWA]
-            if self.offload_skip_prefix_len:
+            if self.offload_skip_prefix_len or self.offload_skip_restored_range:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
             self._offload_node(node_id, transfers)
 
     @contextmanager
-    def skip_offload_prefix(self, length: int):
+    def skip_offload_prefix(
+        self, length: int, restored: Optional[tuple[int, int]] = None
+    ):
         """Skip offloading the first ``length`` radix-key units during an insert."""
         self.offload_skip_prefix_len = length
+        self.offload_skip_restored_range = restored
         try:
             yield
         finally:
             self.offload_skip_prefix_len = 0
+            self.offload_skip_restored_range = None
+
+    def _offload_skip_end(self, first: int) -> int:
+        # Pages before the restored range are a device hit the store may not hold.
+        end = self.offload_skip_prefix_len
+        restored = self.offload_skip_restored_range
+        if restored is not None and restored[0] <= first:
+            end = max(end, restored[1])
+        return end
 
     def _drop_offload_skip_prefix(
         self, node_id: NodeId, transfers: list[PoolTransfer]
@@ -543,11 +557,11 @@ class UnifiedCacheLinkerWrapper:
             first = info.path_end - len(transfer.keys) * page
             drop = min(
                 len(transfer.keys),
-                max(0, (self.offload_skip_prefix_len - first) // page),
+                max(0, (self._offload_skip_end(first) - first) // page),
             )
             if drop == len(transfer.keys):
                 if transfer.name == PoolName.KV:
-                    # The caller delegates storage of this prefix to another writer.
+                    # The store already holds this prefix or another writer owns it.
                     # Mark it stored locally to suppress uploads, without a persistence ACK.
                     self.cache.tree_core.mark_external_cache_stored_path(
                         node_id, info.parent_id
