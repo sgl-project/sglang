@@ -321,13 +321,18 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
+# ROCm (MI350X / gfx950). Block counts tuned at TP2/4/6/8; the thresholds are
+# still the conservative default.
 @cache
 def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     default = AllReduceConfig(
         graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
         eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
         num_push_blocks=num_sm,
-        num_pull_blocks=num_sm,
+        # each pull block runs its own cross-GPU barrier: 32 blocks are 40-65%
+        # faster than one per CU at TP8 from 1 MB, and within a few % of the
+        # best grid at TP2/4/6
+        num_pull_blocks=32,
         num_mc_blocks=None,
     )
     return {world_size: default for world_size in range(2, 9)}

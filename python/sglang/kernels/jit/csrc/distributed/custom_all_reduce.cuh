@@ -460,6 +460,11 @@ struct AllReduceKernel {
                                    : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
+#ifdef USE_ROCM
+      // MI350X: from 128 KB a full block per CU beats the narrower pick for
+      // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
+      if (!two_shot && num_vecs >= 8192) block_size = 1024u;
+#endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
