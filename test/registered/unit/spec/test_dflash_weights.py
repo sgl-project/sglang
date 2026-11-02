@@ -23,6 +23,8 @@ class TestDFlashHeadWeights(CustomTestCase):
         model.projector_type = None
         model.layers = nn.ModuleList()
         model.own_lm_head = nn.Linear(8, 16, bias=False)
+        model._own_lm_head_loaded = False
+        model.norm = nn.Linear(8, 8, bias=False)
         return model
 
     def test_checkpoint_head_is_loaded_instead_of_silently_discarded(self):
@@ -32,6 +34,33 @@ class TestDFlashHeadWeights(CustomTestCase):
                 weight = torch.arange(128, dtype=torch.float32).reshape(16, 8)
                 model.load_weights([(prefix + "lm_head.weight", weight)])
                 torch.testing.assert_close(model.own_lm_head.weight, weight)
+
+    def test_partial_updates_preserve_the_loaded_head(self):
+        model = self.make_model()
+        head = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+        model.load_weights([("lm_head.weight", head)])
+
+        norm = torch.full((8, 8), 0.25)
+        model.load_weights([("norm.weight", norm)])
+        torch.testing.assert_close(model.norm.weight, norm)
+        torch.testing.assert_close(model.own_lm_head.weight, head)
+
+        updated_head = -head
+        model.load_weights([("lm_head.weight", updated_head)])
+        torch.testing.assert_close(model.own_lm_head.weight, updated_head)
+        torch.testing.assert_close(model.norm.weight, norm)
+
+    def test_partial_update_after_a_loader_bypasses_load_weights(self):
+        model = self.make_model()
+        head = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+        with torch.no_grad():
+            model.own_lm_head.weight.copy_(head)
+        model.post_load_weights()
+
+        norm = torch.full((8, 8), 0.5)
+        model.load_weights([("norm.weight", norm)])
+        torch.testing.assert_close(model.norm.weight, norm)
+        torch.testing.assert_close(model.own_lm_head.weight, head)
 
     def test_owned_head_rejects_incompatible_output_paths(self):
         for dflash_config in (

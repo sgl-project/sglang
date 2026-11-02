@@ -830,6 +830,8 @@ class DFlashDraftModel(nn.Module):
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
       - optional `lm_head.*` when `has_own_lm_head` is enabled
+
+    Head completeness is checked on initial loading; later updates may be partial.
     """
 
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
@@ -874,6 +876,7 @@ class DFlashDraftModel(nn.Module):
             or (draft_config.has_own_lm_head and quant_config is not None)
         )
         self.own_lm_head = None
+        self._own_lm_head_loaded = False
         if draft_config.has_own_lm_head:
             if draft_config.selector_rank or draft_config.is_domino:
                 raise ValueError(
@@ -1179,7 +1182,7 @@ class DFlashDraftModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
 
-        if self.own_lm_head is not None:
+        if self.own_lm_head is not None and not self._own_lm_head_loaded:
             required_head = {
                 name for name in params_dict if name.startswith("own_lm_head.")
             }
@@ -1209,6 +1212,7 @@ class DFlashDraftModel(nn.Module):
         for layer in self.layers:
             if isinstance(layer.self_attn, DFlashMLAAttention):
                 layer.self_attn.absorb_kv_b_proj()
+        self._own_lm_head_loaded = True
 
 
 class DFlashLagunaAttention(DFlashAttention):
