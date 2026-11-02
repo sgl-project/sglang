@@ -1,6 +1,7 @@
 import bisect
 import ctypes
 import ctypes.util
+import gc
 import math
 import mmap
 import os
@@ -3707,3 +3708,162 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
+
+
+def _align_numel_offset(
+    offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+) -> int:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment_numel = max(1, alignment_bytes // element_size)
+    remainder = offset % alignment_numel
+    return offset if remainder == 0 else offset + alignment_numel - remainder
+
+
+def estimate_layer_weight_bytes(
+    layers: torch.nn.ModuleList | torch.nn.Sequential,
+) -> dict[int, int]:
+    """Physical per-layer store sizes using the real manager's packing rules."""
+    grouped: dict[int, dict[torch.dtype, list[torch.Tensor]]] = {}
+    for name, tensor in layers.named_parameters():
+        layer_index_text, separator, _ = name.partition(".")
+        if not separator or not layer_index_text.isdigit():
+            continue
+        layer_index = int(layer_index_text)
+        local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        grouped.setdefault(layer_index, {}).setdefault(local_tensor.dtype, []).append(
+            local_tensor
+        )
+
+    totals = {layer_index: 0 for layer_index in range(len(layers))}
+    for layer_index, dtype_to_tensors in grouped.items():
+        for dtype, tensors in dtype_to_tensors.items():
+            contiguous_numel = 0
+            for tensor in tensors:
+                if tensor.is_contiguous():
+                    contiguous_numel = _align_numel_offset(contiguous_numel, dtype)
+                    contiguous_numel += tensor.numel()
+                    continue
+                storage_numel = (
+                    0
+                    if tensor.numel() == 0
+                    else 1
+                    + sum(
+                        (size - 1) * abs(stride)
+                        for size, stride in zip(tensor.shape, tensor.stride())
+                    )
+                )
+                totals[layer_index] += storage_numel * tensor.element_size()
+            totals[layer_index] += (
+                contiguous_numel * torch.empty((), dtype=dtype).element_size()
+            )
+    return totals
+
+
+def release_unused_pinned_memory() -> None:
+    """Return unreferenced cached HostPin blocks to the CUDA driver.
+
+    ``torch.cuda.empty_cache()`` only covers device allocations. PyTorch's
+    host caching allocator currently exposes its corresponding operation via
+    this internal binding; keeping the call isolated makes the compatibility
+    boundary explicit until a public API is available.
+    """
+    if not current_platform.is_cuda():
+        return
+    gc.collect()
+    torch._C._host_emptyCache()
+
+
+class LayerwiseUsageTracker:
+    """Temporary per-layer call counters for one calibration request.
+
+    Managers cannot provide this information when layerwise offload has not
+    been configured yet or was disabled by a resident placement. Observe the
+    declared layer groups directly and remove every hook before returning, so
+    ordinary serving requests pay no counter or hook-dispatch cost.
+    """
+
+    def __init__(
+        self,
+        modules: Mapping[str, object],
+        *,
+        stage_name_provider: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._handles: list[Any] = []
+        self._counts: dict[str, dict[str, list[int]]] = {}
+        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
+        self._stage_name_provider = stage_name_provider
+        for component_name, module in modules.items():
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                continue
+            named_modules = dict(module.named_modules())
+            component_counts: dict[str, list[int]] = {}
+            for layer_name in module.layer_names:
+                layers = named_modules.get(layer_name)
+                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    continue
+                counts = [0] * len(layers)
+                if not counts:
+                    continue
+                component_counts[layer_name] = counts
+                for layer_index, layer in enumerate(layers):
+
+                    def record_use(
+                        _module,
+                        _inputs,
+                        *,
+                        target_counts=counts,
+                        target_index=layer_index,
+                        target_component_name=component_name,
+                        target_layer_name=layer_name,
+                        target_layer_count=len(layers),
+                    ) -> None:
+                        target_counts[target_index] += 1
+                        if self._stage_name_provider is None:
+                            return
+                        stage_name = self._stage_name_provider()
+                        if stage_name is None:
+                            return
+                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
+                        component_stage_counts = stage_counts.setdefault(
+                            target_component_name, {}
+                        )
+                        layer_stage_counts = component_stage_counts.setdefault(
+                            target_layer_name, [0] * target_layer_count
+                        )
+                        layer_stage_counts[target_index] += 1
+
+                    self._handles.append(layer.register_forward_pre_hook(record_use))
+            if component_counts:
+                self._counts[component_name] = component_counts
+
+    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        counts, _ = self.finish_with_stages()
+        return counts
+
+    def finish_with_stages(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, tuple[int, ...]]],
+        dict[str, dict[str, dict[str, tuple[int, ...]]]],
+    ]:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        counts = {
+            component_name: {
+                layer_name: tuple(counts)
+                for layer_name, counts in component_counts.items()
+            }
+            for component_name, component_counts in self._counts.items()
+        }
+        counts_by_stage = {
+            stage_name: {
+                component_name: {
+                    layer_name: tuple(counts)
+                    for layer_name, counts in component_counts.items()
+                }
+                for component_name, component_counts in stage_counts.items()
+            }
+            for stage_name, stage_counts in self._counts_by_stage.items()
+        }
+        return counts, counts_by_stage
