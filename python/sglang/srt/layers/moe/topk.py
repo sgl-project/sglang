@@ -305,6 +305,8 @@ class TopKConfig:
     shared_experts: SharedExpertsConfig = SharedExpertsConfig()
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
+    # Route with correction_bias as stored instead of in the gating dtype on aiter.
+    fp32_correction_bias: bool = False
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
@@ -746,6 +748,8 @@ class TopK(BaseFusedOp):
     --fused_shared_experts_scaling_factor: absolute appended weight on the global AITER
       path; otherwise multiplies the router's existing shared weight under standard EP.
       Models include 1/ep_size when the per-rank shared-expert outputs are all-reduced.
+    --fp32_correction_bias: on aiter grouped routing, pass correction_bias as stored instead
+      of casting it to the gating dtype; an fp32 bias then upcasts the logits.
     """
 
     def __init__(
@@ -770,6 +774,7 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        fp32_correction_bias: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -802,6 +807,7 @@ class TopK(BaseFusedOp):
             shared_experts=shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            fp32_correction_bias=fp32_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
@@ -2997,6 +3003,7 @@ def select_experts(
         and correction_bias.dtype != torch.float32
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
+        and not topk_config.fp32_correction_bias
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
