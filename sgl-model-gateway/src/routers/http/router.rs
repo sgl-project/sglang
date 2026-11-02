@@ -292,14 +292,7 @@ impl Router {
             }
         };
 
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = WorkerLoadGuard::new(worker.clone(), headers);
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -491,7 +484,7 @@ impl Router {
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
-        load_guard: Option<WorkerLoadGuard>,
+        load_guard: WorkerLoadGuard,
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
@@ -643,10 +636,7 @@ impl Router {
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
-            if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
-            }
-            response
+            AttachedBody::wrap_response(response, load_guard)
         }
     }
 
