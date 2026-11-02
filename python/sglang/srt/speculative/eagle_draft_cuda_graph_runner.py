@@ -143,7 +143,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Disable parent paths that don't apply to EAGLE.
         self.compile_bs = []  # disables patch_model torch.compile wrapping
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -169,6 +168,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.enable_torch_compile:
             set_torch_compile_config()
+
+        # Select device capabilities before allocating static inputs.
+        self.backend = resolve_decode_backend(self)
 
         # Static buffers
         with torch.device(model_runner.device):
@@ -298,8 +300,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         # Capture
         try:
             with model_capture_mode():
@@ -327,12 +327,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # Helpers
     # -----------------------------------------------------------------
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
-    def _make_graph_key(
-        self, bs, stream_idx=None, variant_label=None, attention_variant=None
-    ):
-        # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
+    def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
+        # variant_label is _GREEDY_VARIANT or None.
         return ShapeKey(
             size=bs, variant_label=variant_label, attention_variant=attention_variant
         )
@@ -400,7 +398,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
@@ -517,7 +514,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
         served = num_seqs in self.megakernel_served
 
         def run_once():

@@ -153,7 +153,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json --fork-worker-batch-size 20 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json --fork-worker-batch-size 20 --fork-worker-preload sglang.test.test_utils $CONTINUE_ON_ERROR_FLAG
 
       # PRs save only what the base lacks; the implicit if: success() keeps a
       # half-downloaded cache unpublished. skip_cache_save is for callers that
