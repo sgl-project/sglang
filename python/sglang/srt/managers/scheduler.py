@@ -231,6 +231,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAgnosticPolicy,
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
@@ -1717,6 +1718,25 @@ class Scheduler(
             )
 
     def init_overlap(self):
+        if (
+            envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.get() > 0
+            or envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.get() > 0
+        ):
+            if get_parallel().attn_dp_size != 1:
+                raise ValueError(
+                    "Prefill overlap resource budgets require attention DP size 1"
+                )
+            if (
+                not self.enable_overlap
+                or self.enable_overlap_mlx
+                or get_parallel().pp_size > 1
+                or self.disaggregation_mode != DisaggregationMode.NULL
+                or get_disagg().enable_pd_role_switch
+            ):
+                raise ValueError(
+                    "Prefill overlap resource budgets require the standard "
+                    "non-disaggregated overlap scheduler"
+                )
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
@@ -2216,7 +2236,61 @@ class Scheduler(
                 return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
-        return last_batch.grammar_needs_sync()
+        if last_batch.grammar_needs_sync():
+            return True
+
+        token_budget = envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.get()
+        min_free_gb = envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.get()
+        if token_budget <= 0 and min_free_gb <= 0:
+            return False
+        last_batch_is_extend = (
+            last_batch.is_extend_in_batch
+            if self.require_mlp_sync
+            else last_batch.forward_mode.is_extend()
+        )
+        if not last_batch_is_extend:
+            return False
+
+        unknown_prefill_shape = (
+            self.dllm_config is not None
+            or self.dynamic_chunk_sizer is not None
+            or self.get_prefill_adder_class() is not PrefillAdder
+        )
+        if (
+            not unknown_prefill_shape
+            and self.chunked_req is None
+            and not self.waiting_queue
+            and not self.grammar_manager.has_waiting_grammars()
+        ):
+            return False
+
+        # Decide before admission: processing a result after planning can finish
+        # a request whose next step has already allocated KV. The stock chunk
+        # cap bounds logical extend tokens, including mixed decode rows. The
+        # input-token cap alone does not bound an oversized first request.
+        chunk_limit = self.chunked_prefill_size
+        if token_budget > 0 and (
+            unknown_prefill_shape
+            or chunk_limit is None
+            or chunk_limit <= 0
+            or last_batch.extend_num_tokens is None
+            or last_batch.extend_num_tokens + chunk_limit > token_budget
+        ):
+            return True
+        if min_free_gb > 0:
+            # Sample the TP minimum before planning, without clearing caches.
+            # This is a low-water trigger, not a post-admission memory floor.
+            return (
+                get_available_gpu_memory(
+                    self.device,
+                    get_device().gpu_id,
+                    distributed=True,
+                    empty_cache=False,
+                    cpu_group=self.tp_cpu_group,
+                )
+                < min_free_gb
+            )
+        return False
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -4304,6 +4378,96 @@ class Scheduler(
 
         return res
 
+    def _fcfs_warm_chunk_limit(
+        self, adder: PrefillAdder, budget: int, reserve_tokens: int
+    ) -> Optional[int]:
+        """Estimate a bounded reservation for the first FCFS waiter only.
+
+        Normal admission re-matches the request and remains responsible for
+        capacity. Unsupported configurations keep the original schedule.
+        """
+        if (
+            self.policy.policy != CacheAgnosticPolicy.FCFS
+            or not self.waiting_queue
+            or self.enable_hierarchical_cache
+            or self.enable_lmcache
+            or self.enable_unified_cache_external_linker
+            or get_memory().enable_flexkv
+            or get_memory().radix_cache_backend is not None
+            or self.enable_hisparse
+            or self.enable_unified_memory
+            or self.enable_lora
+            or get_exec().features.enable_encoder_swa_bounded_replay
+            or not self.tree_cache.supports_prefix_sharing()
+            or self.tree_cache.supports_mamba()
+            or adder.running_batch.batch_is_full
+            or (
+                adder.prefill_max_requests is not None
+                and adder.prefill_max_requests <= 1
+            )
+        ):
+            return None
+        req = self.waiting_queue[0]
+        if req.beam_group is not None or req.session is not None or req.is_dllm():
+            return None
+        running_batch = adder.running_batch
+        held = int(self.chunked_req.kv.holds_kv)
+        if (
+            self.get_num_allocatable_reqs(
+                len(running_batch.reqs), running_batch=running_batch, num_held_rows=held
+            )
+            <= 1
+        ):
+            return None
+        # Fast-match policies have already populated the estimate. For a slow
+        # FCFS tree, refresh the head. This can touch the tree; no Mamba COW is
+        # requested and real admission will repeat the match.
+        if not self.policy.waiting_queue_prefix_matched(self.waiting_queue):
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        if req.num_matched_prefix_tokens <= 0:
+            return None
+        work = self.policy._shortest_prefill_work(req)
+        charge = ((work + self.page_size - 1) // self.page_size) * self.page_size
+        limit = min(reserve_tokens, budget // 2)
+        remaining = (
+            len(self.chunked_req.full_untruncated_fill_ids)
+            - self.chunked_req.prefix_len
+        )
+        if work >= remaining or charge > limit or budget - charge < self.page_size:
+            return None
+        return (budget - charge) // self.page_size * self.page_size
+
+    def _admit_chunked_req(self, adder: PrefillAdder) -> None:
+        self.chunked_req.init_next_round_input()
+        budget = adder.rem_chunk_tokens or 0
+        if (
+            not get_parallel().dcp_enabled
+            and not adder.kv_shard_granule
+            and not is_cp_sharded_padded()
+        ):
+            # Both budgets are charged by the continuation. Reserving only
+            # from the chunk budget can leave no input for waiting requests.
+            budget = min(budget, max(adder.rem_input_tokens, 0))
+        # Keep DCP and padded/sharded scheduling unchanged: a shortened cap
+        # must be reconciled with their boundaries after other chunk limits.
+        adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            self.chunked_req,
+            self.waiting_queue,
+            budget,
+            self.page_size,
+        )
+        reserve_tokens = envs.SGLANG_FCFS_WARM_PREFILL_RESERVE_TOKENS.get()
+        if (
+            reserve_tokens > 0
+            and not get_parallel().dcp_enabled
+            and not adder.kv_shard_granule
+            and not is_cp_sharded_padded()
+        ):
+            warm_limit = self._fcfs_warm_chunk_limit(adder, budget, reserve_tokens)
+            if warm_limit is not None:
+                adder.chunked_req_limit = warm_limit
+        self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4445,14 +4609,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
-                self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
-                self.page_size,
-            )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self._admit_chunked_req(adder)
 
         if self.enable_lora:
             running_reqs = running_batch.reqs

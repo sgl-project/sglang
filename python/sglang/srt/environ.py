@@ -669,6 +669,8 @@ class Envs:
     # Scheduler token budgeting and admission
     # ===================================================================
     SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
+    # Experimental FCFS warm-prefix reservation; zero preserves default behavior.
+    SGLANG_FCFS_WARM_PREFILL_RESERVE_TOKENS = EnvInt(0)
     # PD prefill: bootstrap-queued requests each refresh also touches; 0 skips them.
     SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX = EnvInt(512)
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -725,6 +727,10 @@ class Envs:
     SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP"
     )
+    # Optional pre-admission limits; non-positive disables each. The token
+    # bound uses logical extend_num_tokens, excluding encoder SWA replay rows.
+    SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET = EnvInt(0)
+    SGLANG_PREFILL_OVERLAP_MIN_FREE_GB = EnvFloat(0.0)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
