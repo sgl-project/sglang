@@ -101,7 +101,7 @@ def _empty_request_lists(s):
     s.disagg_prefill_bootstrap_queue = None
     s.disagg_decode_prealloc_queue = None
     s.disagg_decode_transfer_queue = None
-    s.dllm_manager = None
+    s.dllm_manager = SimpleNamespace(waiting_queue=[])
     s.hisparse_coordinator = None
     s.uocr_runtime = None
     s.deferred_responses = DeferredResponses(

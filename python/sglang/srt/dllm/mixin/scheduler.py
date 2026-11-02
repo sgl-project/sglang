@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
@@ -431,10 +431,6 @@ class DllmManager:
         )
         self.waiting_queue: List[Req] = []
         self.staging_queue: List[Req] = []
-
-    def request_lists(self) -> Dict[str, List[Req]]:
-        # The staging queue is the part of this queue the current round runs.
-        return {"dllm": self.waiting_queue}
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""

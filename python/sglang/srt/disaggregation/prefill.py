@@ -458,9 +458,6 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
-    def request_lists(self) -> Dict[str, List[Req]]:
-        return {"prefill_bootstrap": self.queue}
-
     def add(self, req: Req, num_kv_heads: int) -> None:
         # Rejected at intake: `set_finish_with_abort` left the verdict in
         # `to_finish`, which `finished()` does not read, and swapped the prompt

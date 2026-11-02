@@ -4665,26 +4665,29 @@ class Scheduler(
             "chunked": [] if self.chunked_req is None else [self.chunked_req],
             "running": list(self.running_reqs),
         }
+        # Read at call time: a PD role switch rebuilds the PD queues.
+        if self.disagg_prefill_bootstrap_queue is not None:
+            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
         if self.disagg_prefill_transfer_queue is not None:
             lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
-        # Read at call time: a PD role switch rebuilds the PD queues.
-        owners = (
-            self.disagg_prefill_bootstrap_queue,
+        if self.dllm_config is not None:
+            # Its staging queue is the part of this queue the current round runs.
+            lists["dllm"] = self.dllm_manager.waiting_queue
+        components = (
             self.disagg_decode_prealloc_queue,
             self.disagg_decode_transfer_queue,
-            self.dllm_manager,
             self.hisparse_coordinator,
             self.uocr_runtime,
             self.deferred_responses,
         )
-        for owner in owners:
-            if owner is None:
+        for component in components:
+            if component is None:
                 continue
-            owner_lists = owner.request_lists()
-            assert lists.keys().isdisjoint(owner_lists), sorted(
-                lists.keys() & owner_lists.keys()
+            component_lists = component.request_lists()
+            assert lists.keys().isdisjoint(component_lists), sorted(
+                lists.keys() & component_lists.keys()
             )
-            lists.update(owner_lists)
+            lists.update(component_lists)
         return lists
 
     def _prefill_launch_starts_running(self) -> bool:
