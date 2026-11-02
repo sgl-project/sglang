@@ -126,12 +126,12 @@ class ForwardMetadata:
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
-    # QFA consumes device lengths and one scheduling plan shared by all layers.
-    qfa_cu_seqlens_q: Optional[torch.Tensor] = None
+    # Device query boundaries shared by flash attention implementations.
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    uniform_query_len: Optional[int] = None
+    # QFA scheduling plan and quantized query-scale layout.
     qfa_metadata: Optional[torch.Tensor] = None
-    qfa_query_len: Optional[int] = None
     qfa_layout_q_descale: str = "TND"
-    qfa_mask_mode: int = 0
 
     # DCP per-request lengths and decode inputs
     dcp_seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -361,6 +361,9 @@ class AscendAttnBackend(AttentionBackend):
             )
 
             self.needs_cpu_seq_lens = False
+            # Either target or draft QFA may read the shared request table
+            # asynchronously; enable the scheduler's existing WAR barrier.
+            envs.SGLANG_ENABLE_WAR_BARRIER.set(True)
             self.quant_flash_attn = quant_flash_attn
             self.quant_flash_attn_metadata = quant_flash_attn_metadata
             self.qfa_cache_layout = cache_layout
@@ -647,14 +650,13 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables = torch.empty(
                 (bs, max_pages), dtype=torch.int32, device=self.device
             )
-            metadata.seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_decode_or_idle():
                 query_len = 1
             elif forward_batch.forward_mode.is_target_verify():
                 query_len = int(forward_batch.spec_info.draft_token_num)
             else:
                 query_len = None
-            self._init_qfa_metadata(metadata, forward_batch.forward_mode, query_len)
+            self._init_flash_attn(metadata, query_len)
             self.graph_mode = False
             self.init_forward_metadata_in_graph(forward_batch)
             return
@@ -934,20 +936,16 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
-    def _init_qfa_metadata(self, metadata, forward_mode, query_len):
+    def _init_flash_attn(self, metadata, query_len):
+        """Allocate device lengths and initialize fixed-width query boundaries."""
         bs = metadata.block_tables.shape[0]
-        metadata.qfa_query_len = query_len
-        metadata.qfa_mask_mode = 0 if forward_mode.is_decode_or_idle() else 3
-        groups = self.qfa_num_heads // self.qfa_cache_layout.local_kv_heads
-        metadata.qfa_layout_q_descale = (
-            "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
-        )
+        metadata.uniform_query_len = query_len
         if query_len is None:
-            metadata.qfa_cu_seqlens_q = torch.zeros(
+            metadata.cu_seqlens_q = torch.zeros(
                 bs + 1, dtype=torch.int32, device=self.device
             )
         else:
-            metadata.qfa_cu_seqlens_q = torch.arange(
+            metadata.cu_seqlens_q = torch.arange(
                 0,
                 (bs + 1) * query_len,
                 query_len,
@@ -966,10 +964,15 @@ class AscendAttnBackend(AttentionBackend):
         bs = metadata.block_tables.shape[0]
         if bs == 0:
             return
+        query_len = metadata.uniform_query_len
+        groups = self.qfa_num_heads // self.qfa_cache_layout.local_kv_heads
+        metadata.qfa_layout_q_descale = (
+            "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
+        )
         seq_lens = forward_batch.seq_lens[:bs]
         offset = 0
         if forward_batch.forward_mode.is_target_verify():
-            offset = metadata.qfa_query_len
+            offset = metadata.uniform_query_len
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -988,22 +991,22 @@ class AscendAttnBackend(AttentionBackend):
             page_table=metadata.block_tables,
             page_size=self.page_size,
         )
-        if metadata.qfa_query_len is None:
+        if metadata.uniform_query_len is None:
             torch.cumsum(
                 forward_batch.extend_seq_lens[:bs],
                 dim=0,
                 dtype=torch.int32,
-                out=metadata.qfa_cu_seqlens_q[1:],
+                out=metadata.cu_seqlens_q[1:],
             )
         metadata.qfa_metadata = self.quant_flash_attn_metadata(
             self.qfa_num_heads,
             self.qfa_cache_layout.local_kv_heads,
             self.qfa_cache_layout.key_head_dim,
             1,
-            cu_seqlens_q=metadata.qfa_cu_seqlens_q,
+            cu_seqlens_q=metadata.cu_seqlens_q,
             seqused_kv=metadata.actual_seq_lengths_kv,
-            max_seqlen_q=metadata.qfa_query_len or -1,
-            mask_mode=metadata.qfa_mask_mode,
+            max_seqlen_q=metadata.uniform_query_len or -1,
+            mask_mode=0 if forward_batch.forward_mode.is_decode_or_idle() else 3,
             layout_q="TND",
             layout_q_descale=metadata.qfa_layout_q_descale,
             layout_kv="PA_BNBD",
@@ -1154,14 +1157,13 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         if self.use_qfa:
-            metadata.seq_lens = seq_lens
             if forward_mode.is_draft_extend_v2():
                 query_len = out_cache_loc.shape[0] // bs
             elif forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
             else:
                 query_len = 1
-            self._init_qfa_metadata(metadata, forward_mode, query_len)
+            self._init_flash_attn(metadata, query_len)
             self.graph_metadata[bs] = metadata
             return metadata
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
@@ -2297,14 +2299,14 @@ class AscendAttnBackend(AttentionBackend):
                         v_scale.view(torch.float8_e8m0fnu),
                         1,
                         block_table=self.forward_metadata.block_tables,
-                        cu_seqlens_q=self.forward_metadata.qfa_cu_seqlens_q,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
                         seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
                         metadata=self.forward_metadata.qfa_metadata,
                         attn_mask=self.mix_mask,
                         mask_mode=3,
                         softmax_scale=layer.scaling,
                         p_scale=layer.scheme.p_scale,
-                        max_seqlen_q=self.forward_metadata.qfa_query_len or -1,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.qfa_layout_q_descale,
                         layout_kv="PA_BNBD",
@@ -3222,14 +3224,14 @@ class AscendAttnBackend(AttentionBackend):
                         v_scale.view(torch.float8_e8m0fnu),
                         1,
                         block_table=self.forward_metadata.block_tables,
-                        cu_seqlens_q=self.forward_metadata.qfa_cu_seqlens_q,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
                         seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
                         metadata=self.forward_metadata.qfa_metadata,
                         attn_mask=self.mix_mask,
                         mask_mode=3,
                         softmax_scale=layer.scaling,
                         p_scale=layer.scheme.p_scale,
-                        max_seqlen_q=self.forward_metadata.qfa_query_len or -1,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.qfa_layout_q_descale,
                         layout_kv="PA_BNBD",
@@ -3735,14 +3737,14 @@ class AscendAttnBackend(AttentionBackend):
                 v_scale.view(torch.float8_e8m0fnu),
                 1,
                 block_table=self.forward_metadata.block_tables,
-                cu_seqlens_q=self.forward_metadata.qfa_cu_seqlens_q,
+                cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
                 seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
                 metadata=self.forward_metadata.qfa_metadata,
                 attn_mask=None,
                 mask_mode=0,
                 softmax_scale=layer.scaling,
                 p_scale=layer.scheme.p_scale,
-                max_seqlen_q=self.forward_metadata.qfa_query_len or -1,
+                max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                 layout_q="TND",
                 layout_q_descale=self.forward_metadata.qfa_layout_q_descale,
                 layout_kv="PA_BNBD",
@@ -4143,14 +4145,14 @@ class AscendAttnBackend(AttentionBackend):
                         v_scale.view(torch.float8_e8m0fnu),
                         1,
                         block_table=self.forward_metadata.block_tables,
-                        cu_seqlens_q=self.forward_metadata.qfa_cu_seqlens_q,
+                        cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
                         seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
                         metadata=self.forward_metadata.qfa_metadata,
                         attn_mask=None,
                         mask_mode=0,
                         softmax_scale=layer.scaling,
                         p_scale=layer.scheme.p_scale,
-                        max_seqlen_q=self.forward_metadata.qfa_query_len or -1,
+                        max_seqlen_q=self.forward_metadata.uniform_query_len or -1,
                         layout_q="TND",
                         layout_q_descale=self.forward_metadata.qfa_layout_q_descale,
                         layout_kv="PA_BNBD",
