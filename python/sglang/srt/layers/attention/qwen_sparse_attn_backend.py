@@ -1359,7 +1359,10 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        logical_indices: torch.Tensor,
+        metadata: QwenSparseAttnMetadata,
+        *,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
@@ -1379,7 +1382,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             row_ids = sequence_ids
             slot_table = metadata.token_slot_table
         safe = logical_indices.clamp(min=0, max=slot_table.shape[1] - 1).long()
-        slots = slot_table[row_ids[:, None], safe]
+        if (
+            is_prefill
+            and logical_indices.device.type == "npu"
+            and not metadata.is_cuda_graph
+            and slot_table.is_contiguous()
+            and logical_indices.shape[0] >= 32
+        ):
+            # Large NPU advanced-indexing lookups fall back to AI CPU. A flat
+            # gather avoids that path; small and paged lookups keep the default.
+            offsets = row_ids[:, None] * slot_table.shape[1] + safe
+            slots = (
+                slot_table.view(-1)
+                .index_select(0, offsets.reshape(-1))
+                .view_as(logical_indices)
+            )
+        else:
+            slots = slot_table[row_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
@@ -1541,7 +1560,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
         if q.device.type == "npu" or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
-            slots = self._logical_to_physical(topk_indices, metadata)
+            slots = self._logical_to_physical(topk_indices, metadata, is_prefill=True)
             pool = self.token_to_kv_pool
             attention = (
                 _npu_sparse_attention

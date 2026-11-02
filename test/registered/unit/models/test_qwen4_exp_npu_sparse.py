@@ -54,6 +54,142 @@ class CudaAliasedCPUTensor(torch.Tensor):
         return True
 
 
+class NPUTaggedCPUTensor(CudaAliasedCPUTensor):
+    """Run integer math on CPU while exercising the NPU dispatch predicate."""
+
+    @property
+    def device(self):
+        return NS(type="npu")
+
+
+class NoAdvancedIndexTable(NPUTaggedCPUTensor):
+    """Reject the expensive two-dimensional NPU advanced-indexing route."""
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple) and all(isinstance(x, torch.Tensor) for x in key):
+            raise AssertionError(
+                "prefill lookup used two-dimensional advanced indexing"
+            )
+        return super().__getitem__(key)
+
+
+class NoFlatViewTable(NPUTaggedCPUTensor):
+    """Keep unoptimized lookup modes on their existing table-indexing path."""
+
+    def view(self, *shape):
+        raise AssertionError("fallback lookup flattened the slot table")
+
+
+class TestNPUPrefillMapping(CustomTestCase):
+    def setUp(self):
+        self.code = load(
+            BACKEND,
+            {
+                "QwenSparseAttnBackend": {
+                    "_logical_to_physical",
+                    "forward_extend",
+                    "_resolve_metadata",
+                    "_is_speculative_paged_mode",
+                    "_pad_extend_output",
+                }
+            },
+            {"_npu_sparse_attention": lambda q, k, v, slots, scale: slots},
+        )
+
+    @staticmethod
+    def inputs(rows=32, npu=True):
+        # A contiguous subview with a nonzero storage offset. Physical slot IDs
+        # deliberately differ from table offsets, and request 1 has no valid KV.
+        table = torch.tensor(
+            [
+                [-9] * 5,
+                [11, 17, 23, 29, 31],
+                [41, 43, 47, 53, 59],
+                [61, 67, 71, 73, 79],
+            ],
+            dtype=torch.int32,
+        )[1:]
+        sequence_ids = torch.tensor([2, 0, 1]).repeat((rows + 2) // 3)[:rows]
+        indices = torch.tensor([-1, 0, 2, 4, 5, 8], dtype=torch.int32).repeat(rows, 1)
+        if npu:
+            indices = indices.as_subclass(NPUTaggedCPUTensor)
+        metadata = NS(
+            sequence_lengths=torch.tensor([3, 0, 5]),
+            token_to_batch_idx=sequence_ids,
+            token_slot_table=table,
+            is_cuda_graph=False,
+        )
+        expected = torch.tensor(
+            [[-1, 61, 71, 79, -1, -1], [-1, 11, 23, -1, -1, -1], [-1] * 6],
+            dtype=torch.int32,
+        ).repeat((rows + 2) // 3, 1)[:rows]
+        return indices, metadata, expected
+
+    def test_forward_extend_avoids_aicpu_lookup_and_preserves_slots(self):
+        indices, metadata, expected = self.inputs()
+        metadata.token_slot_table = metadata.token_slot_table.as_subclass(
+            NoAdvancedIndexTable
+        )
+        owner = self.code.QwenSparseAttnBackend()
+        owner.forward_metadata = metadata
+        owner.token_to_kv_pool = NS(
+            layer_router=NS(read=lambda layer: NS(key=lambda: None, value=lambda: None))
+        )
+        q = torch.zeros((32, 1, 1)).as_subclass(NPUTaggedCPUTensor)
+        actual = owner.forward_extend(
+            q,
+            None,
+            None,
+            NS(layer_id=0, tp_q_head_num=1, head_dim=1, scaling=1.0),
+            NS(forward_mode=None),
+            save_kv_cache=False,
+            topk_indices=indices,
+        )
+        torch.testing.assert_close(actual.as_subclass(torch.Tensor), expected)
+
+    def test_prefill_mapping_tracks_updated_slots_and_bounds(self):
+        indices, metadata, _ = self.inputs()
+        table = metadata.token_slot_table.as_subclass(NoAdvancedIndexTable)
+        self.assertGreater(table.storage_offset(), 0)
+        metadata.token_slot_table = table
+        metadata.sequence_lengths.copy_(torch.tensor([1, 5, 3]))
+        metadata.token_to_batch_idx.copy_(torch.arange(32) % 3)
+        table.add_(100)
+        expected = torch.tensor(
+            [
+                [-1, 111, -1, -1, -1, -1],
+                [-1, 141, 147, 159, -1, -1],
+                [-1, 161, 171, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        ).repeat(11, 1)[:32]
+        actual = self.code.QwenSparseAttnBackend._logical_to_physical(
+            indices, metadata, is_prefill=True
+        )
+        torch.testing.assert_close(actual.as_subclass(torch.Tensor), expected)
+
+    def test_mapping_fallbacks_preserve_values(self):
+        for mode in ("cpu", "small", "empty", "strided", "decode", "graph"):
+            with self.subTest(mode=mode):
+                rows = 31 if mode == "small" else 0 if mode == "empty" else 32
+                indices, metadata, expected = self.inputs(rows, npu=mode != "cpu")
+                table = metadata.token_slot_table
+                if mode == "strided":
+                    table = torch.empty((5, 3), dtype=table.dtype).t().copy_(table)
+                table = table.as_subclass(NoFlatViewTable)
+                metadata.token_slot_table = table
+                if mode == "graph":
+                    metadata.is_cuda_graph = True
+                    metadata.req_to_token = table
+                    metadata.row_req_pool_indices = torch.tensor([0, 1, 2])
+                    metadata.token_slot_table = torch.zeros_like(table)
+                kwargs = {} if mode == "decode" else {"is_prefill": True}
+                actual = self.code.QwenSparseAttnBackend._logical_to_physical(
+                    indices, metadata, **kwargs
+                )
+                torch.testing.assert_close(actual.as_subclass(torch.Tensor), expected)
+
+
 class TestNPUQSADispatch(CustomTestCase):
     def test_prefill_relative_scoring_keeps_non_cuda_on_packed_path(self):
         expected = torch.tensor([[1, 3], [2, 4]], dtype=torch.int32)
