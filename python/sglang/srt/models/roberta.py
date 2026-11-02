@@ -333,4 +333,27 @@ class XLMRobertaForSequenceClassification(nn.Module):
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = [XLMRobertaModel, XLMRobertaForSequenceClassification]
+class XLMRobertaForMaskedLM(XLMRobertaModel):
+    """Serve a masked-LM checkpoint (e.g. FacebookAI/xlm-roberta-large) for embeddings.
+
+    The encoder is identical to XLMRobertaModel; only the checkpoint layout differs --
+    encoder weights carry a `roberta.` prefix and the MLM head is unused here.
+    """
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def encoder_weights():
+            for name, weight in weights:
+                if name.startswith("lm_head."):
+                    continue
+                if name.startswith("roberta."):
+                    name = name[len("roberta.") :]
+                yield (name, weight)
+
+        super().load_weights(encoder_weights())
+
+
+EntryClass = [
+    XLMRobertaModel,
+    XLMRobertaForSequenceClassification,
+    XLMRobertaForMaskedLM,
+]

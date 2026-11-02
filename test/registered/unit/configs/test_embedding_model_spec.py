@@ -12,6 +12,7 @@ from sglang.srt.configs.embedding_model_spec import (
     resolve_embedding_model_spec,
     resolved_embedding_plan,
 )
+from sglang.srt.configs.model_config import is_generation_model
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -48,11 +49,40 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertFalse(spec.requires_embedding_flag)
         self.assertTrue(spec.auto_enable_embedding)
 
+    def test_masked_lm_encoders_are_embedding_models_without_the_flag(self):
+        """A masked-LM encoder must not be dispatched as a generation model.
+
+        These encoders only ever return pooled embeddings, so serving one
+        without ``--is-embedding`` reaches their forward with
+        ``get_embedding=False`` and trips an assertion there. Both registries
+        have to agree for the arch to be dispatched as an embedding model, so
+        registering a new encoder class in one and forgetting the other is the
+        failure this guards.
+        """
+        for architecture, family in (
+            ("BertForMaskedLM", "bert"),
+            ("XLMRobertaForMaskedLM", "xlm_roberta"),
+        ):
+            with self.subTest(architecture=architecture):
+                spec = resolve_embedding_model_spec(
+                    [architecture],
+                    is_embedding_requested=False,
+                    is_embedding_gemma=False,
+                )
+
+                self.assertEqual(spec.family, family)
+                self.assertEqual(spec.task, EmbeddingTask.EMBED)
+                self.assertEqual(spec.execution, EmbeddingExecution.ENCODER_ONLY)
+                self.assertEqual(spec.pooling, PoolingStrategy.CLS)
+                self.assertFalse(spec.requires_embedding_flag)
+                self.assertTrue(spec.auto_enable_embedding)
+                self.assertFalse(is_generation_model([architecture]))
+
     def test_support_matrix_is_derived_from_the_same_registry(self):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 8)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
