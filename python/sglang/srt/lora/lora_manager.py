@@ -1251,6 +1251,13 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # A multimodal model names which modules take LoRA; the towers' layers
+            # repeat the text projections' names and must not be indexed as text layers.
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer
             # can apply separate B projections for each.
