@@ -7,7 +7,10 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    MlaPackMetadataCache,
+    copy_mla_rows_into_pack,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.utils import device_stream_context
 
@@ -71,14 +74,25 @@ def try_pack_dcp_src(
         return None
 
     pack = pack_buffer.buffer.narrow(0, pack_offset_bytes, required)
-    row_indices = torch.as_tensor(
-        src_token_indices, device=pack.device, dtype=torch.int64
-    )
     gather_stream = pack_buffer.get_gather_stream()
+    # Preserve the producer dependency, including PP cached-prefix sends.
     gather_stream.wait_stream(pack_buffer.producer_stream())
     with device_stream_context(gather_stream):
+        host_indices = torch.from_numpy(
+            np.ascontiguousarray(src_token_indices, dtype=np.int64)
+        )
+        if pack.device.type == "cuda":
+            host_indices = host_indices.pin_memory()
+        row_indices = host_indices.to(pack.device, non_blocking=True)
+        if not hasattr(pack_buffer, "_dcp_pack_metadata_cache"):
+            pack_buffer._dcp_pack_metadata_cache = MlaPackMetadataCache()
         copy_mla_rows_into_pack(
-            kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
+            kv_data_ptrs,
+            row_indices,
+            pack,
+            token_item_lens,
+            src_token_item_lens,
+            metadata_cache=pack_buffer._dcp_pack_metadata_cache,
         )
     gather_stream.synchronize()
 
@@ -128,7 +142,13 @@ def init_dcp_pack_buffers(
 
     buffers = []
     for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
+        buf = StagingBuffer(
+            size_bytes,
+            device,
+            gpu_id,
+            custom_mem_pool=custom_mem_pool,
+            gather_stream_priority=-1,
+        )
         register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
     logger.info(
