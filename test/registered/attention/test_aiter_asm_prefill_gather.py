@@ -1,4 +1,4 @@
-"""Index arithmetic for the aiter ASM context-chunk prefill KV gather.
+"""Index and layout arithmetic for the aiter prefill helpers.
 
 kv_indptr/kv_indices are token-level for every page_size, so the gather must
 resolve token t of sequence i to kv_indices[kv_indptr[i] + t]. Pure indexing,
@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.attention.aiter_backend import (
     _asm_context_prefill_gather_indices,
+    _prefill_q_heads,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -99,6 +100,32 @@ class TestAsmPrefillGatherIndices(unittest.TestCase):
         kv_indptr, kv_indices, lens = _token_level_metadata(req_to_token)
         self.assertIsNone(
             _asm_context_prefill_gather_indices(kv_indptr, kv_indices, lens, 16)
+        )
+
+
+class TestPrefillQHeads(unittest.TestCase):
+    num_heads, head_dim, num_kv_heads, tokens = 4, 8, 2, 37
+
+    def test_qkv_column_slice_is_not_copied(self):
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        qkv = torch.randn(self.tokens, q_size + 2 * kv_size)
+        q, _, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        out = _prefill_q_heads(q, self.num_heads, self.head_dim)
+        self.assertEqual(out.data_ptr(), qkv.data_ptr())
+        self.assertEqual(out.stride(), (qkv.stride(0), self.head_dim, 1))
+        torch.testing.assert_close(
+            out, q.contiguous().view(-1, self.num_heads, self.head_dim), rtol=0, atol=0
+        )
+
+    def test_strided_last_dim_is_copied(self):
+        q = torch.randn(self.num_heads * self.head_dim, self.tokens).t()
+
+        out = _prefill_q_heads(q, self.num_heads, self.head_dim)
+        self.assertTrue(out.is_contiguous())
+        torch.testing.assert_close(
+            out, q.contiguous().view(-1, self.num_heads, self.head_dim), rtol=0, atol=0
         )
 
 

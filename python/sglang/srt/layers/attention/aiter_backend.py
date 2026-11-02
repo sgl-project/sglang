@@ -163,6 +163,14 @@ fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
 
+def _prefill_q_heads(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    # aiter's mha_batch_prefill copies q only when stride(-1) != 1, so a column
+    # slice of the fused QKV output is split into heads as a view.
+    if q.dim() == 2 and q.stride(-1) == 1:
+        return q.unflatten(-1, (num_heads, head_dim))
+    return q.contiguous().view(-1, num_heads, head_dim)
+
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -4724,7 +4732,7 @@ class AiterAttnBackend(AttentionBackend):
                 extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
 
             o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                _prefill_q_heads(q, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
                 self.forward_metadata.qo_indptr[:bs0],
