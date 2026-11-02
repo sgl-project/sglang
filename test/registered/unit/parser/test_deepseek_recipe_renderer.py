@@ -194,13 +194,8 @@ class TestDeepSeekRecipe(CustomTestCase):
             self.deepseek_recipe.encode(chat),
         )
 
-    def test_a_converted_conversation_cut_after_an_assistant_turn_encodes_as_a_prefix(
-        self,
-    ):
-        """Miles (radixark/miles) tokenizes sessions turn by turn with these calls: a
-        history cut after pending tool calls renders through `convert` and
-        `encode_conversation` as a prefix of the full prompt, then the generation
-        header, preserving the effort budget and response schema."""
+    def test_sliced_conversation_matches_full_prompt_prefix(self):
+        """Dropped prompt configuration breaks prefix parity for sliced histories."""
         recipe = renderer.load_deepseek_recipe()
         call = {
             "id": "call_1",
@@ -232,11 +227,11 @@ class TestDeepSeekRecipe(CustomTestCase):
             }
             with self.subTest(thinking=thinking):
                 conversation = self.deepseek_recipe.convert(body, effort_budget=30)
-                full = self.deepseek_recipe.encode_conversation(
+                full_ids = self.deepseek_recipe.encode_conversation(
                     conversation, effort_budget=30
                 )
                 self.assertEqual(
-                    full, self.deepseek_recipe.encode(body, effort_budget=30)
+                    full_ids, self.deepseek_recipe.encode(body, effort_budget=30)
                 )
                 history = recipe.Conversation(
                     conversation.messages[:2],
@@ -247,12 +242,14 @@ class TestDeepSeekRecipe(CustomTestCase):
                     response_schema=conversation.response_schema,
                     response_regex=conversation.response_regex,
                 )
-                prefix = self.deepseek_recipe.encode_conversation(
+                prefix_ids = self.deepseek_recipe.encode_conversation(
                     history, effort_budget=30
                 )
-                think = "<think>" if thinking else "</think>"
-                self.assertEqual(prefix[-2:], self._ids("<｜Assistant｜>", think))
-                self.assertEqual(full[: len(prefix) - 2], prefix[:-2])
+                think_token = "<think>" if thinking else "</think>"
+                self.assertEqual(
+                    prefix_ids[-2:], self._ids("<｜Assistant｜>", think_token)
+                )
+                self.assertEqual(full_ids[: len(prefix_ids) - 2], prefix_ids[:-2])
 
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
