@@ -172,6 +172,53 @@
       }
     }
   },
+  "request_stats": {
+    "header": "dc001c92a4646f6e65a772756e6e696e679282a474797065a66c656e677468a66c656e67746803c0920202920301920000920000909090909090909090909090929193a66c61756e63680003c09090909090c40090c0928eaf6e756d5f72657472616374696f6e7302b573746f726167655f70726566657463685f77616974cb3fe0000000000000b2666f72776172645f656e7472795f74696d65cb41da39de19100000b570726566696c6c5f66696e69736865645f74696d65cb41da39de19300000aa71756575655f74696d65cb3fc0000000000000b0737065635f6163636570745f72617465cb3fdc71c71c71c71cb2737065635f6163636570745f6c656e677468cb3ff0000000000000b7737065635f6e756d5f636f72726563745f64726166747304b8737065635f6e756d5f70726f706f7365645f64726166747309ae737065635f7665726966795f637403af737065635f6361705f6c656e677468cb3ffaaaaaaaaaaaabb8737065635f626c6f636b5f6163636570745f6c656e677468cb4002aaaaaaaaaaabbd737065635f636f72726563745f6472616674735f686973746f6772616d93000102b7737065635f6361705f6c656e735f686973746f6772616d920003c0",
+    "data": "0100000000000000020000000000000003000000000000000400000000000000",
+    "decode_latencies": {},
+    "meta_info": {
+      "done": {
+        "weight_version": "launch",
+        "weight_versions": [
+          {
+            "version": "launch",
+            "start": 0,
+            "end": 3
+          }
+        ],
+        "cached_tokens_details": null
+      },
+      "running": {
+        "weight_version": "launch",
+        "cached_tokens_details": null
+      }
+    },
+    "request_stats": {
+      "done": {
+        "num_retractions": 2,
+        "storage_prefetch_wait": 0.5,
+        "forward_entry_time": 1760000100.25,
+        "prefill_finished_time": 1760000100.75,
+        "queue_time": 0.125,
+        "spec_accept_rate": 0.4444444444444444,
+        "spec_accept_length": 1.0,
+        "spec_num_correct_drafts": 4,
+        "spec_num_proposed_drafts": 9,
+        "spec_verify_ct": 3,
+        "spec_cap_length": 1.6666666666666667,
+        "spec_block_accept_length": 2.3333333333333335,
+        "spec_correct_drafts_histogram": [
+          0,
+          1,
+          2
+        ],
+        "spec_cap_lens_histogram": [
+          0,
+          3
+        ]
+      }
+    }
+  },
   "abort": {
     "header": "dc001891a761626f727465649182a474797065a561626f7274a76d657373616765b641626f727420696e2077616974696e672071756575659102910091009100909090909090909090909090919293a36f6c64000293a36e657702099090909091c3",
     "completion_tokens": 3,

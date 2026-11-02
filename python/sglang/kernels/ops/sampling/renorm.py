@@ -24,7 +24,7 @@ elif is_npu():
     except ImportError:
         top_k_renorm_prob = None
         top_p_renorm_prob = None
-elif is_musa():
+elif is_musa() or is_xpu():
     try:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
     except Exception:
