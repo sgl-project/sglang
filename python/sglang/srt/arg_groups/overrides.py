@@ -1578,6 +1578,45 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
+_FLASHINFER_TRTLLM_ROUTED_QUANTIZATIONS = frozenset(
+    {
+        "fp8",
+        "mxfp8",
+        "modelopt_fp4",
+        "modelopt_mixed",
+        "nvfp4_online",
+        "minimax_m3_nvfp4",
+        None,
+    }
+)
+
+
+@register_post_process
+def _moe_runner_routed_experts_capture(view: Any) -> dict:
+    """Move flashinfer_trtllm to its routed variant when routed experts are returned.
+
+    flashinfer_trtllm routes inside the kernel and never materializes top-k ids,
+    so the capturer would record nothing; the routed variant computes top-k in
+    SGLang and runs the same expert GEMMs.
+    """
+    if (
+        not view.enable_return_routed_experts
+        or view.moe_runner_backend != "flashinfer_trtllm"
+    ):
+        return {}
+    if view.quantization not in _FLASHINFER_TRTLLM_ROUTED_QUANTIZATIONS:
+        raise ValueError(
+            "--enable-return-routed-experts with flashinfer_trtllm requires the "
+            "routed variant, which does not support quantization "
+            f"{view.quantization!r}; choose another --moe-runner-backend."
+        )
+    logger.warning(
+        "Routed experts capture is enabled with flashinfer_trtllm. Using "
+        "flashinfer_trtllm_routed because it exposes top-k ids to the capturer."
+    )
+    return {"moe_runner_backend": "flashinfer_trtllm_routed"}
+
+
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
     """Disable shared-expert fusion for incompatible MoE runners.
