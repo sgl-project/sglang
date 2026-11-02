@@ -57,7 +57,9 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -104,15 +106,12 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.monokernels.runtime import is_metadata_unread
-from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -1021,7 +1020,10 @@ class DeepseekV4HipRadixBackend(
         # output mode of the fp8 verify: deepseek_v4 fuses the fp8 wo_a quant into it
         self._fp8_verify_epi = (
             "invrope_mxfp8"
-            if any(getattr(m, "wo_a_fp8", False) for m in model_runner.model.modules())
+            if any(
+                getattr(m, "wo_a_fp8_block128", False)
+                for m in model_runner.model.modules()
+            )
             else "bf16"
         )
         self._fp8_split_kv_hint: Dict[int, int] = {}
@@ -2012,7 +2014,7 @@ class DeepseekV4HipRadixBackend(
                 )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -2139,7 +2141,7 @@ class DeepseekV4HipRadixBackend(
                 block_size=int(forward_batch.spec_info.draft_token_num),
             )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -3716,6 +3718,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
             actual_forward_mode=actual_forward_mode,

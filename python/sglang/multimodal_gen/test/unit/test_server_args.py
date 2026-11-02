@@ -71,6 +71,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -138,6 +139,50 @@ class TestPlatformLifecycleHooks(unittest.TestCase):
             )
 
         apply_defaults.assert_called_once_with(server_args)
+
+
+class TestExplicitCliArgs(unittest.TestCase):
+    def test_prepare_uses_its_argv_not_process_flags(self):
+        argv = [
+            "--model-path",
+            "test/model",
+            "--mode=manual",
+            "--dit-cpu-offload",
+            "false",
+        ]
+        with (
+            patch.object(sys, "argv", ["host-program", "--port", "12345"]),
+            patch.object(ServerArgs, "from_dict", side_effect=lambda kwargs: kwargs),
+        ):
+            kwargs = server_args_module.prepare_server_args(argv)
+        self.assertEqual(kwargs["model_path"], "test/model")
+        self.assertEqual(kwargs["performance_mode"], "manual")
+        self.assertIs(kwargs["dit_cpu_offload"], False)
+        self.assertNotIn("port", kwargs)
+        self.assertEqual(
+            kwargs["_explicit_arg_names"],
+            {"model_path", "performance_mode", "dit_cpu_offload"},
+        )
+
+    def test_registered_aliases_use_their_destination(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--pipeline", "CustomPipeline"], "pipeline_class_name", "CustomPipeline"),
+            (["--mode=manual"], "performance_mode", "manual"),
+            (["--cfg-parallel-size", "1"], "cfg_parallel_degree", 1),
+            (["--dp", "2"], "dp_size", 2),
+            (
+                ["--layerwise-offload-modules", "transformer"],
+                "layerwise_offload_components",
+                ["transformer"],
+            ),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
 
 
 class _CudaPlatformTestCase(unittest.TestCase):
@@ -1273,6 +1318,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
+            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
@@ -3099,6 +3145,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
         self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
+    def test_minimax_h3_memory_mode_keeps_one_vae_tile_per_forward(self):
+        for pipeline_cls, mode, expected in (
+            (MiniMaxH3PipelineConfig, "speed", (64, 1)),
+            (MiniMaxH3PipelineConfig, "memory", (1, 1)),
+            (FastH3PipelineConfig, "speed", (0, 1)),
+            (FastH3PipelineConfig, "memory", (1, 1)),
+        ):
+            config = pipeline_cls()
+            self._from_dict_with_pipeline_config(
+                config,
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "ulysses_degree": 4,
+                    "performance_mode": mode,
+                },
+            )
+            self.assertEqual(
+                (config.vae_config.decoder_tile_batch, config.vae_config.window_batch),
+                expected,
+                (pipeline_cls.__name__, mode),
+            )
+
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
             ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
@@ -3366,6 +3435,14 @@ class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
         )
         self.assertFalse(original.enable_breakable_cuda_graph)
 
+    def test_ltx25_distilled_two_stage_serving_turns_bcg_on(self):
+        args = self._resolve(
+            model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
+        )
+        self.assertTrue(args.enable_breakable_cuda_graph)
+        # the two-stage request takes the output size, not LTX-2.5's 960x544 stage 1
+        self.assertEqual(args.warmup_resolutions, ["1920x1088"])
+
     def test_gates_keep_unset_bcg_off(self):
         cases = {
             "explicit off": {"enable_breakable_cuda_graph": False},
@@ -3594,6 +3671,93 @@ class TestPerRoleParallelism(unittest.TestCase):
 
     def _from_dict(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
+
+    def test_role_derivation_recalculates_automatic_topology(self):
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", side_effect=lambda _: WanT2V480PConfig()
+            ),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
+            mock_cuda_platform(),
+        ):
+            for source_options in ({}, {"enable_cfg_parallel": False}):
+                source = ServerArgs.from_kwargs(
+                    model_path="/fake", num_gpus=2, **source_options
+                )
+                original = vars(source).copy()
+                explicit = source._explicit_arg_names.copy()
+                for role in (
+                    RoleType.ENCODER,
+                    RoleType.PROMPT_ENCODER,
+                    RoleType.IMAGE_ENCODER,
+                    RoleType.DENOISER,
+                    RoleType.DECODER,
+                ):
+                    for devices in (1, 2, 4):
+                        with self.subTest(
+                            options=source_options, role=role, gpus=devices
+                        ):
+                            args = source.for_disagg_role(role, num_gpus=devices)
+                            self.assertEqual(args.hsdp_shard_dim, devices)
+                            self.assertEqual(
+                                args.tp_size
+                                * args.sp_degree
+                                * args.cfg_parallel_degree,
+                                devices,
+                            )
+                            self.assertEqual(args.disagg_role, role)
+                            self.assertTrue(args.disagg_mode)
+                            if devices == 1:
+                                self.assertFalse(args.enable_cfg_parallel)
+                                self.assertEqual(args.kv_gather_degree, 1)
+                                self.assertFalse(args.sp_split_auto)
+                self.assertEqual(vars(source), original)
+                self.assertEqual(source._explicit_arg_names, explicit)
+
+    def test_role_derivation_respects_explicit_parallelism(self):
+        with (
+            patch.object(
+                PipelineConfig, "from_kwargs", side_effect=lambda _: WanT2V480PConfig()
+            ),
+            patch.object(ServerArgs, "_model_default_uses_cfg", return_value=True),
+            mock_cuda_platform(),
+        ):
+            for role, option, field in (
+                (RoleType.ENCODER, "encoder_tp", "tp_size"),
+                (RoleType.DENOISER, "denoiser_tp", "tp_size"),
+                (RoleType.DENOISER, "denoiser_sp", "sp_degree"),
+                (RoleType.DENOISER, "denoiser_ulysses", "ulysses_degree"),
+                (RoleType.DECODER, "decoder_sp", "sp_degree"),
+            ):
+                with self.subTest(role=role, option=option):
+                    source = ServerArgs.from_kwargs(
+                        model_path="/fake", num_gpus=2, **{option: 2}
+                    )
+                    args = source.for_disagg_role(role)
+                    self.assertEqual(vars(args)[field], 2)
+                    self.assertEqual(args.cfg_parallel_degree, 1)
+                    self.assertTrue(args.is_arg_explicitly_set(field))
+                    self.assertFalse(source.is_arg_explicitly_set(field))
+
+            source = ServerArgs.from_kwargs(model_path="/fake", num_gpus=2, tp_size=2)
+            self.assertEqual(source.for_disagg_role(RoleType.DENOISER).tp_size, 2)
+            source.denoiser_tp = 1
+            self.assertEqual(source.for_disagg_role(RoleType.DENOISER).tp_size, 1)
+
+            for options in (
+                {"tp_size": 2},
+                {"cfg_parallel_degree": 2},
+                {"enable_cfg_parallel": True},
+                {"hsdp_shard_dim": 2},
+                {"kv_gather_degree": 2, "enable_cfg_parallel": False},
+                {"denoiser_tp": 2, "cfg_parallel_degree": 2},
+            ):
+                with self.subTest(invalid=options):
+                    source = ServerArgs.from_kwargs(
+                        model_path="/fake", num_gpus=2, **options
+                    )
+                    with self.assertRaises(ValueError):
+                        source.for_disagg_role(RoleType.DENOISER, num_gpus=1)
 
     def test_defaults_are_none(self):
         args = self._from_dict({"model_path": "/fake"})

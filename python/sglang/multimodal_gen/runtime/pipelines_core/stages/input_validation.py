@@ -9,8 +9,6 @@ from typing import Iterator
 
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -28,7 +26,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    preprocess_image,
+)
 
 logger = init_logger(__name__)
 
@@ -262,18 +264,17 @@ class InputValidationStage(PipelineStage):
             ow, oh = _best_output_size(iw, ih, dw, dh, max_area)
 
             scale = max(ow / iw, oh / ih)
-            img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.debug("resized condition image to: %sx%s", img.height, img.width)
-
-            # center-crop
-            x1 = (img.width - ow) // 2
-            y1 = (img.height - oh) // 2
-            img = img.crop((x1, y1, x1 + ow, y1 + oh))
-            assert img.width == ow and img.height == oh
-
-            # to tensor
-            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
-            img = img.unsqueeze(0)
+            rw, rh = round(iw * scale), round(ih * scale)
+            img = (
+                preprocess_image(
+                    img,
+                    device=self.device,
+                    size=(rw, rh),
+                    crop=((rh - oh) // 2, (rw - ow) // 2, oh, ow),
+                )
+                .contiguous()
+                .unsqueeze(2)
+            )
             batch.height = oh
             batch.width = ow
             # TODO: should we store in a new field: pixel values?
@@ -440,7 +441,7 @@ class InputValidationStage(PipelineStage):
                 batch.condition_image = []
                 for path in batch.image_path:
                     if path.endswith(".mp4"):
-                        image = load_video(path)[0]
+                        image = load_video(path, max_frames=1)[0]
                     else:
                         image = self.load_condition_image(path)
                     batch.condition_image.append(image)
@@ -454,7 +455,7 @@ class InputValidationStage(PipelineStage):
                 )
             else:
                 if batch.image_path.endswith(".mp4"):
-                    image = load_video(batch.image_path)[0]
+                    image = load_video(batch.image_path, max_frames=1)[0]
                 else:
                     image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image

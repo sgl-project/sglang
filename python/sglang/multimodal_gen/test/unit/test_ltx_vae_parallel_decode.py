@@ -31,6 +31,7 @@ class _DecodeGroup:
         self.world_size = WORLD_SIZE
         self.ranks = list(range(WORLD_SIZE))
         self.device_group = dist.group.WORLD
+        self.cpu_group = dist.group.WORLD
 
     def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
         gathered = [torch.empty_like(x) for _ in range(self.world_size)]
@@ -88,7 +89,7 @@ def _check_decodes(rank: int) -> None:
 
     # below the auto threshold every rank decodes the whole clip, tiled as on one rank
     compare("tiled", auto.decode(z).sample, reference.decode(z).sample)
-    # 4 rows x 8 per rank exceed a 4x4 tile, so every rank still tiles the whole clip
+    # 4 rows x 8 per rank exceed a 4x4 tile, so the ranks split the tiles instead
     compare("tiled_shard", sharded.decode(z).sample, reference.decode(z).sample)
     # they fit a 6x6 tile, so the height split replaces tiling
     sharded.enable_tiling(
