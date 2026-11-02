@@ -12,16 +12,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
+    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
+    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
+    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -75,6 +75,12 @@ fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
             "unknown component type: {other}"
         ))),
     }
+}
+
+/// Map a tree slot's family name onto the Rust enum.
+fn parse_family(family: &str) -> PyResult<Family> {
+    Family::parse(family)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown tree slot family: {family}")))
 }
 
 /// Map the Python EvictLayer IntFlag value onto the Rust enum.
@@ -173,83 +179,13 @@ fn py_array_to_vec_i64(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Vec<i
     buffer.to_vec(py)
 }
 
-/// The tagged-tuple tag of a cache action.
-fn cache_action_tag(action: &CacheAction) -> &'static str {
-    match action {
-        CacheAction::FreeDeviceKV(_) => "free_device_kv",
-        CacheAction::FreeDeviceKVFullOnly(_) => "free_device_kv_full_only",
-        CacheAction::BackupKV(_) => "backup_kv",
-        CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "update_pending_backup_on_node_split",
-        CacheAction::MambaEvictExcessPathStates { .. } => "mamba_evict_excess_path_states",
-        CacheAction::FreeComponentDeviceSlot { .. } => "free_component_device_slot",
-        CacheAction::FreeComponentHostSlot { .. } => "free_component_host_slot",
-        CacheAction::RebuildFullToSwaMapping { .. } => "rebuild_full_to_swa_mapping",
-        CacheAction::RecoverSwaWithLockedFull { .. } => "recover_swa_with_locked_full",
-        CacheAction::SwaRebuild { .. } => "swa_rebuild",
-    }
-}
-
-/// Convert a cache action into its Python tagged tuple.
-fn cache_action_to_py(py: Python<'_>, action: CacheAction) -> PyResult<Py<PyAny>> {
-    let tag = cache_action_tag(&action);
-    match action {
-        CacheAction::FreeDeviceKV(tensors) => {
-            let tensors = PyList::new(py, tensors.into_iter().map(PyTensor))?;
-            (tag, tensors).into_py_any(py)
-        }
-        CacheAction::FreeDeviceKVFullOnly(tensors) => {
-            let tensors = PyList::new(py, tensors.into_iter().map(PyTensor))?;
-            (tag, tensors).into_py_any(py)
-        }
-        CacheAction::BackupKV(backup) => (tag, backup.node_ids).into_py_any(py),
-        CacheAction::UpdatePendingBackupOnNodeSplit {
-            ack_id,
-            old_node_id,
-            new_node_id,
-            new_child_node_id,
-        } => (tag, ack_id, old_node_id, new_node_id, new_child_node_id).into_py_any(py),
-        CacheAction::MambaEvictExcessPathStates { tail_node_id } => {
-            (tag, tail_node_id).into_py_any(py)
-        }
-        CacheAction::FreeComponentDeviceSlot {
-            component_type,
-            indices,
-        } => {
-            let indices = PyList::new(py, indices.into_iter().map(PyTensor))?;
-            (tag, component_type_to_u8(component_type), indices).into_py_any(py)
-        }
-        CacheAction::FreeComponentHostSlot {
-            component_type,
-            host_indices,
-        } => {
-            let host_indices = PyList::new(py, host_indices.into_iter().map(PyTensor))?;
-            (tag, component_type_to_u8(component_type), host_indices).into_py_any(py)
-        }
-        CacheAction::RebuildFullToSwaMapping {
-            full_indices,
-            swa_indices,
-        } => {
-            let full_indices = PyList::new(py, full_indices.into_iter().map(PyTensor))?;
-            let swa_indices = PyList::new(py, swa_indices.into_iter().map(PyTensor))?;
-            (tag, full_indices, swa_indices).into_py_any(py)
-        }
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        } => (tag, node_id, PyTensor(kept_full), PyTensor(incoming_full)).into_py_any(py),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        } => (tag, node_id, PyTensor(source_value)).into_py_any(py),
-    }
-}
+mod cache_action;
 
 /// Convert cache actions into a Python list of tagged tuples.
-fn cache_actions_to_py(py: Python<'_>, actions: Vec<CacheAction>) -> PyResult<Py<PyList>> {
+fn cache_actions_to_py(py: Python<'_>, actions: CacheActions) -> PyResult<Py<PyList>> {
     let list = PyList::empty(py);
     for action in actions {
-        list.append(cache_action_to_py(py, action)?)?;
+        list.append(action.into_py_tagged(py)?)?;
     }
     Ok(list.unbind())
 }
@@ -338,6 +274,10 @@ struct InspectionMatchResultInput {
     last_host_node: NodeId,
     #[pyo3(attribute)]
     best_match_node: NodeId,
+    #[pyo3(attribute)]
+    last_visited_node_id: Option<NodeId>,
+    #[pyo3(attribute)]
+    full_device_match_len: Option<usize>,
     #[pyo3(attribute)]
     host_hit_length: usize,
     #[pyo3(attribute)]
@@ -506,6 +446,7 @@ pub struct TreeCoreInitParamsBinding {
     pub dynamo_kv_event_format: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
+    pub mamba_host_only_checkpoint: bool,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -529,6 +470,7 @@ impl TreeCoreInitParamsBinding {
             dynamo_kv_event_format: self.dynamo_kv_event_format,
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
+            mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
         })
     }
 }
@@ -536,7 +478,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -553,6 +495,7 @@ impl TreeCoreInitParamsBinding {
         tlru_tail_budget: usize,
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
+        mamba_host_only_checkpoint: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -570,6 +513,7 @@ impl TreeCoreInitParamsBinding {
             dynamo_kv_event_format,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
+            mamba_host_only_checkpoint,
         }
     }
 }
@@ -612,6 +556,8 @@ pub struct InsertParamsBinding {
     pub cache_salt: Option<String>,
     pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
+    pub mamba_host_value: Option<Py<PyAny>>,
+    pub allow_missing_mamba: bool,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
@@ -623,7 +569,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, mamba_host_value = None, allow_missing_mamba = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -639,6 +585,8 @@ impl InsertParamsBinding {
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
         rotation_base: Option<i64>,
+        mamba_host_value: Option<Py<PyAny>>,
+        allow_missing_mamba: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -648,6 +596,8 @@ impl InsertParamsBinding {
             cache_salt,
             session_id,
             mamba_value,
+            mamba_host_value,
+            allow_missing_mamba,
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
@@ -665,6 +615,8 @@ pub struct MatchResultBinding {
     last_device_node_id: NodeId,
     last_host_node_id: NodeId,
     best_match_node_id: NodeId,
+    last_visited_node_id: Option<NodeId>,
+    full_device_match_len: Option<usize>,
     host_hit_length: usize,
     swa_host_hit_length: usize,
     swa_branching_seqlen: Option<usize>,
@@ -682,6 +634,8 @@ impl MatchResultBinding {
             last_device_node_id: result.last_device_node_id,
             last_host_node_id: result.last_host_node_id,
             best_match_node_id: result.best_match_node_id,
+            last_visited_node_id: result.last_visited_node_id,
+            full_device_match_len: result.full_device_match_len,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
             swa_branching_seqlen: result.swa_branching_seqlen,
@@ -1035,20 +989,20 @@ struct TreeCoreBinding<Core> {
 macro_rules! tree_core_methods {
     ($core:ident) => {
         impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                let component_types = component_types
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
+                let slots = slots
                     .into_iter()
-                    .map(parse_component_type)
+                    .map(|(slot, family)| Ok((parse_component_type(slot)?, parse_family(&family)?)))
                     .collect::<PyResult<Vec<_>>>()?;
                 let params = init_params.to_cache_init_params()?;
-                $core::<K>::validate_init_params(&params, &component_types)
+                $core::<K>::validate_init_params(&params, &slots)
                     .map_err(PyValueError::new_err)?;
                 let device = params.device;
                 let page_size = params.page_size;
                 Ok(TreeCoreBinding {
-                    core: Mutex::new($core::new(params, component_types)),
+                    core: Mutex::new($core::new_with_slots(params, slots)),
                     device,
                     page_size,
                 })
@@ -1058,6 +1012,13 @@ macro_rules! tree_core_methods {
             /// so a poisoned core is never reused.
             fn core(&self) -> std::sync::MutexGuard<'_, $core<K>> {
                 self.core.lock().unwrap_or_else(|_| {
+                    panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
+                })
+            }
+
+            /// Lock the core for an O(1) read, releasing the GIL only to wait for a busy core.
+            fn core_attached(&self, py: Python<'_>) -> std::sync::MutexGuard<'_, $core<K>> {
+                pyo3::sync::MutexExt::lock_py_attached(&self.core, py).unwrap_or_else(|_| {
                     panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
                 })
             }
@@ -1189,6 +1150,12 @@ macro_rules! tree_core_methods {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
                     None => None,
                 };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
+                    None => None,
+                };
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
@@ -1199,6 +1166,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1227,6 +1196,12 @@ macro_rules! tree_core_methods {
                     Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
                     None => None,
                 };
+                let mamba_host_value = match &params.mamba_host_value {
+                    Some(mamba_host_value) => {
+                        Some(mamba_host_value.bind(py).extract::<PyTensor>()?.0)
+                    }
+                    None => None,
+                };
                 let params = InsertParams {
                     rotation_base: params.rotation_base,
                     key,
@@ -1237,6 +1212,8 @@ macro_rules! tree_core_methods {
                     session_id: params.session_id.as_deref(),
                     value: value.0,
                     mamba_value,
+                    mamba_host_value,
+                    allow_missing_mamba: params.allow_missing_mamba,
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1260,7 +1237,7 @@ macro_rules! tree_core_methods {
 
             /// Whether an insert walk is suspended at a barrier.
             fn has_ongoing_insert(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().has_ongoing_insert())
+                self.core_attached(py).has_ongoing_insert()
             }
 
             /// Finish the insert (idempotent); returns still-pending actions to drain.
@@ -1579,7 +1556,7 @@ macro_rules! tree_core_methods {
                 Ok(EvictDeviceLeafResultBinding {
                     unbacked_tokens: result.unbacked_tokens,
                     backup_kv: backup
-                        .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                        .map(|backup| backup.into_py_tagged(py))
                         .transpose()?,
                     tracker: tracker_to_py(result.tracker),
                     new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -1658,34 +1635,34 @@ macro_rules! tree_core_methods {
 
             /// Evictable token count of the FULL (base) component.
             fn evictable_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().evictable_size())
+                self.core_attached(py).evictable_size()
             }
 
             /// Protected (locked) token count of the FULL (base) component.
             fn protected_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().protected_size())
+                self.core_attached(py).protected_size()
             }
 
             /// FULL component evictable token count.
             fn full_evictable_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().full_evictable_size())
+                self.core_attached(py).full_evictable_size()
             }
 
             /// FULL component protected token count.
             fn full_protected_size(&self, py: Python<'_>) -> usize {
-                py.detach(|| self.core().full_protected_size())
+                self.core_attached(py).full_protected_size()
             }
 
             /// Evictable token count for one component (0 if the component is absent).
             fn component_evictable_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
                 let ct = parse_component_type(component_type)?;
-                Ok(py.detach(|| self.core().component_evictable_size(ct)))
+                Ok(self.core_attached(py).component_evictable_size(ct))
             }
 
             /// Protected token count for one component (0 if the component is absent).
             fn component_protected_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
                 let ct = parse_component_type(component_type)?;
-                Ok(py.detach(|| self.core().component_protected_size(ct)))
+                Ok(self.core_attached(py).component_protected_size(ct))
             }
 
             /// (full_tokens, aux_tokens) summed across the whole tree.
@@ -1706,7 +1683,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the host tier runs as a storage staging buffer, not a cache.
             fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().is_host_memory_buffer_only())
+                self.core_attached(py).is_host_memory_buffer_only()
             }
 
             /// Mark the host tier (HiCache) as wired.
@@ -1716,7 +1693,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the host tier (HiCache) is wired.
             fn enable_hicache(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_hicache())
+                self.core_attached(py).enable_hicache()
             }
 
             /// Mark the SWA host pool as wired (HiCache).
@@ -1726,7 +1703,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the SWA host pool is wired.
             fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().has_swa_host_pool())
+                self.core_attached(py).has_swa_host_pool()
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
@@ -1766,7 +1743,7 @@ macro_rules! tree_core_methods {
                 let backup = py
                     .detach(|| self.core().build_backup_kv_action(node_id))
                     .map_err(node_access_error)?;
-                cache_action_to_py(py, CacheAction::BackupKV(backup))
+                backup.into_py_tagged(py)
             }
 
             /// Gather a node's device value plus per-component BACKUP_HOST transfers.
@@ -2137,7 +2114,7 @@ macro_rules! tree_core_methods {
 
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().is_write_back())
+                self.core_attached(py).is_write_back()
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.
@@ -2147,7 +2124,7 @@ macro_rules! tree_core_methods {
 
             /// The current write-through backup hit threshold.
             fn write_through_threshold(&self, py: Python<'_>) -> i64 {
-                py.detach(|| self.core().write_through_threshold())
+                self.core_attached(py).write_through_threshold()
             }
 
             /// Mark the storage tier (L3) wired; storage attaches after tree construction.
@@ -2157,7 +2134,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the storage tier (L3) is wired.
             fn enable_storage(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_storage())
+                self.core_attached(py).enable_storage()
             }
 
             /// Enable or disable the direct external-cache linker.
@@ -2168,7 +2145,7 @@ macro_rules! tree_core_methods {
 
             /// Whether the direct external-cache linker is wired.
             fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
-                py.detach(|| self.core().enable_external_cache_linker())
+                self.core_attached(py).enable_external_cache_linker()
             }
 
             /// Queue the all-cleared placement event.
@@ -2339,7 +2316,7 @@ macro_rules! tree_core_methods {
 
             /// Order-sensitive digest of reclaimed coexisting host values.
             fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
-                py.detach(|| self.core().write_back_coexist_reclaim_digest())
+                self.core_attached(py).write_back_coexist_reclaim_digest()
             }
 
             /// Whether the component's data is device-evicted but host-backed.
@@ -2709,6 +2686,8 @@ macro_rules! tree_core_methods {
                     last_device_node: last_device_node_id,
                     last_host_node: last_host_node_id,
                     best_match_node: best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,
@@ -2721,6 +2700,8 @@ macro_rules! tree_core_methods {
                     last_device_node_id,
                     last_host_node_id,
                     best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,
@@ -2790,13 +2771,13 @@ macro_rules! tree_core_binding {
 
         #[pymethods]
         impl $name {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
             #[new]
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, component_types)?,
+                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, slots)?,
                     })
                 })
             }

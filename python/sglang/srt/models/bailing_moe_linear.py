@@ -312,7 +312,10 @@ class BailingMoE(nn.Module):
         self.topk.topk_config.apply_routed_scaling_factor_on_output = (
             self.experts.should_fuse_routed_scaling_factor_in_topk
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         if self.num_shared_experts > 0:
             intermediate_size = self.intermediate_size * self.num_shared_experts

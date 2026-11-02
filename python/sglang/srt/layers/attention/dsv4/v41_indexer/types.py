@@ -104,7 +104,7 @@ class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int
     q: torch.Tensor  # [rows, heads, 128] bf16, roped
     weights: torch.Tensor  # [rows, heads] bf16 head weights
-    paged_metadata: PagedIndexerMetadata
+    index_page_size: int  # index-K pool page size at this ratio
     # The selection as pool slots and as request-local compressed positions.
     out_page_indices: torch.Tensor
     out_raw_indices: torch.Tensor

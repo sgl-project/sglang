@@ -257,13 +257,9 @@ def test_memory_bank_retains_decoded_frames(enable_memory_bank):
     server_args = SimpleNamespace(
         enable_torch_compile=False, pipeline_config=PipelineConfig()
     )
-    with mock.patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding.current_platform.is_cuda",
-        return_value=True,
-    ):
-        assert can_encode_while_decoding(request, server_args, 1) == (
-            not enable_memory_bank
-        )
+    assert can_encode_while_decoding(request, server_args, 1) == (
+        not enable_memory_bank
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA video transfer")

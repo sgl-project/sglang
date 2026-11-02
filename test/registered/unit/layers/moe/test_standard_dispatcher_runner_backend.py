@@ -17,7 +17,11 @@ import torch
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import standard
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -150,6 +154,120 @@ def test_fp8_triton_fallback_reaches_the_dispatcher(cutlass_pin):
     assert method.runner.runner_backend.is_triton()
     assert layer.moe_runner_config.runner_backend.is_triton()
     assert not layer.dispatcher.skip_local_expert_mapping
+
+
+@pytest.mark.parametrize(
+    "backend, requested, expected",
+    [
+        (MoeRunnerBackend.FLASHINFER_TRTLLM, None, RoutingMethodType.DeepSeekV3),
+        (MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, None, RoutingMethodType.DeepSeekV3),
+        (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            RoutingMethodType.Default,
+            RoutingMethodType.Default,
+        ),
+        (MoeRunnerBackend.TRITON, None, None),
+        (MoeRunnerBackend.FLASHINFER_CUTLASS, None, None),
+    ],
+)
+def test_fp8_publishes_only_the_selected_runners_policy(
+    ep2_rank0, backend, requested, expected
+):
+    """The layer, router binding and consumer must share the actual FP8 policy."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+    ep2_rank0.runner_backend = backend
+    method = Fp8MoEMethod(
+        Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+    )
+    with patch.object(method, "create_weights"):
+        layer = FusedMoE(
+            num_experts=NUM_EXPERTS,
+            top_k=2,
+            hidden_size=16,
+            intermediate_size=128,
+            layer_id=0,
+            quant_method=method,
+            routing_method_type=requested,
+        )
+    assert layer.routing_method_type == expected
+    assert layer.moe_runner_config.routing_method_type == expected
+    assert layer.runner_backend == method.get_moe_runner_backend(layer)
+    assert layer.dispatcher.skip_local_expert_mapping == (
+        layer.runner_backend.is_flashinfer_trtllm()
+        or layer.runner_backend.is_flashinfer_trtllm_routed()
+    )
+
+
+def test_modelopt_undeclared_policy_keeps_triton_layout_and_local_ids(ep2_rank0):
+    """Publishing another method's default must not enable ModelOpt native repacking."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization import modelopt_quant
+
+    ep2_rank0.runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+    with patch.object(modelopt_quant, "cutlass_fp8_supported", return_value=False):
+        method = modelopt_quant.ModelOptFp8MoEMethod(
+            modelopt_quant.ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+        )
+    with patch.object(method, "create_weights"):
+        layer = FusedMoE(
+            num_experts=NUM_EXPERTS,
+            top_k=2,
+            hidden_size=16,
+            intermediate_size=128,
+            layer_id=0,
+            quant_method=method,
+        )
+    assert layer.routing_method_type is None
+    assert layer.moe_runner_config.routing_method_type is None
+    assert layer.runner_backend.is_triton()
+    assert not layer.dispatcher.skip_local_expert_mapping
+    ids = torch.tensor([[0, 5], [3, 7]], dtype=torch.int32)
+    assert _dispatch_ids(layer.dispatcher, ids).tolist() == [[0, -1], [3, -1]]
+
+
+@pytest.mark.parametrize(
+    "backend, requested, expected",
+    [
+        (MoeRunnerBackend.FLASHINFER_TRTLLM, None, RoutingMethodType.DeepSeekV3),
+        (
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            RoutingMethodType.Default,
+            RoutingMethodType.Default,
+        ),
+        (MoeRunnerBackend.TRITON, None, None),
+    ],
+)
+def test_hybrid_method_preserves_its_gpu_policy(
+    ep2_rank0, backend, requested, expected
+):
+    """The base query must not shadow the wrapped GPU method's routing contract."""
+    from sglang.srt.layers.moe import kt_ep_wrapper
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+    ep2_rank0.runner_backend = backend
+    gpu = Fp8MoEMethod(
+        Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+    )
+    with patch.object(kt_ep_wrapper, "KTRANSFORMERS_AVAILABLE", True):
+        method = kt_ep_wrapper.KTEPWrapperMethod(
+            gpu, SimpleNamespace(num_gpu_experts=4)
+        )
+    with patch.object(method, "create_weights"):
+        layer = FusedMoE(
+            num_experts=NUM_EXPERTS,
+            top_k=2,
+            hidden_size=16,
+            intermediate_size=128,
+            layer_id=0,
+            quant_method=method,
+            routing_method_type=requested,
+        )
+    assert layer.routing_method_type == expected
+    assert layer.moe_runner_config.routing_method_type == expected
+    assert layer.runner_backend == gpu.runner.runner_backend
 
 
 if __name__ == "__main__":
