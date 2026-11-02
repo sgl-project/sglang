@@ -7,7 +7,7 @@ detects such a tokenizer and the prompt dispatch that reacts to it.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -92,9 +92,15 @@ class TestRenderAndEncode(unittest.TestCase):
 
 class TestEnginePrompt(unittest.TestCase):
     def _server(self, lossy):
-        return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+        server = SimpleNamespace(
+            _prompt_text_round_trip_is_lossy=lossy,
+            _uses_mistral_common_tokenizer=False,
+            chat_encoding_spec=None,
         )
+        server._uses_mistral_image_placeholders = MethodType(
+            OpenAIServingChat._uses_mistral_image_placeholders, server
+        )
+        return server
 
     def test_lossy_text_only_sends_ids(self):
         key, value = engine_prompt(
