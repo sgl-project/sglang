@@ -53,6 +53,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.ple_state_pool import SlotIndexedState
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,7 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         device: str,
         temporal_dtype: Optional[torch.dtype] = None,
+        ple_side_states: Optional[List[SlotIndexedState]] = None,
     ):
         self.num_slots = num_slots
         self.device = device
@@ -224,6 +226,19 @@ class MambaCheckpointPool:
             for shape in conv_shapes
         ]
         self.allocator = MambaSlotAllocator(size=num_slots, device=device)
+        # PLE side-state mirrors: one row-block per cached slot, same dtype as
+        # the source (short-conv bf16 / n-gram context int64). Both are exact
+        # copies, not quantized — the int8 path only touches the temporal state.
+        self.ple_mirrors: List[tuple] = []
+        for st in ple_side_states or []:
+            t, dim = self._ple_source(st)
+            if t is None:
+                continue
+            shape = list(t.shape)
+            shape[dim] = num_slots + 1
+            self.ple_mirrors.append(
+                (st, torch.empty(tuple(shape), dtype=t.dtype, device=device), dim)
+            )
 
     # ---- lifecycle (delegates to the embedded allocator) ----
 
@@ -239,7 +254,22 @@ class MambaCheckpointPool:
     def clear(self) -> None:
         """Release every checkpoint slot (radix flush/reset). The int8 qdata is
         left as-is; slots are reused/overwritten on the next store."""
+        # Mirrors intentionally survive the flush: reads follow a fresh
+        # store into a re-handed slot, same discipline as qdata above.
         self.allocator.clear()
+
+    @staticmethod
+    def _ple_source(st: SlotIndexedState):
+        """Return the side state's main (slot-indexed) tensor and its slot axis.
+        ShortConvPool.conv_state is layer-major (slot dim 1); NGramPool.context
+        is slot-major (dim 0). Mirrors the layout comments in ple_state_pool."""
+        t = getattr(st, "conv_state", None)
+        if t is not None:
+            return t, 1
+        t = getattr(st, "context", None)
+        if t is not None:
+            return t, 0
+        return None, 0
 
     # ---- state transfer between the active MambaPool and this store ----
 
@@ -250,6 +280,14 @@ class MambaCheckpointPool:
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
             c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+        for st, mirror, dim in self.ple_mirrors:
+            src, _ = self._ple_source(st)
+            if src is None:
+                continue
+            if dim == 1:
+                mirror[:, ckpt_slots] = src[:, active_slots]
+            else:
+                mirror[ckpt_slots] = src[active_slots]
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from checkpoint slots into the active pool
@@ -258,6 +296,14 @@ class MambaCheckpointPool:
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
             cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+        for st, mirror, dim in self.ple_mirrors:
+            dst, _ = self._ple_source(st)
+            if dst is None:
+                continue
+            if dim == 1:
+                dst[:, active_slots] = mirror[:, ckpt_slots].to(dst.dtype)
+            else:
+                dst[active_slots] = mirror[ckpt_slots].to(dst.dtype)
 
     @staticmethod
     def estimate_mem_usage_bytes(
@@ -270,6 +316,7 @@ class MambaCheckpointPool:
         conv_shapes: List[tuple],
         conv_dtype: torch.dtype,
         temporal_dtype: torch.dtype,
+        ple_extra_bytes: int = 0,
     ) -> dict:
         """Estimate the pool's HBM footprint (bytes) WITHOUT allocating, so a
         caller can check it against free memory before construction. Mirrors the
@@ -290,12 +337,16 @@ class MambaCheckpointPool:
             "qdata": qdata,
             "scale": scale,
             "conv": conv,
-            "total": qdata + scale + conv,
+            "ple": ple_extra_bytes,
+            "total": qdata + scale + conv + ple_extra_bytes,
         }
 
     def mem_usage_bytes(self) -> int:
         conv_bytes = sum(c.numel() * c.element_size() for c in self.conv)
-        return self.temporal.mem_usage_bytes() + conv_bytes
+        ple_bytes = sum(
+            m.numel() * m.element_size() for _, m, _ in self.ple_mirrors
+        )
+        return self.temporal.mem_usage_bytes() + conv_bytes + ple_bytes
 
 
 def maybe_init_int8_mamba_checkpoint_pool(
@@ -304,6 +355,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     cache_params,
     mamba_layer_ids: List[int],
     device: str,
+    ple_side_states: Optional[List[SlotIndexedState]] = None,
 ) -> Optional[MambaCheckpointPool]:
     """Build the optional int8 ``MambaCheckpointPool`` when
     ``--enable-int8-mamba-checkpoint`` is set (and a global server-args context
@@ -339,7 +391,21 @@ def maybe_init_int8_mamba_checkpoint_pool(
         temporal_dtype=cache_params.dtype.temporal,
     )
 
-    est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
+    # Mirror the PLE side states (exact dtype, per cached slot) so a donated
+    # bf16 active slot never orphans its short-conv / n-gram rows.
+    ple_extra = 0
+    for st in ple_side_states or []:
+        t, dim = MambaCheckpointPool._ple_source(st)
+        if t is None:
+            continue
+        others = 1
+        for i, s in enumerate(t.shape):
+            if i != dim:
+                others *= int(s)
+        ple_extra += (ckpt_size + 1) * others * t.element_size()
+    est = MambaCheckpointPool.estimate_mem_usage_bytes(
+        **kwargs, ple_extra_bytes=ple_extra
+    )
     free_bytes = None
     if isinstance(device, str) and device.startswith("cuda"):
         try:
@@ -349,7 +415,8 @@ def maybe_init_int8_mamba_checkpoint_pool(
     logger.info(
         f"int8 mamba checkpoint pool: {ckpt_size} slots, "
         f"{est['total'] / GB:.2f}GB (qdata {est['qdata'] / GB:.2f} + scale "
-        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f}); active mamba "
+        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f} + ple "
+        f"{est.get('ple', 0) / GB:.2f}); active mamba "
         f"pool {mamba_size} slots"
         + (f"; free HBM {free_bytes / GB:.2f}GB" if free_bytes is not None else "")
     )
@@ -360,7 +427,9 @@ def maybe_init_int8_mamba_checkpoint_pool(
             f"(currently {ckpt_size}) or --mem-fraction-static."
         )
 
-    pool = MambaCheckpointPool(device=device, **kwargs)
+    pool = MambaCheckpointPool(
+        device=device, ple_side_states=list(ple_side_states or []), **kwargs
+    )
     # NOTE: this pool's HBM is NOT subtracted from the KV-cache budget
     # (max_total_num_tokens); it is allocated from --mem-fraction-static headroom.
     # The estimate check above guards against an oversized pool; accounting it in
