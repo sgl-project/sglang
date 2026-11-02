@@ -129,9 +129,7 @@ class Serving(msgspec.Struct):
         int,
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
-    ] = (
-        1024 * 1024
-    )
+    ] = 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS
