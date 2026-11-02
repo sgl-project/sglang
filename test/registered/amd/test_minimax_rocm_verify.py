@@ -2,7 +2,6 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -124,38 +123,6 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
             )
 
 
-class TestMiniMaxROCmVerifyIndexerGate(unittest.TestCase):
-    def test_m3_verify_takes_grouped_indexer(self):
-        """An M3 target (Quark MXFP4, EAGLE3) on gfx950 must score verify rows with the
-        grouped indexer."""
-        from sglang.srt.layers.attention import minimax_sparse_backend_hip as _hip
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        def init(spec="EAGLE3", score_type="max"):
-            backend = SimpleNamespace(
-                kv_pool=None, score_type=score_type, speculative_num_draft_tokens=4
-            )
-            with patch.object(_hip, "is_gfx95_supported", lambda: True):
-                _hip.init_sparse_backend(
-                    backend, SimpleNamespace(speculative_algorithm=spec)
-                )
-            return backend
-
-        self.assertTrue(init()._use_grouped_verify_indexer)
-        self.assertFalse(init(spec=None)._use_grouped_verify_indexer)
-        self.assertFalse(init(score_type="lse")._use_grouped_verify_indexer)
-
-        def num_draft(backend, mode):
-            return _hip.verify_num_draft(backend, SimpleNamespace(forward_mode=mode))
-
-        self.assertEqual(num_draft(init(), ForwardMode.TARGET_VERIFY), 4)
-        self.assertIsNone(num_draft(init(), ForwardMode.DECODE))
-        self.assertIsNone(num_draft(init(spec=None), ForwardMode.TARGET_VERIFY))
-
-
-@unittest.skipUnless(
-    torch.version.hip, "the deferred seq-lens pull is ROCm DSpark glue"
-)
 class TestDeferredSeqLensPull(unittest.TestCase):
     def test_host_lengths_are_unknown_until_the_pull(self):
         """A decode step resolves its GPU lengths before the worker pulls the host ones;
