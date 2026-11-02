@@ -173,7 +173,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
         self.invariant_checker = Mock()
-        self.uocr_doc_hooks = None
+        self.uocr_runtime = None
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
