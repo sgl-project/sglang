@@ -87,6 +87,11 @@ def assert_same_qkv(actual, expected):
 def test_model_dispatch(mode, dtype, should_fuse):
     layer = make_layer(dtype=dtype)
     assert layer.use_table_qk_norm_rope
+    should_prefill = (
+        mode == ForwardMode.EXTEND and torch.cuda.get_device_capability()[0] == 9
+    )
+    if should_prefill:
+        assert layer.use_prefill_qk_norm_rope
     x = torch.randn(4, layer.hidden_size, device="cuda", dtype=dtype)
     positions = torch.arange(4, device="cuda") + 17
     batch = SimpleNamespace(forward_mode=mode)
@@ -97,9 +102,14 @@ def test_model_dispatch(mode, dtype, should_fuse):
         patch.object(
             qwen3, "table_qk_norm_rope_", wraps=qwen3.table_qk_norm_rope_
         ) as fused,
+        patch.object(qwen3, "qk_norm_rope", wraps=qwen3.qk_norm_rope) as prefill,
     ):
         layer(positions, x, batch)
     assert fused.call_count == int(should_fuse)
+    if should_prefill:
+        prefill.assert_called_once()
+    else:
+        prefill.assert_not_called()
     if should_fuse:
         assert fused.call_args.kwargs["match_cuda"] is True
     assert_same_qkv(attn.call_args.args[:3], expected)
