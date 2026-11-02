@@ -20,7 +20,7 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
     """A PP stage whose own senders report `succeeded` / `failed` rids."""
     return SimpleNamespace(
         pp_group=SimpleNamespace(is_first_rank=first_rank),
-        disagg_prefill_inflight_queue=[],
+        disagg_prefill_transfer_queue=[],
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
     )
