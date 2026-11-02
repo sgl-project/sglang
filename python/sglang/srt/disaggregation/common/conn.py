@@ -132,6 +132,9 @@ class PrefillServerInfo:
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
+    # Linear-attention state TP when the prefill's state group spans several
+    # attention-DP groups; None (omitted on the wire) when it equals attn TP.
+    state_tp_size: Optional[int] = None
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
     stores_to_linker: bool = False
@@ -164,6 +167,9 @@ class PrefillServerInfo:
         self.stores_to_linker = bool(self.stores_to_linker)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
+        self.state_tp_size = (
+            int(self.state_tp_size) if self.state_tp_size is not None else None
         )
 
 
@@ -306,6 +312,9 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+    # Linear-attention state group width when it spans attention-DP groups
+    # (RFC, see disaggregation/common/state_group.py); None otherwise.
+    state_group_tp_size: Optional[int] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -362,6 +371,7 @@ class CommonKVManager(BaseKVManager):
         # where the GDN heads are partitioned over it and QSA/PLE state is whole
         # on every rank. KV heads keep following attention TP.
         self.state_tp_size = linear_attn_tp_size()
+        self.state_group_tp_size = getattr(args, "state_group_tp_size", None)
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
@@ -1463,10 +1473,31 @@ class CommonKVManager(BaseKVManager):
                     "--enable-kv-cache-sharding."
                 )
 
+        self._check_state_group_supported(info)
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    def _check_state_group_supported(self, info: PrefillServerInfo) -> None:
+        """Refuse peers whose linear-attention state group spans attention-DP
+        groups: the per-room pairing (state_group.plan_state_group_room) is not
+        wired into the receiver yet, and the per-server rank mapping below would
+        silently leave the extra state ranks without a receiver."""
+        spans = [
+            (role, size, tp)
+            for role, size, tp in (
+                ("prefill", info.state_tp_size, info.attn_tp_size),
+                ("decode", self.state_group_tp_size, self.attn_tp_size),
+            )
+            if isinstance(size, int) and size != tp
+        ]
+        if spans:
+            raise NotImplementedError(
+                "PD with a linear-attention state group spanning attention-DP "
+                "groups is not supported yet: "
+                + ", ".join(f"{r} state_tp={s} attn_tp={t}" for r, s, t in spans)
+            )
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1650,6 +1681,9 @@ class CommonKVManager(BaseKVManager):
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
+        state_group_tp_size = self.state_group_tp_size
+        if isinstance(state_group_tp_size, int) and state_group_tp_size != attn_tp[0]:
+            payload["state_tp_size"] = state_group_tp_size
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -3074,6 +3108,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
+        self.state_tp_size: Optional[int] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
@@ -3163,8 +3198,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return web.Response(
                 text="Inconsistent prefill allocation policies", status=400
             )
+        state_tp_size = data.get("state_tp_size")
+        if state_tp_size is not None:
+            state_tp_size = int(state_tp_size)
+        if self._registered_count and self.state_tp_size != state_tp_size:
+            return web.Response(
+                text="Inconsistent state_tp_size across prefill ranks", status=400
+            )
         self.dsv41_spec_layout = dsv41_spec_layout
         self.decode_allocation_policy = policy
+        self.state_tp_size = state_tp_size
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -3279,12 +3322,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 stores_to_linker=bool(self.stores_to_linker),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
+                state_tp_size=self.state_tp_size,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            # Omitted unless set, so decodes that predate the field still parse it.
+            if info.state_tp_size is None:
+                payload.pop("state_tp_size")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
