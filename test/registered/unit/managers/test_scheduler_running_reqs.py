@@ -87,8 +87,27 @@ def _invariant_checker(s):
         get_last_batch=Mock(),
         get_running_batch=Mock(),
         scheduler_stage_metrics=None,
+        get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
         get_running_reqs=lambda: s.running_reqs,
+    )
+
+
+def _empty_request_lists(s):
+    s.waiting_queue = []
+    s.grammar_manager = SimpleNamespace(grammar_queue=[])
+    s.chunked_req = None
+    s.disagg_prefill_transfer_queue = None
+    s.disagg_prefill_bootstrap_queue = None
+    s.disagg_decode_prealloc_queue = None
+    s.disagg_decode_transfer_queue = None
+    s.dllm_manager = SimpleNamespace(waiting_queue=[])
+    s.hisparse_coordinator = None
+    s.uocr_runtime = None
+    s.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
     )
 
 
@@ -99,7 +118,7 @@ def _scheduler():
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.enable_hisparse = False
-    s.chunked_req = None
+    _empty_request_lists(s)
     # run_batch up to the forward
     s.scheduler_stage_metrics = None
     s.metrics_reporter = MagicMock()
@@ -111,11 +130,6 @@ def _scheduler():
     s.forward_sleep_time = None
     s.enable_staging = False
     # process_batch_result, with the mode-specific processing mocked
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
-    )
     s.publish_load_snapshot = Mock()
     s.load_publisher = MagicMock()
     s.load_inquirer = MagicMock()
@@ -216,7 +230,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.disaggregation_mode = DisaggregationMode.NULL
         s.dllm_config = None
         s.enable_hisparse = False
-        s.chunked_req = None
+        _empty_request_lists(s)
         s.invariant_checker = _invariant_checker(s)
         s._confidence_budget_prepare = None
         # Event loop
@@ -288,6 +302,18 @@ class TestRunningReqsHooks(CustomTestCase):
                 (["kept"], [True]),
             ],
         )
+
+    def test_check_fails_a_request_in_two_lists(self):
+        s = _scheduler()
+        req = _req("a")
+        s.running_reqs.join([req])
+        s.waiting_queue.append(req)
+
+        with (
+            envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
+            self.assertRaisesRegex(RuntimeError, "a is in both waiting and running"),
+        ):
+            s.invariant_checker.maybe_check_request_lists()
 
     def test_preemption_leaves_even_when_nothing_is_admitted(self):
         s = _scheduler()
