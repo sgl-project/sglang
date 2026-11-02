@@ -186,25 +186,22 @@ def test_gemma_add_rmsnorm_fp8_group_writes_the_separate_kernels_bytes(
 
 @_GFX95_ONLY
 @torch.inference_mode()
-def test_four_rows_without_bf16_write_the_same_fp8_and_zero_fill():
+def test_four_rows_without_bf16_write_the_same_fp8():
     """Four rows per program without the bf16 norm (the prefill attention input) write
-    the fp8, scales and residual of the launch that keeps it, and zero-fill the GEMM
-    output they are handed."""
+    the fp8, scales and residual of the launch that keeps it."""
     num_tokens = FOUR_ROW_TOKENS
     x, residual, weight = _decode_inputs(num_tokens)
     (q_ref, scale_ref, _), residual_ref = gemma_add_rmsnorm_fp8(
         x, residual, weight, EPS, group_size=128, transpose_scale=True, keep_bf16=True
     )
-    zeros = torch.full((num_tokens, 100), 7.0, device=DEVICE, dtype=torch.bfloat16)
 
     (q, scale), residual_out = gemma_add_rmsnorm_fp8(
-        x, residual, weight, EPS, group_size=128, transpose_scale=True, zeros=zeros
+        x, residual, weight, EPS, group_size=128, transpose_scale=True
     )
 
     assert torch.equal(_bits(q), _bits(q_ref))
     assert torch.equal(_bits(scale), _bits(scale_ref))
     assert torch.equal(_bits(residual_out), _bits(residual_ref))
-    assert not zeros.any()
 
 
 @_GFX95_ONLY
@@ -250,14 +247,12 @@ def test_fp8_reads_of_a_gemma_norm_apply_one_plus_weight(quant_format, num_token
 @_GFX95_ONLY
 @torch.inference_mode()
 def test_no_tokens_return_empty_outputs():
-    """An idle DP-attention rank runs its layers on zero tokens, with the GEMM output to
-    zero-fill as empty as its input."""
+    """An idle DP-attention rank runs its layers on zero tokens."""
     x, residual, weight = _decode_inputs(1)
     x, residual = x[:0], residual[:0]
-    zeros = torch.empty((0, 100), device=DEVICE, dtype=torch.bfloat16)
 
     (q, scale), residual_out = gemma_add_rmsnorm_fp8(
-        x, residual, weight, EPS, group_size=128, transpose_scale=True, zeros=zeros
+        x, residual, weight, EPS, group_size=128, transpose_scale=True
     )
 
     assert q.shape == (0, x.shape[1]) and scale.numel() == 0

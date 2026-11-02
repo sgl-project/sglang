@@ -55,7 +55,6 @@ class HipKernel:
         )
 
     def launch(self, grid, args, stream, block=256, shared=0):
-        grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
             1,
@@ -67,8 +66,8 @@ class HipKernel:
         check_hip(
             hip_lib().hipModuleLaunchKernel(
                 self.fn,
-                grid_x,
-                grid_y,
+                grid,
+                1,
                 1,
                 block,
                 1,

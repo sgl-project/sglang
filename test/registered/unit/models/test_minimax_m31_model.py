@@ -733,40 +733,11 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertIs(result.gated_shared_output, shared)
         self.assertEqual(result.routed_output.data_ptr(), deferred.gemm2_out.data_ptr())
 
-    def test_norms_bind_the_gemm_reading_their_fp8(self):
-        """The input norm's fp8 feeds the fused qkv + index GEMM, the FFN norm's the
-        shared expert's gate_up (the dense gate_up in dense layers); under attention DP
-        the norms keep bf16, since the DP gather after them takes a tensor."""
-        from sglang.srt.layers.layernorm import GemmaRMSNorm
+    def test_attention_dp_norms_keep_bf16(self):
+        """Under attention DP the norms keep bf16, since the DP gather after them takes a
+        tensor."""
         from sglang.srt.models.minimax_common.amd import minimax_m3_hip
 
-        def proj(n):
-            return SimpleNamespace(weight=torch.empty(n, 64))
-
-        def bound(sparse, shared):
-            layer = SimpleNamespace(
-                input_layernorm=GemmaRMSNorm(64),
-                post_attention_layernorm=GemmaRMSNorm(64),
-                self_attn=SimpleNamespace(_fused_qkv_index=proj(2560)),
-                is_layer_sparse=sparse,
-                mlp=SimpleNamespace(
-                    gate_up_proj=proj(6144),
-                    shared_experts=(
-                        SimpleNamespace(gate_up_proj=proj(1536)) if shared else None
-                    ),
-                ),
-            )
-            minimax_m3_hip.Gfx950NormQuant(layer).bind()
-            return (
-                layer.input_layernorm.fp8_out_gemm_shape,
-                layer.post_attention_layernorm.fp8_out_gemm_shape,
-            )
-
-        a2a = SimpleNamespace(is_megamoe=lambda: False, is_deepep=lambda: False)
-        with patch.object(minimax_m3_hip, "get_moe_a2a_backend", lambda: a2a):
-            self.assertEqual(bound(True, True), ((2560, 64), (1536, 64)))
-            self.assertEqual(bound(False, False), ((2560, 64), (6144, 64)))
-            self.assertEqual(bound(True, False), ((2560, 64), None))
         with (
             envs.SGLANG_USE_AITER.override(True),
             patch.object(minimax_m3_hip, "is_dp_attention_enabled", lambda: True),
