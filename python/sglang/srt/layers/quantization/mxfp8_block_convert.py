@@ -17,6 +17,7 @@ from typing import Tuple
 import torch
 
 MXFP8_BLOCK_SIZE = 32
+DEFAULT_MAX_CONVERSION_WORKSPACE_BYTES = 256 * 1024 * 1024
 
 
 def _ue8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
@@ -60,13 +61,77 @@ def bf16_to_block_fp8_128(
     return qweight, scale
 
 
+def _conversion_chunk_rows(
+    k: int, block: int, max_workspace_bytes: int
+) -> int:
+    """Choose a block-aligned row chunk under a conservative memory budget."""
+    if block <= 0:
+        raise ValueError(f"block must be positive, got {block}.")
+    if max_workspace_bytes <= 0:
+        raise ValueError(
+            "max_workspace_bytes must be positive, "
+            f"got {max_workspace_bytes}."
+        )
+
+    padded_k = ((k + block - 1) // block) * block
+    # Conversion can briefly hold BF16 dequantized values, FP32 padded and
+    # normalized values, and FP8 output for the active chunk.
+    bytes_per_row = max(1, padded_k * 12)
+    row_blocks = max(1, max_workspace_bytes // (block * bytes_per_row))
+    return row_blocks * block
+
+
 def convert_mxfp8_weight_to_block_fp8(
-    weight: torch.Tensor, scale_u8: torch.Tensor, block: int = 128
+    weight: torch.Tensor,
+    scale_u8: torch.Tensor,
+    block: int = 128,
+    *,
+    max_workspace_bytes: int = DEFAULT_MAX_CONVERSION_WORKSPACE_BYTES,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """MXFP8 (e4m3fn + 1x32 UE8M0) -> block-fp8 [block,block] (e4m3fn + fp32).
 
     Used on gfx942 to run MXFP8 checkpoints through the fast native block-fp8
-    kernels.
+    kernels. Conversion is row-chunked on block boundaries so loading a large
+    matrix does not materialize full-size BF16 and FP32 copies simultaneously.
     """
-    bf16 = dequant_mxfp8_2d_to_bf16(weight, scale_u8)
-    return bf16_to_block_fp8_128(bf16, block=block)
+    if weight.ndim != 2 or scale_u8.ndim != 2:
+        raise ValueError(
+            "convert_mxfp8_weight_to_block_fp8 requires 2D weight and scale "
+            "tensors."
+        )
+
+    n, k = weight.shape
+    if n <= 0 or k <= 0:
+        raise ValueError(f"MXFP8 weight must be non-empty, got shape {(n, k)}.")
+    if k % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(f"MXFP8 weight K={k} must be divisible by {MXFP8_BLOCK_SIZE}.")
+    expected_scale_shape = (n, k // MXFP8_BLOCK_SIZE)
+    if tuple(scale_u8.shape) != expected_scale_shape:
+        raise ValueError(
+            "MXFP8 scale shape must be [N, K/32]: "
+            f"expected {expected_scale_shape}, got {tuple(scale_u8.shape)} "
+            f"for weight shape {(n, k)}."
+        )
+
+    chunk_rows = _conversion_chunk_rows(k, block, max_workspace_bytes)
+    qweight = torch.empty_like(weight)
+    scale = torch.empty(
+        ((n + block - 1) // block, (k + block - 1) // block),
+        dtype=torch.float32,
+        device=weight.device,
+    )
+
+    for row_start in range(0, n, chunk_rows):
+        row_end = min(row_start + chunk_rows, n)
+        bf16_chunk = dequant_mxfp8_2d_to_bf16(
+            weight[row_start:row_end], scale_u8[row_start:row_end]
+        )
+        q_chunk, scale_chunk = bf16_to_block_fp8_128(bf16_chunk, block=block)
+        qweight[row_start:row_end].copy_(q_chunk)
+        scale_row_start = row_start // block
+        scale[scale_row_start : scale_row_start + scale_chunk.shape[0]].copy_(
+            scale_chunk
+        )
+        del bf16_chunk, q_chunk, scale_chunk
+
+    return qweight, scale
