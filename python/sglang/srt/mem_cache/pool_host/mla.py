@@ -404,7 +404,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         * self.dtype.itemsize
                     )
                 if native.index_scales is not None:
-                    # FP32 scale mirror
+                    # MX scale mirror (4 E8M0 bytes per token per layer)
                     total_bytes += (
                         self.page_num * self.page_size * num_indexer_layers * 4
                     )
@@ -433,14 +433,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
-            # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
+            # Host-side mirror of the NPU quantized-Indexer scale cache
             # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
-            # the device pool carries one (FP8 DSA + npu_quant_lightning_indexer).
+            # the device pool carries one (FP8 DSA + quant_lightning_indexer).
+            # The trailing (k_n, d/64, 2) MX-scale tail and the uint8 storage
+            # dtype are taken from the device pool so the mirror matches it
+            # byte-for-byte.
             self.index_k_scale_buffer = None
             if native.index_scales is not None:
                 self.index_k_scale_buffer = alloc_func(
-                    (*indexer_dims, 1),
-                    dtype=torch.float32,
+                    (*indexer_dims, *native.index_scales.shape[-2:]),
+                    dtype=native.index_scales.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -1327,8 +1330,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
-                    # indexer layer.
+                    # page_size, 1, 2, 2) uint8: 4 E8M0 MX-scale bytes per
+                    # token per indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
                     )
