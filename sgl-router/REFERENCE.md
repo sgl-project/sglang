@@ -612,9 +612,9 @@ With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`
 MiniMax-M3 and M3.1 render with the checkpoint's `chat_template.jinja` through
 `rust/sglang-processor`, which picks them by `config.json`'s `model_type`
 (`minimax_m3_vl`), or by the template when there is no `config.json`, and applies
-SGLang's M3 request rules: the `thinking` type and the `root` message are validated, every tool
-call must be answered, `thinking` and effort aliases map onto `thinking_mode` and
-`reasoning_effort`, and tool results render in tool-call order. Every text chat
+SGLang's M3 request rules: the `thinking` type, the `reasoning_effort` enum (low, medium,
+high, xhigh, max) and the `root` message are validated, every tool call must be answered,
+`thinking` maps onto `thinking_mode`, and tool results render in tool-call order. Every text chat
 forwards `input_ids`. Media, `tool_reference` content in tool results, floats in tool
 schemas, `-0` in tool arguments, and a `chat_template` key in `chat_template_kwargs`
 render on the worker. The processor does not reproduce the `minimax-m3` reasoning and

@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use super::glm53::valid_documents;
 use super::pydantic_dump::{continues_final_message, engine_message, split_continuation};
 use super::qwen38::{prints_unlike_python, template_tools};
-use crate::py::{py_truthy, python_float};
+use crate::py::{py_truthy, python_float, python_json_compact};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -108,8 +108,8 @@ pub(crate) fn render(
     Ok((prompt, prefix))
 }
 
-/// `_validate_minimax_m3_request`: the thinking type, a lone leading `root`
-/// message, and every tool call answered.
+/// `_validate_minimax_m3_request`: the thinking type, the effort within the
+/// enum, a lone leading `root` message, and every tool call answered.
 fn validate(request: &Value, messages: &[Value]) -> Result<(), String> {
     let thinking = &request["thinking"];
     if !thinking.is_null() {
@@ -122,6 +122,25 @@ fn validate(request: &Value, messages: &[Value]) -> Result<(), String> {
                 "thinking.type must be 'adaptive', 'enabled' or 'disabled', got {kind}."
             ));
         }
+    }
+    // The request's own effort (`reasoning_effort`, or the kwargs one when that is
+    // unset) must be in the enum; a server default outside it is dropped instead.
+    let effort = requested_effort(request)
+        .or_else(|| request["chat_template_kwargs"].get("reasoning_effort"))
+        .filter(|effort| !effort.is_null());
+    if let Some(effort) = effort.filter(|effort| {
+        !effort
+            .as_str()
+            .is_some_and(|effort| REASONING_EFFORTS.contains(&effort))
+    }) {
+        let shown = match effort.as_str() {
+            Some(effort) => format!("'{effort}'"),
+            None => python_json_compact(effort),
+        };
+        return Err(format!(
+            "reasoning_effort must be one of {}, got {shown}.",
+            REASONING_EFFORTS.join(", ")
+        ));
     }
     let roots: Vec<usize> = (0..messages.len())
         .filter(|&i| messages[i]["role"] == "root")
@@ -248,8 +267,9 @@ fn template_args(
     Ok(args)
 }
 
-/// `_normalize_minimax_m3_request`: the thinking config and effort aliases mapped
-/// onto the template's `thinking_mode` and `reasoning_effort`.
+/// `_normalize_minimax_m3_request`: the thinking config mapped onto the template's
+/// `thinking_mode`, and the effort kept only while it is in the enum and thinking
+/// is on. An effort never changes the thinking mode.
 fn normalize(kwargs: &mut Map<String, Value>, effort: &mut Option<Value>, thinking: &Value) {
     let kwargs_effort = kwargs.remove("reasoning_effort").filter(|e| !e.is_null());
     let mut current = effort.take().or(kwargs_effort);
@@ -257,12 +277,6 @@ fn normalize(kwargs: &mut Map<String, Value>, effort: &mut Option<Value>, thinki
         kwargs
             .entry("thinking_mode")
             .or_insert_with(|| thinking["type"].clone());
-    }
-    if current
-        .as_ref()
-        .is_some_and(|e| e == "none" || e == "minimal")
-    {
-        kwargs.entry("thinking_mode").or_insert("disabled".into());
     }
     if kwargs
         .get("thinking_mode")
