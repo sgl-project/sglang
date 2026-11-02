@@ -111,6 +111,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     RoutingMethodType,
     has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
 )
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
@@ -2035,11 +2036,34 @@ def _zero_topk_weights_padded_region(
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
+def _mask_topk_ids_padded_region_to_int64(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return masked int64 IDs; int32 inputs on SAIL use the fused kernel."""
+    if (
+        num_token_non_padded is not None
+        and _is_sail
+        and topk_ids.is_cuda
+        and topk_ids.dtype == torch.int32
+        and topk_ids.shape[1] <= 32
+        and topk_ids.is_contiguous()
+    ):
+        from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
+
+        return mask_topk_ids_to_int64(topk_ids, num_token_non_padded)
+    topk_ids = topk_ids.to(torch.int64)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids, expert_location_dispatch_info, num_token_non_padded, cast_to_int64=False
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    if cast_to_int64:
+        return _mask_topk_ids_padded_region_to_int64(topk_ids, num_token_non_padded)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -2714,6 +2738,9 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
+            cast_to_int64 = (
+                _is_sail and topk_ids.dtype == torch.int32 and is_deepep_class_backend()
+            )
             fused_topk_ids = None
             recorder = get_global_expert_distribution_recorder()
             load_buffer = recorder.get_current_pass_count_buffer()
@@ -2726,7 +2753,12 @@ def _post_process_topk_ids(
                 )
             if fused_topk_ids is not None:
                 topk_ids = fused_topk_ids
-                _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+                if cast_to_int64:
+                    topk_ids = _mask_topk_ids_padded_region_to_int64(
+                        topk_ids, num_token_non_padded
+                    )
+                else:
+                    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
                 recorder_was_fused = True
             else:
                 # A remap table indexed by -1 aliases its last entry, so only the
@@ -2739,6 +2771,7 @@ def _post_process_topk_ids(
                         if padded_rows_masked and expert_location_dispatch_info is None
                         else num_token_non_padded
                     ),
+                    cast_to_int64=cast_to_int64,
                 )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely

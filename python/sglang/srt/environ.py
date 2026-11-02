@@ -1419,6 +1419,19 @@ class Envs:
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
+    # Repack MXFP4 experts into the Marlin layout and run BF16 activations; kept
+    # separate from the native W4A4 path.
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
+    # Consume MXFP4 weights and MMA scales directly; mutually exclusive with the
+    # Marlin/VALU mode above.
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
+    # Use gather-read for GEMM1 in TP MoE; the physical scatter path stays the default.
+    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    # Let the channel-wise masked DeepGEMM path use the JIT kernel that fuses
+    # SiLU+Mul with per-token fp8 quantization; set to 0 to fall back to Triton.
+    SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -1521,6 +1534,12 @@ class Envs:
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_SAIL_DEEPEP_RECV_HOOK = EnvBool(True)
+    # Toggle for MNNVL FABRIC support in SAIL DeepEP.
+    SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED = EnvBool(True)
+    SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
+
+    # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

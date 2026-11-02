@@ -117,8 +117,52 @@ def situ_and_mul(
     return impl(input, out, beta, linear_beta)
 
 
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    from .kimi_k3_situ_and_mul import situ_and_mul_masked as impl
+
+    return impl(input, out, masked_m, beta, linear_beta, topk, expected_m)
+
+
+def situ_and_mul_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+) -> None:
+    from .kimi_k3_situ_and_mul import situ_and_mul_post_quant_mxfp4 as impl
+
+    impl(input, output, output_scale, beta, linear_beta)
+
+
+def situ_and_mul_masked_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> None:
+    from .kimi_k3_situ_and_mul import situ_and_mul_masked_post_quant_mxfp4 as impl
+
+    impl(input, output, output_scale, masked_m, beta, linear_beta, topk, expected_m)
+
+
 __all__ = [
     "situ_and_mul",
+    "situ_and_mul_masked",
+    "situ_and_mul_post_quant_mxfp4",
+    "situ_and_mul_masked_post_quant_mxfp4",
     "SiluAndMulOp",
     "silu_and_mul",
 ]
@@ -164,6 +208,24 @@ register_kernel(
 )
 
 
+# The new SiTU producers still belong to activation; device implementations stay
+# lazily imported.
+for _fn in (
+    "situ_and_mul_masked",
+    "situ_and_mul_post_quant_mxfp4",
+    "situ_and_mul_masked_post_quant_mxfp4",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.kimi_k3_situ_and_mul:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn
+
+
 # MXFP8-quantizing SwiGLU-OAI producers; registered for inventory.
 for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
     register_kernel(
@@ -171,6 +233,22 @@ for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
             op=f"activation.{_fn}",
             backend=KernelBackend.TRITON,
             target=f"sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:{_fn}",
+        )
+    )
+del _fn
+# SAIL goes through the CUDA interface; the dedicated-instruction constraint is
+# checked by each implementation's cached factory.
+for _fn in (
+    "silu_and_mul_post_quant_mxfp4",
+    "silu_and_mul_post_per_token_quant_fp8",
+    "silu_and_mul_masked_post_quant_mxfp4",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_mul_quant:{_fn}",
+            capabilities=CUDA_ONLY,
         )
     )
 del _fn

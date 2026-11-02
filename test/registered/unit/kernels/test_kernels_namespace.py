@@ -311,6 +311,9 @@ def test_import_stays_metadata_only():
         "('sgl_kernel', 'cutlass', 'flydsl', 'aiter', "
         "'sglang.kernels.ops.gemm.kimi_k3', "
         "'sglang.kernels.ops.activation.softcap', "
+        "'sglang.kernels.ops.activation.kimi_k3_situ_and_mul', "
+        "'sglang.kernels.ops.gemm.sail_deepgemm', "
+        "'sglang.kernels.ops.quantization.sail_mxfp4', "
         "'sglang.kernels.ops.attention.dllm_kv_pack', "
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
@@ -327,6 +330,10 @@ def test_import_stays_metadata_only():
     "op, backend, device",
     [
         ("activation.situ_and_mul", KernelBackend.JIT, "cuda"),
+        ("activation.situ_and_mul_masked", KernelBackend.JIT, "cuda"),
+        ("activation.situ_and_mul_post_quant_mxfp4", KernelBackend.JIT, "cuda"),
+        ("activation.situ_and_mul_masked_post_quant_mxfp4", KernelBackend.JIT, "cuda"),
+        ("gemm.grouped_gemm_nt_bf16i4bf16_fused", KernelBackend.DEEPGEMM, "cuda"),
         ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
@@ -454,6 +461,8 @@ def test_reclassified_public_entry_points_are_inventoried():
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
         "activation.silu_and_mul_clamp",
+        "activation.kimi_k3_situ_and_mul",
+        "quantization.sail_mxfp4",
         "moe.gemma4_routing",
         "moe.shared_expert_gate",
         "memory.adler32",

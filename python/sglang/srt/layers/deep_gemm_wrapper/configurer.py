@@ -6,12 +6,14 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_musa,
+    is_sail,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 
 def _sm120_deep_gemm_apis_available() -> bool:
@@ -30,18 +32,26 @@ def _sm120_deep_gemm_apis_available() -> bool:
 
 
 def _compute_enable_deep_gemm():
-    if not (_is_cuda or _is_musa):
+    if not (_is_cuda or _is_musa or _is_sail):
         return False
     if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
         return False
 
     sm_version = get_device_sm()
-    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+    if not _is_sail and (
+        (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31)
+    ):
+        return False
+    elif _is_sail and sm_version < 80:
         return False
     # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
     # probe every API used by the SM120 DSV4 paths since installed builds may
     # expose fp8_einsum but still predate the SM120 kernels.
-    if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
+    if (
+        not _is_sail
+        and sm_version in (120, 121)
+        and not _sm120_deep_gemm_apis_available()
+    ):
         return False
 
     try:
@@ -54,11 +64,13 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
-DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
-    get_platform().is_sm100 or get_device_sm() in (120, 121)
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and not _is_sail and get_platform().is_sm100
+DEEPGEMM_SCALE_UE8M0 = (
+    ENABLE_JIT_DEEPGEMM
+    and not _is_sail
+    and (get_platform().is_sm100 or get_device_sm() in (120, 121))
 )
-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_sail)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:

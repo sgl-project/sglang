@@ -216,7 +216,13 @@ pass_configs = {
 
 
 def _use_deep_gemm_hc_prenorm() -> bool:
-    if is_hip() or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    # SAIL dense/MoE support does not imply TF32 MHC split-k support; keep the
+    # existing fallback path.
+    if (
+        get_platform().is_sail
+        or is_hip()
+        or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+    ):
         return False
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM

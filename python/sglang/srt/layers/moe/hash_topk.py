@@ -19,13 +19,17 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _mask_topk_ids_padded_region_to_int64,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
     resolve_routing_inputs,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
+)
 from sglang.srt.runtime_context import get_flags, get_model
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_sail, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -311,10 +315,14 @@ class HashTopK(nn.Module):
             topk_ids = routed_cols
         if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        elif is_sail() and topk_ids.dtype == torch.int32 and is_deepep_class_backend():
+            topk_ids = _mask_topk_ids_padded_region_to_int64(
+                topk_ids, num_token_non_padded
+            )
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-            if recorder_topk_ids is not None:
-                _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
+        if not (_is_hip or _is_npu) and recorder_topk_ids is not None:
+            _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         if recorder_topk_ids is None:
             recorder_topk_ids = topk_ids
         if _is_npu and num_token_non_padded is not None:

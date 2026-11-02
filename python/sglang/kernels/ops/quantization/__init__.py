@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
+    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -129,6 +130,26 @@ register_kernel(
         target=(
             "sglang.kernels.ops.quantization.fp4_indexer_quant"
             ":quantize_fp4_indexer_tensor"
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.downcast_to_mxfp4",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.sail_mxfp4:downcast_to_mxfp4",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.preprocess_mxfp4_w4a16_mma_scales",
+        backend=KernelBackend.TORCH,
+        target=(
+            "sglang.kernels.ops.quantization.sail_mxfp4"
+            ":preprocess_mxfp4_w4a16_mma_scales"
         ),
     )
 )

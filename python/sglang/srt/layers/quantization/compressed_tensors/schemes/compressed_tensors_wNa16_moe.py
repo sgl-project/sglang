@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CompressedTensorsWNA16MoE",
     "CompressedTensorsWNA16TritonMoE",
+    "CompressedTensorsWNA16DeepGemmMoE",
     "NPUCompressedTensorsW4A16Int4DynamicMoE",
 ]
 
@@ -561,6 +562,43 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         )
 
         quant_info = self.get_triton_quant_info(layer)
+        return self.runner.run(dispatch_output, quant_info)
+
+
+class CompressedTensorsWNA16DeepGemmMoE(CompressedTensorsWNA16MoE):
+    """W4A16 MoE implementation backed by SAIL DeepGEMM kernels."""
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.DEEP_GEMM, moe_runner_config)
+
+    def get_deep_gemm_quant_info(self, layer):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+        return DeepGemmMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a16=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            block_shape=[0, self.group_size],
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "situ",
+        ), "SAIL W4A16 DeepGEMM MoE only supports SiLU and SiTU."
+
+        quant_info = self.get_deep_gemm_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 

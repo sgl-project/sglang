@@ -18,6 +18,17 @@ if TYPE_CHECKING:
 
 _HIP = frozenset({CapabilityRequirement.HIP})
 
+for _ep_op in ("ep_scatter_sail", "ep_gather"):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_ep_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.ep_moe_kernels:{_ep_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _ep_op
+
 register_kernel(
     KernelSpec(
         op="moe.shared_expert_gate",
@@ -319,6 +330,14 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:mask_topk_ids",
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.mask_topk_ids_to_int64",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mask_topk_ids_to_int64",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

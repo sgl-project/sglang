@@ -145,7 +145,7 @@ from sglang.srt.layers.moe.utils import (
     sum_post_experts_output,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
@@ -232,7 +232,9 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_device_sm,
     is_non_idle_and_non_empty,
+    is_sail,
     is_sm90_supported,
     make_pp_layers,
     use_intel_amx_backend,
@@ -280,6 +282,7 @@ logger = logging.getLogger(__name__)
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
+_is_sail = is_sail()
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -397,6 +400,47 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+
+        # SAIL's dynamic channelwise FP8 fused path skips down_proj, so the
+        # parallelism and LoRA contracts must be preserved.
+        if (
+            _is_sail
+            and self.allow_fused_down
+            and not self.down_proj.reduce_results
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+            and get_device_sm() >= 89
+            and isinstance(self.down_proj.quant_method, Fp8LinearMethod)
+            and not self.down_proj.quant_method.block_quant
+            and not self.down_proj.quant_method.use_marlin
+            and getattr(self.down_proj, "input_scale", None) is None
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.shape[-1] % 16 == 0
+            and getattr(self.down_proj, "weight", None) is not None
+            and self.down_proj.weight.dtype == torch.float8_e4m3fn
+            and self.down_proj.weight.shape
+            == (gate_up.shape[-1] // 2, self.down_proj.output_size)
+            and getattr(self.down_proj, "weight_scale", None) is not None
+            and self.down_proj.weight_scale.dtype == torch.float32
+            and self.down_proj.weight_scale.numel() == self.down_proj.weight.shape[1]
+        ):
+            from sglang.kernels.ops.activation.silu_mul_quant import (
+                silu_and_mul_post_per_token_quant_fp8,
+            )
+
+            M = gate_up.shape[0]
+            down_input_fp8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
+                gate_up, swiglu_limit=self.swiglu_limit
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            if M != 0:
+                deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                    (down_input_fp8, down_input_scale),
+                    (self.down_proj.weight.t(), self.down_proj.weight_scale),
+                    down_output,
+                )
+            return down_output
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).

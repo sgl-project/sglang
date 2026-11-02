@@ -193,7 +193,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
+    if is_sail_runtime() or is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 
