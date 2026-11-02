@@ -2549,11 +2549,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
+        # swizzle+allocate here to avoid GPU memory fragmentation.
+        # The marlin MoE runner never reads the swizzled copy (it consumes
+        # w13_weight_scale / w2_weight_scale via get_marlin_quant_info()), yet
+        # this branch used to allocate an extra fp8 copy of every expert
+        # blockscale on that path. Only materialise it when the selected backend
+        # actually consumes it.
+        moe_runner_backend = getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        )
+        # AUTO is resolved later, in process_weights_after_loading(). Treat it as
+        # "do not materialise": the backends that do read the swizzled copy
+        # (Cutlass / CuteDSL) recompute and bind it there anyway, while the
+        # marlin path returns before that and would never free an eager copy.
+        _need_swizzled = not (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+            or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_auto()
+        )
+        if not _need_swizzled:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2573,10 +2588,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+        if not _need_swizzled:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
