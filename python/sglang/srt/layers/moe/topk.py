@@ -3245,26 +3245,16 @@ def select_experts(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
-def precomputed_topk_postprocess_is_noop(
-    topk_config: TopKConfig,
-    num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-) -> bool:
-    """Whether :func:`build_precomputed_topk_output` can stand in for
-    :func:`select_experts`' post-processing.
+def can_postprocess_precomputed_topk(topk_config: TopKConfig) -> bool:
+    """Whether post-processing needs only the fused router's weights and IDs.
 
-    A router that produces (weights, ids) itself -- e.g. K3's fused gate+top-k
-    kernel -- skips select_experts entirely, so it must not skip the work
-    select_experts does *after* the top-k: the EPLB logical->physical remap, the
-    padded-region mask, and the shared-expert append.  This returns True only
-    when all of those reduce to no-ops, leaving just the capture hook and the
-    distribution recorder (which the builder below still runs).
+    Placement and padding use the ordinary post-processing below. Shared slots
+    and routing simulation also need the full logits, which the merged front
+    does not return.
     """
     return (
         _is_cuda
         and topk_config.num_shared_topk_slots == 0
-        and num_token_non_padded is None
-        and expert_location_dispatch_info is None
         and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
     )
@@ -3275,14 +3265,33 @@ def build_precomputed_topk_output(
     topk_ids: torch.Tensor,
     topk_config: TopKConfig,
     layer_id: int,
+    *,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-    """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
-    capture hook and the expert-distribution recorder that select_experts would.
+    """Finish precomputed logical routes through select_experts' post-processing.
 
-    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+    The caller must supply already-scaled weights and exclude shared slots and
+    routing simulation. Fake dispatch changes logits *before* top-k selection,
+    so it must use the ordinary router rather than this entry point.
     """
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    if num_token_non_padded is None and expert_location_dispatch_info is None:
+        capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+        return StandardTopKOutput(topk_weights, topk_ids, None)
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        topk_config=topk_config,
+        router_logits=None,
+        layer_id=layer_id,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+    if recorder_topk_ids is not None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.
     return StandardTopKOutput(topk_weights, topk_ids, None)

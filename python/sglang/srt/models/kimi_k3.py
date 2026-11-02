@@ -82,7 +82,7 @@ from sglang.srt.layers.moe.topk import (
     TopK,
     TopKOutputFormat,
     build_precomputed_topk_output,
-    precomputed_topk_postprocess_is_noop,
+    can_postprocess_precomputed_topk,
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -458,6 +458,13 @@ class KimiK3MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        # K3 allocates one weight slot per logical expert. Online relocation
+        # and extra replicas require a separate weight-layout implementation.
+        if get_exec().moe.enable_eplb or get_exec().moe.ep_num_redundant_experts:
+            raise ValueError(
+                "Kimi-K3 supports initial expert placement without online EPLB "
+                "or redundant experts."
+            )
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
@@ -908,11 +915,12 @@ class KimiK3MoE(nn.Module):
             return False
         if self.gate.e_score_correction_bias is None:
             return False
-        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
-        # select_experts' post-processing collapses to the capture hook and the
-        # recorder -- both of which build_precomputed_topk_output runs. Bail out
-        # if that ever stops holding rather than silently dropping the remap.
-        if not precomputed_topk_postprocess_is_noop(cfg):
+        # Physical placement and batch padding are applied after the fused
+        # router, through the same post-processing as TopK. Fake dispatch
+        # rewrites logits before routing and must retain the ordinary path.
+        if get_exec().moe.ep_dispatch_algorithm == "fake":
+            return False
+        if not can_postprocess_precomputed_topk(cfg):
             return False
         if get_exec().deterministic.enable_deterministic_inference:
             return False
@@ -975,7 +983,18 @@ class KimiK3MoE(nn.Module):
                 self.layer_idx,
                 hidden_states.shape[0],
             )
-        return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+        num_token_non_padded, dispatch_info = self.topk.routing_inputs()
+        return (
+            build_precomputed_topk_output(
+                w,
+                i,
+                cfg,
+                self.layer_idx,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            ),
+            routed,
+        )
 
     def _ep_front_overlap(self, hidden_states: torch.Tensor):
         """Overlap the exact fp32 gate+top-k with the latent down projection.
@@ -3001,6 +3020,16 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=config.num_expert_group,
+        )
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -3458,6 +3487,12 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    @staticmethod
+    def get_model_config_for_expert_location(config):
+        return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
 
     supports_cuda_vmm_feature_transport = True
 
