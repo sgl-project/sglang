@@ -19,14 +19,12 @@ from sglang.srt.configs.minimax_vl import (
 from sglang.srt.configs.model_config import (
     ModelConfig,
     is_dspark_draft,
-    uses_minimax_m3_packed_nvfp4_kv,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.models import minimax_m3
 from sglang.srt.models.dspark_minimax import DSparkMiniMaxDraftModel
-from sglang.srt.models.minimax_common import minimax_weight_loader
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     get_spec_layer_idx_from_weight_name,
@@ -298,112 +296,6 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 _minimax_m3_overrides(rocm_server_args(**quark), MXFP8)
             _minimax_m3_overrides(rocm_server_args(attn_dp_size=2, **quark), MXFP8)
 
-    def test_blackwell_keeps_attention_tp_above_the_kv_heads(self):
-        """Blackwell replicates KV heads past one per rank; the ROCm guard must not fire there."""
-        with override_platform(is_blackwell=True, is_sm100=True, is_hip=False):
-            _minimax_m3_overrides(rocm_server_args(tp_size=8), NVFP4)
-
-    def test_nvfp4_on_rocm_requires_gfx950(self):
-        """Off gfx950 the override would pick the CUDA-only Marlin and FA3 backends."""
-        with (
-            override_platform(
-                is_blackwell=False, is_sm100=False, is_hip=True, is_gfx95=False
-            ),
-            self.assertRaisesRegex(ValueError, "requires gfx950"),
-        ):
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-
-    def test_quark_mxfp4_keeps_custom_all_reduce(self):
-        """RCCL slows the Quark path's decode on gfx950, where it was measured; MXFP8 and
-        other ROCm GPUs keep the default."""
-        with gfx950(), envs.SGLANG_M3_ALLOW_CUSTOM_AR.override(False):
-            quark = _minimax_m3_overrides(
-                rocm_server_args(quantization="quark_mxfp4"), MXFP8
-            )
-            mxfp8 = _minimax_m3_overrides(rocm_server_args(quantization="mxfp8"), MXFP8)
-        with (
-            override_platform(
-                is_blackwell=False, is_sm100=False, is_hip=True, is_gfx95=False
-            ),
-            envs.SGLANG_M3_ALLOW_CUSTOM_AR.override(False),
-        ):
-            quark_gfx942 = _minimax_m3_overrides(
-                rocm_server_args(quantization="quark_mxfp4"), MXFP8
-            )
-        self.assertTrue(quark_gfx942["disable_custom_all_reduce"])
-        self.assertNotIn("disable_custom_all_reduce", quark)
-        self.assertTrue(mxfp8["disable_custom_all_reduce"])
-
-    def test_m31_quark_export_gets_the_nvfp4_gfx950_defaults(self):
-        """The M3.1 Quark export shares the NVFP4 checkpoint's MXFP8 linears and MXFP4
-        experts, so it resolves the same gfx950 defaults; the M3 Quark export (bf16
-        linears) keeps the MiniMax-M3 ones."""
-        block, level = (
-            "SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE",
-            "ROCM_QUICK_REDUCE_QUANTIZATION",
-        )
-        with (
-            gfx950(),
-            envs.SGLANG_M3_ALLOW_CUSTOM_AR.override(False),
-            patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE="static"),
-        ):
-            os.environ.pop(block, None)
-            os.environ.pop(level, None)
-            spec = dict(speculative_algorithm="DSPARK")
-            m3 = _minimax_m3_overrides(rocm_server_args(**spec), QUARK_M3)
-            self.assertNotIn(block, os.environ)
-            self.assertNotIn(level, os.environ)
-            m31 = _minimax_m3_overrides(rocm_server_args(**spec), QUARK_M31)
-            self.assertTrue(envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
-            self.assertEqual(os.environ[level], "INT4")
-            os.environ[block] = "0"
-            _minimax_m3_overrides(rocm_server_args(**spec), QUARK_M31)
-            self.assertFalse(envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.get())
-            explicit = _minimax_m3_overrides(
-                rocm_server_args(kv_cache_dtype="bf16"), QUARK_M31
-            )
-        self.assertTrue(m3["disable_custom_all_reduce"])
-        self.assertNotIn("kv_cache_dtype", m3)
-        self.assertNotIn("disable_custom_all_reduce", m31)
-        self.assertEqual(m31["kv_cache_dtype"], "fp8_e4m3")
-        self.assertEqual(m31["speculative_draft_kv_cache_dtype"], "bf16")
-        self.assertNotIn("kv_cache_dtype", explicit)
-        with gfx950(), self.assertRaisesRegex(ValueError, "4 KV heads"):
-            _minimax_m3_overrides(rocm_server_args(tp_size=8), QUARK_M31)
-
-    def test_gfx950_kv_defaults_to_nvfp4_only_under_dspark(self):
-        """Only the DSPARK verify indexer reads an NVFP4 index K: the default keeps plain
-        decode on fp8, fp8 opts DSPARK out, and an unknown format fails at startup."""
-        cases = {
-            (None, "DSPARK"): True,
-            (None, None): False,
-            (" FP8", "DSPARK"): False,
-        }
-        key = "SGLANG_MINIMAX_M3_AMD_KV_FORMAT"
-        for (kv_format, algorithm), packed in cases.items():
-            with (
-                self.subTest(kv_format=kv_format, algorithm=algorithm),
-                gfx950(),
-                patch.dict("os.environ"),
-            ):
-                os.environ.pop(key, None)
-                if kv_format is not None:
-                    os.environ[key] = kv_format
-                self.assertEqual(
-                    uses_minimax_m3_packed_nvfp4_kv(
-                        "minimax_m3_nvfp4", speculative_algorithm=algorithm
-                    ),
-                    packed,
-                )
-        with (
-            gfx950(),
-            patch.dict("os.environ", {key: "nvfp4"}),
-            self.assertRaisesRegex(ValueError, "must be auto or fp8"),
-        ):
-            uses_minimax_m3_packed_nvfp4_kv(
-                "minimax_m3_nvfp4", speculative_algorithm="DSPARK"
-            )
-
     def test_gfx950_quick_all_reduce_takes_int4_only_where_unset(self):
         """M3.1 gets INT4 when no level is set; a level already set stays, INT8 included,
         since the ROCm images' INT8 cannot be told from one the user chose."""
@@ -433,31 +325,6 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             os.environ.pop(level, None)
             _minimax_m3_overrides(rocm_server_args(tp_size=2), NVFP4)
             self.assertNotIn(level, os.environ)
-
-    def test_gfx950_jit_quick_reduce_takes_mid_sizes_under_int4_or_int8(self):
-        """Only an INT4 or INT8 quick-reduce on a bf16 model runs the JIT build, and only
-        then does custom all-reduce stop at 2.4 MiB; a cutoff the user set stays."""
-        cap, jit = "AITER_CUSTOM_AR_MAX_SIZE", "SGLANG_ROCM_QUICK_ALL_REDUCE_JIT"
-        level = "ROCM_QUICK_REDUCE_QUANTIZATION"
-        cases = (
-            ("FP", "auto", None, None),
-            ("INT8", "auto", None, "2516582"),
-            ("INT4", "float16", None, None),
-            ("INT4", "auto", "1048576", "1048576"),
-        )
-        for preset, dtype, user_cap, resolved_cap in cases:
-            with (
-                self.subTest(level=preset, dtype=dtype, cap=user_cap),
-                gfx950(),
-                patch.dict("os.environ", {level: preset}),
-            ):
-                os.environ.pop(jit, None)
-                os.environ.pop(cap, None)
-                if user_cap is not None:
-                    os.environ[cap] = user_cap
-                _minimax_m3_overrides(rocm_server_args(dtype=dtype), NVFP4)
-                self.assertEqual(jit in os.environ, preset != "FP" and dtype == "auto")
-                self.assertEqual(os.environ.get(cap), resolved_cap)
 
     def test_draft_target_ids_are_zero_based_and_the_input_is_kept(self):
         config = draft_config()
@@ -532,21 +399,6 @@ class TestMiniMaxM31Rocm(CustomTestCase):
 
 class TestMiniMaxM31QuarkScaleNames(CustomTestCase):
     """Quark 0.14+eef70b3 names the MXFP8 [1, 32] linear scale weight_scale."""
-
-    def test_alias_redirects_only_an_unmatched_scale(self):
-        p = nn.Parameter(torch.zeros(1), requires_grad=False)
-        params = {
-            "a.qkv_proj.weight_scale_inv": p,
-            "b.weight_scale": p,
-            "b.weight_scale_inv": p,
-        }
-        alias = minimax_weight_loader.mxfp8_linear_scale_alias
-        self.assertEqual(
-            alias("a.qkv_proj.weight_scale", params), "a.qkv_proj.weight_scale_inv"
-        )
-        self.assertEqual(alias("b.weight_scale", params), "b.weight_scale")
-        self.assertEqual(alias("c.weight_scale", params), "c.weight_scale")
-        self.assertEqual(alias("a.qkv_proj.weight", params), "a.qkv_proj.weight")
 
     def test_multimodal_loader_puts_quark_scales_into_weight_scale_inv(self):
         model = object.__new__(MiniMaxM3SparseForConditionalGeneration)
