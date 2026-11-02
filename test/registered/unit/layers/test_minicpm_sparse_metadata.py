@@ -630,6 +630,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(4, 1, 1, 1)
         value_cache = torch.ones(4, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )
@@ -699,6 +700,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(4, 1, 1, 1)
         value_cache = torch.ones(4, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
             forward_decode=Mock(),
@@ -770,6 +772,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(8, 1, 1, 1)
         value_cache = torch.ones(8, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )

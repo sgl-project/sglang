@@ -341,7 +341,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
-        self._fa4_prefill = getattr(prefill_attn_backend, "fa_impl_ver", None) == 4
+        self._fa4_prefill = getattr(
+            prefill_attn_backend, "fa_impl_ver", None
+        ) == 4 or getattr(prefill_attn_backend, "fa3_upgrades_to_fa4", False)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
