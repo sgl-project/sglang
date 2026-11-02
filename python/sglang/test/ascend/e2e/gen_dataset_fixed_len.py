@@ -355,7 +355,9 @@ def generate_gsm8k_shared_prefix_dataset(
     train_data = load_jsonl(source_dataset_path)
     pool_ids = []
     total = 0
-    target = int(input_len * 1.01)  # over-fill: truncation lands inside the shared prefix
+    target = int(
+        input_len * 1.01
+    )  # over-fill: truncation lands inside the shared prefix
     for item in train_data * ((target // 500) + 1):  # a QA pair is ~200-500 tokens
         ids = tokenizer.encode(format_qa(item), add_special_tokens=False)
         pool_ids.extend(ids)
