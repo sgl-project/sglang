@@ -2,8 +2,9 @@
 
 The one-device scale test cannot catch an omitted/double boundary reduction or
 an incorrectly padded six-token verify graph. Exercise both fusion settings on
-the same weights, rescore generated tokens through CP prefill, and require
-actual target-verify graph replay at the requested batch sizes.
+the same weights, rescore generated tokens through prefill and hold that gap to
+the one a plain TP8 server shows, and require actual target-verify graph replay
+at the requested batch sizes.
 """
 
 import hashlib
@@ -31,9 +32,9 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-# Two full FP8 model loads need the eight-GPU extra lane, not the scale test's
-# four-GPU lane. No simulated ranks, dummy weights, or reduced layer count.
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-b300")
+# Three full FP8 model loads need the eight-GPU extra lane, not the scale
+# test's four-GPU lane. No simulated ranks, dummy weights, or reduced layer count.
+register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
 
 TP_SIZE = 8
 OUTPUT_LEN = 32
@@ -50,12 +51,16 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
     # Keep an absolute bound as well as exact greedy token equality; do not
     # discard positions after a divergence or normalize away a scale error.
     logprob_atol = 0.02
-    # Comparisons across different kernel paths (VERIFY vs teacher-forced
-    # prefill, fused vs fallback reduction) also differ in FP8 GEMM shapes and
-    # FP8 KV-cache reads, so per-token noise exceeds logprob_atol even for the
-    # first output token, which both paths compute in a prefill. An omitted,
-    # doubled or mis-scaled reduction still changes greedy tokens or shifts
-    # logprobs by far more than these bounds.
+    # VERIFY and teacher-forced prefill run different kernels over the same FP8
+    # weights and FP8 KV cache, so their logprobs differ by more than
+    # logprob_atol even on plain TP8. Bound the CP server's VERIFY-vs-prefill
+    # gap by the same gap on a plain TP8 server instead. An omitted, doubled or
+    # mis-scaled boundary reduction changes greedy tokens or moves logprobs far
+    # past this margin.
+    baseline_ratio = 2.0
+    baseline_mean_slack = 0.05
+    baseline_max_slack = 0.25
+    # Fused and fallback CP servers differ only in the reduction kernel.
     cross_path_median_atol = 0.1
     cross_path_mean_atol = 0.2
     cross_path_max_atol = 1.0
@@ -120,7 +125,8 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
 
     def _prompt(self, length, index):
         if length == 1:
-            # Below the CP threshold: ordinary EXTEND must agree with VERIFY.
+            # Generation prefills this below the CP threshold (attn_cp_size
+            # tokens), while its 33-token teacher-forced rescore runs as CP.
             return [self.tokenizer.encode("Hello", add_special_tokens=False)[0]]
         prefix = self.tokenizer.encode(
             f"Document {index}. Read the following background notes.\n",
@@ -170,8 +176,8 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
             err_msg=label,
         )
 
-    def _assert_prefill_rescore(self, prompts, outputs):
-        # Independently complete the attention output on full CP-prefill rows.
+    def _prefill_rescore_diffs(self, prompts, outputs):
+        # Independently complete the attention output on full prefill rows.
         # Both fusion settings could otherwise agree on the same wrong decode
         # reduction. Teacher forcing keeps every compared prefix identical.
         token_lists = [
@@ -188,15 +194,42 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
             },
         )
         self.assertEqual(len(scores), len(outputs))
+        diffs = []
         for prompt, output, score in zip(prompts, outputs, scores, strict=True):
-            self._assert_logprobs_cross_path(
+            actual, expected = self._logprob_values(
                 output["meta_info"]["output_token_logprobs"],
                 score["meta_info"]["input_token_logprobs"][len(prompt) :],
-                "VERIFY versus teacher-forced CP prefill",
+                "VERIFY versus teacher-forced prefill tokens",
             )
+            diffs.append(np.abs(actual - expected))
+        return diffs
+
+    def _assert_rescore_within_baseline(self, rescore, baseline, label):
+        self.assertEqual(rescore.keys(), baseline.keys())
+        for case, diffs in rescore.items():
+            for index, (diff, base) in enumerate(
+                zip(diffs, baseline[case], strict=True)
+            ):
+                stats = (
+                    f"VERIFY versus teacher-forced prefill {label} {case}[{index}]: "
+                    f"mean={diff.mean():.4f} max={diff.max():.4f}; "
+                    f"tp8 mean={base.mean():.4f} max={base.max():.4f}"
+                )
+                print(stats)
+                self.assertLessEqual(
+                    diff.mean(),
+                    self.baseline_ratio * base.mean() + self.baseline_mean_slack,
+                    stats,
+                )
+                self.assertLessEqual(
+                    diff.max(),
+                    self.baseline_ratio * base.max() + self.baseline_max_slack,
+                    stats,
+                )
 
     def _exercise(self, log_path):
         results = {}
+        rescore = {}
         # Non-divisible lengths exercise CP padding. The 8193-token case spans
         # three 4096-token chunks, including a one-token final chunk.
         cases = [(1, [1]), (1, [8193])]
@@ -249,20 +282,16 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                 # Score once per shape, after the replay assertions so scoring
                 # requests cannot supply the graph evidence for generation.
                 if repeat == 1:
-                    self._assert_prefill_rescore(prompts, outputs)
-        return results
+                    rescore[tuple(lengths)] = self._prefill_rescore_diffs(
+                        prompts, outputs
+                    )
+        return results, rescore
 
     def test_prefill_verify_replay_and_fusion_parity(self):
         common_args = [
             "--trust-remote-code",
             "--tp",
             "8",
-            "--attn-cp-size",
-            "8",
-            "--enable-prefill-cp",
-            "--cp-strategy",
-            "interleave",
-            "--enable-cp-decode-attn-tp",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -299,14 +328,32 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
             "--random-seed",
             "260126",
         ]
+        cp_args = [
+            "--attn-cp-size",
+            "8",
+            "--enable-prefill-cp",
+            "--cp-strategy",
+            "interleave",
+            "--enable-cp-decode-attn-tp",
+        ]
         reference = None
-        for fused in (False, True):
-            label = "fused" if fused else "fallback"
+        baseline = None
+        # Plain TP8 first: it measures the VERIFY-vs-prefill gap the CP arms
+        # are held to.
+        for label, cp, fused in (
+            ("tp8", False, False),
+            ("fallback", True, False),
+            ("fused", True, True),
+        ):
             log_path = Path(self.artifacts.name) / f"{label}.log"
-            args = common_args + (
-                ["--flashinfer-allreduce-fusion-backend", "mnnvl"]
-                if fused
-                else ["--enforce-disable-flashinfer-allreduce-fusion"]
+            args = (
+                common_args
+                + (cp_args if cp else [])
+                + (
+                    ["--flashinfer-allreduce-fusion-backend", "mnnvl"]
+                    if fused
+                    else ["--enforce-disable-flashinfer-allreduce-fusion"]
+                )
             )
             try:
                 with (
@@ -333,12 +380,11 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                     response = requests.get(self.base_url + "/server_info", timeout=30)
                     response.raise_for_status()
                     info = response.json()
-                    for key, expected in {
+                    expected_info = {
                         "tp_size": TP_SIZE,
-                        "attn_cp_size": TP_SIZE,
-                        "enable_cp_decode_attn_tp": True,
-                        "enable_prefill_cp": True,
-                        "cp_strategy": "interleave",
+                        "attn_cp_size": TP_SIZE if cp else 1,
+                        "enable_cp_decode_attn_tp": cp,
+                        "enable_prefill_cp": cp,
                         "speculative_algorithm": "EAGLE",
                         "speculative_num_steps": 5,
                         "speculative_eagle_topk": 1,
@@ -346,7 +392,10 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                         "flashinfer_allreduce_fusion_backend": "mnnvl"
                         if fused
                         else None,
-                    }.items():
+                    }
+                    if cp:
+                        expected_info["cp_strategy"] = "interleave"
+                    for key, expected in expected_info.items():
                         self.assertEqual(info[key], expected, key)
                     if fused:
                         log_text = log_path.read_text()
@@ -363,15 +412,19 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                         self.assertNotIn(
                             "CP decode all-reduce/norm fusion declined", log_text
                         )
-                    results = self._exercise(log_path)
+                    results, rescore = self._exercise(log_path)
                     if fused:
                         self.assertNotIn(
                             "CP decode all-reduce/norm fusion declined",
                             log_path.read_text(),
                         )
-                    if reference is None:
+                    if not cp:
+                        baseline = rescore
+                    elif reference is None:
+                        self._assert_rescore_within_baseline(rescore, baseline, label)
                         reference = results
                     else:
+                        self._assert_rescore_within_baseline(rescore, baseline, label)
                         self.assertEqual(results.keys(), reference.keys())
                         for case, outputs in results.items():
                             for actual, expected in zip(
