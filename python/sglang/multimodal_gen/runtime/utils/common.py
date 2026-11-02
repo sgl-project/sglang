@@ -28,6 +28,22 @@ def add_prefix(name: str, prefix: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
+def upload_without_sync(batch, device):
+    """Move a batch of host tensors to `device` without waiting for the GPU work already queued.
+
+    A pageable host-to-device copy synchronizes its stream first; a pinned one does not.
+    """
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        return batch.to(device)
+    pinned = type(batch)(
+        {
+            k: v.pin_memory() if torch.is_tensor(v) and v.device.type == "cpu" else v
+            for k, v in batch.items()
+        }
+    )
+    return pinned.to(device, non_blocking=True)
+
+
 def is_valid_ipv6_address(address: str) -> bool:
     try:
         ipaddress.IPv6Address(address)

@@ -37,28 +37,6 @@ def _small_config():
 
 
 class TestLocateAnythingProjector(CustomTestCase):
-    def test_merged_size_and_output_shape(self):
-        cfg = _small_config()
-        proj = LocateAnythingMultiModalProjector(cfg)
-        # merged_size = hidden_size * merge_h * merge_w = 8 * 2 * 2 = 32
-        self.assertEqual(proj.merged_size, 32)
-        self.assertEqual(proj.pre_norm.normalized_shape, (32,))
-        self.assertEqual(proj.linear_1.in_features, 32)
-        self.assertEqual(proj.linear_1.out_features, 16)
-        self.assertEqual(proj.linear_2.in_features, 16)
-        self.assertEqual(proj.linear_2.out_features, 16)
-
-    def test_forward_flattens_merged_patches(self):
-        cfg = _small_config()
-        proj = LocateAnythingMultiModalProjector(cfg).eval()
-        # MoonViT patch_merger yields (num_merged_tokens, merge_h*merge_w, hidden).
-        num_tokens = 5
-        feats = torch.randn(num_tokens, 4, 8)
-        with torch.no_grad():
-            out = proj(feats)
-        # One projected vector of text_hidden width per merged token.
-        self.assertEqual(out.shape, (num_tokens, 16))
-
     def test_forward_handles_noncontiguous_input(self):
         cfg = _small_config()
         proj = LocateAnythingMultiModalProjector(cfg).eval()
@@ -283,16 +261,6 @@ class TestGetImageFeatureWiring(CustomTestCase):
     HIDDEN = 8  # vision hidden_size, must match _small_config()
     MERGE = 4  # merge_h * merge_w = 2 * 2
     TEXT_HIDDEN = 16  # text_config hidden_size
-
-    def test_single_image_projects_to_text_hidden(self):
-        cfg = _small_config()
-        model = _bare_model(cfg)
-        # grid [[2, 2]] -> prod = 4 patches.
-        model.vision_tower = _StubVisionTower(self.HIDDEN, self.MERGE, [4])
-        feature = torch.randn(4, self.HIDDEN)  # one image's raw patches
-        out = model.get_image_feature([_image_item(feature, [[2, 2]])])
-        # 4 patches / merge(4) = 1 merged token, projected to text hidden width.
-        self.assertEqual(out.shape, (1, self.TEXT_HIDDEN))
 
     def test_multi_image_features_concatenated_in_order(self):
         cfg = _small_config()

@@ -404,7 +404,7 @@ inline void run_hadamard(const tvm::ffi::TensorView x, const tvm::ffi::TensorVie
   auto SX = SymbolicSize{"x_batch_stride"};
   auto SO = SymbolicSize{"out_batch_stride"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({N, D}).with_strides({SX, 1}).with_dtype<DType>().with_device(device).verify(x);
   TensorMatcher({N, D}).with_strides({SO, 1}).with_dtype<DType>().with_device(device).verify(out);

@@ -602,7 +602,6 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        self.scale = float(1.0 / (self.head_dim**0.5))
         self.q_scale = self.k_scale = self.v_scale = torch.tensor(
             [1.0], dtype=torch.float32
         ).to(self.device)
@@ -4642,6 +4641,7 @@ class AiterAttnBackend(AttentionBackend):
                 page_table,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
+                softmax_scale=layer.scaling,
                 causal=True,
                 logits_soft_cap=self.logits_soft_cap,
                 alibi_slopes=None,
@@ -4871,7 +4871,7 @@ class AiterAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
                     v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    self.scale,
+                    layer.scaling,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
                     self.kv_last_page_len,

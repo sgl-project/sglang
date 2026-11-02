@@ -18,11 +18,13 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
 )
+from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    create_ascend_moe_runner,
+)
 from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
     NPUOnlineMoEWeightLoader,
 )
-from sglang.srt.layers.moe.moe_runner import MoeRunner
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
 if TYPE_CHECKING:
@@ -60,13 +62,13 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
                 f"'ascend', got {backend.value!r}."
             )
 
-        # The kernels must be attached before the runner is built:
-        # AscendRunnerCore.__init__ reads layer.w2_kernel to pick its activation.
-        layer.w13_kernel = NPUMXFP8MoEMethod("w13")
-        layer.w2_kernel = NPUMXFP8MoEMethod("w2")
-        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        self.runner = create_ascend_moe_runner(
+            layer,
+            moe_runner_config,
+            w13_kernel=NPUMXFP8MoEMethod("w13"),
+            w2_kernel=NPUMXFP8MoEMethod("w2"),
+        )
         # Inherited apply() consults this; aiter is CUDA/ROCm-only.
         self._aiter_runner = None
 
@@ -129,8 +131,10 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
                 f"'ascend', got {backend.value!r}."
             )
 
-        layer.w13_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w13")
-        layer.w2_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w2")
-        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        self.runner = create_ascend_moe_runner(
+            layer,
+            moe_runner_config,
+            w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+            w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+        )

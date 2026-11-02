@@ -598,6 +598,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        lora_use_virtual_experts: Optional[bool] = None,
         enable_lora_overlap_loading: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
@@ -657,6 +658,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            lora_use_virtual_experts=bool(lora_use_virtual_experts),
             enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loaded_loras=max_loaded_loras,
             json_model_override_args=(
@@ -695,6 +697,7 @@ class SRTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
@@ -709,7 +712,10 @@ class SRTRunner:
         else:
             if self.model_type == "embedding":
                 response = self.engine.encode(
-                    prompt=prompts, image_data=image_data, dimensions=dimensions
+                    prompt=prompts,
+                    image_data=image_data,
+                    dimensions=dimensions,
+                    encoding_format=encoding_format,
                 )
                 if isinstance(response, list):
                     logits = [x["embedding"] for x in response]

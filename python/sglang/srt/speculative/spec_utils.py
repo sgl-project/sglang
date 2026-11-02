@@ -1060,9 +1060,11 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
 _VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+    VerifyTrackIndices()
+    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+    else None
 )
 
 
@@ -1367,6 +1369,9 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
+        ring_indices = None
+        if mamba_pool.replayssm_request_ring:
+            ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -1376,6 +1381,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            ring_indices=ring_indices,
         )
         return
 

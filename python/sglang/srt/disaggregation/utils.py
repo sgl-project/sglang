@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from typing import (
     overload,
 )
 
+import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.msgpack_utils import enc_hook, ext_hook
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -175,6 +178,10 @@ def disagg_transfers_in_flight(scheduler):
     - DECODE: `pop_preallocated` publishes one request's destinations and keeps
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
+
+    A decode request receiving into the host pool (`host_staged`) exposes host
+    pages only and holds no device page until `allocate_host_staged`, so it
+    does not close the gate while it waits on the transfer queue.
     """
 
     # The scheduler and pool outlive the queues rebuilt by a PD role switch.
@@ -187,7 +194,10 @@ def disagg_transfers_in_flight(scheduler):
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                scheduler.disagg_decode_transfer_queue.queue
+                any(
+                    not decode_req.host_staged
+                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
+                )
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -232,6 +242,11 @@ def _is_fake_transfer(req: Req) -> bool:
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
+
+def pre_alloc_fill_len(req: Req) -> int:
+    """The last output id is the pending decode input, so its KV is not written."""
+    return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
@@ -388,7 +403,13 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class CustomizedInfoError(ValueError):
+    pass
+
+
 class MetadataBuffers:
+    CUSTOMIZED_INFO_SLOTS = slice(6, 8)
+
     def __init__(
         self,
         size: int,
@@ -404,6 +425,19 @@ class MetadataBuffers:
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
+        customized_info_capacity_env = envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES
+        customized_info_capacity = (
+            customized_info_capacity_env.parse(
+                os.environ[customized_info_capacity_env.name]
+            )
+            if customized_info_capacity_env.is_set()
+            else customized_info_capacity_env.get()
+        )
+        if customized_info_capacity < 0:
+            raise ValueError(
+                f"{customized_info_capacity_env.name} must be non-negative "
+                f"(got {customized_info_capacity})"
+            )
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -441,6 +475,15 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_customized_info = None
+            self.output_customized_info_len = None
+            if customized_info_capacity:
+                self.output_customized_info = torch.zeros(
+                    (size, customized_info_capacity), dtype=torch.uint8, device=device
+                )
+                self.output_customized_info_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
             self.output_token_sampling_logprobs = None
@@ -521,6 +564,8 @@ class MetadataBuffers:
             self.output_token_logprobs_idx,
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
+            self.output_customized_info,
+            self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
             self.output_token_sampling_logprobs,
@@ -534,6 +579,11 @@ class MetadataBuffers:
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
         bufs = [buf for buf in bufs if buf is not None]
+        if self.output_customized_info is not None:
+            assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
+                self.output_customized_info,
+                self.output_customized_info_len,
+            ]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
@@ -573,8 +623,63 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
+    def get_customized_info(self, idx: int) -> dict[str, list[object]] | None:
+        if self.output_customized_info is None:
+            return None
+        length = int(self.output_customized_info_len[idx, 0].item())
+        if not 0 <= length <= self.output_customized_info.shape[1]:
+            raise ValueError(f"Invalid disaggregation customized_info length: {length}")
+        if length == 0:
+            return None
+        payload = self.output_customized_info[idx, :length].cpu().numpy().tobytes()
+        return msgspec.msgpack.decode(
+            payload, type=dict[str, list[object]], ext_hook=ext_hook
+        )
 
+    def _set_customized_info(self, req: Req):
+        if self.output_customized_info is None:
+            if req.customized_info:
+                raise CustomizedInfoError(
+                    "customized_info transfer is disabled. Set "
+                    "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES to the same positive "
+                    "capacity on both prefill and decode."
+                )
+            return
+        try:
+            payload = (
+                b""
+                if req.customized_info is None
+                else msgspec.msgpack.encode(
+                    req.customized_info,
+                    enc_hook=lambda obj: enc_hook(
+                        obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
+                    ),
+                )
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
+        if len(payload) > self.output_customized_info.shape[1]:
+            raise CustomizedInfoError(
+                f"customized_info payload ({len(payload)} bytes) exceeds "
+                "disaggregation metadata capacity "
+                f"({self.output_customized_info.shape[1]} bytes). Increase "
+                "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES on both prefill and decode."
+            )
+        idx = req.metadata_buffer_index
+        if payload:
+            try:
+                msgspec.msgpack.decode(
+                    payload, type=dict[str, list[object]], ext_hook=ext_hook
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
+            self.output_customized_info[idx, : len(payload)].copy_(
+                torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
+            )
+        self.output_customized_info_len[idx, 0] = len(payload)
+
+    def set_buf(self, req: Req):
+        self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -1563,7 +1668,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finish_outside_step(FINISH_ABORT(error_message, status_code))
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

@@ -8,7 +8,7 @@ struct HcCombineDecode {
     using namespace host;
     SymbolicSize m{"rows"};
     SymbolicDevice dev;
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     TensorMatcher({m, 10240}).with_dtype<bf16_t>().with_device(dev).verify(normed);
     TensorMatcher({4, 10240}).with_dtype<bf16_t>().with_device(dev).verify(weight);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
@@ -30,7 +30,7 @@ struct HcCombineDecode {
     using namespace host;
     SymbolicSize m{"rows"};
     SymbolicDevice dev;
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     TensorMatcher({m, 2560}).with_dtype<bf16_t>().with_device(dev).verify(block);
     TensorMatcher({m, 10240}).with_dtype<bf16_t>().with_device(dev).verify(residual).verify(out);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
@@ -134,7 +134,7 @@ struct HcCombineNormDecode {
     using namespace host;
     SymbolicSize m{"rows"};
     SymbolicDevice dev;
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     TensorMatcher({m, 2560}).with_dtype<bf16_t>().with_device(dev).verify(block);
     TensorMatcher({m, 10240})
         .with_dtype<bf16_t>()

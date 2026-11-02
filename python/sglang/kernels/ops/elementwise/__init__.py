@@ -72,6 +72,25 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="elementwise.sam_rel_pos_bias",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.sam_rel_pos_bias:sam_rel_pos_bias",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="elementwise.window_unpartition_add",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.elementwise.window_unpartition_add:"
+            "window_unpartition_add"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="elementwise.kimi_k3_mla_output_gate",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.mla_output_gate:kimi_k3_mla_output_gate",

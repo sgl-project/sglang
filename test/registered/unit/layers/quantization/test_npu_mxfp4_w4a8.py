@@ -11,6 +11,7 @@ from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization import (
     linear_method_npu,
     moe_methods,
+    moe_utils,
     online_moe_methods,
 )
 from sglang.srt.layers.linear import (
@@ -234,7 +235,7 @@ class TestW4A8MoE(unittest.TestCase):
                 patch.object(
                     online_moe_methods, "get_moe_runner_backend", return_value=backend
                 ),
-                patch.object(online_moe_methods, "MoeRunner") as runner,
+                patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as runner,
             ):
                 method = online_moe_methods.NPUW4A8MXFP4OnlineMoEMethod()
                 # This base class preserves gate/up shard ordering in FusedMoE.
@@ -322,7 +323,7 @@ class TestW4A8MoE(unittest.TestCase):
         config = SimpleNamespace(layer=None)
         with (
             patch.object(fp8, "_is_npu", True),
-            patch.object(fp8, "MoeRunner") as runner,
+            patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as runner,
         ):
             method.create_moe_runner(layer, config)
             runner.assert_called_once_with(MoeRunnerBackend.ASCEND, config)
@@ -465,7 +466,12 @@ class TestW4A8MoE(unittest.TestCase):
                             return_value=FP4_DTYPE,
                         ),
                         patch.object(
-                            moe_methods,
+                            moe_utils,
+                            "_get_float4_e2m1fn_x2_dtype",
+                            return_value=FP4_DTYPE,
+                        ),
+                        patch.object(
+                            moe_utils,
                             "npu_format_cast",
                             side_effect=lambda weight, **kw: weight,
                         ),

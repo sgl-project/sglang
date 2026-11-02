@@ -138,10 +138,10 @@ void timestep_embedding(
   TensorMatcher({B})  // input
       .with_strides({1})
       .with_dtype<TIn>()
-      .template with_device<kDLCUDA>(device)
+      .template with_device<kDLGPU>(device)
       .verify(input);
 
-  TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLCUDA>(device).verify(output);
+  TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLGPU>(device).verify(output);
 
   RuntimeCheck(D.unwrap() == dim, "Output dim mismatch: ", D.unwrap(), " vs ", dim);
   RuntimeCheck(dim % 8 == 0, "dim must align to 8, got ", dim);

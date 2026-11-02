@@ -92,11 +92,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_two_batch_overlap=True is not supported "
             "(adaptive state swap would discard the TboAttnBackend wrapper)"
         )
-    if cfg.enable_pdmux:
-        return (
-            "enable_pdmux=True is not supported "
-            "(adaptive state swap does not update decode_attn_backend_group)"
-        )
     return None
 
 

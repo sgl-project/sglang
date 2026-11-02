@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
+    NPUSwigluWithLimit,
 )
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
@@ -50,15 +51,7 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if has_clamp:
-        # MXFP8 has no unfused gmm1 path at all, so a swiglu_limit
-        # checkpoint cannot be served by it.
-        if isinstance(kernel, NPUMXFP8MoEMethod):
-            raise NotImplementedError(
-                "NPUMXFP8MoEMethod has no unfused gmm1 path, and the fused "
-                "gmm1 kernel applies SiLU without clamp — a swiglu_limit "
-                "checkpoint cannot be served by this method."
-            )
-        return False  # W4A8MXFP4: fall back to unfused to preserve the clamp
+        return False  # Keep the separate activation to preserve the clamp.
     if isinstance(kernel, NPUMXFP8MoEMethod):
         return True
     return kernel.use_fused_gmm1
@@ -144,26 +137,36 @@ class AscendRunnerCore(MoeRunnerCore):
     runner_backend = MoeRunnerBackend.ASCEND
 
     def __init__(self, config: MoeRunnerConfig):
+        from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
+            _NPUBlockFp8MoEKernel,
+        )
+
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
 
+        # W13 decides fusion; W2 determines the separate activation's format.
         if _uses_fused_gmm1(config.layer.w13_kernel, config):
             # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
             # reaching for it fails loudly instead of silently applying an
             # unfused swiglu to already-requantised activations. This holds
-            # for every transport: the no-A2A path gets its activation quant
-            # fused into routing, DeepEP dispatches bf16 and gmm1 quantises it
-            # itself.
+            # for each transport: routing may quantize the input, while BF16
+            # dispatcher output is quantized before gmm1 when scales are absent.
             self.activation = None
         elif (
-            isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+            isinstance(kernel, (NPUW4A8MXFP4MoEMethod, NPUMXFP8MoEMethod))
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
+        elif (
+            isinstance(kernel, _NPUBlockFp8MoEKernel)
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            self.activation = NPUSwigluWithLimit(config.swiglu_limit)
         elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             # DeepEP / Ascend Ops path: the dispatcher hands over tokens grouped
             # by expert, so use a unified kernel that decides quantisation.

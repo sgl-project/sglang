@@ -24,6 +24,8 @@ pub struct MambaComponent {
     mamba_checkpoint_grid: usize,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     mamba_max_states_per_path: Option<usize>,
+    /// Host checkpoints count as a device-prefix match.
+    mamba_host_only_checkpoint: bool,
 }
 
 impl MambaComponent {
@@ -44,6 +46,7 @@ impl MambaComponent {
             // a radix-node boundary. `params.page_size` is already widened by DCP.
             mamba_checkpoint_grid: least_common_multiple(mamba_cache_chunk_size, params.page_size),
             mamba_max_states_per_path: params.mamba_max_states_per_path,
+            mamba_host_only_checkpoint: params.mamba_host_only_checkpoint,
         }
     }
 }
@@ -78,9 +81,40 @@ impl MambaComponent {
         }
         cache_actions.push(Box::new(MambaEvictExcessPathStates { tail_node_id }));
     }
+
+    /// Store a hicache host index and leave the node without a GPU mamba slot.
+    fn commit_host_only_checkpoint<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        host_value: &Tensor,
+        result: &mut InsertResult,
+        cache_actions: &mut CacheActions,
+    ) {
+        if tree_core.arena.has_device_value(node_id, MAMBA)
+            || tree_core.arena.has_host_value(node_id, MAMBA)
+        {
+            result.mamba_exist = true;
+            return;
+        }
+        tree_core
+            .arena
+            .set_host_value(node_id, MAMBA, host_value.shallow_clone());
+        if !tree_core.host_lru_list(MAMBA).in_list(Some(node_id)) {
+            tree_core.host_lru_list_mut(MAMBA).insert_mru(node_id);
+        }
+        let tick = tree_core.arena.get_and_bump_access_counter();
+        tree_core.arena.node_mut(node_id).last_access_counter = tick;
+        result.mamba_exist = false;
+        self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+    }
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
+    fn host_only_checkpoint_counts_as_device(&self) -> bool {
+        self.mamba_host_only_checkpoint
+    }
+
     fn component_type(&self) -> ComponentType {
         MAMBA
     }
@@ -121,9 +155,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         match_device_only: bool,
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
         // HiCache: evicted + backuped (host_value present) is also a valid match.
+        // Host-only mode never puts the checkpoint on a GPU slot, so that host
+        // value must also keep the Full KV device prefix reachable.
+        let host_counts_as_device = self.mamba_host_only_checkpoint;
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
-            node.has_device_value(MAMBA) || (!match_device_only && node.has_host_value(MAMBA))
+            node.has_device_value(MAMBA)
+                || ((host_counts_as_device || !match_device_only) && node.has_host_value(MAMBA))
         })
     }
 
@@ -167,6 +205,21 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         result: &mut InsertResult,
         cache_actions: &mut CacheActions,
     ) {
+        assert!(
+            params.mamba_value.is_none() || params.mamba_host_value.is_none(),
+            "mamba insert sets both a device slot and a host checkpoint"
+        );
+        if params.mamba_value.is_none() && params.mamba_host_value.is_none() {
+            if params.allow_missing_mamba {
+                result.mamba_exist = true;
+                return;
+            }
+        } else if params.mamba_value.is_none()
+            && let Some(host_value) = params.mamba_host_value.as_ref()
+        {
+            self.commit_host_only_checkpoint(tree_core, node_id, host_value, result, cache_actions);
+            return;
+        }
         let mamba_value = params
             .mamba_value
             .as_ref()
@@ -218,7 +271,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if node.is_root() {
                 break;
             }
-            if node.has_device_value(MAMBA) {
+            let host_only_holder = self.mamba_host_only_checkpoint
+                && !node.has_device_value(MAMBA)
+                && node.has_host_value(MAMBA);
+            if node.has_device_value(MAMBA) || host_only_holder {
                 holders.push(node_id);
             }
             cursor = node.parent;
@@ -234,19 +290,28 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 break;
             }
             let node = tree_core.arena.node(node_id);
+            let host_only_holder = !node.has_device_value(MAMBA) && node.has_host_value(MAMBA);
             if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
+                continue;
+            }
+            if host_only_holder && node.host_lock_ref(MAMBA) > 0 {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(node_id) {
                 continue;
             }
+            let layer = if host_only_holder {
+                EvictLayer::Host
+            } else {
+                EvictLayer::Device
+            };
             tree_core.evict_component_and_detach_lru_(
                 node_id,
                 MAMBA,
                 device_frees,
                 host_frees,
                 cache_actions,
-                EvictLayer::Device,
+                layer,
                 Some(&mut tracker),
             );
             tree_core.cascade_evict_(
@@ -256,7 +321,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 device_frees,
                 host_frees,
                 cache_actions,
-                EvictLayer::Device,
+                layer,
             );
             excess -= 1;
         }
@@ -557,8 +622,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     return Ok(None);
                 }
                 let mut transfers = Vec::new();
-                // restore single node if host_value exists
-                if let Some(host_value) = node.try_host_value(MAMBA) {
+                // restore single node if host_value exists. A host-only
+                // checkpoint keeps no GPU slot on the node, so the request copy
+                // below is the only H->D.
+                if !self.mamba_host_only_checkpoint
+                    && let Some(host_value) = node.try_host_value(MAMBA)
+                {
                     transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
@@ -657,6 +726,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 }
             }
             CacheTransferPhase::LoadBack => {
+                // Host-only: the only transfer targets the request's slot,
+                // which must not become the node's value.
+                if self.mamba_host_only_checkpoint {
+                    return;
+                }
                 let Some(transfer) = transfers.first() else {
                     return;
                 };
