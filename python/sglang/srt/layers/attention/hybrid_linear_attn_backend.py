@@ -1497,17 +1497,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_mixed() and not is_linear_attn:
-            # Let the child backend select its platform-specific mixed path.
-            return self.full_attn_backend.forward(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
         elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,

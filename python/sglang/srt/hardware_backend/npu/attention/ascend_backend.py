@@ -3506,24 +3506,16 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if topk_indices is not None or (not self.use_fia and layer.qk_head_dim > 128):
+        if (
+            topk_indices is not None
+            or self.use_mla
+            or (not self.use_fia and layer.qk_head_dim > 128)
+        ):
             raise NotImplementedError(
                 "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
-                "1. When using the deepseekv3.2 model on Ascend NPU devices, "
-                "2. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
-            )
-        if self.use_mla:
-            # MIXED uses expanded MLA Q/K/V, as in prefill. The shared extend
-            # path compacts valid prefix tokens before batched FIA and LSE merge.
-            return self.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                q_rope=q_rope,
-                k_rope=k_rope,
+                "1. When using the MLA backend on Ascend NPU devices, "
+                "2. When using the deepseekv3.2 model on Ascend NPU devices, "
+                "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
             )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
