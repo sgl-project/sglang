@@ -183,7 +183,7 @@ def create_layout_reference_images(
     patch_size: int = 32,
 ) -> List[Image.Image]:
     """Create bordered ref images plus one layout image (len(ref_pils) + 1)."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream.generation import (
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image.generation import (
         resize_pilimage,
     )
 
