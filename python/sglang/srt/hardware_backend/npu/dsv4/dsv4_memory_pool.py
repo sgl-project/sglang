@@ -15,20 +15,15 @@ There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 
 from __future__ import annotations
 
-import math
 from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
+from sgl_kernel_npu.operators.dsv4 import NPU_KV_QUANT_PATH, kv_compress_epilog
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.utils import (
-    MQSMLA_OP_NAMES,
-    NPU_KV_QUANT_PATH,
-    is_npu_arch35,
-    require_cann_transformer_ops,
-)
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -72,14 +67,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     def a5_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        scale_dim = math.ceil(nope_dim / NPU_KV_QUANT_PATH.quant_group_size)
-        bytes_per_token = (
-            nope_dim + rope_dim * 2 + scale_dim * NPU_KV_QUANT_PATH.scale_itemsize
-        )
-        return (
-            math.ceil(bytes_per_token / NPU_KV_QUANT_PATH.row_alignment)
-            * NPU_KV_QUANT_PATH.row_alignment
-        )
+        return NPU_KV_QUANT_PATH.packed_dim(nope_dim, rope_dim)
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
@@ -617,10 +605,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        _, _, writer_op = require_cann_transformer_ops(*MQSMLA_OP_NAMES)
-        # The writer takes the 4-D cache as raw bytes (608B rows).
-        writer_op(
-            buf.view(torch.uint8),
+        kv_compress_epilog(
+            buf,
             cache_2d,
             slot_mapping,
             quant_group_size=NPU_KV_QUANT_PATH.quant_group_size,
