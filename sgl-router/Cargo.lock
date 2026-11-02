@@ -3653,6 +3653,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sgl-kv-indexer",
+ "sglang-api-types",
  "sglang-processor",
  "sglang-runtime-v1-types",
  "sha2",
