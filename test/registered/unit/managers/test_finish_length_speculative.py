@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
@@ -77,6 +78,40 @@ def _make_req(
 
 
 class TestFinishLengthSpeculative(CustomTestCase):
+    def test_abort_caps_speculative_run_without_losing_abort_reason(self):
+        for max_new_tokens in (3, 4, 5):
+            with self.subTest(max_new_tokens=max_new_tokens):
+                req = _make_req([10, 11], max_new_tokens=max_new_tokens)
+                abort = FINISH_ABORT("cancelled", 499, "ClientDisconnect")
+                req.to_finish = abort
+                accepted = [12, 13, 14, 15, 16]
+                req.output_ids.extend(accepted)
+
+                req.update_finish_state(new_accepted_len=len(accepted))
+
+                self.assertIs(req.finished_reason, abort)
+                self.assertIsNone(req.to_finish)
+                self.assertEqual(req.finished_len, max_new_tokens)
+                self.assertEqual(
+                    list(req.output_ids_through_stop),
+                    [10, 11, 12, 13, 14, 15, 16][:max_new_tokens],
+                )
+                # The accepted run remains available for KV cleanup.
+                self.assertEqual(len(req.output_ids), 7)
+
+    def test_abort_within_budget_keeps_untrimmed_output(self):
+        for max_new_tokens in (2, 3):
+            with self.subTest(max_new_tokens=max_new_tokens):
+                req = _make_req([10, 11], max_new_tokens=max_new_tokens)
+                abort = FINISH_ABORT()
+                req.to_finish = abort
+
+                req.update_finish_state(new_accepted_len=1)
+
+                self.assertIs(req.finished_reason, abort)
+                self.assertIsNone(req.finished_len)
+                self.assertEqual(list(req.output_ids_through_stop), [10, 11])
+
     def test_eos_mid_run_beats_length_cap(self):
         # One spec step commits [12, EOS, 20], crossing max_new_tokens=5 in the
         # same step the EOS lands. Length-first ordering finished this as
@@ -206,9 +241,18 @@ class TestSpecOvershootCacheLen(CustomTestCase):
         with mock.patch("sglang.srt.managers.schedule_batch.get_parallel") as gp:
             gp().tp_rank = 0
             req.set_finish_with_abort("boom")
+        req.update_finish_state()
         self.assertIsNone(req.finished_len)
         with get_context().override_server_args(strip_thinking_cache=False):
             self.assertEqual(req.owned_kv_len(), req.kv.kv_committed_len)
+
+    def test_abort_overshoot_is_not_a_cache_key(self):
+        req = _make_req([10, 11, 12, 13, 14], max_new_tokens=3)
+        req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
+        req.to_finish = FINISH_ABORT()
+        req.update_finish_state(new_accepted_len=3)
+        with get_context().override_server_args(strip_thinking_cache=False):
+            self.assertEqual(req.owned_kv_len(), len(req.origin_input_ids) + 3)
 
 
 if __name__ == "__main__":
