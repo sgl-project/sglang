@@ -19,7 +19,7 @@ for mod in (
     "torch_npu.contrib",
     "sgl_kernel_npu",
     "sgl_kernel_npu.operators",
-    "sgl_kernel_npu.operators.dsv4",
+    "sgl_kernel_npu.operators.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.kvcacheio",
@@ -86,7 +86,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
 _backend.NPU_KV_QUANT_PATH.reader_quant_mode = 1
 
 _BACKEND_NPU_OPS = (
-    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.dsv4_ops"
+    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_attention_ops"
 )
 
 
@@ -1051,7 +1051,10 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
         backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
         compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
         quant_cache = MagicMock()
-        with patch(_BACKEND_NPU_OPS + ".indexer_quant_cache", quant_cache):
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_cache_ops.indexer_quant_cache",
+            quant_cache,
+        ):
             backend._compressor_epilog_npu(
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
