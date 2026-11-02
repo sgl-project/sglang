@@ -390,6 +390,7 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
             draft_parallel_layout=SimpleNamespace(tp_group=None),
             lilicorr=None,
             _use_fused_kv_materialize=False,
+            _kv_fuse_store=lambda *args, **kwargs: False,
             _fused_kv_helper=None,
         )
         worker._append_target_hidden_sequential = lambda **kw: (
