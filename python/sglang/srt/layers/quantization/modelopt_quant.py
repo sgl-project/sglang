@@ -1713,24 +1713,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Per-token activation metadata requires serialized W4A4 NVFP4"
                 )
             quant_config.use_per_token_activation = metadata["use_per_token_activation"]
-            if (
-                quant_config.use_per_token_activation
-                and get_moe_runner_backend().is_flashinfer_cutlass()
-            ):
-                raise ValueError(
-                    "flashinfer_cutlass does not support per-token NVFP4 activation."
-                )
             # The MoE hook only sees the environment switch, so metadata that
             # turns per-token scaling on must repeat the DeepEP check here.
-            if (
-                quant_config.use_per_token_activation
-                and get_moe_runner_backend().is_flashinfer_cutedsl()
-                and get_moe_a2a_backend().is_deepep()
-            ):
-                raise ValueError(
-                    "flashinfer_cutedsl per-token NVFP4 activation requires "
-                    "moe_a2a_backend='none' or 'flashinfer'."
-                )
+            if quant_config.use_per_token_activation:
+                backend = get_moe_runner_backend()
+                if backend.is_flashinfer_cutlass():
+                    raise ValueError(
+                        "flashinfer_cutlass does not support per-token NVFP4 activation."
+                    )
+                if (
+                    backend.is_flashinfer_cutedsl()
+                    and get_moe_a2a_backend().is_deepep()
+                ):
+                    raise ValueError(
+                        "flashinfer_cutedsl per-token NVFP4 activation requires "
+                        "moe_a2a_backend='none' or 'flashinfer'."
+                    )
         # Legacy ModelOpt exports bundle an unquantized MTP layer with the target.
         quant_config.quantized_mtp = metadata.get("quantized_mtp", False)
         if quant_config.quantized_mtp and not is_checkpoint_nvfp4_serialized:

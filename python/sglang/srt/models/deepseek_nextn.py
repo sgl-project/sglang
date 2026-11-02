@@ -77,7 +77,7 @@ class DeepseekModelNextN(nn.Module):
         if (
             quant_config is not None
             and quant_config.get_name() == "modelopt_fp4"
-            and not getattr(quant_config, "quantized_mtp", False)
+            and not quant_config.quantized_mtp
         ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
@@ -98,9 +98,9 @@ class DeepseekModelNextN(nn.Module):
 
         # A separately packed draft quantizes eh_proj too; its quant method still
         # honors the checkpoint's ignore list.
-        if quant_config is not None and (
-            quant_config.get_name() == "quark"
-            or getattr(quant_config, "quantized_mtp", False)
+        if quant_config is not None and quant_config.get_name() in (
+            "quark",
+            "modelopt_fp4",
         ):
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
