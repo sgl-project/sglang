@@ -65,6 +65,7 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format: str = "",
         true_sequential: bool = False,
         static_groups: bool = False,
+        is_sym: bool = False,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -103,6 +104,7 @@ class GPTQConfig(QuantizationConfig):
         self.checkpoint_format = checkpoint_format
         self.true_sequential = true_sequential
         self.static_groups = static_groups
+        self.is_sym = is_sym
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -168,6 +170,7 @@ class GPTQConfig(QuantizationConfig):
             checkpoint_format,
             true_sequential,
             static_groups,
+            is_sym=cls.get_from_keys_or(config, ["sym"], default=False),
         )
 
     def get_quant_method(
@@ -242,8 +245,9 @@ class CPUGPTQConfig(GPTQConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
+            return get_linear_quant_method(
+                self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+            )
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
             return GPTQMoEMethod(self)
