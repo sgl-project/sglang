@@ -24,14 +24,15 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalPro
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.models.llama import LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM, get_attention_sliding_window_size
 from sglang.srt.models.llava import LlavaForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
 
 class MistralForCausalLM(LlamaForCausalLM):
-    pass
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
 
 class MistralForCausalLMMistralFormat(MistralForCausalLM):
