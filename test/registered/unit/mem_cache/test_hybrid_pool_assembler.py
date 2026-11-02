@@ -386,6 +386,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             layer_num=1,
             size=800,
             start_layer=0,
+            layer_shard_enabled=False,
             get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=object()),),
         )
         draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
@@ -1207,13 +1208,9 @@ class TestHostPoolPreflight(CustomTestCase):
     def test_packed_hybrid_draft_uses_its_full_kv_child(self):
         """Composite draft wrappers do not have the child KV's layer count."""
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-        for wrapper_type, has_index in (
-            (HybridLinearKVPool, True),
-            (QSATokenToKVPool, False),
-        ):
-            with self.subTest(wrapper=wrapper_type.__name__):
+        for has_index in (True, False):
+            with self.subTest(has_index=has_index):
                 target = _dsa_pool_stub(layer_num=2)
                 draft = _dsa_pool_stub(layer_num=1)
                 if not has_index:
@@ -1227,7 +1224,7 @@ class TestHostPoolPreflight(CustomTestCase):
                         pool.store_dtype = torch.bfloat16
                         pools.append(pool)
                     target, draft = pools
-                wrapper = object.__new__(wrapper_type)
+                wrapper = object.__new__(HybridLinearKVPool)
                 wrapper.full_kv_pool = draft
                 config = prepare_host_pool_config(
                     root=target,

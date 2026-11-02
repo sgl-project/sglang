@@ -662,6 +662,43 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertIs(actual, expected)
         self.assertEqual(len(swa.host_pool.device_buffers), 5)
 
+    def test_draft_swa_sidecar_moves_whole_v41_pages(self):
+        """A separate V4.1 draft SWA sidecar must not take the token-granular copy,
+        which assumes the 576-byte V4 value plus 8-byte scale row."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        class UnpinnedHostPool(DeepSeekV4PagedHostPool):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs, pin_memory=False)
+
+        draft = self.make_pool([0, 0], [], KVLayout.V41)
+        target_swa = UnpinnedHostPool.__new__(UnpinnedHostPool)
+        target_swa.slot_page_size = draft.swa_kv_pool.page_size
+        target_swa.num_host_pages = 2
+        target_swa.layout = "layer_first"
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    entry_map={PoolName.SWA: SimpleNamespace(host_pool=target_swa)}
+                )
+            )
+        )
+        with (
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "DeepSeekV4PagedHostPool", UnpinnedHostPool),
+        ):
+            _, entries = assembler.build_swa_draft_pools(
+                draft_kv_pool=draft, tree_cache=tree_cache
+            )
+        host = entries[0].host_pool
+        self.assertTrue(host.page_aligned_only)
+        for actual, expected in zip(
+            host.device_buffers, draft.swa_kv_pool.kv_buffer, strict=True
+        ):
+            self.assertIs(actual, expected)
+
     def test_v41_pool_buffers(self):
         for main in (KVLayout.V41, KVLayout.V41_NEW):
             for option, encoding in (
