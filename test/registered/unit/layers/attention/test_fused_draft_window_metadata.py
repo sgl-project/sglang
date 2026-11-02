@@ -297,7 +297,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         updater.kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
         updater._swa_kv_pool = self.bound_pool
         updater._swa_space = reader.space(IdSpaceKind.SLIDING_WINDOW)
-        updater.prefill_wrapper_ragged = None
+        updater.prefill_wrappers_ragged = [None, None]
         planned = []
 
         def begin_forward(qo_indptr, kv_indptr, kv_indices, *args, **kwargs):

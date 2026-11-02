@@ -1,10 +1,12 @@
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -178,6 +180,248 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    @contextmanager
+    def _swa_fixture(self, case, *, head_dim, max_context_len=64, use_paged=False):
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(use_paged):
+            fixture = build_dense_attention_fixture(
+                self,
+                case,
+                head_dim=head_dim,
+                hidden_size=self.HIDDEN_SIZE,
+                max_context_len=max_context_len,
+                dtype=torch.bfloat16,
+            )
+            try:
+                with (
+                    torch.no_grad(),
+                    forward_context(ForwardContext(attn_backend=fixture.backend)),
+                ):
+                    yield fixture
+            finally:
+                fixture.runner._server_args_override.restore()
+
+    def test_window_511_prefill_and_cached_decode_boundary_keys(self):
+        """Sliding layers must drop the key past the window in prefill and decode."""
+        # Orthogonal key coordinates give the selected sentinel a logit of 32.
+        # Its value dominates when visible; masking it out yields an exactly
+        # representable uniform mean. A missing/extra boundary key therefore
+        # changes outputs by about 1 or more, independently of GEMM rounding.
+        num_tokens = 514
+        q = torch.zeros(num_tokens, 4, 64, dtype=torch.bfloat16, device="cuda")
+        k = torch.zeros(num_tokens, 2, 64, dtype=torch.bfloat16, device="cuda")
+        v = torch.zeros_like(k)
+        for head in range(3):
+            q[:, head, head] = 16
+            k[head, :, head] = 16
+            v[head] = 2**head
+        for offset, position in enumerate((511, 512, 513)):
+            q[position, 3, 3 + offset] = 16
+            k[position, :, 3 + offset] = 16
+            v[position] = 8
+        expected = (
+            torch.tensor(
+                [[1, 2, 4, 8], [22 / 512, 2, 4, 8], [28 / 512, 28 / 512, 4, 8]],
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            .unsqueeze(-1)
+            .expand(-1, -1, 64)
+        )
+
+        case = DenseAttentionCase(
+            name="swa_511_dominant_boundary_keys",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(num_tokens,),
+            sliding_window_size=511,
+        )
+        for use_paged in (False, True):
+            with (
+                self.subTest(use_paged=use_paged),
+                self._swa_fixture(
+                    case, head_dim=64, max_context_len=528, use_paged=use_paged
+                ) as fixture,
+            ):
+                batch = fixture.forward_batch
+
+                def attend(batch, start, end):
+                    fixture.backend.init_forward_metadata(batch)
+                    return fixture.actual_module.attn(
+                        q[start:end], k[start:end], v[start:end], batch
+                    ).view(-1, 4, 64)
+
+                prefix = replace(
+                    batch,
+                    input_ids=batch.input_ids[:511],
+                    positions=batch.positions[:511],
+                    out_cache_loc=batch.out_cache_loc[:511],
+                    seq_lens=batch.seq_lens.new_tensor([511]),
+                    seq_lens_cpu=torch.tensor([511], dtype=torch.int32),
+                    seq_lens_sum=511,
+                    extend_seq_lens=batch.extend_seq_lens.new_tensor([511]),
+                    extend_seq_lens_cpu=[511],
+                    extend_num_tokens=511,
+                )
+                fixture.runner.runner_ids.bind_own_plan(prefix)
+                attend(prefix, 0, 511)
+                for offset, position in enumerate((511, 512, 513)):
+                    decode = ForwardBatch(
+                        forward_mode=ForwardMode.DECODE,
+                        batch_size=1,
+                        input_ids=batch.input_ids[position : position + 1],
+                        req_pool_indices=batch.req_pool_indices,
+                        seq_lens=batch.seq_lens.new_tensor([position + 1]),
+                        seq_lens_cpu=torch.tensor([position + 1], dtype=torch.int32),
+                        seq_lens_sum=position + 1,
+                        positions=batch.positions[position : position + 1],
+                        out_cache_loc=batch.out_cache_loc[position : position + 1],
+                    )
+                    fixture.runner.runner_ids.bind_own_plan(decode)
+                    actual = attend(decode, position, position + 1)
+                    with self.subTest(phase="decode", position=position):
+                        torch.testing.assert_close(
+                            actual[0], expected[offset], atol=1e-3, rtol=0
+                        )
+
+                actual = attend(batch, 0, num_tokens)
+                for offset, position in enumerate((511, 512, 513)):
+                    with self.subTest(phase="prefill", position=position):
+                        torch.testing.assert_close(
+                            actual[position], expected[offset], atol=1e-3, rtol=0
+                        )
+
+    def test_window_511_mixed_prefill_boundary_keys(self):
+        """Prefill must apply the window at each request's own positions."""
+        case = DenseAttentionCase(
+            name="swa_511_mixed_prefill_boundary_keys",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(512, 513),
+            sliding_window_size=511,
+        )
+        with self._swa_fixture(case, head_dim=64, max_context_len=528) as fixture:
+            q = torch.zeros(1025, 4, 64, dtype=torch.bfloat16, device="cuda")
+            k = torch.zeros(1025, 2, 64, dtype=torch.bfloat16, device="cuda")
+            v = torch.zeros_like(k)
+            q[:, :, 0] = 16
+            k[[0, 512], :, 0] = 16
+            v[[0, 512]] = 8
+            # Each first key has logit 32: it dominates the shorter
+            # sequence's last row and is masked out of the longer one.
+            batch = fixture.forward_batch
+            fixture.backend.init_forward_metadata(batch)
+            actual = fixture.actual_module.attn(q, k, v, batch).view(-1, 4, 64)
+            torch.testing.assert_close(
+                actual[[511, 1024]],
+                actual.new_tensor([8, 0]).view(2, 1, 1).expand(2, 4, 64),
+                atol=1e-3,
+                rtol=0,
+            )
+
+    def test_long_prefix_and_extend_masks(self):
+        """Both portions exceed the window: cached keys must leave the window
+        while new keys first enter it, then leave it within the same extend."""
+        case = DenseAttentionCase(
+            name="swa_long_prefix_and_extend_masks",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(7,),
+            extend_lens=(7,),
+            sliding_window_size=4,
+        )
+        for head_dim in (128, 256):
+            with (
+                self.subTest(head_dim=head_dim),
+                self._swa_fixture(
+                    case, head_dim=head_dim, max_context_len=32
+                ) as fixture,
+            ):
+                q = torch.zeros(7, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+                k = torch.zeros(14, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+                v = torch.zeros_like(k)
+                q[:, :, 0] = 16
+                sentinel_positions = torch.tensor([0, 3, 7, 12], device="cuda")
+                heads = torch.arange(4, device="cuda")
+                k[sentinel_positions, heads, 0] = 16
+                v[sentinel_positions, heads] = 8
+                layer = fixture.actual_module.attn
+                prefix_locs = fixture.runner.req_to_token_pool.req_to_token[
+                    0, :7
+                ].long()
+                fixture.runner.token_to_kv_pool.set_kv_buffer(
+                    layer, prefix_locs, k[:7], v[:7]
+                )
+
+                # Each head has one nonzero-value key. When visible,
+                # its softmax denominator contains it and four zeros.
+                score = q.new_tensor(256 * layer.scaling, dtype=torch.float32)
+                visible_value = 8 * score.exp() / (score.exp() + 4)
+                positions = torch.arange(7, 14, device="cuda").unsqueeze(1)
+                visible = (sentinel_positions >= positions - 4) & (
+                    sentinel_positions <= positions
+                )
+                expected = (visible * visible_value).to(q.dtype)
+                batch = fixture.forward_batch
+                fixture.backend.init_forward_metadata(batch)
+                actual = layer(q, k[7:], v[7:], batch).view(7, 4, head_dim)
+                torch.testing.assert_close(
+                    actual,
+                    expected.unsqueeze(-1).expand_as(actual),
+                    atol=0.04,
+                    rtol=0,
+                )
+
+    def test_sliding_and_full_layers_reuse_same_prefill_metadata(self):
+        """Full layers must not inherit the sliding layers' prefill window."""
+        case = DenseAttentionCase(
+            name="swa_full_swa_shared_prefill_metadata",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(7,),
+            sliding_window_size=4,
+        )
+        with self._swa_fixture(case, head_dim=128) as fixture:
+            sliding = fixture.actual_module.attn
+            full = RadixAttention(
+                num_heads=4,
+                head_dim=128,
+                scaling=sliding.scaling,
+                num_kv_heads=2,
+                layer_id=0,
+                sliding_window_size=-1,
+            )
+            q = torch.zeros(7, 4, 128, device="cuda", dtype=torch.bfloat16)
+            k = torch.zeros(7, 2, 128, device="cuda", dtype=torch.bfloat16)
+            v = torch.zeros_like(k)
+            q[:, :, 0] = 32
+            k[0, :, 0] = 32
+            v[0] = 8
+            batch = fixture.forward_batch
+            fixture.backend.init_forward_metadata(batch)
+            # Do not re-plan between layers. Both wrappers must retain
+            # their own window specialization across repeated use.
+            for layer in (sliding, full, sliding):
+                actual = layer(q, k, v, batch, save_kv_cache=False).view(7, 4, 128)
+                expected = actual.new_full((7, 4, 128), 8)
+                if layer is sliding:
+                    expected[5:] = 0
+                torch.testing.assert_close(actual, expected, atol=1e-3, rtol=0)
 
     def test_full_layer_ragged_prefill_reads_cached_prefix_only(self):
         """Full attention must ignore stale K/V in unwritten extend slots."""
