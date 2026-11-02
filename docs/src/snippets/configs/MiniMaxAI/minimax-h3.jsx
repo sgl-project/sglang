@@ -186,6 +186,7 @@ return {
     "gb200",
     "h200",
     "h100",
+    "xeon",
     "mi300x",
     "mi355x",
     "rtxpro6000",
@@ -203,6 +204,7 @@ return {
     "rtx3060",
   ],
   hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
     { id: "rtx6000ada", label: "RTX 6000 Ada", vram: "48GB", vendor: "consumer" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
@@ -457,7 +459,7 @@ return {
         {
           id: "auto",
           label: "Auto",
-          flags: (s) => (s.nodes > 1 ? ["--encoder-parallel replicate"] : []),
+          flags: (s) => s.hw === "xeon" ? ["--encoder-parallel auto"] : (s.nodes > 1 ? ["--encoder-parallel replicate"] : []),
           recommended: true,
           description: "Folds on verified single-host P2P systems and resolves to replicate across nodes.",
         },
@@ -465,7 +467,7 @@ return {
           id: "dp",
           label: "Data parallel",
           flags: ["--encoder-parallel dp"],
-          disabled: (s) => CONSUMER_SINGLE.includes(s.hw) || (s.topology_mode === "manual"
+          disabled: (s) => s.hw === "xeon" || CONSUMER_SINGLE.includes(s.hw) || (s.topology_mode === "manual"
             ? Number(s.tp_size)
             : config.commandBuilder.resource.autoTopology(s).tp_size) > 1,
           disableReason: "Encoder DP requires TP1 and a multi-GPU DP group; TP > 1 and the single-card consumer recipes do not qualify.",
@@ -477,7 +479,7 @@ return {
           id: "fold",
           label: "Fold",
           flags: ["--encoder-parallel fold"],
-          disabled: (s) => s.nodes > 1,
+          disabled: (s) => s.hw === "xeon" || s.nodes > 1,
           disableReason: "Fold assumes fast node-local peer-to-peer access.",
           description: "Uses one folded encoder copy across a node-local group and preserves native weights.",
         },
@@ -485,6 +487,8 @@ return {
           id: "replicate",
           label: "Replicate",
           flags: ["--encoder-parallel replicate"],
+          disabled: (s) => s.hw === "xeon",
+          disableReason: "Xeon always runs the auto encoder policy.",
           recommendedWhen: (s) => s.nodes > 1,
           description: "The safe cross-node default because encoder auto is not node-boundary aware.",
         },
@@ -527,18 +531,18 @@ return {
       description: "Cumulative reference, fusion-only, or audited Cache-DiT execution.",
       quality: "Sampling policy",
       learnMore: "#choose-the-quality-level",
-      default: "lossless",
+      default: "exact",
       options: [
         {
-          id: "lossless",
-          label: "Lossless",
+          id: "exact",
+          label: "Exact",
           recommended: true,
           description: "Reference-exact denoising without Cache-DiT approximation.",
         },
         {
-          id: "extra-high",
-          label: "Extra high",
-          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its lossless denoise path at this tier.",
+          id: "lossless",
+          label: "Lossless",
+          description: "Includes fusion-only request paths but not Cache-DiT; MiniMax-H3 currently follows its exact denoise path at this tier.",
         },
         {
           id: "high",
@@ -565,6 +569,33 @@ return {
       default: 1,
       options: [],
     },
+    {
+      id: "reference_resize_mode",
+      title: "Reference image resize",
+      scope: "request",
+      showWhen: (s) => ["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode),
+      description: "Resize Ref2VA image references before encoding; audio, video, and FL2VA keyframes are unaffected.",
+      quality: "Preprocessing policy",
+      default: "diffusers",
+      options: [
+        {
+          id: "diffusers",
+          label: "Diffusers-compatible",
+          recommended: true,
+          description: "Preserve the existing behavior by scaling the reference short edge to 2048 pixels, including upscaling.",
+        },
+        {
+          id: "match",
+          label: "Match target area",
+          description: "Match the target canvas pixel area without upscaling; required by ModelTC Ref2VA Turbo.",
+        },
+        {
+          id: "max",
+          label: "2048 short-edge cap",
+          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
+        },
+      ],
+    },
   ],
 
   commandBuilder: {
@@ -579,8 +610,8 @@ return {
     },
     resource: {
       limits: {
-        nodes: { min: 1, max: 8 },
-        gpus_per_node: { min: 1, max: 8 },
+        nodes: { min: 1, max: 8, allowedValues: (s) => s.hw === "xeon" ? [1, 2, 4, 8] : [] },
+        gpus_per_node: { min: 1, max: 8, disabledWhen: (s) => s.hw === "xeon", disabledValue: 0 },
       },
       verifiedRecipes: [
         { id: "b200-resident-8", hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
@@ -654,6 +685,27 @@ return {
       },
     },
     resolveDeployment: (s) => {
+      if (s.hw === "xeon") {
+        return {
+          match: { hw: s.hw },
+          nnodes: 1,
+          verified: false,
+          verificationStatus: "unverified",
+          env: ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"],
+          flags: [
+            `--model-path MiniMaxAI/MiniMax-H3 \\\n  --tp-size ${s.nodes}`,
+            "--host {{HOST_IP}}",
+            "--port {{PORT}}",
+          ],
+          builder: {
+            topologySummary: "CPU",
+            errors: [],
+            warnings: ["Xeon CPU deployment is supported."],
+            verification: { serve: "unverified", request: "unverified" },
+            resolvedSettings: {},
+          },
+        };
+      }
       const resource = config.commandBuilder.resource;
       const topology = s.topology_mode === "manual"
         ? {
@@ -716,8 +768,8 @@ return {
       const serveVerified = topologyVerified && encoderVerified && attentionVerified
         && precisionVerified && executionVerified && checkpointVerified;
       const requestCovered = s.hw !== "gb300" || (serveVerified && s.weights === "fl2va"
-        && s.mode === "t2va" && s.quality === "lossless" && Number(s.outputs) === 1);
-      const requestVerified = topologyVerified && requestCovered && (["lossless", "extra-high"].includes(s.quality)
+        && s.mode === "t2va" && s.quality === "exact" && Number(s.outputs) === 1);
+      const requestVerified = topologyVerified && requestCovered && (["exact", "lossless"].includes(s.quality)
         || (s.quality === "high" && highAudited && s.execution === "eager"));
 
       const topologyParts = [];
@@ -990,6 +1042,10 @@ return {
       request.seed = 3104;
     }
 
+    if (["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode)) {
+      request.reference_resize_mode = s.reference_resize_mode;
+    }
+
     const body = JSON.stringify(request, null, 2).replace(
       /"{{(DURATION_SECONDS|INPUT_VIDEO_START_SECONDS|SECOND_INPUT_VIDEO_START_SECONDS)}}"/g,
       "{{$1}}",
@@ -1001,16 +1057,11 @@ return {
 
   dockerMounts: ["{{MEDIA_DIR}}:/data/minimax-h3:ro"],
 
-  dockerRunCommand: (s) =>
-    ["mi300x", "mi355x"].includes(s.hw)
-      ? `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion_hip]" && exec sglang serve "$@"' --`
-      : `bash -lc 'python -m pip install -e "/sgl-workspace/sglang/python[diffusion]" && exec sglang serve "$@"' --`,
-
   // Publish Docker only after the platform's H3 image/command has been validated.
   runModes: (s) =>
-    ["mi300x", "mi355x", "gb200", "gb300"].includes(s.hw)
+    ["mi300x", "mi355x", "gb200", "gb300", "xeon"].includes(s.hw)
       ? ["python"]
-      : ["python", "docker"],
+      : ["docker", "python"],
 
   dockerImages: {
     b200: "lmsysorg/sglang:dev",

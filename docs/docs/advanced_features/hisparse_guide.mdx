@@ -137,7 +137,7 @@ python3 -m sglang.launch_server \
     --port 8000 --host 0.0.0.0 \
     --context-length 81920 \
     --chunked-prefill-size 65536 \
-    --tp-size 8 --dp-size 8 --enable-dp-attention \
+    --tp-size 8 --attn-dp-size 8 \
     --mem-fraction-static 0.85 \
     --disaggregation-mode prefill \
     --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3 \
@@ -152,7 +152,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --port 8000 --host 0.0.0.0 \
     --context-length 81920 \
-    --tp-size 8 --dp-size 8 --enable-dp-attention \
+    --tp-size 8 --attn-dp-size 8 \
     --mem-fraction-static 0.85 \
     --disable-radix-cache \
     --disaggregation-mode decode \

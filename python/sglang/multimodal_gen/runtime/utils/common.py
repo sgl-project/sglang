@@ -3,7 +3,6 @@
 import ipaddress
 import logging
 import os
-import platform
 import socket
 from functools import lru_cache
 from typing import Any
@@ -27,6 +26,22 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def upload_without_sync(batch, device):
+    """Move a batch of host tensors to `device` without waiting for the GPU work already queued.
+
+    A pageable host-to-device copy synchronizes its stream first; a pinned one does not.
+    """
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        return batch.to(device)
+    pinned = type(batch)(
+        {
+            k: v.pin_memory() if torch.is_tensor(v) and v.device.type == "cpu" else v
+            for k, v in batch.items()
+        }
+    )
+    return pinned.to(device, non_blocking=True)
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -247,7 +262,7 @@ def get_zmq_socket(
                         # Last attempt failed
                         logger.error(
                             f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
-                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                            f"Original endpoint: {endpoint}, last tried: {current_endpoint}"
                         )
                         raise
                     else:
@@ -266,19 +281,6 @@ def get_zmq_socket(
         return socket, endpoint
 
     return socket, endpoint
-
-
-# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
-
-
-@lru_cache(maxsize=1)
-def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
 
 
 # cuda
@@ -315,11 +317,11 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     falsy_values = {"0", "false", "no", "n", "f", "off", ""}
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 

@@ -8,7 +8,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -26,6 +28,9 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 class TestSchedulePolicy(CustomTestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
         self.tree_cache = RadixCache.create_simulated()
 
     def test_init_with_cache_aware_policy(self):

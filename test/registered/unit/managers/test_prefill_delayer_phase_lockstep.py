@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -7,16 +8,15 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
-from sglang.srt.runtime_context import get_context
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 DP_SIZE = 2
-NUM_FIELDS = 6
-IN_FLIGHT_FIELD = 5
+NUM_FIELDS = 7
+IN_FLIGHT_FIELD = 6
 
 
 class TestPrefillDelayerPhaseLockstep(CustomTestCase):
@@ -24,14 +24,13 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
     in-flight chunk on any rank OR (allow AND num_prefillable > 0)."""
 
     def setUp(self):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        override = get_context().override_server_args(
-            enable_dp_attention=True, dp_size=DP_SIZE, tp_size=DP_SIZE
+        self.enterContext(published_topology(tp_size=DP_SIZE, attn_dp_size=DP_SIZE))
+        self.enterContext(
+            get_parallel().override(
+                tp_group=SimpleNamespace(cpu_group=None, device_group=None)
+            )
         )
-        override.install()
-        self.addCleanup(override.restore)
         self.delayer = PrefillDelayer(
-            cpu_group=MagicMock(),
             max_delay_passes=100,
             token_usage_low_watermark=None,
         )
@@ -64,7 +63,7 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
         # The delayer sees "mixed" and delays rank 0 (allow=False), but the
         # pass is still a prefill pass because rank 1 is mid-chunk.
         executor = self._run_pass(
-            remote_rows=[[0, 0, 0, 0, 0, 1]], local_prefillable=True
+            remote_rows=[[0, 0, 0, 0, 0, 0, 1]], local_prefillable=True
         )
         self.assertFalse(executor._result.output_allow)
         self.assertTrue(executor._result.any_prefill_in_flight)
@@ -72,7 +71,7 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
 
     def test_local_in_flight_bit_is_gathered_and_forces_phase_prefill(self):
         executor = self._run_pass(
-            remote_rows=[[0, 0, 0, 0, 0, 0]],
+            remote_rows=[[0, 0, 0, 0, 0, 0, 0]],
             local_prefillable=True,
             prefill_in_flight=True,
         )
@@ -83,7 +82,7 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
         # "none" allows for simplicity, but with num_prefillable == 0 nobody
         # runs prefill, so the phase is decode.
         executor = self._run_pass(
-            remote_rows=[[0, 0, 0, 0, 0, 0]], local_prefillable=False
+            remote_rows=[[0, 0, 0, 0, 0, 0, 0]], local_prefillable=False
         )
         self.assertTrue(executor._result.output_allow)
         self.assertEqual(executor._result.num_prefillable, 0)
@@ -93,7 +92,7 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
         # Wanting to prefill is not prefilling: a delayed "mixed" pass with no
         # chunk in flight anywhere runs decode on every rank.
         executor = self._run_pass(
-            remote_rows=[[0, 0, 0, 0, 0, 0]], local_prefillable=True
+            remote_rows=[[0, 0, 0, 0, 0, 0, 0]], local_prefillable=True
         )
         self.assertFalse(executor._result.output_allow)
         self.assertEqual(executor._result.num_prefillable, 1)
@@ -101,7 +100,7 @@ class TestPrefillDelayerPhaseLockstep(CustomTestCase):
 
     def test_allowed_prefill_is_prefill_phase(self):
         executor = self._run_pass(
-            remote_rows=[[1, 0, 0, 0, 0, 0]], local_prefillable=True
+            remote_rows=[[1, 0, 0, 0, 0, 0, 0]], local_prefillable=True
         )
         self.assertTrue(executor._result.output_allow)
         self.assertTrue(executor.is_phase_prefill)

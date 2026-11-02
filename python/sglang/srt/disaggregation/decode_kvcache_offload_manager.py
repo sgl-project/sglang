@@ -21,15 +21,16 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_hybrid_swa_stack,
     build_kv_host_pool,
+    build_unified_host_stack,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -80,17 +81,13 @@ class DecodeKVCacheOffloadManager:
                 )
 
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, UnifiedSWAKVPool):
-            full_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if not is_swa
-            }
-            swa_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if is_swa
-            }
+        router = self.kv_cache.layer_router
+        # A unified pool's window sub-pool: its pages are bound per virtual page.
+        self._unified_window = (
+            self.token_to_kv_pool_allocator.hands_out_virtual_ids
+            and router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        )
+        if self._unified_window:
             params = CacheInitParams(
                 disable=False,
                 req_to_token_pool=self.req_to_token_pool,
@@ -98,18 +95,17 @@ class DecodeKVCacheOffloadManager:
                 page_size=self.page_size,
                 tp_cache_group=tp_group,
             )
-            self.decode_host_mem_pool, self.cache_controller = build_hybrid_swa_stack(
+            stack = build_unified_host_stack(
+                storage=self.token_to_kv_pool_allocator.storage,
                 params=params,
-                full_kv_pool=self.kv_cache.full_kv_pool,
-                swa_kv_pool=self.kv_cache.swa_kv_pool,
-                full_layer_mapping=full_mapping,
-                swa_layer_mapping=swa_mapping,
+                cache=None,
                 load_cache_event=threading.Event(),
                 storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
                 model_name=get_serving().served_model_name,
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
             )
+            self.decode_host_mem_pool = stack.host_pool_group
+            self.cache_controller = stack.cache_controller
         else:
             if not isinstance(self.kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
                 raise ValueError("Unsupported KV cache type for decode offload")
@@ -166,12 +162,12 @@ class DecodeKVCacheOffloadManager:
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         full_indices = virtual_indices
-        if not isinstance(self.kv_cache, UnifiedSWAKVPool):
+        if not self._unified_window:
             return full_indices, []
 
-        swa_indices = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            virtual_indices
-        )
+        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[
+            IdSpaceKind.SLIDING_WINDOW
+        ].ids(virtual_indices)
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
         if live_swa_indices.numel() == 0:
@@ -277,6 +273,28 @@ class DecodeKVCacheOffloadManager:
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
 
+    def drain_before_retraction(self):
+        """Drain offloads, then refuse retraction on every rank if any rank still tracks a D2H copy."""
+        self.check_offload_progress()
+        cc = self.cache_controller
+        # Retraction frees the device KV these copies read. Storage backups read only
+        # host memory, so they do not count.
+        pending = torch.tensor(
+            [bool(cc.ack_write_queue or self.ongoing_offload or self.offload_inflight)],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+            )
+        if pending.item():
+            raise RuntimeError(
+                "Decode KV offload copies are still pending on some rank; "
+                f"refusing to retract (local: {len(cc.ack_write_queue)} acks, "
+                f"{len(self.ongoing_offload)} copies, "
+                f"{len(self.offload_inflight)} requests)."
+            )
+
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
@@ -315,7 +333,7 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (double free, double unpin).
+        # non-idempotent side effects (double free, double unlock).
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
@@ -325,8 +343,13 @@ class DecodeKVCacheOffloadManager:
         self.tree_cache.free_kv_row(
             req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
         )
-        self.tree_cache.unpin(req)
-        self.req_to_token_pool.free(req)
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
+        kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+        ).release_row(req)
         req.kv.mark_kv_released()
         self.offloaded_state.pop(req, None)
 

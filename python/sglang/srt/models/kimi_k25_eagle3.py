@@ -24,8 +24,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
-from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -161,7 +162,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         attn_input = torch.cat([embeds, hidden_states], dim=-1)
 
         # MLA's forward_absorb_prepare reads the qkv-down projection result
-        # from attn_tp_context. We bypass LayerCommunicator here (the eagle3
+        # from attn_tp_context. We bypass layer boundary preparation here (the eagle3
         # draft layer is one isolated layer with custom pre-attention norms),
         # so publish the attention input ourselves.
         get_attn_tp_context().set_attn_inputs(
@@ -318,6 +319,8 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     an EAGLE3 layout with multi-latent attention so the draft KV cache shape
     matches the target's MLA cache.
     """
+
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
     def __init__(
         self,

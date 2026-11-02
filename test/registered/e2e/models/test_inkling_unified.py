@@ -45,7 +45,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=115, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -204,10 +204,11 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
 
     The pairing used to be a hard boot failure: unified disabled prefill
     capture outright. With capture on, both the captured block table and the
-    SWA write loc have to come from the translator. Re-running the full->swa
+    SWA write loc have to come from the runner_ids. Re-running the full->swa
     map on `out_cache_loc` does not work here -- it is already FULL-side
-    kernel-facing by then, and indexes far past the swa v2p table (a
-    device-side "index out of bounds" assert).
+    physical by then, and a full physical page number is also a valid
+    virtual page of the swa v2p, so the map would silently resolve it to an
+    unrelated token's swa slot.
     `test_input_output_logprobs_match` is the sharp guard: a wrong-slot SWA
     write moves logprobs at once, and
     `test_long_decode_slides_past_swa_window` keeps compaction running

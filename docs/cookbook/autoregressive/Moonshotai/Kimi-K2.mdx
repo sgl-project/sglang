@@ -36,7 +36,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 - **Memory**: Requires 8 GPUs with ≥140GB each (H200/B200). Use `--context-length 128000` to conserve memory.
 - **Expert Parallelism (EP)**: Use `--ep` for better MoE throughput. See [EP docs](../../../docs/advanced_features/expert_parallelism).
-- **Data Parallel (DP)**: Enable with `--dp 4 --enable-dp-attention` for production throughput.
+- **Data Parallel (DP)**: Enable with `--attn-dp-size 4` for production throughput.
 - **KV Cache**: Use `--kv-cache-dtype fp8_e4m3` to reduce memory by 50% (CUDA 11.8+).
 - **Reasoning Parser**: Add `--reasoning-parser kimi_k2` for Kimi-K2-Thinking to separate thinking and content.
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
@@ -359,8 +359,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 python3 -m sglang.launch_server \
     --model-path moonshotai/Kimi-K2-Instruct \
     --tp 8 \
-    --dp 4 \
-    --enable-dp-attention \
+    --attn-dp-size 4 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -427,9 +426,8 @@ Max ITL (ms):                            19.94
 python3 -m sglang.launch_server \
     --model-path moonshotai/Kimi-K2-Instruct \
     --tp 8 \
-    --dp 4 \
+    --attn-dp-size 4 \
     --ep 4 \
-    --enable-dp-attention \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
