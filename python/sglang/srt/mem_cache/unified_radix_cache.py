@@ -3226,6 +3226,9 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        self.cache_controller._finish_op_trace(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -4103,6 +4106,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
+
+    def retained_window_tokens(self) -> int:
+        return 0 if self.uocr_doc_reuse is None else self.uocr_doc_reuse.held_tokens()
+
+    def retained_window_req_count(self) -> int:
+        return (
+            0 if self.uocr_doc_reuse is None else len(self.uocr_doc_reuse.held_slots())
+        )
 
     def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
         """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""

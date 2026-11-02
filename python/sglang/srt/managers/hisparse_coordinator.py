@@ -1057,6 +1057,9 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {"hisparse_staging": [act.req for act in self.ack_staging_queue]}
+
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 

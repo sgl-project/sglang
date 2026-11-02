@@ -66,7 +66,7 @@ from sglang.srt.models.gemma4_causal import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_xpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -327,17 +327,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
         mask_dtype: torch.dtype,
+        sliding_layers_only: bool = True,
     ):
         """Prepare bidirectional attention masks for image tokens.
 
         Gemma 4 uses bidirectional attention for image soft tokens
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
-        tokens), not across items.
+        tokens), not across items, and only for checkpoints with
+        ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
         Triton and FA4 use causal attention for image spans split across chunks.
+        XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
+        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
+        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
+        That mask has no sliding-window variant, so sliding layers keep causal
+        image attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
+        if (
+            getattr(self.config.text_config, "use_bidirectional_attention", None)
+            != "vision"
+        ):
+            return
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
         if getattr(prefill_backend, "fa_impl_ver", None) == 4:
@@ -378,6 +390,22 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 input_ids.device, non_blocking=True
             )
             return
+        if is_xpu():
+            # Same per-token image-block ids as Gemma 3; the sgl-kernel-xpu FMHA
+            # prefill turns them into bidirectional image attention. Imported
+            # lazily so non-XPU builds are unaffected.
+            from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+            from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
+
+            if isinstance(prefill_backend, XPUAttentionBackend):
+                assert forward_batch.forward_mode == ForwardMode.EXTEND
+                prefill_backend.bidirectional_block_ids = (
+                    Gemma3ForConditionalGeneration._build_xpu_image_block_ids(
+                        forward_batch=forward_batch, device=input_ids.device
+                    )
+                )
+                prefill_backend.bidirectional_sliding_layers_only = sliding_layers_only
+                return
         if not isinstance(prefill_backend, TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
