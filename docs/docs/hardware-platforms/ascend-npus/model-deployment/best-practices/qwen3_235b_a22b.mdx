@@ -19,13 +19,13 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Ascend A3 Series Products | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+| Qwen3-235B-A22B | A3 Series Products | 8 | PD Mixed | 11k+1.5k | 8ms | BF16 | [Optimal Configuration](#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-235B-A22B | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
+| Qwen3-235B-A22B | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50.1ms | W8A8 INT8 | [Optimal Configuration](#qwen3-235b-a22b-w8a8-8p-in3k5-out1k5-50-1ms) |
 
 ## Optimal Configuration
 
@@ -35,7 +35,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Qwen3-235B-A22B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -132,7 +132,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-235B-A22B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
