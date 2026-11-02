@@ -138,7 +138,9 @@ def _simt_schedule(n: int, k: int) -> SIMTSchedule:
         candidates = [
             d for d in range(1, min(n, lanes // _SIMT_MAX_M_TILE) + 1) if n % d == 0
         ]
-    n_tile = next((d for d in candidates if n // d <= current_arch().num_sms), candidates[-1])
+    n_tile = next(
+        (d for d in candidates if n // d <= current_arch().num_sms), candidates[-1]
+    )
     rows_per_lane = 1 if lanes <= _WARP_THREADS else n_tile
     return SIMTSchedule(n_tile, _SIMT_MAX_M_TILE, rows_per_lane)
 
