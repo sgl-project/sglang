@@ -6,9 +6,11 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -50,6 +52,9 @@ class _Req:
 
     def finished(self):
         return self.finished_reason is not None
+
+    def request_finish(self, reason):
+        self.to_finish = reason
 
     def update_finish_state(self):
         self.finished_reason = self.to_finish
@@ -238,6 +243,44 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertEqual(req.output_ids, [])
         self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+
+
+class TestAbortYieldedPrefill(CustomTestCase):
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_abort_reaches_a_yielded_request_with_a_chunk_in_flight(self, release):
+        # The yield took it out of the chunked slot and its batch; only
+        # prefill_launched_reqs holds it until its chunk's result is processed.
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=1)
+        req.to_finish = None
+        scheduler.prefill_launched_reqs.join([req])
+        scheduler.optimistic_release_and_requeue = Mock()
+        scheduler.deferred_responses = Mock()
+        scheduler.mm_receiver = None
+        scheduler.waiting_queue = []
+        scheduler.uocr_runtime = None
+        scheduler.dllm_config = None
+        scheduler.grammar_manager = Mock()
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.collect_inflight_reqs = lambda: set()
+
+        Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+
+        # Only marked: the chunk in flight still writes its KV.
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+        self.assertIn(req, scheduler.prefill_launched_reqs)
+        release.assert_not_called()
+        req.disagg_kv_sender.abort.assert_not_called()
+
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+        scheduler.optimistic_release_and_requeue.assert_not_called()
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertNotIn(req, scheduler.prefill_launched_reqs)
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
+        req.disagg_kv_sender.abort.assert_called_once_with()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
