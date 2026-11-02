@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
@@ -797,6 +798,63 @@ class TestStartupDecodeGraphReuse(unittest.TestCase):
                         runner.init_decode_cuda_graph.assert_called_once_with()
                 finally:
                     rc.reset_context()
+
+
+class TestBootstrapEpochAcrossRoleSwitch(unittest.TestCase):
+    """A prefill -> decode -> prefill round trip rebuilds the prefill KV manager
+    behind the same bootstrap server. Decode workers must notice and drop the
+    bootstrap infos they cached for it, or requests hang until the timeout."""
+
+    @staticmethod
+    def _register(server, tp_rank, rank_port):
+        payload = {
+            "attn_tp_size": 2,
+            "attn_tp_rank": tp_rank,
+            "attn_cp_size": 1,
+            "attn_cp_rank": 0,
+            "attn_dp_size": 1,
+            "attn_dp_rank": 0,
+            "pp_size": 1,
+            "pp_rank": 0,
+            "system_dp_size": 1,
+            "system_dp_rank": 0,
+            "rank_ip": "10.0.0.1",
+            "rank_port": rank_port,
+            "page_size": 1,
+            "kv_cache_dtype": "auto",
+        }
+        request = SimpleNamespace(json=AsyncMock(return_value=payload))
+        return server._handle_route_put(request)
+
+    def test_reregistered_rank_changes_health_epoch(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+        with patch.object(CommonKVBootstrapServer, "run"):
+            server = CommonKVBootstrapServer("127.0.0.1", 0)
+
+        async def scenario():
+            epochs = []
+            for tp_rank, port in ((0, 17000), (1, 17001), (0, 17100)):
+                await self._register(server, tp_rank, port)
+                health = await server._handle_health_check(None)
+                epochs.append(health.headers["X-Bootstrap-Epoch"])
+            return epochs
+
+        # TP1 registering for the first time keeps the epoch; TP0 again changes it.
+        self.assertEqual(asyncio.run(scenario()), ["0", "0", "1"])
+
+    def test_decode_drops_the_prefill_only_when_its_epoch_changes(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr._bootstrap_epochs = {}
+        addr = "10.0.0.1:8998"
+        with patch.object(mgr, "_handle_node_failure") as drop:
+            for epoch in (None, "0", "0"):  # no header, first heartbeat, unchanged
+                mgr._check_bootstrap_epoch(addr, epoch)
+            drop.assert_not_called()
+            mgr._check_bootstrap_epoch(addr, "1")
+        drop.assert_called_once_with(addr)
 
 
 if __name__ == "__main__":
