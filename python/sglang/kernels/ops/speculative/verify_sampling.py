@@ -14,8 +14,11 @@ if is_npu():
     except ImportError:
         chain_speculative_sampling_triton = None
         tree_speculative_sampling_target_only = None
+    # NPU does not have a chain target-only kernel yet.
+    chain_speculative_sampling_target_only_triton = None
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_target_only_triton,
         chain_speculative_sampling_triton,
     )
 
@@ -31,4 +34,8 @@ else:
     else:
         tree_speculative_sampling_target_only = None
 
-__all__ = ["chain_speculative_sampling_triton", "tree_speculative_sampling_target_only"]
+__all__ = [
+    "chain_speculative_sampling_target_only_triton",
+    "chain_speculative_sampling_triton",
+    "tree_speculative_sampling_target_only",
+]
