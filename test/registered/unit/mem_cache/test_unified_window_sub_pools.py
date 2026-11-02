@@ -417,7 +417,9 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                 req.decode_batch_idx = frontier - 16
                 batch.maybe_evict_swa()
                 long, short = cache.window_slots()
-                cache.evict(EvictParams(window_num_tokens={long: 80, short: 80}))
+                cache.evict(
+                    EvictParams(window_num_tokens={"window_16": 80, "window_8": 80})
+                )
                 for ct, window in (
                     (long, long_window),
                     (short, short_window),
@@ -437,10 +439,7 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
             cache.evict(
                 EvictParams(
                     num_tokens=80,
-                    window_num_tokens={
-                        long: 80,
-                        cache.window_slots()[1]: 80,
-                    },
+                    window_num_tokens={"window_16": 80, "window_8": 80},
                 )
             )
             self.assertEqual(storage.accounting_violations(), [])
@@ -523,9 +522,12 @@ class TestThreeWindowTree(CustomTestCase):
             [0, 8, 12],
         )
         # Each further window evicts what lies before its own window, alone.
-        result = cache.evict(EvictParams(window_num_tokens={swa_8: 16, swa_4: 16}))
+        result = cache.evict(
+            EvictParams(window_num_tokens={"window_8": 16, "window_4": 16})
+        )
         self.assertEqual(
-            result.window_num_tokens_evicted, {swa: 0, swa_8: 8, swa_4: 12}
+            result.window_num_tokens_evicted,
+            {"window_16": 0, "window_8": 8, "window_4": 12},
         )
         self.assertEqual(result.num_tokens_evicted, 0)
         self.assertEqual(
@@ -541,7 +543,7 @@ class TestThreeWindowTree(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=64,
-                window_num_tokens={swa: 64, swa_8: 64, swa_4: 64},
+                window_num_tokens={"window_16": 64, "window_8": 64, "window_4": 64},
             )
         )
         self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
@@ -587,14 +589,17 @@ class TestThreeWindowTree(CustomTestCase):
                 before = {
                     c: cache.window_evictable_size(n) for c, n in zip(slots, names)
                 }
-                result = cache.evict(EvictParams(window_num_tokens={ct: 64}))
+                result = cache.evict(EvictParams(window_num_tokens={name: 64}))
                 self.assertEqual(result.num_tokens_evicted, 0)
                 # The victim's whole history goes; another window's entries
                 # on the same nodes go with it (up to that window's own
                 # history), whichever window is the victim.
                 self.assertEqual(
                     result.window_num_tokens_evicted,
-                    {c: min(before[c], before[ct]) for c in slots},
+                    {
+                        cache.window_sub_pool_of_slot(c): min(before[c], before[ct])
+                        for c in slots
+                    },
                 )
                 self.assertEqual(cache.window_evictable_size(name), 0)
                 cache.unlock(lock)

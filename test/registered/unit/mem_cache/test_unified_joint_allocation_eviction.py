@@ -471,7 +471,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_until(
-                EvictParams(window_num_tokens={ComponentType.SWA: 2}),
+                EvictParams(
+                    window_num_tokens={
+                        cache.window_sub_pool_of_slot(ComponentType.SWA): 2
+                    }
+                ),
                 lambda: allocator.ensure_capacity(token_demand(allocator, 4, 4)),
             )
         self.assertTrue(
