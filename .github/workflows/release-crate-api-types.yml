@@ -66,7 +66,12 @@ jobs:
             exit 1
           fi
 
+      - name: Package the crate
+        if: github.event_name != 'push'
+        run: cargo package -p sglang-api-types --locked
+
       - name: Build the crate as crates.io would
+        if: github.event_name == 'push'
         run: cargo publish -p sglang-api-types --locked --dry-run
 
   # Tags only: protocol PRs leave the version unchanged until a release bumps it.
@@ -109,12 +114,25 @@ jobs:
         working-directory: .
         run: bash scripts/ci/utils/install_rustup.sh
 
+      # 0.1.0 is uploaded by hand, so its tag finds it already there.
+      - name: Check whether this version is already on crates.io
+        id: published
+        run: |
+          version=${GITHUB_REF_NAME#api-types-v}
+          if curl -fsS https://index.crates.io/sg/la/sglang-api-types |
+            jq -es --arg version "$version" 'any(.[]; .vers == $version)' > /dev/null; then
+            echo "sglang-api-types $version is already on crates.io; skipping the upload."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # crates.io Trusted Publishing: a short-lived token, no stored secret.
       - name: Get a crates.io token
+        if: steps.published.outputs.skip != 'true'
         id: crates-io-token
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Upload to crates.io
+        if: steps.published.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-token.outputs.token }}
         run: cargo publish -p sglang-api-types --locked
