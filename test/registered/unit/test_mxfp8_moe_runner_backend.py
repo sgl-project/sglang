@@ -136,6 +136,26 @@ class TestMxfp8TrtllmDeviceConstraint(CustomTestCase):
                         "flashinfer_trtllm_routed",
                     )
 
+    def test_names_outside_the_choices_are_refused_after_the_override(self):
+        # The device check reads the backend this pass resolved to, not the name the
+        # request carried, so an off-list name takes the existing device-free warning
+        # first and lands in the same refusal rather than being warned into a runner
+        # that has no cubins on the device. flashinfer_cutlass is the name worth
+        # pinning: it is what this pass resolves modelopt_fp4 to on SM120, but it is
+        # not in MXFP8_MOE_RUNNER_BACKEND_CHOICES, so for mxfp8 it is off-list too.
+        for arch in ("sm110", "sm120", "sm121"):
+            for backend in ("triton", "marlin", "flashinfer_cutlass"):
+                with self.subTest(arch=arch, backend=backend):
+                    with _platform(is_hip=False, arch=arch):
+                        with self.assertRaisesRegex(ValueError, self._REFUSAL):
+                            _resolve(backend)
+
+        # Off consumer Blackwell the override keeps answering as it did.
+        for backend in ("triton", "marlin", "flashinfer_cutlass"):
+            with self.subTest(arch="sm90", backend=backend):
+                with _platform(is_hip=False, arch="sm90"):
+                    self.assertEqual(_resolve(backend), "flashinfer_trtllm")
+
     def test_accepted_where_the_default_is_not_trtllm(self):
         # Hopper answers the same question the way it did before: this arm has no
         # trtllm-device check, so only a request naming a trtllm backend is in
