@@ -474,6 +474,17 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_chat_with_sglang_rid(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_sglang_rid(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        sglang_rid: Option<&str>,
+    ) -> Response {
         let start = Instant::now();
         let model = model_id.unwrap_or(body.model.as_str());
         let streaming = body.stream;
@@ -534,6 +545,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 metrics_labels::ERROR_VALIDATION,
             );
             return error_responses::bad_request(format!("Provider transform error: {}", e));
+        }
+
+        if let Some(rid) = sglang_rid {
+            payload["rid"] = Value::String(rid.to_owned());
         }
 
         let mut ctx = RequestContext::for_chat(
