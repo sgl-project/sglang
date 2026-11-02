@@ -2537,7 +2537,6 @@ class Cosmos3DecodingStage(PipelineStage):
         if (
             not self.vae.supports_decode_on_frames
             or (self._guardrails and batch.use_guardrails is not False)
-            or (self.sound_tokenizer is not None and batch.audio_latents is not None)
             or batch.action_latents is not None
             or batch.extra.get("transfer_plan") is not None
         ):
@@ -2547,9 +2546,41 @@ class Cosmos3DecodingStage(PipelineStage):
         )
         if save_file_path is None:
             return None
+        has_audio = self.sound_tokenizer is not None and batch.audio_latents is not None
+        if has_audio:
+            if not envs.SGLANG_USE_NVENC.get():
+                return None
+            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+                supports_nvenc,
+            )
+
+            if not supports_nvenc(batch.latents.device):
+                return None
         return EncodeWhileDecoding(
-            save_file_path, batch, finish_frames=self._postprocess_tensor
+            save_file_path,
+            batch,
+            # Keep the VAE's returned frames intact if encoding needs to fall back.
+            finish_frames=lambda frames: frames.mul(0.5).add_(0.5).clamp_(0, 1).float(),
+            use_nvenc=envs.SGLANG_USE_NVENC.get(),
         )
+
+    def _decode_audio(self, batch: Req, device: torch.device):
+        if self.sound_tokenizer is None or batch.audio_latents is None:
+            return None, None
+        with self.use_declared_component(
+            component_name="sound_tokenizer", module=self.sound_tokenizer
+        ) as sound_tokenizer:
+            assert sound_tokenizer is not None
+            with torch.no_grad():
+                decoded_audio = sound_tokenizer.decode(batch.audio_latents.to(device))
+        audio = decoded_audio.float().cpu()
+        audio_sample_rate = sound_tokenizer.sample_rate
+        self.log_debug(
+            "Decoded audio tensor shape: %s @ %s Hz",
+            tuple(audio.shape),
+            audio_sample_rate,
+        )
+        return audio, audio_sample_rate
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
@@ -2642,6 +2673,17 @@ class Cosmos3DecodingStage(PipelineStage):
                 **action_metadata,
             )
 
+        pre_encoded_paths = batch.extra.pop("streamed_video_output_file_paths", None)
+        if pre_encoded_paths is not None:
+            return OutputBatch(
+                output=None,
+                output_file_paths=pre_encoded_paths,
+                action_pred=action_pred,
+                metrics=batch.metrics,
+                rollout_trajectory_data=batch.rollout_trajectory_data,
+                **action_metadata,
+            )
+
         is_image_gen = batch.data_type == DataType.IMAGE
         self.log_info(
             "Decoding latents to image..."
@@ -2671,9 +2713,24 @@ class Cosmos3DecodingStage(PipelineStage):
                             stream.abort()
                         raise
             if output_file_paths is not None:
+                audio, audio_sample_rate = self._decode_audio(batch, device)
+                if audio is not None:
+                    from sglang.multimodal_gen.runtime.entrypoints.utils import (
+                        _maybe_mux_audio_into_mp4,
+                    )
+
+                    _maybe_mux_audio_into_mp4(
+                        save_file_path=output_file_paths[0],
+                        audio=audio,
+                        frames=range(int(decoded.shape[2])),
+                        fps=batch.fps,
+                        audio_sample_rate=audio_sample_rate,
+                    )
                 return OutputBatch(
                     output=None,
                     output_file_paths=output_file_paths,
+                    audio=audio,
+                    audio_sample_rate=audio_sample_rate,
                     metrics=batch.metrics,
                     rollout_trajectory_data=batch.rollout_trajectory_data,
                     **action_metadata,
@@ -2697,24 +2754,7 @@ class Cosmos3DecodingStage(PipelineStage):
         elif not is_image_gen:
             self.log_debug("Postprocessed video tensor shape: %s", output.shape)
 
-        audio = None
-        audio_sample_rate = None
-        if self.sound_tokenizer is not None and batch.audio_latents is not None:
-            with self.use_declared_component(
-                component_name="sound_tokenizer", module=self.sound_tokenizer
-            ) as sound_tokenizer:
-                assert sound_tokenizer is not None
-                with torch.no_grad():
-                    decoded_audio = sound_tokenizer.decode(
-                        batch.audio_latents.to(device)
-                    )
-            audio = decoded_audio.float().cpu()
-            audio_sample_rate = sound_tokenizer.sample_rate
-            self.log_debug(
-                "Decoded audio tensor shape: %s @ %s Hz",
-                tuple(audio.shape),
-                audio_sample_rate,
-            )
+        audio, audio_sample_rate = self._decode_audio(batch, device)
 
         return OutputBatch(
             output=output,
