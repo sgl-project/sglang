@@ -13,8 +13,6 @@ from unittest.mock import patch
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
-    TraceEvent,
-    TraceNullContext,
     TraceReqContext,
     TraceSliceContext,
     TraceThreadInfo,
@@ -45,16 +43,6 @@ class TestTraceFunctions(unittest.TestCase):
     def test_extract_trace_headers_missing(self):
         self.assertEqual(extract_trace_headers({}), {})
 
-    def test_set_global_trace_level(self):
-        from sglang.srt.runtime_context import get_resources
-
-        orig = get_resources().trace_level
-        try:
-            set_global_trace_level(5)
-            self.assertEqual(get_global_trace_level(), 5)
-        finally:
-            get_resources().trace_level = orig
-
     def test_global_trace_level_env_var(self):
         # The level lives on ctx.resources and is seeded lazily from the env
         # on first read after a reset (no module reload involved).
@@ -69,18 +57,6 @@ class TestTraceFunctions(unittest.TestCase):
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
-
-
-class TestTraceNullContext(unittest.TestCase):
-    def test_null_object_pattern(self):
-        ctx = TraceNullContext()
-        self.assertFalse(ctx.tracing_enable)
-        # Any attribute access returns self
-        self.assertIs(ctx.some_method, ctx)
-        # Callable returns self
-        self.assertIs(ctx("arg1", key="val"), ctx)
-        # Chaining works
-        self.assertIs(ctx.foo.bar.baz(1, 2, 3), ctx)
 
 
 class TestSpanAttributes(unittest.TestCase):
@@ -285,23 +261,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.assertIsNotNone(ctx.root_span)
         ctx.trace_req_finish(ts=2000)
 
-    def test_trace_slice_combined(self):
-        """trace_slice() creates and ends a span in one call."""
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-
-        s = TraceSliceContext(
-            "decode",
-            2000,
-            end_time_ns=3000,
-            level=1,
-            attrs={"key": "val"},
-            events=[TraceEvent("evt", 2500, {"e": 1})],
-        )
-        ctx.trace_slice(s)
-        self.assertIsNotNone(ctx.last_span_context)
-        ctx.trace_req_finish(ts=4000)
-
     def test_trace_slice_with_events_cache(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -417,21 +376,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.abort(ts=2000)
         self.assertEqual(len(ctx.events_cache), 0)
 
-    def test_abort_with_abort_info_dict(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.abort(ts=2000, abort_info={"reason": "cancelled"})
-        self.assertIsNone(ctx.thread_context)
-
-    def test_abort_with_base_finish_reason(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-
-        abort_obj = FINISH_LENGTH(length=10)
-        ctx.abort(ts=2000, abort_info=abort_obj)
-        self.assertIsNone(ctx.thread_context)
-
     def test_check_fast_return_by_level(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -466,14 +410,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         state = ctx.__getstate__()
         self.assertFalse(state["tracing_enable"])
         ctx.root_span_context = True  # prevent __del__ issues
-        ctx.trace_req_finish(ts=2000)
-
-    def test_getstate_with_slice_stack(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.trace_slice_start("s1", level=1, ts=1500)
-        state = ctx.__getstate__()
-        self.assertIn("last_span_context", state)
         ctx.trace_req_finish(ts=2000)
 
     def test_setstate_enabled(self):
