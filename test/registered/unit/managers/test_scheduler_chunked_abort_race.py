@@ -15,8 +15,12 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.deferred_responses import (  # noqa: E402
+    DeferredResponses,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -62,6 +66,11 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.last_batch = None
     sched.beam_coordinator = Mock()
     sched.output_streamer = Mock()
+    sched.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     return sched
 
 

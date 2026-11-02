@@ -11,8 +11,8 @@ import torch
 import torch.nn.functional as F
 import triton.testing
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
@@ -149,12 +149,11 @@ def benchmark_fp8(m, n, k, provider):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         print(
             "dsv3_fused_a_gemm JIT kernel requires SM90+ (Hopper). Skipping benchmark."
         )
     else:
         benchmark.run(print_data=True)
-        arch = get_jit_cuda_arch()
-        if arch.major == 10:
+        if current_arch().is_sm(10):
             benchmark_fp8.run()

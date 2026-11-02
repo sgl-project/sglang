@@ -13,11 +13,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -97,7 +96,7 @@ def dsv3_fused_a_gemm(
 
 @cache_once
 def dsv3_fused_a_gemm_fp8_module(k: int, n: int, packed_scales: bool) -> Module:
-    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+    if not current_arch().is_sm(10):
         raise RuntimeError("dsv3_fused_a_gemm_fp8 is validated on SM10x only")
     args = make_cpp_args(k, n, packed_scales, is_arch_support_pdl())
     return load_jit(
