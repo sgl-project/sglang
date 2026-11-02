@@ -9,12 +9,14 @@ import numpy.typing as npt
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.mooncake.buffers import group_units
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.transport.base import Copy
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -123,23 +125,6 @@ class AscendKVManager(MooncakeKVManager):
             npu_id=self.kv_args.gpu_id,
             disaggregation_mode=self.disaggregation_mode,
         )
-
-    def register_buffer_to_engine(self):
-        # MemFabric aligns registered buffers to 2 MiB. Register everything in
-        # one batch so overlapping aligned ranges from small tensors are merged
-        # before they are published to the peer.
-        ptrs = list(self.kv_args.kv_data_ptrs)
-        lens = list(self.kv_args.kv_data_lens)
-        ptrs.extend(self.kv_args.aux_data_ptrs)
-        lens.extend(self.kv_args.aux_data_lens)
-        for component_ptrs, component_lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
-        ):
-            ptrs.extend(component_ptrs)
-            lens.extend(component_lens)
-        if ptrs:
-            self.engine.batch_register(ptrs, lens)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
@@ -295,14 +280,14 @@ class AscendKVManager(MooncakeKVManager):
         if self.is_hybrid_mla_backend and self.pp_size > 1:
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
-                src_data_ptrs=self.kv_args.kv_data_ptrs,
-                dst_data_ptrs=dst_kv_ptrs,
                 item_lens=self.kv_args.kv_item_lens,
                 prefill_data_indices=prefill_kv_indices,
                 dst_data_indices=dst_kv_indices,
                 executor=executor,
                 src_layer_ids=self.kv_args.kv_layer_ids,
                 dst_layer_ids=dst_layer_ids,
+                src_keys=self._local_keys.kv,
+                dst_keys=self._peers[mooncake_session_id].keys.kv,
             )
 
         # Group by indices
@@ -310,86 +295,78 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
+        src_entries = list(range(len(self.kv_args.kv_data_ptrs)))
+        dst_entries = list(range(len(dst_kv_ptrs)))
         if self.pp_size > 1:
             if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                src_layers, dst_layers, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(src_entries, dst_entries)
                 )
                 layers_params = [
                     (
-                        src_kv_ptrs[layer_id],
-                        sliced_dst_kv_ptrs[layer_id],
+                        src_layers[layer_id],
+                        dst_layers[layer_id],
                         self.kv_args.kv_item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
             else:
                 (
-                    src_k_ptrs,
-                    src_v_ptrs,
-                    dst_k_ptrs,
-                    dst_v_ptrs,
+                    src_k,
+                    src_v,
+                    dst_k,
+                    dst_v,
                     layers_current_pp_stage,
-                ) = self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+                ) = self.get_mha_kv_ptrs_with_pp(src_entries, dst_entries)
 
                 layers_params = [
                     (
-                        src_k_ptrs[layer_id],
-                        dst_k_ptrs[layer_id],
+                        src_k[layer_id],
+                        dst_k[layer_id],
                         self.kv_args.kv_item_lens[layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ] + [
                     (
-                        src_v_ptrs[layer_id],
-                        dst_v_ptrs[layer_id],
+                        src_v[layer_id],
+                        dst_v[layer_id],
                         self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id],
                     )
                     for layer_id in range(layers_current_pp_stage)
                 ]
         else:
-            num_layers = len(self.kv_args.kv_data_ptrs)
             layers_params = [
-                (
-                    self.kv_args.kv_data_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    self.kv_args.kv_item_lens[layer_id],
-                )
-                for layer_id in range(num_layers)
+                (layer_id, layer_id, self.kv_args.kv_item_lens[layer_id])
+                for layer_id in src_entries
             ]
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+        kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
+        local_kv_keys = self._local_keys.kv
+        peer_kv_keys = self._peers[mooncake_session_id].keys.kv
+
+        def make_layer_copy(src_entry: int, dst_entry: int, item_len: int) -> Copy:
+            return Copy(
+                src=local_kv_keys[src_entry],
+                dst=peer_kv_keys[dst_entry],
+                ranges=kv_units * item_len,
+            )
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        def process_layer(src_entry: int, dst_entry: int, item_len: int) -> int:
+            return self._transfer_copies(
+                mooncake_session_id, [make_layer_copy(src_entry, dst_entry, item_len)]
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_copies(
+                mooncake_session_id,
+                [make_layer_copy(*params) for params in layers_params],
+            )
 
         if self.enable_custom_mem_pool:
             futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                executor.submit(process_layer, *params) for params in layers_params
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -445,7 +422,9 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+        _, dst_entries, _ = self.get_mla_kv_ptrs_with_pp(
+            list(range(len(src_kv_ptrs))), list(range(len(dst_kv_ptrs)))
+        )
         if dst_kv_item_lens:
             _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
                 self.kv_args.kv_item_lens, dst_kv_item_lens
@@ -454,7 +433,7 @@ class AscendKVManager(MooncakeKVManager):
         layout = self._get_dcp_remote_decode_layout()
         num_entries = len(src_kv_ptrs)
         if not (
-            len(dst_kv_ptrs)
+            len(dst_entries)
             == len(self.kv_args.kv_item_lens)
             == len(dcp_token_item_lens)
             == len(layout)
@@ -475,7 +454,8 @@ class AscendKVManager(MooncakeKVManager):
             num_kv_tokens=num_kv_tokens,
         )
 
-        transfer_blocks: List[Tuple[int, int, int]] = []
+        peer_kv_keys = self._peers[mooncake_session_id].keys.kv
+        copies: List[Copy] = []
         for entry, uses_global_slots in enumerate(layout):
             page_bytes = self.kv_args.kv_item_lens[entry]
             if page_bytes != dcp_token_item_lens[entry] * self.kv_args.page_size:
@@ -495,17 +475,16 @@ class AscendKVManager(MooncakeKVManager):
 
             src_pages = global_src if uses_global_slots else local_src
             dst_pages = global_dst if uses_global_slots else local_dst
-            src_groups, dst_groups = group_concurrent_contiguous(src_pages, dst_pages)
-            for src_group, dst_group in zip(src_groups, dst_groups):
-                transfer_blocks.append(
-                    (
-                        src_kv_ptrs[entry] + int(src_group[0]) * page_bytes,
-                        dst_kv_ptrs[entry] + int(dst_group[0]) * page_bytes,
-                        len(src_group) * page_bytes,
-                    )
+            units = group_units(*group_concurrent_contiguous(src_pages, dst_pages))
+            copies.append(
+                Copy(
+                    src=self._local_keys.kv[entry],
+                    dst=peer_kv_keys[dst_entries[entry]],
+                    ranges=units * page_bytes,
                 )
+            )
 
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        return self._transfer_copies(mooncake_session_id, copies)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.
