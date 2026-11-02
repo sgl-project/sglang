@@ -344,7 +344,7 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -363,7 +363,7 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
+                if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
 
     @DynamicGradMode()
@@ -628,7 +628,7 @@ class SchedulerPPMixin:
         step with the others.
         """
         succeeded, failed = self.get_rids(
-            self.disagg_prefill_inflight_queue,
+            self.disagg_prefill_transfer_queue,
             True,
             [KVPoll.Success],
             [KVPoll.Failed],
@@ -1671,11 +1671,8 @@ class SchedulerPPMixin:
                     trace_only=True,
                 )
                 if pp_proxy_tensors is not None:
-                    # The recv allocated these on another stream, and the scheduler
-                    # can drop them before this forward runs (async batch depth > pp
-                    # size / 2 queues enough forwards). Without record_stream the
-                    # allocator hands their memory to the next recv, which then
-                    # overwrites what this forward reads.
+                    # Prevent allocator reuse of received tensors while the forward
+                    # stream is still consuming them.
                     for tensor in pp_proxy_tensors.tensors.values():
                         if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
                             tensor.record_stream(self.forward_stream)
