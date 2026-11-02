@@ -1638,42 +1638,60 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
+    # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
+    # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
-    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_BK_VEC_COPY",
+    )
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.
-    SGLANG_Q35MF_MKH_N3B = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_MKH_N3B",
+    )
     # The post-verify graphs' per-round input load as one small_field_copy launch that also
     # reads the injected acceptance length from its pinned host slot (bit-identical); needs
     # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
-    SGLANG_Q35MF_MKH_N3C = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_MKH_N3C",
+    )
     # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
     # with build_chain_tree instead of a full-context tree mask.
-    SGLANG_Q35MF_EDGE_CHAIN_TREE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_CHAIN_TREE",
     )
     # A verify whose requests all sample with a finite top-k within the compact limit
     # samples on that support (eagle_sample's compact branch), graphed or eager.
-    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
     )
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
-    SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
     )
     # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
     # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
-    SGLANG_Q35MF_EDGE_SHM_SYNC = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
-    # With SGLANG_Q35MF_EDGE_SHM_SYNC, a group across hosts exchanges per host and only
-    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
-    SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC",
     )
-    SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    # With SGLANG_OPT_SCHEDULER_SHM_SYNC, a group across hosts exchanges per host and only
+    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
+    )
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.

@@ -52,8 +52,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
-_COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
-_PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
+_COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
+_PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 logger = logging.getLogger(__name__)
 
@@ -556,7 +556,7 @@ def _can_use_sparse_uno_tree_target_sampling(
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     """The support for eagle_sample's compact top-k branch under
-    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, or None for the dense branch: every
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
     request must sample with a finite top-k within the compact limit."""
     if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
         return None
@@ -939,7 +939,7 @@ def _verify_outputs(
     *, rows: int, bs: int, depth: int, device, packed: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
-    [bs] int32; packed (SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST): views of one buffer,
+    [bs] int32; packed (SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST): views of one buffer,
     returned last so a sampled result goes to the TP group in one broadcast."""
     if not packed:
         predict = torch.zeros((rows,), dtype=torch.int32, device=device)
