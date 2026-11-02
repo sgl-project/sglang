@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -157,6 +158,40 @@ DataEmbeddingFunc = Callable[
     [List[MultimodalDataItem]],
     torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult,
 ]
+
+
+class PrefetchedEmbeddingFunc(ABC):
+    """A ``DataEmbeddingFunc`` that already holds some items' embeddings.
+
+    The per-image paths take a held embedding in place of a vision pass.
+    """
+
+    @abstractmethod
+    def __call__(
+        self, items: List[MultimodalDataItem]
+    ) -> torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult:
+        """Encode ``items`` that hold no embedding."""
+
+    @abstractmethod
+    def has_prefetched(self) -> bool:
+        """Whether any embedding is held; lets the lookups below be skipped."""
+
+    @abstractmethod
+    def prefetched(
+        self, item_hash: Optional[int], token_count: int
+    ) -> Optional[torch.Tensor]:
+        """The held ``[token_count, hidden]`` embedding of an item, or None."""
+
+
+def _prefetched_source(
+    data_embedding_func: DataEmbeddingFunc,
+) -> Optional[PrefetchedEmbeddingFunc]:
+    if (
+        isinstance(data_embedding_func, PrefetchedEmbeddingFunc)
+        and data_embedding_func.has_prefetched()
+    ):
+        return data_embedding_func
+    return None
 
 
 def _flatten_embedding_result(
@@ -364,6 +399,7 @@ def _batch_encode_per_image_misses(
     unique_misses: Dict[Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
 
+    prefetched = _prefetched_source(data_embedding_func)
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
@@ -380,6 +416,11 @@ def _batch_encode_per_image_misses(
             cache_key = (item.hash, expected_token_count)
             if cache_key in hash_to_embedding:
                 continue
+            if prefetched is not None:
+                early = prefetched.prefetched(item.hash, expected_token_count)
+                if early is not None:
+                    hash_to_embedding[cache_key] = early
+                    continue
             cached = embedding_cache.get_single(item.hash)
             if cached is not None:
                 cached_embedding = cached.embedding
@@ -465,7 +506,13 @@ def _get_chunked_embedding_by_item(
 
     cached_embeddings = {}
     miss_items = []
+    prefetched = _prefetched_source(data_embedding_func)
     for idx, item, expected_token_count in overlapping:
+        if prefetched is not None:
+            early = prefetched.prefetched(item.hash, expected_token_count)
+            if early is not None:
+                cached_embeddings[idx] = early
+                continue
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embedding = cached.embedding

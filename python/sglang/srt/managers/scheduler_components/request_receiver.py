@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -18,7 +19,6 @@ from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -33,6 +33,10 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    get_shm_exchange,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -46,6 +50,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
+        AsyncShmMaterializer,
+    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -68,13 +75,25 @@ class SchedulerRequestReceiver:
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_batch: Callable[[], Any]
+    # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
+    # listener's ring rather than received over zmq.
+    rust_server_mode: bool
+    # Unlimited-OCR only: off-thread SHM materialization and crop prefetch.
+    async_shm_materializer: Optional[AsyncShmMaterializer] = None
+    submit_crop_prefetch: Optional[Callable[[list], None]] = None
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
+        # The async SHM materializer reserves queue room for one bounded poll.
+        limit = (
+            self.max_recv_per_poll
+            if self.async_shm_materializer is None
+            else self.async_shm_materializer.max_recv_per_poll
+        )
+        if limit < 0:
             return False
-        return num_recv_reqs >= self.max_recv_per_poll
+        return num_recv_reqs >= limit
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
@@ -85,6 +104,8 @@ class SchedulerRequestReceiver:
         local_reqs are aborts the caller decided on this rank; they ride the
         same broadcast as the pulled requests.
         """
+        if self.async_shm_materializer is not None:
+            return self._recv_requests_async(local_reqs)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
@@ -93,6 +114,14 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
+        recv_reqs = self._recv_and_broadcast(local_reqs)
+
+        self._finalize_shm_features(recv_reqs)
+
+        self._submit_crop_prefetch(recv_reqs)
+        return recv_reqs
+
+    def _recv_and_broadcast(self, local_reqs: Optional[List[AbortReq]]) -> List:
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
@@ -103,11 +132,41 @@ class SchedulerRequestReceiver:
         if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
-        recv_reqs = self._apply_mm_receiver(recv_reqs)
+        return self._apply_mm_receiver(recv_reqs)
 
-        self._finalize_shm_features(recv_reqs)
+    def _recv_requests_async(self, local_reqs: Optional[List[AbortReq]]) -> List:
+        """Return materialized values in arrival order; new ones materialize off-thread."""
+        materializer = self.async_shm_materializer
+        ready = materializer.pop_ready()
 
-        return recv_reqs
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.step()
+
+        if (
+            self.recv_skipper is not None
+            and not self.recv_skipper.handle(self.get_last_batch())
+        ) or not materializer.reserve_receive(extra_items=len(local_reqs or ())):
+            self._submit_crop_prefetch(ready)
+            return ready
+
+        try:
+            recv_reqs = self._recv_and_broadcast(local_reqs)
+            materializer.submit(
+                recv_reqs,
+                finalize=self._finalize_shm_features,
+                has_shm=has_shm_features,
+            )
+            ready = ready + materializer.pop_ready()
+        except BaseException:
+            materializer.cancel_receive()
+            raise
+
+        self._submit_crop_prefetch(ready)
+        return ready
+
+    def _submit_crop_prefetch(self, values: List) -> None:
+        if self.submit_crop_prefetch is not None and values:
+            self.submit_crop_prefetch(values)
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:
@@ -117,7 +176,7 @@ class SchedulerRequestReceiver:
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
-                if envs.SGLANG_RUST_SERVER.get():
+                if self.rust_server_mode:
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
@@ -203,12 +262,18 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    tp_group.rank,
-                    tp_group.cpu_group,
-                    src=tp_group.ranks[0],
-                )
+                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                if exchange is not None:
+                    recv_reqs = _broadcast_via_exchange(
+                        recv_reqs, exchange=exchange, tp_group=tp_group
+                    )
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
@@ -335,3 +400,24 @@ class SchedulerRequestReceiver:
             )
         ]
         return work_reqs, control_reqs
+
+
+def _broadcast_via_exchange(
+    recv_reqs: Optional[List], *, exchange: ShmTagExchange, tp_group
+) -> List:
+    """Same result as broadcast_pyobj; the size travels through shared memory and
+    only a non-empty payload goes over the cpu group."""
+    is_src = tp_group.rank == tp_group.ranks[0]
+    payload = pickle.dumps(recv_reqs) if is_src and recv_reqs else b""
+    size = exchange.allgather([len(payload)])[0][0]
+    if size == 0:
+        return recv_reqs if is_src else []
+    if is_src:
+        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        torch.distributed.broadcast(
+            data, src=tp_group.ranks[0], group=tp_group.cpu_group
+        )
+        return recv_reqs
+    data = torch.empty(size, dtype=torch.uint8)
+    torch.distributed.broadcast(data, src=tp_group.ranks[0], group=tp_group.cpu_group)
+    return pickle.loads(data.numpy().tobytes())
