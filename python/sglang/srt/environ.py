@@ -42,6 +42,10 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+def _default_topk_v2_mode() -> int:
+    return 1 if _default_hip() else 0
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -1572,6 +1576,10 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Exactness of the top-k v2 kernel, compiled in once per process: 0 fast (an
+    # overflowing threshold bin keeps an arbitrary subset), 1 exact (values equal
+    # torch.topk's), 2 exact with the same selected set on every run.
+    SGLANG_TOPK_V2_MODE = EnvInt(_default_topk_v2_mode)
 
     # ===================================================================
     # Kernel selection and fused backends

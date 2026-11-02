@@ -29,7 +29,10 @@ requests packed into one score buffer, sharing a table row per request.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import tempfile
 
 import pytest
 import torch
@@ -40,10 +43,11 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
@@ -379,9 +383,36 @@ def _narrow_seed(dist, *rest):
     return seed
 
 
-# Longest row that never reaches the CUDA cluster path, which still truncates an
-# overflowing threshold bin (the smallest get_static_cluster_floor in topk_v2.cuh).
+# Longest row that never reaches the CUDA cluster path (the smallest
+# get_static_cluster_floor in topk_v2.cuh).
 CUDA_MAX_NON_CLUSTER_SEQ = 24576
+
+
+# SGLANG_TOPK_V2_MODE values
+MODE_FAST, MODE_EXACT, MODE_DETERMINISTIC = 0, 1, 2
+
+
+def _topk_mode() -> int:
+    """The exactness mode this process's top-k v2 module is built with."""
+    return envs.SGLANG_TOPK_V2_MODE.get()
+
+
+def _assert_topk_legal(our_raw, batch, seq_lens, k):
+    """FAST mode: an overflowing bin keeps an arbitrary subset, so only legality holds."""
+    for i in range(batch):
+        L = int(seq_lens[i])
+        our = our_raw[i]
+        assert len(our) == min(k, L) and len(set(our)) == len(our), f"row {i}"
+        assert all(0 <= v < L for v in our), f"row {i}: index out of range"
+
+
+def _assert_smallest_index_ties(scores_cpu, our_raw, batch, seq_lens, k):
+    """DETERMINISTIC mode: elements equal to the k-th value are taken smallest index first."""
+    for i in range(batch):
+        L = int(seq_lens[i])
+        row = scores_cpu[i, :L].tolist()
+        expected = sorted(range(L), key=lambda j: (-row[j], j))[:k]
+        assert sorted(our_raw[i]) == sorted(expected), f"row {i}: tie choice is not by smallest index"
 
 
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
@@ -391,10 +422,9 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
     """No tolerance here: the threshold bin holds the whole row at k=2048, so a
     dropped candidate is a wrong answer rather than a tie swap. Covers
     register-path and streaming-path shapes, and a ROCm split-path shape (above
-    split_floor); tie staging is per-template.
+    split_floor), and on CUDA the small-batch cluster kernel above the cluster
+    floor; tie staging is per-template.
     """
-    if not is_hip() and seq > CUDA_MAX_NON_CLUSTER_SEQ:
-        pytest.skip("CUDA may route this shape to the unrefined cluster path")
     torch.manual_seed(_narrow_seed(dist, batch, seq))
     device = "cuda"
     k = 2048
@@ -403,10 +433,76 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
 
     our_raw = _run_raw(scores, seq_lens, k)
+    if _topk_mode() == MODE_FAST:
+        _assert_topk_legal(our_raw, batch, seq_lens.cpu(), k)
+        return
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(
         scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
     )
+
+
+def _mode_check() -> None:
+    """Exactness checks of this process's mode, run by test_topk_v2_exact_modes in a
+    subprocess per mode (the mode is compiled in once per process). Shapes cover the
+    one-block paths and, on CUDA, the C16 / C8 small-batch cluster kernels and the
+    persistent cluster pool (34 rows above the plan's smallest threshold); equal-value groups
+    larger than the tie buffer included."""
+    mode = _topk_mode()
+    assert mode != MODE_FAST
+    k = 2048
+    for dist in NARROW_DISTRIBUTIONS:
+        for batch, seq in [(6, 8192), (4, 16384), (4, CUDA_MAX_NON_CLUSTER_SEQ), (4, 65536), (12, 40960), (34, 131076)]:
+            torch.manual_seed(_narrow_seed(dist, batch, seq))
+            width = (seq + 3) & ~3
+            scores = _single_bin_scores(dist, batch, width, "cuda")[:, :seq]
+            seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+            scores_cpu, lens_cpu = scores.cpu(), seq_lens.cpu()
+            runs = [_run_raw(scores, seq_lens, k) for _ in range(3)]
+            ref_raw = _reference(scores, seq_lens, k)
+            _assert_topk_close(scores_cpu, ref_raw, runs[0], batch, lens_cpu, k, max_permit_error=0)
+            if mode == MODE_DETERMINISTIC:
+                for other in runs[1:]:
+                    assert [sorted(r) for r in other] == [sorted(r) for r in runs[0]], dist
+                _assert_smallest_index_ties(scores_cpu, runs[0], batch, lens_cpu, k)
+        print(f"mode {mode} {dist}: ok", flush=True)
+
+
+_EXACT_MODE_CHECKS: dict[int, tuple[subprocess.Popen, object]] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _start_exact_mode_checks():
+    """Start the per-mode subprocesses at module start, so their JIT builds overlap
+    this process's build and tests instead of running after them."""
+    if is_hip() or not torch.cuda.is_available():
+        yield
+        return
+    for mode in (MODE_EXACT, MODE_DETERMINISTIC):
+        log = tempfile.TemporaryFile(mode="w+")
+        with envs.SGLANG_TOPK_V2_MODE.override(mode):
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--mode-check"],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        _EXACT_MODE_CHECKS[mode] = (proc, log)
+    yield
+    for proc, log in _EXACT_MODE_CHECKS.values():
+        if proc.poll() is None:
+            proc.kill()
+        log.close()
+
+
+@pytest.mark.skipif(is_hip(), reason="ROCm runs EXACT in-process by default")
+@pytest.mark.parametrize("mode", [MODE_EXACT, MODE_DETERMINISTIC])
+def test_topk_v2_exact_modes(mode: int) -> None:
+    """EXACT / DETERMINISTIC in their own process, since one process builds one mode."""
+    proc, log = _EXACT_MODE_CHECKS[mode]
+    proc.wait(timeout=1800)
+    log.seek(0)
+    assert proc.returncode == 0, log.read()[-8000:]
 
 
 # --- ragged entry point ------------------------------------------------------
@@ -811,4 +907,7 @@ def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> N
 
 
 if __name__ == "__main__":
+    if "--mode-check" in sys.argv:
+        _mode_check()
+        sys.exit(0)
     sys.exit(pytest.main([__file__, "-v"]))

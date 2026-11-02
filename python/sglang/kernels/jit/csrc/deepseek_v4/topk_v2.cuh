@@ -17,6 +17,10 @@
 
 #include <sgl_kernel/deepseek_v4/topk_impl.cuh>
 
+#if SUPPORT_CLUSTER
+#include <cooperative_groups.h>
+#endif
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -25,8 +29,11 @@
 #include <climits>
 #include <cstdint>
 #include <iterator>
+
+#ifdef USE_ROCM
 #include <mutex>
 #include <utility>
+#endif
 
 namespace sglang {
 
@@ -574,6 +581,10 @@ constexpr uint32_t kMaxCluster16BatchSize = SGL_TOPK_V2_MAX_C16_OCC1;
 constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
+// Inlined on Blackwell, where calling the cold path puts per-item state on the stack; on Hopper
+// inlining it lengthens the collect loops instead.
+constexpr bool kPoolInlineCold = SGL_ARCH_BLACKWELL_OR_GREATER;
+
 /// Persistent cluster kernel for the items the plan routed to the pool; topk_main_kernel handles the rest.
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
@@ -585,12 +596,15 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   device::PDLWaitPrimary<kPDL>();
   if (bx >= params.batch_size) return;
   device::PDLTriggerSecondary<kPDL>();
+  // Last plan item first: the producer wrote the highest rows last, so they are the likeliest
+  // still in L2.
   auto idx = static_cast<int32_t>(num_cluster_items - 1 - bx);
+  uint32_t item = 0;
 #pragma unroll 1
   while (idx >= 0) {
     const auto it = params.item(idx);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    ClusterN::template forward<false>(problem, &smem);
+    ClusterN::template forward</*kUsePDL=*/false, kPoolInlineCold>(problem, &smem, item++);
     idx -= kNumPersistentClusters;
     if (idx >= 0) __syncthreads();
   }
@@ -666,14 +680,13 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
     uint32_t max_batch_size;
   };
   constexpr Pair kCandidates[] = {
-#if SGL_ARCH_BLACKWELL_OR_GREATER  // tuned on B200
-      {32768, 48},
-      {131072, 66},
-      {163840, 99},
-      {196608, 132},
-      {262144, 198},
-      {393216, 231},
-      {524288, 264},
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+      // Tuned on B300 with the exact paths. The pool runs its items in waves of
+      // kNumPersistentClusters and Streaming runs every row in one wave, so the pool
+      // only pays off for few, long rows.
+      {122880, 48},
+      {163840, 66},
+      {229376, 99},
 #else  // tuned on H200
       {65536, 30},
       {98304, 45},
@@ -709,7 +722,12 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
     __syncthreads();
     if (tx == 0) {
       uint32_t accum = 0;
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+      // More long rows than even the largest candidate admits: nothing goes to the pool.
+      uint32_t chosen = UINT32_MAX;
+#else
       uint32_t chosen = kCandidates[kNumCandidates - 1].threshold;
+#endif
 #pragma unroll
       for (uint32_t i = 0; i < kNumCandidates; ++i) {
         const auto j = kNumCandidates - 1 - i;
@@ -868,7 +886,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
-    const bool zero_bin = is_zero_bin(v_lo);
+    const bool zero_bin = impl::kExact && is_zero_bin(v_lo);
     if (zero_bin && tx == 0) smem->tie_nonzero = 0;
     __syncthreads();
 
@@ -892,8 +910,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
     const auto n_eq = min(smem->count_eq, kMaxNumTie);
     if (tx == 0) {
       smem->base_gt = atomicAdd(&ctr->count_gt, n_gt);
-      // Uncapped: finish_ties needs the row's exact bin size to detect overflow and refine.
-      smem->base_eq = atomicAdd(&ctr->count_eq, smem->count_eq);
+      // Exact modes leave it uncapped: finish_ties needs the row's bin size to detect overflow and refine.
+      smem->base_eq = atomicAdd(&ctr->count_eq, impl::kExact ? smem->count_eq : n_eq);
       if (zero_bin && smem->tie_nonzero != 0) atomicOr(&ctr->tie_nonzero, 1u);
     }
     __syncthreads();
@@ -924,7 +942,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
         // served out of this CU's own stale cache.
         smem->total_gt = atomicAdd(&ctr->count_gt, 0u);
         smem->total_eq = atomicAdd(&ctr->count_eq, 0u);
-        if (is_zero_bin(smem->v_lo)) smem->tie_nonzero = atomicAdd(&ctr->tie_nonzero, 0u);
+        if (impl::kExact && is_zero_bin(smem->v_lo)) smem->tie_nonzero = atomicAdd(&ctr->tie_nonzero, 0u);
       }
     }
     __syncthreads();
@@ -937,8 +955,8 @@ struct TopKSplit : impl::TopKRadixBase<12> {
   SGL_DEVICE static void finish_ties(const TopKProblem& problem, const impl::TieValue* ties, Smem* smem) {
     const auto tx = threadIdx.x;
     uint32_t above_count, tie_count;
-    const bool zero_ties = is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
-    if (smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
+    const bool zero_ties = impl::kExact && is_zero_bin(smem->v_lo) && smem->tie_nonzero == 0;
+    if (impl::kExact && smem->total_eq > kMaxNumTie && !zero_ties) [[unlikely]] {
       // The global list holds an arrival-order subset. refine_ties emits after
       // the slots every rank already took, so seed its counter with their total.
       if (tx == 0) smem->count_gt = smem->total_gt;
@@ -948,7 +966,7 @@ struct TopKSplit : impl::TopKRadixBase<12> {
       tie_count = min(smem->count_eq, kMaxNumTie);
     } else {
       above_count = smem->total_gt;
-      tie_count = zero_ties ? min(smem->total_eq, kMaxNumTie) : smem->total_eq;
+      tie_count = min(smem->total_eq, kMaxNumTie);
       for (uint32_t t = tx; t < tie_count; t += kBlockSize)
         smem->tie_values[t] = ties[t];
       __syncthreads();
@@ -1180,6 +1198,12 @@ struct TopKKernel {
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
               .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
         } else {
+          // TODO(perf): one C8 launch could also run two TopKCluster<4> halves per cluster when the
+          // pool has many items (a per-call width bit from the plan). Measured (B300): C4 is
+          // 0.65-0.94x C8 for 34-256 rows of 64K-256K, but 1.2-1.7x C8 when only a few rows of
+          // 256K-1M go to the pool (one row's latency ~ L / width).
+          // TODO(perf): claiming items dynamically (a work counter) helps only when the tail is more
+          // than half a wave: 96 x 256K 38.6 vs 44.4 us, 99 x 256K 42.2 vs 53.8; 40 x 512K 36.6 vs 30.8.
           constexpr uint32_t kClusterSize = 8;
           const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
           LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
