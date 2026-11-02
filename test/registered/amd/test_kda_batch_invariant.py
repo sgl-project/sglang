@@ -1,6 +1,7 @@
-"""Kimi Delta Attention in batch-invariant mode: a sequence's prefill (chunk_kda) and a
-request's decode step (fused_recurrent_kda_packed_decode) must give the same bits alone
-and inside larger batches, although both pick their kernels by batch size otherwise."""
+"""Kimi Delta Attention in batch-invariant mode: a sequence's prefill (chunk_kda, and the
+prefill dispatch that tries the gfx950 HIP kernel first) and a request's decode step
+(fused_recurrent_kda_packed_decode) must give the same bits alone and inside larger
+batches, although they pick their kernels by batch size otherwise."""
 
 import random
 import sys
@@ -15,6 +16,8 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
 from sglang.kernels.ops.attention.fla.kda import chunk_kda
+from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -30,6 +33,9 @@ def _batch_invariant_mode():
         patch.object(kda_mod, "is_batch_invariant_mode_enabled", return_value=True),
         patch.object(
             fused_recurrent_mod, "is_batch_invariant_mode_enabled", return_value=True
+        ),
+        patch.object(
+            kda_gfx950_prefill, "is_batch_invariant_mode_enabled", return_value=True
         ),
     ):
         yield
@@ -84,6 +90,54 @@ def test_chunk_kda_prefill_batch_invariant(target_len):
         seqs = [_sequence(rng.randint(16, 400), g) for _ in range(n - 1)]
         seqs.insert(pos, target)
         out, state, cu = _prefill(seqs, A_log, dt_bias)
+        start = int(cu[pos])
+        assert torch.equal(out[:, start : start + target_len], alone), (
+            f"output, {n} seqs"
+        )
+        assert torch.equal(state[pos + 1], alone_state[1]), f"final state, {n} seqs"
+
+
+def _extend(seqs, A_log, dt_bias):
+    """The backend's prefill entry with the gate lower bound and raw beta that make
+    it try the gfx950 HIP kernel first (GLM-5.3, Kimi-K3)."""
+    q, k, v, a, beta = (torch.cat([s[i] for s in seqs], dim=1) for i in range(5))
+    lens = [s[0].shape[1] for s in seqs]
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda")
+    state = torch.zeros(len(seqs) + 1, H, V, K, dtype=torch.float32, device="cuda")
+    idx = torch.arange(1, len(seqs) + 1, dtype=torch.int32, device="cuda")
+    o = TritonKDAKernel().extend(
+        q,
+        k,
+        v,
+        a,
+        beta,
+        ssm_states=state,
+        cache_indices=idx,
+        query_start_loc=cu.to(torch.int32),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        beta_is_raw=True,
+        extend_seq_lens_cpu=lens,
+    )
+    return (o[0] if isinstance(o, tuple) else o), state, cu
+
+
+def test_kda_extend_long_sequence_batch_invariant():
+    """A 2,606-token sequence: on gfx950 the HIP kernel's rows from 1,792 on depend on
+    the batch, so batch-invariant mode must keep chunk_kda."""
+    target_len = 2606
+    g = torch.Generator(device="cuda").manual_seed(2)
+    A_log = torch.randn(H, generator=g, device="cuda")
+    dt_bias = torch.randn(H * K, generator=g, device="cuda")
+    target = _sequence(target_len, g)
+    alone, alone_state, _ = _extend([target], A_log, dt_bias)
+    rng = random.Random(target_len)
+    for n in (2, 4):
+        pos = rng.randrange(n)
+        seqs = [_sequence(rng.randint(16, 2000), g) for _ in range(n - 1)]
+        seqs.insert(pos, target)
+        out, state, cu = _extend(seqs, A_log, dt_bias)
         start = int(cu[pos])
         assert torch.equal(out[:, start : start + target_len], alone), (
             f"output, {n} seqs"
