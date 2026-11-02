@@ -19,8 +19,9 @@ import logging
 import math
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import msgspec
 from typing_extensions import Self
@@ -199,6 +200,7 @@ class RequestStage:
         level=3,
         metrics_is_observed=True,
     )
+    CACHE_CHECKPOINT_CPU = RequestStageConfig("cache_checkpoint_cpu", level=1)
 
     # EPD disaggregation Encode process
     MM_ENCODE = RequestStageConfig(
@@ -375,6 +377,39 @@ class ReqTimeStatsBase:
                 attrs=attrs,
             )
             self.trace_ctx.trace_slice(_slice)
+
+    @contextmanager
+    def trace_cache_checkpoint(self, *, up_to: int, phase: str) -> Iterator[None]:
+        if not self.trace_ctx.tracing_enable:
+            yield
+            return
+
+        stage = RequestStage.CACHE_CHECKPOINT_CPU
+        start_time = monotonic_time()
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            # Capture the backend interval before any span creation or export.
+            # This is elapsed call time, including waits, not CPU consumption.
+            end_time = monotonic_time()
+            try:
+                self.trace_slice(
+                    stage,
+                    start_time,
+                    end_time,
+                    attrs={
+                        "cache.checkpoint.phase": phase,
+                        "cache.checkpoint.up_to": up_to,
+                        "cache.checkpoint.succeeded": succeeded,
+                    },
+                )
+            except Exception:
+                # Diagnostics must not skip a checkpoint or mask its exception.
+                logger.debug(
+                    "Failed to record cache checkpoint CPU trace", exc_info=True
+                )
 
     def __getstate__(self) -> object:
         # The object is propagated to other processes via serialization and deserialization methods,
