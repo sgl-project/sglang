@@ -5674,15 +5674,12 @@ class Scheduler(
             and self._pp_microbatches_drained()
         )
 
-        # Request lists
         lists = self.request_lists()
         if for_health_check:
             busy_lists = {"chunked", "waiting"}
             if not self._engine_paused:
                 busy_lists.add("decode_retracted")
         else:
-            # Grammar and PD queues may not produce batch results instantly,
-            # but they still indicate the server is not idle.
             busy_lists = lists.keys() - {
                 # Their steps are counted through the batches above.
                 "running",
@@ -5693,8 +5690,7 @@ class Scheduler(
                 "decode_held",
                 # Counted by uocr blocks_flush below.
                 "uocr_parked",
-                # Finished; only the output rank holds them, and every rank
-                # must see the same idle state.
+                # Finished, and held only on the output rank; all ranks must agree.
                 "deferred",
             }
         if ignore_waiting:
@@ -6135,8 +6131,7 @@ class Scheduler(
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
 
-            # Retracted requests have their KV backed up; held ones, retracted
-            # for rebootstrap until generation resumes, hold no KV.
+            # Retracted requests hold a KV backup; held ones hold no KV.
             retracted, held = self.disagg_decode_prealloc_queue.take_aborted(recv_req)
             for req in retracted:
                 discard_kv_cache_backup(

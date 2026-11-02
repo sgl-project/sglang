@@ -1056,8 +1056,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return False
 
     def take_aborted(self, recv_req: AbortReq) -> Tuple[List[Req], List[Req]]:
-        """Remove the retracted and held requests the abort matches."""
-
         def aborted(req: Req) -> bool:
             return recv_req.abort_all or req.rid.startswith(recv_req.rid)
 

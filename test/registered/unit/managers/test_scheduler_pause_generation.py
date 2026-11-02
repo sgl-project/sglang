@@ -893,8 +893,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler._engine_paused)
 
     def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
-        """An abort during a retract pause reaches the requests held for
-        rebootstrap; only the others are enqueued on resume."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -906,8 +904,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         scheduler.deferred_responses = MagicMock()
         scheduler.mm_receiver = None
-        scheduler.uocr_runtime = None
-        scheduler.dllm_config = None
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.enable_continuous_input_polling = False
