@@ -174,9 +174,6 @@ class HYV3MoEFused(nn.Module):
         self, routed_output: torch.Tensor, shared_output: Optional[torch.Tensor]
     ) -> torch.Tensor:
         if self.is_mori:
-            # MoRI's combine already sums each token's routed expert outputs back
-            # to its source rank; only the shared expert's partial still owes the
-            # post-experts sum.
             if shared_output is None:
                 return routed_output
             return routed_output + post_experts_all_reduce(shared_output)
