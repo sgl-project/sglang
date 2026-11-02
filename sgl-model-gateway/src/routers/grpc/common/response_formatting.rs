@@ -7,8 +7,8 @@
 use crate::{
     protocols::common::Usage,
     routers::grpc::{
-        proto_wrapper::ProtoGenerateComplete, utils::clamp_worker_token_count,
-        utils::saturate_to_usage_u32,
+        proto_wrapper::ProtoGenerateComplete,
+        utils::{clamp_worker_token_count, saturate_to_usage_u32},
     },
 };
 
