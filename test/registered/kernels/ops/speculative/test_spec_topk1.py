@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
+    split_argmax,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -187,6 +188,25 @@ class TestSpecTopk1Triton(CustomTestCase):
         torch.testing.assert_close(
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
+
+    def test_split_argmax_takes_the_first_max_across_splits(self):
+        """Equal maxima in different vocab splits resolve to the lowest index, as
+        in torch.argmax; a NaN ranks below every finite logit instead of winning."""
+        vocab_size = 163840
+        for rows, dtype in (
+            (1, torch.bfloat16),
+            (4, torch.float32),
+            (64, torch.bfloat16),
+        ):
+            with self.subTest(rows=rows, dtype=dtype):
+                g = torch.Generator(device=self.device).manual_seed(rows)
+                logits = torch.randn(
+                    (rows, vocab_size), dtype=dtype, device=self.device, generator=g
+                )
+                logits[:, [3, 70000, 150000]] = 50.0
+                logits[0, 10] = float("nan")
+
+                self.assertEqual(split_argmax(logits).tolist(), [3] * rows)
 
     def test_empty_batch(self):
         logits = torch.empty((0, 1024), dtype=torch.float32, device=self.device)
