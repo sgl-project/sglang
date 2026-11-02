@@ -143,6 +143,7 @@ class DiffusersExecutionStage(PipelineStage):
 
             result = self._convert_to_tensor(data)
             if result is not None:
+                result = self._to_output_layout(result, attr in ("frames", "video"))
                 logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
@@ -155,7 +156,11 @@ class DiffusersExecutionStage(PipelineStage):
         return None
 
     def _convert_to_tensor(self, data: Any) -> torch.Tensor | None:
-        """Convert various data formats to a tensor."""
+        """Convert various data formats to a channels-first tensor.
+
+        Images come out as (B, C, H, W) and videos as (B, T, C, H, W);
+        _to_output_layout then maps them to the final output layout.
+        """
         if isinstance(data, torch.Tensor):
             return data
 
@@ -163,7 +168,7 @@ class DiffusersExecutionStage(PipelineStage):
             tensor = torch.from_numpy(data).float()
             if tensor.max() > 1.0:
                 tensor = tensor / 255.0
-            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, T, C, H, W)
+            # (B, H, W, C) -> (B, C, H, W), (B, T, H, W, C) -> (B, T, C, H, W)
             if tensor.ndim == 4:
                 tensor = tensor.permute(0, 3, 1, 2)
             elif tensor.ndim == 5:
@@ -206,6 +211,17 @@ class DiffusersExecutionStage(PipelineStage):
 
         return stacked
 
+    @staticmethod
+    def _to_output_layout(tensor: torch.Tensor, is_video: bool) -> torch.Tensor:
+        """Map a channels-first tensor to (B, C, H, W) or (B, C, T, H, W)."""
+        if tensor.dim() == 5:
+            # (B, T, C, H, W) -> (B, C, T, H, W)
+            return tensor.permute(0, 2, 1, 3, 4)
+        if is_video and tensor.dim() == 4:
+            # A single video, (T, C, H, W) -> (1, C, T, H, W)
+            return tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        return tensor
+
     def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
         """Post-process output tensor to ensure valid values and correct shape."""
         output = output.cpu().float()
@@ -231,18 +247,9 @@ class DiffusersExecutionStage(PipelineStage):
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
         """Fix tensor shape for downstream processing.
 
-        Expected: (B, C, H, W) for images or (B, C, T, H, W) for videos.
+        4D and 5D outputs are already in the final layout from
+        _to_output_layout; this only expands lower-rank images to (B, C, H, W).
         """
-        if output.dim() == 5:
-            # Video: (B, T, C, H, W) -> (B, C, T, H, W)
-            return output.permute(0, 2, 1, 3, 4)
-
-        if output.dim() == 4:
-            if output.shape[0] == 1 or output.shape[1] in [1, 3, 4]:
-                return output  # Already (B, C, H, W)
-            # (T, C, H, W) -> (1, C, T, H, W)
-            return output.unsqueeze(0).permute(0, 2, 1, 3, 4)
-
         if output.dim() == 3:
             c, h, w = output.shape
             if c > 4 and w <= 4:

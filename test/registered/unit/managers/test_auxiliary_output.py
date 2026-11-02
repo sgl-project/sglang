@@ -542,12 +542,13 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
         snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
+        _maybe_collect_customized_info=Mock(),
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_inflight_queue=[],
+        disagg_prefill_transfer_queue=[],
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
