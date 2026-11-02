@@ -1203,6 +1203,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info, "has_watermark_candidates", False
             ):
                 raise RuntimeError("DSpark tree does not support watermark.")
+            if sampling_info is not None and not sampling_info.is_all_greedy:
+                raise RuntimeError(
+                    "DSpark tree currently supports greedy verification only; "
+                    "sampling acceptance is not implemented."
+                )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
