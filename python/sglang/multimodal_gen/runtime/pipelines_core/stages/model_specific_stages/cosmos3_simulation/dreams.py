@@ -1337,6 +1337,8 @@ class _RolloutContext(msgspec.Struct):
     device: torch.device
     dtype: torch.dtype
     row_domain_ids: torch.Tensor | None = None
+    # Latent frames in the whole request; bounds the K/V buffer's initial capacity.
+    target_frame: int | None = None
 
     def chunk_domain_ids(
         self, frame_start: int, frame_end: int, action_count: int
@@ -1439,6 +1441,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         )
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         row_domain_ids = batch.extra.get(EXTRA_ACTION_DOMAIN_IDS)
+        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
         context = _RolloutContext(
             text_kv=text_kv,
             fps=float(batch.fps),
@@ -1454,9 +1457,9 @@ class CosmosDreamsRolloutStage(PipelineStage):
             device=device,
             dtype=torch.bfloat16,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
+            target_frame=target_frame,
         )
         rows: torch.Tensor | None = batch.extra[EXTRA_ACTION_ROWS]
-        target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
         seed = batch.seed
         if not isinstance(seed, int):
             raise ValueError(
@@ -1652,9 +1655,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
             window = self.profile.window_frames
             capacity = 0
             if window is not None:
-                capacity = (
-                    self.profile.sink_frames + window + self.manifest.chunk_size
-                ) * context.tokens_per_frame
+                frames = self.profile.sink_frames + window + self.manifest.chunk_size
+                if context.target_frame is not None:
+                    # Never reserve more than the request can commit.
+                    frames = min(frames, context.target_frame)
+                capacity = frames * context.tokens_per_frame
             history = PrefixKVHistory(context.text_kv, capacity_tokens=capacity)
         return commit_clean_kv(
             self.transformer,
