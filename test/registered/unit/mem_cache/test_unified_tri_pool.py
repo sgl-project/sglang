@@ -29,6 +29,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import check_decode_capacity
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -1321,7 +1322,9 @@ class TestTriPoolHardening(_PoolTestCase):
         self.assertGreater(len(reqs), 2)
         # Pool saturated: a large decode step does not fit.
         need = 16
-        while not allocator.check_decode_capacity(num_tokens=need, tree_cache=None):
+        while not check_decode_capacity(
+            allocator=allocator, num_tokens=need, tree_cache=None
+        ):
             self.assertGreater(len(reqs), 1, "retract must converge before bs=1")
             allocator.free(reqs.pop())
         # A yes is the decode take succeeding, relayout included.
@@ -1359,7 +1362,7 @@ class TestTriPoolHardening(_PoolTestCase):
         _, allocator, _, _ = self._build()
         big = allocator.available_size() + 64
         self.assertFalse(
-            allocator.check_decode_capacity(num_tokens=big, tree_cache=None)
+            check_decode_capacity(allocator=allocator, num_tokens=big, tree_cache=None)
         )
 
 

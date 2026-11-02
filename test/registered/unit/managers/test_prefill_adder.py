@@ -98,6 +98,8 @@ class TestPrefillAdder(CustomTestCase):
         size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
+        # Separate pools: the allocator's own hooks reclaim from the cache.
+        allocator.pools_share_memory = False
         allocator.has_window_pool = False
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
@@ -1435,6 +1437,7 @@ class TestPrefillAdder(CustomTestCase):
             size_swa=size_swa,
         )
         self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+        self.mock_token_allocator.pools_share_memory = False
         self.mock_token_allocator.has_window_pool = True
         self.mock_token_allocator.swa_req_ring = ring
         self.mock_token_allocator.swa_ring_cost_tokens = 4096
@@ -1620,7 +1623,9 @@ class TestPrefillAdder(CustomTestCase):
         allocator = self.mock_token_allocator
         allocator.window_pool_names.return_value = ()
         allocator.sub_pool_roles.return_value = ("full", (), None)
-        allocator.reclaim_for_load_back.return_value = None
+        # One shared memory: the cache evicts, and the pool says it fits.
+        allocator.pools_share_memory = True
+        allocator.prealloc_shortfall.return_value = None
         # A state slot takes free slot ids and 64 tokens' worth of shared bytes.
         allocator.admits.side_effect = lambda demand, **kwargs: (
             demand.state_slots <= allocator.mamba_allocator.schedulable_available_size()

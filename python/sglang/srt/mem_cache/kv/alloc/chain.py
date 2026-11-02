@@ -757,41 +757,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             KVDemand(full_tokens, windows, demand.state_slots), evictable=evictable
         )
 
-    def admit_preallocation(
-        self,
-        tree_cache,
-        admission: KVDemand,
-        take: KVDemand,
-        *,
-        evictable: Dict[str, int],
-        full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
-    ) -> bool:
-        """Admit a decode-node preallocation on the admission rule, crediting
-        the entries the prefix cache could evict, then reclaim what that
-        credit counted on so ``take`` fits now: every admission that credits
-        eviction reclaims before the take."""
-        if not self.prealloc_fits(
-            admission,
-            evictable=evictable,
-            full_budget_tokens=full_budget_tokens,
-            swa_budget_tokens=swa_budget_tokens,
-        ):
-            return False
-        return self.reclaim_for_prealloc(tree_cache, take) is None
-
-    def reclaim_for_load_back(self, tree_cache, demand: KVDemand) -> str | None:
-        """Reclaim before a host load takes its rows; None means ready."""
-        return self.reclaim_for_prealloc(tree_cache, demand)
-
-    def reclaim_for_prealloc(self, tree_cache, demand: KVDemand) -> str | None:
-        """Free room for a preallocation; None means it is ready, else a
-        description of the shortfall for the caller to attach to its request."""
-        pages = self.page_demands(demand)
-        if tree_cache is not None and tree_cache.supports_prefix_sharing():
-            self.flush_deferred_full_frees()
-            tree_cache.evict_for_alloc(demand)
-        if self.units_fit(pages):
+    def prealloc_shortfall(self, demand: KVDemand) -> str | None:
+        """Whether a preallocation of ``demand`` fits now; None means it does,
+        else a description of the shortfall. Eviction, if any, came first,
+        driven by the prefix cache (`mem_cache.capacity`)."""
+        if self.units_fit(self.page_demands(demand)):
             return None
         return (
             "Unified memory reclamation insufficient: "
@@ -806,13 +776,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         not see the room it made otherwise and would evict on."""
         self.flush_deferred_full_frees()
         return self.units_fit(demands)
-
-    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
-        from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
-
-        return ChainPrefillBudget(
-            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
-        )
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
         """Each sub-pool's (capacity, available units), by sub-pool name: the
@@ -911,26 +874,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             prefix_lens=prefix_lens_cpu,
         )
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
-        """Evict cached entries until ``num_tokens`` new tokens, which every
-        window keeps too, can be taken Return whether they can,
-        or None without a prefix cache."""
-        if tree_cache is None or not tree_cache.supports_prefix_sharing():
-            return None
-        self.flush_deferred_full_frees()
-        demand = KVDemand.same_tokens(self, num_tokens)
-        tree_cache.evict_for_alloc(demand)
-        return self.units_fit(
-            {n: d for n, d in self.page_demands(demand).items() if d > 0}
+    # The prefix cache drives "evict, then check" for a pool whose sub-pools
+    # share one memory (`mem_cache.capacity`); the separate-pool hooks this
+    # class would inherit hand the allocator a cache, which it never calls.
+    def _asks_the_cache(self, *args, **kwargs):
+        raise TypeError(
+            "a shared-memory pool does not call the prefix cache; ask "
+            "sglang.srt.mem_cache.capacity instead"
         )
 
-    def check_decode_capacity(
-        self, *, num_tokens: int, tree_cache, requests=None, spec_algorithm=None
-    ) -> bool:
-        """Whether the next decode step's allocation fits after eviction: the
-        same question the decode take answers."""
-        self.evict_to_free_tokens(tree_cache, num_tokens)
-        return self.ensure_capacity(KVDemand.same_tokens(self, num_tokens))
+    admit_preallocation = _asks_the_cache
+    create_prefill_budget = _asks_the_cache
+    evict_to_free_tokens = _asks_the_cache
+    check_decode_capacity = _asks_the_cache
+    reclaim_for_prealloc = _asks_the_cache
+    reclaim_for_load_back = _asks_the_cache
 
     def resize(self, config) -> None:
         if (

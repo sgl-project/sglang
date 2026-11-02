@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.capacity import create_prefill_budget, reclaim_for_prealloc
 from sglang.srt.mem_cache.kv.alloc.band import FloatBand
 from sglang.srt.mem_cache.kv.alloc.pricing import NO_MOVE, plan
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -201,7 +202,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     supports_mamba=lambda: True,
                     mamba_evictable_size=lambda: 0,
                 )
-                budget = allocator.create_prefill_budget(cache)
+                budget = create_prefill_budget(allocator, cache)
                 cap = budget._chunk_cap(
                     max_chunk_tokens=11,
                     chunk_limit=12,
@@ -397,7 +398,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                             NO_MOVE,
                         )
                     )
-                    self.assertIsNone(allocator.reclaim_for_prealloc(None, request))
+                    self.assertIsNone(reclaim_for_prealloc(None, allocator, request))
                     with allocator.scoped_physical_takes(request):
                         refused, reserved = _load_back(
                             allocator,
@@ -439,7 +440,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     # demand fits.
                     if not allocator.ensure_capacity(request):
                         continue
-                    self.assertIsNone(allocator.reclaim_for_prealloc(None, request))
+                    self.assertIsNone(reclaim_for_prealloc(None, allocator, request))
                     histories += 1
                     with self.subTest(device=device, seed=seed, state=state, lazy=lazy):
                         with allocator.scoped_physical_takes(request):

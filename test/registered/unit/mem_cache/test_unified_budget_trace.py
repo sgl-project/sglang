@@ -19,6 +19,7 @@ from test_unified_chain_realize import _allocator
 from test_unified_window_sub_pools import _storage
 
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -120,7 +121,7 @@ def _allocator_answers(allocator, names, state):
 
 
 def _budget_answers(allocator, cache):
-    budget = allocator.create_prefill_budget(cache)
+    budget = create_prefill_budget(allocator, cache)
     out = {
         "remaining_swa": int(budget.remaining_swa),
         "has_capacity": budget.has_capacity(),

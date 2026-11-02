@@ -3,7 +3,6 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import torch
 
@@ -18,6 +17,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -178,7 +178,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
         cache = _cache()
         cache.supports_mamba = lambda: True
         cache.mamba_evictable_size = lambda: 0
-        budget = allocator.create_prefill_budget(cache)
+        budget = create_prefill_budget(allocator, cache)
         # Running decode estimates can be fractional under new_token_ratio.
         budget.total_offset = 0.5
         budget.window_offsets = {name: 0.5 for name in budget.window_offsets}
@@ -215,7 +215,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 cache.sliding_window_size = 16
                 cache.supports_mamba = lambda: True
                 cache.mamba_evictable_size = lambda: 0
-                budget = allocator.create_prefill_budget(cache)
+                budget = create_prefill_budget(allocator, cache)
                 prompt_tokens = 28 if tracking else 8
                 reserved_tokens = prompt_tokens + 4
                 requests = [
@@ -312,7 +312,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
         cache.sliding_window_size = 16
         cache.supports_mamba = lambda: True
         cache.mamba_evictable_size = lambda: 0
-        budget = allocator.create_prefill_budget(cache)
+        budget = create_prefill_budget(allocator, cache)
         budget.reserve(8, 0, state_slots=1)
         # Two more slots represent the next request and its host checkpoint.
         # Their placement must be checked even when token demand alone fits.
@@ -336,8 +336,9 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
             self.assertTrue(
                 all(call.args[0].state_slots == 3 for call in fit.call_args_list)
             )
-        with unittest.mock.patch.object(
-            allocator, "reclaim_for_load_back", return_value=None
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.prefill_budget.reclaim_for_load_back",
+            return_value=None,
         ) as reclaim:
             self.assertTrue(
                 budget.prepare_load_back(
@@ -348,14 +349,14 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     state_slots=2,
                 )
             )
-            self.assertEqual(reclaim.call_args.args[1].state_slots, 3)
+            self.assertEqual(reclaim.call_args.args[2].state_slots, 3)
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):
     def setUp(self):
         self.allocator = _shared_allocator()
         self.cache = _cache()
-        self.budget = self.allocator.create_prefill_budget(self.cache)
+        self.budget = create_prefill_budget(self.allocator, self.cache)
         self.request = dict(
             extend_input_len=12,
             total_tokens=20,
@@ -387,8 +388,8 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(self.allocator.swa_attn_allocator.allocated_count(), 0)
 
     def test_mixed_decode_reserves_both_sides(self):
-        budget = self.allocator.create_prefill_budget(
-            self.cache, num_mixed_decode_tokens=4
+        budget = create_prefill_budget(
+            self.allocator, self.cache, num_mixed_decode_tokens=4
         )
         budget.reserve(12, 4, chunk_limit=16)
         self.assertEqual(
@@ -452,9 +453,11 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
     def test_common_eviction_dispatches_joint_reclaim(self):
         self.cache.token_to_kv_pool_allocator = self.allocator
-        self.allocator.evict_to_free_tokens = MagicMock()
-        evict_from_tree_cache(self.cache, 8)
-        self.allocator.evict_to_free_tokens.assert_called_once_with(self.cache, 8)
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.capacity.evict_to_free_tokens"
+        ) as evict:
+            evict_from_tree_cache(self.cache, 8)
+        evict.assert_called_once_with(self.cache, self.allocator, 8)
 
 
 class TestSharedPrefillAdmission(unittest.TestCase):
@@ -609,7 +612,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator._swa_ring_cost = 32
         cache = _cache()
         cache.swa_evictable_size = lambda: 1000
-        budget = allocator.create_prefill_budget(cache)
+        budget = create_prefill_budget(allocator, cache)
         budget.reserve(12, 4, chunk_limit=16)
         self.assertEqual(budget.remaining_swa, 32)
         budget.reserve(12, 4, chunk_limit=16, is_chunked_continuation=True)
@@ -629,14 +632,14 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
     def test_pure_swa_budget_reads_swa_capacity(self):
         allocator = self._allocator(PureSWATokenToKVPoolAllocator)
         allocator.full_available_size = lambda: 0
-        budget = allocator.create_prefill_budget(_cache())
+        budget = create_prefill_budget(allocator, _cache())
         self.assertEqual(budget.remaining_total, 64)
         self.assertTrue(budget.has_capacity())
 
     def test_hisparse_budget_reads_wrapper_capacity(self):
         allocator = self._allocator(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         allocator.full_available_size = lambda: 12
-        budget = allocator.create_prefill_budget(_cache())
+        budget = create_prefill_budget(allocator, _cache())
         self.assertEqual(budget.remaining_total, 12)
         self.assertEqual(budget.remaining_swa, 64)
 

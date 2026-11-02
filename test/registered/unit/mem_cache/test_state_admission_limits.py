@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_decls
@@ -90,7 +91,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
                 with self.subTest(window=window, lazy=lazy):
                     storage = _build(window=window, lazy=lazy)
                     allocator = storage.allocator
-                    budget = allocator.create_prefill_budget(_cache())
+                    budget = create_prefill_budget(allocator, _cache())
                     self.assertEqual(allocator.full_attn_allocator.max_live_tokens, 512)
                     self.assertGreater(
                         allocator.mamba_allocator.entry_bytes,
@@ -205,7 +206,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
         self.assertEqual(state.available_size(), 20)
         self.assertEqual(owner.available_size(), 20)
         self.assertEqual(window.available_size(), 20)
-        budget = allocator.create_prefill_budget(_cache())
+        budget = create_prefill_budget(allocator, _cache())
         self.assertTrue(budget.state_slots_fit(12))
         self.assertGreaterEqual(budget.remaining_total, 12)
         self.assertGreaterEqual(budget.remaining_swa, 12)
@@ -231,7 +232,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
             with self.subTest(window=window):
                 storage = _build(window=window, lazy=True)
                 allocator = storage.allocator
-                budget = allocator.create_prefill_budget(_cache())
+                budget = create_prefill_budget(allocator, _cache())
                 slots = allocator.state_slots_available() + 1
                 self.assertFalse(
                     budget.check_prefill(
@@ -252,7 +253,7 @@ class TestStateChunkProgress(unittest.TestCase):
                 storage = _build(window=window, lazy=True)
                 allocator = storage.allocator
                 allocator.full_attn_allocator.max_live_tokens = None
-                budget = allocator.create_prefill_budget(_cache())
+                budget = create_prefill_budget(allocator, _cache())
                 budget.reserve(0, 0, state_slots=1)
                 limit = int(budget.available_chunk_tokens(1 << 20))
                 selected = budget.fit_chunk(
