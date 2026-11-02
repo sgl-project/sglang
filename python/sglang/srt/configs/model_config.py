@@ -225,19 +225,6 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
 
 
-def draft_dcp_loc_space_scale(config, dcp_size: int) -> int:
-    """How many DCP-widened allocator ids an EAGLE/NEXTN draft pool spans per token.
-
-    A replicated draft indexes the target allocator's widened ids raw, so it
-    spans ``dcp_size`` of them; a draft that shards like the target spans one.
-    The draft pool's ``loc_space_scale`` and the target's memory budget for that
-    pool must agree, so both read this.
-    """
-    if dcp_size > 1 and not dsa_draft_shards_under_dcp(config, dcp_size):
-        return dcp_size
-    return 1
-
-
 def is_glm_moe_dsa(config) -> bool:
     """True for GLM-5.2, both the main arch and the NextN draft head."""
     return _hf_arch(config) in (

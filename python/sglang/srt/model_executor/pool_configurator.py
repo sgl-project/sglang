@@ -19,7 +19,6 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    draft_dcp_loc_space_scale,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -314,13 +313,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         self._cell_size * draft_num_layers / int(num_layers)
                     )
-                    self._cell_size += (
-                        draft_kv_size
-                        * draft_loc_space_scale
-                        * draft_dcp_loc_space_scale(
-                            kvc.model_config.hf_config, dcp_size
-                        )
-                    )
+                    # Under DCP a non-DSA draft pool spans the allocator's widened
+                    # ids (KVCacheConfigurator.loc_space_scale).
+                    self._cell_size += draft_kv_size * draft_loc_space_scale * dcp_size
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
