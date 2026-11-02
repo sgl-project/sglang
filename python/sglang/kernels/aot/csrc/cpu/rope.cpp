@@ -4,7 +4,7 @@
 namespace {
 
 struct RopeParams {
-  // Treat all tensors as [B, S, H, D]
+  // Standard Q/K layouts interpreted as [B, S, H, D].
   //   2D [S, H * D] -> [1, S, H, D]
   //   3D [S, H, D]  -> [1, S, H, D]
   //   4D               [B, S, H, D]
@@ -16,6 +16,11 @@ struct RopeParams {
   // out-of-place destination strides; default to a contiguous [B, S, H, D] output
   int64_t q_out_strideB{0}, q_out_strideS{0}, q_out_strideH{0};
   int64_t k_out_strideB{0}, k_out_strideS{0}, k_out_strideH{0};
+  int64_t q_strideD{1}, k_strideD{1};
+  int64_t q_out_strideD{1}, k_out_strideD{1};
+  at::DimVector row_sizes;
+  // Per-row strides for query, key, query_out, key_out, excluding head/feature dimensions.
+  std::vector<std::array<int64_t, 4>> row_strides;
 
   RopeParams() = default;
 
@@ -64,20 +69,50 @@ struct RopeParams {
     k_out_strideB = seqlen * k_out_strideS;
   }
 
+  RopeParams(
+      const at::Tensor& query,
+      const at::Tensor& key,
+      const at::Tensor& query_out,
+      const at::Tensor& key_out,
+      int64_t head_dim)
+      : rotary_dim(query.size(-1)), head_size(query.size(-1)) {
+    num_heads = query.size(head_dim);
+    num_heads_kv = key.size(head_dim);
+    q_strideH = query.stride(head_dim);
+    k_strideH = key.stride(head_dim);
+    q_out_strideH = query_out.stride(head_dim);
+    k_out_strideH = key_out.stride(head_dim);
+    q_strideD = query.stride(-1);
+    k_strideD = key.stride(-1);
+    q_out_strideD = query_out.stride(-1);
+    k_out_strideD = key_out.stride(-1);
+    for (int64_t d = 0; d < query.dim() - 1; ++d) {
+      if (d == head_dim) {
+        continue;
+      }
+      row_sizes.push_back(query.size(d));
+      row_strides.push_back({query.stride(d), key.stride(d), query_out.stride(d), key_out.stride(d)});
+      seqlen *= query.size(d);
+    }
+  }
+
   inline int64_t rows() const {
     return batches * seqlen;
   }
-  inline int64_t q_offset(int64_t b, int64_t s, int64_t h) const {
-    return b * q_strideB + s * q_strideS + h * q_strideH;
-  }
-  inline int64_t k_offset(int64_t b, int64_t s, int64_t h) const {
-    return b * k_strideB + s * k_strideS + h * k_strideH;
-  }
-  inline int64_t q_out_offset(int64_t b, int64_t s, int64_t h) const {
-    return b * q_out_strideB + s * q_out_strideS + h * q_out_strideH;
-  }
-  inline int64_t k_out_offset(int64_t b, int64_t s, int64_t h) const {
-    return b * k_out_strideB + s * k_out_strideS + h * k_out_strideH;
+  inline std::array<int64_t, 4> row_offsets(int64_t row, int64_t b, int64_t s) const {
+    std::array<int64_t, 4> offsets{
+        b * q_strideB + s * q_strideS,
+        b * k_strideB + s * k_strideS,
+        b * q_out_strideB + s * q_out_strideS,
+        b * k_out_strideB + s * k_out_strideS};
+    for (int64_t d = static_cast<int64_t>(row_sizes.size()) - 1; d >= 0; --d) {
+      const int64_t index = row % row_sizes[d];
+      row /= row_sizes[d];
+      for (int j = 0; j < 4; ++j) {
+        offsets[j] += index * row_strides[d][j];
+      }
+    }
+    return offsets;
   }
 };
 
@@ -92,6 +127,8 @@ template <typename param_t>
 struct SplitCosSinRow {
   const param_t* cos;
   const param_t* sin;
+  int64_t cos_stride{1};
+  int64_t sin_stride{1};
 };
 
 // Already-indexed T/H/W cache rows for 2D mRoPE (no gathered buffer).
@@ -205,55 +242,41 @@ struct RotaryEmbedInternal<scalar_t, RotaryMode::Neox> {
 template <typename scalar_t>
 struct RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull> {
   template <typename CosT>
-  static inline void
-  apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, SplitCosSinRow<CosT> cache, int size) {
-    // load_float_vec2/store_float_vec2 move two float vectors per call, for float and reduced alike
-    constexpr int kVecSize = 2 * at::vec::Vectorized<float>::size();
-    const int half_size = size / 2;
-    int d = 0;
-    for (; d <= half_size - kVecSize; d += kVecSize) {
-      auto [x0, x1] = load_float_vec2(input + d);
-      auto [y0, y1] = load_float_vec2(input + half_size + d);
-      auto [cos_x0, cos_x1] = load_float_vec2(cache.cos + d);
-      auto [sin_x0, sin_x1] = load_float_vec2(cache.sin + d);
-      auto [cos_y0, cos_y1] = load_float_vec2(cache.cos + half_size + d);
-      auto [sin_y0, sin_y1] = load_float_vec2(cache.sin + half_size + d);
-      auto out0 = x0 * cos_x0 - y0 * sin_x0;
-      auto out1 = x1 * cos_x1 - y1 * sin_x1;
-      auto out2 = y0 * cos_y0 + x0 * sin_y0;
-      auto out3 = y1 * cos_y1 + x1 * sin_y1;
-      store_float_vec2(out + d, out0, out1);
-      store_float_vec2(out + half_size + d, out2, out3);
-    }
-    for (; d < half_size; ++d) {
-      float x = input[d], y = input[d + half_size];
-      float cos_x = static_cast<float>(cache.cos[d]);
-      float sin_x = static_cast<float>(cache.sin[d]);
-      float cos_y = static_cast<float>(cache.cos[d + half_size]);
-      float sin_y = static_cast<float>(cache.sin[d + half_size]);
-      out[d] = static_cast<scalar_t>(x * cos_x - y * sin_x);
-      out[d + half_size] = static_cast<scalar_t>(y * cos_y + x * sin_y);
-    }
-  }
-
-  template <typename CosT>
-  static inline void apply_strided(
+  static inline void apply(
       scalar_t* __restrict__ out,
       const scalar_t* __restrict__ input,
       SplitCosSinRow<CosT> cache,
       int size,
-      int64_t input_stride,
-      int64_t cos_stride,
-      int64_t sin_stride) {
+      int64_t input_stride = 1,
+      int64_t output_stride = 1) {
+    // load_float_vec2/store_float_vec2 move two float vectors per call, for float and reduced alike
+    constexpr int kVecSize = 2 * at::vec::Vectorized<float>::size();
     const int half_size = size / 2;
-    for (int d = 0; d < half_size; ++d) {
+    int d = 0;
+    if (input_stride == 1 && output_stride == 1 && cache.cos_stride == 1 && cache.sin_stride == 1) {
+      for (; d <= half_size - kVecSize; d += kVecSize) {
+        auto [x0, x1] = load_float_vec2(input + d);
+        auto [y0, y1] = load_float_vec2(input + half_size + d);
+        auto [cos_x0, cos_x1] = load_float_vec2(cache.cos + d);
+        auto [sin_x0, sin_x1] = load_float_vec2(cache.sin + d);
+        auto [cos_y0, cos_y1] = load_float_vec2(cache.cos + half_size + d);
+        auto [sin_y0, sin_y1] = load_float_vec2(cache.sin + half_size + d);
+        auto out0 = x0 * cos_x0 - y0 * sin_x0;
+        auto out1 = x1 * cos_x1 - y1 * sin_x1;
+        auto out2 = y0 * cos_y0 + x0 * sin_y0;
+        auto out3 = y1 * cos_y1 + x1 * sin_y1;
+        store_float_vec2(out + d, out0, out1);
+        store_float_vec2(out + half_size + d, out2, out3);
+      }
+    }
+    for (; d < half_size; ++d) {
       float x = input[d * input_stride], y = input[(d + half_size) * input_stride];
-      float cos_x = static_cast<float>(cache.cos[d * cos_stride]);
-      float sin_x = static_cast<float>(cache.sin[d * sin_stride]);
-      float cos_y = static_cast<float>(cache.cos[(d + half_size) * cos_stride]);
-      float sin_y = static_cast<float>(cache.sin[(d + half_size) * sin_stride]);
-      out[d] = static_cast<scalar_t>(x * cos_x - y * sin_x);
-      out[d + half_size] = static_cast<scalar_t>(y * cos_y + x * sin_y);
+      float cos_x = static_cast<float>(cache.cos[d * cache.cos_stride]);
+      float sin_x = static_cast<float>(cache.sin[d * cache.sin_stride]);
+      float cos_y = static_cast<float>(cache.cos[(d + half_size) * cache.cos_stride]);
+      float sin_y = static_cast<float>(cache.sin[(d + half_size) * cache.sin_stride]);
+      out[d * output_stride] = static_cast<scalar_t>(x * cos_x - y * sin_x);
+      out[(d + half_size) * output_stride] = static_cast<scalar_t>(y * cos_y + x * sin_y);
     }
   }
 };
@@ -270,26 +293,37 @@ void rotary_embedding_kernel_impl(
     int64_t bs = 0, seq = 0;
     data_index_init(begin, bs, p.batches, seq, p.seqlen);
     for (int64_t i = begin; i < end; ++i) {
-      auto cache = cache_pos(bs * p.seqlen + seq);
+      auto cache = cache_pos(i);
+      const auto offsets = p.row_offsets(i, bs, seq);
       for (int64_t h = 0; h < p.num_heads; ++h) {
-        scalar_t* q_in = query + p.q_offset(bs, seq, h);
+        scalar_t* q_in = query + offsets[0] + h * p.q_strideH;
         scalar_t* q_out;
         if constexpr (inplace) {
           q_out = q_in;
         } else {
-          q_out = query_out + p.q_out_offset(bs, seq, h);
+          q_out = query_out + offsets[2] + h * p.q_out_strideH;
         }
-        RotaryEmbedInternal<scalar_t, mode>::apply(q_out, q_in, cache, p.rotary_dim);
+        if constexpr (mode == RotaryMode::NeoxFull) {
+          RotaryEmbedInternal<scalar_t, mode>::apply(
+              q_out, q_in, cache, p.rotary_dim, p.q_strideD, inplace ? p.q_strideD : p.q_out_strideD);
+        } else {
+          RotaryEmbedInternal<scalar_t, mode>::apply(q_out, q_in, cache, p.rotary_dim);
+        }
       }
       for (int64_t h = 0; h < p.num_heads_kv; ++h) {
-        scalar_t* k_in = key + p.k_offset(bs, seq, h);
+        scalar_t* k_in = key + offsets[1] + h * p.k_strideH;
         scalar_t* k_out;
         if constexpr (inplace) {
           k_out = k_in;
         } else {
-          k_out = key_out + p.k_out_offset(bs, seq, h);
+          k_out = key_out + offsets[3] + h * p.k_out_strideH;
         }
-        RotaryEmbedInternal<scalar_t, mode>::apply(k_out, k_in, cache, p.rotary_dim);
+        if constexpr (mode == RotaryMode::NeoxFull) {
+          RotaryEmbedInternal<scalar_t, mode>::apply(
+              k_out, k_in, cache, p.rotary_dim, p.k_strideD, inplace ? p.k_strideD : p.k_out_strideD);
+        } else {
+          RotaryEmbedInternal<scalar_t, mode>::apply(k_out, k_in, cache, p.rotary_dim);
+        }
       }
       data_index_step(bs, p.batches, seq, p.seqlen);
     }
@@ -441,9 +475,6 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
   CHECK_EQ(cos.size(-1), head_size);
   CHECK_EQ(sin.size(-1), head_size);
 
-  // Decode each row across the non-head dimensions. This preserves non-contiguous
-  // q/k views and independently strided cos/sin without copying their storage.
-  int64_t num_rows = 1;
   for (int64_t d = 0; d < ndim - 1; ++d) {
     if (d == unsqueeze_dim) {
       continue;
@@ -452,74 +483,32 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
     CHECK_EQ(key.size(d), query.size(d));
     CHECK_EQ(cos.size(cos_d), query.size(d));
     CHECK_EQ(sin.size(cos_d), query.size(d));
-    num_rows *= query.size(d);
   }
 
   at::Tensor query_out = at::empty(query.sizes(), query.options());
   at::Tensor key_out = at::empty(key.sizes(), key.options());
-  const auto q_sizes = query.sizes();
-  const auto q_strides = query.strides(), k_strides = key.strides();
+  const RopeParams p{query, key, query_out, key_out, unsqueeze_dim};
   const auto cos_strides = cos.strides(), sin_strides = sin.strides();
-  const auto q_out_strides = query_out.strides(), k_out_strides = key_out.strides();
-
-  const int64_t q_heads = query.size(unsqueeze_dim), k_heads = key.size(unsqueeze_dim);
-  const int64_t q_head_stride = query.stride(unsqueeze_dim), k_head_stride = key.stride(unsqueeze_dim);
-  const int64_t q_out_head_stride = query_out.stride(unsqueeze_dim);
-  const int64_t k_out_head_stride = key_out.stride(unsqueeze_dim);
-  const int64_t q_last_stride = query.stride(-1), k_last_stride = key.stride(-1);
-  const int64_t cos_last_stride = cos.stride(-1), sin_last_stride = sin.stride(-1);
-  const bool unit_last_stride =
-      q_last_stride == 1 && k_last_stride == 1 && cos_last_stride == 1 && sin_last_stride == 1;
 
   CPU_DISPATCH_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), [&] {
-    const scalar_t* q_ptr = query.data_ptr<scalar_t>();
-    const scalar_t* k_ptr = key.data_ptr<scalar_t>();
+    scalar_t* q_ptr = query.data_ptr<scalar_t>();
+    scalar_t* k_ptr = key.data_ptr<scalar_t>();
     scalar_t* q_out_ptr = query_out.data_ptr<scalar_t>();
     scalar_t* k_out_ptr = key_out.data_ptr<scalar_t>();
     const param_t* cos_ptr = cos.data_ptr<param_t>();
     const param_t* sin_ptr = sin.data_ptr<param_t>();
-    at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
-      for (int64_t row = begin; row < end; ++row) {
-        int64_t remaining = row;
-        int64_t q_offset = 0, k_offset = 0, cos_offset = 0, sin_offset = 0;
-        int64_t q_out_offset = 0, k_out_offset = 0;
-        for (int64_t d = ndim - 2; d >= 0; --d) {
-          if (d == unsqueeze_dim) {
-            continue;
-          }
-          const int64_t index = remaining % q_sizes[d];
-          remaining /= q_sizes[d];
-          const int64_t cos_d = d < unsqueeze_dim ? d : d - 1;
-          q_offset += index * q_strides[d];
-          k_offset += index * k_strides[d];
-          cos_offset += index * cos_strides[cos_d];
-          sin_offset += index * sin_strides[cos_d];
-          q_out_offset += index * q_out_strides[d];
-          k_out_offset += index * k_out_strides[d];
-        }
-        SplitCosSinRow<param_t> cache{cos_ptr + cos_offset, sin_ptr + sin_offset};
-        for (int64_t h = 0; h < q_heads; ++h) {
-          scalar_t* out = q_out_ptr + q_out_offset + h * q_out_head_stride;
-          const scalar_t* in = q_ptr + q_offset + h * q_head_stride;
-          if (unit_last_stride) {
-            RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull>::apply(out, in, cache, head_size);
-          } else {
-            RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull>::apply_strided(
-                out, in, cache, head_size, q_last_stride, cos_last_stride, sin_last_stride);
-          }
-        }
-        for (int64_t h = 0; h < k_heads; ++h) {
-          scalar_t* out = k_out_ptr + k_out_offset + h * k_out_head_stride;
-          const scalar_t* in = k_ptr + k_offset + h * k_head_stride;
-          if (unit_last_stride) {
-            RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull>::apply(out, in, cache, head_size);
-          } else {
-            RotaryEmbedInternal<scalar_t, RotaryMode::NeoxFull>::apply_strided(
-                out, in, cache, head_size, k_last_stride, cos_last_stride, sin_last_stride);
-          }
-        }
+    auto cache_pos = [&](int64_t row) -> SplitCosSinRow<param_t> {
+      int64_t cos_offset = 0, sin_offset = 0;
+      for (int64_t d = static_cast<int64_t>(p.row_sizes.size()) - 1; d >= 0; --d) {
+        const int64_t index = row % p.row_sizes[d];
+        row /= p.row_sizes[d];
+        cos_offset += index * cos_strides[d];
+        sin_offset += index * sin_strides[d];
       }
-    });
+      return {cos_ptr + cos_offset, sin_ptr + sin_offset, cos.stride(-1), sin.stride(-1)};
+    };
+    rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, false>(
+        q_out_ptr, k_out_ptr, q_ptr, k_ptr, p, cache_pos);
   });
   return std::make_tuple(query_out, key_out);
 }

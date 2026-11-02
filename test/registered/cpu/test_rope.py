@@ -278,12 +278,13 @@ class TestROPE(CustomTestCase):
         def single_test(
             query, key, cos_shape, unsqueeze_dim, sincos_dtype, strided_cache=False
         ):
-            cache_width = cos_shape[-1] * (2 if strided_cache else 1)
-            cos = torch.rand(*cos_shape[:-1], cache_width).to(sincos_dtype)
-            sin = torch.rand(*cos_shape[:-1], cache_width).to(sincos_dtype)
+            cos_width = cos_shape[-1] * (2 if strided_cache else 1)
+            sin_width = cos_shape[-1] * (3 if strided_cache else 1)
+            cos = torch.rand(*cos_shape[:-1], cos_width).to(sincos_dtype)
+            sin = torch.rand(*cos_shape[:-1], sin_width).to(sincos_dtype)
             if strided_cache:
                 cos = cos[..., ::2]
-                sin = sin[..., ::2]
+                sin = sin[..., ::3]
             query_clone = query.clone()
             key_clone = key.clone()
 
@@ -371,6 +372,35 @@ class TestROPE(CustomTestCase):
                         dtype
                     )[..., ::2],
                     (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
+                )
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
+                )
+                single_test(
+                    torch.randn(num_heads, seq_len, head_size).to(dtype),
+                    torch.randn(num_kv_heads, seq_len, head_size).to(dtype),
+                    (seq_len, head_size),
+                    0,
+                    sincos_dtype,
+                )
+                single_test(
+                    torch.randn(2, 3, num_heads, 5, head_size)
+                    .to(dtype)
+                    .transpose(0, 1),
+                    torch.randn(2, 3, num_kv_heads, 5, head_size)
+                    .to(dtype)
+                    .transpose(0, 1),
+                    (3, 2, 5, head_size),
                     2,
                     sincos_dtype,
                     strided_cache=True,
