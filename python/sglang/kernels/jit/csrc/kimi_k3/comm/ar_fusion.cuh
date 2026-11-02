@@ -237,10 +237,9 @@ SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::Align
   return sum_eq;
 }
 
-// FinWeight != void selects the finalize variant: stage 1 computes the
-// deferred MoE finalize per vector (with FinWeight-typed routing weights)
-// instead of reading a staged input tensor; `input` is then output-only. The
-// host sets num_norm_rows to the full row count (every reduced row is normed).
+// FinWeight != void selects the finalize variant: stage 1 finalizes the
+// leading latent rows (with FinWeight-typed routing weights), then optionally
+// stages the shared-expert rows from `input`. Only latent rows are normed.
 template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL, typename FinWeight = void>
 __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClusterSize, 1, 1)  //
     void all_reduce_push_norm_cluster_kernel(const __grid_constant__ FusionParams params) {
@@ -294,7 +293,11 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec;
     if constexpr (kFinalize) {
-      vec = finalize_vec<FinWeight>(params, vid);
+      if (vid < params.num_norm_rows * kNormRowVecs) {
+        vec = finalize_vec<FinWeight>(params, vid);
+      } else {
+        ptx::ld_global_16B(vec, params.input, vid);
+      }
     } else {
       ptx::ld_global_16B(vec, params.input, vid);
     }
@@ -773,10 +776,9 @@ struct AllReduceFusionKernel {
         .enable_pdl(kUsePDL)(all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL>, params);
   }
 
-  /// Deferred MoE finalize + 1shot push all-reduce + RMSNorm over EVERY row.
-  /// `out` (flattened [num_tokens * kNormDim] bf16) is output-only: each
-  /// rank's partial latent is computed from the trtllm-gen deferred-finalize
-  /// triple during the staging pass and never materializes in global memory.
+  /// Deferred MoE finalize + push all-reduce + latent RMSNorm.
+  /// `out` is flattened latent-only or [latent | shared] bf16. Latent rows
+  /// are output-only; optional shared rows contain rank-local partial sums.
   static void finalize_push_norm(
       CommunicatorRef ref,
       TensorView out,
@@ -788,9 +790,10 @@ struct AllReduceFusionKernel {
     using namespace host;
     constexpr auto kClusterSize = 7;
     const auto& push = ref.get()->get_push_obj();
-    // every row of the latent-only output is normed
-    auto params = make_params_norm(*ref.get(), out, weight, eps, out.size(0) / kNormDim);
-    const auto num_tokens = params.num_vecs / kNormRowVecs;
+    const auto num_tokens = expert_weights.size(0);
+    CHECK_HOST(out.size(0) == num_tokens * kNormDim || out.size(0) == num_tokens * 3 * kNormDim)
+        << "expected latent-only or [latent | shared] output";
+    auto params = make_params_norm(*ref.get(), out, weight, eps, num_tokens);
 
     auto P = SymbolicSize{"num_permuted_rows"};
     auto T = SymbolicSize{"num_tokens"};
@@ -817,7 +820,7 @@ struct AllReduceFusionKernel {
         << "expert_weights must be " << device::kMaxVecBytes << "B aligned";
 
     constexpr uint32_t kMaxClusters = 96;
-    const auto num_row_clusters = std::max<uint32_t>(std::min(num_tokens, kMaxClusters), 1);
+    const auto num_row_clusters = std::max<uint32_t>(std::min(params.num_vecs / kNormRowVecs, kMaxClusters), 1);
     CHECK_HOST(num_row_clusters < push.num_blocks);
     const auto kernel = is_type<fp32_t>(expert_weights.dtype())
                             ? all_reduce_push_norm_cluster_kernel<kWorldSize, kClusterSize, kUsePDL, fp32_t>
