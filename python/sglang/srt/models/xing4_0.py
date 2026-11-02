@@ -36,7 +36,6 @@ from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.configs.xing4_0 import Xing4_0Config
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layer_boundary import (
     MHCState,
@@ -551,7 +550,7 @@ class Xing4_0Model(nn.Module):
         super().__init__()
 
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -663,7 +662,7 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> None:
         super().__init__()
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
