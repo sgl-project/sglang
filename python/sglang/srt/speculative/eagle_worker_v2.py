@@ -11,13 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -503,7 +496,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2DraftCudaGraphRunner = {
             "xpu": EAGLEDraftCudaGraphRunner,
-            "npu": EAGLEDraftNpuGraphRunner,
+            "npu": EAGLEDraftCudaGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
@@ -555,7 +548,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2ExtendCudaGraphRunner = {
             "xpu": EAGLEDraftExtendCudaGraphRunner,
-            "npu": EAGLEDraftExtendNpuGraphRunner,
+            "npu": EAGLEDraftExtendCudaGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
@@ -1886,9 +1879,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
                 # Same runner class as the startup target verify graph on OOT.
                 TargetGraphRunnerCls = _select_spec_graph_runner_cls(
-                    builtin_runner_cls=lambda: (
-                        NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
-                    ),
+                    builtin_runner_cls=lambda: DecodeCudaGraphRunner,
                     oot_runner_cls=current_platform.get_graph_runner_cls,
                 )
             if TargetGraphRunnerCls is not None:

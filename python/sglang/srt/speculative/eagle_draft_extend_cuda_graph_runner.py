@@ -164,6 +164,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        self.backend = resolve_decode_backend(self)
+
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -307,8 +309,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         try:
             with model_capture_mode():
                 self.capture()
@@ -322,7 +322,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return self.backend.replay(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
         return ShapeKey(size=bs, attention_variant=attention_variant)
