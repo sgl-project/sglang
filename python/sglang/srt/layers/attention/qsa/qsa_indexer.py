@@ -73,6 +73,8 @@ class QSAIndexer(MultiPlatformOp):
         if rotary_emb is None:
             raise ValueError("QSAIndexer must reuse its Qwen4-Exp attention RoPE")
         self.rotary_emb = rotary_emb
+        # The fused prepare kernels read an fp32 cos/sin cache.
+        self.rotary_emb.keep_cos_sin_cache_fp32 = True
         if not 0 < self.rotary_emb.rotary_dim <= self.index_head_dim:
             raise ValueError(
                 "Qwen4-Exp attention RoPE rotary_dim must fit the QSA index head: "

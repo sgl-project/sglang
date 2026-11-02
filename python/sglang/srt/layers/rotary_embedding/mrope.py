@@ -172,8 +172,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if _is_hip:
-            # On HIP, keep fp32 for the fused QSA indexer JIT kernel.
+        if _is_hip or (_is_xpu and self.keep_cos_sin_cache_fp32):
+            # Keep fp32 for the fused QSA indexer prepare kernels.
             if self.cos_sin_cache.device != query.device:
                 self.cos_sin_cache = self.cos_sin_cache.to(query.device)
         else:
