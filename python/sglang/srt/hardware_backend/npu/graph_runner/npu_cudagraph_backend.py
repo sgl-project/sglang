@@ -89,14 +89,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def supports_shared_read_events(self) -> bool:
         # QFA snapshots shared pool mappings inside the graph. Preserve the
         # existing event behavior for the other NPU attention paths.
-        return self._use_qfa
+        return self._use_flash_attn
 
     @property
     def cache_loc_dtype(self):
         return torch.int32
 
     @property
-    def _use_qfa(self):
+    def _use_flash_attn(self):
         cache_layout = self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
         return cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
 
@@ -213,7 +213,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
-        if self._use_qfa:
+        if self._use_flash_attn:
             # Use the common runner's device input staging, including pre-planned
             # batches. QFA rebuilds its metadata inside the captured graph.
             return False
@@ -470,7 +470,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
-        if runner is not None and not self._use_qfa:
+        if runner is not None and not self._use_flash_attn:
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
             )
