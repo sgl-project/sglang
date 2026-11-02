@@ -211,9 +211,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         Each attention-TP rank holds an equal, rank-ordered share of the local
         DP buffer, so concatenating the shares rebuilds the row order the
         per-layer all-gather produced. Every rank of the group must call this
-        once per forward. An all-gather reuses the group's existing all-gather
-        path; a gather runs as NCCL send/recv, which took ~1 GiB more on the
-        receiving rank.
+        once per forward. It is an all-gather so it reuses the group's NCCL
+        buffers; a gather would run as send/recv with buffers of its own.
         """
         parallel = get_parallel()
         # Graph replay runs no Python capture(); the graph runners publish the
