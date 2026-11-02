@@ -363,7 +363,8 @@ class TestEagleBinding(CustomTestCase):
         # a plugin pins these names: a rename here must fail first
         members = {
             "EagleBinding": set(dir(eb.EagleBinding)),
-            "ForwardBatch": set(ForwardBatch.__dataclass_fields__),
+            "ForwardBatch": set(ForwardBatch.__dataclass_fields__)
+            | set(dir(ForwardBatch)),
         }
         for name in eb.TOLERATED_CALLABLES + eb.TOLERATED_READS:
             owner, _, attr = name.partition(".")
@@ -406,6 +407,72 @@ class TestEagleBinding(CustomTestCase):
                 for index, layer_id in enumerate(layer_ids):
                     self.assertIs(view.k[index], expected_keys[layer_id])
                     self.assertIs(view.v[index], expected_values[layer_id])
+
+    def test_prefill_view_uses_committed_state_without_speculative_buffers(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+            TritonGDNKernel,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+
+        backend = _hybrid()
+        linear = backend.linear_attn_backend
+        state = SimpleNamespace(
+            conv=[torch.zeros(2, 4, 3)], temporal=torch.zeros(2, 4, 8)
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_map={4: 0, 6: 1},
+            mamba_pool=SimpleNamespace(mamba_cache=state),
+            get_speculative_mamba2_params_all_layers=MagicMock(
+                side_effect=AssertionError("prefill must not read speculative scratch")
+            ),
+        )
+        meta = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        linear.forward_metadata = meta
+        linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
+        linear.requires_contiguous_prefill_state = True
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+        self.assertIs(view.state.temporal, state.temporal)
+        self.assertIs(view.state_indices, meta.mamba_cache_indices)
+
+    def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
+        views = SimpleNamespace(
+            forward_view=MagicMock(), prefill_view=MagicMock(return_value="prefill")
+        )
+        built = SimpleNamespace(
+            plan=lambda *a, **k: Step(mode="prefill", rows=5),
+            forward=lambda step, original, *a, **k: step.view,
+        )
+        wrapped = runtime._Dispatch(
+            built=built, original=MagicMock(), binding=views
+        ).wrapped()
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            self.assertEqual(
+                wrapped(torch.zeros(5), None, SimpleNamespace(batch_size=5)), "prefill"
+            )
+        views.prefill_view.assert_called_once_with()
+        views.forward_view.assert_not_called()
+
+    def test_prefill_without_an_offered_plan_uses_stock(self):
+        original = MagicMock(return_value="stock")
+        views = SimpleNamespace(prefill_view=MagicMock(), forward_view=MagicMock())
+        wrapped = runtime._Dispatch(
+            built=SimpleNamespace(plan=lambda *a, **k: None),
+            original=original,
+            binding=views,
+        ).wrapped()
+        args = (torch.zeros(5), None, SimpleNamespace(batch_size=5))
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            self.assertEqual(wrapped(*args), "stock")
+        original.assert_called_once_with(*args)
+        views.prefill_view.assert_not_called()
+        views.forward_view.assert_not_called()
 
     def test_a_reallocated_pool_fails_assert_live_by_name(self):
         backend = _hybrid()
@@ -648,8 +715,6 @@ class TestEagleEntries(CustomTestCase):
 
 
 class TestSpeculativeRuntimeContract(CustomTestCase):
-
-
     def test_strategy_passes_the_local_policy_to_runtime(self):
         output = spec.PostVerifyOutput(
             token_ids=torch.tensor([1]),
@@ -728,7 +793,6 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             selected = runtime.bind_speculative_runtime_hooks(model, defaults)
         self.assertIs(selected.post_verify.run, defaults.post_verify.run)
         self.assertIs(selected.post_verify.local_keys, custom_keys)
-
 
     def test_default_post_verify_uses_the_stock_signature(self):
         io = SimpleNamespace(

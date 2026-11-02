@@ -91,7 +91,7 @@ class BuildContext(msgspec.Struct, frozen=True):
 class Step(msgspec.Struct, frozen=True):
     """A covered step, decided from host state alike on every rank."""
 
-    mode: str  # "decode" or "target_verify"
+    mode: str  # "decode", "target_verify" or "prefill"
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None

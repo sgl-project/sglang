@@ -1517,7 +1517,11 @@ class _Dispatch:
                 if capturing:
                     self.binding.seal_capture_view(forward_batch, view)
             else:
-                view = self.binding.forward_view()
+                view = (
+                    self.binding.prefill_view()
+                    if step.mode == "prefill"
+                    else self.binding.forward_view()
+                )
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,
