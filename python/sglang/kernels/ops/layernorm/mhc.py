@@ -2137,31 +2137,12 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    from sglang.srt.hardware_backend.npu.utils import (
-        require_cann_transformer_ops,
-    )
+    from sgl_kernel_npu.operators.dsv4 import mhc_pre
 
-    # The fused op takes 4-D BSND; mHC is token-local, so a (T, 1, n, c)
-    # view of the TND batch is equivalent.
-    fused = require_cann_transformer_ops("mhc_pre_sinkhorn")[0]
-    x4 = x.reshape(-1, 1, hc_mult, shape[-1])
-    h_in, h_post, h_res, *_ = fused(
-        x4,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult,
-        hc_sinkhorn_iters,
-        hc_eps,
-        rms_norm_eps,
-        False,
+    y, post, comb = mhc_pre(
+        x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    return (
-        h_in.reshape(-1, shape[-1]).to(dtype),
-        h_post.reshape(-1, hc_mult),
-        h_res.reshape(-1, hc_mult, hc_mult),
-        False,
-    )
+    return y, post, comb, False
 
 
 @triton.jit
