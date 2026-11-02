@@ -2637,6 +2637,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
             get_running_reqs=lambda: self.running_reqs,
             get_pp_running_mbs=lambda: (
@@ -4654,6 +4655,41 @@ class Scheduler(
             if not req.finished()
         ]
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        """The lists that hold the live requests, by name. A request is in at
+        most one; one that PD prefill or HiSparse launched is in none until its
+        result is processed."""
+        lists = {
+            "waiting": self.waiting_queue,
+            "grammar": self.grammar_manager.grammar_queue,
+            "chunked": [] if self.chunked_req is None else [self.chunked_req],
+            "running": list(self.running_reqs),
+        }
+        # Read at call time: a PD role switch rebuilds the PD queues.
+        if self.disagg_prefill_bootstrap_queue is not None:
+            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
+        if self.disagg_prefill_transfer_queue is not None:
+            lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
+        if self.dllm_config is not None:
+            # Its staging queue is the part of this queue the current round runs.
+            lists["dllm"] = self.dllm_manager.waiting_queue
+        components = (
+            self.disagg_decode_prealloc_queue,
+            self.disagg_decode_transfer_queue,
+            self.hisparse_coordinator,
+            self.uocr_runtime,
+            self.deferred_responses,
+        )
+        for component in components:
+            if component is None:
+                continue
+            component_lists = component.request_lists()
+            assert lists.keys().isdisjoint(component_lists), sorted(
+                lists.keys() & component_lists.keys()
+            )
+            lists.update(component_lists)
+        return lists
+
     def _prefill_launch_starts_running(self) -> bool:
         """Whether launching a request's last prefill chunk starts it running: not
         under PD (KV transfer, or the prebuilt merge), HiSparse (after staging) or
@@ -4690,6 +4726,7 @@ class Scheduler(
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
         self._join_launched_reqs(batch)
+        self.invariant_checker.maybe_check_request_lists()
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
