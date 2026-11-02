@@ -1,4 +1,3 @@
-import itertools
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -40,9 +39,9 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
         self.assertEqual(output.device, hidden.device)
 
     def test_draft_counts_are_not_scaled_twice(self):
-        for persistent, width in itertools.product((False, True), (6, 7)):
+        for width in (6, 7):
             for rank, local_tokens in ((0, 0), (1, 3 * width), (2, 0)):
-                with self.subTest(persistent=persistent, width=width, rank=rank):
+                with self.subTest(width=width, rank=rank):
                     plan = DPSpecPrefillCoordinationPlan(
                         [8192, 3, 0], [1, 3, 0], torch.tensor([1, 0, 0]), width, 7
                     )
@@ -51,7 +50,6 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     proposer = object.__new__(DraftBlockProposer)
                     proposer._dp_moe_sync = True
                     proposer._num_token_non_padded = None
-                    proposer._persistent_dp_meta = persistent
                     proposer._dp_meta_host = None
                     proposer._dp_meta_device = None
                     proposer._dp_meta_copied = []
