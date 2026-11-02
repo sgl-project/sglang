@@ -1,12 +1,16 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods import dense_attention
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    TinyModelConfig,
     make_swa_no_prefix_input_config_cases,
     make_swa_prefix_input_config_cases,
     run_dense_attention_case,
@@ -26,6 +30,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=21, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+# backend-specific: the gfx950 window-only DSpark draft verify (triton_backend_hip).
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+class _AllWindowDSparkDraftConfig(TinyModelConfig):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.hf_config.architectures = ["DSparkMiniMaxDraftModel"]
+        self.hf_config.layer_types = ["sliding_attention"]
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -393,6 +406,46 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     spec_kind=spec_kind,
                 )
+
+    @unittest.skipUnless(is_gfx95_supported(), "the window-only verify is gfx950-only")
+    def test_all_window_dspark_draft_verify_reads_window_indices_only(self):
+        """The all-window M3.1 DSpark draft verifies correctly, eager and graphed, without
+        packing the full-context KV index stream."""
+        from sglang.srt.layers.attention import triton_backend_hip
+
+        packs = []
+        fill = TritonAttnBackend._fill_kv_indptr_and_indices
+
+        def record_fill(backend, plan, bs, seq_lens, req_pool_indices, kv_indices, *a):
+            packs.append(kv_indices is not None)
+            return fill(backend, plan, bs, seq_lens, req_pool_indices, kv_indices, *a)
+
+        case = DenseAttentionCase(
+            name="dspark_draft_verify_swa_above_window",
+            backend="triton",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=16,
+            prefix_lens=(6, 8),
+            extend_lens=(3, 3),
+            sliding_window_size=4,
+        )
+        with (
+            patch.object(
+                dense_attention, "TinyModelConfig", _AllWindowDSparkDraftConfig
+            ),
+            patch.object(TritonAttnBackend, "_fill_kv_indptr_and_indices", record_fill),
+            patch.object(
+                triton_backend_hip, "is_minimax_m31_dspark_draft", lambda *_: True
+            ),
+        ):
+            run_dense_spec_verify_case(self, case, topk=1, spec_kind="dflash")
+            run_dense_spec_verify_cuda_graph_case(
+                self, case, topk=1, spec_kind="dflash"
+            )
+        self.assertTrue(packs)
+        self.assertFalse(any(packs))
 
 
 if __name__ == "__main__":

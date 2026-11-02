@@ -1,13 +1,15 @@
-"""Causal verify metadata and routing with no ordinary prefill metadata."""
+"""ROCm MiniMax sparse attention: verify metadata and routing."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(torch.version.hip, "ROCm verify integration")
@@ -121,6 +123,74 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
                 idx_k=self.q,
                 idx_v=None,
             )
+
+
+class TestMiniMaxROCmVerifyIndexerGate(unittest.TestCase):
+    def test_m3_verify_takes_grouped_indexer(self):
+        """An M3 target (Quark MXFP4, EAGLE3) on gfx950 must score verify rows with the
+        grouped indexer."""
+        from sglang.srt.layers.attention import minimax_sparse_backend_hip as _hip
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        def init(spec="EAGLE3", score_type="max"):
+            backend = SimpleNamespace(
+                kv_pool=None, score_type=score_type, speculative_num_draft_tokens=4
+            )
+            with patch.object(_hip, "is_gfx95_supported", lambda: True):
+                _hip.init_sparse_backend(
+                    backend, SimpleNamespace(speculative_algorithm=spec)
+                )
+            return backend
+
+        self.assertTrue(init()._use_grouped_verify_indexer)
+        self.assertFalse(init(spec=None)._use_grouped_verify_indexer)
+        self.assertFalse(init(score_type="lse")._use_grouped_verify_indexer)
+
+        def num_draft(backend, mode):
+            return _hip.verify_num_draft(backend, SimpleNamespace(forward_mode=mode))
+
+        self.assertEqual(num_draft(init(), ForwardMode.TARGET_VERIFY), 4)
+        self.assertIsNone(num_draft(init(), ForwardMode.DECODE))
+        self.assertIsNone(num_draft(init(spec=None), ForwardMode.TARGET_VERIFY))
+
+
+@unittest.skipUnless(
+    torch.version.hip, "the deferred seq-lens pull is ROCm DSpark glue"
+)
+class TestDeferredSeqLensPull(unittest.TestCase):
+    def test_host_lengths_are_unknown_until_the_pull(self):
+        """A decode step resolves its GPU lengths before the worker pulls the host ones;
+        until then the previous step's host lengths must not pass for this step's."""
+        from sglang.srt.managers.overlap_utils_hip import DeferredSeqLensPull
+
+        lens = torch.tensor([5, 9, 7, 0], dtype=torch.int64, device="cuda")
+        publish_ready = torch.cuda.Event()
+        future_map = SimpleNamespace(
+            new_seq_lens_buf=lens,
+            publish_ready=publish_ready,
+            req_pool_size=lens.numel(),
+            device=lens.device,
+            _publish_fresh=True,
+        )
+        pull = DeferredSeqLensPull(future_map)
+        pull.on_publish(lens)
+        publish_ready.record()
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                future_indices=torch.tensor([2, 1], device="cuda")
+            ),
+            req_pool_indices_cpu=torch.tensor([2, 1]),
+            seq_lens=None,
+            seq_lens_cpu=torch.tensor([6, 8]),
+            seq_lens_sum=14,
+        )
+        pull.resolve(batch)
+        self.assertEqual(batch.seq_lens.tolist(), [7, 9])
+        self.assertIsNone(batch.seq_lens_cpu)
+        self.assertIsNone(batch.seq_lens_sum)
+        pull.apply(batch)
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [7, 9])
+        self.assertEqual(batch.seq_lens_sum, 16)
 
 
 if __name__ == "__main__":
