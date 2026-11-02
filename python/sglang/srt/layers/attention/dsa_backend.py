@@ -511,6 +511,25 @@ class DeepseekSparseAttnBackend(
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
+    def _call_flash_mla_sparse_fwd(self, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_sparse_fwd,
+        )
+
+        return flash_mla_sparse_fwd(**kwargs)
+
+    def _call_flash_mla_with_kvcache(self, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_with_kvcache,
+        )
+
+        return flash_mla_with_kvcache(**kwargs)
+
+    def _call_get_mla_metadata(self, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
+
+        return get_mla_metadata(**kwargs)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2293,8 +2312,8 @@ class DeepseekSparseAttnBackend(
             raise NotImplementedError(
                 "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
                 f"batches only; got forward_mode={forward_batch.forward_mode.name} "
-                "(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under "
-                "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
+                "(DLLM_EXTEND under --dllm-algorithm; --enable-mixed-chunk is "
+                "rejected at launch)."
             )
 
         if self.use_fused_topk:
@@ -2541,6 +2560,17 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
             )
         elif dsa_impl == "intel_xpu":
+            if self.hisparse_coordinator is not None:
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                return self._forward_intel_xpu_sparse_prefill(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                )
             return self._forward_intel_xpu_dense_prefill(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -2846,10 +2876,6 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_sparse_fwd,
-        )
-
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
@@ -2896,7 +2922,7 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, _ = self._call_flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -3350,10 +3376,6 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_with_kvcache,
-        )
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
@@ -3382,7 +3404,7 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
+        o, _ = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -3691,6 +3713,40 @@ class DeepseekSparseAttnBackend(
             causal=True,
             num_kv_splits=1,
         )
+
+    def _forward_intel_xpu_sparse_prefill(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+        topk_length: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sparse prefill for XPU over HiSparse-translated slots.
+
+        HiSparse holds only the swapped-in top-k rows in the device buffer, so
+        the dense path's page-indexed block table cannot address them: it is
+        built from logical locations and diverges from the device slots as soon
+        as a request takes a logical-only page. This consumes the translated
+        top-k slot list instead, which is what the swap-in actually filled.
+        """
+        from sgl_kernel.attention import flash_mla_sparse_fwd
+
+        if topk_length is not None and topk_length.shape[0] != q_all.shape[0]:
+            # Padding helpers normally keep metadata rows aligned with q rows;
+            # fall back to full-width compute if they ever diverge.
+            topk_length = None
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_all,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            topk_length=topk_length,
+        )
+        return o
 
     def _forward_aiter(
         self,
@@ -4227,11 +4283,9 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
-
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        flashmla_metadata, num_splits = get_mla_metadata(
+        flashmla_metadata, num_splits = self._call_get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?

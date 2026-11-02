@@ -47,6 +47,8 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_req: int = -1
 
+    # Seed for ForwardBatch.ragged_verify_layout (handed over in
+    # prepare_for_verify); set at construction, never reassigned after.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
@@ -108,6 +110,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            ragged_verify_layout=self.ragged_verify_layout,
             iteration_ids=self.iteration_ids,
             write_cols=self.iteration_cols,
         )

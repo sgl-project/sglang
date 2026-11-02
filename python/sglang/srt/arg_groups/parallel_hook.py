@@ -197,6 +197,7 @@ def handle_context_parallelism(server_args: Any):
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
+        cp_kv_layout=cfg.cp_kv_layout,
     )
 
 
@@ -715,9 +716,6 @@ def handle_elastic_ep(server_args: Any):
             )
             assert not cfg.forward_hooks, (
                 "Elastic EP CUDA graph recapture does not support forward hooks."
-            )
-            assert not cfg.enable_pdmux, (
-                "Elastic EP CUDA graph recapture does not support PDMux."
             )
         assert attn_dp_enabled_of(resolved), (
             "Elastic EP scale-up requires attention DP (--attn-dp-size); "

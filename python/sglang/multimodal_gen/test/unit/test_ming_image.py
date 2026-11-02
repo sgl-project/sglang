@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MingImageReferenceStage,
     ming_reference_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -204,7 +205,12 @@ def test_ming_norm_and_swiglu_preserve_reference_rounding():
     torch.testing.assert_close(MingSiluAndMul()(x), F.silu(gate) * up, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# The fused RMSNorm kernel is CUDA-only; on ROCm MingRMSNorm always takes the
+# native path, so the kernel call this test expects never happens.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or current_platform.is_rocm(),
+    reason="the fused RMSNorm kernel needs CUDA",
+)
 @pytest.mark.parametrize("dim", [128, 3840])
 def test_ming_norm_fusion_replay_and_native_fallback(dim, monkeypatch):
     from sglang.kernels.ops.diffusion import BitExactFusionGate

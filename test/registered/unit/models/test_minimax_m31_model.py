@@ -85,6 +85,7 @@ def server_args(**kwargs):
         pp_size=1,
         speculative_draft_kv_cache_dtype=None,
         speculative_draft_attention_backend=None,
+        speculative_draft_model_quantization=None,
     )
     return SimpleNamespace(**(args | kwargs))
 
@@ -104,6 +105,7 @@ def packed_moe_hf(**quant_overrides):
 class TestMiniMaxM31ConfigResolution(CustomTestCase):
     def test_nvfp4_defaults_on_blackwell_and_portable_fallback(self):
         base = dict(quantization="minimax_m3_nvfp4", page_size=128)
+        portable = base | dict(moe_runner_backend="marlin", attention_backend="fa3")
         blackwell = base | dict(
             moe_a2a_backend="megamoe",
             moe_runner_backend="deep_gemm",
@@ -122,10 +124,17 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
                 ),
             ),
             # MegaMoE and the packed NVFP4 KV cache are SM100-only.
+            (False, None, portable),
+            # The draft's MXFP8 projections load as block-FP8 like the target's.
             (
                 False,
-                None,
-                base | dict(moe_runner_backend="marlin", attention_backend="fa3"),
+                "DSPARK",
+                portable
+                | dict(
+                    speculative_draft_kv_cache_dtype="bf16",
+                    speculative_draft_model_quantization="minimax_m3_nvfp4",
+                    speculative_draft_attention_backend="fa3",
+                ),
             ),
         ]
         for is_blackwell, algorithm, expected in cases:
@@ -208,6 +217,13 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
                 self.assertRaises(ValueError),
             ):
                 call()
+        with (
+            self.subTest("dflash off blackwell"),
+            override_platform(is_blackwell=False),
+            patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE="static"),
+            self.assertRaises(ValueError),
+        ):
+            resolve(speculative_algorithm="DFLASH")()
 
 
 class TestMiniMaxM31DSparkDraft(CustomTestCase):
