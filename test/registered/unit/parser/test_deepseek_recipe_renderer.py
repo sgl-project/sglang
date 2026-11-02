@@ -194,6 +194,40 @@ class TestDeepSeekRecipe(CustomTestCase):
             self.deepseek_recipe.encode(chat),
         )
 
+    def test_a_converted_conversation_cut_after_an_assistant_turn_encodes_as_a_prefix(
+        self,
+    ):
+        """Callers that tokenize turn by turn render a history through `convert` and
+        `encode_conversation`; the effort budget must apply there, as in `encode`."""
+        recipe = renderer.load_deepseek_recipe()
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+        }
+        body = {
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": "", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "thinking": True,
+        }
+        conversation = self.deepseek_recipe.convert(body, effort_budget=30)
+        full = self.deepseek_recipe.encode_conversation(conversation, effort_budget=30)
+        self.assertEqual(full, self.deepseek_recipe.encode(body, effort_budget=30))
+        history = recipe.Conversation(
+            conversation.messages[:2],
+            thinking_mode=conversation.thinking_mode,
+            tools=conversation.tools,
+            reasoning_effort=conversation.reasoning_effort,
+        )
+        prefix = self.deepseek_recipe.encode_conversation(history, effort_budget=30)
+        # The history render ends with the next turn's generation header.
+        self.assertEqual(prefix[-2:], self._ids("<｜Assistant｜>", "<think>"))
+        self.assertEqual(full[: len(prefix) - 2], prefix[:-2])
+
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
             self.deepseek_recipe.encode(
