@@ -219,6 +219,10 @@ class PageInterleaveKVPoolMixin:
             device=shard_group.device,
             cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
         )
+        if not self.kv_gather_comm.available:
+            raise RuntimeError(
+                "Page-interleave KV cache requires an available PyNccl communicator."
+            )
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
@@ -820,8 +824,11 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self._translate_loc_cached(loc)
         kv_buffer = slot.tensors["kv"]
         if self.store_dtype != self.dtype:
@@ -1031,6 +1038,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         """Read logical rows as separate NoPE and RoPE tensors.
 
@@ -1040,9 +1048,13 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         converts those decoded values to the requested type.
         """
         if not self.dsa_kv_cache_store_fp8:
-            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+            return super().get_mla_kv_buffer(
+                layer, loc, dst_dtype, layer_id_override=layer_id_override
+            )
 
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self.translate_loc_to_scratch(loc)
         kv = dequantize_k_cache_paged_dsa(self._scratch_kv(slot), rows)
         if dst_dtype is not None:
