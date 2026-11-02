@@ -1549,9 +1549,11 @@
                     ]
                   },
                   {
-                    "group": "Cosmos",
+                    "group": "NVIDIA",
                     "pages": [
-                      "cookbook/diffusion/Cosmos/Cosmos3"
+                      "cookbook/diffusion/Cosmos/Cosmos3",
+                      "cookbook/diffusion/SANA-Video/SANA-Video",
+                      "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
                   },
                   {
@@ -1666,12 +1668,6 @@
                     ]
                   },
                   {
-                    "group": "SANA Video",
-                    "pages": [
-                      "cookbook/diffusion/SANA-Video/SANA-Video"
-                    ]
-                  },
-                  {
                     "group": "MiniMax",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
@@ -1696,12 +1692,6 @@
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World",
                       "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
-                    ]
-                  },
-                  {
-                    "group": "SANA-WM",
-                    "pages": [
-                      "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
                   },
                   {
