@@ -744,7 +744,7 @@ def _node_commit_kernels():
         if row == 0:
             tl.store(PageActive + job, enabled)
         if row < rows and enabled:
-            matches = on_page & (position % rows == row)
+            matches = (on_page & (position % rows == row)) != 0
             # Ascending request priority, latest accepted depth within a request.
             priority = tl.where(matches, (N - req) * (MAX_Q + 1) + depth, -1)
             best = tl.max(priority, 0)
