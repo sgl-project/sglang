@@ -7,6 +7,10 @@ from unittest.mock import patch
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,6 +52,40 @@ def _make_runtime_handle(responses):
 
 
 class TestNativeGrpcParallelResponses(CustomTestCase):
+    def test_native_admission_errors_preserve_status(self):
+        async def run(error, embed):
+            async def fail(*args, **kwargs):
+                raise error
+                yield
+
+            handle = _make_runtime_handle([])
+            handle.tokenizer_manager.generate_request = fail
+            calls = []
+
+            def callback(payload, **kwargs):
+                calls.append((payload, kwargs))
+                return _ChunkStatus.Ready
+
+            obj = SimpleNamespace(rid="overloaded", parallel_sample_num=1, batch_size=1)
+            if embed:
+                await handle._run_embed(obj, callback, None)
+            else:
+                await handle._run_generate(obj, callback, stream=False, request=None)
+            return calls
+
+        for error, status in (
+            (MmMemoryOverloaded("pool full"), 429),
+            (MmMemoryRequestTooLarge("does not fit"), 413),
+            (RuntimeError("internal failure"), None),
+        ):
+            for embed in (False, True):
+                with self.subTest(status=status, embed=embed):
+                    calls = asyncio.run(run(error, embed))
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][1]["error"], str(error))
+                    self.assertEqual(calls[0][1].get("status_code"), status)
+                    self.assertTrue(calls[0][1]["finished"])
+
     def test_non_streaming_returns_every_choice_before_finishing(self):
         callback = _RecordingCallback()
         responses = [

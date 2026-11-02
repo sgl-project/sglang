@@ -46,6 +46,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -239,6 +240,8 @@ def _forget_parent_executor_wakeups():
 
 
 class BaseMultimodalProcessor(ABC):
+    cuda_ipc_publisher = None
+    cudaipc_mmfeature_pool = None
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
@@ -485,6 +488,12 @@ class BaseMultimodalProcessor(ABC):
                 self.server_args.base_gpu_id,
                 get_mm_feature_consumer_count(),
             )
+            if get_mm().mm_admission_timeout_ms is not None:
+                self.cuda_ipc_publisher = BoundedFeaturePublisher(
+                    self.cudaipc_mmfeature_pool,
+                    get_mm().mm_admission_timeout_ms,
+                    cpu_tensors=False,
+                )
 
     @property
     def keep_mm_features_on_device(self) -> bool:
@@ -534,6 +543,8 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+        if self.cuda_ipc_publisher is not None:
+            self.cuda_ipc_publisher.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
@@ -2051,7 +2062,7 @@ class BaseMultimodalProcessor(ABC):
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
-        if not self.use_cuda_ipc:
+        if not self.use_cuda_ipc or self.cuda_ipc_publisher is not None:
             return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out

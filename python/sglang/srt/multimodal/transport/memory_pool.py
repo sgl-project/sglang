@@ -2,11 +2,13 @@
 
 import logging
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
+from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -158,10 +160,15 @@ class PoolLease:
     generation: int
     ready_byte_offset: int
     ack_byte_offset: int
+    reserved_at: float = field(default_factory=time.monotonic, compare=False)
 
 
 class StreamOrderedMmFeaturePool:
     """Bounded GPU pool with generation-safe producer/consumer leases."""
+
+    on_capacity_change = None
+    reclaimed_count = 0
+    reclaimed_seconds = 0.0
 
     def __init__(
         self,
@@ -226,7 +233,10 @@ class StreamOrderedMmFeaturePool:
         self._available_slots = list(reversed(range(max_inflight_slices)))
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
+        self._cancelling: set[int] = set()
         self._lock = threading.Lock()
+        self.on_capacity_change = None
+        self._pool_error = None
         self._recycle_interval = recycle_interval
         self._recycler_stop_event = threading.Event()
         self._recycle_thread = threading.Thread(
@@ -239,6 +249,28 @@ class StreamOrderedMmFeaturePool:
     @property
     def usable_size(self) -> int:
         return self.memory_size - self.data_start
+
+    def capacity_snapshot(self):
+        """Allocator-only diagnostics; never query or synchronize CUDA here."""
+        with self._lock:
+            free = sum(end - start for start, end in self._available_ranges)
+            return {
+                "occupied_bytes": self.usable_size - free,
+                "free_bytes": free,
+                "largest_free_bytes": max(
+                    (end - start for start, end in self._available_ranges), default=0
+                ),
+                "free_slots": len(self._available_slots),
+                "oldest_lease_seconds": max(
+                    (
+                        time.monotonic() - lease.reserved_at
+                        for lease in self._occupied.values()
+                    ),
+                    default=0.0,
+                ),
+                "reclaimed_count": self.reclaimed_count,
+                "reclaimed_seconds": self.reclaimed_seconds,
+            }
 
     @property
     def active_lease_count(self) -> int:
@@ -254,14 +286,15 @@ class StreamOrderedMmFeaturePool:
         ]
         if not candidates or not self._available_slots:
             return None
+        slot = self._available_slots[-1]
+        generation = self._slot_generations[slot] + 1
+        if generation > 0x7FFFFFFF:
+            raise RuntimeError(f"{self.transport_name} pool slot generation exhausted")
         _, index, start, end = min(candidates)
         self._available_ranges.pop(index)
         if start + allocation_bytes < end:
             self._available_ranges.append((start + allocation_bytes, end))
-        slot = self._available_slots.pop()
-        generation = self._slot_generations[slot] + 1
-        if generation > 0x7FFFFFFF:
-            raise RuntimeError(f"{self.transport_name} pool slot generation exhausted")
+        self._available_slots.pop()
         self._slot_generations[slot] = generation
         ready_byte_offset = slot * self.control_words_per_slot * CONTROL_WORD_BYTES
         lease = PoolLease(
@@ -276,6 +309,65 @@ class StreamOrderedMmFeaturePool:
         self._occupied[slot] = lease
         return lease
 
+    def try_reserve_batch(self, sizes: list[int]) -> Optional[list[PoolLease]]:
+        """Reserve all ranges and control slots, or leave no partial ownership."""
+        required = sum(align_up(size, DATA_ALIGNMENT) for size in sizes)
+        if required > self.usable_size or len(sizes) > self.max_inflight_slices:
+            raise MmMemoryRequestTooLarge(
+                f"CUDA IPC publication needs {required} bytes/{len(sizes)} slots; "
+                f"capacity is {self.usable_size} bytes/{self.max_inflight_slices} slots"
+            )
+        with self._lock:
+            if self._pool_error is not None:
+                raise RuntimeError("CUDA IPC feature pool failed") from self._pool_error
+            if self._recycler_stop_event.is_set():
+                raise RuntimeError("CUDA IPC feature pool is closing")
+            leases = []
+            complete = False
+            try:
+                for size in sizes:
+                    lease = self._allocate_locked(size)
+                    if lease is None:
+                        return None
+                    leases.append(lease)
+                complete = True
+                return leases
+            finally:
+                if not complete:
+                    for lease in leases:
+                        self._release_locked(lease)
+                    self._merge_ranges_locked()
+
+    def release_reserved_batch(self, leases: list[PoolLease]) -> None:
+        """Release reservations only before copy starts or after stream completion."""
+        with self._lock:
+            for lease in leases:
+                self._release_locked(lease)
+            self._merge_ranges_locked()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
+
+    def copy_reserved_batch(
+        self, tensors: list[torch.Tensor], leases: list[PoolLease]
+    ) -> list[torch.Tensor]:
+        destinations = []
+        try:
+            for tensor, lease in zip(tensors, leases, strict=True):
+                _, destination = self.copy_tensor(tensor, lease=lease)
+                destinations.append(destination)
+            torch.cuda.current_stream(self.device_id).synchronize()
+            return destinations
+        except BaseException:
+            # cancellation/failure cannot make bytes reusable while an enqueued
+            # copy still touches them; a failed CUDA sync poisons the pool
+            try:
+                torch.cuda.current_stream(self.device_id).synchronize()
+            except BaseException as error:
+                self._pool_error = error
+                raise
+            self.release_reserved_batch(leases)
+            raise
+
     def _release_locked(self, lease: PoolLease) -> None:
         active_lease = self._occupied.get(lease.slot)
         if active_lease != lease:
@@ -284,6 +376,8 @@ class StreamOrderedMmFeaturePool:
                 f"(slot={lease.slot}, generation={lease.generation})"
             )
         del self._occupied[lease.slot]
+        self.reclaimed_count += 1
+        self.reclaimed_seconds += time.monotonic() - lease.reserved_at
         self._available_slots.append(lease.slot)
         self._available_ranges.append((lease.start, lease.end))
 
@@ -296,10 +390,11 @@ class StreamOrderedMmFeaturePool:
                 merged.append((start, end))
         self._available_ranges = merged
 
-    def _recycle_ready_leases_locked(self) -> None:
-        if not self._occupied:
+    def _recycle_ready_leases(self) -> None:
+        with self._lock:
+            leases = list(self._occupied.values())
+        if not leases:
             return
-        leases = list(self._occupied.values())
         slot_indices = torch.tensor(
             [lease.slot for lease in leases],
             dtype=torch.long,
@@ -316,17 +411,24 @@ class StreamOrderedMmFeaturePool:
             .cpu()
             .tolist()
         )
-        for lease, is_complete in zip(leases, completed):
-            if is_complete:
-                self._release_locked(lease)
-        self._merge_ranges_locked()
+        with self._lock:
+            for lease, is_complete in zip(leases, completed):
+                if (
+                    is_complete
+                    and self._occupied.get(lease.slot) is lease
+                    and lease.slot not in self._cancelling
+                ):
+                    self._release_locked(lease)
+            self._merge_ranges_locked()
+        if self.on_capacity_change is not None:
+            self.on_capacity_change()
 
     def _recycle_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         while not self._recycler_stop_event.is_set():
             try:
-                with self._lock, torch.cuda.device(self.device_id):
-                    self._recycle_ready_leases_locked()
+                with torch.cuda.device(self.device_id):
+                    self._recycle_ready_leases()
             except Exception:
                 logger.warning(
                     "%s multimodal pool recycle failed",
@@ -336,7 +438,7 @@ class StreamOrderedMmFeaturePool:
             self._recycler_stop_event.wait(self._recycle_interval)
 
     def copy_tensor(
-        self, tensor: torch.Tensor
+        self, tensor: torch.Tensor, *, lease: Optional[PoolLease] = None
     ) -> tuple[Optional[PoolLease], Optional[torch.Tensor]]:
         if not tensor.is_cuda:
             raise ValueError(f"{self.transport_name} requires a CUDA tensor")
@@ -344,8 +446,10 @@ class StreamOrderedMmFeaturePool:
         nbytes = source.numel() * source.element_size()
         if nbytes == 0:
             raise ValueError(f"{self.transport_name} cannot transport an empty tensor")
-        with self._lock:
-            lease = self._allocate_locked(nbytes)
+        reserved = lease is not None
+        if not reserved:
+            with self._lock:
+                lease = self._allocate_locked(nbytes)
         if lease is None:
             return None, None
 
@@ -362,9 +466,13 @@ class StreamOrderedMmFeaturePool:
                     self.transport_name,
                 )
         except Exception:
-            with self._lock:
-                self._release_locked(lease)
-                self._merge_ranges_locked()
+            if not reserved:
+                try:
+                    torch.cuda.current_stream(self.device_id).synchronize()
+                except BaseException as error:
+                    self._pool_error = error
+                    raise
+                self.release_reserved_batch([lease])
             raise
         return lease, destination
 
@@ -397,6 +505,12 @@ class StreamOrderedMmFeaturePool:
                     f"(slot={slot}, generation={generation})"
                 )
 
+            if slot in self._cancelling:
+                return
+            self._cancelling.add(slot)
+
+        # keep the lease pinned, not the allocator lock, across driver calls
+        try:
             with torch.cuda.device(self.device_id):
                 stream_wait_value32(
                     self.device_id,
@@ -411,6 +525,12 @@ class StreamOrderedMmFeaturePool:
                         generation,
                         self.transport_name,
                     )
+        except BaseException as error:
+            self._pool_error = error
+            raise
+        else:
+            with self._lock:
+                self._cancelling.remove(slot)
 
     def shutdown(self) -> None:
         self._recycler_stop_event.set()

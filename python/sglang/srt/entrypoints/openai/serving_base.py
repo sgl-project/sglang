@@ -14,6 +14,10 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -120,6 +124,10 @@ class OpenAIServingBase(ABC):
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+        except (MmMemoryOverloaded, MmMemoryRequestTooLarge) as e:
+            return self.create_error_response(
+                message=str(e), err_type=e.error_code, status_code=e.status_code
+            )
         except ValueError as e:
             return self.create_error_response(
                 message=str(e),
@@ -204,12 +212,15 @@ class OpenAIServingBase(ABC):
 
     def create_error_response(
         self,
-        message: str,
+        message: str | ValueError,
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        if isinstance(message, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+            err_type, status_code = message.error_code, message.status_code
+        message = str(message)
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
@@ -222,11 +233,14 @@ class OpenAIServingBase(ABC):
 
     def create_streaming_error_response(
         self,
-        message: str,
+        message: str | Exception,
         err_type: str = "BadRequestError",
         status_code: int = 400,
     ) -> str:
         """Create a streaming error response"""
+        if isinstance(message, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+            err_type, status_code = message.error_code, message.status_code
+        message = str(message)
         error = ErrorResponse(
             object="error",
             message=message,

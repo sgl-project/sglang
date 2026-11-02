@@ -411,10 +411,49 @@ sglang serve \
 
 For multimodal models, you can use `--mm-feature-transport=cuda_ipc` to optimize for latency at the cost of increased GPU memory usage:
 
-- **Default behavior**: Multimodal feature tensors are moved to CPU after processing to save GPU memory
+- **CPU transport**: Multimodal feature tensors are moved to CPU after processing. Automatic transport selection depends on the model and topology; use `--mm-feature-transport cpu` to select this explicitly.
 - **With `--mm-feature-transport=cuda_ipc`**: Feature tensors stay in a bounded GPU pool shared over CUDA IPC, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
 
 Use this option when you have sufficient GPU memory and want to minimize latency for multimodal inference.
+
+### GPU feature-pool admission
+
+On NVIDIA CUDA, normal serving can opt into `--mm-admission-timeout-ms` with
+`--mm-feature-transport cuda_ipc` or `cuda_vmm`. This protects publication into
+the feature pool; it does **not** bound image decoding or preprocessing memory,
+and is not a fix for a CUDA driver hang.
+
+- Unset: keep the existing per-tensor CPU fallback when the pool is full.
+- `0`: reject immediately if the whole publication batch cannot fit now.
+- Positive: wait up to that many milliseconds for pool capacity, then reject.
+
+The publisher reserves all required slices before copying. Waiting requests hold
+no partial slices. Each tokenizer worker allows at most 64 pending publications,
+whose aligned payload bytes together cannot exceed its share of the pool.
+`SGLANG_MM_FEATURE_CACHE_MB` still controls the total pool across tokenizer
+workers; admission does not allocate another pool or change the processor backend.
+EPD and PD are not supported with this option.
+
+OpenAI and Native HTTP requests return `413 / mm_memory_request_too_large` when
+one batch cannot fit even in an empty pool, or `429 / mm_memory_overloaded` when
+the queue is full or the wait expires. Retry only the latter, with backoff.
+If streaming headers have already been sent, the error arrives as an SSE error
+event instead of a different HTTP status. Native Engine calls raise the corresponding
+`MmMemoryRequestTooLarge` or `MmMemoryOverloaded` exception.
+Native gRPC maps these to `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`, respectively.
+
+With `--enable-metrics`, inspect `sglang:mm_publication_requests_total`,
+`sglang:mm_publication_wait_seconds`, and `sglang:mm_publication_state` (pending
+count/bytes, occupied/free bytes, largest free range, and IPC free slots).
+Largest-free-range values are per-worker diagnostics; summing them does not
+describe a single allocation that can fit across workers.
+`sglang:mm_publication_oldest_lease_seconds` shows the oldest unreclaimed slice.
+The `mm_publication_reclaimed_total` and
+`mm_publication_reclaimed_lifetime_seconds_total` counters give the count and
+total lifetime of reclaimed slices (including rollback), not GPU copy time.
+`sglang:mm_publication_cpu_spills_total` stays zero on the guarded path: pressure
+waits or rejects rather than spilling. These observations use CPU bookkeeping;
+they do not add GPU synchronization to a metrics scrape.
 
 ### Multimodal Inputs Limitation
 

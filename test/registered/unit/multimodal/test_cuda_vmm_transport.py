@@ -10,6 +10,7 @@ import os
 import pickle
 import queue
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_vmm_transport_utils import (
     CudaVmmFeatureTransport,
@@ -76,6 +82,71 @@ def _produce_vmm_tensor(proxy_queue, consumer_done, result_queue, mode):
             del pool
         gc.collect()
     result_queue.put(("ok", None))
+
+
+class TestSingleDeviceGuardedVmm(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is required")
+
+    def test_packed_admission_rejects_pressure_and_reclaims(self):
+        pool = _FabricUnavailableCudaVmmMemoryPool(
+            4 << 20, 0.01, 0, 1, allow_posix_fallback=True
+        )
+        publisher = BoundedFeaturePublisher(
+            pool, 0, cpu_tensors=True, pack_features=True
+        )
+        # allocation granularity can enlarge the requested pool
+        nbytes = pool.publication_capacity // 3
+        source = torch.arange(nbytes, dtype=torch.uint8, device="cuda")
+
+        def request(count):
+            return MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                    for _ in range(count)
+                ],
+            )
+
+        async def run():
+            first, second = request(2), request(2)
+            await publisher.prepare([first])
+            proxies = [item.feature for item in first.mm_items]
+            self.assertTrue(
+                all(
+                    isinstance(proxy, CudaVmmPackedTensorTransportProxy)
+                    for proxy in proxies
+                )
+            )
+            self.assertIs(proxies[0]._packed_owner, proxies[1]._packed_owner)
+            self.assertEqual(len(pool.occupied_chunks), 1)
+            with self.assertRaises(MmMemoryOverloaded):
+                await publisher.prepare([second])
+            with self.assertRaises(MmMemoryRequestTooLarge):
+                await publisher.prepare([request(4)])
+            for proxy in proxies:
+                self.assertTrue(
+                    torch.equal(proxy.reconstruct_on_target_device(0), source)
+                )
+            torch.cuda.synchronize()
+            deadline = time.monotonic() + 5
+            while pool.occupied_chunks and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(pool.occupied_chunks, [])
+            await publisher.prepare([second])
+            for item in second.mm_items:
+                pool.cancel_proxy(item.feature)
+            self.assertEqual(pool.occupied_chunks, [])
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+
+        try:
+            asyncio.run(run())
+        finally:
+            publisher.shutdown()
+            _imported_pool_cache_clear()
+            pool.shutdown()
 
 
 class TestCudaVmmTransport(CustomTestCase):

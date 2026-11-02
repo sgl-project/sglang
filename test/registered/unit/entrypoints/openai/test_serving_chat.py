@@ -47,6 +47,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.multimodal.transport.admission import FeaturePublicationAdmission
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -390,6 +391,40 @@ class TestPythonChatTemplateSegments(CustomTestCase):
 
 
 class ServingChatTestCase(CustomTestCase):
+    def test_publication_admission_errors_keep_status_in_chat_api(self):
+        async def run():
+            for nbytes, status, error_type in (
+                (2, 413, "mm_memory_request_too_large"),
+                (1, 429, "mm_memory_overloaded"),
+            ):
+
+                async def generate(*args, **kwargs):
+                    gate = FeaturePublicationAdmission(1, 0)
+                    await gate.acquire(nbytes, lambda: None)
+                    yield  # admission must reject before a token is produced
+
+                for request in (self.basic_req, self.stream_req):
+                    with self.subTest(status=status, stream=request.stream):
+                        with (
+                            patch.object(self.tm, "generate_request", generate),
+                            patch.object(
+                                self.chat,
+                                "_process_messages",
+                                return_value=MessageProcessingResult(
+                                    "Test prompt", [1, 2, 3], None, None, [], [], None
+                                ),
+                            ),
+                        ):
+                            response = await self.chat.handle_request(
+                                request, self.fastapi_request
+                            )
+                        self.assertEqual(response.status_code, status, response.body)
+                        payload = json.loads(response.body)
+                        self.assertEqual(payload["type"], error_type)
+                        self.assertEqual(payload["code"], status)
+
+        asyncio.run(run())
+
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has

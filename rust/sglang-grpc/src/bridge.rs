@@ -14,7 +14,13 @@ use crate::utils::{json_map_to_pydict, py_value_to_json_string};
 pub enum ResponseChunk {
     Data(ResponseData),
     Finished(ResponseData),
-    Error(String),
+    Error(ResponseError),
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseError {
+    pub message: String,
+    pub status_code: i32,
 }
 
 impl ResponseChunk {
@@ -656,12 +662,13 @@ impl ChunkCallback {
         clear_on_ready_for_rid(&self.rid, &self.state);
     }
 
-    #[pyo3(signature = (chunk, finished=false, error=None))]
+    #[pyo3(signature = (chunk, finished=false, error=None, status_code=None))]
     fn __call__(
         &self,
         chunk: &Bound<'_, PyDict>,
         finished: bool,
         error: Option<String>,
+        status_code: Option<i32>,
     ) -> PyResult<ChunkSendStatus> {
         let py = chunk.py();
         let state = lock_or_recover(self.state.as_ref(), "state");
@@ -679,7 +686,10 @@ impl ChunkCallback {
                 &self.runtime_handle,
                 &self.tokio_handle,
                 &sender,
-                ResponseChunk::Error(err_msg),
+                ResponseChunk::Error(ResponseError {
+                    message: err_msg,
+                    status_code: status_code.unwrap_or(500),
+                }),
             );
         }
 
@@ -768,7 +778,10 @@ impl JsonChunkCallback {
                 &self.runtime_handle,
                 &self.tokio_handle,
                 &sender,
-                ResponseChunk::Error(err_msg),
+                ResponseChunk::Error(ResponseError {
+                    message: err_msg,
+                    status_code: status_code.unwrap_or(500),
+                }),
             );
         }
 
