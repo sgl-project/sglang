@@ -1057,6 +1057,9 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {"hisparse_staging": [act.req for act in self.ack_staging_queue]}
+
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
@@ -1238,12 +1241,19 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                device_locs,
-                io_backend="kernel",
-            )
+            if self.is_dsv4_hisparse:
+                # One scattered token per request: a multiple of the page size
+                # must not be mistaken for whole pages.
+                self.mem_pool_host.backup_tokens_from_device_all_layer(
+                    host_locs, device_locs
+                )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs,
+                    io_backend="kernel",
+                )
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
@@ -1545,8 +1555,8 @@ class HiSparseCoordinator:
             device_buffer_locs=self.req_device_buffer_token_locs[host_layer],
             host_cache_k=self.mem_pool_host.k_buffer[host_layer],
             host_cache_v=self.mem_pool_host.v_buffer[host_layer],
-            device_buffer_k=self.mem_pool_device.get_key_buffer(layer_id),
-            device_buffer_v=self.mem_pool_device.get_value_buffer(layer_id),
+            device_buffer_k=self.mem_pool_device.layer_router.read(layer_id).key(),
+            device_buffer_v=self.mem_pool_device.layer_router.read(layer_id).value(),
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,

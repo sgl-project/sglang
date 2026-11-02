@@ -11,6 +11,7 @@ from .utils import (
     _apply_rotary_emb,
     _apply_rotary_emb_complex,
     apply_flashinfer_rope_qk_inplace,
+    rope_positions,
 )
 
 if current_platform.is_npu():
@@ -311,13 +312,9 @@ class RotaryEmbedding(CustomOp):
         batch_size, seq_len, _, head_dim = query.shape
 
         if positions is None:
-            pos_1d = torch.arange(
-                position_offset,
-                position_offset + seq_len,
-                device=query.device,
-                dtype=torch.int64,
+            positions = rope_positions(
+                position_offset, seq_len, batch_size, query.device
             )
-            positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
         else:
             positions = positions.to(device=query.device, dtype=torch.long)
 
@@ -430,13 +427,9 @@ class RotaryEmbedding(CustomOp):
             num_tokens = batch_size * seq_len
 
             if positions is None:
-                pos_1d = torch.arange(
-                    position_offset,
-                    position_offset + seq_len,
-                    device=query.device,
-                    dtype=torch.int64,
+                positions = rope_positions(
+                    position_offset, seq_len, batch_size, query.device
                 )
-                positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
             else:
                 if positions.dim() != 1 or positions.numel() != num_tokens:
                     raise ValueError(

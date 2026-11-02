@@ -14,7 +14,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def build_mrope(
@@ -130,7 +130,7 @@ class TestMRopeAxisMap(CustomTestCase):
             )
 
     def test_qwen35_npu_prefill_and_decode_dispatch(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import qwen3_5
 
         layer = SimpleNamespace(
