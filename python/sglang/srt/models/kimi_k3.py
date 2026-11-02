@@ -1951,14 +1951,22 @@ class KimiK3DeltaAttention(nn.Module):
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
             }.get(backend)
+            state_dtype = self.config.mamba2_cache_params.dtype.temporal
             backend_available = fused_ops is not None and fused_ops.available(
-                f_b_weight.device
+                f_b_weight.device, state_dtype=state_dtype
             )
+            if backend_available:
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    k3_fused_decode_f_b_weight,
+                )
+
+                f_b_weight = k3_fused_decode_f_b_weight(self.f_b_proj)
             if (
                 backend_available
                 and w is not None
                 and tuple(w.shape) == (3 * 12 * 128, 4)
                 and w.dtype == torch.float32
+                and f_b_weight is not None
                 and f_b_weight.shape == (12 * 128, 128)
                 and f_b_weight.dtype == torch.bfloat16
                 and layer.A_log is not None
@@ -1986,6 +1994,7 @@ class KimiK3DeltaAttention(nn.Module):
                     lower_bound=float(layer.lower_bound),
                     norm_weight=norm_weight,
                     norm_eps=float(self.o_norm.eps),
+                    state_dtype=state_dtype,
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops
