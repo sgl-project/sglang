@@ -505,6 +505,11 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     instead of the Marlin-specific format.
     """
 
+    @classmethod
+    def get_min_capability(cls) -> int:
+        # Triton W4A16 MoE kernels support Turing/Volta (sm_70/sm_75) and up
+        return 70
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):
             return
