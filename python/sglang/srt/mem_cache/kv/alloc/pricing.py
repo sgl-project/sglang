@@ -206,6 +206,10 @@ FLUSH_ENDS = "FLUSH_ENDS"
 RELAYOUT = "RELAYOUT"
 PLAN_STEPS = (NO_MOVE, FLUSH_ENDS, RELAYOUT)
 
+# The part of its growth-proportional share of the slack every gap keeps when
+# a rearrangement places floats; the rest may go to keeping floats in place.
+_SHARE_KEPT = (7, 8)
+
 
 class PlanTake(msgspec.Struct, frozen=True, gc=False, kw_only=True):
     """One band's part of a plan, on its own page grid: ``reuse`` holes taken
@@ -347,40 +351,77 @@ def _segment_fits(
     return packed is not None and packed[1] <= high_byte
 
 
-def _segment_starts(
+def _segment_blocks(
     low_byte: int,
     movers: Tuple[Tuple[BandSnapshot, int], ...],
     high_byte: int,
     weights: Tuple[int, ...],
-) -> Tuple[int, ...]:
-    """Start bytes of a segment's placed floats: the demand first, then the
-    slack split between the segment's gaps by ``weights`` (one per gap, evenly
-    when all are zero), each float clamped between its leftmost packed start
-    and its latest start that still lets the floats after it fit (never past
-    its first fixed page)."""
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Start and end bytes of a segment's placed floats.
+
+    The slack (what the leftmost packing leaves) is a store of room for later
+    takes. Split between the segment's gaps in proportion to ``weights`` (each
+    gap's expected growth; evenly when all are zero), it lasts the most takes
+    before the next rearrangement. Each gap keeps at least
+    `_SHARE_KEPT` of that proportional share; within that, a float that already
+    has live pages stays as close to where it is as it can, so a rearrangement
+    copies as few pages as the shares allow. An empty float is placed at its
+    proportional start. Every start stays between the float's leftmost packed
+    start and its latest start that still lets the floats after it fit, and
+    never passes its first fixed page. A float with live pages also keeps its
+    far edge where its span ends, holding its holes, when the gap after it
+    still keeps its share: only the pages its new start leaves behind are
+    copied."""
     _, end = _pack(low_byte, movers)
     slack = high_byte - end
     if not any(weights):
         weights = (1,) * len(weights)
     total = sum(weights)
-    latest = [0] * len(movers)
-    y = high_byte
-    for i in range(len(movers) - 1, -1, -1):
+    share = [slack * w // total for w in weights]
+    kept = [s * _SHARE_KEPT[0] // _SHARE_KEPT[1] for s in share]
+    n = len(movers)
+    latest = [0] * n
+    latest_kept = [0] * n
+    y = y_kept = high_byte
+    y_kept -= kept[n]
+    for i in range(n - 1, -1, -1):
         b, pages = movers[i]
         e = b.page_bytes
-        y = (min(y, b.num_pages * e) - (b.live + pages) * e) // e * e
+        block = (b.live + pages) * e
+        y = (min(y, b.num_pages * e) - block) // e * e
+        y_kept = (min(y_kept, b.num_pages * e) - block) // e * e
         if b.fixed is not None:
             y = min(y, b.fixed[0] * e)
+            y_kept = min(y_kept, b.fixed[0] * e)
         latest[i] = y
+        latest_kept[i] = min(y_kept, y)
+        y_kept = latest_kept[i] - kept[i]
     starts, x = [], low_byte
     for i, (b, pages) in enumerate(movers):
         e = b.page_bytes
         earliest = max(_align_up(x, e), b.min_page * e)
-        gap = slack * weights[i] // total
-        start = min(max(_align_up(x + gap, e), earliest), latest[i])
+        proportional = min(max(_align_up(x + share[i], e), earliest), latest[i])
+        low = max(_align_up(x + kept[i], e), earliest)
+        high = latest_kept[i]
+        if b.live and low <= high:
+            start = min(max(b.low_byte, low), high)
+        else:
+            start = proportional
         starts.append(start)
         x = _block_end(b, pages, start)
-    return tuple(starts)
+    ends = []
+    for i, (b, pages) in enumerate(movers):
+        e = b.page_bytes
+        end = _block_end(b, pages, starts[i])
+        if b.live:
+            # Keep the block's far edge where the float's span ends, its holes
+            # inside, when the next gap still keeps its share: the pages beyond
+            # a compacted block would otherwise be copied in.
+            limit = (starts[i + 1] if i + 1 < n else high_byte) - kept[i + 1]
+            keep_to = min(b.high_byte, limit, b.num_pages * e) // e * e
+            end = max(end, keep_to)
+        ends.append(end)
+    return tuple(starts), tuple(ends)
 
 
 def _gap_weights(
@@ -474,11 +515,10 @@ def plan(
     for low_byte, segment, high_byte, right in segments:
         if segment:
             weights = _gap_weights(snapshot, left, segment, right, growth)
-            starts = _segment_starts(low_byte, segment, high_byte, weights)
-            for (b, pages), start in zip(segment, starts):
+            starts, ends = _segment_blocks(low_byte, segment, high_byte, weights)
+            for (b, pages), start, end in zip(segment, starts, ends):
                 first = start // b.page_bytes
                 if b.live:
-                    end = _block_end(b, pages, start)
                     targets[b.name] = (first, end // b.page_bytes)
                     takes[b.name] = PlanTake(reuse=pages, low_byte=start, high_byte=end)
                 else:

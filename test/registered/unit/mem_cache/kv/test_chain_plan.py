@@ -270,7 +270,11 @@ class TestChainPlan(CustomTestCase):
                 if b.name in found.targets:
                     first, end = found.targets[b.name]
                     if b.fixed is None:
-                        self.assertEqual(end - first, b.live + pages)
+                        # Live pages and the demand, plus at most the holes the
+                        # float keeps by keeping its far edge where it was.
+                        self.assertGreaterEqual(end - first, b.live + pages)
+                        if end - first > b.live + pages:
+                            self.assertLessEqual(end * e, b.high_byte)
                     else:
                         self.assertGreaterEqual(end - first, b.live + pages)
                         self.assertLessEqual(first, b.fixed[0])
@@ -427,6 +431,72 @@ if __name__ == "__main__":
 class TestPlacement(CustomTestCase):
     """Where a layout places floats and which ends it compacts: never whether
     one exists."""
+
+    def test_placement_inputs_never_change_whether_a_layout_exists(self):
+        for chain, demands, rng in _instances(7, 3000):
+            growth = {b.name: rng.choice((0, 0, 1, 5, 64)) for b in chain.bands}
+            for step in PLAN_STEPS:
+                plain = plan(chain, demands, step) is not None
+                self.assertEqual(
+                    plan(chain, demands, step, growth=growth) is not None, plain
+                )
+            self.assertEqual(
+                first_plan(chain, demands, growth=growth) is not None,
+                feasible(chain, demands),
+            )
+
+    def _left_grows(self, growth):
+        # An up end full against a float of 4 live pages, plenty of room to
+        # the float's right before the down end.
+        up = _band("up", "up", 1, num_pages=100, min_page=0, low=0, high=20, live=20)
+        mid = _band(
+            "mid", "float", 1, num_pages=100, min_page=1, low=20, high=24, live=4
+        )
+        down = _band(
+            "down", "down", 1, num_pages=100, min_page=1, low=90, high=100, live=10
+        )
+        chain = _chain((up, mid, down), 100)
+        return plan(chain, {"up": 2}, RELAYOUT, growth=growth)
+
+    def test_the_slack_goes_to_the_side_that_grows(self):
+        # 66 pages of slack after the demand; the up end alone grows, so the
+        # gap below the float keeps at least 7/8 of it, where an even split
+        # would leave the float half way.
+        first, end = self._left_grows({"up": 4}).targets["mid"]
+        slack = 90 - 22 - 4
+        self.assertGreaterEqual(first - 22, slack * 7 // 8)
+        self.assertLessEqual(end, 90)
+        even_first, _ = self._left_grows({}).targets["mid"]
+        self.assertLess(even_first, first)
+
+    def test_a_float_with_room_keeps_its_place(self):
+        # The float already sits where both gaps keep their shares: a
+        # relayout for the down end's demand does not move it.
+        up = _band("up", "up", 1, num_pages=100, min_page=0, low=0, high=10, live=10)
+        mid = _band(
+            "mid", "float", 1, num_pages=100, min_page=1, low=45, high=50, live=5
+        )
+        down = _band(
+            "down", "down", 1, num_pages=100, min_page=1, low=90, high=100, live=10
+        )
+        chain = _chain((up, mid, down), 100)
+        found = plan(chain, {"down": 3}, RELAYOUT)
+        self.assertEqual(found.targets["mid"], (45, 50))
+
+    def test_a_moved_float_keeps_its_far_edge_and_holes(self):
+        # A float of 4 live pages spread over [20, 40), the down end at 50.
+        # The up end's 3 pages push the float's start to 32 (each gap keeps
+        # 7/8 of an even share of the 23 pages of slack); its end stays at 40,
+        # holding its holes, so only the pages below 32 are copied.
+        up = _band("up", "up", 1, num_pages=100, min_page=0, low=0, high=20, live=20)
+        mid = _band(
+            "mid", "float", 1, num_pages=100, min_page=1, low=20, high=40, live=4
+        )
+        down = _band(
+            "down", "down", 1, num_pages=100, min_page=1, low=50, high=100, live=50
+        )
+        chain = _chain((up, mid, down), 100)
+        self.assertEqual(plan(chain, {"up": 3}, RELAYOUT).targets["mid"], (32, 40))
 
     def test_only_the_ends_a_layout_needs_are_compacted(self):
         # The float grows by 5 and has no room in place; compacting the up
