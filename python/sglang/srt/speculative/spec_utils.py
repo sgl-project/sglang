@@ -16,9 +16,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
@@ -37,9 +34,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.runtime_context import (
