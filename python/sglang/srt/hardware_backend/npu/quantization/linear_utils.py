@@ -1,9 +1,86 @@
+"""Shared weight preparation and bias handling for NPU linear methods."""
+
 from typing import List, Optional
 
 import torch
 from torch.nn import Module
+from torch.nn.parameter import Parameter
+
+from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
+    _dequant_e4m3fn_to_float32,
+)
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
+
+
+def create_unquantized_linear_weight(
+    layer: torch.nn.Module,
+    input_size_per_partition: int,
+    output_partition_sizes,
+    params_dtype: torch.dtype,
+    **extra_weight_attrs,
+):
+    from sglang.srt.layers.parameter import ModelWeightParameter
+
+    output_size_per_partition = sum(output_partition_sizes)
+    weight_loader = extra_weight_attrs.get("weight_loader")
+
+    layer.logical_widths = output_partition_sizes
+    layer.input_size_per_partition = input_size_per_partition
+    layer.output_size_per_partition = output_size_per_partition
+    layer.orig_dtype = params_dtype
+
+    # Load weights in original dtype; quantise later in process_weights_after_loading
+    weight = ModelWeightParameter(
+        data=torch.empty(
+            output_size_per_partition,
+            input_size_per_partition,
+            dtype=params_dtype,
+        ),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=weight_loader,
+    )
+    layer.register_parameter("weight", weight)
+
+
+def cache_linear_bias_fp32(layer: torch.nn.Module):
+    # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+    if getattr(layer, "bias", None) is not None and layer.bias.dtype != torch.float32:
+        layer.bias_fp32 = Parameter(
+            layer.bias.data.to(torch.float32), requires_grad=False
+        )
+    else:
+        layer.bias_fp32 = None
+
+
+def get_linear_bias_fp32(layer: torch.nn.Module, bias):
+    if bias is None:
+        quant_bias = None
+    elif (
+        bias is getattr(layer, "bias", None)
+        and getattr(layer, "bias_fp32", None) is not None
+    ):
+        quant_bias = layer.bias_fp32
+    else:
+        quant_bias = bias.to(torch.float32)
+    return quant_bias
+
+
+def prepare_w8a8_int8_linear_weights(
+    layer: torch.nn.Module, *, weight_scale_required: bool = True
+):
+    layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+    layer.weight.data = npu_format_cast(layer.weight.data)
+
+    # Static W8A8S exports may supply deq_scale without weight_scale;
+    # dynamic W8A8 still requires weight_scale for its matmul.
+    if weight_scale_required or hasattr(layer, "weight_scale"):
+        layer.weight_scale.data = layer.weight_scale.data.flatten()
+    # Compressed-tensors format doesn't have this field
+    if hasattr(layer, "weight_offset"):
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
 def process_npu_arch35_mxfp8_linear_weights(
@@ -23,27 +100,6 @@ def process_npu_arch35_mxfp8_linear_weights(
         _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
     else:
         _layout_npu_arch35_e4m3_weights(layer, weight_block_size)
-
-
-def _dequant_e4m3fn_to_float32(u8: torch.Tensor) -> torch.Tensor:
-    """Decode float8_e4m3fn payload bytes to FP32 by explicit bit layout.
-
-    Direct ``.to(torch.float32)`` on NPU fp8 tensors fails on some CANN builds
-    (aclnnInplaceCopy error 561103), so decode manually. Only used at
-    weight-load time, where the extra elementwise ops are irrelevant.
-    """
-    bits = u8.view(torch.uint8).to(torch.int32)
-    sign = torch.where(bits >= 0x80, -1.0, 1.0)
-    e = ((bits >> 3) & 0xF).to(torch.float32)
-    m = (bits & 0x7).to(torch.float32)
-    mag = torch.where(
-        e == 0.0,
-        m * (1.0 / 512.0),  # subnormal: m * 2^-9
-        (1.0 + m / 8.0) * torch.pow(2.0, e - 7.0),
-    )
-    # e4m3fn reserves S.1111.111 for NaN (no infinities); max finite is 448.
-    mag = torch.where((e == 15.0) & (m == 7.0), float("nan"), mag)
-    return sign * mag
 
 
 def _layout_npu_arch35_e4m3_weights(
