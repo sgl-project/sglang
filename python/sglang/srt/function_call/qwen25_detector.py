@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 from typing import List
 
@@ -8,10 +7,9 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallParseError,
     _GetInfoFunc,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class Qwen25Detector(BaseFormatDetector):
@@ -39,6 +37,8 @@ class Qwen25Detector(BaseFormatDetector):
         self.eot_token = "\n</tool_call>"
         self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
+        self._validation_tail = ""
+        self._validation_parts: list[str] | None = None
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
@@ -62,15 +62,48 @@ class Qwen25Detector(BaseFormatDetector):
         match_result_list = re.findall(pattern, text, re.DOTALL)
         calls = []
         for match_result in match_result_list:
-            try:
-                parsed_call = json.loads(match_result.strip())
-                calls.extend(self.parse_base_json(parsed_call, tools))
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}"
-                )
-                continue
+            parsed_call = self._parse_complete_json(match_result)
+            calls.extend(self.parse_base_json(parsed_call, tools))
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    @staticmethod
+    def _parse_complete_json(payload: str):
+        try:
+            return json.loads(payload.strip())
+        except json.JSONDecodeError:
+            # Do not include generated arguments in the error or server logs.
+            raise ToolCallParseError(
+                "Invalid JSON in a complete tool-call block. Check that the "
+                "model's tool-call format matches the selected JSON parser."
+            ) from None
+
+    def _validate_streaming_json(self, new_text: str) -> None:
+        # Keep validation independent of the base parser's buffer: it may
+        # consume a JSON object before a trailing syntax error or end tag arrives.
+        # Save fragments and join once per complete call, avoiding a second
+        # quadratic string accumulation on long streaming arguments.
+        text = self._validation_tail + new_text
+        self._validation_tail = ""
+        while text:
+            marker = (
+                self.bot_token if self._validation_parts is None else self.eot_token
+            )
+            index = text.find(marker)
+            if index == -1:
+                keep = min(len(text), len(marker) - 1)
+                if self._validation_parts is not None and len(text) > keep:
+                    self._validation_parts.append(text[:-keep])
+                self._validation_tail = text[-keep:]
+                return
+
+            if self._validation_parts is None:
+                self._validation_parts = []
+            else:
+                self._validation_parts.append(text[:index])
+                payload = "".join(self._validation_parts)
+                self._validation_parts = None
+                self._parse_complete_json(payload)
+            text = text[index + len(marker) :]
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -79,6 +112,10 @@ class Qwen25Detector(BaseFormatDetector):
         Streaming incremental parsing for Qwen 2.5 tool calls.
         Uses base class implementation with buffering to handle partial end tokens.
         """
+        # Incomplete blocks may still be repaired by later tokens or cut short
+        # by the token limit. Only reject a block once its closing tag arrives.
+        self._validate_streaming_json(new_text)
+
         result = super().parse_streaming_increment(new_text, tools)
 
         # Handle partial end tokens that are streamed character by character
