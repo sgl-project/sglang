@@ -93,6 +93,8 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._wait_poll_ms = 0
     manager._transfer_timeout_ms = 0
+    manager._mori_backend = "rdma"
+    manager._fabric_staging = False
     return manager
 
 
@@ -265,7 +267,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             side_effect=(0.0, 0.002),
         ):
             with self.assertRaises(KeyboardInterrupt):
-                manager._transfer_worker(queue)
+                manager._transfer_worker(queue, 0)
 
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
@@ -283,7 +285,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         with patch("sglang.srt.disaggregation.mori.conn.logger.exception"):
             with self.assertRaises(KeyboardInterrupt):
-                manager._transfer_worker(queue)
+                manager._transfer_worker(queue, 0)
 
         self.assertNotIn(11, manager._staging_outstanding)
         manager.conclude_failure.assert_called_once()

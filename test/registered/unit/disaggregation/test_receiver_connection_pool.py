@@ -181,6 +181,7 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.rank_port = 5000
         manager.attn_tp_size = 2
         manager.dcp_size, manager.dcp_rank = 1, 0
+        manager._fabric_staging, manager._staging_slots = False, None
         manager.kv_args = SimpleNamespace(
             kv_data_ptrs=[0x1000],
             kv_data_lens=[256],
