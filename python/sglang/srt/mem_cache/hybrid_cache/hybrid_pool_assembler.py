@@ -2867,13 +2867,17 @@ def build_minimax_sparse_hicache_stack(
                 start_layer=index_k_pool.start_layer,
                 end_layer=index_k_pool.end_layer,
             )
+            # NVFP4 page rows report compact layer ids, not the sparse model layers.
+            index_layer_ids = tuple(sparse_pool.index_k_layer_id_mapping)
         else:
+            (index_info,) = index_k_pool.get_device_pool_infos()
             index_host_pool = MHATokenToKOnlyPoolHost(
-                index_k_pool,
-                kv_host_pool,
-                get_memory().hicache_mem_layout,
+                buffer_info=index_info.buffer_info,
+                anchor_host=kv_host_pool,
+                layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
             )
+            index_layer_ids = index_info.layer_ids
         entries.append(
             build_pool_entry(
                 name=PoolName.INDEXER,
@@ -2881,7 +2885,7 @@ def build_minimax_sparse_hicache_stack(
                 device_pool=index_k_pool,
                 layer_mapping={
                     gid - start_layer: sub_id
-                    for gid, sub_id in sparse_pool.index_k_layer_id_mapping.items()
+                    for sub_id, gid in enumerate(index_layer_ids)
                 },
                 transfer_layer_id_max=transfer_layer_id_max,
             )
