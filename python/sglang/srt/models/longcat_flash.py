@@ -606,7 +606,11 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = get_stream("alt")
+        self.alt_stream = (
+            get_stream("alt")
+            if not _is_npu or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
         with layer_stack():
             self.layers = nn.ModuleList(
                 [
