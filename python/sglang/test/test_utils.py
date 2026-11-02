@@ -910,8 +910,11 @@ def _assert_pd_server_gpus_visible(other_args, env: Optional[dict]) -> None:
     A runner that has lost a GPU otherwise fails a rank deep in startup with
     `invalid device ordinal`, which reads like a code bug. Counts only TP x PP
     on one node, a lower bound on what the server uses, so this never rejects
-    a launch that could have started.
+    a launch that could have started. Runs only on the H20 CI runners, which
+    are the ones seen losing a GPU.
     """
+    if not os.environ.get("RUNNER_LABELS", "").endswith("-gpu-h20"):
+        return
     # A server env that remaps devices sees a different set than this process.
     if env is not None and any(
         env.get(var, os.environ.get(var)) != os.environ.get(var)
