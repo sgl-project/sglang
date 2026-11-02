@@ -247,15 +247,15 @@ class TestPerRequestSpecOptOut(CustomTestCase):
             ),
         ):
             sampler = sampler_impl.Sampler()
-            # Exercise both unrestricted sampling and top-k/top-p/min-p filtering.
+            # The ordinary sampler supports seeded top-k/top-p, but explicitly
+            # rejects seeded min-p. Cover min-p only on its unseeded path.
             for filtered in (False, True):
-                info.need_top_k_sampling = info.need_top_p_sampling = (
-                    info.need_min_p_sampling
-                ) = filtered
+                info.need_top_k_sampling = info.need_top_p_sampling = filtered
+                info.need_min_p_sampling = filtered and not seeded
                 if filtered:
                     info.top_ks.fill_(4)
                     info.top_ps.fill_(0.9)
-                    info.min_ps.fill_(0.01)
+                    info.min_ps.fill_(0.0 if seeded else 0.01)
                 torch.manual_seed(1234)
                 actual = _sample_spec_opt_out_roots(
                     output.next_token_logits, verify, batch, sampler
