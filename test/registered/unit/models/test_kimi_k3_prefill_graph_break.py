@@ -85,7 +85,7 @@ def test_as_eager_prefill_restores_on_error(prefill_graph_flags):
     _assert_graph_state(prefill_graph_flags)
 
 
-def _fake_layer(seen):
+def _fake_layer(seen, skips_capture_warmup=False):
     def inner(hidden_states, positions, forward_batch, zero_allocator):
         seen.append(
             dict(
@@ -96,7 +96,10 @@ def _fake_layer(seen):
         )
         return hidden_states * 2
 
-    return SimpleNamespace(_run_self_attn_inner=inner)
+    return SimpleNamespace(
+        _run_self_attn_inner=inner,
+        _mla_skips_capture_warmup=skips_capture_warmup,
+    )
 
 
 def test_mla_break_runs_live_rows_and_plans_once(prefill_graph_flags, monkeypatch):
@@ -142,3 +145,25 @@ def test_mla_break_without_live_batch_uses_static_batch(
     kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(_fake_layer(seen), hidden, out)
     assert seen[0]["batch"] is prefill_graph_flags and seen[0]["rows"] == 4
     torch.testing.assert_close(out, hidden * 2)
+
+
+def test_dsa_dcp_break_skips_capture_warmup(prefill_graph_flags, monkeypatch):
+    # K3.1 DSA under DCP: the capture batch has no DCP-sharded KV layout, so
+    # the warm-up break only zeroes its output; a replay attends the live batch.
+    monkeypatch.setattr(
+        kimi_k3,
+        "get_attn_backend",
+        lambda: SimpleNamespace(init_forward_metadata=lambda fb: None),
+    )
+    prefill_graph_flags.positions = torch.arange(4)
+    seen = []
+    layer = _fake_layer(seen, skips_capture_warmup=True)
+    hidden = torch.ones(4, 2)
+    out = torch.full((4, 2), 3.0)
+    kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(layer, hidden, out)
+    assert seen == [] and torch.count_nonzero(out) == 0
+    prefill_graph_flags.live_forward_batch = SimpleNamespace(positions=torch.arange(2))
+    kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(layer, hidden, out)
+    assert [s["rows"] for s in seen] == [2]
+    torch.testing.assert_close(out[:2], hidden[:2] * 2)
+    assert torch.count_nonzero(out[2:]) == 0

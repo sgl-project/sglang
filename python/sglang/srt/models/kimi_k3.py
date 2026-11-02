@@ -2959,6 +2959,15 @@ class KimiK3DecoderLayer(nn.Module):
         # gather, sparse MLA) reads per-batch host metadata.
         self._mla_eager_under_prefill_graph = not config.is_kda_layer(layer_idx)
         self._breakable_mla_self_attn = eager_on_graph(self._mla_self_attn_eager)
+        # K3.1 DSA under attention DCP reads every request's KV and index-K rows
+        # back through req_to_token, sharded by widened slot id across the DCP
+        # ranks. A capture batch's requests have no such layout (their table rows
+        # are unset), so the sharded gather cannot run on it.
+        self._mla_skips_capture_warmup = (
+            self._mla_eager_under_prefill_graph
+            and getattr(self.self_attn, "use_dsa", False)
+            and get_parallel().attn_dcp_size > 1
+        )
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -3098,6 +3107,11 @@ class KimiK3DecoderLayer(nn.Module):
         planned on (absent at capture, where the dummy batch is unpadded)."""
         static_batch = get_tc_piecewise_forward_context().forward_batch
         live_batch = getattr(static_batch, "live_forward_batch", None)
+        if live_batch is None and self._mla_skips_capture_warmup:
+            # Capture warm-up of K3.1 DSA under DCP. The break is opaque to the
+            # graph: its output feeds only the warm-up of the captured segments.
+            out.zero_()
+            return
         forward_batch = static_batch if live_batch is None else live_batch
         num_tokens = forward_batch.positions.shape[0]
         with _as_eager_prefill(forward_batch):
