@@ -98,7 +98,21 @@ async def process_sample(
         image_url = f"data:{mime};base64,{b64}"
     else:
         image_url = image_path
-    extra_body = {"lora_path": lora_path} if lora_path else None
+    # CLI sampling options can include SGLang extensions that are not OpenAI
+    # SDK keyword arguments. Send them as request-body fields instead.
+    request_params = dict(sampling_params)
+    sdk_options = {
+        key: request_params.pop(key)
+        for key in ("extra_headers", "extra_query", "timeout")
+        if key in request_params
+    }
+    extra_body = {"lora_path": lora_path} if lora_path else {}
+    extra_body.update(request_params)
+    if reasoning_effort:
+        extra_body["reasoning_effort"] = reasoning_effort
+    nested_extra_body = extra_body.pop("extra_body", None)
+    if nested_extra_body:
+        extra_body.update(nested_extra_body)
     payload = {
         "model": model,
         "messages": [
@@ -111,12 +125,9 @@ async def process_sample(
                 ],
             }
         ],
-        "extra_body": extra_body,
-        **sampling_params,
+        "extra_body": extra_body or None,
     }
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
-    response = await client.chat.completions.create(**payload)
+    response = await client.chat.completions.create(**payload, **sdk_options)
     msg = response.choices[0].message
     content = msg.content
     if content is None:
