@@ -19,8 +19,6 @@ from typing import Any
 
 import torch
 
-KVPair = tuple[torch.Tensor, torch.Tensor]
-
 DEFAULT_SINK_SIZE = 8
 DEFAULT_RETRIEVED_SIZE = 32
 DEFAULT_RECENT_SIZE = 32
@@ -464,56 +462,6 @@ def resolve_frustum_selector(
         temporal_compression_factor=temporal_compression_factor,
         fps=fps,
     )
-
-
-class SelectedHistory(Sequence):
-    """Read-only per-layer view of the archive restricted to ``frame_ids``.
-
-    Indexable like ``list[KVPair]`` so the transformer gathers one layer at a
-    time and frees it after attention instead of materializing every layer's
-    selected K/V at once.
-    """
-
-    def __init__(
-        self,
-        archive: Sequence[KVPair],
-        *,
-        frame_ids: Sequence[int],
-        tokens_per_frame: int,
-    ) -> None:
-        if not archive:
-            raise ValueError("SelectedHistory needs a non-empty archive.")
-        stored = archive[0][0].shape[1] // tokens_per_frame
-        ids = list(frame_ids)
-        if ids != sorted(set(ids)) or (ids and (ids[0] < 0 or ids[-1] >= stored)):
-            raise ValueError(
-                f"Selected frames must be ordered unique committed frames, got {ids} "
-                f"with {stored} committed."
-            )
-        self._archive = archive
-        self._frame_ids = tuple(ids)
-        self._positions = torch.tensor(
-            [
-                frame * tokens_per_frame + i
-                for frame in ids
-                for i in range(tokens_per_frame)
-            ],
-            dtype=torch.long,
-            device=archive[0][0].device,
-        )
-
-    @property
-    def frame_ids(self) -> tuple[int, ...]:
-        return self._frame_ids
-
-    def __len__(self) -> int:
-        return len(self._archive)
-
-    def __getitem__(self, layer: int) -> KVPair:  # type: ignore[override]
-        key, value = self._archive[layer]
-        return key.index_select(1, self._positions), value.index_select(
-            1, self._positions
-        )
 
 
 def describe_selection(
