@@ -79,9 +79,15 @@ def _b64_encode_images(images: list[bytes]) -> list[str]:
 
 
 async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
-    return await asyncio.gather(
-        *(cloud_storage.upload_and_cleanup(path) for path in paths)
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
     )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 def _fallback_image_urls(

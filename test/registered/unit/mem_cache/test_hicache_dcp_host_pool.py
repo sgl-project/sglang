@@ -19,6 +19,8 @@ import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.kv.layout.mha import MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -144,6 +146,64 @@ class TestDcpKernelIndices(CustomTestCase):
 
 
 class TestHostPoolSizingUnderDcp(CustomTestCase):
+    def test_storage_shard_identity_follows_mla_layout(self):
+        """Unified and static MLA keep one storage writer per DCP shard."""
+        for view_type, is_mla in (
+            (MLATokenToKVPool, True),
+            (MLAView, True),
+            (MHAView, False),
+        ):
+            for dcp_size in (1, 2):
+                for tp_rank in range(4):
+                    with self.subTest(
+                        view=view_type.__name__, dcp_size=dcp_size, tp_rank=tp_rank
+                    ):
+                        controller = HiCacheController.__new__(HiCacheController)
+                        controller.mem_pool_device = view_type.__new__(view_type)
+                        controller.mem_pool_host = SimpleNamespace(
+                            layout="page_first", storage_format_tag=None
+                        )
+                        controller.storage_host_pool = controller.mem_pool_host
+                        controller.enable_storage_metrics = False
+                        controller.page_size = PHYSICAL_PAGE * dcp_size
+                        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+                        with (
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.get_memory",
+                                return_value=SimpleNamespace(
+                                    hicache_storage_key_scheme="rank-suffix"
+                                ),
+                            ),
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.get_parallel",
+                                return_value=SimpleNamespace(
+                                    tp_rank=tp_rank,
+                                    tp_size=4,
+                                    pp_rank=0,
+                                    pp_size=1,
+                                    attn_dcp_size=dcp_size,
+                                    attn_dcp_rank=tp_rank % dcp_size,
+                                ),
+                            ),
+                            mock.patch(
+                                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                                return_value=False,
+                            ),
+                        ):
+                            if dcp_size > 1 and not is_mla:
+                                with self.assertRaisesRegex(ValueError, "requires MLA"):
+                                    controller._generate_storage_config()
+                                continue
+                            config = controller._generate_storage_config()
+                        self.assertEqual(config.is_mla_model, is_mla)
+                        self.assertEqual(
+                            config.is_storage_writer, not is_mla or tp_rank < dcp_size
+                        )
+                        if dcp_size > 1:
+                            self.assertEqual(
+                                config.logical_page_size, PHYSICAL_PAGE * dcp_size
+                            )
+
     @staticmethod
     def _attach_storage(pool, mode="cache"):
         cc = HiCacheController.__new__(HiCacheController)
@@ -157,6 +217,10 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         cc._create_sync_groups = mock.Mock(return_value=[])
         cc._generate_storage_config = mock.Mock()
         with (
+            mock.patch(
+                "sglang.srt.managers.cache_controller.get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="rank-suffix"),
+            ),
             mock.patch(
                 "sglang.srt.managers.cache_controller.get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=pool.dcp_size),

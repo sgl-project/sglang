@@ -220,6 +220,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         return x
 
     experts.quant_method = None
+    experts.supports_routed_deferred_finalize = False
     experts.moe_runner_config = SimpleNamespace(inplace=False)
     gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate
     moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
@@ -228,6 +229,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         tp_size=4,
         reduce_results=True,
         is_deepseek_v4=True,
+        shared_experts=None,
         _shared_expert_tp1=shared_tp1,
         layer_id=0,
         is_nextn=False,
@@ -387,10 +389,7 @@ def _engram_table(rows):
         .flatten(1)
         .to(torch.bfloat16)
     )
-    with (
-        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
-        torch.device("cuda"),
-    ):
+    with torch.device("cuda"):
         # One hash column per rank, so TP4 takes the column-aligned split.
         bounds = tuple(rows * c // 4 for c in range(5))
         embed = EngramEmbedding(rows, 128, layer_id=1, column_bounds=bounds)

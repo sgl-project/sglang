@@ -6,15 +6,16 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    select_new_output_ids,
+    token_output_sse_chunks,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    DeltaMessage,
     FunctionResponse,
+    ResponsesRequest,
     ToolCall,
 )
-from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.inkling_output import (
     InklingOutputDelta,
@@ -144,60 +145,29 @@ class InklingChatEncodingAdapter:
                 keep_matched_stop=request.no_stop_trim,
             )
 
-        chunk_fields = dict(
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
+        if delta.tool_calls:
+            has_tool_calls[index] = True
+        return token_output_sse_chunks(
             chunk_id=content["meta_info"]["id"],
             created=created,
             model=request.model,
             index=index,
             usage=usage,
+            logprobs=choice_logprobs,
+            reasoning=delta.reasoning,
+            content=delta.content,
+            tool_calls=[
+                self._tool_call(call, history_tool_calls_cnt)
+                for call in delta.tool_calls
+            ],
         )
-
-        chunks = []
-        remaining_logprobs = choice_logprobs
-        if delta.reasoning:
-            chunks.append(
-                build_sse_content(
-                    reasoning_content=delta.reasoning,
-                    logprobs=remaining_logprobs,
-                    **chunk_fields,
-                )
-            )
-            remaining_logprobs = None
-        if delta.content:
-            chunks.append(
-                build_sse_content(
-                    content=delta.content, logprobs=remaining_logprobs, **chunk_fields
-                )
-            )
-            remaining_logprobs = None
-        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
-        for call in delta.tool_calls:
-            has_tool_calls[index] = True
-            tool_call_chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=chunk_fields["created"],
-                choices=[
-                    ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(
-                            tool_calls=[self._tool_call(call, history_tool_calls_cnt)]
-                        ),
-                        finish_reason=None,
-                    )
-                ],
-                model=request.model,
-                usage=usage,
-            )
-            chunks.append(f"data: {tool_call_chunk.model_dump_json()}\n\n")
-        if remaining_logprobs is not None:
-            chunks.append(
-                build_sse_content(logprobs=remaining_logprobs, **chunk_fields)
-            )
-        return chunks
 
     def parse_responses_output(
         self,
         *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
         output_ids: list[int],
         finish_reason: dict[str, Any] | None,
         separate_reasoning: bool,
@@ -214,7 +184,12 @@ class InklingChatEncodingAdapter:
         return delta.reasoning, delta.content, _tool_call_items(delta)
 
     def new_responses_stream(
-        self, *, separate_reasoning: bool, parse_tool_calls: bool
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
     ) -> InklingResponsesStream:
         return InklingResponsesStream(
             separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
@@ -278,24 +253,6 @@ def _tool_call_items(delta: InklingOutputDelta) -> list[ToolCallItem]:
         ToolCallItem(tool_index=call.index, name=call.name, parameters=call.arguments)
         for call in delta.tool_calls
     ]
-
-
-def select_new_output_ids(
-    *,
-    output_ids: list[int],
-    num_consumed_tokens: int,
-    completion_tokens: int,
-    finish_reason_type: str | None,
-    incremental: bool,
-) -> list[int]:
-    if not incremental:
-        # Intermediate chunks share the live output list; completion_tokens is
-        # this chunk's snapshot, so later tokens wait for their own chunk.
-        return output_ids[num_consumed_tokens:completion_tokens]
-    if finish_reason_type == "abort":
-        # The abort chunk re-sends already-streamed tokens.
-        return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
-    return output_ids
 
 
 _TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2"

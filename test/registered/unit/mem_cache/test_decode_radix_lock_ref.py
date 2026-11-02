@@ -412,7 +412,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
         )
         req.lock = lock
-        req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -453,6 +452,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # auto-create one and break the `available_size() <= 0` comparison in
         # pop_preallocated.
         queue.req_to_token_pool.mamba_allocator = None
+        queue.req_to_token_pool.holds_state_slots = False
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
         queue.token_to_kv_pool = MagicMock()

@@ -117,28 +117,28 @@ class TestEffortBudget(CustomTestCase):
                 renderer.parse_effort_budget(value)
 
 
-class TestRecipeEncoder(CustomTestCase):
+class TestDeepSeekRecipe(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         from tokenizers import Tokenizer
 
         cls.tokenizer = Tokenizer.from_file(_tokenizer_file())
-        cls.encoder = renderer.RecipeEncoder("dsv41", cls.tokenizer)
+        cls.deepseek_recipe = renderer.DeepSeekRecipe("dsv41", cls.tokenizer)
 
     def _ids(self, *tokens):
         return [self.tokenizer.token_to_id(token) for token in tokens]
 
     def test_encodes_with_the_served_vocabulary(self):
         self.assertEqual(
-            self.encoder.encode(
+            self.deepseek_recipe.encode(
                 {"messages": [{"role": "user", "content": ""}], "thinking": False}
             ),
             self._ids(
                 "<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "</think>"
             ),
         )
-        thinking = self.encoder.encode(
+        thinking = self.deepseek_recipe.encode(
             {"messages": [{"role": "user", "content": "hi"}], "thinking": True}
         )
         self.assertEqual(thinking[-2:], self._ids("<｜Assistant｜>", "<think>"))
@@ -149,7 +149,7 @@ class TestRecipeEncoder(CustomTestCase):
                 "messages": [{"role": "user", "content": "hello"}],
                 "thinking": thinking,
             }
-            plain = self.encoder.encode(body)
+            plain = self.deepseek_recipe.encode(body)
             for task, token in renderer.TASK_TOKENS.items():
                 with self.subTest(thinking=thinking, task=task):
                     expected = (
@@ -157,7 +157,9 @@ class TestRecipeEncoder(CustomTestCase):
                         if task == "action"
                         else plain[:-2] + self._ids(token)
                     )
-                    self.assertEqual(self.encoder.encode(body, task=task), expected)
+                    self.assertEqual(
+                        self.deepseek_recipe.encode(body, task=task), expected
+                    )
         continued = {
             "messages": [
                 {"role": "user", "content": "count"},
@@ -167,12 +169,12 @@ class TestRecipeEncoder(CustomTestCase):
             "continue_final_message": True,
         }
         with self.assertRaisesRegex(ValueError, "end with a user message"):
-            self.encoder.encode(continued, task="query")
+            self.deepseek_recipe.encode(continued, task="query")
 
     def test_effort_budget_rewrites_the_effort_line(self):
         body = {"messages": [{"role": "user", "content": "hi"}], "thinking": True}
         high = self.tokenizer.decode(
-            self.encoder.encode({**body, "reasoning_effort": "high"}),
+            self.deepseek_recipe.encode({**body, "reasoning_effort": "high"}),
             skip_special_tokens=False,
         )
         self.assertIn("Reasoning Effort: 75 (range 1-100", high)
@@ -182,18 +184,19 @@ class TestRecipeEncoder(CustomTestCase):
                     "Reasoning Effort: 75 ", f"Reasoning Effort: {budget} ", 1
                 )
                 self.assertEqual(
-                    self.encoder.encode(body, effort_budget=budget),
+                    self.deepseek_recipe.encode(body, effort_budget=budget),
                     self.tokenizer.encode(expected, add_special_tokens=False).ids,
                 )
         # Chat mode renders no effort line, so the budget changes nothing.
         chat = {"messages": [{"role": "user", "content": "hi"}], "thinking": False}
         self.assertEqual(
-            self.encoder.encode(chat, effort_budget=30), self.encoder.encode(chat)
+            self.deepseek_recipe.encode(chat, effort_budget=30),
+            self.deepseek_recipe.encode(chat),
         )
 
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
-            self.encoder.encode(
+            self.deepseek_recipe.encode(
                 {
                     "messages": [{"role": "user", "content": "hi"}],
                     "thinking": True,

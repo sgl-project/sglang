@@ -29,6 +29,8 @@ TASK_TOKENS = {
     "title": "<｜title｜>",
     "read_url": "<｜read_url｜>",
 }
+# `action` follows the generation header; the other tasks replace it.
+TASKS_AFTER_HEADER = ("action",)
 # V4.1 renders an integer budget as this line; recipe's "high" tier is budget 75.
 BUDGET_TIER, BUDGET_TIER_VALUE = "high", 75
 BUDGET_LINE = "Reasoning Effort: {budget}"
@@ -100,7 +102,7 @@ def _error_message(body: Any) -> str:
         return str(body)
 
 
-class RecipeEncoder:
+class DeepSeekRecipe:
     """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
     with its own copy of it, and the SGLang extensions splice ids from the original."""
 
@@ -108,21 +110,25 @@ class RecipeEncoder:
         recipe = load_deepseek_recipe()
         self.model = MODEL_NAMES[chat_encoding_spec]
         self.hf_tokenizer = tokenizer
-        special = recipe.SpecialTokens(image=IMAGE_TOKEN)
-        self._options = recipe.ConversionOptions().with_special_tokens(special)
-        encoding = (
-            recipe.DeepseekV4Encoding()
-            if chat_encoding_spec == "dsv4"
-            else recipe.DeepseekV41Encoding()
+        self.special_tokens = recipe.SpecialTokens(image=IMAGE_TOKEN)
+        self._options = recipe.ConversionOptions().with_special_tokens(
+            self.special_tokens
         )
-        self._encoding = encoding.with_special_tokens(special).with_tokenizer(
-            recipe.Tokenizer.from_str(tokenizer.to_str())
-        )
+        if chat_encoding_spec == "dsv4":
+            encoding = recipe.DeepseekV4Encoding()
+            self.model_version = recipe.ModelVersion.DeepseekV4Pro
+        else:
+            encoding = recipe.DeepseekV41Encoding()
+            self.model_version = recipe.ModelVersion.DeepseekV41Flash
+        self.tokenizer = recipe.Tokenizer.from_str(tokenizer.to_str())
+        self._encoding = encoding.with_special_tokens(
+            self.special_tokens
+        ).with_tokenizer(self.tokenizer)
 
     @classmethod
     def from_hf_tokenizer(
         cls, chat_encoding_spec: str, tokenizer: Any
-    ) -> RecipeEncoder:
+    ) -> DeepSeekRecipe:
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if backend is None:
             raise ValueError(
@@ -161,6 +167,38 @@ class RecipeEncoder:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
+    def parse_start(
+        self,
+        *,
+        thinking: bool,
+        task: Optional[str] = None,
+        continued: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """Where output parsing begins after the prompt `encode` renders for these
+        settings, as recipe's ThinkingInitialStage; None when the output is answer
+        only. `continued` is the final assistant message the prompt continues."""
+        if not thinking or (task is not None and task not in TASKS_AFTER_HEADER):
+            return None
+        recipe = load_deepseek_recipe()
+        if continued is None:
+            return recipe.ThinkingInitialStage.ReasoningStart
+        if task is not None:
+            # The continued prefix follows the task token.
+            return recipe.ThinkingInitialStage.ContentContinuation
+        body = pre_normalize(
+            {
+                "messages": [{"role": "user", "content": ""}, continued],
+                "thinking": True,
+                "continue_final_message": True,
+            }
+        )
+        body["model"] = self.model
+        try:
+            converted = recipe.ChatCompletionRequest(body).convert(self._options)
+        except recipe.ConversionError as error:
+            raise ValueError(_error_message(error.body)) from error
+        return converted.parsing_options.thinking_initial_stage
+
     def encode_text(self, text: str) -> list[int]:
         return self.hf_tokenizer.encode(text, add_special_tokens=False).ids
 
@@ -194,6 +232,6 @@ class RecipeEncoder:
                 "task requires the conversation to end with a user message"
             )
         task_id = self.hf_tokenizer.token_to_id(TASK_TOKENS[task])
-        if task == "action":
+        if task in TASKS_AFTER_HEADER:
             return prompt_ids + [task_id]
         return prompt_ids[: -len(header)] + [task_id]

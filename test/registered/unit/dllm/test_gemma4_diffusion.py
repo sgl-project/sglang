@@ -24,7 +24,7 @@ from sglang.srt.models.gemma4_diffusion import DiffusionGemmaForBlockDiffusion
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeTritonBackend:
@@ -91,13 +91,18 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
             mm_inputs=[SimpleNamespace(mm_items=image_items)],
         )
         input_ids = torch.arange(6)
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(use_bidirectional_attention="vision")
+            )
+        )
 
         with (
             patch.object(gemma4_mm, "TritonAttnBackend", _FakeTritonBackend),
             patch.object(gemma4_mm, "get_attn_backend", return_value=backend),
         ):
             Gemma4ForConditionalGeneration.prepare_attn_masks(
-                None, forward_batch, input_ids, torch.bool
+                model, forward_batch, input_ids, torch.bool
             )
 
         expected = torch.ones((6, 8), dtype=torch.bool).tril(diagonal=2)
@@ -140,8 +145,20 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
         self.assertEqual(
             prepare_attn_masks.call_args_list,
             [
-                call(model, forward_batch, input_ids, torch.bool),
-                call(model, forward_batch, input_ids, torch.bool),
+                call(
+                    model,
+                    forward_batch,
+                    input_ids,
+                    torch.bool,
+                    sliding_layers_only=False,
+                ),
+                call(
+                    model,
+                    forward_batch,
+                    input_ids,
+                    torch.bool,
+                    sliding_layers_only=False,
+                ),
             ],
         )
         self.assertIsNone(model.model.input_embeds[0])
