@@ -8,6 +8,7 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    Iterable,
     List,
     Optional,
     Tuple,
@@ -66,9 +67,11 @@ class SchedulerInvariantChecker:
     # The lists that hold the live requests, by name (`Scheduler.request_lists`).
     get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
     get_chunked_req: Callable = field(default=lambda: None)
-    get_running_reqs: Callable = field(default=lambda: None)
-    # Under PP, the micro-batches' running batches and step batches.
-    get_pp_running_mbs: Callable = field(default=lambda: ())
+    get_running_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
+    get_prefill_launched_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
+    # The running batch, and under PP every micro-batch's running batch.
+    get_running_batches: Callable = field(default=lambda: ())
+    # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -471,8 +474,10 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def maybe_check_request_lists(self) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, no request is in two lists."""
+    def maybe_check_request_lists(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: no
+        request is in two lists, the requests the running batches and the steps
+        in flight hold are in one, and each list holds requests in its state."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
         owners: Dict[Req, str] = {}
@@ -484,33 +489,53 @@ class SchedulerInvariantChecker:
                     )
                 owners[req] = name
 
-    def maybe_check_running_reqs(
-        self,
-        running_batch: Optional[ScheduleBatch],
-        last_batch: Optional[ScheduleBatch],
-    ) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the running batches and the steps decode, apart from
-        the chunked request. A launched prefill joins running at its merge."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
-        held = [
-            req
-            for b in (running_batch, *self.get_pp_running_mbs())
-            if b is not None
-            for req in b.reqs
-        ]
-        # An extend step decodes only the rows a mixed step took from a running
-        # batch; its other rows are launched prefills.
-        held += [
-            req
-            for b in (last_batch, *self.get_pp_mbs())
-            if b is not None
-            for req in (
-                (b.decoding_reqs or ()) if b.forward_mode.is_extend() else b.reqs
+        chunked_req = self.get_chunked_req()
+        running_batches = [b for b in self.get_running_batches() if b is not None]
+        steps = [b for b in (batch, *self.get_pp_mbs()) if b is not None]
+        in_running_batch = {req for b in running_batches for req in b.reqs}
+        held = {req for b in steps for req in b.reqs} | in_running_batch
+        not_listed = sorted(
+            req.rid
+            for req in held
+            if not req.finished() and req not in owners and req is not chunked_req
+        )
+        if not_listed:
+            raise RuntimeError(
+                f"Requests held by a running batch or a step but in no list: "
+                f"{not_listed}"
             )
-        ]
-        self.get_running_reqs().check(held, chunked_req=self.get_chunked_req())
+
+        merged = sorted(
+            req.rid
+            for req in self.get_prefill_launched_reqs()
+            if req in in_running_batch
+        )
+        if merged:
+            raise RuntimeError(
+                f"Requests in prefill_launched but in a running batch: {merged}"
+            )
+        running = self.get_running_reqs()
+        not_running = sorted(
+            req.rid
+            for req in in_running_batch
+            if not req.finished() and req is not chunked_req and req not in running
+        )
+        if not_running:
+            raise RuntimeError(
+                f"Requests in a running batch but not in running: {not_running}"
+            )
+        # A running request is out of every running batch only with a step in
+        # flight: a mixed step took its decode row, or under overlap a queued
+        # result finishes it.
+        not_held = sorted(
+            req.rid
+            for req in running
+            if req not in in_running_batch and req.inflight_steps <= 0
+        )
+        if not_held:
+            raise RuntimeError(
+                f"Requests in running but in no running batch or step: {not_held}"
+            )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with

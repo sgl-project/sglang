@@ -35,7 +35,6 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import RequestList
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -179,7 +178,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
-        self.running_reqs = RunningReqs()
+        self.running_reqs = RequestList()
         self.prefill_launched_reqs = RequestList()
         self.invariant_checker = Mock()
         self.uocr_runtime = None
@@ -1266,7 +1265,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.dllm_config = None
-        self.running_reqs = RunningReqs()
+        self.running_reqs = RequestList()
         self.prefill_launched_reqs = RequestList()
         self.enable_staging = False
         self.enable_overlap = False
