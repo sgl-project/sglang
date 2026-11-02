@@ -39,6 +39,11 @@ pub fn content_hash_u64(data: &[u8]) -> u64 {
     u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
 }
 
+// Match Python is_jpeg_with_cuda: trailing bytes select PIL preprocessing.
+pub fn is_jpeg(data: &[u8]) -> bool {
+    data.starts_with(&[0xff, 0xd8]) && data.ends_with(&[0xff, 0xd9])
+}
+
 pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     use image::ColorType;
 
