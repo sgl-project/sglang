@@ -18,11 +18,36 @@ def config(**kwargs):
         dsa_prefill_backend="triton",
         dsa_decode_backend="triton",
         dcp_replicate_q_proj=False,
+        dcp_comm_backend=None,
     )
     return SimpleNamespace(**(values | kwargs))
 
 
 class TestDsaPdDcpConfig(unittest.TestCase):
+    def test_rocm_decode_uses_merged_triton_defaults(self):
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
+            return_value=SimpleNamespace(is_hip=True),
+        ):
+            self.assertEqual(
+                _dsa_dcp_overrides(
+                    config(dsa_prefill_backend=None, dsa_decode_backend=None)
+                ),
+                {"dsa_prefill_backend": "triton", "dsa_decode_backend": "triton"},
+            )
+
+    def test_rocm_decode_preserves_a2a_q_replication_default(self):
+        with patch(
+            "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
+            return_value=SimpleNamespace(is_hip=True),
+        ):
+            self.assertEqual(
+                _dsa_dcp_overrides(
+                    config(dcp_replicate_q_proj=None, dcp_comm_backend="a2a")
+                ),
+                {"dcp_replicate_q_proj": True},
+            )
+
     def test_only_rocm_decode_is_allowed_for_pd_dcp(self):
         for hip in (False, True):
             for mode in ("null", "prefill", "decode"):
