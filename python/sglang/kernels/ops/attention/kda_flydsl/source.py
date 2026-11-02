@@ -1,15 +1,14 @@
 """Select SGLang-vendored or upstream AITER Kimi-K3 FlyDSL operators."""
 
 import importlib
-
-from sglang.srt.environ import envs
+import os
 
 
 def load_module(local_module: str, aiter_module: str):
-    mode = envs.SGLANG_USE_HIP_K3_FLYDSL_SOURCE.get().lower()
+    mode = os.environ.get("SGLANG_K3_FLYDSL_SOURCE", "auto").lower()
     if mode not in ("auto", "sglang", "aiter"):
         raise ValueError(
-            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
+            "SGLANG_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
         )
 
     candidates = (

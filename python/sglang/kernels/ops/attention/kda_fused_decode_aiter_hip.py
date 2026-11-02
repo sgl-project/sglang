@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 _HEADS = 12
@@ -14,7 +15,7 @@ _WARMED: set[tuple[int, float, float]] = set()
 
 
 def enabled() -> bool:
-    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
+    return os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
 
 
 def _ops():
