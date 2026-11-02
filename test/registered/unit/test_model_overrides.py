@@ -2770,6 +2770,83 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_kpool_backend_support_follows_kv_dtype_and_gpu(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        hf_config = SimpleNamespace(
+            architectures=["Glm5NextForConditionalGeneration"],
+            index_topk=2048,
+            index_kpool=4,
+        )
+        # sm_major, kv dtype, prefill, decode, rejected backend
+        cases = (
+            (9, "fp8_e4m3", None, None, "prefill=flashmla_kv"),
+            (9, "fp8_e4m3", "fa3", "fa3", "prefill=fa3"),
+            (9, "fp8_e4m3", "flashmla_sparse", "fa3", "prefill=flashmla_sparse"),
+            (9, "fp8_e4m3", "trtllm", "trtllm", "prefill=trtllm"),
+            (9, "fp8_e4m3", "tilelang", "tilelang", None),
+            (9, "bfloat16", None, None, None),
+            (9, "bfloat16", "flashmla_auto", None, None),
+            (9, "bfloat16", "flashmla_sparse_q8", "tilelang", None),
+            (9, "bfloat16", "tilelang", "tilelang", None),
+            (9, "bfloat16", "tilelang", "flashmla_kv", "decode=flashmla_kv"),
+            (9, "bfloat16", "tilelang", "flashmla_auto", "decode=flashmla_auto"),
+            (9, "bfloat16", "trtllm", "trtllm", "prefill=trtllm"),
+            (10, "fp8_e4m3", None, None, None),
+            (
+                10,
+                "fp8_e4m3",
+                "flashmla_sparse",
+                "flashmla_sparse",
+                "prefill=flashmla_sparse",
+            ),
+            (10, "fp8_e4m3", "flashmla_sparse", "trtllm", None),
+            (10, "fp8_e4m3", "flashmla_auto", "trtllm", None),
+            (10, "fp8_e4m3", "trtllm", "fa3", "decode=fa3"),
+            (10, "bfloat16", None, None, None),
+            (10, "bfloat16", "tilelang", "tilelang", None),
+            (10, "bfloat16", "fa3", "fa3", "prefill=fa3"),
+            (
+                10,
+                "bfloat16",
+                "flashmla_sparse_q8",
+                "tilelang",
+                "prefill=flashmla_sparse_q8",
+            ),
+            (12, "fp8_e4m3", None, None, "prefill=trtllm"),
+            (12, "bfloat16", "fa3", "fa3", "prefill=fa3"),
+        )
+        for sm_major, dtype, prefill, decode, rejected in cases:
+            view = ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(hf_config=hf_config),
+                    kv_cache_dtype=dtype,
+                    dsa_prefill_backend=prefill,
+                    dsa_decode_backend=decode,
+                    enable_hisparse=False,
+                )
+            )
+            with (
+                self.subTest(sm=sm_major, dtype=dtype, pair=(prefill, decode)),
+                override_platform(is_npu=False, is_xpu=False, is_hip=False),
+                patch("torch.cuda.get_device_capability", return_value=(sm_major, 0)),
+            ):
+                if rejected is None:
+                    _dsa_split_backend_resolution(view)
+                    continue
+                with self.assertRaisesRegex(
+                    ValueError, f"and the .*{rejected}.* DSA backend"
+                ) as raised:
+                    _dsa_split_backend_resolution(view)
+                # The error must not recommend a backend that cannot read these rows.
+                if (sm_major, dtype) == (9, "fp8_e4m3"):
+                    self.assertIn(
+                        "Supported prefill backends: tilelang.", str(raised.exception)
+                    )
+
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
