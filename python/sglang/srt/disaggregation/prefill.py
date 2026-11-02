@@ -1607,6 +1607,16 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
+            if (
+                self.tree_cache.supports_prefix_sharing()
+                and not req.skip_radix_cache_insert
+            ):
+                # A checkpoint can stop short of the computed chunk (e.g. at
+                # an SWA branch). A later checkpoint may deduplicate and free
+                # the unprotected tail, so leave it out of in-flight sends.
+                # Keep checkpointing for SWA reclamation; the final send
+                # carries any remainder before the request is released.
+                end_idx = min(end_idx, req.kv.cache_protected_len)
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:
