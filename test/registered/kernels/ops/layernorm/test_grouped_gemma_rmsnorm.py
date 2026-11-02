@@ -27,8 +27,8 @@ def _reference_grouped_gemma_rmsnorm(
 # fp64 reference on 4xB300 (sm103): bf16 max rel err 3.9e-3 (1 ulp), fp16
 # 4.9e-4 (0.5 ulp). The kernel computes in fp32 like the eager reference.
 _TOLERANCES = {
-    torch.bfloat16: dict(rtol=5e-3, atol=5e-3),
-    torch.float16: dict(rtol=1e-3, atol=1e-3),
+    torch.bfloat16: {"rtol": 5e-3, "atol": 5e-3},
+    torch.float16: {"rtol": 1e-3, "atol": 1e-3},
 }
 
 
@@ -36,6 +36,7 @@ _TOLERANCES = {
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,group_size",
     [
+        (0, 10240, 2560),  # idle attention-DP ranks still enter the model
         (1, 10240, 2560),  # production shape (HC 4 x 2560)
         (7, 10240, 2560),
         (128, 10240, 2560),
@@ -60,8 +61,9 @@ def test_grouped_gemma_rmsnorm_correctness(
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-def test_grouped_gemma_rmsnorm_out_param():
-    x = torch.randn(64, 10240, dtype=torch.bfloat16, device="cuda")
+@pytest.mark.parametrize("num_tokens", [0, 64])
+def test_grouped_gemma_rmsnorm_out_param(num_tokens):
+    x = torch.randn(num_tokens, 10240, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(10240, dtype=torch.bfloat16, device="cuda") * 0.2
     out = torch.empty_like(x)
 
@@ -72,6 +74,30 @@ def test_grouped_gemma_rmsnorm_out_param():
 
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(result, expected, **_TOLERANCES[x.dtype])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_grouped_gemma_rmsnorm_empty_during_cuda_graph(dtype):
+    empty = torch.empty(0, 10240, dtype=dtype, device="cuda")
+    x = torch.randn(1, 10240, dtype=dtype, device="cuda")
+    weight = torch.randn(10240, dtype=dtype, device="cuda") * 0.2
+    grouped_gemma_rmsnorm(x, weight, 2560)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        empty_out = grouped_gemma_rmsnorm(empty, weight, 2560)
+        out = grouped_gemma_rmsnorm(x, weight, 2560)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert empty_out.shape == empty.shape
+    assert empty_out.dtype == dtype
+    assert empty_out.device == empty.device
+    expected = _reference_grouped_gemma_rmsnorm(
+        x, weight, 2560, 1e-6, compute_dtype=torch.float64
+    ).to(dtype)
+    torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
 def test_grouped_gemma_rmsnorm_bad_group_size():
