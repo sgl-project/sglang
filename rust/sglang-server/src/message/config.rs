@@ -662,6 +662,8 @@ pub enum DisaggregationMode {
 pub struct ModelConfig {
     /// Authoritative HF model type, used to select a native chat formatter.
     pub model_type: Option<String>,
+    /// HF `architectures`, reported by model info.
+    pub architectures: Option<Vec<String>>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -684,13 +686,14 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type, architectures))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
     ) -> Self {
         Self {
             context_len,
@@ -698,6 +701,7 @@ impl ModelConfig {
             is_multimodal,
             default_sampling_params,
             model_type,
+            architectures,
         }
     }
 }
@@ -708,6 +712,7 @@ impl Default for ModelConfig {
         Self {
             context_len: 2048,
             model_type: None,
+            architectures: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),

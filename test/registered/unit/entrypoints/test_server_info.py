@@ -296,6 +296,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             model_config=model_config,
             kv_events_publisher=SimpleNamespace(local_kv_event_sources=lambda _: []),
             page_size=1,
+            tree_cache=None,
             # The server loads the scheduler's tokenizer copy but reports the
             # public path.
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
