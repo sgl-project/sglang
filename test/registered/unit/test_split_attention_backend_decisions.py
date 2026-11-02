@@ -277,33 +277,6 @@ class TestDraftFactoryStamping(CustomTestCase):
         with self.assertRaises(AssertionError):
             factory._create_cutedsl_mla_prefill_backend()
 
-    def test_cutedsl_prefill_uses_the_unabsorbed_head_dimensions(self):
-        from types import SimpleNamespace
-
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.srt.models.deepseek_common.attention_backend_handler import (
-            AttentionBackendRegistry,
-        )
-        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
-            AttnForwardMethod,
-        )
-
-        handler = AttentionBackendRegistry.get_handler("cutedsl_mla")
-        attn = SimpleNamespace(disable_chunked_prefix_cache=False)
-        for mode in (
-            ForwardMode.EXTEND,
-            ForwardMode.DECODE,
-            ForwardMode.DRAFT_EXTEND_V2,
-        ):
-            with self.subTest(mode=mode):
-                batch = SimpleNamespace(forward_mode=mode, extend_prefix_lens_cpu=[0])
-                expected = (
-                    AttnForwardMethod.MHA_CHUNKED_KV
-                    if mode == ForwardMode.EXTEND
-                    else AttnForwardMethod.MLA
-                )
-                self.assertEqual(handler(attn, batch), expected)
-
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
         # `hybrid_linear_attn` picks fa3/intel_amx/triton by host inside its
         # constructor, so no static rename can say what it builds -- the

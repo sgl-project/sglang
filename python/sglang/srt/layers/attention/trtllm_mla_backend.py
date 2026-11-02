@@ -1582,7 +1582,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 # The sum equals bs * max only when all request lengths match.
                 total_tokens = q.shape[0]
-                tokens_per_seq = total_tokens // bs if bs > 0 else 0
+                query_shape = (bs, metadata.max_seq_len_q, *q.shape[1:])
+                max_seq_len = metadata.max_seq_len_k + metadata.max_seq_len_q
                 can_direct_view = (
                     bs > 0
                     and total_tokens
@@ -1591,52 +1592,32 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
 
                 if can_direct_view:
-                    max_seq_len = metadata.max_seq_len_k + tokens_per_seq
-                    q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
+                    q = q.view(query_shape)
                     needs_unpad = False
                 else:
-                    # Varying lengths: pad q to (bs, max_seq_len_q, ...)
-                    actual_seq_lens_q = metadata.seq_lens_q
-                    actual_max_seq_len_q = metadata.max_seq_len_q
-                    max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
-
-                    actual_cu_seqlens_q = metadata.cu_seqlens_q
-
                     if self.padded_q_buffer is not None:
                         # The padding kernel requires packed rows even when
                         # the captured request width exceeds this batch's.
                         padded_q = (
                             self.padded_q_buffer.flatten(0, 1)[
-                                : bs * actual_max_seq_len_q
+                                : bs * metadata.max_seq_len_q
                             ]
-                            .view(
-                                bs,
-                                actual_max_seq_len_q,
-                                layer.tp_q_head_num,
-                                layer.head_dim,
-                            )
+                            .view(query_shape)
                             .to(dtype=q.dtype)
                         )
                         padded_q.zero_()
                     else:
                         padded_q = torch.zeros(
-                            (
-                                bs,
-                                actual_max_seq_len_q,
-                                layer.tp_q_head_num,
-                                layer.head_dim,
-                            ),
-                            dtype=q.dtype,
-                            device=q.device,
+                            query_shape, dtype=q.dtype, device=q.device
                         )
 
                     q = self.pad_draft_extend_query(
-                        q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
+                        q, padded_q, metadata.seq_lens_q, metadata.cu_seqlens_q
                     )
                     needs_unpad = True
                     unpad_zero_uncovered = False
-                    unpad_seq_lens_q = actual_seq_lens_q
-                    unpad_cu_seqlens_q = actual_cu_seqlens_q
+                    unpad_seq_lens_q = metadata.seq_lens_q
+                    unpad_cu_seqlens_q = metadata.cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
