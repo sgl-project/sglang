@@ -135,13 +135,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
-    def prealloc_fits_assumes_reclaim(self) -> bool:
-        """Whether `prealloc_fits` answers about the state reachable AFTER
-        reclaiming the evictable pages, so admitting on it still owes the
-        reclaim. False when the answer describes the pool as it stands.
-        """
-        return False
-
     def window_pool_names(self) -> Tuple[str, ...]:
         """The window pools this allocator keeps, by the names a
         `KVDemand` uses for them; none for a pool without windows."""
@@ -178,6 +171,27 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return demand.full_tokens <= full_budget_tokens and (
             swa_budget_tokens is None
             or all(t <= swa_budget_tokens for t in demand.window_tokens.values())
+        )
+
+    def admit_preallocation(
+        self,
+        tree_cache,
+        admission: KVDemand,
+        take: KVDemand,
+        *,
+        evictable: Mapping[str, int],
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation is admitted (``admission``,
+        with its decode reservation) and its rows (``take``) can be taken
+        now. Separate buffers hold the room their budgets count, so nothing
+        is reclaimed here: admission is the whole answer."""
+        return self.prealloc_fits(
+            admission,
+            evictable=evictable,
+            full_budget_tokens=full_budget_tokens,
+            swa_budget_tokens=swa_budget_tokens,
         )
 
     def get_extend_allocation_demand(
