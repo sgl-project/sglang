@@ -1742,7 +1742,7 @@ class V1RerankReqInput(BaseModel):
 
 class RerankResponse(BaseModel):
     score: float
-    document: Optional[str] = None
+    document: Optional[RerankContent] = None
     index: int
     meta_info: Optional[dict] = None
 

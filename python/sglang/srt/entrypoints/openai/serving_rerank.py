@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.configs.embedding_model_spec import RerankInputFormat
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentTextPart,
@@ -210,6 +211,10 @@ class OpenAIServingRerank(OpenAIServingBase):
         # TemplateManager is optional; rerank uses tokenizer.chat_template today.
         # Keeping this explicit makes the dependency clear and supports future extensions.
         self.template_manager = template_manager
+        self._use_query_document_chat = (
+            tokenizer_manager.model_config.embedding_model_spec.rerank_input_format
+            == RerankInputFormat.QUERY_DOCUMENT_CHAT
+        )
 
         # Cache yes/no token IDs for Qwen3 reranker scoring
         self._yes_token_id, self._no_token_id = _get_yes_no_token_ids(
@@ -253,8 +258,38 @@ class OpenAIServingRerank(OpenAIServingBase):
         - For Qwen3-VL reranker (multimodal decoder-only): keep the request.
         - For Qwen3 reranker (text-only decoder-only): keep the request and score via
           `tokenizer_manager.score_prompts(...)` in the handler.
-        - For cross-encoder rerank models: adapt into `EmbeddingReqInput` pairs.
+        - For query/document chat inputs: render roles and preserve images.
+        - For other cross-encoders: adapt into `EmbeddingReqInput` pairs.
         """
+        if self._use_query_document_chat:
+            input_ids = []
+            image_data = []
+            for document in request.documents:
+                query, doc, images, videos = self._build_vl_reranker_content(
+                    query=request.query, document=document
+                )
+                if videos:
+                    raise ValueError(
+                        "Query/document chat reranking supports text and images only"
+                    )
+                messages = [
+                    {"role": "query", "content": query},
+                    {"role": "document", "content": doc},
+                ]
+                input_ids.append(
+                    self.tokenizer_manager.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        return_dict=False,
+                    )
+                )
+                image_data.append(images or None)
+            return EmbeddingReqInput(
+                input_ids=input_ids,
+                image_data=image_data if any(image_data) else None,
+            ), request
+
         chat_template = self.tokenizer_manager.tokenizer.chat_template
         model_path = getattr(self.tokenizer_manager.model_config, "model_path", "")
         backend = _detect_rerank_backend(
