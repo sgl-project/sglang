@@ -61,6 +61,22 @@ class TestTemperatureSoftmax(CustomTestCase):
         logits = torch.randn((4096, 3), dtype=torch.float32, device="cuda").T
         self.assert_matches_torch(logits, self.temperatures(logits.shape[0]))
 
+    def test_misaligned_view_falls_back(self):
+        # Row stride and vocab size are vector multiples, but the base address is not.
+        logits = torch.randn((2, 1032), dtype=torch.float32, device="cuda")[:, 1:1025]
+        self.assert_matches_torch(logits, None)
+
+    def test_sanitized_nan_sentinels(self):
+        # SGLANG_SANITIZE_NAN_LOGITS maps +-inf / NaN to +-1e30.
+        logits = torch.randn((4, 32000), dtype=torch.float32, device="cuda")
+        logits[0, 7] = 1e30
+        logits[1, 7] = 1e30
+        logits[1, 100:200] = -1e30
+        logits[2, :] = -1e30
+        logits[3, 31999] = 1e30
+        self.assert_matches_torch(logits, None)
+        self.assert_matches_torch(logits, self.temperatures(4))
+
     def test_sparse_grammar_mask_with_fully_masked_splits(self):
         for vocab_size, rows in product((65537, 131072), (1, 3, 16, 32)):
             with self.subTest(vocab_size=vocab_size, rows=rows):
