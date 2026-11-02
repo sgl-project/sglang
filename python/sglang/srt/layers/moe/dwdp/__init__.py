@@ -1,4 +1,4 @@
-"""DWDP: keep tokens local and prefetch distributed expert weights."""
+"""DWDP (Distributed Weight Data Parallelism): MoE prefill with tokens kept on-rank and peer expert weights prefetched via NVLink into a composite VMM address space."""
 
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
