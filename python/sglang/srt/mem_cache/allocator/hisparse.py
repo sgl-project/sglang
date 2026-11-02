@@ -413,6 +413,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (swa_capacity, self.swa_available_size()),
         )
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),

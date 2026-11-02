@@ -39,8 +39,14 @@ class _FakeAllocator:
     # builder binds it).
     window_retention = {"swa": 4}
 
+    # The pools take their rows from memories of their own.
+    pools_share_memory = False
+
     def window_pool_names(self):
         return ("swa",)
+
+    def window_available_size(self, sub_pool):
+        return self.swa_available_size()
 
     def target_window_pool(self):
         return "swa"

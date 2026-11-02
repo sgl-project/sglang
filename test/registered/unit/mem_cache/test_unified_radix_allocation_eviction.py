@@ -32,6 +32,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         capacity = {"available": 30}
         allocator = MagicMock()
         allocator.available_size.side_effect = lambda: capacity["available"]
+        allocator.owner_available_size.side_effect = lambda: capacity["available"]
         # Pools that share no memory: the tree walks each target itself.
         allocator.pools_share_memory = False
         cache.token_to_kv_pool_allocator = allocator
@@ -188,17 +189,24 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             (True, KVDemand(full_tokens=40, window_tokens={"swa": 10}), None),
         ]:
             with self.subTest(supports_swa=supports_swa, demand=demand):
+                # Pools of their own; a window pool beside the token pool
+                # leaves the token pool its full side (40 of 30 + 10).
                 allocator = SimpleNamespace(
-                    available_size=lambda: 30,
-                    full_available_size=lambda: 40,
-                    swa_available_size=lambda: 10,
+                    pools_share_memory=False,
+                    owner_available_size=lambda: 40 if supports_swa else 30,
+                    window_available_size=lambda name: 10,
                 )
                 cache = SimpleNamespace(
                     token_to_kv_pool_allocator=allocator,
                     supports_swa=lambda: supports_swa,
                     window_sub_pools=lambda: (("swa", 4),) if supports_swa else (),
-                    window_available_size=lambda name: allocator.swa_available_size(),
+                    window_available_size=lambda name: allocator.window_available_size(
+                        name
+                    ),
                     evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
+                )
+                cache.evict_pool_shortfalls = lambda d, cache=cache: (
+                    BasePrefixCache.evict_pool_shortfalls(cache, d)
                 )
                 BasePrefixCache.evict_for_alloc(cache, demand)
                 if expected is None:

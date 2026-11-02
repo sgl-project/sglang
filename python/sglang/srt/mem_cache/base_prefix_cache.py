@@ -585,19 +585,29 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
-        """Evict so that an allocation of ``demand`` can be served: here, the
-        shortfall of each pool the allocator reads, evicted as counts. A
-        cache that keeps no window sub-pools of its own keeps a single pool,
-        which serves the demand's tokens and windows alike."""
+        """Evict so that an allocation of ``demand`` (what it will take, not
+        what to evict) can be served, by the pool's reclaim discipline
+        (`mem_cache/capacity.py`)."""
+        from sglang.srt.mem_cache.capacity import evict_for_alloc
+
+        return evict_for_alloc(self, demand)
+
+    def reclaim_jointly(self, demand: KVDemand) -> EvictResult:
+        """Evict until the allocator can take all of ``demand`` at once, its
+        pools sharing one memory. A cache that does not reclaim so evicts each
+        pool's shortfall instead."""
+        return self.evict_pool_shortfalls(demand)
+
+    def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
+        """Evict each pool's shortfall for ``demand``, as counts. A cache that
+        keeps no window sub-pools of its own keeps a single pool, which serves
+        the demand's tokens and windows alike."""
         allocator = self.token_to_kv_pool_allocator
         shortfall = EvictParams(mamba_num=demand.state_slots)
         if demand.full_tokens > 0:
-            available = (
-                allocator.full_available_size()
-                if self.supports_swa()
-                else allocator.available_size()
+            shortfall.num_tokens = max(
+                0, demand.full_tokens - allocator.owner_available_size()
             )
-            shortfall.num_tokens = max(0, demand.full_tokens - available)
         if self.window_sub_pools():
             for name, tokens in demand.window_tokens.items():
                 if tokens > 0:
@@ -605,12 +615,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                     if short:
                         shortfall.window_num_tokens[name] = short
         elif any(t > 0 for t in demand.window_tokens.values()):
-            tokens = max(demand.window_tokens.values())
-            available = (
-                allocator.swa_available_size()
-                if self.supports_swa()
-                else allocator.available_size()
-            )
+            name, tokens = max(demand.window_tokens.items(), key=lambda kv: kv[1])
+            available = allocator.window_available_size(name)
             shortfall.num_tokens = max(shortfall.num_tokens, tokens - available)
         if not (
             shortfall.num_tokens or shortfall.window_num_tokens or shortfall.mamba_num

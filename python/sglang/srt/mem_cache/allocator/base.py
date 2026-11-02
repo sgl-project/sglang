@@ -278,6 +278,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def owner_available_size(self):
+        """What the token pool can serve now; an allocator keeping a window
+        pool beside it answers for its full-attention side."""
+        return self.available_size()
+
     def get_kvcache(self):
         return self._kvcache
 
