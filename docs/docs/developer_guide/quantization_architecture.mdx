@@ -1,0 +1,94 @@
+---
+title: "Quantization architecture"
+metatags:
+    description: "Which layer owns which part of a quantization method: config, scheme, device scheme, and backend method, and where a change belongs."
+---
+
+This page states where quantization code goes. It covers Linear and MoE layers under `python/sglang/srt/layers/quantization/` and `python/sglang/srt/hardware_backend/<device>/quantization/`. For the steps, validation, and PR checklist, see the [Quantization Contribution Guide](./quantization_contribution_guide).
+
+The design follows [Quantization Modifications](https://github.com/sgl-project/sglang/issues/15194). Existing code does not follow every rule below yet. When a file you would copy disagrees with this page, follow this page.
+
+## Layers and ownership
+
+A quantized layer passes through four layers. Only the first two know the checkpoint format.
+
+| Layer | Lives in | Owns | Knows the checkpoint format |
+| --- | --- | --- | --- |
+| Config | `layers/quantization/<format>/<format>.py` | Parsing the quantization config, validating options, selecting a scheme per layer | Yes |
+| Scheme | `layers/quantization/<format>/schemes/` | Parameter names, shapes, dtypes, weight loaders, and conversion from the checkpoint's layout to the backend's input | Yes |
+| Device scheme | The format's scheme file for that recipe | The scheme's differences on one device: which backend method it uses, and conversions only that device needs | Yes |
+| Backend method | `hardware_backend/<device>/quantization/` | Kernel-required layout (transpose, packing, scale pairing, casts), and the forward pass | No |
+
+The scheme holds the backend method as `self.kernel` and calls its `process_weights_after_loading` and `apply`. Examples: `ModelSlimW8A8Int8` chooses between `NPUW8A8Int8LinearMethod` and `NPUW8A8Int8DynamicLinearMethod`. `NPUCompressedTensorsW8A8Int8` subclasses `CompressedTensorsW8A8Int8` and uses `NPUW8A8Int8DynamicLinearMethod`.
+
+A format with several schemes uses this package layout:
+
+```text
+python/sglang/srt/layers/quantization/<format>/
+  __init__.py
+  <format>.py              # config
+  schemes/
+    __init__.py
+    <format>_scheme.py     # scheme base classes
+    <format>_<recipe>.py   # Linear scheme and its device schemes
+    <format>_<recipe>_moe.py
+```
+
+Keep backend imports narrow and local to the scheme that needs them, so other platforms never import a kernel dependency they lack.
+
+## Rules
+
+### The backend method's input is fixed by the recipe, not the format
+
+A backend method declares what it accepts: weight dtype and layout, scale granularity (per-tensor, per-channel, per-group), and the parameter names it reads. Two checkpoint formats that store the same recipe use the same backend method. Each scheme converts its format to that input.
+
+A backend method must not:
+
+- branch on the checkpoint format or a format option (for example `checkpoint_format == "gptq_v2"`),
+- create parameters that the checkpoint loads, or wrap their weight loaders,
+- import from `layers/quantization/<format>/`.
+
+### Format conversion goes in the scheme; kernel layout goes in the backend
+
+Ask: "Would a second format that stores the same recipe need this step?"
+
+- **No, only this format stores it this way.** It goes in the scheme. Examples: merging per-shard scales of a fused layer, expanding a per-tensor scale to per-channel, renaming or reshaping a checkpoint tensor, rejecting a format option the device does not support.
+- **Yes, the kernel needs it whatever the source.** It goes in the backend method. Examples: transposing the weight for the matmul kernel, pairing MX block scales, casting to the dtype the kernel takes, packing int4 into the kernel's word size.
+
+If the conversion is needed on one device only, put it in the device scheme, not in the generic scheme and not in the backend method.
+
+### Name backend methods by recipe
+
+Name a backend method by what it computes, for example `NPUW8A8Int8DynamicLinearMethod` (int8 weights, per-token dynamic int8 activations). Do not name it after a checkpoint format or a quantization tool. Add new methods to the existing module for that layer type (`linear_method_npu.py`, `moe_methods.py` on NPU). Do not create a new `<format>_kernels.py` file for a format that reuses an existing recipe.
+
+AWQ and GPTQ are exceptions: their packing is part of the recipe, so `awq_kernels.py` and `gptq_kernels.py` carry the method name.
+
+### Extend an existing backend method before adding one
+
+If a recipe differs from an existing backend method in one step (for example a static input scale instead of per-token dynamic quantization), subclass that method. Call `super().process_weights_after_loading(layer)`, then add what differs, and override only the step that changes. Reuse the existing parameter names (`aclnn_input_scale`, `aclnn_input_offset`). A new parallel class duplicates weight post-processing, and the two copies drift.
+
+### Same checkpoint, same load behaviour
+
+A device scheme may reject a checkpoint the device cannot run. It must not load an accepted checkpoint with different semantics than the generic scheme, for example by reducing fused input scales differently. If the device needs a stricter rule, state why in the code.
+
+## Where does my change go
+
+| Change | Goes in |
+| --- | --- |
+| New config key or format option | Config |
+| New checkpoint format for a recipe a device already runs | New scheme that converts to the existing backend method's input |
+| Existing format on a new device | Device scheme that subclasses the format's scheme |
+| Parameter names, shapes, or weight loaders | Scheme |
+| Conversion from the checkpoint's scale or weight layout | Scheme, or device scheme if only one device needs it |
+| Transpose, packing, or casts the kernel requires | Backend method |
+| A new recipe on a device | New backend method, named by recipe |
+| A small variant of an existing recipe | Subclass of the existing backend method |
+| Kernel selection by device generation or shape | Backend method |
+
+## MoE
+
+MoE follows the same split. The MoE scheme (`CompressedTensorsMoEScheme`, `ModelSlimMoEScheme`) creates the expert weights and selects the backend method. On NPU, MoE backend methods live in `hardware_backend/npu/quantization/moe_methods.py`. Hidden-state quantization before dispatch lives in `hardware_backend/npu/moe/quant.py`.
+
+## Online quantization
+
+With online quantization (`--quantization <recipe>` on a BF16/FP16 checkpoint), the config selects a backend method directly and the method quantizes weights at load time. The scheme layer is absent, so the method creates its own parameters. Keep the load-time quantization separate from the kernel layout step. An offline scheme can then reuse that method without the method branching on weight dtype.
