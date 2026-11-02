@@ -15,10 +15,10 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
         UnifiedCacheLinker,
     )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
 
@@ -62,7 +62,7 @@ def create_unified_cache_linker(
     *,
     backend: str,
     config: dict[str, Any] | None,
-    components: set[ComponentType],
+    cache: UnifiedRadixCache,
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
     if config is not None and not isinstance(config, dict):
@@ -93,7 +93,7 @@ def create_unified_cache_linker(
         return linker_cls(
             server_args,
             params,
-            components=components,
+            cache=cache,
             extra_config=deepcopy(config.linker_extra_config),
             forward_stream=forward_stream,
         )
@@ -110,12 +110,18 @@ def create_unified_cache_linker(
         )
 
         linker_cls = UMBPDirectLinker
+    elif backend == "lmcache":
+        from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_cache_linker import (
+            LMCacheUnifiedCacheLinker,
+        )
+
+        linker_cls = LMCacheUnifiedCacheLinker
     else:
         raise ValueError(f"Unknown unified cache external linker backend: {backend!r}")
     return linker_cls(
         server_args,
         params,
-        components=components,
+        cache=cache,
         extra_config=deepcopy(config or {}),
         forward_stream=forward_stream,
     )
