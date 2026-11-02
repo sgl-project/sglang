@@ -803,16 +803,17 @@ def build_prefill_indices(
     ring_stride: int,  # SWA ring per-slot stride / modulo (win_with_spec)
     swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
-    c4_topk_lengths: Optional[torch.Tensor],  # [T] int32 top-k slots per token
+    c4_sparse_page_indices: Optional[torch.Tensor] = None,
+    c4_topk_lengths: Optional[torch.Tensor] = None,  # [T] int32 top-k slots per token
     c4_topk_width: int = 0,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]:
     """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr, prefix_swa_len).
 
-    Ratio 4 sizes each prefix segment by c4_topk_lengths and leaves its
+    Ratio 4 with c4_topk_lengths sizes each prefix segment by it and leaves its
     compressed tail unwritten: the top-k slots differ per layer and go in at
-    prefix_swa_len with fill_compress_tail."""
+    prefix_swa_len with fill_compress_tail. Otherwise prefix_swa_len is None."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
@@ -827,11 +828,16 @@ def build_prefill_indices(
         page_idx = c128_page_indices[:T]
         assert page_idx.is_contiguous()
         Wc = page_idx.shape[1]
-    elif compress_ratio == 4:
-        assert c4_topk_lengths is not None and c4_topk_width > 0
+    elif compress_ratio == 4 and c4_topk_lengths is not None:
+        assert c4_topk_width > 0
         topk_len = c4_topk_lengths[:T]
         assert topk_len.is_contiguous()
         Wc = c4_topk_width
+    elif compress_ratio == 4:
+        assert c4_sparse_page_indices is not None
+        page_idx = c4_sparse_page_indices[:T]
+        assert page_idx.is_contiguous()
+        Wc = page_idx.shape[1]
     else:
         raise ValueError(f"bad compress_ratio {compress_ratio}")
 

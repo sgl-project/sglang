@@ -2339,13 +2339,16 @@ class MQALayer(MqaAttentionBase):
                 # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
                 # computed -- it only addresses the kernel store this path drops.
                 #
-                # kv stays the strided slice of qkv_a: the kernel norms it in
-                # place and the ring store takes the row stride.
+                # On gfx1250 kv stays the strided slice of qkv_a: the kernel
+                # norms it in place and the ring store takes the row stride.
+                # Elsewhere the ring store requires a contiguous buffer.
                 #
                 # Under fp8, verify takes the decode arm below instead: the ring
                 # rows are per token (swa_loc is built for verify too) and are
                 # written before attention either way, so the kernel stores them
                 # itself, off the strided kv.
+                if not _is_gfx1250_supported:
+                    kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, True
             elif unified and fuse_prefill:

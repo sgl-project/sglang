@@ -52,6 +52,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -302,11 +305,18 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        # Rows past each rank's logical length are never selected below.
-        if x.shape[0] >= physical_rank_len and x.is_contiguous():
+        if _is_gfx1250_supported:
+            # Rows past each rank's logical length are never selected below.
+            reuse_x = x.shape[0] >= physical_rank_len
+        else:
+            # Equal shards already have the collective shape. Avoid a zero fill
+            # and D2D staging copy before launching the attention KV collective.
+            reuse_x = local_logical_len == physical_rank_len
+        if reuse_x and x.is_contiguous():
             padded_x = x[:physical_rank_len]
         else:
-            padded_x = x.new_empty((physical_rank_len, *x.shape[1:]))
+            new_buf = x.new_empty if _is_gfx1250_supported else x.new_zeros
+            padded_x = new_buf((physical_rank_len, *x.shape[1:]))
             padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
@@ -331,10 +341,12 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             )
 
         flat_indices = torch.arange(total_tokens, device=x.device)
-        metadata.gather_index = (
+        gather_indices = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, metadata.gather_index)
+        if _is_gfx1250_supported:
+            metadata.gather_index = gather_indices
+        return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]

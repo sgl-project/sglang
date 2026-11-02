@@ -385,6 +385,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(f"{_HIP_RADIX}.is_cp_active", return_value=True),
+            mock.patch(f"{_HIP_RADIX}._is_gfx1250_supported", True),
             mock.patch(
                 f"{_HIP_RADIX}.get_parallel",
                 return_value=SimpleNamespace(attn_cp_size=2, attn_cp_rank=1),

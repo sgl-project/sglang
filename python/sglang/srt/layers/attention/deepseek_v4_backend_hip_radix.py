@@ -113,7 +113,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.utils import ceil_align, is_gfx95_supported
+from sglang.srt.utils import ceil_align, is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -131,6 +131,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DSPARK_DRAFT_RAW_METADATA = envs.SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA.get()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
@@ -1257,7 +1258,7 @@ class DeepseekV4HipRadixBackend(
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
-            if core_attn_metadata.unified is not None:
+            if _is_gfx1250_supported and core_attn_metadata.unified is not None:
                 core_attn_metadata.unified.apply_cp_reindex()
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
@@ -2962,40 +2963,70 @@ class DeepseekV4HipRadixBackend(
         # prefill / extend
         meta = core_attn_metadata.unified
         state_slot = state_slot_full = meta.pf_state_slot
+        chunk_start = meta.pf_chunk_start
         cu_q = meta.pf_cu_q
 
         # CP: query metadata is this rank's rows; cache-write metadata stays global.
         _cp_active = is_cp_active(forward_batch)
         positions_full = positions
         if _cp_active:
-            state_slot = meta.pf_cp_state_slot
-            assert state_slot.shape[0] == cu_q.shape[0] == T, (state_slot.shape, T)
+            if _is_gfx1250_supported:
+                state_slot = meta.pf_cp_state_slot
+                assert state_slot.shape[0] == cu_q.shape[0] == T, (state_slot.shape, T)
+            else:
+                _cp_size = get_parallel().attn_cp_size
+                # pf_* were built on the padded global layout before the reindex.
+                assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
+                _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
+                state_slot, chunk_start, cu_q = (
+                    v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q)
+                )
             # Already CP-reindexed; padding rows carry the inert expansion position.
             positions = core_attn_metadata.positions_casual
+            if not _is_gfx1250_supported:
+                positions = positions.to(torch.int64)
             assert positions.shape[0] == T
             positions_full = forward_batch.positions.to(torch.int64)
 
-        # Layer-invariant except the C4 top-k tail, filled per layer below.
         c4_len = None
-        if compress_ratio == 4:
-            c4_len = core_attn_metadata.c4_sparse_topk_lengths_raw[:T]
-        streams = meta.pf_indices.get((compress_ratio, T))
-        if streams is None:
-            streams = runtime.build_prefill_indices(
+        if not _is_gfx1250_supported:
+            kpre_i, kpre_p, kext_i, kext_p, _ = runtime.build_prefill_indices(
                 compress_ratio=compress_ratio,
                 state_slot=state_slot,
                 positions=positions,
-                chunk_start=meta.pf_chunk_start,
+                chunk_start=chunk_start,
                 cu_q=cu_q,
                 win=win,
                 ring_stride=ring_stride,
                 swa_pages=swa_pages,
                 c128_page_indices=c128_pi,
-                c4_topk_lengths=c4_len,
-                c4_topk_width=0 if c4_len is None else c4_pi.shape[1],
+                c4_sparse_page_indices=c4_pi,
             )
-            meta.pf_indices[(compress_ratio, T)] = streams
-        kpre_i, kpre_p, kext_i, kext_p, kpre_swa_len = streams
+            if kpre_p.shape[0] < T + 1:
+                pad = T + 1 - kpre_p.shape[0]
+                kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
+                kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
+        else:
+            # Layer-invariant except the C4 top-k tail, filled per layer below.
+            if compress_ratio == 4:
+                c4_len = core_attn_metadata.c4_sparse_topk_lengths_raw[:T]
+            streams = meta.pf_indices.get((compress_ratio, T))
+            if streams is None:
+                streams = runtime.build_prefill_indices(
+                    compress_ratio=compress_ratio,
+                    state_slot=state_slot,
+                    positions=positions,
+                    chunk_start=chunk_start,
+                    cu_q=cu_q,
+                    win=win,
+                    ring_stride=ring_stride,
+                    swa_pages=swa_pages,
+                    c128_page_indices=c128_pi,
+                    c4_topk_lengths=c4_len,
+                    c4_topk_width=0 if c4_len is None else c4_pi.shape[1],
+                )
+                meta.pf_indices[(compress_ratio, T)] = streams
+            kpre_i, kpre_p, kext_i, kext_p, kpre_swa_len = streams
         if c4_len is not None:
             runtime.fill_compress_tail(
                 indices=kpre_i,
