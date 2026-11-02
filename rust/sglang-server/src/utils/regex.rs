@@ -519,15 +519,16 @@ fn alternation_under_repetition(ast: &regex_syntax::ast::Ast) -> bool {
     }
 }
 
-/// Strict upper bound on the characters `hir` can match; `None` (unbounded) maps to
-/// the full-scan sentinel. Saturating throughout: a nested `{65535}` repeat would
+/// Strict upper bound on the UTF-8 bytes `hir` can match, which bounds its tokens too:
+/// a byte-level tokenizer can spend one token per byte. `None` (unbounded) maps to the
+/// full-scan sentinel. Saturating throughout: a nested `{65535}` repeat would
 /// otherwise overflow into a small — and therefore unsafe — bound.
 fn hir_max_len(hir: &regex_syntax::hir::Hir) -> usize {
     use regex_syntax::hir::HirKind;
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => 0,
         HirKind::Literal(lit) => lit.0.len(),
-        HirKind::Class(_) => 1,
+        HirKind::Class(cls) => cls.maximum_len().unwrap_or(0),
         HirKind::Repetition(rep) => match rep.max {
             None => STOP_REGEX_MAX_LEN,
             Some(max) => (max as usize)
@@ -661,7 +662,7 @@ mod tests {
     fn admitted_pattern_carries_its_own_text_and_bound() {
         let p = RegexPattern::try_from(r"\d{6}").expect("valid");
         assert_eq!(p.pattern(), r"\d{6}");
-        assert_eq!(p.max_len(), 6);
+        assert_eq!(p.max_len(), 24);
     }
 
     /// The property this whole design rests on: **anything Rust admits, Python can
@@ -841,23 +842,23 @@ mod tests {
                 Some(8589934593),
                 INF,
             ),
-            case("(?:.?){30}Z", Policy::MustReject, 31, Some(31), INF), // round 7
-            case("(?:.?){255}Z", Policy::MustReject, 256, Some(256), INF),
+            case("(?:.?){30}Z", Policy::MustReject, 121, Some(121), INF), // round 7
+            case("(?:.?){255}Z", Policy::MustReject, 1021, Some(1021), INF),
             case(
                 "(?:.{0,1}.{0,1}.{0,1}){8}Z",
                 Policy::MustReject,
-                25,
-                Some(25),
+                97,
+                Some(97),
                 INF,
             ),
             case(
                 "(?:(?:.?){15}){15}Z",
                 Policy::MustReject,
-                226,
-                Some(226),
+                901,
+                Some(901),
                 INF,
             ),
-            case("(?:.?.?.?.?){60}Z", Policy::MustReject, 241, Some(241), INF),
+            case("(?:.?.?.?.?){60}Z", Policy::MustReject, 961, Some(961), INF),
             // ---- MustAdmit. Only the first two are contractual: `matched_stop_kit`
             // sends them over HTTP and five registered suites assert on the result.
             // The next three are canaries — a plain literal, a bounded class repeat,
@@ -909,18 +910,18 @@ mod tests {
                 Some(1073741824),
                 0.04,
             ),
-            case(r"(?i)\d{4}-\d{2}", Policy::MayReject, 7, Some(7), 0.06),
+            case(r"(?i)\d{4}-\d{2}", Policy::MayReject, 25, Some(25), 0.06),
             case("(?imsx)a-b", Policy::MayReject, 3, Some(3), 0.04),
             case("(?-i:abc)", Policy::MayReject, 3, Some(3), 0.03),
             case("(?i-s:a)", Policy::MayReject, 1, Some(1), 0.04),
             case("(?i)(?m)a", Policy::MayReject, 1, Some(1), 0.03),
             case(r"\x41", Policy::MayReject, 1, Some(1), 0.02),
-            case(r"\d{6}", Policy::MustAdmit, 6, Some(6), 0.03),
+            case(r"\d{6}", Policy::MustAdmit, 24, Some(24), 0.03),
             case("abc", Policy::MustAdmit, 3, Some(3), 0.03),
             case("(?P<n>a)", Policy::MayReject, 1, Some(1), 0.03),
             case(r"a\.b", Policy::MayReject, 3, Some(3), 0.03),
             case(r"\bword\b", Policy::MayReject, 4, Some(4), 0.03),
-            case(r"[\d\s]{2}", Policy::MayReject, 2, Some(2), 0.03),
+            case(r"[\d\s]{2}", Policy::MayReject, 8, Some(8), 0.03),
             // ---- MayReject: CPython accepts, `regex-syntax` is stricter. A 400
             // costs the client a feature; admitting costs nothing either. Listed so
             // the set of deliberate over-rejections is visible rather than folklore.
@@ -928,7 +929,7 @@ mod tests {
             case(r"(a)\1", Policy::MayReject, 0, Some(1073741825), 0.04),
             case("(?=x)y", Policy::MayReject, 0, Some(1073741825), 0.03),
             case("a{,5}", Policy::MayReject, 5, Some(5), 0.04),
-            case(r"\N{SNOWMAN}", Policy::MayReject, 1, Some(1), 0.03),
+            case(r"\N{SNOWMAN}", Policy::MayReject, 3, Some(3), 0.03),
             case(r"\0", Policy::MayReject, 1, Some(1), 0.03),
         ];
         // Flat concatenations of optional atoms — the round-8 escape. Built rather
@@ -936,15 +937,15 @@ mod tests {
         c.push(case(
             &format!("{}Z", ".{0,1}".repeat(20)),
             Policy::MustReject,
-            21,
-            Some(21),
+            81,
+            Some(81),
             650.62,
         ));
         c.push(case(
             &format!("{}Z", ".{0,4}".repeat(12)),
             Policy::MustReject,
-            49,
-            Some(49),
+            193,
+            Some(193),
             INF,
         ));
         c
@@ -1160,7 +1161,7 @@ mod tests {
         }
         // Ordinary nesting still works.
         assert_eq!(stop_regex_bound("(?:ab){3}").unwrap(), 6);
-        assert_eq!(stop_regex_bound(r"\d{6}").unwrap(), 6);
+        assert_eq!(stop_regex_bound(r"\d{6}").unwrap(), 24);
     }
 
     /// Deep nesting is rejected here rather than blowing Python's parser stack:
@@ -1185,14 +1186,25 @@ mod tests {
     #[test]
     fn stop_regex_bound_is_finite_when_bounded() {
         let len = |p: &str| stop_regex_bound(p).expect("valid pattern");
-        assert_eq!(len(r"\d{6}"), 6);
+        assert_eq!(len(r"\d{6}"), 24); // \d is Unicode: 4 bytes per digit
         assert_eq!(len("abc"), 3);
         assert_eq!(len(r"^abc$"), 3); // anchors are zero-width
         assert_eq!(len("a|bbb"), 3); // alternation → max branch
         assert_eq!(len(r"(ab){3}"), 6);
-        assert_eq!(len(r"a\d{2,5}"), 6);
+        assert_eq!(len(r"a\d{2,5}"), 21);
         assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
         assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
         assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
+    }
+
+    /// A class counts its widest member in UTF-8 bytes, as a literal already does.
+    /// Counting it as 1 sized the window too small for a multi-byte match.
+    #[test]
+    fn class_bound_counts_utf8_bytes() {
+        let len = |p: &str| stop_regex_bound(p).expect("valid pattern");
+        assert_eq!(len("[\u{1F6D1}\u{26D4}]"), 4);
+        assert_eq!(len("[a-z\u{E9}]"), 2);
+        assert_eq!(len("."), 4);
+        assert_eq!(len("[a-z]{3}"), 3);
     }
 }

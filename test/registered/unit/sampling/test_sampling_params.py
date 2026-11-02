@@ -577,8 +577,38 @@ class TestRegexMaxLength(CustomTestCase):
         self.assertEqual(get_max_seq_length("[a-z]"), 1)
 
     def test_dot_any(self):
-        """Test that dot wildcard '.' gives max length 1."""
-        self.assertEqual(get_max_seq_length("."), 1)
+        """Test that dot wildcard '.' gives the widest UTF-8 character, 4 bytes."""
+        self.assertEqual(get_max_seq_length("."), 4)
+
+    def test_non_ascii_literal_counts_utf8_bytes(self):
+        """Test that each literal counts its UTF-8 length: 2, 3 or 4 bytes."""
+        self.assertEqual(get_max_seq_length("é"), 2)
+        self.assertEqual(get_max_seq_length("停止"), 6)
+        self.assertEqual(get_max_seq_length("🛑"), 4)
+        self.assertEqual(get_max_seq_length("Done 🛑"), 9)
+        self.assertEqual(get_max_seq_length("(停|stop)"), 4)
+
+    def test_character_class_uses_widest_member(self):
+        """Test that a class of literals and ranges counts its widest member,
+        taking the upper end of each range."""
+        self.assertEqual(get_max_seq_length("[🛑⛔]"), 4)
+        self.assertEqual(get_max_seq_length("[a-zé]"), 2)
+        self.assertEqual(get_max_seq_length("[a-é]"), 2)
+        self.assertEqual(get_max_seq_length("[\u4e00-\u9fff]{2}"), 6)
+        self.assertEqual(get_max_seq_length("[.!?。]"), 3)
+
+    def test_category_and_negated_class_assume_widest(self):
+        """Test that \\d, \\w, \\s and negated classes can match any character,
+        so they count 4 bytes."""
+        self.assertEqual(get_max_seq_length(r"\d"), 4)
+        self.assertEqual(get_max_seq_length(r"\w"), 4)
+        self.assertEqual(get_max_seq_length(r"\s"), 4)
+        self.assertEqual(get_max_seq_length(r"[a-z\d]"), 4)
+        self.assertEqual(get_max_seq_length("[^ab]"), 4)
+
+    def test_lone_surrogate_escape(self):
+        """Test that an escaped lone surrogate is counted, not raised on."""
+        self.assertEqual(get_max_seq_length(r"\ud800"), 3)
 
     def test_unbounded_star(self):
         """Test that 'a*' (zero or more, no upper bound) returns MAX_LEN."""
@@ -606,8 +636,8 @@ class TestRegexMaxLength(CustomTestCase):
         self.assertEqual(get_max_seq_length("^abc$"), 3)
 
     def test_complex_pattern(self):
-        """Test combined pattern '(foo|bar)\\d{2}': branch(3) + repeat(2) = 5."""
-        self.assertEqual(get_max_seq_length(r"(foo|bar)\d{2}"), 5)
+        """Test combined pattern '(foo|bar)\\d{2}': branch(3) + repeat(2 * 4) = 11."""
+        self.assertEqual(get_max_seq_length(r"(foo|bar)\d{2}"), 11)
 
     def test_nested_groups(self):
         """Test that nested groups '((ab))' correctly recurse to give max length 2."""
