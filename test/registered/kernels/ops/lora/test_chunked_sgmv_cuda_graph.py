@@ -12,11 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 
-"""CUDA-graph regressions for #28371: dynamic chunked-SGMV LoRA segments."""
+"""CUDA-graph replay regressions for chunked-SGMV LoRA."""
+
+import math
+from unittest.mock import patch
 
 import pytest
 import torch
 
+import sglang.kernels.ops.lora.dense.chunked_sgmv_shrink as shrink_module
 from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
     _chunked_lora_expand_kernel,
     chunked_sgmv_lora_expand_forward,
@@ -31,13 +35,14 @@ from sglang.kernels.ops.lora.dense.kv_b_lora_absorbed import (
     step_b_q_fwd,
     step_b_v_fwd,
 )
+from sglang.srt.environ import envs
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, csgmv_segment_grid_size
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -193,7 +198,7 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             device=torch.device("cuda"),
             server_args=server_args,
         )
-        backend.init_cuda_graph_batch_info(
+        backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=BS, num_tokens_per_req=1
         )
         lora_ranks = [MAX_RANK] * NUM_LORAS
@@ -224,6 +229,46 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             backend.batch_info.seg_indptr.cpu(),
             torch.tensor([0, 2, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
         )
+
+
+def test_segment_grid_size_covers_replays_with_smaller_chunks():
+    """A 64-request graph launches 9 segment programs, enough for its worst replay."""
+
+    class MockForwardBatch:
+        forward_mode = ForwardMode.DECODE
+
+        def __init__(self, batch_size):
+            self.batch_size = batch_size
+
+    with get_context().override_server_args(max_lora_chunk_size=32) as server_args:
+        backend = ChunkedSgmvLoRABackend(
+            max_loras_per_batch=NUM_LORAS,
+            device=torch.device("cuda"),
+            server_args=server_args,
+        )
+        backend.init_decode_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=64, num_tokens_per_req=1
+        )
+
+        def prepare(weight_indices):
+            backend.prepare_lora_batch(
+                forward_batch=MockForwardBatch(len(weight_indices)),
+                weight_indices=weight_indices,
+                lora_ranks=[MAX_RANK] * NUM_LORAS,
+                scalings=[1.0] * NUM_LORAS,
+                use_cuda_graph=True,
+            )
+
+        # Capture a 64-request graph: it uses 32-token chunks.
+        prepare([0] * 64)
+        grid = csgmv_segment_grid_size(backend.batch_info, num_tokens=64)
+
+        # Replay 63 requests: they drop to 16-token chunks, and their adapter
+        # groups of 17, 17, 17, 11 and 1 tokens need 2 + 2 + 2 + 1 + 1 segments.
+        prepare([1, 2, 3] * 17 + [4] * 11 + [0])
+        assert backend.batch_info.num_segments == 8
+        assert grid == 9  # 64 // 16 + 5
+        assert csgmv_segment_grid_size(backend.batch_info, num_tokens=4096) == 64
 
 
 def test_absorbed_kv_b_replay_uses_all_current_segments():
@@ -291,6 +336,56 @@ def test_absorbed_kv_b_replay_uses_all_current_segments():
 
     torch.testing.assert_close(captured_q, expected_q, rtol=RTOL, atol=ATOL)
     torch.testing.assert_close(captured_v, expected_v, rtol=RTOL, atol=ATOL)
+
+
+def _set_mixed_segment_state(batch_info, *, active):
+    _set_segment_state(batch_info, active=active)
+    if active:
+        batch_info.lora_ranks.copy_(
+            torch.tensor([0, 8, 16, 32, 0], dtype=torch.int32, device="cuda")
+        )
+    batch_info.permutation.copy_(
+        torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32, device="cuda")
+    )
+    batch_info.scalings.copy_(torch.tensor([1.0, -0.7, 1.0, 1.5, 0.3], device="cuda"))
+
+
+def test_split_k_compact_replay_uses_current_metadata():
+    """Captured split-K and compact expand must follow inactive and active adapter updates."""
+    torch.manual_seed(7)
+    batch_info = _make_batch_info()
+    _set_mixed_segment_state(batch_info, active=False)
+    inputs = torch.randn(BS, 4096, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(NUM_LORAS, 96, 4096, device="cuda", dtype=torch.bfloat16) / 64
+    b = torch.randn(
+        NUM_LORAS, 194, 32, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(32)
+    offsets_cpu = torch.tensor([0, 65, 65, 194], dtype=torch.int32)
+    offsets_gpu = offsets_cpu.cuda()
+    base = torch.randn(BS, 211, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        h = chunked_sgmv_lora_shrink_forward(inputs, a, batch_info, 3, split_k=8)
+        output = base.clone()
+        chunked_sgmv_lora_expand_forward(
+            h, b, batch_info, offsets_gpu, 129, output[:, :194], offsets_cpu
+        )
+        return output
+
+    split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
+    with (
+        envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False),
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
+        patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
+    ):
+        graph, captured = _capture(run)
+        assert launches.call_count == 4
+        for active in (True, False, True):
+            _set_mixed_segment_state(batch_info, active=active)
+            expected = run()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

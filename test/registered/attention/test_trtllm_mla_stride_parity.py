@@ -1,6 +1,6 @@
 """The paged MLA decode kernels must not depend on the KV cache's slot stride.
 
-trtllm_mla, cutedsl_mla and tokenspeed_mla hand their decode kernels
+trtllm_mla and cutedsl_mla hand their decode kernels
 `paged_row_view(k_cache, page_size).unsqueeze(1)`: `[pages, 1, page_size,
 kv_cache_dim]` whose in-page token stride is the pool's SLOT stride. Under the
 unified pool's token-major layout that stride spans every layer's latent row,
@@ -19,8 +19,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_sm100_supported, is_tokenspeed_mla_available
+from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
@@ -118,38 +117,6 @@ class TestPagedMLADecodeStrideParity(unittest.TestCase):
                     )
 
                 self._assert_stride_independent(run, kv_dtype)
-
-    def test_tokenspeed_mla_decode_is_identical_across_slot_strides(self):
-        if not is_tokenspeed_mla_available():
-            self.skipTest("tokenspeed_mla is not installed")
-        import tokenspeed_mla
-
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            _get_tokenspeed_workspace,
-        )
-
-        # The workspace is sized for the DCP-gathered head count.
-        with get_parallel().override(attn_dcp_size=1):
-            workspace = _get_tokenspeed_workspace(
-                torch.device("cuda"), _Q_HEADS, _KV_LORA_RANK
-            )
-        kv_dtype = torch.float8_e4m3fn
-        q = torch.randn(_BS, 1, _Q_HEADS, _KV_CACHE_DIM, device="cuda").to(kv_dtype)
-
-        def run(kv_cache):
-            return tokenspeed_mla.tokenspeed_mla_decode(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=workspace,
-                kv_lora_rank=_KV_LORA_RANK,
-                qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-                block_tables=self.block_tables,
-                seq_lens=self.seq_lens,
-                max_seq_len=_PAGES * _PAGE_SIZE,
-                softmax_scale=_KV_CACHE_DIM**-0.5,
-            )
-
-        self._assert_stride_independent(run, kv_dtype)
 
 
 if __name__ == "__main__":

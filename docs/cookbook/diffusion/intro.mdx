@@ -81,6 +81,12 @@ Video models denoise a bounded latent video sequence for each request. Use these
 
 <CardGroup cols={3}>
   <Card
+    title="FLUX.3"
+    mode="card"
+    href="/cookbook/diffusion/FLUX/FLUX.3"
+    img="/cards/logos/flux.png"
+  />
+  <Card
     title="Cosmos"
     mode="card"
     href="/cookbook/diffusion/Cosmos/Cosmos3"
@@ -127,6 +133,12 @@ Video models denoise a bounded latent video sequence for each request. Use these
     mode="card"
     href="/cookbook/diffusion/MiniMax/MiniMax-H3"
     img="/cards/logos/minimax.png"
+  />
+  <Card
+    title="MOSS-Image"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/OpenMOSS/MOSS-Image"
   />
   <Card
     title="LingBot Video MoE"

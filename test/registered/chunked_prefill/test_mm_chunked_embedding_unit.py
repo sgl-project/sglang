@@ -25,7 +25,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -480,6 +480,34 @@ def test_precomputed_audio_slices_concatenate_once(monkeypatch, prefix, length, 
         == embeddings.untyped_storage().data_ptr()
     )
     concat.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "n_ids,n_placeholders,ids_dtype",
+    [
+        (1, 1, torch.int64),
+        (64, 3, torch.int64),
+        (4096, 800, torch.int64),
+        (16384, 800, torch.int32),
+    ],
+)
+def test_multimodal_mask_matches_broadcast_compare(n_ids, n_placeholders, ids_dtype):
+    gen = torch.Generator().manual_seed(n_ids)
+    pad_values = torch.randperm(4 * n_placeholders + 8, generator=gen)[
+        :n_placeholders
+    ].tolist()
+    # Host-sorted placeholders with a repeat, as embed_mm_inputs builds them; ids
+    # below, between and above them.
+    placeholders = torch.tensor(sorted(pad_values + pad_values[:1]))
+    input_ids = torch.randint(-2, 4 * n_placeholders + 10, (n_ids,), generator=gen).to(
+        ids_dtype
+    )
+
+    mask = mm_schedule._get_multimodal_mask(input_ids, placeholders)
+
+    broadcast = (input_ids.unsqueeze(-1) == placeholders).any(-1).unsqueeze(-1)
+    assert torch.equal(mask, broadcast)
+    assert torch.equal(mask, torch.isin(input_ids, placeholders).unsqueeze(-1))
 
 
 if __name__ == "__main__":
