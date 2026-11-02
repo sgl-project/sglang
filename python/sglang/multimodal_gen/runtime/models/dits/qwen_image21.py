@@ -243,20 +243,19 @@ class PrefixPad:
         return self.value
 
 
-@eager_on_graph
-def attend_past_prefix_pad(attn, q, k, v, prefix_pad, out):
+@eager_on_graph(
+    output_factory=lambda attn, q, k, v, prefix_pad: q.new_empty(
+        (*q.shape[:-1], v.shape[-1])
+    )
+)
+def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
     # a graph break: the pad varies per request, and skipping it hands the
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
     # impl like USPAttention does without SP, since its forward is a break too
     rows = prefix_pad.get()
-    result = attn.attn_impl.forward(
+    return attn.attn_impl.forward(
         q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
     )
-    # copy_ would broadcast a mispredicted shape or cast a dtype silently.
-    assert out.shape == result.shape and out.dtype == result.dtype, (
-        "Qwen-Image 2.1 prefix-pad attention output mispredicted"
-    )
-    out.copy_(result)
 
 
 def cat_outputs(outputs, dim=0):
@@ -722,9 +721,7 @@ class QwenImage21Attention(nn.Module):
     def attend_target(self, q, k, v, prefix_pad):
         if prefix_pad is None:
             return self.target_attn(q, k, v)
-        out = q.new_empty((*q.shape[:-1], v.shape[-1]))
-        attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad, out)
-        return out
+        return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
 
     def attend_sample(
         self,

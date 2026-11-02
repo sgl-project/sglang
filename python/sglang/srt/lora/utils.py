@@ -114,6 +114,25 @@ class Phase(str, Enum):
     PREFILL = "prefill"
 
 
+# Smallest csgmv chunk size; --max-lora-chunk-size only changes the largest.
+MIN_CHUNK_SIZE = 16
+
+
+def csgmv_segment_grid_size(batch_info: LoRABatchInfo, num_tokens: int) -> int:
+    """Number of segment programs a csgmv launch over num_tokens rows needs.
+
+    Under a CUDA graph the grid must cover every batch that replays it, and a
+    smaller batch can use smaller chunks, so assume MIN_CHUNK_SIZE: at most
+    num_tokens // MIN_CHUNK_SIZE segments plus one partial per adapter slot.
+    """
+    if not batch_info.use_cuda_graph:
+        return batch_info.num_segments
+    return min(
+        batch_info.weight_indices.shape[0],
+        num_tokens // MIN_CHUNK_SIZE + batch_info.lora_ranks.shape[0],
+    )
+
+
 def architecture_for_capability(major: int) -> str:
     """Plan-table name for compute capability major: sm90, sm100 (>= 10) or default."""
     if major == 9:

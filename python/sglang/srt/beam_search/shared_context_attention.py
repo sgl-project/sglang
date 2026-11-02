@@ -26,7 +26,7 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -286,7 +286,7 @@ def forward(
     q: torch.Tensor,
     layer: RadixAttention,
     forward_batch: ForwardBatch,
-    token_to_kv_pool: MHATokenToKVPool,
+    kv_layers: KVLayerRouter,
 ) -> Optional[torch.Tensor]:
     metadata = forward_batch.beam_attention_metadata
     if metadata is None:
@@ -297,7 +297,7 @@ def forward(
             "disable SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION for this model."
         )
 
-    k_buffer, v_buffer = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+    k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:
         raise RuntimeError("Shared-context attention requires 3D MHA K/V cache buffers")
 

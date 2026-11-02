@@ -55,7 +55,7 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_layer(
                         forward_batch,
@@ -67,6 +67,4 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        return shared_context_attention.forward(
-            q, layer, forward_batch, self.token_to_kv_pool
-        )
+        return shared_context_attention.forward(q, layer, forward_batch, self.kv_layers)
