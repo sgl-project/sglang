@@ -19,9 +19,14 @@ import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.device_pool_info import (
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
+)
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -541,6 +546,97 @@ class TestLayerShardedHostTransfers(CustomTestCase):
                 buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
             )
             self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
+
+
+def _fake_widened_index_pool(size: int = 1024, layer_num: int = 2) -> SimpleNamespace:
+    """A DSA device pool whose index-K spans every widened DCP slot."""
+    row_bytes = 128 + 128 // 128 * 4
+    pages = (size * DCP_SIZE + PHYSICAL_PAGE) // PHYSICAL_PAGE
+    return SimpleNamespace(
+        index_k_with_scale_buffer=[
+            torch.zeros(pages, PHYSICAL_PAGE * row_bytes, dtype=torch.uint8)
+            for _ in range(layer_num)
+        ],
+        index_page_size=PHYSICAL_PAGE,
+        page_size=PHYSICAL_PAGE,
+        index_head_dim=128,
+        quant_block_size=128,
+        skip_topk_layers=[False] * layer_num,
+        store_dtype=torch.float16,
+        layer_num=layer_num,
+        start_layer=0,
+        end_layer=layer_num - 1,
+        device="cpu",
+        layer_shard_enabled=False,
+    )
+
+
+class TestDsaIndexerHostUnderDcp(CustomTestCase):
+    def _make(self, packed_drafts=()):
+        anchor = _make_host_pool(dcp_rank=5)
+        self.addCleanup(anchor.destroy)
+        device_pool = _fake_widened_index_pool()
+        # Packed draft layers follow the target layers in both the buffer list
+        # and the device layer ids, which is how the host pool tells them apart.
+        buffers = list(device_pool.index_k_with_scale_buffer)
+        layer_mapping = {layer: layer for layer in range(device_pool.layer_num)}
+        for draft in packed_drafts:
+            for buffer in draft.index_k_with_scale_buffer:
+                layer_mapping[len(buffers)] = len(buffers)
+                buffers.append(buffer)
+        host = DSAIndexerPoolHost(
+            IndexKeyBufferInfo(
+                page_size=PHYSICAL_PAGE,
+                compress_ratio=1,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                buffers=tuple(buffers),
+            ),
+            layer_mapping=layer_mapping,
+            target_device_layer_num=device_pool.layer_num,
+            # The host mirror spans every rank's slots, so it pages the widened
+            # transfer indices untranslated. This is what the assembler passes.
+            num_host_pages=anchor.page_num * anchor.dcp_size,
+            transfer_page_size=anchor.page_size,
+            layout=anchor.layout,
+            buffer_device=device_pool.device,
+            dtype=device_pool.store_dtype,
+            pin_memory=False,
+        )
+        self.addCleanup(host.destroy)
+        return anchor, device_pool, host
+
+    def test_sized_over_the_widened_slot_space(self):
+        anchor, _, host = self._make()
+        self.assertEqual(host.page_size, PHYSICAL_PAGE)
+        self.assertEqual(host.size, anchor.logical_size)
+        self.assertEqual(host.page_num, anchor.page_num * DCP_SIZE)
+        self.assertGreaterEqual(
+            host.indexer_page_num * PHYSICAL_PAGE, anchor.logical_size
+        )
+
+    def test_backup_pages_widened_indices_untranslated(self):
+        anchor, device_pool, host = self._make()
+        start = anchor.logical_size - WIDENED_PAGE
+        slots = torch.arange(start, anchor.logical_size)
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.dsa.transfer_kv_all_layer_mla",
+            create=True,
+        ) as kernel:
+            host.backup_from_device_all_layer(
+                device_pool, slots, slots.clone(), "kernel"
+            )
+        pages = torch.arange(
+            start // PHYSICAL_PAGE, anchor.logical_size // PHYSICAL_PAGE
+        )
+        torch.testing.assert_close(kernel.call_args.kwargs["src_indices"], pages)
+        torch.testing.assert_close(kernel.call_args.kwargs["dst_indices"], pages)
+        self.assertLess(int(pages.max()), host.indexer_page_num)
+
+    def test_packed_draft_adds_a_widened_tail_layer(self):
+        draft = _fake_widened_index_pool(layer_num=1)
+        anchor, _, host = self._make(packed_drafts=(draft,))
+        self.assertEqual(host.layer_num, 3)
+        self.assertEqual(host.size, anchor.logical_size)
 
 
 if __name__ == "__main__":

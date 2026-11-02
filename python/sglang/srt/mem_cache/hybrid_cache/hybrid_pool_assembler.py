@@ -1689,7 +1689,9 @@ def _build_sidecar_host_pool(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
         target_device_layer_num=root.layer_num,
-        num_host_pages=root_host_pool.page_num,
+        # Under DCP the device index-K spans every rank's slots, so the host
+        # mirror pages the widened transfer indices untranslated.
+        num_host_pages=root_host_pool.page_num * root_host_pool.dcp_size,
         transfer_page_size=root_host_pool.page_size,
         layout=root_host_pool.layout,
         buffer_device=root.device,
