@@ -38,7 +38,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import apply_qk_norm_rope, can_use_jit_qk_norm_rope
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
@@ -252,6 +252,13 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
+        self.use_jit_qk_norm_rope = can_use_jit_qk_norm_rope(
+            self.q_norm,
+            self.k_norm,
+            self.rotary_emb,
+            self.head_dim,
+            torch.get_default_dtype(),
+        )
 
         # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
         # CUDA head sizes also select the non-fallback RoPE implementation.
@@ -323,15 +330,17 @@ class Qwen3Attention(nn.Module):
                 match_cuda=True,
             )
         else:
-            q, k = apply_qk_norm(
+            q, k = apply_qk_norm_rope(
                 q=q,
                 k=k,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                rotary_emb=self.rotary_emb,
+                positions=positions,
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
+                use_jit=self.use_jit_qk_norm_rope,
             )
-            q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
