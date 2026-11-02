@@ -1462,6 +1462,16 @@ def fused_topk(
     return topk_weights, topk_ids
 
 
+def fused_shared_expert_weight(
+    *, routed_scaling_factor: Optional[float], fused_in_topk: bool
+) -> float:
+    """Shared-slot weight that cancels any later routed-output scaling."""
+    if fused_in_topk or not routed_scaling_factor:
+        return 1.0
+    # The routed output, shared column included, is scaled by the factor later.
+    return 1.0 / routed_scaling_factor
+
+
 # This is used by the Deepseek V2/V3/R1 series models
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
@@ -1501,37 +1511,48 @@ def grouped_topk_gpu(
         .reshape(num_token, -1)
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    num_routed_topk = (
+        topk - num_fused_shared_experts if num_fused_shared_experts > 0 else topk
+    )
     topk_weights, topk_ids = torch.topk(
         tmp_scores,
-        k=topk,
+        k=num_routed_topk,
         dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
+        sorted=False,
     )
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
-            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
         # fp16); the sum dtype and the division's type promotion upcast inside
         # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
-        )
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
+    if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
         topk_weights *= routed_scaling_factor
+
+    if num_fused_shared_experts > 0:
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
+        shared_weight_val = fused_shared_expert_weight(
+            routed_scaling_factor=routed_scaling_factor,
+            fused_in_topk=bool(apply_routed_scaling_factor_on_output),
+        )
+        shared_weights = torch.full(
+            (num_token, num_fused_shared_experts),
+            shared_weight_val,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+        topk_weights = torch.cat([topk_weights, shared_weights], dim=-1)
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -1689,39 +1710,49 @@ def biased_topk_impl(
     scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
         -1, num_experts
     )
+    num_routed_topk = (
+        topk - num_fused_shared_experts if num_fused_shared_experts > 0 else topk
+    )
     _, topk_ids = torch.topk(
         scores_for_choice,
-        k=topk,
+        k=num_routed_topk,
         dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
+        sorted=False,
     )
     topk_weights = scores.gather(1, topk_ids)
-
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
-            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
         # fp16); the sum dtype and the division's type promotion upcast inside
         # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
-        )
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
+    if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
         topk_weights *= routed_scaling_factor
+
+    if num_fused_shared_experts > 0:
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
+        shared_weight_val = fused_shared_expert_weight(
+            routed_scaling_factor=routed_scaling_factor,
+            fused_in_topk=bool(apply_routed_scaling_factor_on_output),
+        )
+        shared_weights = torch.full(
+            (num_token, num_fused_shared_experts),
+            shared_weight_val,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+        topk_weights = torch.cat([topk_weights, shared_weights], dim=-1)
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
@@ -1898,41 +1929,49 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
+    num_routed_topk = (
+        topk - num_fused_shared_experts if num_fused_shared_experts > 0 else topk
+    )
     _, topk_ids = torch.topk(
         tmp_scores,
-        k=topk,
+        k=num_routed_topk,
         dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
+        sorted=False,
     )
     topk_weights = scores.gather(1, topk_ids)
-
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
         # fp16); the sum dtype and the division's type promotion upcast inside
         # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
-        )
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
+    if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
         topk_weights *= routed_scaling_factor
 
-    if num_fused_shared_experts:
-        topk_weights[:, -1] = fused_shared_expert_weight(
+    if num_fused_shared_experts > 0:
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
+        shared_weight_val = fused_shared_expert_weight(
             routed_scaling_factor=routed_scaling_factor,
             fused_in_topk=bool(apply_routed_scaling_factor_on_output),
         )
+        shared_weights = torch.full(
+            (num_token, num_fused_shared_experts),
+            shared_weight_val,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+        topk_weights = torch.cat([topk_weights, shared_weights], dim=-1)
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -2555,16 +2594,6 @@ def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
         topk_config.scoring_func == "sqrtsoftplus"
         and topk_config.custom_routing_function is None
     )
-
-
-def fused_shared_expert_weight(
-    *, routed_scaling_factor: Optional[float], fused_in_topk: bool
-) -> float:
-    """Shared-slot weight that cancels any later routed-output scaling."""
-    if fused_in_topk or not routed_scaling_factor:
-        return 1.0
-    # The routed output, shared column included, is scaled by the factor later.
-    return 1.0 / routed_scaling_factor
 
 
 def remap_topk_for_per_rank_shared_slots(
