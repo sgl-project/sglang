@@ -1611,8 +1611,10 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
-            final_seq_lens = ctx.final_seq_lens_cpu.to(
-                device=ctx.device, dtype=torch.int32
+            final_seq_lens = (
+                ctx.compress_seq_lens
+                if ctx.active_target_verify
+                else ctx.final_seq_lens_cpu.to(device=ctx.device, dtype=torch.int32)
             )
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
