@@ -605,9 +605,7 @@ class TestFusedQKNorm:
             sin = cache[:, None, half:]
             if is_neox:
                 x0, y0 = rows[..., :half], rows[..., half:]
-                rotated = torch.cat(
-                    [x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1
-                )
+                rotated = torch.cat([x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1)
             else:
                 x0, y0 = rows[..., 0::2], rows[..., 1::2]
                 rotated = torch.stack(
