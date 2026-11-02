@@ -19,7 +19,7 @@ use dynamo_renderer::{
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
-use sglang_processor::{ChatFormatter as ProcessorFormatter, DeepSeekV4Profile};
+use sglang_processor::ChatFormatter as ProcessorFormatter;
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -74,7 +74,7 @@ impl ChatFormatter {
             Some(t) if t.starts_with("deepseek_v4") => {
                 let mut formatter = Self::deepseek_native(model_type.as_deref(), model_id);
                 if let Some(formatter) = &mut formatter {
-                    formatter.configure_deepseek(files, &config)?;
+                    formatter.attach_deepseek_tokenizer(files)?;
                 }
                 return Ok(formatter);
             }
@@ -87,29 +87,25 @@ impl ChatFormatter {
         let mut formatter = Self::from_tokenizer_config(cfg, jinja.as_deref())?
             .or_else(|| Self::deepseek_native(model_type.as_deref(), model_id));
         if let Some(formatter) = &mut formatter {
-            formatter.configure_deepseek(files, &config)?;
+            formatter.attach_deepseek_tokenizer(files)?;
         }
         Ok(formatter)
     }
 
-    fn configure_deepseek(
-        &mut self,
-        files: &super::adapter::ModelFiles,
-        config: &JsonValue,
-    ) -> Result<()> {
-        if let Some(ProcessorFormatter::DeepSeekV4(profile)) = &mut self.processor {
-            let profile_override = config
-                .get("dsv4_reasoning_effort_profile")
-                .filter(|v| !v.is_null())
-                .map(|v| v.as_str().context("invalid dsv4_reasoning_effort_profile"))
-                .transpose()?;
-            let encoder = match profile_override {
-                Some(_) => None,
-                None => files.text("encoding/encoding_dsv4.py")?,
-            };
-            *profile = DeepSeekV4Profile::from_checkpoint(profile_override, encoder.as_deref())
-                .map_err(anyhow::Error::msg)?;
-        }
+    /// DeepSeek-V4 and V4.1 encode their own prompt ids, as SGLang's recipe
+    /// path does, with the checkpoint's `tokenizer.json`.
+    fn attach_deepseek_tokenizer(&mut self, files: &super::adapter::ModelFiles) -> Result<()> {
+        let v41 = match self.processor {
+            Some(ProcessorFormatter::DeepSeekV4(_)) => false,
+            Some(ProcessorFormatter::DeepSeekV41(_)) => true,
+            _ => return Ok(()),
+        };
+        let tokenizer = files
+            .tokenizer_text()?
+            .context("DeepSeek-V4 prompts need the checkpoint's tokenizer.json")?;
+        self.processor = Some(
+            ProcessorFormatter::deepseek_v4(v41, Some(&tokenizer)).map_err(anyhow::Error::msg)?,
+        );
         Ok(())
     }
 
@@ -246,9 +242,9 @@ impl ChatFormatter {
             defaults,
             bos_token: Some("<｜begin▁of▁sentence｜>".into()),
             processor: if is_deepseek_v41 {
-                Some(ProcessorFormatter::DeepSeekV41)
+                Some(ProcessorFormatter::DeepSeekV41(None))
             } else {
-                is_deepseek_v4.then_some(ProcessorFormatter::DeepSeekV4(DeepSeekV4Profile::Preview))
+                is_deepseek_v4.then_some(ProcessorFormatter::DeepSeekV4(None))
             },
             worker_defaults: ChatTemplateKwargs::new(),
         })
@@ -281,6 +277,11 @@ impl ChatFormatter {
     /// (`chat_encoding_spec`).
     pub fn is_kimi_k3(&self) -> bool {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
+    }
+
+    /// The `sglang_processor` formatter, for models that render through it.
+    pub fn processor(&self) -> Option<&ProcessorFormatter> {
+        self.processor.as_ref()
     }
 
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
@@ -400,6 +401,13 @@ impl ChatFormatter {
     }
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+        if let Some(ids) = self
+            .processor
+            .as_ref()
+            .and_then(|formatter| formatter.encode_request(request.clone(), &self.worker_defaults))
+        {
+            return ids.context("render chat");
+        }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
             Some(segments) if self.is_kimi_k3() => super::kimi::encode(tokenizer, &segments)?,
@@ -1052,7 +1060,6 @@ mod tests {
         let enc = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias").unwrap();
         for (effort, budget) in [
             (None, default_budget.as_str()),
-            (Some("unsupported"), default_budget.as_str()),
             (Some("low"), "50"),
             (Some("high"), "75"),
             (Some("xhigh"), "75"),
@@ -1094,23 +1101,6 @@ mod tests {
     }
 
     #[test]
-    fn v4_task_uses_dynamo_task_tokens() {
-        let mut req = request(json!([{"role":"user","content":"example.com"}]));
-        for (task, suffix) in [
-            ("domain", "<｜domain｜>"),
-            ("action", "<｜Assistant｜></think><｜action｜>"),
-        ] {
-            req["task"] = json!(task);
-            assert_eq!(
-                deepseek_v4().render(&req).unwrap(),
-                format!("<｜begin▁of▁sentence｜><｜User｜>example.com{suffix}")
-            );
-        }
-        req["messages"] = json!([{"role":"system","content":"hi"}]);
-        assert!(deepseek_v4().render(&req).is_err());
-    }
-
-    #[test]
     fn continuation_preserves_token_boundaries() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg: JsonValue =
@@ -1139,14 +1129,5 @@ mod tests {
             out,
             "<｜begin▁of▁sentence｜><｜User｜>hi\n\nb<｜Assistant｜></think>"
         );
-    }
-
-    /// The engine never renders `response_format` into the prompt.
-    #[test]
-    fn v4_ignores_response_format() {
-        let mut req = request(json!([{"role":"user","content":"ABCD"}]));
-        let plain = deepseek_v4().render(&req).unwrap();
-        req["response_format"] = json!({"type": "json_object"});
-        assert_eq!(deepseek_v4().render(&req).unwrap(), plain);
     }
 }

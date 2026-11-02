@@ -7,11 +7,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
@@ -39,6 +42,7 @@ class TestSchedulerFlushCacheAfterRetract(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None

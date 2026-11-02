@@ -145,6 +145,7 @@ def _build_worker(*, backend, processor):
         ),
     )
     worker.draft_runner = SimpleNamespace(
+        model=torch.nn.Identity(),
         device="cpu",
         ps=SimpleNamespace(tp_size=1, attn_dp_size=1),
         server_args=get_server_args(),

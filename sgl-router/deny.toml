@@ -32,6 +32,9 @@ allow = [
     "MPL-2.0",
     # Added per the initial license review:
     "CDLA-Permissive-2.0",  # webpki-roots — Linux Foundation permissive license.
+    # deepseek-recipe's dependency tree (both OSI approved, permissive):
+    "BSL-1.0",  # xxhash-rust — Boost Software License.
+    "MIT-0",  # borrow-or-share (via jsonschema) — MIT No Attribution.
 ]
 confidence-threshold = 0.93
 

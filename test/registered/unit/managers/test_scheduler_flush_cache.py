@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
+from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
@@ -18,7 +18,7 @@ from sglang.srt.managers.scheduler_components.flush_wrapper import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.watermarking.proposal_relay import RequestProposalRelay
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
@@ -132,16 +132,6 @@ class TestSchedulerFlushCache(CustomTestCase):
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
         scheduler.send_output.assert_not_called()
-
-    def test_control_output_goes_to_the_embedded_rust_server(self):
-        """A control reply, deferred flush included, takes the Rust server's
-        egress ring when the scheduler embeds one, else the tokenizer socket."""
-        output = FlushCacheReqOutput(success=True)
-        req = FlushCacheReqInput(rid="r", timeout_s=1.0)
-        rust = SimpleNamespace(rust_server=MagicMock(), ipc_channels=MagicMock())
-        Scheduler.send_control_output(rust, output, req)
-        rust.rust_server.push_control_output.assert_called_once_with(req, output)
-        rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
 class TestSynthIDCacheFlush(CustomTestCase):

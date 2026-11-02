@@ -2,11 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.penaltylib import (
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,
@@ -16,7 +16,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 VOCAB_SIZE = 32
@@ -60,16 +60,12 @@ class _SamplingMetadataTestBase(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        exec_context = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=True),
+        config = get_context().override_server_args(
+            enable_custom_logit_processor=True,
+            enable_deterministic_inference=False,
         )
-        context_patch = patch(
-            "sglang.srt.sampling.sampling_batch_info.get_exec",
-            return_value=exec_context,
-        )
-        context_patch.start()
-        self.addCleanup(context_patch.stop)
+        config.install()
+        self.addCleanup(config.restore)
 
     def assert_device_tensor(self, actual, expected, dtype=None):
         self.assertEqual(actual.device, torch.device(self.device))

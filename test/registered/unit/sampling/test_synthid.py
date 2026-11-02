@@ -851,6 +851,7 @@ class TestSynthID(CustomTestCase):
                         draft_runner=SimpleNamespace(tp_group=None),
                         _draft_extend_for_decode=Mock(),
                         draft_owns_attention=False,
+                        parallel_layout=SimpleNamespace(tp_group=None),
                     )
                     worker = SimpleNamespace(
                         speculative_num_steps=0,
@@ -865,9 +866,10 @@ class TestSynthID(CustomTestCase):
                         draft_worker=draft,
                         verify=Mock(),
                         _stub_skipped_draft_extend=Mock(),
+                        _post_verify_graphs=None,
                         _build_trivial_verify_input=Mock(
                             return_value=SimpleNamespace(
-                                is_verify_input=lambda: True, kv_loc_plan=None
+                                is_verify_input=lambda: True, iteration_ids=None
                             )
                         ),
                     )

@@ -22,7 +22,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestTritonSparseMLAValidator(CustomTestCase):
@@ -223,7 +223,7 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
 
     def _method(self, prefill_impl, *, store_fp8=True, mode=None):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_kv_cache_store_fp8 = store_fp8

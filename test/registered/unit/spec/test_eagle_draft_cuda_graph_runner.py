@@ -22,7 +22,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -30,6 +31,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_worker_v2
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -42,11 +46,91 @@ from sglang.srt.watermarking.synthid import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 CAPTURE_BS = 4
 SEQ_LEN_FILL_VALUE = 1
 NUM_STEPS = 3
+
+# A megakernel's graph variants of the batch sizes it serves; select reads host state.
+_KV_LENGTH_VARIANTS = SimpleNamespace(
+    capture_labels=("short", "long"),
+    select=lambda fb: "long" if fb.attention_kv_len_lower_bound >= 8 else "short",
+)
+# (variants offered, the requests' KV lengths, the lower bound, the label replayed):
+# a batch of the size the megakernel serves (1) replays what select picks; a batch of
+# another size, or a runner offered none, replays the unlabeled graph
+_REPLAY_KEYS = (
+    (True, [9], 8, "long"),
+    (True, [9], 7, "short"),
+    (True, [9, 10], None, None),
+    (False, [9], 8, None),
+)
+
+
+def _offer_variants(runner, served):
+    runner.attention_graph_variants = _KV_LENGTH_VARIANTS
+    runner.attention_variant_sizes = frozenset(served)
+
+
+def _extend_runner(raw_bs):
+    """A bare draft-extend runner of capture sizes 1 and 2, as execute() reads it, and
+    a forward batch of raw_bs requests three rows wide."""
+    width = 3
+    rows = 2 * width
+    runner = EAGLEDraftExtendCudaGraphRunner.__new__(EAGLEDraftExtendCudaGraphRunner)
+    runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+    runner.buffers = SimpleNamespace(
+        input_ids=torch.zeros(rows, dtype=torch.int64),
+        seq_lens=torch.zeros(2, dtype=torch.int64),
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        positions=torch.zeros(rows, dtype=torch.int64),
+        req_pool_indices=torch.zeros(2, dtype=torch.int64),
+        num_correct_drafts=torch.zeros(2, dtype=torch.int32),
+        num_accept_tokens=torch.zeros(2, dtype=torch.int32),
+        extend_seq_lens=torch.zeros(2, dtype=torch.int32),
+        select_index=torch.zeros(2, dtype=torch.int64),
+        mamba_track_indices=None,
+        hidden_states=torch.zeros((rows, 2)),
+        seq_lens_cpu=torch.zeros(2, dtype=torch.int64),
+    )
+    runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
+    runner.captured_req_width, runner.capture_bs = width, [1, 2]
+    runner.seq_len_fill_value = 1
+    runner.extend_seq_lens_cpu = [width] * 2
+    runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    runner.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(model_is_mrope=False), device_timer=None
+    )
+    runner.draft_extend_attn_backend = SimpleNamespace(
+        init_forward_metadata_out_graph=lambda fb_view: None,
+        shared_read_ends=lambda mode: SharedReadEnds.UNKNOWN,
+    )
+    num_tokens = raw_bs * width
+    forward_batch = SimpleNamespace(
+        batch_size=raw_bs,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        seq_lens=torch.full((raw_bs,), 12),
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+        positions=torch.zeros(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.ones(raw_bs, dtype=torch.int64),
+        mrope_positions=None,
+        extend_seq_lens=torch.full((raw_bs,), width, dtype=torch.int32),
+        mamba_track_indices=None,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=[width] * raw_bs,
+        seq_lens_sum=None,
+        out_cache_loc_virtual=None,
+        iteration_ids=None,
+        iteration_cols=None,
+        spec_info=SimpleNamespace(
+            num_correct_drafts=torch.zeros(raw_bs, dtype=torch.int32),
+            num_accept_tokens=torch.ones(raw_bs, dtype=torch.int32),
+            hidden_states=torch.zeros((num_tokens, 2)),
+        ),
+    )
+    select_index = torch.arange(raw_bs) * width + width - 1
+    return runner, forward_batch, select_index
 
 
 class _RecordingDraftBackend:
@@ -405,6 +489,39 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         )
         return backend, forward_batch
 
+    def test_replay_keys_the_graph_select_picks_where_the_megakernel_serves(self):
+        """A batch size the draft megakernel serves captures one graph per label of
+        its draft_loop variants; a replay must ask for the one select picks, and for
+        the unlabeled graph at any other size."""
+        for offered, seq_lens, bound, label in _REPLAY_KEYS:
+            with self.subTest(offered=offered, seq_lens=seq_lens, bound=bound):
+                runner = self._build_runner(_RecordingDraftBackend())
+                keys = []
+                runner._replay_graph = lambda key, fb: keys.append(key)
+                if offered:
+                    _offer_variants(runner, served=[1])
+                forward_batch = self._build_forward_batch(seq_lens, sum(seq_lens))
+                forward_batch.attention_kv_len_lower_bound = bound
+                runner.execute(forward_batch)
+                self.assertEqual(keys[0].attention_variant, label)
+
+    def test_draft_extend_replay_keys_the_graph_select_picks(self):
+        """As the draft graphs, for the draft-extend graphs and their variants."""
+        for offered, seq_lens, bound, label in _REPLAY_KEYS:
+            with self.subTest(offered=offered, seq_lens=seq_lens, bound=bound):
+                runner, forward_batch, select_index = _extend_runner(len(seq_lens))
+                keys = []
+                out = SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=torch.zeros((2, 2)),
+                )
+                runner._replay_graph = lambda key, fb: keys.append(key) or out
+                if offered:
+                    _offer_variants(runner, served=[1])
+                forward_batch.attention_kv_len_lower_bound = bound
+                runner.execute(forward_batch, select_index)
+                self.assertEqual(keys[0].attention_variant, label)
+
     def test_padded_replay_keeps_seq_lens_sum_consistent(self):
         # raw_bs=2 < CAPTURE_BS=4: the batch is padded with fake rows of length
         # SEQ_LEN_FILL_VALUE, so every observation must see seq_lens_sum equal to
@@ -716,6 +833,61 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         output = runner.execute(forward_batch)
 
         self.assertIs(output[-1], pooled_probs)
+
+    def test_graph_proposal_layouts_reach_verify_outside_the_graph_pool(self):
+        """Native graph outputs omit sparse IDs; SynthID must retain and own them."""
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                worker = EagleDraftWorker.__new__(EagleDraftWorker)
+                probs = torch.tensor([[[0.7, 0.3]]])
+                ids = torch.tensor([[[2, 5]]]) if sparse else None
+                graph_output = (
+                    torch.tensor([[-1]]),
+                    torch.tensor([[0]]),
+                    torch.tensor([[2]]),
+                    probs,
+                )
+                if sparse:
+                    graph_output = (*graph_output, ids)
+                worker.cuda_graph_runner = Mock()
+                worker.cuda_graph_runner.execute.return_value = graph_output
+                worker.cuda_graph_runner_watermark_off = None
+                worker.cuda_graph_runner_watermark_mixed = None
+                worker.req_to_token_pool = None
+                worker.draft_runner = SimpleNamespace(canary_manager=None)
+                worker.target_worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(runner_ids=None)
+                )
+                worker.seed_dsa_topk_from_draft_extend = False
+                worker.topk = worker.speculative_num_steps = 1
+                worker.speculative_num_draft_tokens = 2
+                worker.tree_mask_mode = None
+                worker.device = "cpu"
+                batch = SimpleNamespace(
+                    spec_info=object(),
+                    sampling_info=SimpleNamespace(synthid_state=None),
+                )
+                with (
+                    patch.object(
+                        eagle_worker_v2,
+                        "prepare_for_draft",
+                        return_value=(
+                            SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                            True,
+                            None,
+                        ),
+                    ),
+                    patch.object(eagle_worker_v2, "build_eagle_verify_input") as build,
+                ):
+                    worker.draft(batch)
+                proposal, proposal_ids = build.call_args.args[5:7]
+                torch.testing.assert_close(proposal, probs)
+                self.assertNotEqual(proposal.data_ptr(), probs.data_ptr())
+                if sparse:
+                    torch.testing.assert_close(proposal_ids, ids)
+                    self.assertNotEqual(proposal_ids.data_ptr(), ids.data_ptr())
+                else:
+                    self.assertIsNone(proposal_ids)
 
 
 if __name__ == "__main__":
