@@ -5,7 +5,9 @@ the prefill-only activation rule -- without launching a server. The collectives 
 fused matmul fast-paths need a real TP group and are covered by the e2e test.
 """
 
+import gc
 import unittest
+import weakref
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -91,6 +93,36 @@ class TestLayerNormSPGating(CustomTestCase):
             get_forward().set("sp_active", False)
             self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
         reset_context()
+
+
+class TestSPCollectiveWorkspaceOwnership(CustomTestCase):
+    def test_growth_retains_storage_used_by_older_graphs(self):
+        from sglang.srt.layers.communication import sp_collective_gemm_workspace as sp
+
+        class Workspace:
+            def __init__(self, kind, group, rows, *args):
+                self.capacity = 1 << (rows - 1).bit_length()
+                self.handle = SimpleNamespace(barrier=MagicMock())
+
+        x = SimpleNamespace(dtype=torch.bfloat16, device=torch.device("cuda:0"))
+        group, stream = object(), SimpleNamespace(synchronize=MagicMock())
+        with (
+            patch.dict(sp._workspaces, clear=True),
+            patch.object(sp, "_retired_workspaces", [], create=True),
+            patch.object(sp, "SPCollectiveGemmWorkspace", side_effect=Workspace),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+        ):
+            old = sp.sp_collective_gemm_workspace("ag", group, 64, 32, x)
+            previous = weakref.ref(old)
+            del old
+            current = sp.sp_collective_gemm_workspace("ag", group, 128, 32, x)
+            gc.collect()
+            self.assertIsNotNone(previous())
+            self.assertIsNot(previous(), current)
+            self.assertIs(
+                sp.sp_collective_gemm_workspace("ag", group, 32, 32, x), current
+            )
 
 
 class TestLayerNormSPValidation(CustomTestCase):
