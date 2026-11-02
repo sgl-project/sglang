@@ -12,6 +12,7 @@ Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
 Sliding window and attention sink features are supported.
 """
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -61,7 +62,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, print_info_once
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,40 @@ def _native_fp4_prefill_output_capacity(
     if chunked_prefill_limit > 0:
         return chunked_prefill_limit
     return max(max_context_len, max_prefill_tokens)
+
+
+# Query rows per CTA (upper bound) whose partial O (FP32) and (max, sum) float2 a
+# trtllm-gen multi-CTA KV split keeps in the workspace.
+_KV_SPLIT_SCRATCH_ROWS_PER_CTA = 128
+
+
+def _full_attn_kv_split_sm_count(
+    *,
+    splits: int,
+    batch_size: int,
+    num_kv_heads: int,
+    device_sm_count: int,
+    max_split_ctas: int,
+) -> Optional[int]:
+    """The SM count that makes trtllm-gen split each (request, KV head) into
+    ``splits`` CTAs, capped at ``max_split_ctas`` CTAs in total; None where
+    FlashInfer's own choice, max(1, sm_count // (batch * kv_heads)), is as high."""
+    base_ctas = batch_size * num_kv_heads
+    splits = min(splits, max_split_ctas // base_ctas)
+    if splits < 2 or device_sm_count // base_ctas >= splits:
+        return None
+    return splits * base_ctas
+
+
+@contextlib.contextmanager
+def _trtllm_decode_sm_count(sm_count: int):
+    # FlashInfer has no per-call KV split yet; it reads get_device_sm_count per call.
+    original = flashinfer.decode.get_device_sm_count
+    flashinfer.decode.get_device_sm_count = lambda device: sm_count
+    try:
+        yield
+    finally:
+        flashinfer.decode.get_device_sm_count = original
 
 
 def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
@@ -411,6 +446,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        # TRTLLM-GEN (SM100) only; the XQA decode kernels pick their own split.
+        self._full_attn_kv_splits = (
+            0 if self.is_xqa_impl else envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.get()
+        )
+        if self._full_attn_kv_splits > 1:
+            self._init_full_attn_kv_splits(v_head_dim=config.v_head_dim)
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -423,6 +464,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+
+    def _init_full_attn_kv_splits(self, *, v_head_dim: int) -> None:
+        self._full_attn_kv_split_min_bs = max(
+            1, envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS.get()
+        )
+        self._device_sm_count = flashinfer.utils.get_device_sm_count(
+            torch.device(self.device)
+        )
+        # Every split CTA keeps its partials within half the workspace and takes
+        # one int32 semaphore of the counter buffer (counted in multiples of 8).
+        scratch_bytes_per_cta = _KV_SPLIT_SCRATCH_ROWS_PER_CTA * (8 + 4 * v_head_dim)
+        self._full_attn_kv_split_max_ctas = min(
+            self.workspace_buffer.numel() // 2 // scratch_bytes_per_cta,  # uint8
+            self._multi_ctas_kv_counter_buffer.numel() // 4 // 8 * 8,
+        )
+        print_info_once(
+            f"TRTLLM MHA full-attention decode: {self._full_attn_kv_splits} KV "
+            f"splits per (request, KV head) at batch >= "
+            f"{self._full_attn_kv_split_min_bs}."
+        )
+
+    def _full_attn_kv_split_scope(self, *, window_left: int, batch_size: int, kv_cache):
+        """The SM-count scope of one trtllm-gen decode call under
+        SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS; a no-op on sliding-window layers."""
+        if (
+            self._full_attn_kv_splits < 2
+            or window_left >= 0
+            or batch_size < self._full_attn_kv_split_min_bs
+        ):
+            return contextlib.nullcontext()
+        k_cache = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
+        sm_count = _full_attn_kv_split_sm_count(
+            splits=self._full_attn_kv_splits,
+            batch_size=batch_size,
+            num_kv_heads=k_cache.shape[-3],  # HND paged cache
+            device_sm_count=self._device_sm_count,
+            max_split_ctas=self._full_attn_kv_split_max_ctas,
+        )
+        if sm_count is None:
+            return contextlib.nullcontext()
+        return _trtllm_decode_sm_count(sm_count)
 
     def _fmha_v2_paged_inputs(
         self,
@@ -1522,24 +1604,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 kwargs["q_len_per_req"] = q_len_per_req
             if mask is not None:
                 kwargs["mask"] = mask[: group_seq_lens.shape[0]]
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=group_query,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=group_block_tables,
-                seq_lens=group_seq_lens,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
+            with self._full_attn_kv_split_scope(
                 window_left=window_left,
-                sinks=sinks,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out=group_out,
-                out_dtype=None if group_out is not None else resolved_out_dtype,
-                kv_cache_sf=kv_cache_sf,
-                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
-                **kwargs,
-            )
+                batch_size=group_query.shape[0] // q_len_per_req,  # as FlashInfer
+                kv_cache=kv_cache,
+            ):
+                return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=group_query,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=group_block_tables,
+                    seq_lens=group_seq_lens,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=window_left,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out=group_out,
+                    out_dtype=None if group_out is not None else resolved_out_dtype,
+                    kv_cache_sf=kv_cache_sf,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                    **kwargs,
+                )
 
         num_requests = seq_lens.shape[0]
         num_splits = min(self.decode_seq_len_splits, num_requests)

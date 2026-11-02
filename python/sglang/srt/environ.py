@@ -1340,6 +1340,13 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Split the KV of each (request, KV head) of a full-attention layer across at
+    # least this many CTAs in TRTLLM-GEN fixed-q-len decode/verify (not ragged
+    # verify), at batch sizes >= MIN_BS. FlashInfer stops splitting once
+    # batch * kv_heads exceeds half the SMs. 0 keeps FlashInfer's choice.
+    SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS = EnvInt(0)
+    # Measured with 4 KV heads per rank on one GPU type; re-tune elsewhere.
+    SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS = EnvInt(12)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
