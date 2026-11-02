@@ -45,6 +45,11 @@ def test_checkpoint_spec_splits_fused_gate_up_and_int8_scales() -> None:
         (f"{mlp}.gate_up.weight", gate_up),
         (f"{mlp}.gate_up.weight_scale", scale),
         (f"{mlp}.gate_up.comfy_quant", torch.zeros(3)),
+        # Turbo files carry per-layer attention kernel hints the worker ignores.
+        (
+            "transformer_blocks.1.attn.comfy_attention.config",
+            torch.zeros(3, dtype=torch.uint8),
+        ),
         ("img_in.weight", torch.ones(1)),
     ]
     spec = get_comfyui_checkpoint_spec("QwenImage21Pipeline")
