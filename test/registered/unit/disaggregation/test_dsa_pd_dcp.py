@@ -33,6 +33,30 @@ def _mgr_stub(*, page_size, kv_item_lens, num_draft_entries):
 
 
 class TestDraftLayoutPolicy(CustomTestCase):
+    def test_uses_merged_rocm_dsa_policy(self):
+        from sglang.srt.configs import model_config
+        from sglang.srt.disaggregation.common.conn import _decode_draft_shards_under_dcp
+
+        for hip in (False, True):
+            for dcp in (1, 4):
+                for index_topk in (None, 2048):
+                    config = SimpleNamespace(
+                        architectures=["GlmMoeDsaForCausalLM"],
+                        index_topk=index_topk,
+                    )
+                    with (
+                        self.subTest(hip=hip, dcp=dcp, index_topk=index_topk),
+                        patch.object(model_config, "is_hip", return_value=hip),
+                        patch(
+                            "sglang.srt.runtime_context.process_model_config",
+                            return_value=SimpleNamespace(hf_config=config),
+                        ),
+                    ):
+                        self.assertEqual(
+                            _decode_draft_shards_under_dcp(dcp),
+                            hip and dcp > 1 and index_topk is not None,
+                        )
+
     def test_missing_backend_policy_preserves_replicated_draft(self):
         from sglang.srt.configs import model_config
         from sglang.srt.disaggregation.common.conn import _decode_draft_shards_under_dcp
