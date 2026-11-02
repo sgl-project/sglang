@@ -1003,6 +1003,22 @@ def pre_permute_standard_to_deep_gemm(
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+    pre_quant = dispatch_output.hidden_states_pre_quant
+    if pre_quant is not None:
+        q, scale = pre_quant
+        if (
+            not deep_gemm_sm120.use_swizzle()
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            or quant_info.use_mxfp8
+            or quant_info.block_shape != [128, 128]
+            or quant_info.w13_weight.dtype != torch.float8_e4m3fn
+            or q.dtype != torch.float8_e4m3fn
+            or not q.is_contiguous()
+            or q.shape != hidden_states.shape
+            or scale.dtype != torch.float32
+            or scale.shape != (q.shape[0], q.shape[1] // 128)
+        ):
+            raise ValueError("Unsupported pre-quantized DeepGEMM MoE input")
     # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
     # Feeding it the shared masked/swizzled layout does not raise -- it silently
     # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
@@ -1025,7 +1041,8 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids = topk_weights, topk_ids
 
     if (
-        deep_gemm_sm120.allows_masked_standard_layout()
+        pre_quant is None
+        and deep_gemm_sm120.allows_masked_standard_layout()
         and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
     ):
         output_dtype = (
@@ -1122,15 +1139,19 @@ def pre_permute_standard_to_deep_gemm(
         )
 
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-        packed_input_source, packed_input_source_scale = (
-            sglang_per_token_group_quant_fp8(
-                hidden_states,
-                block_k,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        if pre_quant is not None:
+            packed_input_source = pre_quant[0]
+            packed_input_source_scale = pre_quant[1].contiguous()
+        else:
+            packed_input_source, packed_input_source_scale = (
+                sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    block_k,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
             )
-        )
         # ep_scatter writes every live row and the grouped GEMM's results for
         # the alignment padding are dropped by post_reorder, so the zeroing is
         # dead work -- 174 MB per layer at bs=64. The sibling dispatch path in
@@ -1179,9 +1200,10 @@ def pre_permute_standard_to_deep_gemm(
         expert_alignment=block_e,
         expert_start=expert_start,
     )
-    if packed_input_source is not hidden_states:
+    # Borrowed operands may still be consumed by a separate shared expert.
+    if pre_quant is None and packed_input_source is not hidden_states:
         dispose_tensor(packed_input_source)
-    if packed_input_source_scale is not None:
+    if pre_quant is None and packed_input_source_scale is not None:
         dispose_tensor(packed_input_source_scale)
 
     # Preserve the input when a shared expert or its gate may still use it.
