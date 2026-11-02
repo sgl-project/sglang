@@ -137,6 +137,18 @@ Example config:
 
 Non-integer keys (`ema_alpha`, `warmup_batches`, `update_interval`) are global overrides applied to every BS slot. Integer keys (`"1"`, `"8"`) define per-BS slots.
 
+## Memory budget for runtime states
+
+Every candidate tier owns its own CUDA graphs and attention backends, so startup memory grows with the number of tiers. By default all tiers are built at startup. `--speculative-adaptive-memory-budget-gb` caps how much GPU memory the tiers beyond the initial one may take:
+
+- Tiers are pre-built in ascending step order until the budget is spent. The cost of a tier is only known after capture, so the total can overshoot the budget by one tier.
+- Tiers that did not fit are built the first time the policy switches to them. That build captures CUDA graphs while the server is serving, so the first switch to such a tier stalls decode for the capture time (typically seconds).
+- The initial tier (`--speculative-num-steps`) is always built at startup and does not count against the budget.
+
+```bash
+--speculative-adaptive --speculative-adaptive-memory-budget-gb 4
+```
+
 ## Config file reference
 
 The config file is optional. When provided, each integer BS-slot key must specify `candidate_steps`; all other keys fall back to defaults.
