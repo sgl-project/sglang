@@ -4,7 +4,7 @@ import threading
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import numpy as np
 import pytest
@@ -12,10 +12,14 @@ import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime import ipc_array
+from sglang.multimodal_gen.runtime import (
+    ipc_array,
+)
+from sglang.multimodal_gen.runtime import scheduler_client as scheduler_client_module
 from sglang.multimodal_gen.runtime.distributed.ipc_cuda import CudaIpcRef
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
+    ShutdownReq,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -262,7 +266,125 @@ def test_sync_scheduler_client_converts_configured_seconds_to_milliseconds():
     assert client._forward_one("tcp://scheduler", object(), None) is response
 
     socket.setsockopt.assert_any_call(zmq.RCVTIMEO, 2000)
+    socket.poll.assert_not_called()
     socket.close.assert_called_once_with()
+
+
+def test_sync_scheduler_client_worker_failure_interrupts_wait_without_deadline():
+    socket = MagicMock()
+    socket.poll.return_value = 0
+    client = SchedulerClient()
+    client.context = SimpleNamespace(socket=lambda _socket_type: socket)
+    client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+    check_worker_health = MagicMock(
+        side_effect=[None, RuntimeError("Scheduler worker exited")]
+    )
+
+    with pytest.raises(RuntimeError, match="Scheduler worker exited"):
+        client._forward_one(
+            "tcp://scheduler",
+            object(),
+            None,
+            check_worker_health=check_worker_health,
+        )
+
+    socket.send_pyobj.assert_called_once()
+    socket.poll.assert_called_once_with(1000, zmq.POLLIN)
+    socket.recv_pyobj.assert_not_called()
+    socket.close.assert_called_once_with()
+
+
+def test_sync_scheduler_client_can_wait_across_multiple_health_polls():
+    response = object()
+    socket = MagicMock()
+    socket.poll.side_effect = [0, 0, zmq.POLLIN]
+    socket.recv_pyobj.return_value = response
+    client = SchedulerClient()
+    client.context = SimpleNamespace(socket=lambda _socket_type: socket)
+    client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+    check_worker_health = MagicMock()
+
+    assert (
+        client._forward_one(
+            "tcp://scheduler",
+            object(),
+            None,
+            check_worker_health=check_worker_health,
+        )
+        is response
+    )
+
+    assert check_worker_health.call_count == 3
+    assert socket.poll.call_args_list == [call(1000, zmq.POLLIN)] * 3
+    socket.send_pyobj.assert_called_once()
+    socket.recv_pyobj.assert_called_once_with()
+    socket.close.assert_called_once_with()
+
+
+def test_sync_scheduler_client_health_polls_share_one_transport_deadline(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    socket = MagicMock()
+
+    def poll(timeout_ms, flags):
+        clock.now += timeout_ms / 1000
+        return 0
+
+    socket.poll.side_effect = poll
+    monkeypatch.setattr(scheduler_client_module.time, "monotonic", lambda: clock.now)
+    client = SchedulerClient()
+    client.context = SimpleNamespace(socket=lambda _socket_type: socket)
+    client.server_args = SimpleNamespace(scheduler_rpc_timeout=9)
+    check_worker_health = MagicMock()
+
+    with pytest.raises(TimeoutError, match="did not respond"):
+        client._forward_one(
+            "tcp://scheduler",
+            object(),
+            timeout_ms=2500,
+            check_worker_health=check_worker_health,
+        )
+
+    assert socket.poll.call_args_list == [
+        call(1000, zmq.POLLIN),
+        call(1000, zmq.POLLIN),
+        call(500, zmq.POLLIN),
+    ]
+    assert clock.now == 2.5
+    socket.send_pyobj.assert_called_once()
+    socket.recv_pyobj.assert_not_called()
+    socket.close.assert_called_once_with()
+
+
+def test_sync_scheduler_client_forward_preserves_default_routing_call_shape():
+    batch = object()
+    client = SchedulerClient()
+    client._forward_routed = MagicMock(return_value="response")
+
+    assert client.forward(batch) == "response"
+
+    client._forward_routed.assert_called_once_with(batch, None, None)
+
+
+@pytest.mark.parametrize("with_health_check", [False, True])
+@pytest.mark.parametrize("control_request", [False, True])
+def test_sync_scheduler_client_routes_optional_worker_health_check(
+    with_health_check, control_request
+):
+    batch = ShutdownReq() if control_request else object()
+    client = SchedulerClient()
+    client.server_args = SimpleNamespace(scheduler_endpoints=["tcp://scheduler"])
+    client.request_logger = MagicMock()
+    client._forward_one = MagicMock(return_value="response")
+    check_worker_health = MagicMock() if with_health_check else None
+
+    assert client.forward(batch, check_worker_health=check_worker_health) == "response"
+
+    expected_kwargs = (
+        {"check_worker_health": check_worker_health} if with_health_check else {}
+    )
+    client._forward_one.assert_called_once_with(
+        "tcp://scheduler", batch, None, **expected_kwargs
+    )
 
 
 def test_async_scheduler_client_has_no_transport_deadline_by_default():

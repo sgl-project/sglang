@@ -758,6 +758,48 @@ def test_sequence_parallel_indivisible_segment_rejected_by_input_validation(
             stage.forward(batch, args)
 
 
+@torch.inference_mode()
+def test_camera_chunk_of_one_reads_each_frames_value_without_attention(monkeypatch):
+    module = tiny_model().action_modules[0]
+    assert module.chunk_size == 1
+    x, camera = torch.randn(1, 12, 256), torch.randn(1, 3, 64)  # 3 frames x 4 tokens
+    _, value = (
+        module.keyboard_attn_kv(module.keyboard_embed(camera))
+        .view(1, 3, 2, 16, 64)
+        .unbind(2)
+    )
+    q, k = torch.randn(1, 12, 16, 64), torch.randn(1, 3, 16, 64)
+    attended = torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                q[:, 4 * f : 4 * f + 4].transpose(1, 2),
+                k[:, f : f + 1].transpose(1, 2),
+                value[:, f : f + 1].transpose(1, 2),
+            )
+            .transpose(1, 2)
+            .flatten(2)
+            for f in range(3)
+        ],
+        dim=1,
+    )
+    expected = x + module.proj_keyboard(attended)
+
+    def unused(*args):
+        raise AssertionError("a one-key softmax needs no query")
+
+    monkeypatch.setattr(module.img_attn_q, "forward", unused)
+    torch.testing.assert_close(
+        module(x, camera, 4, None), expected, atol=1e-6, rtol=1e-6
+    )
+    # A sequence-parallel rank holds a token slice that starts mid-frame.
+    torch.testing.assert_close(
+        module(x[:, 5:11], camera, 4, None, token_offset=5),
+        expected[:, 5:11],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_action_windows_and_camera_gate_follow_upstream():
     """Malformed action timing must degrade to full attention, not reject the
     request, and a camera-on segment must not carry a gate mask."""
