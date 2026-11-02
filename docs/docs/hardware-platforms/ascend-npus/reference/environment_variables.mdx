@@ -42,6 +42,16 @@ This document provides a list of commonly used environment variables and aims to
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
     </tr>
+    <tr>
+      <td><code>SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS</code></td>
+      <td>Under DCP, the most prefix rows one KV all-gather collective <br/> moves at a DSA extend, which bounds the gather scratch buffer.<br/> Set to <code>0</code> or less to gather the whole prefix at once.</td>
+      <td><code>262144</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS</code></td>
+      <td>Under DCP, a DSA extend with more new tokens than this gathers <br/> the prefix KV whatever the byte comparison says, because the <br/> query path's FP32 merge grows with the new tokens.</td>
+      <td><code>4096</code></td>
+    </tr>
   </tbody>
 </table>
 

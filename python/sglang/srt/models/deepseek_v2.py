@@ -267,6 +267,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        prepare_dcp_extend_metadata_npu,
     )
 else:
     pass
@@ -3555,7 +3556,22 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu or is_deepseek_dsa(self.config):
+        if _is_npu:
+            return prepare_dcp_extend_metadata_npu(
+                self,
+                seq_lens=seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens_sum=seq_lens_sum,
+                kv_buffer_shape=kv_buffer_shape,
+                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_device=kv_cache_device,
+                create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            )
+        if is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
