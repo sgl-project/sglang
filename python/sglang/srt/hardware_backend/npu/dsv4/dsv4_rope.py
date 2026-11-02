@@ -160,11 +160,8 @@ class Dsv4NpuRoPE:
         # kv_rope: [T, 1, head_dim] or None. Prefer the NPU kernel: torch accumulates
         # bf16 muls in bf16 while the kernel uses fp32; drift compounds and flips argmax.
         rope_dim = cos4.shape[-1]
-        from sglang.srt.hardware_backend.npu.utils import (
-            require_cann_transformer_ops,
-        )
+        from sgl_kernel_npu.operators.dsv4 import inplace_partial_rotary_mul as rope_op
 
-        rope_op = require_cann_transformer_ops("inplace_partial_rotary_mul")[0]
         rope_op(
             q_rope.unsqueeze(1),
             cos4,
