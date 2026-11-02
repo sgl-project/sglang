@@ -483,7 +483,9 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SchedulerDisaggregationPrefillMixin()
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
-        scheduler.disagg_prefill_inflight_queue = list(reqs)
+        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
+            queue=list(reqs), pending_chunk_rids=set()
+        )
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
@@ -525,12 +527,12 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
             finalize_bootstrap=Mock(side_effect=finalize)
         )
-        self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+        self.assertEqual(scheduler.process_disagg_prefill_transfer_queue(), [])
+        self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, [req])
         scheduler.send_kv_chunk.assert_not_called()
         # This is the existing metadata-received transition, not readiness.
         self.prefill.update_status(1, KVPoll.WaitingForInput)
-        self.assertEqual(scheduler.process_disagg_prefill_inflight_queue(), [])
+        self.assertEqual(scheduler.process_disagg_prefill_transfer_queue(), [])
         scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
         self.assertFalse(req.pending_bootstrap)
 
@@ -548,15 +550,15 @@ class TestAllocationIntegration(CustomTestCase):
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
         ):
-            scheduler.process_disagg_prefill_inflight_queue()
-            self.assertEqual(scheduler.disagg_prefill_inflight_queue, reqs)
+            scheduler.process_disagg_prefill_transfer_queue()
+            self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, reqs)
 
             scheduler.waiting_queue.append(object())
-            scheduler.process_disagg_prefill_inflight_queue()
-            self.assertEqual(scheduler.disagg_prefill_inflight_queue, reqs[1:])
+            scheduler.process_disagg_prefill_transfer_queue()
+            self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, reqs[1:])
             self.assertEqual(pool.available_size(), 1)
 
-            scheduler.process_disagg_prefill_inflight_queue()
+            scheduler.process_disagg_prefill_transfer_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):

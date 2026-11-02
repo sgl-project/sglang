@@ -487,7 +487,7 @@ class SchedulerMetricsReporter:
         prefill_q = WelfordAccumulator()
         decode_q = WelfordAccumulator()
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in self.scheduler.disagg_prefill.bootstrap_queue.queue:
+            for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
                 prefill_q.add(len(req.origin_input_ids))
             for req in self.scheduler.waiting_queue:
                 prefill_q.add(len(req.origin_input_ids))
@@ -761,10 +761,8 @@ class SchedulerMetricsReporter:
         if prefill_stats.log_replay_tokens:
             msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill.bootstrap_queue.queue)}, "
-            msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill.inflight_queue)}, "
-            )
+            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
+            msg += f"#inflight-req: {len(self.scheduler.disagg_prefill_transfer_queue.queue)}, "
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
 
@@ -875,11 +873,11 @@ class SchedulerMetricsReporter:
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill.bootstrap_queue.queue,
+                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill.inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -1102,11 +1100,11 @@ class SchedulerMetricsReporter:
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill.bootstrap_queue.queue,
+                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill.inflight_queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1515,10 +1513,10 @@ class SchedulerMetricsReporter:
         self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill.bootstrap_queue.queue, priority_enabled
+                self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill.inflight_queue, priority_enabled
+                self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)

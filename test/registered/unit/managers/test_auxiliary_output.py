@@ -548,7 +548,9 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_inflight_queue=[],
+        disagg_prefill_transfer_queue=SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        ),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),

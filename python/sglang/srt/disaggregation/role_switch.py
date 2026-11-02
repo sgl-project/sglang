@@ -228,7 +228,7 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
 def _current_kv_manager(scheduler: Scheduler):
     """The KV manager of the current role's disaggregation queue, or None."""
     if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-        q = getattr(scheduler.disagg_prefill, "bootstrap_queue", None)
+        q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
     elif scheduler.disaggregation_mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
     else:
@@ -241,12 +241,13 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
     buffers, KV transfer manager) so the other role can be rebuilt."""
     mode = scheduler.disaggregation_mode
     if mode == DisaggregationMode.PREFILL:
-        q = getattr(scheduler.disagg_prefill, "bootstrap_queue", None)
+        q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
         if q is not None:
             km = getattr(q, "kv_manager", None)
             if km is not None:
                 km.teardown()
-        scheduler.disagg_prefill = None
+            scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = None
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

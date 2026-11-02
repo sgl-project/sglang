@@ -24,6 +24,9 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -90,6 +93,11 @@ def _rank(rank):
 
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
+    scheduler.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     scheduler.waiting_queue = [req]
     scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm_config = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL

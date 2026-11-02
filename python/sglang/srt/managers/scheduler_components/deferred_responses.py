@@ -28,6 +28,7 @@ class DeferredResponses:
         output_streamer: SchedulerOutputStreamer,
         send_abort: Callable[[Req, Optional[FinishReasonDict]], None],
     ):
+        # Fixed for the process: a PD role switch never leaves or enters PD.
         self.disaggregation_mode = disaggregation_mode
         self.output_streamer = output_streamer
         self.send_abort = send_abort

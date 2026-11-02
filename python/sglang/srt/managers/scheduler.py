@@ -94,8 +94,8 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
-    DisaggPrefill,
     PrefillBootstrapQueue,
+    PrefillTransferQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
@@ -1561,7 +1561,8 @@ class Scheduler(
 
     def init_disaggregation(self):
         self.mm_receiver = None
-        self.disagg_prefill = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_transfer_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1678,7 +1679,7 @@ class Scheduler(
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
-            bootstrap_queue = PrefillBootstrapQueue(
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -1690,7 +1691,7 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            self.disagg_prefill = DisaggPrefill(bootstrap_queue)
+            self.disagg_prefill_transfer_queue = PrefillTransferQueue()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2744,10 +2745,10 @@ class Scheduler(
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: (
-                self.disagg_prefill.bootstrap_queue
+                self.disagg_prefill_bootstrap_queue
             ),
-            get_disagg_prefill_inflight_queue=lambda: (
-                self.disagg_prefill.inflight_queue
+            get_disagg_prefill_transfer_queue=lambda: (
+                self.disagg_prefill_transfer_queue.queue
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
@@ -3668,7 +3669,7 @@ class Scheduler(
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
-            self.disagg_prefill.bootstrap_queue.add(
+            self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
@@ -4353,8 +4354,8 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
             bootstrap_queue=(
-                self.disagg_prefill.bootstrap_queue.queue
-                if self.disagg_prefill is not None
+                self.disagg_prefill_bootstrap_queue.queue
+                if self.disagg_prefill_bootstrap_queue is not None
                 else []
             ),
         )
@@ -5704,7 +5705,7 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
+            # Grammar queue and prefill transfer queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.async_shm_materializer is not None:
@@ -5714,8 +5715,8 @@ class Scheduler(
                     ignore_waiting=ignore_waiting
                 )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill.inflight_queue) == 0
-                idle &= len(self.disagg_prefill.bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_transfer_queue.queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -6109,7 +6110,7 @@ class Scheduler(
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill.bootstrap_queue.queue:
+            for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req)
@@ -6120,9 +6121,9 @@ class Scheduler(
                         prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
-            for req in self.disagg_prefill.inflight_queue:
+            for req in self.disagg_prefill_transfer_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    logger.debug(f"Abort transfer queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -6224,7 +6225,7 @@ class Scheduler(
             # last_batch itself; its requests are already listed above.
             and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill.inflight_queue. Merging them into
+            # already in the transfer queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL

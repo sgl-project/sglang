@@ -254,7 +254,9 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
                 kv_args=SimpleNamespace(state_types=[StateType.MINIMAX_INDEX_K])
             )
         ),
-        disagg_prefill_pending_chunk_rids=set(),
+        disagg_prefill_transfer_queue=SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        ),
     )
     req = SimpleNamespace(
         kv=SimpleNamespace(req_pool_idx=0),

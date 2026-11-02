@@ -28,6 +28,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -108,7 +111,11 @@ def _scheduler():
     s.forward_sleep_time = None
     s.enable_staging = False
     # process_batch_result, with the mode-specific processing mocked
-    s._deferred_responses = None
+    s.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     s.publish_load_snapshot = Mock()
     s.load_publisher = MagicMock()
     s.load_inquirer = MagicMock()

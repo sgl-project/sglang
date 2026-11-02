@@ -373,7 +373,7 @@ class SchedulerWeightUpdaterManager:
                         if queue is not None:
                             queue.release_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler.disagg_prefill, "bootstrap_queue", None)
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
@@ -429,7 +429,7 @@ class SchedulerWeightUpdaterManager:
                         if queue is not None:
                             queue.resume_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler.disagg_prefill, "bootstrap_queue", None)
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
 
