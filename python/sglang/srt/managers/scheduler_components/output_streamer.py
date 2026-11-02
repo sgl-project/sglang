@@ -53,7 +53,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
-    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+        UocrSchedulerRuntime,
+    )
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
@@ -102,7 +104,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
     enable_metrics: bool = field(init=False)
@@ -293,7 +295,7 @@ class SchedulerOutputStreamer:
             ),
             output_sink=self.output_sink,
             current_weight_version=get_serving().weight_version,
-            uocr_doc_hooks=self.uocr_doc_hooks,
+            uocr_runtime=self.uocr_runtime,
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
             ),
@@ -491,7 +493,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     # Spliced document-overlap tokens per request (Unlimited-OCR v2 only).
     uocr_forced_tokens: list = field(default_factory=list)
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     weight_versions: list = field(default_factory=list)
     prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
@@ -648,8 +650,8 @@ class _GenerationStreamAccumulator:
             self.http_worker_ipcs.append(req.http_worker_ipc)
 
         forced_tokens = 0
-        if self.uocr_doc_hooks is not None:
-            forced_tokens = self.uocr_doc_hooks.forced_tokens(req)
+        if self.uocr_runtime is not None:
+            forced_tokens = self.uocr_runtime.forced_tokens(req)
             self.uocr_forced_tokens.append(forced_tokens)
 
         if self.output_sink is OutputSink.RUST:
@@ -877,8 +879,8 @@ class _GenerationStreamAccumulator:
         if not (self.rids or is_idle_batch):
             return None
         customized_info = self.customized_info
-        if self.uocr_doc_hooks is not None:
-            customized_info = self.uocr_doc_hooks.with_forced_tokens(
+        if self.uocr_runtime is not None:
+            customized_info = self.uocr_runtime.with_forced_tokens(
                 customized_info, self.uocr_forced_tokens
             )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
