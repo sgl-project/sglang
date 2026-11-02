@@ -445,8 +445,6 @@ class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
         variant = server_args.model_variant
         if variant is not None and variant.strip().lower() not in ("fl2va", "ref2va"):
             raise ValueError("Pika H3 Flex model_variant must be fl2va or ref2va")
-        if server_args.lora_alpha not in (None, 128) or server_args.lora_scale != 1.0:
-            raise ValueError("Pika H3 Flex requires LoRA alpha 128 and scale 1.0")
         # A BF16 merge rounds away about a third of the adapters' update (by
         # norm, under auto's 50% cutoff), so keep them unmerged like the
         # reference unless a merge mode is chosen explicitly.

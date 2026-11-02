@@ -440,17 +440,11 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
         )
         policy = PIKA_H3_FLEX_POLICY
         frames = server_args.warmup_num_frames
-        # Upward 17-frame alignment adds less than one 24-fps second, so floor
-        # division recovers the requested integer duration (rounding does not).
-        duration = frames // 24 if frames else policy.duration_seconds[0]
-        if not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1] or (
-            frames
-            and frames
-            not in (duration * 24, minimax_h3_align_frame_count(duration * 24))
-        ):
-            raise ValueError(
-                "Pika H3 Flex warmup frames must represent a whole-second duration from 5 to 15"
-            )
+        duration = frames / 24 if frames else 5.0
+        # Recover whole-second requests from their aligned frame count; otherwise
+        # let the shared H3 duration validation handle the requested frame count.
+        if frames and frames == minimax_h3_align_frame_count((frames // 24) * 24):
+            duration = frames // 24
         for tier, max_pixels in policy.max_pixels.items():
             for aspect_ratio in policy.aspect_ratios:
                 width, height = map(int, aspect_ratio.split(":"))
@@ -467,9 +461,11 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                         "aspect_ratio": aspect_ratio,
                         "duration_seconds": float(duration),
                     }
-        raise ValueError(
-            f"Pika H3 Flex warmup canvas {canvas} is not a released bucket"
-        )
+        return {
+            "short_edge": min(canvas),
+            "aspect_ratio": f"{canvas[0]}:{canvas[1]}",
+            "duration_seconds": float(duration),
+        }
 
     def _validate(self) -> None:
         super()._validate()
@@ -488,19 +484,8 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                     f"Pika H3 Flex adapters were trained at {name}={trained:g}; "
                     f"got {value}"
                 )
-        for name, expected in (
-            ("imgvid_cond_noise_aug_for_inference", 0.999),
-            ("audio_cond_noise_aug_for_inference", 1.0),
-        ):
-            value = getattr(self, name)
-            if value is not None and value != expected:
-                raise ValueError(f"Pika H3 Flex requires {name}={expected}")
-        if self.reference_resize_mode != "diffusers":
-            raise ValueError("Pika H3 Flex uses the released tiered reference resizing")
         if self.enable_spectrum or self.enable_cache_dit or self.quality == "high":
             raise ValueError("Pika H3 Flex requires all six denoiser evaluations")
-        if self.num_outputs_per_prompt != 1:
-            raise ValueError("Pika H3 Flex supports one output per request")
         if self.rollout:
             raise ValueError(
                 "Pika H3 Flex renoise sampling does not support RL rollouts"

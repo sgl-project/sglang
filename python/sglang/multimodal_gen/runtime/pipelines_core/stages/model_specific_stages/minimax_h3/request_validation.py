@@ -90,16 +90,7 @@ def _validate_target(
         # verified one.
         warn_unverified_short_edge(short_edge)
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
-    if policy is not None:
-        if short_edge not in policy.max_pixels:
-            raise ValueError("Pika H3 Flex target.short_edge must be 480 or 768")
-        if aspect_ratio not in policy.aspect_ratios:
-            raise ValueError(
-                f"Pika H3 Flex target.aspect_ratio must be one of {policy.aspect_ratios}"
-            )
-        if target.get("duration_seconds") is None:
-            raise ValueError("Pika H3 Flex target.duration_seconds is required")
-    elif profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
+    if policy is None and profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
         raise ValueError(
             f'{path}.aspect_ratio must be "auto" for task {profile.task!r}, '
             f"got {aspect_ratio!r}"
@@ -140,13 +131,6 @@ def _validate_target(
                 f"{path}.duration_seconds must be in "
                 f"[{MINIMAX_H3_MIN_DURATION_SECONDS:g}, "
                 f"{MINIMAX_H3_MAX_DURATION_SECONDS:g}], got {duration}"
-            )
-        if policy is not None and (
-            not float(duration).is_integer()
-            or not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1]
-        ):
-            raise ValueError(
-                "Pika H3 Flex target.duration_seconds must be whole seconds from 5 to 15"
             )
         out["duration_seconds"] = float(duration)
     return out
@@ -414,11 +398,6 @@ def minimax_h3_validate_canonical_request(
     normalized_audio_flow_shift = optional_positive_finite_float(
         audio_flow_shift, "audio_flow_shift"
     )
-    if policy is not None and (
-        normalized_flow_shift not in (None, 12.0)
-        or normalized_audio_flow_shift not in (None, 3.0)
-    ):
-        raise ValueError("Pika H3 Flex requires video/audio flow shifts 12/3")
     if normalized_flow_shift is not None:
         canonical["flow_shift"] = normalized_flow_shift
     if normalized_audio_flow_shift is not None:

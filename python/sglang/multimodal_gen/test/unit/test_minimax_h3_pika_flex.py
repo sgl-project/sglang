@@ -188,8 +188,8 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch, variant) -> None:
     def server_args(explicit: bool, mode: str) -> SimpleNamespace:
         return SimpleNamespace(
             model_variant=variant,
-            lora_alpha=None,
-            lora_scale=1.0,
+            lora_alpha=64,
+            lora_scale=0.5,
             lora_merge_mode=mode,
             is_arg_explicitly_set=lambda name: explicit and name == "lora_merge_mode",
         )
@@ -279,7 +279,9 @@ def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
         dict(type="image", role="keyframe", uri=f"frame{i}.png", frame_index=i)
         for i in indices
     ]
-    params = _pika_request(task, conditions)
+    params = _pika_request(
+        task, conditions, aspect_ratio="auto" if task == "l2va" else "16:9"
+    )
     request = VideoGenerationsRequest(
         prompt=params.prompt, task=task, conditions=conditions, target=params.target
     )
@@ -304,6 +306,8 @@ def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
         lambda *a, **kw: {"display_width": 832, "display_height": 480},
     )
     prepared = prequeue.minimax_h3_prepare_for_queue(batch)
+    assert (prepared.shape["width"], prepared.shape["height"]) == (832, 480)
+    assert prepared.shape["keyframe_fit"] == "source_crop"
     # The scheduler handoff must retain the release policy after media probing.
     decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(prepared), type=type(plan))
     assert decoded == prepared
@@ -323,18 +327,19 @@ def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
 
 
 @pytest.mark.parametrize(
-    "target",
-    [
-        {"short_edge": 512},
-        {"aspect_ratio": "auto"},
-        {"duration_seconds": 4},
-        {"duration_seconds": 5.5},
-    ],
+    "tier,aspect,duration,expected",
+    [(512, "7:4", 5.5, (896, 512, 141)), (480, "auto", 4, (832, 480, 107))],
 )
-def test_pika_rejects_unreleased_targets(target):
-    """Pika restricts base H3 geometry and duration to the released CLI contract."""
-    with pytest.raises(ValueError, match="Pika H3 Flex target"):
-        _plan(_pika_request(**target))
+def test_pika_reuses_h3_geometry_outside_release_buckets(
+    tier, aspect, duration, expected
+):
+    """CLI presets must not bypass H3's adaptive geometry or frame alignment."""
+    plan = _plan(
+        _pika_request(short_edge=tier, aspect_ratio=aspect, duration_seconds=duration)
+    )
+    assert (
+        tuple(plan.shape[key] for key in ("width", "height", "frame_count")) == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -438,8 +443,15 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
         -2.003, 7.997, sum(t * h * w // 4 for t, h, w in shapes) * 96
     ).reshape(-1, 96)
     original = clean.clone()
-    audio = torch.tensor([[0.123456]], dtype=torch.float32)
-    sampling = SimpleNamespace(seed=seed)
+    audio = torch.full((4, 32), 0.123456, dtype=torch.float32)
+    override_noise = task == "ref2va" and device == "cpu"
+    visual_aug, audio_aug = (0.0, 0.0) if override_noise else (0.999, 1.0)
+    sampling = PikaH3FlexSamplingParams(
+        prompt="p",
+        imgvid_cond_noise_aug_for_inference=visual_aug,
+        audio_cond_noise_aug_for_inference=audio_aug,
+    )
+    sampling.seed = seed
     plan = SimpleNamespace(policy=PIKA_H3_FLEX_POLICY, task=task, seed=seed)
     contexts = [
         SimpleNamespace(
@@ -452,7 +464,7 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
             if task == "fl2va"
             else None,
             ref2va_positive_blocks=[
-                dict(kind=kind, latent_t=t, latent_h=h, latent_w=w)
+                dict(kind=kind, latent_t=t, latent_h=h, latent_w=w, ref_audio_t=2)
                 for kind, (t, h, w) in zip(("image", "video"), shapes)
             ]
             if task == "ref2va"
@@ -462,7 +474,10 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
     ]
     for context in contexts:
         denoising._apply_condition_noise_aug(
-            context, sampling=sampling, imgvid_noise_aug=0.999, audio_noise_aug=1.0
+            context,
+            sampling=sampling,
+            imgvid_noise_aug=visual_aug,
+            audio_noise_aug=audio_aug,
         )
     # Reference wrapper draws [B,F,C,H,W] per condition before packing.
     generator = torch.Generator(device=device).manual_seed(42 + 7919)
@@ -479,11 +494,22 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
     )
     rounded = (clean.bfloat16().float() if task == "fl2va" else clean).to(device)
     torch.testing.assert_close(
-        contexts[0].cond_rows, 0.999 * rounded + (1.0 - 0.999) * noise, rtol=0, atol=0
+        contexts[0].cond_rows,
+        visual_aug * rounded + (1.0 - visual_aug) * noise,
+        rtol=0,
+        atol=0,
     )
     assert torch.equal(contexts[0].cond_rows, contexts[1].cond_rows)
     assert torch.equal(clean, original)
-    assert contexts[0].audio_ref_rows is audio
+    if override_noise:
+        torch.testing.assert_close(
+            contexts[0].audio_ref_rows,
+            torch.randn(audio.shape, generator=torch.Generator().manual_seed(43)),
+            rtol=0,
+            atol=0,
+        )
+    else:
+        assert contexts[0].audio_ref_rows is audio
 
 
 def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch):
@@ -505,7 +531,7 @@ def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch)
 
 @pytest.mark.parametrize(
     "duration,frames,aligned",
-    [(5, 120, 124), (5, 124, 124), (6, 158, 158), (15, 362, 362)],
+    [(5, 120, 124), (5, 124, 124), (6, 158, 158), (15, 362, 362), (5.5, 132, 141)],
 )
 def test_warmup_frames_recover_requested_duration(duration, frames, aligned):
     """17n+5 alignment is not inverted by dividing aligned frames by 24."""

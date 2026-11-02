@@ -247,7 +247,16 @@ def _resolve_spatial(
     base_short_edge = _validate_base_short_edge(
         target.get("short_edge"), warn_unverified=policy is None
     )
-    if policy is None and aspect_ratio == "auto":
+    if policy is not None:
+        shape.update(
+            keyframe_fit="source_crop",
+            max_pixels=policy.max_pixels.get(base_short_edge, MINIMAX_H3_MAX_PIXELS),
+        )
+        if base_short_edge in policy.reference_short_edges:
+            shape["reference_short_edge"] = policy.reference_short_edges[
+                base_short_edge
+            ]
+    if aspect_ratio == "auto":
         if auto_aspect_ratio is None:
             # Deferred: canvas comes from material/model geometry at prepare time.
             shape["geometry"] = "deferred"
@@ -264,22 +273,19 @@ def _resolve_spatial(
             width=ar_w,
             height=ar_h,
             base_short_edge=base_short_edge,
-            max_pixels=(
-                policy.max_pixels[base_short_edge]
-                if policy is not None
-                else MINIMAX_H3_MAX_PIXELS
-            ),
+            max_pixels=shape.get("max_pixels", MINIMAX_H3_MAX_PIXELS),
             warn_unverified=policy is None,
         )
     )
     if policy is not None:
-        shape.update(
-            geometry_source="request",
-            shape_policy_version=policy.name,
-            size_mode="bucket",
-            keyframe_fit="source_crop",
-            reference_short_edge=policy.reference_short_edges[base_short_edge],
-        )
+        shape["shape_policy_version"] = policy.name
+        if target["aspect_ratio"] != "auto":
+            shape["geometry_source"] = "request"
+        if (
+            base_short_edge in policy.max_pixels
+            and aspect_ratio in policy.aspect_ratios
+        ):
+            shape["size_mode"] = "bucket"
     return shape
 
 

@@ -106,6 +106,8 @@ def _resolve_deferred_spatial_shape(
             width=width,
             height=height,
             base_short_edge=int(shape["base_short_edge"]),
+            max_pixels=shape.get("max_pixels", MINIMAX_H3_MAX_PIXELS),
+            warn_unverified=plan.policy is None,
         )
     )
     shape["geometry_source"] = geometry_source

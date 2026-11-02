@@ -30,12 +30,11 @@ class MiniMaxH3RequestPolicy(msgspec.Struct, frozen=True):
     max_pixels: dict[int, int]
     reference_short_edges: dict[int, int]
     keyframe_task_aliases: dict[str, int]
-    duration_seconds: tuple[int, int]
     max_text_tokens: int
     condition_noise_seed_offset: int
 
 
-# Pinned Pika buckets.yaml and CLI contract. Base H3 retains its adaptive policy.
+# Pinned Pika release defaults. Base H3 retains its adaptive policy.
 PIKA_H3_FLEX_POLICY = MiniMaxH3RequestPolicy(
     name="pika_h3_flex",
     aspect_ratios=(
@@ -54,7 +53,6 @@ PIKA_H3_FLEX_POLICY = MiniMaxH3RequestPolicy(
     max_pixels={480: 480 * 832, 768: 768 * 1344},
     reference_short_edges={480: 1024, 768: 2048},
     keyframe_task_aliases={"i2va": 0, "l2va": -1},
-    duration_seconds=(5, 15),
     max_text_tokens=2048,
     condition_noise_seed_offset=7919,
 )

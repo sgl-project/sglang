@@ -1260,9 +1260,7 @@ def _apply_condition_noise_aug(
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
     )
     noise_audio_conditions = (
-        policy is None
-        and ctx.audio_ref_rows is not None
-        and float(audio_noise_aug) < 1.0
+        ctx.audio_ref_rows is not None and float(audio_noise_aug) < 1.0
     )
     if not (noise_visual_conditions or noise_audio_conditions):
         return
