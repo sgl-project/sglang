@@ -742,7 +742,7 @@ class _DeepepAutoSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         )
         start = self._rank * num_local_physical_experts
         end = start + num_local_physical_experts
-        # Waterfill's fused shared expert is the final local DeepEP slot.  It
+        # The fused shared expert is the final local DeepEP slot.  It
         # is not part of EPLB's routed-expert placement statistics.
         self._data[layer_idx, start:end] += local_physical_count_of_layer[
             :num_local_physical_experts

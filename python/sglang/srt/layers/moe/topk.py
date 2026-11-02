@@ -704,7 +704,7 @@ class TopK(BaseFusedOp):
     Parameters:
     --top_k: the number of routed experts selected per token. When the model being built
       fuses shared experts (``get_num_fused_shared_experts``), their columns follow: written
-      by the router (``TopKConfig.num_shared_topk_slots``), or appended by Waterfill.
+      by the router (``TopKConfig.num_shared_topk_slots``), or appended by the load balancer.
     --layer_id: global index of the owning layer. Required: routed-experts capture and
       per-layer EPLB state are keyed by it.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
@@ -765,12 +765,6 @@ class TopK(BaseFusedOp):
         self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
-        # Draft layers are not attached to the load balancer, so when it owns
-        # the shared-expert slot on the target they expand it with Waterfill.
-        self.enable_waterfill = shared_experts.use_waterfill or (
-            self.is_draft and shared_experts.routed_by_load_balancer
-        )
-        self.waterfill_balancer = None
         num_shared_slots = shared_experts.num_shared_topk_slots
 
         # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
@@ -789,10 +783,10 @@ class TopK(BaseFusedOp):
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
-            # Waterfill and the MoE load balancer expand a standard top-k output.
+            # The MoE load balancer expands a standard top-k output.
             output_format=(
                 TopKOutputFormat.STANDARD
-                if self.enable_waterfill or self.mlb_requires_post_topk_routing
+                if self.mlb_requires_post_topk_routing
                 else output_format
             ),
             scoring_func=scoring_func,
@@ -868,7 +862,7 @@ class TopK(BaseFusedOp):
                     "MoE load balancer routing is enabled but ModelRunner did not "
                     "attach MoELoadBalancer to this TopK."
                 )
-            return self._apply_waterfill(topk_output, num_tokens)
+            return topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise RuntimeError("MoE load balancer routing requires StandardTopKOutput.")
 
@@ -881,21 +875,11 @@ class TopK(BaseFusedOp):
             num_tokens=num_tokens,
             num_token_non_padded=num_token_non_padded,
             routed_scaling_factor=(
-                self.topk_config.routed_scaling_factor
-                if self.topk_config.routed_scaling_factor is not None
-                else 1.0
+                1.0
+                if is_routed_scaling_factor_fused_in_topk(self.topk_config)
+                else self.topk_config.routed_scaling_factor or 1.0
             ),
         )
-
-    def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
-        if self.enable_waterfill and self.waterfill_balancer is None:
-            raise RuntimeError(
-                "Waterfill TopK must be prepared by ModelRunner before forward."
-            )
-        if self.waterfill_balancer is None:
-            return topk_output
-        assert TopKOutputChecker.format_is_standard(topk_output)
-        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def forward_musa(self, *args, **kwargs) -> TopKOutput:
         # MUSA follows the CUDA path explicitly: select_experts branches on
@@ -974,7 +958,7 @@ class TopK(BaseFusedOp):
         requires_remapping = expert_location_dispatch_info is not None and (
             explicit_dispatch_info
             or is_expert_remapping_enabled()
-            or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
+            or expert_location_dispatch_info.ep_dispatch_algorithm == "fake"
         )
         if output_format == TopKOutputFormat.TRITON_KERNEL and requires_remapping:
             raise NotImplementedError(
@@ -1138,28 +1122,7 @@ class TopK(BaseFusedOp):
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
     ) -> TopKOutput:
-        """Return an empty topk output for a rank with zero tokens this forward.
-
-        Target layers call their owning ``LPLBSolver.solve(empty)`` so this
-        rank participates in the EP all-reduce even without tokens. Draft
-        layers skip the target solver. The optional ``layer_id`` is retained
-        for caller compatibility; the router's owning layer determines the solver.
-        """
-        if not self.is_draft:
-            layer_id = self.layer_id
-            # Skip the full ExpertLocationDispatchInfo allocation — we only
-            # need the per-layer solver to participate in the EP all-reduce.
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                lplb_solver.solve(
-                    torch.empty(
-                        (0, self.topk_config.top_k),
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                )
+        """Return empty routing output, including load-balancer collectives."""
         topk = self.topk_config.top_k - self.topk_config.num_shared_topk_slots
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -2718,40 +2681,7 @@ def _post_process_topk_ids(
     recorder_was_fused = False
     _fold_pad_weights_into_append = False
     if _is_cuda:
-        # LP path: solve LP outside torch.compile (the solver contains an
-        # EP all-reduce that can't run inside compiled regions).
-        log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
-        ):
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                lp_routed_ids = (
-                    topk_ids[:, :-num_shared_topk_slots]
-                    if router_wrote_shared_cols
-                    else topk_ids
-                )
-                log2phy_prob = lplb_solver.solve(lp_routed_ids)
-
-        if log2phy_prob is not None:
-            if router_wrote_shared_cols:
-                shared_cols = topk_ids[:, -num_shared_topk_slots:]
-                routed_cols = topk_ids_logical_to_physical(
-                    topk_ids[:, :-num_shared_topk_slots],
-                    expert_location_dispatch_info,
-                    log2phy_prob,
-                )
-                topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-                recorder_topk_ids = topk_ids[:, :-num_shared_topk_slots]
-            else:
-                topk_ids = topk_ids_logical_to_physical(
-                    topk_ids, expert_location_dispatch_info, log2phy_prob
-                )
-            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif router_wrote_shared_cols:
+        if router_wrote_shared_cols:
             # Shared IDs are outside EPLB's routed-expert table for both global
             # and per-rank layouts, so remap only routed columns.
             shared_cols = topk_ids[:, -num_shared_topk_slots:]

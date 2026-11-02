@@ -368,7 +368,6 @@ def test_unsupported_coupled_configuration_fails_early(overrides, message):
     values = dict(
         moe_load_balancer_algorithm="ultraep",
         ep_dispatch_algorithm=None,
-        enable_waterfill=False,
         ep_num_redundant_experts=2,
         ep_size=2,
         elastic_ep_backend=None,

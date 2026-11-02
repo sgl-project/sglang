@@ -4,20 +4,6 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.eplb.lplb_solver import (
-    LPLBSolver,
-    assert_lplb_supported_model,
-    clear_global_lplb_solvers,
-    set_global_lplb_solver,
-)
-from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import (
-    TopK,
-    fused_shared_expert_weight,
-    is_routed_scaling_factor_fused_in_topk,
-)
-from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -26,53 +12,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-
-
-def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
-    parallel = get_parallel()
-    balancer_cls = None
-    num_prepared = 0
-    num_routed_experts = None
-    for module in model.modules():
-        if not isinstance(module, (TopK, HashTopK)):
-            continue
-        if not module.enable_waterfill or module.waterfill_balancer is not None:
-            continue
-        if num_routed_experts is None:
-            num_routed_experts = getattr(
-                model_config.hf_config, "n_routed_experts", None
-            )
-            if num_routed_experts is None:
-                raise ValueError("Waterfill requires model config n_routed_experts.")
-        if balancer_cls is None:
-            from sglang.srt.layers.moe.waterfill import WaterfillBalancer
-
-            balancer_cls = WaterfillBalancer
-        # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
-        # Redundant experts therefore need to be included in the per-rank
-        # expert count used for Waterfill's shared-expert slot remapping.
-        num_physical_routed_experts = (
-            num_routed_experts + get_exec().moe.ep_num_redundant_experts
-        )
-        if isinstance(module, TopK):
-            routed_scaling_factor = module.topk_config.routed_scaling_factor
-            fused_in_topk = is_routed_scaling_factor_fused_in_topk(module.topk_config)
-        else:
-            routed_scaling_factor = module.routed_scaling_factor
-            fused_in_topk = module.apply_routed_scaling_factor_on_output
-        module.waterfill_balancer = balancer_cls(
-            num_routed_experts=num_physical_routed_experts,
-            world_size=parallel.moe_ep_size,
-            rank=parallel.moe_ep_rank,
-            layer_id=module.layer_id,
-            shared_weight=fused_shared_expert_weight(
-                routed_scaling_factor=routed_scaling_factor,
-                fused_in_topk=fused_in_topk,
-            ),
-        )
-        num_prepared += 1
-    if num_prepared:
-        log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
 def prebuild_deepep_v2_buffer(*, model) -> None:
@@ -99,36 +38,6 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
                 logger, "Prebuilt the DeepEP-V2 ElasticBuffer at startup."
             )
             return
-
-
-def init_lplb_solvers(*, model_config: ModelConfig) -> None:
-    """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.runtime_context import get_parallel
-
-    # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
-    # don't participate in the EP all-reduce (would deadlock under DP-
-    # attention). Failure here happens before any forward pass.
-    architectures = getattr(model_config.hf_config, "architectures", None)
-    if architectures:
-        assert_lplb_supported_model(architectures[0])
-
-    metadata = get_global_expert_location_metadata()
-    if metadata is None:
-        return
-    clear_global_lplb_solvers()
-    ep_group = get_parallel().moe_ep_group
-    for lid in range(metadata.num_layers):
-        solver = LPLBSolver(
-            phy2log=metadata.physical_to_logical_map[lid],
-            log2phy=metadata.logical_to_all_physical_map[lid],
-            num_gpus=metadata.ep_size,
-            ep_group=ep_group,
-            logical_to_all_physical_map_num_valid=(
-                metadata.logical_to_all_physical_map_num_valid[lid]
-            ),
-        )
-        set_global_lplb_solver(lid, solver)
-    logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
 
 def check_quantized_moe_compatibility(

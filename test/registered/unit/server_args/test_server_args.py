@@ -149,21 +149,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (535, "grpc_response_timeout_secs"),
-            (536, "enable_paged_experts"),
-            (537, "paged_experts_num_resident"),
-            (538, "enable_nvidia_megakernel"),
-            (539, "enable_megamoe_for_layernorm_sp"),
+            (534, "grpc_response_timeout_secs"),
+            (535, "enable_paged_experts"),
+            (536, "paged_experts_num_resident"),
+            (537, "enable_nvidia_megakernel"),
+            (538, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional = [getattr(defaults, field.name) for field in fields[:535]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[535] = 123.0
+        positional[534] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -2177,6 +2177,40 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
 
 
 class TestMoELoadBalancerAlgorithm(unittest.TestCase):
+    def test_pipeline_capabilities_gate_overlap_and_online_graphs(self):
+        from types import SimpleNamespace
+
+        pipeline = SimpleNamespace(
+            name="custom",
+            placement_policy=None,
+            capabilities=SimpleNamespace(
+                supports_concurrent_microbatches=False,
+                graph_stability="realloc_on_placement_change",
+                requires_post_topk_routing=True,
+                routes_shared_expert=False,
+            ),
+        )
+        for fields, message in (
+            ({"enable_two_batch_overlap": True}, "microbatches"),
+            ({"enable_single_batch_overlap": True}, "microbatches"),
+            ({"enable_eplb": True}, "disable-cuda-graph"),
+        ):
+            with (
+                self.subTest(**fields),
+                patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                handle_moe_load_balancer(
+                    ServerArgs(
+                        model_path="dummy",
+                        moe_load_balancer_algorithm="custom",
+                        **fields,
+                    )
+                )
+
     def test_native_eplb_path_does_not_import_evenmoe(self):
         server_args = ServerArgs(model_path="dummy", enable_eplb=True, ep_size=2)
         with patch.dict(sys.modules, {"evenmoe": None}):
@@ -2981,21 +3015,27 @@ class TestAdaptiveSpecArgs(CustomTestCase):
 
 
 class TestAscendOpsArgs(CustomTestCase):
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
     def test_ascend_ops_rejected_by_waterfill_without_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
         )
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
             handle_a2a_moe(server_args)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
     def test_ascend_ops_rejected_by_waterfill_with_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
             moe_ascend_ops_config="{}",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
         )
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
             handle_a2a_moe(server_args)
@@ -3035,12 +3075,30 @@ class TestAscendOpsArgs(CustomTestCase):
             resolve_ascend_ops_speculative_draft(server_args)
 
 
-class TestWaterfillArgs(CustomTestCase):
+class TestLoadBalancerSharedRoutingArgs(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from types import SimpleNamespace
+
+        pipeline = SimpleNamespace(
+            capabilities=SimpleNamespace(
+                requires_deepep=True,
+                routes_shared_expert=True,
+                requires_post_topk_routing=True,
+            )
+        )
+        patcher = patch(
+            "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+            return_value=pipeline,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -3056,7 +3114,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="none",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
@@ -3067,11 +3125,11 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
 
-    def test_waterfill_keeps_megamoe_backend(self):
+    def test_pipeline_backend_requirement_overrides_megamoe(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="megamoe",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             disable_shared_experts_fusion=True,
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -3079,7 +3137,7 @@ class TestWaterfillArgs(CustomTestCase):
 
         from sglang.srt.arg_groups.overrides import resolved_view
 
-        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
+        self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
 
@@ -3087,7 +3145,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
-            enable_waterfill=True,
+            moe_load_balancer_algorithm="waterfill",
             deepep_mode="low_latency",
         )
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
@@ -4349,7 +4407,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     SGLANG_ENABLE_DP_TBO env: enabling DP TBO now needs no extra flag.
 
     dummy-model short-circuits __post_init__, so the guard handler is invoked
-    directly (same pattern as TestWaterfillArgs)."""
+    directly (same pattern as TestLoadBalancerSharedRoutingArgs)."""
 
     def _args(self, **overrides):
         args = ServerArgs(model_path="dummy")

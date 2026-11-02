@@ -474,8 +474,6 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 tp_rank=0,
                 expert_backup_client=backup,
                 update_weights_from_disk_callable=Mock(),
-                ep_dispatch_algorithm=None,
-                init_lplb_solvers_callable=Mock(),
                 on_placement_committed=committed,
             )
         self.assertEqual(order, ["move", "recover", "commit"])
@@ -502,8 +500,6 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 tp_rank=0,
                 expert_backup_client=backup,
                 update_weights_from_disk_callable=Mock(),
-                ep_dispatch_algorithm=None,
-                init_lplb_solvers_callable=Mock(),
                 on_placement_committed=committed,
             )
         committed.assert_not_called()

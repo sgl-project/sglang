@@ -44,21 +44,36 @@ logger = logging.getLogger(__name__)
 def handle_moe_load_balancer(server_args: Any):
     """Resolve ``--moe-load-balancer-algorithm`` (EvenMoE) when it is set.
 
-    EvenMoE is strictly opt-in: without the flag the native EPLB dispatch and
-    Waterfill paths are untouched and ``evenmoe`` is never imported.
+    Without the flag, native EPLB dispatch does not import ``evenmoe``.
     """
     cfg = resolving_view(server_args)
     from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
 
     pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
     if pipeline is not None:
-        if cfg.ep_dispatch_algorithm is not None or cfg.enable_waterfill:
+        if cfg.ep_dispatch_algorithm is not None:
             raise ValueError(
-                "--moe-load-balancer-algorithm cannot be combined with --ep-dispatch-algorithm or --enable-waterfill"
+                "--moe-load-balancer-algorithm cannot be combined with --ep-dispatch-algorithm"
             )
         resolutions = {"moe_load_balancer_algorithm": pipeline.name}
+        capabilities = pipeline.capabilities
+        if not capabilities.supports_concurrent_microbatches and (
+            cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap
+        ):
+            raise ValueError(
+                "The selected EvenMoE pipeline does not support overlapping microbatches."
+            )
+        if (
+            capabilities.graph_stability == "realloc_on_placement_change"
+            and cfg.enable_eplb
+            and not cfg.disable_cuda_graph
+        ):
+            raise ValueError(
+                "The selected EvenMoE pipeline changes routing buffers after placement updates; "
+                "--enable-eplb requires --disable-cuda-graph."
+            )
         if pipeline.placement_policy is not None:
-            _check_coupled_placement(cfg, pipeline)
+            _check_coupled_placement(cfg)
         if (
             pipeline.capabilities.requires_post_topk_routing
             and not pipeline.capabilities.routes_shared_expert
@@ -67,20 +82,13 @@ def handle_moe_load_balancer(server_args: Any):
         declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
 
 
-def _check_coupled_placement(cfg: Any, pipeline: Any) -> None:
+def _check_coupled_placement(cfg: Any) -> None:
     """A coupled placement policy re-plans layers online from live traffic."""
-    from evenmoe import ExpertDeploymentConfig
-
-    reason = pipeline.is_applicable(
-        ExpertDeploymentConfig(
-            num_redundant_experts=cfg.ep_num_redundant_experts,
-            routes_shared_expert=True,
-            carries_placement_metadata=True,
-        )
-    )
-    if reason is not None:
-        raise ValueError(reason)
-    if cfg.ep_size <= 1 or cfg.ep_num_redundant_experts % cfg.ep_size:
+    if (
+        cfg.ep_size <= 1
+        or cfg.ep_num_redundant_experts <= 0
+        or cfg.ep_num_redundant_experts % cfg.ep_size
+    ):
         raise ValueError(
             "Coupled EvenMoE placement requires redundant slots on every EP rank."
         )
@@ -95,10 +103,6 @@ def _check_coupled_placement(cfg: Any, pipeline: Any) -> None:
     if cfg.enable_eplb and not cfg.disable_cuda_graph:
         raise ValueError(
             "Online coupled EvenMoE placement currently requires --disable-cuda-graph."
-        )
-    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
-        raise ValueError(
-            "Coupled EvenMoE placement does not support overlapping microbatches."
         )
     if cfg.expert_distribution_recorder_mode not in (None, "stat"):
         raise ValueError("Coupled EvenMoE placement requires the stat expert recorder.")
@@ -397,12 +401,16 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    # Check the requested backend before Waterfill's backend override. Waterfill
-    # currently supports DeepEP/MegaMOE only; otherwise the override below would
-    # hide an explicitly incompatible ascend_ops selection.
-    if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
+    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+
+    pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
+    if (
+        pipeline is not None
+        and pipeline.capabilities.requires_deepep
+        and cfg.moe_a2a_backend == "ascend_ops"
+    ):
         raise ValueError(
-            "--enable-waterfill is incompatible with --moe-a2a-backend ascend_ops."
+            "The selected EvenMoE pipeline requires DeepEP and is incompatible with ascend_ops."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
@@ -415,16 +423,19 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, validate_ascend_ops_config)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
-    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
-
-    pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
-    if cfg.enable_waterfill or (
-        pipeline is not None and pipeline.capabilities.routes_shared_expert
-    ):
+    if pipeline is not None and pipeline.capabilities.requires_post_topk_routing:
+        if a2a_backend == "none":
+            raise ValueError(
+                "--moe-load-balancer-algorithm requires a MoE A2A backend "
+                "to dispatch each token to its selected physical replica."
+            )
+    if pipeline is not None and pipeline.capabilities.routes_shared_expert:
         declare_resolution(
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
         )
-        logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+        logger.info(
+            f"EvenMoE shared-expert routing uses moe_a2a_backend='{a2a_backend}'."
+        )
 
     if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
         None,
@@ -580,7 +591,7 @@ def handle_a2a_moe(server_args: Any):
         )
 
     # The resolving view, not the field: `_a2a_backend_overrides` may have
-    # moved this already (waterfill forces `deepep`).
+    # moved this already (a routing pipeline can require `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
 
     if a2a_now == "flashinfer":

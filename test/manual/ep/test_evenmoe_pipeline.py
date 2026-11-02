@@ -138,6 +138,7 @@ def main():
         resources=SimpleNamespace(
             mlb_model_info={"num_logical_experts": 2, "num_groups": None},
             expert_location_metadata=metadata,
+            mlb_placement_refresh=None,
             expert_distribution_recorder=recorder,
             experts_capturer=None,
         ),
@@ -147,34 +148,38 @@ def main():
     modes = {
         "lplb": "lplb",
         "waterfill": "waterfill",
-        "waterfill_dynamic": "waterfill_dynamic",
+        "waterfill_dynamic": "waterfill",
         "combined": "lplb+waterfill",
         "combined_idle": "lplb+waterfill",
     }
     for mode, algorithm in modes.items():
-        context.config_bag = lambda name: SimpleNamespace(
-            moe=SimpleNamespace(
-                moe_load_balancer_algorithm=algorithm, ep_num_redundant_experts=2
+        with patch.dict(
+            os.environ,
+            {"WATERFILL_USE_GLOBAL_LOAD": "1" if mode == "waterfill_dynamic" else "0"},
+        ):
+            context.config_bag = lambda name: SimpleNamespace(
+                moe=SimpleNamespace(
+                    moe_load_balancer_algorithm=algorithm, ep_num_redundant_experts=2
+                )
             )
-        )
-        mlb = MoELoadBalancer.from_algorithm(**to_load_balancer_kwargs(context))
-        commit_placement(mlb, context, [0])
-        _run_l2_mode(mlb, metadata, recorder, rank, mode, device, context)
-        replacement = _Metadata(device, rank)
-        replacement.physical_to_logical_map = replacement.physical_to_logical_map.flip(
-            -1
-        )
-        replacement.logical_to_all_physical_map = (
-            replacement.logical_to_all_physical_map.flip(1)
-        )
-        replacement.logical_to_rank_dispatch_physical_map = (
-            replacement.logical_to_rank_dispatch_physical_map.flip(-1)
-        )
-        context.resources.expert_location_metadata = replacement
-        commit_placement(mlb, context, [0])
-        _run_l2_mode(mlb, replacement, recorder, rank, mode, device, context)
-        context.resources.expert_location_metadata = metadata
-        dist.barrier()
+            mlb = MoELoadBalancer.from_algorithm(**to_load_balancer_kwargs(context))
+            commit_placement(mlb, context, [0])
+            _run_l2_mode(mlb, metadata, recorder, rank, mode, device, context)
+            replacement = _Metadata(device, rank)
+            replacement.physical_to_logical_map = (
+                replacement.physical_to_logical_map.flip(-1)
+            )
+            replacement.logical_to_all_physical_map = (
+                replacement.logical_to_all_physical_map.flip(1)
+            )
+            replacement.logical_to_rank_dispatch_physical_map = (
+                replacement.logical_to_rank_dispatch_physical_map.flip(-1)
+            )
+            context.resources.expert_location_metadata = replacement
+            commit_placement(mlb, context, [0])
+            _run_l2_mode(mlb, replacement, recorder, rank, mode, device, context)
+            context.resources.expert_location_metadata = metadata
+            dist.barrier()
 
     if rank == 0:
         print("PASS: EPLB, LPLB, Waterfill, and combined L2 pipeline")

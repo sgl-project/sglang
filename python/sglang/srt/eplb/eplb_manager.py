@@ -232,10 +232,6 @@ class EPLBManager:
             broadcast_over_world=is_post_scale_rebalance,
         )
 
-        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
-            init_lplb_solvers,
-        )
-
         on_placement_committed = None
         if self._moe_load_balancer is not None:
             from evenmoe.adapters.sglang import commit_placement
@@ -269,10 +265,6 @@ class EPLBManager:
                 use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
-                ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
-                init_lplb_solvers_callable=lambda: init_lplb_solvers(
-                    model_config=self._model_config
-                ),
             )
             if is_post_scale_rebalance:
                 # P2P waits only synchronize participating peers. Ranks without
@@ -411,8 +403,6 @@ def update_expert_location_with_recovery(
     use_flat_topology: bool = False,
     expert_backup_client,
     update_weights_from_disk_callable,
-    ep_dispatch_algorithm: str,
-    init_lplb_solvers_callable,
     on_placement_committed=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
@@ -452,10 +442,6 @@ def update_expert_location_with_recovery(
 
     if on_placement_committed is not None:
         on_placement_committed(update_layer_ids)
-
-    # Re-init LPLB solvers after expert location update
-    if ep_dispatch_algorithm == "lp":
-        init_lplb_solvers_callable()
 
 
 def _chunk_list(items: List, chunk_size):

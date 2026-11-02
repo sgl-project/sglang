@@ -329,7 +329,6 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_backend",
     "enable_elastic_expert_backup",
     "mooncake_ib_device",
-    "enable_waterfill",
     "ep_join_mode",
     "ep_join_rank_offset",
     "elastic_ep_initial_size",

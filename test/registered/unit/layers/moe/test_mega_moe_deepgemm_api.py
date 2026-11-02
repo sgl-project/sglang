@@ -387,7 +387,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         """
         config = get_context().override_server_args(
             model_path="dummy",
-            enable_waterfill=False,
             ep_dispatch_algorithm=None,
             enable_eplb=False,
         )
@@ -519,14 +518,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]
         )
         moe.topk.topk_config.sqrtsoftplus_log1p = True
-        moe.topk.enable_waterfill = False
+        moe.topk.mlb_requires_post_topk_routing = False
         moe.mega_gate_supported = True
         if hash_routing:
             moe.is_hash = True
             moe.gate.e_score_correction_bias = None
             moe.topk = SimpleNamespace(
-                enable_waterfill=False,
                 topk=2,
+                mlb_requires_post_topk_routing=False,
                 num_shared_topk_slots=0,
                 routed_scaling_factor=2.0,
                 apply_routed_scaling_factor_on_output=scale_in_topk,
@@ -561,6 +560,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             patch.object(mega_gate_runtime, "_device_sm", 100),
         ):
             self.assertTrue(supported(moe))
+            with patch.object(moe.topk, "mlb_requires_post_topk_routing", True):
+                self.assertFalse(supported(moe))
             self.assertTrue(supported(self._mega_gate_moe(hash_routing=True)))
             with patch.object(moe.topk.topk_config, "scoring_func", "sigmoid"):
                 self.assertFalse(supported(moe))
@@ -692,7 +693,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertTrue((buf.topk_weights[2:4] == 0).all())
         self.assertEqual(len(recorded), 1)
         torch.testing.assert_close(recorded[0], buf.topk_idx[:4])
-        for algorithm in ("lp", "fake"):
+        for algorithm in ("fake",):
             with patch.object(
                 moe.topk,
                 "routing_inputs",
