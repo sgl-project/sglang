@@ -45,7 +45,6 @@ def _decode_batch():
     batch.return_logprob = False
     batch.sampling_info = sampling
     batch.prefill_input_ids_cpu = None
-    batch.uocr_graph_io_deferred = False
     batch.penalty_update_pending = False
     batch.input_ids_from_graph = False
     return batch
