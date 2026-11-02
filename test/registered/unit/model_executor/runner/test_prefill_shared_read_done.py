@@ -35,7 +35,11 @@ class _Event:
 
 
 def _model_runner(
-    *, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True, declared=None
+    *,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    compliant=True,
+    declared=None,
+    offload_fenced=False,
 ):
     if declared is None:
         declared = SharedReadEnds.PRE_REPLAY if compliant else SharedReadEnds.UNKNOWN
@@ -45,6 +49,7 @@ def _model_runner(
         spec_algorithm=spec_algorithm,
         attn_backend=attn_backend,
         shared_read_done_event=None,
+        kv_offload_fenced_on_forward_stream=offload_fenced,
     )
     return runner
 
@@ -88,6 +93,28 @@ def test_disabled_when_flag_is_false():
 def test_kv_offload_keeps_the_coarse_barrier(memory):
     runner = _model_runner()
     with get_memory().override(**memory):
+        _prepare_and_publish(runner, _batch())
+    assert runner.shared_read_done_event is None
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [
+        {"enable_hierarchical_cache": True},
+        {"enable_hierarchical_cache": True, "hicache_storage_backend": "mooncake"},
+    ],
+)
+def test_fenced_kv_offload_publishes(memory):
+    runner = _model_runner(offload_fenced=True)
+    with get_memory().override(**memory):
+        _prepare_and_publish(runner, _batch())
+    published = runner.shared_read_done_event
+    assert isinstance(published, _Event) and published.recorded
+
+
+def test_lmcache_keeps_the_coarse_barrier_when_hicache_is_fenced():
+    runner = _model_runner(offload_fenced=True)
+    with get_memory().override(enable_hierarchical_cache=True, enable_lmcache=True):
         _prepare_and_publish(runner, _batch())
     assert runner.shared_read_done_event is None
 

@@ -286,7 +286,7 @@ class SchedulePolicy:
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
-            or get_memory().radix_eviction_policy.lower() != "lru"
+            or get_memory().radix_eviction_policy.lower() not in ("lru", "joint_lru")
             or self.tree_cache.supports_fast_match_prefix()
             or not self.tree_cache.supports_prefix_sharing()
         ):
@@ -1383,6 +1383,19 @@ class PrefillAdder:
         if self.tree_cache.buffer_pipeline is not None:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
 
+    @staticmethod
+    def release_request_slot(tree_cache, waiting_queue) -> bool:
+        """reclaim a cache-owned request row when admission has no free row"""
+        return False
+
+    def should_defer(self, req: Req) -> bool:
+        """whether admission must wait before staging cache transfers for this candidate"""
+        return False
+
+    def batch_is_full_after_rejection(self, req: Req) -> bool:
+        """whether running work must finish before another admission attempt"""
+        return bool(self.can_run_list) or not self.running_batch.is_empty()
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1559,7 +1572,7 @@ class PrefillAdder:
                         return admission
                 req.prefix_len += req.host_loaded_length
                 if self.tree_cache.load_back_is_cache_owned():
-                    req.kv.cache_protected_len = req.prefix_len
+                    req.kv.protect_prefix(req.prefix_len)
 
             if (
                 self.kv_shard_scratch_spec is not None
