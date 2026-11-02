@@ -8,12 +8,15 @@ causal transformer class.
 """
 
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
+    HISTORY_MODE_AUTO,
     HISTORY_MODE_FULL,
+    HISTORY_MODE_SLIDING,
     CosmosDreamsInferenceProfile,
     CosmosDreamsManifest,
     load_cosmos_dreams_manifest,
@@ -76,11 +79,13 @@ class CosmosDreamsConfig(Cosmos3Config):
     # artifact sigma for a chunk starting at latent frame 0, sigmas 0 and 2 afterwards. Override
     # with --pipeline-config-path JSON, e.g. [[1.0, 0.9375, 0.8333, 0.625]] for four steps everywhere.
     frame_sigma_schedules: list[list[float]] | None = None
-    # "full" keeps the K/V of the first history_max_frames pixel frames like training over
-    # whole clips (the action exports set no training window; their window_frames is an
-    # exporter default); "sliding" evicts beyond the artifact's window_frames. The Transfer
-    # config defaults to "auto" and follows the training config instead.
-    history_mode: str = HISTORY_MODE_FULL
+    # "auto" follows the export's training config: sliding over the artifact's
+    # window_frames/sink_frames when it records kv_cache_inference_size (the Oct 2026
+    # Sim-Bimanual export: 64 frames, 8 sinks; Sim-Transfer: 30 frames, 3 sinks), the
+    # whole clip otherwise. "full" keeps the K/V of the first history_max_frames pixel
+    # frames regardless (frustum retrieval needs it); "sliding" evicts beyond the
+    # artifact's window_frames or the deploy overrides below.
+    history_mode: str = HISTORY_MODE_AUTO
     history_max_frames: int = COSMOS_DREAMS_HISTORY_MAX_FRAMES
     # Deploy-time K/V cache for history_mode "sliding", in the training config's units:
     # kv_cache_inference_size counts the pinned sink frames, the recent frames and the
@@ -104,13 +109,25 @@ class CosmosDreamsConfig(Cosmos3Config):
         self.inference_profile(manifest)
 
     def inference_profile(
-        self, manifest: CosmosDreamsManifest
+        self,
+        manifest: CosmosDreamsManifest,
+        *,
+        trained_window: tuple[int | None, int] | None = None,
     ) -> CosmosDreamsInferenceProfile:
-        """Rollout schedule and history settings the stages run with."""
+        """Rollout schedule and history settings the stages run with.
+
+        ``trained_window`` is ``(kv_cache_inference_size, attention_sink_size)`` of
+        the training config; ``None`` reads it from the export's root ``config.json``.
+        """
         return resolve_inference_profile(
             manifest,
             frame_sigma_schedules=self.frame_sigma_schedules,
-            history_mode=self.history_mode,
+            history_mode=resolve_history_mode(
+                manifest,
+                history_mode=self.history_mode,
+                model_path=self.model_path,
+                trained_window=trained_window,
+            ),
             history_max_frames=self.history_max_frames,
             kv_cache_inference_size=self.kv_cache_inference_size,
             attention_sink_size=self.attention_sink_size,
@@ -180,6 +197,61 @@ class CosmosDreamsConfig(Cosmos3Config):
 
     def supports_dynamic_batching(self) -> bool:
         return False
+
+
+def resolve_history_mode(
+    manifest: CosmosDreamsManifest,
+    *,
+    history_mode: str,
+    model_path: str | None,
+    trained_window: tuple[int | None, int] | None = None,
+) -> str:
+    """Turn ``auto`` into ``full`` or ``sliding`` from the export's training config.
+
+    The reference slides only when the training config recorded a K/V window, and
+    the artifact must then declare the same window; explicit modes pass through.
+    """
+    if history_mode != HISTORY_MODE_AUTO:
+        return history_mode
+    if trained_window is None:
+        trained_window = training_kv_window(model_path)
+    window, sink = trained_window
+    if window is None:
+        return HISTORY_MODE_FULL
+    if (window, sink) != (manifest.window_frames, manifest.sink_frames):
+        raise ValueError(
+            f"Cosmos-Dreams {manifest.conditioning_mode} export disagrees with its "
+            f"training config: artifact window_frames={manifest.window_frames}, "
+            f"sink_frames={manifest.sink_frames}; training "
+            f"kv_cache_inference_size={window}, attention_sink_size={sink}."
+        )
+    return HISTORY_MODE_SLIDING
+
+
+def training_kv_window(model_path: str | None) -> tuple[int | None, int]:
+    """``(kv_cache_inference_size, attention_sink_size)`` from ``model.config`` of the
+    export's root ``config.json`` (the imaginaire4 training config the exporter dumps);
+    ``(None, 0)`` when the export has no such record."""
+    if not model_path:
+        return None, 0
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        load_dict,
+        prepare_diffusers_component_path_for_loading,
+    )
+
+    root = prepare_diffusers_component_path_for_loading(model_path)
+    config_path = os.path.join(root, "config.json")
+    if not os.path.isfile(config_path):
+        return None, 0
+    model_config = load_dict(config_path).get("model", {}).get("config", {})
+    window = model_config.get("kv_cache_inference_size")
+    sink = model_config.get("attention_sink_size", 0) or 0
+    if window is not None and (isinstance(window, bool) or not isinstance(window, int)):
+        raise ValueError(
+            "Cosmos-Dreams training config kv_cache_inference_size must be an int, "
+            f"got {window!r}."
+        )
+    return window, int(sink)
 
 
 def register():

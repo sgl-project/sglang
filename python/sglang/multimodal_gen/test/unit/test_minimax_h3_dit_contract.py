@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionBackend,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+    SDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -46,6 +49,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_group_attend,
     _modulate_gate,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
@@ -413,6 +417,31 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     assert output.data_ptr() != x.data_ptr()
     torch.testing.assert_close(x, original, rtol=0, atol=0)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_group_attend_skips_only_the_trailing_alignment_rows():
+    """The pipelined Ulysses group attention gives the real rows the bytes of
+    forward_varlen and leaves the packing's alignment rows zero."""
+    used, total = 16400, 16448  # long enough for FA4 on sm_103
+    impl = DynamicCudnnSDPAImpl(
+        num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+    )
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(total, 2, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    bounds = (0, used, total)
+    kwargs = dict(
+        cu_seqlens=torch.tensor(bounds, device="cuda", dtype=torch.int32),
+        cu_seqlens_host=bounds,
+        max_seqlen=used,
+    )
+    ref = impl.forward_varlen(q, k, v, **kwargs)
+    got = _minimax_h3_group_attend(impl, **kwargs)(q, k, v)
+    assert torch.equal(got[:used], ref[:used])
+    assert not got[used:].any()
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():

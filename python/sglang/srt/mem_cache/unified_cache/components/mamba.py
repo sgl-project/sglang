@@ -676,8 +676,10 @@ class MambaComponent(TreeComponent):
         if cd.lock_ref == 0:
             self.tree_core._update_evictable_leaf_sets(node)
 
-    def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _try_alloc_mamba_slot(
+        self, req: Optional[Req] = None
+    ) -> Optional[torch.Tensor]:
+        """Allocate a slot after eviction, or return None if all states are locked."""
         storage, sub_pool = self._state()
         slot = storage.take_state_slots(sub_pool, 1)
         if slot is None:
@@ -702,7 +704,12 @@ class MambaComponent(TreeComponent):
                     lock.receipt.skipped_lock_components += (ct,)
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = storage.take_state_slots(sub_pool, 1)
-            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
+    def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
+        """Allocate a slot required for request state or load-back."""
+        slot = self._try_alloc_mamba_slot(req)
+        assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     def _state(self):
@@ -821,7 +828,9 @@ class MambaComponent(TreeComponent):
             # Donate the mamba index to the radix cache instead of copying.
             if self.quantizes_checkpoints:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot(req)
+                    new_slot = self._try_alloc_mamba_slot(req)
+                    if new_slot is None:
+                        return 0
                     storage, sub_pool = self._state()
                     src_active = storage.donate_tracking_slot(sub_pool, req, new_slot)
                     mamba_value_donated = self._commit_int8_checkpoint(src_active)
@@ -831,13 +840,17 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot(req)
+                new_slot = self._try_alloc_mamba_slot(req)
+                if new_slot is None:
+                    return 0
                 storage, sub_pool = self._state()
                 mamba_value_donated = storage.donate_tracking_slot(
                     sub_pool, req, new_slot
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot(req)
+                mamba_value_donated = self._try_alloc_mamba_slot(req)
+                if mamba_value_donated is None:
+                    return 0
                 storage, sub_pool = self._state()
                 storage.copy_state(
                     sub_pool, req.kv.mamba_pool_idx.unsqueeze(0), mamba_value_donated

@@ -1164,12 +1164,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.increment_scheduler_iterations = lambda: None
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
-        scheduler.forward_ct = 0
-        scheduler._sched_idled = False
-        scheduler.profiler_manager = SimpleNamespace(
-            _profile_batch_predicate=lambda batch: None
-        )
-        scheduler._join_launched_reqs = lambda batch: None
+        scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
