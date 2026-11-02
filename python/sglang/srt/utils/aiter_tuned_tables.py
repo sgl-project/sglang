@@ -1,5 +1,4 @@
-"""In-tree rows for aiter's tuned-config tables, for shapes a model needs before the aiter pin
-has them.
+"""In-tree rows for aiter's tuned-config tables, for shapes the aiter pin lacks.
 
 ``aiter_tuned_configs/<table>/<model>.csv`` holds a model's rows for one aiter table, in
 that table's columns. ``install_aiter_tuned_tables()`` runs before the model loads: it
@@ -61,7 +60,7 @@ class AiterTable(msgspec.Struct, frozen=True):
         """The ``AITER_CONFIGS`` property that resolves the table."""
         return self.env + "_FILE"
 
-    def csvs(self) -> list:
+    def csv_paths(self) -> list:
         return sorted(glob.glob(os.path.join(CONFIG_DIR, self.name, "*.csv")))
 
 
@@ -197,8 +196,12 @@ def _aiter_has_flydsl() -> bool:
 
 def uses_flydsl(rows, kernel_cols):
     """Rows whose kernel aiter builds with FlyDSL: libtype flydsl, or a flydsl_ kernel name."""
+    import pandas as pd
+
     flydsl = (
-        rows["libtype"] == "flydsl" if "libtype" in rows.columns else rows.index < 0
+        rows["libtype"] == "flydsl"
+        if "libtype" in rows.columns
+        else pd.Series(False, index=rows.index)
     )
     for c in kernel_cols:
         if "kernelName" in c and c in rows.columns:
@@ -302,9 +305,9 @@ def install_aiter_tuned_tables() -> Optional[dict]:
     if _report is not None:
         return _report
     from sglang.srt.environ import envs
-    from sglang.srt.utils.common import get_bool_env_var, is_hip
+    from sglang.srt.utils.common import is_hip
 
-    if not (is_hip() and get_bool_env_var("SGLANG_USE_AITER")):
+    if not (is_hip() and envs.SGLANG_USE_AITER.get()):
         return None
     if not envs.SGLANG_AITER_INTREE_GEMM_TUNE.get():
         return None
@@ -315,10 +318,10 @@ def install_aiter_tuned_tables() -> Optional[dict]:
     out_dir = intree_out_dir()
     report = {}
     for table in TABLES:
-        csvs = table.csvs()
-        user = os.environ.get(table.env)
+        csvs = table.csv_paths()
         if not csvs:
             continue
+        user = os.environ.get(table.env)
         if user and os.path.dirname(os.path.abspath(user)) != os.path.abspath(out_dir):
             report[table.name] = f"user {table.env}"
             continue

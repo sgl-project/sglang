@@ -329,10 +329,28 @@ class TestInTreeTables(CustomTestCase):
         type(AITER_CONFIGS).get_config_file.cache_clear()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_install(self):
+    def test_a_table_the_user_set_is_left_alone(self):
+        """A user's AITER_CONFIG_* is their table: the in-tree rows must not replace it."""
+        user = os.path.join(self.tmp, "user_table.csv")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_USE_AITER": "1",
+                    "SGLANG_AITER_INTREE_GEMM_TUNE": "1",
+                    _TABLE.env: user,
+                },
+            ),
+            mock.patch.object(tables, "_report", None),
+        ):
+            report = tables.install_aiter_tuned_tables()
+            self.assertEqual(report[_TABLE.name], f"user {_TABLE.env}")
+            self.assertEqual(os.environ[_TABLE.env], user)
+
+    def test_rows_are_unique_and_resolve_on_the_pinned_aiter(self):
         pinned = _aiter_commit().startswith(_TABLES_AITER)
         for table in tables.TABLES:
-            csvs = table.csvs()
+            csvs = table.csv_paths()
             if not csvs:
                 continue
             with self.subTest(table.name):
