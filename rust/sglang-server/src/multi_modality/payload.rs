@@ -1,9 +1,10 @@
 //! Convert a request's ids and [`MmData`] into the typed [`MmInput`] the
 //! `sglang-mm` driver consumes — an in-process handoff, nothing serialized.
 //!
-//! Every `Err` rejects the request back to the client; the message says whether
-//! the input is malformed or merely outside the pipeline's scope (video/audio,
-//! precomputed features, …).
+//! Every `Err` rejects the request back to the client: `Client` when the input
+//! is malformed or merely outside the pipeline's scope (video/audio,
+//! precomputed features, …), `Server` when the API layer's prefetch and this
+//! walk disagree.
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted};
@@ -12,6 +13,7 @@ use sglang_mm::driver::{ImageSource, MmInput};
 use crate::message::multimodal::{MediaHints, MmItem};
 use crate::message::request::MmData;
 use crate::message::types::TokenIds;
+use crate::multi_modality::worker::MediaError;
 
 /// Fully resolved media for a multimodal processor. I/O sources were
 /// prefetched on the async API layer; data URLs and bare base64 are decoded on
@@ -30,7 +32,10 @@ pub struct ResolvedMediaWork {
 }
 
 /// Resolve all modality fields in the fixed image/video/audio prefetch order.
-pub fn resolve_media_work(input_ids: TokenIds, mm: MmData) -> Result<ResolvedMediaWork, String> {
+pub fn resolve_media_work(
+    input_ids: TokenIds,
+    mm: MmData,
+) -> Result<ResolvedMediaWork, MediaError> {
     resolve_media_work_with_budget(input_ids, mm, sglang_mm::driver::MAX_REQUEST_BYTES)
 }
 
@@ -38,7 +43,7 @@ fn resolve_media_work_with_budget(
     input_ids: TokenIds,
     mm: MmData,
     max_request_bytes: u64,
-) -> Result<ResolvedMediaWork, String> {
+) -> Result<ResolvedMediaWork, MediaError> {
     let MmData {
         image_data,
         video_data,
@@ -52,7 +57,9 @@ fn resolve_media_work_with_budget(
     let (videos, video_hints) = collect_media(video_data, &mut prefetched, "video_data", &budget)?;
     let (audios, audio_hints) = collect_media(audio_data, &mut prefetched, "audio_data", &budget)?;
     if prefetched.next().is_some() {
-        return Err("media prefetch produced more payloads than the request consumes".into());
+        return Err(MediaError::Server(
+            "media prefetch produced more payloads than the request consumes".into(),
+        ));
     }
     Ok(ResolvedMediaWork {
         input_ids,
@@ -70,7 +77,7 @@ fn collect_media(
     prefetched: &mut std::vec::IntoIter<Bytes>,
     field: &str,
     budget: &ByteBudget,
-) -> Result<(Vec<Bytes>, Vec<MediaHints>), String> {
+) -> Result<(Vec<Bytes>, Vec<MediaHints>), MediaError> {
     let resolved = items
         .into_iter()
         .map(|item| {
@@ -79,30 +86,43 @@ fn collect_media(
                 MmItem::Ref { url, hints } => (url, hints),
             };
             let bytes = if is_io_source(&source) {
-                let bytes = prefetched
-                    .next()
-                    .ok_or_else(|| format!("I/O-backed {field} source was not prefetched"))?;
-                budget.charge_existing(bytes.len(), field)?;
+                let bytes = prefetched.next().ok_or_else(|| {
+                    MediaError::Server(format!("I/O-backed {field} source was not prefetched"))
+                })?;
+                budget
+                    .charge_existing(bytes.len(), field)
+                    .map_err(MediaError::Client)?;
                 bytes
             } else {
-                fetch_bytes_budgeted(&source, budget).map(Bytes::from)?
+                // Only data URLs and bare base64 get here: malformed or over
+                // budget, the request's fault.
+                fetch_bytes_budgeted(&source, budget)
+                    .map(Bytes::from)
+                    .map_err(MediaError::Client)?
             };
             Ok((bytes, hints))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, MediaError>>()?;
     Ok(resolved.into_iter().unzip())
 }
 
 /// True for sources the API layer must resolve before MM dispatch: I/O — network
 /// *or* disk, since a network mount can hang past any HTTP timeout — never runs
-/// on the fixed MM worker pool (see `core::prefetch`). `data:` and bare
-/// base64 are pure CPU and stay on the worker. Lives next to [`image_source`]
-/// so the prefetch walk and the parse walk cannot drift.
+/// on the fixed MM worker pool (see `core::prefetch`). That is every absolute
+/// path and every `scheme://` URI, so a scheme no fetcher serves is rejected
+/// there instead of being decoded as base64. `data:` and bare base64 are pure
+/// CPU and stay on the worker. Lives next to [`image_source`] so the prefetch
+/// walk and the parse walk cannot drift.
 pub fn is_io_source(src: &str) -> bool {
-    src.starts_with("http://")
-        || src.starts_with("https://")
-        || src.starts_with("file://")
-        || src.starts_with('/')
+    // A bounded scan of the scheme alone: an inline payload can be megabytes
+    // of base64, and this runs on the async API workers.
+    const MAX_SCHEME_LEN: usize = 32;
+    let scheme_len = src
+        .bytes()
+        .take(MAX_SCHEME_LEN)
+        .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        .count();
+    src.starts_with('/') || (scheme_len > 0 && src[scheme_len..].starts_with("://"))
 }
 
 /// The I/O-backed sources of one modality's items, in item order.
@@ -118,7 +138,7 @@ pub fn io_sources(items: &[MmItem]) -> Vec<String> {
 /// I/O-backed sources are swapped for their `mm.prefetched` bytes (in
 /// [`io_sources`] order); one left without an entry is an internal error here,
 /// never a fetch.
-pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
+pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, MediaError> {
     let MmData {
         image_data,
         video_data,
@@ -127,7 +147,9 @@ pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
         mm_hashes: _,
     } = mm;
     if !video_data.is_empty() || !audio_data.is_empty() {
-        return Err("unsupported modality: video/audio input".into());
+        return Err(MediaError::Client(
+            "unsupported modality: video/audio input".into(),
+        ));
     }
     let mut prefetched = prefetched.iter();
     let images = image_data
@@ -135,7 +157,9 @@ pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
         .map(|item| image_source(item, &mut prefetched))
         .collect::<Result<Vec<_>, _>>()?;
     if images.is_empty() {
-        return Err("no raw image sources in mm input".into());
+        return Err(MediaError::Client(
+            "no raw image sources in mm input".into(),
+        ));
     }
     Ok(MmInput { input_ids, images })
 }
@@ -143,7 +167,7 @@ pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, String> {
 fn image_source(
     item: MmItem,
     prefetched: &mut std::slice::Iter<Bytes>,
-) -> Result<ImageSource, String> {
+) -> Result<ImageSource, MediaError> {
     match item {
         MmItem::Source(source) | MmItem::Ref { url: source, .. } => {
             if !is_io_source(&source) {
@@ -152,7 +176,9 @@ fn image_source(
             prefetched
                 .next()
                 .map(|bytes| ImageSource::Bytes(bytes.to_vec()))
-                .ok_or_else(|| "I/O-backed image source was not prefetched".to_string())
+                .ok_or_else(|| {
+                    MediaError::Server("I/O-backed image source was not prefetched".to_string())
+                })
         }
     }
 }
@@ -203,16 +229,15 @@ mod tests {
             video_data: vec![src("video.mp4")],
             ..Default::default()
         };
-        assert!(
-            to_mm_input(IDS.to_vec(), video)
-                .err()
-                .unwrap()
-                .contains("video/audio")
-        );
+        assert!(matches!(
+            to_mm_input(IDS.to_vec(), video),
+            Err(MediaError::Client(message)) if message.contains("video/audio")
+        ));
     }
 
-    /// I/O-backed sources (URLs, file paths) take their prefetched bytes in walk
-    /// order; one left unfetched errors, so no I/O can reach an MM worker.
+    /// I/O-backed sources (URLs of any scheme, file paths) take their
+    /// prefetched bytes in walk order; one left unfetched errors, so no I/O
+    /// can reach an MM worker.
     #[test]
     fn io_sources_use_prefetched_bytes() {
         let image = vec![
@@ -222,11 +247,29 @@ mod tests {
                 url: "/mnt/nfs/y.png".into(),
                 hints: MediaHints::default(),
             },
+            src("s3://bucket/z.png"),
         ];
-        assert_eq!(io_sources(&image), vec!["http://a/x.png", "/mnt/nfs/y.png"]);
+        assert_eq!(
+            io_sources(&image),
+            vec!["http://a/x.png", "/mnt/nfs/y.png", "s3://bucket/z.png"]
+        );
+        for source in ["file:///x.png", "https://a/x", "custom+v1.x-y://z"] {
+            assert!(is_io_source(source), "{source}");
+        }
+        // Bare base64 has no ':', and a data URL's prefix is no scheme.
+        for source in ["aGk=", "data:text/plain,a://b", "://x", "a b://c"] {
+            assert!(!is_io_source(source), "{source}");
+        }
+        // Only a bounded prefix is scanned, so a long scheme-alphabet run is
+        // inline data however it ends.
+        assert!(!is_io_source(&format!("{}://x", "A".repeat(64))));
 
         let mut work = image_work(image.clone());
-        work.prefetched = vec![Bytes::from_static(b"aa"), Bytes::from_static(b"bb")];
+        work.prefetched = vec![
+            Bytes::from_static(b"aa"),
+            Bytes::from_static(b"bb"),
+            Bytes::from_static(b"cc"),
+        ];
         let input = to_mm_input(IDS.to_vec(), work).unwrap();
         let as_bytes = |i: usize| match &input.images[i] {
             ImageSource::Bytes(b) => b.as_slice(),
@@ -234,20 +277,22 @@ mod tests {
         };
         assert_eq!(as_bytes(0), b"aa");
         assert_eq!(as_bytes(2), b"bb");
+        assert_eq!(as_bytes(3), b"cc");
         assert!(matches!(&input.images[1], ImageSource::String(_)));
 
         let err = to_mm_input(IDS.to_vec(), image_work(image)).err().unwrap();
-        assert!(err.contains("not prefetched"), "{err}");
+        assert!(
+            matches!(&err, MediaError::Server(message) if message.contains("not prefetched")),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn image_free_work_rejected() {
-        assert!(
-            to_mm_input(IDS.to_vec(), MmData::default())
-                .err()
-                .unwrap()
-                .contains("no raw image sources")
-        );
+        assert!(matches!(
+            to_mm_input(IDS.to_vec(), MmData::default()),
+            Err(MediaError::Client(message)) if message.contains("no raw image sources")
+        ));
     }
 
     #[test]
@@ -259,7 +304,10 @@ mod tests {
         let err = resolve_media_work_with_budget(IDS.to_vec(), work, 7)
             .err()
             .unwrap();
-        assert!(err.contains("request media byte budget"), "{err}");
+        assert!(
+            matches!(&err, MediaError::Client(message) if message.contains("request media byte budget")),
+            "{err:?}"
+        );
 
         let work = MmData {
             image_data: vec![src("YWJjZA==")],
@@ -269,7 +317,10 @@ mod tests {
         let err = resolve_media_work_with_budget(IDS.to_vec(), work, 7)
             .err()
             .unwrap();
-        assert!(err.contains("request media byte budget"), "{err}");
+        assert!(
+            matches!(&err, MediaError::Client(message) if message.contains("request media byte budget")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -298,6 +349,7 @@ mod tests {
         assert_eq!(resolved.video_hints[0].fps, Some(2.0));
         assert_eq!(resolved.audio_hints, vec![MediaHints::default()]);
 
+        // A prefetch that disagrees with the walk is the server's fault.
         for work in [
             image_work(vec![src("/missing")]),
             MmData {
@@ -305,7 +357,10 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(resolve_media_work(IDS.to_vec(), work).is_err());
+            assert!(matches!(
+                resolve_media_work(IDS.to_vec(), work),
+                Err(MediaError::Server(_))
+            ));
         }
         let work = MmData {
             image_data: vec![src("/image")],

@@ -18,7 +18,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-s
 class TestSmallMTop22(CustomTestCase):
     def route(self, scores, bias, enabled, **kwargs):
         with patch.dict(
-            os.environ, {"SGLANG_SM120_MTP_ROUTER_TOP22": str(int(enabled))}
+            os.environ, {"SGLANG_OPT_SM120_MTP_ROUTER_TOP22": str(int(enabled))}
         ):
             return gate.moe_fused_gate(scores, bias, topk=22, **kwargs)
 

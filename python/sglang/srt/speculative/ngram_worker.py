@@ -7,6 +7,9 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
+from sglang.kernels.ops.speculative.reconstruct_tree import (
+    reconstruct_indices_from_tree_mask_func,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -31,19 +34,10 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
-
-if is_xpu():
-    from sglang.kernels.ops.speculative.reconstruct_tree import (
-        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
-    )
-elif is_cuda() or is_hip():
-    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
-else:
-    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +92,6 @@ class NGRAMWorker(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
-        self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
@@ -241,12 +234,9 @@ class NGRAMWorker(BaseSpecWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        # Overlap mode processes results one iteration behind, so the last
-        # round's accepted tokens are not yet in req.output_ids and must be
-        # spliced in from spec_info. Sync mode and grammar batches process
-        # results before the next draft prep, so output_ids is already
-        # complete and splicing would duplicate the tail.
-        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+        # Splice the last round's accepted tokens until its result is processed;
+        # this launch is counted, so a count above one means it is not yet.
+        pending = [req.inflight_steps > 1 for req in batch.reqs]
 
         # Accept-independent prep, hoisted above the blocking .cpu() below.
         req_ids = [req.rid for req in batch.reqs]
@@ -265,7 +255,7 @@ class NGRAMWorker(BaseSpecWorker):
             for req in batch.reqs
         ]
 
-        if use_prev_tokens:
+        if any(pending):
             prev_token_ids, prev_accept_lens = (
                 batch.spec_info.accept_tokens,
                 batch.spec_info.accept_lens,
@@ -276,7 +266,9 @@ class NGRAMWorker(BaseSpecWorker):
             # Worker-level staging: written here at draft prep, consumed by
             # _update_ngram_corpus after verify within the same forward call.
             self.prev_token_ids = prev_token_ids.tolist()
-            self.prev_accept_lens = prev_accept_lens.tolist()
+            self.prev_accept_lens = [
+                n if p else 0 for n, p in zip(prev_accept_lens.tolist(), pending)
+            ]
             assert bs == len(self.prev_accept_lens)
         else:
             # _update_ngram_corpus still reads the staging; fill it empty.
@@ -287,11 +279,9 @@ class NGRAMWorker(BaseSpecWorker):
         batch_tokens = []
         total_lens = []
         for i in range(bs):
-            prev_tokens = (
-                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if use_prev_tokens
-                else []
-            )
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
             check_token = self._efficient_concat_last_n(
                 input_tails[i],
                 output_tails[i] + prev_tokens,
@@ -345,7 +335,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
         # generate positions and some indices using tree_mask
-        reconstruct_indices_from_tree_mask(
+        reconstruct_indices_from_tree_mask_func(
             tree_mask,
             batch.seq_lens,
             positions,  # mutable
@@ -402,20 +392,15 @@ class NGRAMWorker(BaseSpecWorker):
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Same splice condition as _prepare_draft_tokens: only overlap mode
-        # has accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
             # if batch.forward_mode.is_extend():
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
-            prev_tokens = (
-                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
-                if use_prev_tokens
-                else []
-            )
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
             put_ids = self._efficient_concat_last_n(
                 list(req.origin_input_ids_unpadded[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,

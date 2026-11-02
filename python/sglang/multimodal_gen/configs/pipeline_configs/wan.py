@@ -2,14 +2,18 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits import WanAnimate2Config, WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits import (
+    WanAnimate2Config,
+    WanAnimate2DistilledConfig,
+    WanVideoConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
@@ -19,6 +23,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+    TextConditioningOutput,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -31,7 +36,25 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def wan_text_encoder_extra_args() -> list[dict]:
+    """Tokenizer overrides for the Wan UMT5 encoder, chosen by
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING. t5_postprocess_text zero-pads the
+    embeddings back to 512, so the encoder itself can run on fewer tokens."""
+    mode = envs.SGLANG_DIFFUSION_WAN_TEXT_PADDING
+    if mode == "max":
+        return [{}]
+    if mode == "longest":
+        return [dict(padding="longest")]
+    if mode == "bucket":
+        return [dict(padding="longest", pad_to_multiple_of=64)]
+    raise ValueError(
+        f"SGLANG_DIFFUSION_WAN_TEXT_PADDING must be max, longest or bucket, got {mode!r}"
+    )
+
+
+def t5_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
     mask: torch.Tensor = outputs.attention_mask
     hidden_state: torch.Tensor = outputs.last_hidden_state
     seq_lens = mask.gt(0).sum(dim=1).long()
@@ -44,7 +67,10 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
         ],
         dim=0,
     )
-    return prompt_embeds_tensor
+    prompt_embeds_mask = torch.arange(512, device=seq_lens.device) < seq_lens[:, None]
+    return TextConditioningOutput(
+        prompt_embeds_tensor, prompt_embeds_mask, seq_lens.tolist()
+    )
 
 
 def animate2_postprocess_text(outputs: BaseEncoderOutput, text_inputs) -> torch.Tensor:
@@ -91,6 +117,11 @@ class WanT2V480PConfig(PipelineConfig):
     )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (t5_postprocess_text,))
+    )
+    # Off by default ("max"): a shorter padding changes the bf16 rounding, so the
+    # video is a different valid sample. See wan_text_encoder_extra_args.
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=wan_text_encoder_extra_args
     )
 
     # Precision for each component
@@ -284,9 +315,12 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         self.dit_config.torch_compile_mode = "default"
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
@@ -301,9 +335,12 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
@@ -428,6 +465,21 @@ class Wan_Animate_2_14B_Config(WanI2V720PConfig):
         super().validate_server_args(server_args)
 
 
+@dataclass
+class Wan_Animate_2_14B_Distilled_Config(Wan_Animate_2_14B_Config):
+    """Distilled Wan-Animate-2 14B: same components and stages, log_scale -1.3 in the DiT."""
+
+    dit_config: DiTConfig = field(default_factory=WanAnimate2DistilledConfig)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # No unconditional branch to split: a CFG group would recompute one branch per rank,
+        # so an explicit CFG group is rejected. Auto-enable needs no flag: the server only
+        # auto-enables CFG parallel for a model whose default sampling params use guidance.
+        return replace(
+            super().get_model_deployment_config(), supports_cfg_parallel=False
+        )
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================
@@ -441,6 +493,19 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
     warp_denoising_step: bool = True
 
 
+def _is_wan_animate_2_path(p: str) -> bool:
+    # Registry probes are lower-cased. Require the "-2-"/"_2" token so a v1
+    # Wan2.2-Animate-14B checkpoint (a different model / pipeline) does not route here.
+    return "wan_animate_2" in p or "wan2.2-animate-2" in p
+
+
+def _is_wan_animate_2_distilled_path(p: str) -> bool:
+    # The distill token counts in the directory's own name only, so a base checkpoint
+    # kept under a parent such as distillation-runs/ keeps the base config.
+    short_name = p.rstrip("/").split("/")[-1]
+    return _is_wan_animate_2_path(p) and "distill" in short_name
+
+
 def register():
     from sglang.multimodal_gen.configs.sample.wan import (
         FastWanT2V480PConfig,
@@ -449,6 +514,7 @@ def register():
         Wan2_2_I2V_A14B_SamplingParam,
         Wan2_2_T2V_A14B_SamplingParam,
         Wan2_2_TI2V_5B_SamplingParam,
+        Wan_Animate_2_14B_Distilled_SamplingParam,
         Wan_Animate_2_14B_SamplingParam,
         WanI2V_14B_480P_SamplingParam,
         WanI2V_14B_720P_SamplingParam,
@@ -551,20 +617,34 @@ def register():
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
+    # Both repos ship model_index.json with the same _class_name (WanAnimate2Pipeline);
+    # modular_model_index.json names the variant, and the registry probes the detectors
+    # with both classes and the path (a distill token counts in the directory's own name
+    # only). Detectors are checked in registration order, and a directory that ships
+    # model_index.json matches the base detector through the shared class as well, so
+    # the distilled entry is registered first.
+    register_configs(
+        sampling_param_cls=Wan_Animate_2_14B_Distilled_SamplingParam,
+        pipeline_config_cls=Wan_Animate_2_14B_Distilled_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"],
+        model_detectors=[
+            lambda p: (
+                p == "wananimate2distilledmodularpipeline"
+                or _is_wan_animate_2_distilled_path(p)
+            )
+        ],
+    )
     register_configs(
         sampling_param_cls=Wan_Animate_2_14B_SamplingParam,
         pipeline_config_cls=Wan_Animate_2_14B_Config,
-        hf_model_paths=[
-            "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
-        ],
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
         model_detectors=[
-            # The registry calls this with the path and with model_index's lower-cased
-            # _class_name. Require the "-2-"/"_2" token so a v1 Wan2.2-Animate-14B
-            # checkpoint (a different model / pipeline) does not mis-route here.
             lambda p: (
-                "wan_animate_2" in p.lower()
-                or "wan2.2-animate-2" in p.lower()
-                or p.lower() == "wananimate2pipeline"
+                p in ("wananimate2modularpipeline", "wananimate2pipeline")
+                or (
+                    _is_wan_animate_2_path(p)
+                    and not _is_wan_animate_2_distilled_path(p)
+                )
             )
         ],
     )
