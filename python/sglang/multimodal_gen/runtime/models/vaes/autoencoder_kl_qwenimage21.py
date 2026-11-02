@@ -661,6 +661,169 @@ class AutoencoderKLQwenImage21(ParallelTiledVAE):
         if self.spatial_parallel:
             enable_qwen21_spatial_decode(self.decoder)
 
+        # These prerequisites are fixed by the encoder/decoder constructors.
+        self._context_tiles_supported = (
+            (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_world_size() == 1
+            )
+            and ac.is_residual
+            and ac.patch_size in (None, 1)
+            and self.spatial_compression_ratio == 2 ** (len(ac.dim_mult) - 1)
+        )
+        self._context_stochastic_dropout = 0 < ac.dropout < 1
+
+    def _supports_context_tiles(self, x, *, encode):
+        branch = self.encoder if encode else self.decoder
+        return (
+            self._context_tiles_supported
+            and not (branch.training and self._context_stochastic_dropout)
+            and x.shape[2] == 1
+            and all(n > 0 for n in x.shape[-2:])
+            and (
+                not encode
+                or all(n % self.spatial_compression_ratio == 0 for n in x.shape[-2:])
+            )
+        )
+
+    @staticmethod
+    def _context_plan(core, stages, shape):
+        """Back-propagate half-open rectangles through residual/up/conv stages.
+
+        A stage is (module, residual radius, scale): 2 upsamples, -2
+        downsamples, and 1 preserves the grid. Invert the final sampling
+        operation before the residual radius, preserving stride phase and
+        clipping each interval at the true image boundary.
+        """
+        shapes = [shape]
+        for _, _, scale in stages:
+            shapes.append(
+                tuple(n * scale if scale > 0 else n // -scale for n in shapes[-1])
+            )
+        plan = [core]
+        for (_, radius, scale), size in zip(reversed(stages), reversed(shapes[:-1])):
+            previous = []
+            for (lo, hi), length in zip(plan[-1], size):
+                if scale == 2:
+                    lo, hi = (lo - 1) // 2, hi // 2 + 1
+                elif scale == -2:
+                    lo, hi = 2 * lo, 2 * hi + 1
+                lo, hi = lo - radius, hi + radius
+                if scale == -2:
+                    # Preserve the global stride phase and the even local size
+                    # required by the AvgDown3D shortcut at this stage.
+                    lo, hi = lo // 2 * 2, -(-hi // 2) * 2
+                previous.append((max(0, lo), min(length, hi)))
+            plan.append(tuple(previous))
+        return list(reversed(plan))
+
+    def _context_prefix(self, source, window, *, encode):
+        branch = self.encoder if encode else self.decoder
+        stages = [(branch.conv_in, 1, 1)]
+        if encode:
+            stages += [
+                (
+                    block,
+                    2 * len(block.resnets),
+                    -2 if block.downsampler is not None else 1,
+                )
+                for block in branch.down_blocks
+            ]
+        stages.append((branch.mid_block.resnets[0], 2, 1))
+        plan = self._context_plan(window, stages, tuple(source.shape[-2:]))
+        if encode:
+            ratio = self.spatial_compression_ratio
+            plan[0] = tuple(
+                (a // ratio * ratio, min(n, -(-b // ratio) * ratio))
+                for (a, b), n in zip(plan[0], source.shape[-2:])
+            )
+        (top, bottom), (left, right) = plan[0]
+        x = source[..., top:bottom, left:right]
+        if not encode:
+            x = self.post_quant_conv(x)
+        for index, (block, _, scale) in enumerate(stages):
+            x = block(x)
+            (top, _), (left, _) = plan[index]
+            if scale == -2:
+                top, left = top // 2, left // 2
+            (a, b), (c, d) = plan[index + 1]
+            x = x[..., a - top : b - top, c - left : d - left].contiguous()
+        return x
+
+    def _context_tiled(self, source, *, encode):
+        branch = self.encoder if encode else self.decoder
+        ratio = self.spatial_compression_ratio
+        shape = tuple(n // ratio if encode else n for n in source.shape[-2:])
+        _, _, step_h, step_w = self._spatial_tile_geometry()
+        if step_h <= 0 or step_w <= 0:
+            raise ValueError("VAE tile strides must be positive")
+        cores = [
+            ((top, min(top + step_h, shape[0])), (left, min(left + step_w, shape[1])))
+            for top in range(0, shape[0], step_h)
+            for left in range(0, shape[1], step_w)
+        ]
+        # Assemble each valid prefix core once. The native attention block sees
+        # the complete spatial grid, with no query or key/value partitioning.
+        context = None
+        for (top, bottom), (left, right) in cores:
+            tile = self._context_prefix(
+                source, ((top, bottom), (left, right)), encode=encode
+            )
+            if context is None:
+                context = tile.new_empty((*tile.shape[:-2], *shape))
+            context[..., top:bottom, left:right] = tile
+        del tile
+        context = branch.mid_block.attentions[0](context)
+        stages = [(branch.mid_block.resnets[1], 2, 1)]
+        if not encode:
+            stages += [
+                (block, 2 * len(block.resnets), 2 if block.upsampler is not None else 1)
+                for block in branch.up_blocks
+            ]
+        stages.append((None, 1, 1))  # pointwise norm/SiLU, then conv_out
+        output_scale = 1 if encode else ratio
+        output = None
+        for core in cores:
+            target = tuple((a * output_scale, b * output_scale) for a, b in core)
+            plan = self._context_plan(target, stages, shape)
+            (top, bottom), (left, right) = plan[0]
+            x = context[..., top:bottom, left:right].contiguous()
+            # Resume the original core grid after the attention barrier. Include
+            # the complete suffix halo, then discard dead halo at each stage.
+            for index, (block, _, scale) in enumerate(stages):
+                if block is None:
+                    x = branch.conv_out(branch.nonlinearity(branch.norm_out(x)))
+                elif isinstance(block, QwenImage21ResidualUpBlock):
+                    x = block(x, first_chunk=True)
+                else:
+                    x = block(x)
+                (top, _), (left, _) = plan[index]
+                (a, b), (c, d) = plan[index + 1]
+                x = x[
+                    ...,
+                    a - top * scale : b - top * scale,
+                    c - left * scale : d - left * scale,
+                ].contiguous()
+            if encode:
+                x = self.quant_conv(x)
+            if output is None:
+                output = x.new_empty(
+                    (*x.shape[:-2], shape[0] * output_scale, shape[1] * output_scale)
+                )
+            (a, b), (c, d) = target
+            output[..., a:b, c:d] = x
+        return output
+
+    def spatial_tiled_encode(self, x):
+        if not self._supports_context_tiles(x, encode=True):
+            return super().spatial_tiled_encode(x)
+        return self._context_tiled(x, encode=True)
+
+    def spatial_tiled_decode(self, z):
+        if not self._supports_context_tiles(z, encode=False):
+            return super().spatial_tiled_decode(z)
+        return self._context_tiled(z, encode=False).clamp(-1, 1)
+
     def _encode(self, x):
         if x.shape[2] != 1:
             raise ValueError("Qwen-Image 2.1 VAE expects one image frame")

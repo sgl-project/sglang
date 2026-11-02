@@ -1,17 +1,8 @@
-"""Unit tests for the Quark W4A4 MXFP4 MoE clamped-SwiGLU plumbing.
-
-CPU-only, no model loading and no aiter/ROCm dependency: they exercise the
-pure-Python control flow in ``QuarkW4A4MXFp4MoE.create_moe_runner`` and
-``apply_weights`` that decides whether the AITER MoE runner is driven on the
-clamped-SwiGLU path (``activation="swiglu"`` + ``swiglu_limit``) or the plain
-SiLU path. See the regression these guard against: clamped-SwiGLU MXFP4
-checkpoints (e.g. MiniMax-M3) declare ``activation="silu"`` + a
-``gemm1_clamp_limit``, and without this plumbing the experts silently run plain
-SiLU and emit garbage.
-"""
+"""CPU regression tests for Quark MXFP4 MoE loading and runner plumbing."""
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -21,8 +12,9 @@ from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
     QuarkW4A4MXFp4MoE,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_scheme() -> QuarkW4A4MXFp4MoE:
@@ -86,6 +78,53 @@ def test_apply_weights_defaults_swiglu_limit_zero_without_clamp(monkeypatch):
     scheme.apply_weights(_fake_layer(), dispatch_output=object())
 
     assert store["quant_info"].swiglu_limit == 0.0
+
+
+class TestOnlineWeightLoader(CustomTestCase):
+    def test_nonlocal_w13_after_quantization(self):
+        self._check_no_copy("w13")
+
+    def test_nonlocal_w2_after_quantization(self):
+        self._check_no_copy("w2")
+
+    def test_invalid_weight_name(self):
+        self._check_no_copy("invalid")
+
+    def _check_no_copy(self, name):
+        packed = torch.nn.Parameter(
+            torch.ones(1, 2, 2, dtype=torch.uint8), requires_grad=False
+        )
+        layer = SimpleNamespace(
+            w13_weight=packed,
+            w2_weight=packed,
+            _w13_loaded_numel=8,
+            _w2_loaded_numel=8,
+            _load_device=torch.device("cpu"),
+        )
+        original_loader = MagicMock()
+        loader = _make_scheme().get_online_weight_loader(layer, original_loader)
+        args = (
+            packed,
+            torch.ones(2, 4),
+            f"{name}_weight",
+            "w2" if name == "w2" else "w1",
+            1,
+        )
+        with patch(
+            "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe.dynamic_mxfp4_quant"
+        ) as quantize:
+            if name == "invalid":
+                with self.assertRaisesRegex(ValueError, "Expected w13 or w2"):
+                    loader(*args)
+            else:
+                loader(*args)
+            quantize.assert_not_called()
+        original_loader.assert_called_once()
+        self.assertIs(layer.w13_weight, packed)
+        self.assertIs(layer.w2_weight, packed)
+        self.assertEqual(layer._w13_loaded_numel, 8)
+        self.assertEqual(layer._w2_loaded_numel, 8)
+        torch.testing.assert_close(packed, torch.ones_like(packed))
 
 
 if __name__ == "__main__":

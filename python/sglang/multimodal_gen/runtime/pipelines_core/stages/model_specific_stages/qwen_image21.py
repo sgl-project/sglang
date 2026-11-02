@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+from collections import OrderedDict
 
 import torch
 from PIL import Image
@@ -27,7 +28,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import Denois
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.utils.common import upload_without_sync
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
+
+logger = init_logger(__name__)
 
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 SYSTEM_TEMPLATE = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
@@ -69,6 +74,83 @@ class QwenImage21InputValidationStage(InputValidationStage):
         return batch
 
 
+class TextEncoderGraphs:
+    """CUDA graphs of the text-only encoder forward, one per prompt length.
+
+    The eager forward launches ~2600 small kernels and is host-bound; a replay
+    runs the same kernels, so the output is bit-identical. A length is captured
+    on its second request; moved or replaced weights drop every graph.
+    """
+
+    max_graphs = 8
+
+    def __init__(self):
+        self.graphs = OrderedDict()
+        self.seen = set()
+        self.weights = None
+        self.pool = None
+        self.disabled = False
+
+    def __call__(self, encoder, inputs, run):
+        ids = inputs["input_ids"]
+        if (
+            self.disabled
+            or ids.shape[0] != 1
+            or "pixel_values" in inputs
+            or not all(torch.is_tensor(v) and v.is_cuda for v in inputs.values())
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or (model_parallel_is_initialized() and get_tp_group().world_size > 1)
+        ):
+            return run(inputs)
+        tensors = [*encoder.parameters(), *encoder.buffers()]
+        if not all(t.is_cuda for t in tensors):
+            return run(inputs)
+        # graphs read weights by address; offload, reload or replacement moves them
+        weights = tuple(t.data_ptr() for t in tensors)
+        if weights != self.weights:
+            self.graphs.clear()
+            self.seen.clear()
+            self.weights = weights
+        key = ids.shape[1]
+        entry = self.graphs.get(key)
+        if entry is None:
+            if key not in self.seen:
+                self.seen.add(key)
+                return run(inputs)
+            try:
+                entry = self._capture(inputs, run)
+            except Exception as e:
+                logger.warning("Text encoder CUDA graph disabled: %s", e)
+                self.disabled = True
+                return run(inputs)
+            self.graphs[key] = entry
+            if len(self.graphs) > self.max_graphs:
+                self.graphs.popitem(last=False)
+        self.graphs.move_to_end(key)
+        graph, static_inputs, output = entry
+        for name, tensor in static_inputs.items():
+            tensor.copy_(inputs[name])
+        graph.replay()
+        return output
+
+    def _capture(self, inputs, run):
+        static_inputs = {name: tensor.clone() for name, tensor in inputs.items()}
+        # the side-stream warmup settles lazy allocations before capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(static_inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        if self.pool is None:
+            self.pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        # thread_local: an async output-save thread may use CUDA during capture
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+            output = run(static_inputs)
+        return graph, static_inputs, output
+
+
 class QwenImage21EncodingStage(PipelineStage):
     def __init__(self, text_encoder, processor, vae, scheduler):
         super().__init__()
@@ -80,7 +162,11 @@ class QwenImage21EncodingStage(PipelineStage):
         )
         self.text_encoder.model.visual.fp32_position_interpolation = False
         self.text_encoder.model.visual.rotary_pos_emb.recompute_on_device_change = True
+        # (dtype, device) -> latent mean/std, uploaded once: a per-request upload
+        # blocks the host on the VAE encode it should overlap with prompt prep
+        self.latent_stats = {}
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        self.text_graphs = TextEncoderGraphs()
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
         ]
@@ -138,15 +224,22 @@ class QwenImage21EncodingStage(PipelineStage):
                     image = white
                 vision_images.append(image)
             kwargs["images"] = vision_images
-        inputs = self.processor(**kwargs).to(device)
+        inputs = upload_without_sync(self.processor(**kwargs), device)
         with self.use_declared_component(
             component_name="text_encoder", module=self.text_encoder
         ) as encoder:
-            outputs = encoder(
-                **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
-            )
-            # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
-            final_hidden = outputs.hidden_states[-1]
+
+            def run(encoder_inputs):
+                outputs = encoder(
+                    **encoder_inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    logits_to_keep=1,
+                )
+                # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
+                return outputs.hidden_states[-1]
+
+            final_hidden = self.text_graphs(encoder, inputs, run)
         valid = inputs.attention_mask[0].bool()
         hidden = final_hidden[0, valid][self.drop_idx :]
         ids = inputs.input_ids[0, valid][self.drop_idx :]
@@ -195,8 +288,13 @@ class QwenImage21EncodingStage(PipelineStage):
                     )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
                     latent = vae.encode(pixels).mode()
-                    mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
-                    std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+                    stats_key = (latent.dtype, latent.device)
+                    if stats_key not in self.latent_stats:
+                        self.latent_stats[stats_key] = tuple(
+                            latent.new_tensor(values).view(1, ac.z_dim, 1, 1, 1)
+                            for values in (ac.latents_mean, ac.latents_std)
+                        )
+                    mean, std = self.latent_stats[stats_key]
                     conditions.append(
                         ((latent - mean) / std).flatten(2).transpose(1, 2)
                     )

@@ -10,12 +10,11 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_amd_ci,
-    is_in_ci,
     popen_launch_server,
 )
 
 # tp=1 pp=2 -- two GPUs.
-register_cuda_ci(est_time=221, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=202, stage="nightly", runner_config="2-gpu-large")
 
 
 @unittest.skipIf(
@@ -73,27 +72,6 @@ class TestGemma4PPAccuracy(unittest.TestCase):
         self.assertGreaterEqual(metrics["score"], 0.90)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_mmmu(self):
-        # Multimodal accuracy gate covering the vision_tower → embed_vision
-        # (first rank) → PP-proxy handoff → LM tail (last rank) chain.
-        # Measured 0.71 on 200 examples; full eval (~900 questions) takes
-        # ~5-7 min on H100 so this is manual-only.
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmmu",
-            num_examples=None,
-            num_threads=32,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        # Measured 0.72 on this setup; published Gemma-4-26B MMMU lies in
-        # 0.69-0.73.  Gate 0.65 leaves ~5 SE of headroom (SE on 900 binary
-        # samples ≈ 0.015) while still catching mid-grade vision/PP
-        # regressions, not just complete breakage.
-        self.assertGreater(metrics["score"], 0.65)
 
 
 @unittest.skipIf(

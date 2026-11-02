@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MLATokenToKVPool,
@@ -43,7 +44,7 @@ def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
     """Rank-independent gate. CUDA only; FP4 excluded (its per-rank scale
     buffer is not covered by the broadcast)."""
     return (
-        isinstance(kv_cache, MLATokenToKVPool)
+        isinstance(kv_cache, MLAKVView)
         and not isinstance(kv_cache, MLATokenToKVPoolFP4)
         and is_cuda()
         and storage_supports_host_dedup(storage_backend)

@@ -14,16 +14,21 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ### Supported Devices
 
-- Ascend A3 Series Products
+- A3 Series Products
 
 To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
+
+<Tip>
+If `npu-smi` is reported as `command not found`, the NPU driver is not installed on the host. Start from
+[installing the NPU HDK](https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2C89dda9ba9de741349efa03687a487678%2C28%2CAArch64%2Coffline_run_file).
+</Tip>
 
 ### Docker
 
 Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
 
-```bash
+```shell Command
 docker --version && docker info
 ```
 
@@ -40,23 +45,17 @@ at least **30GB** of free space. If you need to download model weights, check th
 
 <Tip>
 We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version,
-or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes. CANN 9.1.0 has no stable
-image yet, so use the daily build tag for now.
-
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
+or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes.
 </Tip>
 
 If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```shell Command
-# TODO: CANN 9.1.0 has no stable image yet, so only the daily build tag is
-# available for now. Once the stable image is published, restore the stable
-# release option here.
-export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -135,7 +134,7 @@ SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
 
-Wait a moment for the server to shut down gracefully. The output should be like the following:
+Wait a few seconds for the server to shut down gracefully. The output should be like the following:
 
 ```log Output
 INFO:     Shutting down
@@ -146,3 +145,16 @@ INFO:     Finished server process [<SGLANG_PID>]
 
 The server has now stopped. You can verify it with `ps -ef | grep sglang` — the expected output is nothing (no matching process),
 then exit the container by pressing `Ctrl+D`.
+
+## Next Steps
+
+- [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+  — Complete installation guide covering source install, Docker build, version mapping, and system settings
+- [Model Tutorials](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials)
+  — Step-by-step deployment tutorials for mainstream models
+- [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices)
+  — Tuned, benchmark-proven launch configurations for mainstream models
+- [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
+  — Performance optimization parameters for SGLang on NPUs
+- [Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models)
+  — LLM, multimodal, and embedding models supported on NPUs

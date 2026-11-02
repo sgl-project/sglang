@@ -1,4 +1,5 @@
 use super::*;
+use crate::cache_action::UpdatePendingBackupOnNodeSplit;
 use crate::components::{ComponentSet, FULL};
 use crate::node::NodeAccessError;
 use crate::test_utils::accumulate_step;
@@ -75,6 +76,8 @@ fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -496,7 +499,7 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
     // asynchronously under write_back; matching can split it before the ack.
     let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
     let published_a = match action {
-        Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+        Some(UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
@@ -603,6 +606,8 @@ fn host_drive_is_a_noop_without_host_leaves() {
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,

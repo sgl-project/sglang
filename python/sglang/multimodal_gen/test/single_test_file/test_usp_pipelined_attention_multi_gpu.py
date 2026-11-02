@@ -3,7 +3,8 @@ pipelined over head groups as with the sequential exchange.
 
 The pipeline only engages on a same-host Ulysses group with peer-to-peer access,
 so nothing in the single-GPU suite reaches it. Runs on 2 ranks, and on 4 when
-four GPUs are visible:
+four GPUs are visible; the collective (NCCL/RCCL) head-group pipeline runs on 4
+ranks on any platform:
 
     pytest -v python/sglang/multimodal_gen/test/single_test_file/test_usp_pipelined_attention_multi_gpu.py
 """
@@ -84,6 +85,28 @@ def _worker() -> int:
             failures.append(label)
         ran.append(label)
 
+    def filled(label, layer, q, k, v):
+        """q/k written into the exchange blocks by fill_all (copies here) must give
+        the sequential exchange's bits."""
+
+        def fill_all(blocks, part):
+            rows = (q, k)[part][0]
+            for head_start, head_count, *dst in blocks:
+                dst[part].copy_(rows[:, head_start : head_start + head_count])
+
+        outs = []
+        for groups, call in (
+            (0, lambda: layer(q, k, v)),
+            (2, lambda: layer.forward_qk_filled(q, k, v, fill_all)),
+        ):
+            envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = groups
+            with torch.inference_mode(), set_forward_context(0, None, None):
+                outs.append(call())
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = -1
+        if outs[1] is None or not torch.equal(outs[0], outs[1]):
+            failures.append(label)
+        ran.append(label)
+
     for backend in backends:
         try:
             layer = USPAttention(
@@ -105,6 +128,8 @@ def _worker() -> int:
         for batch in (1, 2):
             q, k, v = (shard(batch, s_local, heads, 10 + i) for i in range(3))
             both(f"{name} dense b{batch}", lambda: layer(q, k, v))
+            if batch == 1:
+                filled(f"{name} q/k filled exchange", layer, q, k, v)
 
             rep = [replicated(batch, n_rep, heads, 20 + i) for i in range(3)]
             joined = [torch.cat([r, t], dim=1) for r, t in zip(rep, (q, k, v))]
@@ -134,6 +159,13 @@ def _worker() -> int:
                 f"{name} gathered key mask b{batch}",
                 lambda: layer(q, k, v, attn_mask=key_mask),
             )
+        if name == "DYNAMIC_CUDNN_SDPA" and torch.cuda.get_device_capability()[0] >= 10:
+            # FA4 in place of cuDNN: every group attends straight into the output rows
+            layer.attn_impl._use_cudnn_sdpa = lambda *args: False
+            q, k, v = (shard(1, s_local, heads, 60 + i) for i in range(3))
+            both(f"{name} FA4 into dense b1", lambda: layer(q, k, v))
+            filled(f"{name} FA4 into q/k filled exchange", layer, q, k, v)
+            del layer.attn_impl._use_cudnn_sdpa
         gqa = USPAttention(
             num_heads=heads,
             head_size=dim,
@@ -192,9 +224,61 @@ def _worker() -> int:
     return 1 if verdict.item() else 0
 
 
+def _collective_worker() -> int:
+    """The collective head-group pipeline against the sequential packed exchange."""
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+    )
+
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=1, sp_size=world, ulysses_degree=world
+    )
+    from sglang.multimodal_gen.runtime.layers import usp
+
+    def attend(q, k, v):
+        # head-independent but row-order dependent, like attention
+        return torch.cumsum(q.float() * k.flip(0).float(), dim=0).to(q.dtype) + v
+
+    rows, dim = 37, 128
+    failures = []
+    for heads_per_rank in (8, 14):
+        heads = heads_per_rank * world
+        torch.manual_seed(rank)
+        qkv = torch.randn(rows, 3 * heads * dim, device="cuda").bfloat16()
+        # q/k/v are views of a fused projection, as in MiniMax-H3
+        q, k, v = (t.view(rows, heads, dim) for t in qkv.split(heads * dim, dim=-1))
+        with torch.inference_mode():
+            gathered = usp._usp_input_all_to_all_packed_qkv(q, k, v)
+            ref = usp._usp_output_all_to_all(attend(*gathered)[None], head_dim=2)[0]
+            for groups in (2, heads_per_rank // 2):
+                out = usp.ulysses_head_group_pipelined_attention(
+                    q, k, v, attend, groups
+                )
+                if not torch.equal(out, ref):
+                    failures.append(f"{heads_per_rank} heads/rank, {groups} groups")
+
+    verdict = torch.tensor([len(failures)], device="cuda")
+    dist.all_reduce(verdict)
+    if failures:
+        print(f"rank{rank} MISMATCH: {failures}", flush=True)
+    if rank == 0:
+        print(
+            f"USP_PIPELINE_PARITY {'FAIL' if verdict.item() else 'PASS'} world={world}",
+            flush=True,
+        )
+    dist.barrier()
+    dist.destroy_process_group()
+    return 1 if verdict.item() else 0
+
+
 class TestUspPipelinedAttentionMultiGpu(CustomTestCase):
-    def _run(self, world: int, port: int):
-        if not current_platform.is_cuda():
+    def _run(self, world: int, port: int, worker: str = "--worker"):
+        if worker == "--worker" and not current_platform.is_cuda():
             self.skipTest("the copy-engine pipeline is CUDA-only")
         if torch.cuda.device_count() < world:
             self.skipTest(f"needs {world} GPUs")
@@ -206,7 +290,7 @@ class TestUspPipelinedAttentionMultiGpu(CustomTestCase):
                 f"--nproc-per-node={world}",
                 f"--master-port={port}",
                 __file__,
-                "--worker",
+                worker,
             ],
             capture_output=True,
             text=True,
@@ -225,8 +309,13 @@ class TestUspPipelinedAttentionMultiGpu(CustomTestCase):
     def test_four_ranks_match_sequential_bitwise(self):
         self._run(4, 29557)
 
+    def test_collective_pipeline_matches_sequential_bitwise(self):
+        self._run(4, 29567, worker="--collective-worker")
+
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
         raise SystemExit(_worker())
+    if "--collective-worker" in sys.argv:
+        raise SystemExit(_collective_worker())
     unittest.main()

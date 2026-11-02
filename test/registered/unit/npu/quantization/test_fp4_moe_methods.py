@@ -6,29 +6,50 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
-# Load the quantization package first so `base_config`, `moe_methods`, and
-# `linear_method_npu` initialize in dependency order. Importing `fp4_moe_methods`
-# (or `linear_method_npu`) directly from a cold process triggers a circular
-# import: linear_method_npu -> base_config -> quantization/__init__ ->
-# gguf/unquant/gptq_moe -> moe_methods -> linear_method_npu (partially
-# initialized, `_get_float8_e8m0fnu_dtype` not yet defined). Initializing the
-# package first mirrors how the engine loads quantization at model-config time.
+# Initialize the quantization registry as in model-config loading.
 import sglang.srt.layers.quantization  # noqa: F401
-from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluMxfp8Quant
+from sglang.srt.hardware_backend.npu.moe.activation import (
+    NPUSwigluMxfp8Quant,
+)
+from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
+    NPUBlockFp8MoEMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A8MXFP4FusedMoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     _pair_pack_mxfp_act_scale,
-    prepare_w4a8_mxfp_weight,
-    reshape_w4a8_mxfp_weight_scale_for_npu,
     w4a8_mxfp_gmm,
 )
+from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    prepare_w4a8_mxfp_weight,
+    reshape_w4a8_mxfp_weight_scale_for_npu,
+)
+from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+    NPUMXFP8OnlineMoEMethod,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import deepep
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.runtime_context import get_context
+from sglang.test.test_utils import CustomTestCase
+
+
+def _make_fp4_method(**kwargs):
+    """Build the real method with the Ascend MX-quant op stubbed out.
+
+    Constructing it also builds the W13/W2 kernels, whose
+    ``HiddenStatesDynamicQuant`` resolves ``torch.ops.npu.npu_dynamic_mx_quant``
+    at init time; that op only exists on an NPU host. These tests cover the
+    checkpoint-loading, runner-delegation and dispatcher wiring above it, never
+    the kernel itself.
+    """
+    with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
+        return NPUW4A8MXFP4FusedMoEMethod(**kwargs)
 
 
 class TestFP4MethodGate(unittest.TestCase):
@@ -57,6 +78,12 @@ class TestFP4MethodGate(unittest.TestCase):
             patch(
                 "sglang.srt.layers.quantization.fp8.is_npu_arch35",
                 return_value=True,
+            ),
+            # The arches only pick the class; building the real W13/W2 kernels
+            # would grab torch.ops.npu.npu_dynamic_mx_quant, which exists only
+            # on an NPU host.
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.NPUW4A8MXFP4MoEMethod"
             ),
         ):
             method = config.get_quant_method(layer, "model.layers.0.experts")
@@ -122,7 +149,7 @@ class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
             )
 
 
-class TestPrepareW4A8MxfpWeight(unittest.TestCase):
+class TestPrepareW4A8MxfpWeight(CustomTestCase):
     def test_uses_shared_weight_and_scale_layout(self):
         # A wrong transpose or scale packing makes both ModelSlim W4A8 and
         # DeepSeek-V4 W4A8 read different blocks from the same checkpoint.
@@ -131,7 +158,7 @@ class TestPrepareW4A8MxfpWeight(unittest.TestCase):
         formatted_weight = torch.arange(16, dtype=torch.uint8).view(1, 2, 8)
 
         with patch(
-            "sglang.srt.hardware_backend.npu.quantization.moe_methods.npu_format_cast",
+            "sglang.srt.hardware_backend.npu.quantization.moe_utils.npu_format_cast",
             return_value=formatted_weight,
         ):
             prepared_weight, prepared_scale = prepare_w4a8_mxfp_weight(weight, scale)
@@ -150,7 +177,7 @@ class TestMxfp4ScaleWeightLoader(unittest.TestCase):
             loaded.append(loaded_weight.clone())
 
         layer = torch.nn.Module()
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        method = _make_fp4_method(prefix="test")
         method.create_weights(
             layer,
             num_experts=1,
@@ -684,55 +711,103 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         )
 
 
-class TestRunnerDelegation(unittest.TestCase):
-    def test_apply_delegates_with_dsv4_scale_names(self):
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
-        expected = object()
-        method.runner = MagicMock()
-        method.runner.run.return_value = expected
-        layer = SimpleNamespace(
-            w13_weight=MagicMock(),
-            w13_weight_scale_inv=MagicMock(),
-            w2_weight=MagicMock(),
-            w2_weight_scale_inv=MagicMock(),
+class TestRunnerDelegation(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        context = get_context().override_server_args(model_path="dummy")
+        context.install()
+        self.addCleanup(context.restore)
+
+    @staticmethod
+    def _methods():
+        return (
+            _make_fp4_method(prefix="test"),
+            NPUBlockFp8MoEMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+                )
+            ),
+            Fp8MoEMethod(Fp8Config(is_fp4_experts=True)),
         )
-        dispatch_output = object()
 
-        output = method.apply(layer, dispatch_output)
+    def test_apply_delegates_with_dsv4_scale_names(self):
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros(1, 4, 4),
+            w13_weight_scale_inv=torch.ones(1, 4, 1),
+            w2_weight=torch.zeros(1, 4, 2),
+            w2_weight_scale_inv=torch.full((1, 4, 1), 2.0),
+            # These are different conventions; the checkpoint paths must keep
+            # using scale_inv and must not start forwarding optional bias.
+            w13_weight_scale=object(),
+            w2_weight_scale=object(),
+            w13_weight_bias=object(),
+        )
+        dispatch_output = SimpleNamespace(hidden_states=torch.zeros(1, 4))
 
-        self.assertIs(output, expected)
-        method.runner.run.assert_called_once()
-        self.assertIs(method.runner.run.call_args.args[0], dispatch_output)
-        quant_info = method.runner.run.call_args.args[1]
-        self.assertIs(quant_info.w13_weight_scale, layer.w13_weight_scale_inv)
-        self.assertIs(quant_info.w2_weight_scale, layer.w2_weight_scale_inv)
+        with patch("sglang.srt.layers.quantization.fp8._is_npu", True):
+            for method in self._methods():
+                with self.subTest(method=type(method).__name__):
+                    if isinstance(method, NPUW4A8MXFP4FusedMoEMethod):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "not been initialized"
+                        ):
+                            method.apply(layer, dispatch_output)
+                    expected = object()
+                    method.moe_runner_config = MoeRunnerConfig()
+                    method.runner = MagicMock()
+                    method.runner.run.return_value = expected
+
+                    output = method.apply(layer, dispatch_output)
+
+                    self.assertIs(output, expected)
+                    method.runner.run.assert_called_once()
+                    self.assertIs(method.runner.run.call_args.args[0], dispatch_output)
+                    quant_info = method.runner.run.call_args.args[1]
+                    self.assertIs(quant_info.w13_weight, layer.w13_weight)
+                    self.assertIs(quant_info.w2_weight, layer.w2_weight)
+                    self.assertIs(
+                        quant_info.w13_weight_scale, layer.w13_weight_scale_inv
+                    )
+                    self.assertIs(quant_info.w2_weight_scale, layer.w2_weight_scale_inv)
+                    self.assertIsNone(quant_info.w13_weight_bias)
 
     def test_create_runner_installs_internal_kernels_before_runner(self):
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
-        layer = SimpleNamespace()
-        config = SimpleNamespace(layer=None)
-        backend = MagicMock()
-        backend.is_auto.return_value = True
-
+        # The real constructor reads both kernels to select the activation.
+        # Installing kernels after construction would fail here.
         with (
-            patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as moe_runner,
-            patch(
-                "sglang.srt.layers.moe.utils.get_moe_runner_backend",
-                return_value=backend,
-            ),
+            patch("sglang.srt.layers.quantization.fp8._is_npu", True),
+            patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True),
         ):
-            method.create_moe_runner(layer, config)
+            methods = (*self._methods(), NPUMXFP8OnlineMoEMethod())
+            for method in methods:
+                with self.subTest(method=type(method).__name__):
+                    layer = SimpleNamespace()
+                    config = MoeRunnerConfig()
+                    method.create_moe_runner(layer, config)
 
-        self.assertIs(layer.w13_kernel, method.w13_kernel)
-        self.assertIs(layer.w2_kernel, method.w2_kernel)
-        self.assertIs(config.layer, layer)
-        moe_runner.assert_called_once()
+                    self.assertIs(config.layer, layer)
+                    self.assertIs(method.runner.config, config)
+                    self.assertIs(method.runner.runner_backend, MoeRunnerBackend.ASCEND)
+                    if isinstance(method, NPUW4A8MXFP4FusedMoEMethod):
+                        self.assertIs(layer.w13_kernel, method.w13_kernel)
+                        self.assertIs(layer.w2_kernel, method.w2_kernel)
+                    if isinstance(method, NPUBlockFp8MoEMethod):
+                        self.assertTrue(method._owns_moe_runner)
+                        self.assertIs(method.moe_runner_config, config)
+                        self.assertIsNotNone(method.runner.runner_core.activation)
+                    elif type(method) is Fp8MoEMethod:
+                        self.assertFalse(method._owns_moe_runner)
+                    elif isinstance(method, NPUMXFP8OnlineMoEMethod):
+                        self.assertIs(method.moe_runner_config, config)
+                        self.assertIsNone(method._aiter_runner)
+                        self.assertIsNotNone(layer.w13_kernel.hidden_states_quantizer)
+                        self.assertIsNone(layer.w2_kernel.hidden_states_quantizer)
 
 
-class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
+class TestProcessWeightsAfterLoadingZeroScale(CustomTestCase):
     @staticmethod
     def _method():
-        return NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        return _make_fp4_method(prefix="test")
 
     def test_raises_when_w13_scales_never_loaded(self):
         # An all-zero scale is the signature of a checkpoint whose scale names
@@ -764,27 +839,62 @@ class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
     def test_keeps_low_latency_dispatch_in_mxfp8(self):
         layer = SimpleNamespace(
             w13_weight=torch.nn.Parameter(
-                torch.ones(1, 2, 32, dtype=torch.uint8), requires_grad=False
+                torch.arange(64, dtype=torch.uint8).view(1, 2, 32), requires_grad=False
             ),
             w13_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(1, 2, 1, dtype=torch.uint8), requires_grad=False
+                torch.tensor([[[125, 126], [127, 128]]], dtype=torch.uint8),
+                requires_grad=False,
             ),
             w2_weight=torch.nn.Parameter(
-                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+                torch.full((1, 64, 32), 255, dtype=torch.uint8), requires_grad=False
             ),
             w2_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+                torch.full((1, 64, 2), 127, dtype=torch.uint8), requires_grad=False
             ),
             dispatcher=MagicMock(),
         )
-        prepared_weight = torch.ones(1, 32, 2, dtype=torch.uint8)
-        prepared_scale = torch.ones(1, 1, 2, 2, dtype=torch.uint8)
+        original_scales = (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+
+        def format_cast(weight, acl_format, **kwargs):
+            self.assertEqual(acl_format, 29)  # ACL_FORMAT_FRACTAL_NZ
+            self.assertEqual(weight.dtype, torch.uint8)
+            self.assertIsNotNone(kwargs["input_dtype"])
+            return weight
 
         with patch(
-            "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.prepare_w4a8_mxfp_weight",
-            return_value=(prepared_weight, prepared_scale),
+            "sglang.srt.hardware_backend.npu.quantization.moe_utils.npu_format_cast",
+            side_effect=format_cast,
         ):
             self._method().process_weights_after_loading(layer)
+
+        self.assertTrue(
+            torch.equal(
+                layer.w13_weight,
+                torch.arange(64, dtype=torch.uint8).view(1, 2, 32).transpose(1, 2),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w2_weight, torch.full((1, 32, 64), 255, dtype=torch.uint8)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w13_weight_scale_inv,
+                torch.tensor([[[[125, 126], [127, 128]]]], dtype=torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w2_weight_scale_inv,
+                torch.full((1, 1, 64, 2), 127, dtype=torch.uint8),
+            )
+        )
+        for original, processed in zip(
+            original_scales, (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+        ):
+            self.assertIsNot(original, processed)
+            self.assertFalse(processed.requires_grad)
 
         layer.dispatcher.set_quant_config.assert_called_once_with(
             {

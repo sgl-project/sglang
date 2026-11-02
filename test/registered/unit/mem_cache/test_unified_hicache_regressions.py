@@ -10,12 +10,18 @@ from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
+from sglang.srt.mem_cache.kv.alloc.pricing import ends_compaction_allowed
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    chain_snapshot,
+    pin_every_band,
+    token_ends,
+)
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestHiCacheIndexDomains(unittest.TestCase):
@@ -30,9 +36,10 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(dcp_size=dcp_size),
-            SimpleNamespace(host_transfer_translate=translate),
+            SimpleNamespace(),
             logical.clone(),
             logical,
+            device_translate=translate,
         )
         resolved = L2TransferEngine._resolve_device_indices(transfer)
         for rank in range(dcp_size):
@@ -58,14 +65,16 @@ class TestHostGateCapacity(unittest.TestCase):
         allocator.free_swa(ids[2:6])
         full = allocator.full_attn_allocator
         state = {"open": True}
-        allocator.set_host_transfer_move_gate(lambda: state["open"])
+        pin_every_band(allocator, lambda: not state["open"])
         epoch = full._chain_capacity_epoch()
         before = full.schedulable_available_size()
         state["open"] = False
         self.assertEqual(full._chain_capacity_epoch(), epoch)
         self.assertEqual(full.schedulable_available_size(), full.available_size())
         self.assertGreater(before, full.schedulable_available_size())
-        self.assertFalse(allocator._compaction_allowed())
+        self.assertFalse(
+            ends_compaction_allowed(chain_snapshot(allocator), token_ends(allocator))
+        )
         self.assertEqual(allocator.verify_byte_accounting(), [])
         state["open"] = True
         self.assertEqual(full.schedulable_available_size(), before)
@@ -146,7 +155,8 @@ class TestTransferStreamOrdering(unittest.TestCase):
         start.record()
 
         def translate(indices):
-            self.assertEqual(torch.cuda.current_stream(), engine.host_to_device_stream)
+            # Translation runs on the index stream, never behind queued copies.
+            self.assertEqual(torch.cuda.current_stream(), engine.index_stream)
             torch.cuda._sleep(20_000_000)
             resolved.copy_(indices + 100)
             return resolved
@@ -159,10 +169,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
             ),
         )
         transfer = L2Transfer(
-            host,
-            SimpleNamespace(host_transfer_translate=translate),
-            torch.arange(3),
-            ids,
+            host, SimpleNamespace(), torch.arange(3), ids, device_translate=translate
         )
         completion = engine.submit_host_to_device(
             [transfer], transfer_layer_id_max=1, start_event=start
@@ -212,9 +219,10 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(),
-            SimpleNamespace(device="cuda", host_transfer_translate=translate),
+            SimpleNamespace(device="cuda"),
             torch.tensor([0, 1]),
             torch.tensor([2, 1]),
+            device_translate=translate,
         )
         result = L2TransferEngine._resolve_device_indices(transfer)
         self.assertEqual(result.device.type, "cpu")
@@ -223,27 +231,27 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
 class TestTriPoolAssembly(CustomTestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-            MultiEndedAllocator,
-        )
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.kv.alloc.band import (
+            Band,
+        )
 
         for unified in (False, True):
             with self.subTest(unified=unified):
-                # Unified memory always builds a MultiEndedAllocator SWA end.
+                # Unified memory always builds a Band SWA end.
                 swa_allocator = (
-                    object.__new__(MultiEndedAllocator)
+                    object.__new__(Band)
                     if unified
                     else SimpleNamespace(alloc=Mock(), free=Mock())
                 )
-                composite = SimpleNamespace(swa_attn_allocator=swa_allocator)
+                composite = SimpleNamespace(
+                    swa_attn_allocator=swa_allocator,
+                    state_slots=SimpleNamespace(alloc=Mock(), free=Mock()),
+                )
                 params = SimpleNamespace(
                     mtp_draft_device_pools=(),
                     mtp_draft_mamba_pools=(),
                     token_to_kv_pool_allocator=composite,
-                    req_to_token_pool=SimpleNamespace(
-                        mamba_allocator=SimpleNamespace(alloc=Mock(), free=Mock())
-                    ),
                 )
                 memory = MagicMock(enable_unified_memory=unified, hicache_size=0)
                 host = MagicMock()

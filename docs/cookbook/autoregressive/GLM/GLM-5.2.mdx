@@ -49,10 +49,10 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+docker pull quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3
 ```
 
-Run the following setup before copying the generated command (CANN 9.0.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -129,6 +129,96 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 
 <AgentX data={agentx} />
 
+### MI355X deployment measured with SemiAnalysis InferenceX
+
+MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4064](https://github.com/SemiAnalysisAI/InferenceX/pull/4064)): TP8·EP1 at concurrency 1–4, TP4·EP4 with HiCache at concurrency 4–16, and TP4·EP4 with DCP4 at concurrency 16–48.
+
+Image: `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028` (`sha256:2456fff6cfaffb822026d089a0629a4859c84d2448864ffd6d5fa4f945ef2c86`). Set `--max-running-requests` to twice the concurrency and `--cuda-graph-max-bs-decode` to twice the concurrency, capped at 64; the commands below use concurrency 4, 10 and 40.
+
+These commands match the InferenceX runs; the Deploy panel cells above are general-purpose starting points.
+
+```bash TP8·EP1 (concurrency 1–4)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path amd/GLM-5.2-MXFP4 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 8 \
+  --cuda-graph-max-bs-decode 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash TP4·EP4 HiCache (concurrency 4–16)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path amd/GLM-5.2-MXFP4 \
+  --tp-size 4 \
+  --ep-size 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 20 \
+  --cuda-graph-max-bs-decode 20 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --enable-hierarchical-cache \
+  --hicache-size 180 \
+  --hicache-write-policy write_through \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash TP4·EP4 DCP4 (concurrency 16–48)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path amd/GLM-5.2-MXFP4 \
+  --tp-size 4 \
+  --ep-size 4 \
+  --dcp-size 4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 80 \
+  --cuda-graph-max-bs-decode 64 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ## 1. Model Introduction
 
 **GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench. For AMD MI355X (gfx950), AMD publishes an **MXFP4** build (`amd/GLM-5.2-MXFP4`, Quark-quantized) — see the AMD GPUs configuration tip below; this recipe is inferred from the validated `amd/GLM-5.1-MXFP4` MI355X recipe and not yet benchmarked on GLM-5.2 (`verified: false`).
@@ -186,7 +276,20 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 **gfx950 block-FP8 accuracy: fixed as of the pinned MI355X image (`v0.5.13.post1-rocm720-mi35x-20260618`).** Earlier SGLang ROCm images miscompiled AMD aiter's `gemm_a8w8_blockscale_bpreshuffle` GEMM on gfx950 (ROCm 7.2): the error was small per layer but compounded across all 78 layers and silently corrupted output — in-context reasoning broke (GSM8K ≈ 0) while short factual prompts still looked fine. The root cause was a gfx950/ROCm-7.2 miscompile of the CK kernel (a packed illegal-type FMA that relied on an LLVM coercion pass removed in ROCm 7.2; non-deterministic wrong rows near tile boundaries). This is resolved in the pinned image and newer: GLM-5.2-FP8 on MI350X/MI355X (gfx950) was re-validated at TP4 and TP8 — **GSM8K ≈ 0.96 (0% invalid)** and **15/15 needle-in-haystack retrieval to ~118K tokens**. **MI300X / MI325X (gfx942) were never affected.** If you must run an older image, treat gfx950 FP8 output as unverified. Background: [sgl-project/sglang#28685](https://github.com/sgl-project/sglang/issues/28685) (analysis) and the upstream CK fix [ROCm/rocm-libraries#8639](https://github.com/ROCm/rocm-libraries/pull/8639) (scalar FMA + accumulator anchor; restores correctness and determinism at -O3).
 </Note>
 
-- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260930`. Choose **Low-Latency** for TP8/EP1, or **High-Throughput** for TP4/EP4 with HiCache (`--enable-hierarchical-cache --hicache-ratio 1.0`). HiCache uses the default `kernel`, `page_first`, and `write_through` settings. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+- **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028`. Choose **Low-Latency** for TP8/EP1, or **High-Throughput** for TP4/EP4 with DCP4 (`--dcp-size 4`). That cell runs without HiCache, which SGLang rejects with DCP and EAGLE. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+
+- **Ascend NPU (A3 Series) topology.** One A3 node is 8 cards x 2 dies = **16 devices**, so every A3 recipe runs `--tp-size 16` per node. **Single Node** is PD mixed on one node; the **Prefill role** / **Decode role** on the PD Disagg card are one node each, so a 1P1D pair spans two nodes and is fronted by the router command the panel emits below the recipe. Send client traffic to the router, not to either role.
+- **Ascend weights and the MTP head.** The msModelSlim W8A8 build is ~774 GB and fits one node's 16 x 64 GB; the BF16 checkpoint (~1.5 TB) needs two. Quantization covers the main model only: in the shard that holds layer 78 the tensors are BF16 and F32 with no INT8, while ordinary layers in the same shard are INT8 plus F32 scales. That is why every A3 recipe passes `--speculative-draft-model-quantization unquant` -- the nextn head is served unquantized.
+- **Prepare the Ascend host.** The tutorial's recipes assume the CPUs are in performance mode with the NUMA balancer out of the way. Run this on the host before starting the server:
+
+  ```bash Command
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+  sysctl -w vm.swappiness=0
+  sysctl -w kernel.numa_balancing=0
+  sysctl -w kernel.sched_migration_cost_ns=50000
+  ```
+
+- **Wire up the two nodes (A3 PD only).** Set `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface that carries **that node's own** IP, and give both roles the **same** `ASCEND_MF_STORE_URL`, pointing at the prefill node -- it is the rendezvous for the KV transfer. Start the prefill role first, then the decode role.
 
 ## 3. Advanced Usage
 

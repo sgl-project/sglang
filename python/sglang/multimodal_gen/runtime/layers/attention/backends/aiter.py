@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import logging
 import os
 
@@ -10,6 +9,7 @@ import aiter
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.core import ENABLE_CK as _AITER_ENABLE_CK
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
-    USE_AITER_GFX942,
     USE_AITER_GFX1250,
 )
 
@@ -362,7 +361,7 @@ class AITerImpl(AttentionImpl):
             if output is not None:
                 return output
 
-        if USE_AITER_GFX1250:
+        if USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
             return self._forward_bf16_eager(query, key, value)
         return self._forward_bf16(query, key, value)
 
@@ -383,8 +382,6 @@ class AITerImpl(AttentionImpl):
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
 
-    # On gfx1250 flash_attn_func dispatches to a FlyDSL kernel whose Python JIT reads
-    # thread-local MLIR context state; Dynamo tracing into it fails at compile time.
     @torch.compiler.disable
     def _forward_bf16_eager(
         self,
@@ -406,14 +403,7 @@ class AITerImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
-        if USE_AITER_GFX942:
-            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
-            # sequences on gfx942; AITER's Triton path handles this shape.
-            attention_func = importlib.import_module(
-                "aiter.ops.triton.attention.mha"
-            ).flash_attn_varlen_func
-        else:
-            attention_func = aiter.flash_attn_varlen_func
+        attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
         output = attention_func(
@@ -426,5 +416,6 @@ class AITerImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return output[0] if isinstance(output, tuple) else output

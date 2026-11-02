@@ -38,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -61,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -135,6 +138,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("get_hicache_l3_cache_layout", GetHiCacheL3LayoutReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
@@ -970,6 +974,16 @@ class TokenizerControlMixin:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
+    async def get_hicache_l3_cache_layout(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetHiCacheL3LayoutReq()
+        responses: List[
+            GetHiCacheL3LayoutReqOutput
+        ] = await self.get_hicache_l3_cache_layout_communicator(req)
+        return [res.layout for res in responses]
+
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
@@ -1048,6 +1062,14 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    def release_uocr_doc(self: TokenizerManager, doc_id: str) -> None:
+        """Tell the scheduler to free a split document's retained window.
+
+        Sync because it is also called from a `finally` while the handler is
+        being cancelled.
+        """
+        self._dispatch_to_scheduler(ReleaseUocrDocReqInput(doc_id=doc_id))
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

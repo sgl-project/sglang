@@ -1779,7 +1779,10 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+                get_parallel().tp_group,
+                # Replicated modules have no TP group and produce complete
+                # local outputs; they do not need a collective memory window.
+                disabled=self.tp_group is None or not is_allocation_symmetric(),
             )
         with symm_ctx:
             if output_tensor is None:

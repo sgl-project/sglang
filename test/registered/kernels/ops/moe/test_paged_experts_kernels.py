@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -29,9 +30,14 @@ class _State:
         self.dst = torch.zeros(K, **i32)
         self.count = torch.zeros(1, **i32)
 
-    def decide(self, topk):
+    def decide(self, topk, weights=None):
+        """Run the decide kernel; return the runner inputs it wrote (slots, weights)."""
+        if weights is None:
+            weights = torch.ones(topk.shape, device="cuda")
+        run_ids, run_w = torch.empty_like(topk), torch.empty_like(weights)
         paged_experts_decide(
             topk,
+            weights,
             self.step,
             self.slot_expert,
             self.expert_slot,
@@ -39,7 +45,10 @@ class _State:
             self.src,
             self.dst,
             self.count,
+            run_ids,
+            run_w,
         )
+        return run_ids, run_w
 
 
 class _Reference:
@@ -87,13 +96,29 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertEqual(state.expert_slot.tolist(), expert_slot)
 
     def test_decide_matches_reference(self):
+        """The LRU decision and plan, and the runner inputs: each entry's slot and weight,
+        slot 0 and weight 0 for padding."""
         generator = torch.Generator().manual_seed(0)
         state, ref = _State(), _Reference()
         for _ in range(200):
             topk = _random_topk(generator, int(torch.randint(1, K + 1, (1,))))
+            weights = torch.rand(topk.shape, generator=generator)
             plan = ref.decide(topk.tolist())
-            state.decide(topk.cuda())
+            run_ids, run_w = state.decide(topk.cuda(), weights.cuda())
             self.assert_state(state, ref, plan)
+            routed = topk >= 0
+            slots = [ref.slot_expert.index(e) if e >= 0 else 0 for e in topk.tolist()]
+            self.assertEqual(run_ids.tolist(), slots)
+            self.assertTrue(torch.equal(run_w.cpu(), weights.masked_fill(~routed, 0)))
+
+    def test_decide_pads_ids_outside_the_experts(self):
+        topk = torch.tensor([3, E, -1, 3, E + 5], dtype=torch.int32, device="cuda")
+        weights = torch.arange(1, 6, dtype=torch.float32, device="cuda")
+        state = _State()
+        run_ids, run_w = state.decide(topk, weights)
+        self.assertEqual(run_ids.tolist(), [3, 0, 0, 3, 0])
+        self.assertEqual(run_w.tolist(), [1.0, 0.0, 0.0, 4.0, 0.0])
+        self.assertEqual(state.count.item(), 0)
 
     def test_decide_rejects_more_entries_than_slots(self):
         with self.assertRaises(Exception):
@@ -105,6 +130,8 @@ class TestPagedExpertsKernels(CustomTestCase):
             torch.randint(0, 100, (E, 12), dtype=torch.int32).pin_memory(),
             torch.randn(E, dtype=torch.float32).pin_memory(),  # 4-byte rows
             torch.randn(E, 3, dtype=torch.float32).pin_memory(),  # 12-byte rows
+            torch.randn(E, dtype=torch.bfloat16).pin_memory(),  # 2-byte rows
+            torch.randn(E, 3, dtype=torch.bfloat16).pin_memory(),  # 6-byte rows
         ]
         gpus = [
             torch.zeros(K, *h.shape[1:], dtype=h.dtype, device="cuda") for h in hosts
@@ -120,6 +147,70 @@ class TestPagedExpertsKernels(CustomTestCase):
             for e, s in ((5, 2), (63, 0), (17, 15)):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
             self.assertFalse(gpu[1].any())  # untouched
+
+    def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
+        """The host store pins exactly its size (torch's pinned allocator rounds up to a power
+        of two), and the gather kernel reads it through the GPU."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
+        self.assertTrue(host.is_pinned())
+        self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
+        src = torch.tensor([5, 63] + [0] * (K - 2), dtype=torch.int32).cuda()
+        dst = torch.tensor([2, 0] + [0] * (K - 2), dtype=torch.int32).cuda()
+        count = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+        paged_experts_gather(*_gather_args([host], [gpu]), src, dst, count)
+
+        self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
+        self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
+
+    def test_store_is_on_the_host_under_a_default_cuda_device(self):
+        """Models are constructed under ``torch.device("cuda")``; a store created there (by
+        a format that pages its loaded rows as they are) is still pinned host memory."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        with torch.device("cuda"):
+            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
+                "w"
+            ]
+        self.assertEqual(host.device.type, "cpu")
+        self.assertTrue(host.is_pinned())
+
+    def test_store_unregisters_its_pages_once_the_last_tensor_is_freed(self):
+        """The pinned pages stay registered while any tensor on them lives (here a slice that
+        outlives the store and its tensor), and are unregistered once the last one is freed."""
+        import gc
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        ptr = store.host["w"].data_ptr()
+        expert = store.host["w"][5]
+        gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
+        del store
+        gc.collect()
+        self.assertTrue(expert.is_pinned())
+
+        del expert
+        gc.collect()
+        # Unregistering again must fail: the pages are no longer registered. In a thread of its
+        # own, as CUDA keeps the error as the thread's last error for a later call to report.
+        rc = []
+        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+        thread = threading.Thread(target=unregister)
+        thread.start()
+        thread.join()
+        self.assertNotEqual(rc[0], 0)
 
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
@@ -161,7 +252,7 @@ def _gather_args(hosts, gpus):
         for v in (
             [paged_experts_host_device_pointer(h) for h in hosts],
             [g.data_ptr() for g in gpus],
-            [h[0].numel() * h.element_size() // 4 for h in hosts],
+            [h[0].numel() * h.element_size() for h in hosts],
         )
     ]
 

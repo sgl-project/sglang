@@ -13,9 +13,11 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -26,6 +28,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import (
+    remap_dspark_weight_name_npu,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -468,6 +473,17 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._tp_shard = MarkovW2ShardGeometry(
+            tp_size=tp_size,
+            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
+            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
+            num_embeddings_per_partition=per_partition,
+            num_embeddings_padded=num_padded,
+        )
+        # A rank holding the whole unpadded vocab has nothing to gather, so the
+        # draft step adds the bias, keeps the logits and selects in one pass.
+        if per_partition == self.vocab_size:
+            return
         vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
@@ -477,15 +493,10 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         if shard_group.rank == 0:
             cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
-        self._tp_shard = MarkovW2ShardGeometry(
-            tp_size=tp_size,
-            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
-            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
-            num_embeddings_per_partition=per_partition,
-            num_embeddings_padded=num_padded,
-        )
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=vocab_gather
+            start=self._tp_shard.org_vocab_start,
+            width=self._tp_shard.org_vocab_end - self._tp_shard.org_vocab_start,
+            gather=vocab_gather,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -678,10 +689,12 @@ DSparkV4Stage = DSparkV4CudaStage if _is_cuda else DSparkV4PlatformStage
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -692,7 +705,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if cls.uses_own_vocab_modules:
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -851,9 +864,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
+        self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
+
+    def project_commit_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> List[torch.Tensor]:
+        """The context rows' per-stage KV, before norm / rope / store; reads no KV
+        location, so it can run before the accept decides what is committed."""
         main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -863,6 +883,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def store_commit_kv(
+        self,
+        *,
+        kvs: List[torch.Tensor],
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
@@ -905,8 +935,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> LogitsProcessorOutput:
         if not _is_cuda:
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
         try:
-            return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds
+                )
         finally:
             residual_batch.clear(forward_batch)
 
@@ -933,7 +968,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            x = mhc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            # The kernel widens each element to fp32 as it loads it.
+            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
@@ -1004,11 +1040,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         for name, loaded_weight in weights:
             mapped = (
-                self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                remap_dspark_weight_name_npu(name)
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
+                continue
+            if _is_npu and mapped in ("embed_tokens.weight", "lm_head.weight"):
+                if not self.uses_own_vocab_modules:
+                    continue
+                stage_idx = int(name.split(".", 2)[1])
+                vocab_stage = (
+                    0 if mapped == "embed_tokens.weight" else self.num_stages - 1
+                )
+                if stage_idx != vocab_stage:
+                    continue
+            if mapped.startswith("confidence_head.") and self.confidence_head is None:
                 continue
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
@@ -1123,64 +1170,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
-        return f"stages.{stage_id}.{mapped_rest}"
-
-    def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-        if "rotary_emb.inv_freq" in name:
-            return None
-
-        if not name.startswith("mtp."):
-            return None
-        parts = name.split(".", 2)
-        if len(parts) < 3:
-            return None
-        stage_id, rest = parts[1], parts[2]
-        if not stage_id.isdigit():
-            return None
-        stage_idx = int(stage_id)
-        if rest in ("embed.weight", "embed_tokens.weight"):
-            return (
-                "embed_tokens.weight"
-                if self.uses_own_vocab_modules and stage_idx == 0
-                else None
-            )
-        if rest in ("head.weight", "lm_head.weight"):
-            return (
-                "lm_head.weight"
-                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
-                else None
-            )
-        if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-
-        if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.') :]}"
-
-        if rest.startswith("confidence_head."):
-            if self.confidence_head is None:
-                return None
-            return f"confidence_head.{rest[len('confidence_head.') :]}"
-
-        mapped_rest = rest
-        if mapped_rest.startswith("attn."):
-            mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-        elif mapped_rest.startswith("ffn."):
-            mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
-        elif mapped_rest.startswith("attn_norm."):
-            mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
-        elif mapped_rest.startswith("ffn_norm."):
-            mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
-                "ffn_norm."
-            )
-        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        if mapped_rest.endswith(".scale"):
-            mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
 
 

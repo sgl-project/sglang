@@ -24,11 +24,9 @@ from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
+    is_supported_rmsnorm_hidden_size,
 )
-from sglang.kernels.ops.layernorm.rmsnorm_hf import (
-    is_supported_rmsnorm_hf_hidden_size,
-    rmsnorm_hf,
-)
+from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -39,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     RotaryEmbedding,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import rope_positions
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -89,6 +88,11 @@ if USE_AITER:
 
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
+
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_scale_residual_norm_scale_shift_sycl,
+        fused_scale_residual_norm_scale_shift_sycl,
+    )
 
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
@@ -144,13 +148,17 @@ class RMSNorm(CustomOp):
             if (
                 x_2d.dtype in (torch.float16, torch.bfloat16)
                 and self.weight.dtype == x_2d.dtype
-                and is_supported_rmsnorm_hf_hidden_size(x_2d.shape[-1])
+                and is_supported_rmsnorm_hidden_size(x_2d.shape[-1])
             ):
-                return rmsnorm_hf(
+                out = torch.empty_like(x_2d)
+                jit_rmsnorm(
                     x_2d,
                     self.weight.data,
+                    out,
                     self.variance_epsilon,
-                ).view(shape)
+                    cast_x_before_out_mul=True,
+                )
+                return out.view(shape)
             return self.forward_native(x)
 
         x = x.reshape(-1, shape[-1])
@@ -727,6 +735,25 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if self.norm_type == "layer":
             weight = self.norm.weight
             bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_sycl(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_sycl(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
             if can_use_fused_scale_residual_norm_scale_shift_triton(
                 residual=residual,
                 x=x,
@@ -1169,13 +1196,7 @@ def apply_qk_norm_rope(
         ) == seq_len * k.stride(1)
 
     if positions is None:
-        pos_1d = torch.arange(
-            position_offset,
-            position_offset + seq_len,
-            device=q.device,
-            dtype=torch.int64,
-        )
-        positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+        positions = rope_positions(position_offset, seq_len, batch_size, q.device)
     else:
         if positions.dim() != 1 or positions.numel() != batch_size * seq_len:
             raise ValueError(

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
@@ -127,12 +128,13 @@ class WeightChecker:
         action: str,
         allow_quant_error: bool = False,
         skip_tensor_list: Optional[List[str]] = None,
+        names: Optional[List[str]] = None,
         *,
         role: str,
     ) -> Optional[Dict]:
         logger.info(
             f"[WeightChecker] handle action={action} "
-            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list}"
+            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list} names={names}"
         )
         if action == "snapshot":
             return self._snapshot()
@@ -144,6 +146,8 @@ class WeightChecker:
             )
         elif action == "checksum":
             return self._compute_checksum(skip_tensor_list, role=role)
+        elif action == "raw_checksum":
+            return self._compute_raw_checksum(names, role=role)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -205,7 +209,7 @@ class WeightChecker:
     def _compute_checksum(
         self, skip_tensor_list: Optional[List[str]] = None, *, role: str
     ) -> Dict:
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._get_model())
@@ -222,7 +226,7 @@ class WeightChecker:
 
         overall = overall_checksum(checksums)
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         elapsed = time.perf_counter() - start
         logger.info(
             f"[WeightChecker] checksum computed for {len(checksums)} tensors in {elapsed:.3f}s"
@@ -231,6 +235,28 @@ class WeightChecker:
         info = ChecksumInfo(
             checksums=checksums,
             per_gpu_checksum=overall,
+            parallelism_info=self._parallelism_info(role=role),
+        )
+        return info.model_dump()
+
+    def _compute_raw_checksum(self, names: Optional[List[str]], *, role: str) -> Dict:
+        params = {
+            name: tensor
+            for name, tensor in self._model_state()
+            if not _is_non_persistent_buffer_name(name)
+        }
+        if names is not None and (missing := sorted(set(names) - params.keys())):
+            raise ValueError(
+                f"raw_checksum names unavailable on {role} runner "
+                f"at {self._placement}: {missing}"
+            )
+        checksums = {
+            name: _sha256_tensor(params[name].data)
+            for name in (params if names is None else names)
+        }
+        info = ChecksumInfo(
+            checksums=checksums,
+            per_gpu_checksum=overall_checksum(checksums),
             parallelism_info=self._parallelism_info(role=role),
         )
         return info.model_dump()
@@ -252,6 +278,12 @@ class WeightChecker:
 
 def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
+
+
+def _sha256_tensor(t: torch.Tensor) -> str:
+    return hashlib.sha256(
+        t.detach().cpu().contiguous().flatten().view(torch.uint8).numpy()
+    ).hexdigest()
 
 
 def _check_tensors(

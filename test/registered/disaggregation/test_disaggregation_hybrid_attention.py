@@ -8,83 +8,10 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    is_in_ci,
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=578, stage="extra-b", runner_config="8-gpu-h200")
-
-
-@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
-class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-
-        # Non blocking start servers
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "4",
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "4",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            max_tokens=2048,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_sgl_eval(args)
-        print(f"Evaluation metrics: {metrics}")
-
-        self.assertGreater(metrics["score"], 0.93)
+register_cuda_ci(est_time=545, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):

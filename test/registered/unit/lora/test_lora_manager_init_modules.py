@@ -12,24 +12,27 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Module-scan regressions in LoRAManager.init_lora_modules."""
+"""LoRA attachment and target-validation contracts."""
 
 import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
+from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import auto_detect_lora_target_modules
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # A VL model whose vision tower nests under `layers.<i>.` just like the decoder,
 # so get_layer_id() resolves both to layer 0 and only should_apply_lora can tell
@@ -37,9 +40,6 @@ register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 LANGUAGE_QKV = "language_model.model.layers.0.mixer.qkv_proj"
 VISION_QKV = "vision_model.encoder.layers.0.attn.attn.qkv_proj"
 LANGUAGE_EMBED_TOKENS = "language_model.model.embed_tokens"
-# Intern-S2-Mobius routed banks: a FusedMoE outside the decoder hierarchy, so
-# get_layer_id() returns None and should_apply_lora rejects the prefix.
-META_MLP_BANK = "model.meta_mlp.0.experts"
 
 
 class _TiedEmbedding(torch.nn.Module):
@@ -116,21 +116,31 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         return manager
 
     def test_vision_tower_module_sharing_a_target_name_is_skipped(self):
+        """The vision tower's qkv_proj is skipped while the decoder's is wrapped,
+        and the gate stays below the embed_tokens / lm_head handling, which sits
+        outside the gated prefix and must still be wrapped."""
+        embed_tokens = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
         manager = self._manager(
             modules=[
                 (LANGUAGE_QKV, torch.nn.Module()),
                 (VISION_QKV, torch.nn.Module()),
+                (LANGUAGE_EMBED_TOKENS, embed_tokens),
             ],
-            target_modules={"qkv_proj"},
+            target_modules={"qkv_proj", "embed_tokens"},
         )
 
         with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
             manager.init_lora_modules()
 
         self.assertEqual(list(manager.lora_modules[0]), [LANGUAGE_QKV])
+        self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
 
+
+class TestModelLoRAScope(CustomTestCase):
     def test_model_scope_keeps_decoder_projections(self):
-        """Decoder FFN, expert, and hybrid projections stay inside LoRA scope."""
+        """Decoder FFN, expert, and hybrid projections stay inside LoRA scope;
+        encoders stay outside (per-model `should_apply_lora` snapshot). A
+        projection a model stops admitting is served without LoRA, silently."""
         from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
         from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
         from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
@@ -175,30 +185,119 @@ class TestShouldApplyLoRAGate(CustomTestCase):
                     name = encoder + ".layers.0.qkv_proj"
                     self.assertFalse(model.should_apply_lora(name), name)
 
-    def test_embed_tokens_outside_the_gated_prefix_is_still_wrapped(self):
-        """The gate stays below the embed_tokens / lm_head handling."""
-        embed_tokens = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
-        manager = self._manager(
-            modules=[(LANGUAGE_EMBED_TOKENS, embed_tokens)],
-            target_modules={"embed_tokens"},
+
+class _MockLinearBase(torch.nn.Module):
+    pass
+
+
+class _MockFusedMoE(torch.nn.Module):
+    pass
+
+
+class _MockParallelLMHead(torch.nn.Module):
+    pass
+
+
+class TestAutoDetectTargets(CustomTestCase):
+    def test_auto_detect_lora_target_modules(self):
+        """A Qwen3-8B-like dense module tree resolves to the expected target set;
+        a silent rename of an internal projection would make auto-detection
+        skip that module and LoRA would never be applied there."""
+        model = torch.nn.Module()
+        inner = torch.nn.Module()
+        layer = torch.nn.Module()
+        attn = torch.nn.Module()
+        attn.qkv_proj = _MockLinearBase()
+        attn.o_proj = _MockLinearBase()
+        layer.self_attn = attn
+        mlp = torch.nn.Module()
+        mlp.gate_up_proj = _MockLinearBase()
+        mlp.down_proj = _MockLinearBase()
+        layer.mlp = mlp
+        inner.layers = torch.nn.ModuleList([layer])
+        inner.embed_tokens = torch.nn.Embedding(10, 8)  # not a LinearBase: excluded
+        model.model = inner
+        model.lm_head = _MockParallelLMHead()
+
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
+        ):
+            detected = auto_detect_lora_target_modules(model)
+
+        self.assertEqual(
+            detected, {"qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"}
         )
 
-        with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
-            manager.init_lora_modules()
 
-        self.assertEqual(manager.embed_tokens_module, LANGUAGE_EMBED_TOKENS)
+class TestTargetValidation(CustomTestCase):
+    """init_state rejects unsupported targets before any module is wrapped."""
 
-    def test_routed_bank_outside_the_gated_prefix_still_raises(self):
-        """Routed-bank targets raise instead of being skipped by the gate."""
-        bank = FusedMoE.__new__(FusedMoE)
-        manager = self._manager(
-            modules=[(META_MLP_BANK, bank)],
-            target_modules={"gate_up_proj", "down_proj"},
+    @staticmethod
+    def _manager(adapter_targets=None):
+        manager = LoRAManager.__new__(LoRAManager)
+        modules = [("model.layers.0.experts", FusedMoE.__new__(FusedMoE))]
+        manager.base_model = SimpleNamespace(named_modules=lambda: modules)
+        manager.configs = {}
+        if adapter_targets is not None:
+            manager.configs["adapter"] = LoRAConfig.from_dict(
+                {"target_modules": adapter_targets, "r": 8, "lora_alpha": 8}
+            )
+        manager.lora_refs = {
+            "adapter": SimpleNamespace(lora_name="adapter", lora_path="/unused")
+        }
+        manager.init_lora_adapters = Mock()
+        manager.lora_backend = Mock()
+        manager.init_lora_modules = Mock()
+        manager.init_memory_pool = Mock()
+        manager.lora_added_tokens_size = None
+        return manager
+
+    @staticmethod
+    def _replicated_q():
+        return patch.object(
+            lora_manager_module,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_replicate_q_proj=True),
         )
 
-        with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
-            with self.assertRaisesRegex(ValueError, "meta_mlp routed banks"):
-                manager.init_lora_modules()
+    def test_normalized_q_target_rejects_replication_before_attachment(self):
+        """Explicit and adapter-inferred q_proj targets hit the same check."""
+        explicit = self._manager()
+        inferred = self._manager("all-linear")
+        inferred.base_model.named_modules().append(
+            ("model.layers.0.q_proj", ReplicatedLinear.__new__(ReplicatedLinear))
+        )
+        for manager, kwargs in (
+            (explicit, dict(target_modules={"q_proj"})),
+            (inferred, dict(lora_paths=[object()])),
+        ):
+            with (
+                self.subTest(**kwargs),
+                self._replicated_q(),
+                self.assertRaisesRegex(ValueError, "Replicated-Q"),
+            ):
+                manager.init_state(max_lora_rank=8, **kwargs)
+            self.assertIn("qkv_proj", manager.target_modules)
+            manager.init_lora_modules.assert_not_called()
+            manager.init_memory_pool.assert_not_called()
+
+    def test_indexer_target_requires_unfused_projection(self):
+        manager = self._manager()
+        manager.base_model.named_modules().append(
+            (
+                "model.layers.0.self_attn.indexer",
+                SimpleNamespace(use_dsa_indexer_fusion=True),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "DSA indexer Q/K fusion"):
+            manager.init_lora_shapes(max_lora_rank=8, target_modules={"wk"})
 
 
 if __name__ == "__main__":

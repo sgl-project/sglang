@@ -3,8 +3,8 @@
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from collections import defaultdict
@@ -61,7 +61,7 @@ class _FakeTreeCore:
         )
 
     def _cascade_evict(
-        self, node, component, tracker, device_frees, host_frees, cache_actions
+        self, node, component, tracker, device_frees, host_frees, cache_actions, target
     ):
         self.cascaded.append(node)
 
@@ -76,6 +76,7 @@ def _build_unified_chain(cap, length=3):
     component = object.__new__(MambaComponent)
     component.cache = cache
     component.tree_core = core
+    component.host_only_checkpoint = False
     component.mamba_max_states_per_path = cap
 
     nodes = []

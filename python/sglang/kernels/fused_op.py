@@ -49,12 +49,13 @@ may pre-seed that attribute to pin an instance to a specific path (e.g. the
 env-gated aiter paths in ``srt/layers``). Steps 1-2 stay per-call so tests and
 tools can flip backends on live instances.
 
-torch.compile integration: :meth:`enter_torch_compile` switches the op to its
-compile-safe path (``forward_native`` by default; see
-:meth:`_torch_compile_forward` for the TopK / FusedMoE special cases) so an
-*outer* ``torch.compile`` never traces device-specific kernels, and
-:meth:`leave_torch_compile` restores the original dispatch. Both are
-idempotent because one module instance may be shared by many layers.
+torch.compile integration: :meth:`enter_torch_compile` selects the function to
+use when compiling the model. An OOT compile function registered for the active
+platform takes precedence over :meth:`_torch_compile_forward`, which selects
+``forward_native`` by default (TopK / FusedMoE have their own selection rules).
+Dynamo traces the selected function's body. :meth:`leave_torch_compile` restores
+the previous forward function. Repeated enter/leave calls are safe because one
+module instance may be shared by many layers.
 
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
@@ -67,6 +68,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import types
 from abc import ABC, abstractmethod
 from typing import (
     AbstractSet,
@@ -110,6 +112,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.HELION: "forward_helion",
     KernelBackend.KDA: "forward_kda",
     KernelBackend.CAKE: "forward_cake",
+    KernelBackend.PLUGIN: "forward_plugin",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
@@ -126,6 +129,7 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
     KernelBackend.CAKE,
+    KernelBackend.PLUGIN,
     KernelBackend.AOT,
     KernelBackend.JIT,
     KernelBackend.FLASHINFER,
@@ -285,6 +289,12 @@ def _dispatch_label(method: Callable) -> str:
     ``forward_native`` traces as ``"torch"``, matching explicit-backend
     calls); platform forwards trace as their device key (``"cuda"``, ...).
     """
+    # For OOT calls, derive the trace label from the registered function's name.
+    func = getattr(method, "__func__", None)
+    if func is BaseFusedOp._forward_oot:
+        method = method.__self__._resolved_oot_forward
+    elif func is BaseFusedOp._forward_oot_compile:
+        method = method.__self__._resolved_oot_compile_forward
     name = getattr(method, "__name__", "")
     label = _METHOD_BACKEND_LABELS.get(name)
     if label is not None:
@@ -368,14 +378,36 @@ class BaseFusedOp(nn.Module, ABC):
     # OOT forward registry shared by all fused ops: platform dispatch key ->
     # {op class -> forward fn}. Populated by out-of-tree platform plugins.
     _oot_forward_registry: ClassVar[Dict[str, Dict[type, Callable]]] = {}
+    _oot_compile_forward_registry: ClassVar[Dict[str, Dict[type, Callable]]] = {}
 
     @classmethod
     def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
         """Register an OOT forward implementation for a specific op class and
-        platform. ``fn`` is bound to the instance at dispatch time (it receives
-        the op as ``self``) and takes precedence over ``forward_<platform_key>``
-        methods on that exact class."""
+        platform. ``fn`` receives the op instance as ``self`` and takes
+        precedence over ``forward_<platform_key>`` methods on that exact class.
+        Model compilation uses :meth:`_torch_compile_forward` unless a separate
+        OOT compile function is registered.
+        """
         cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
+
+    @classmethod
+    def register_oot_compile_forward(
+        cls, op_cls: type, fn: Callable, platform_key: str
+    ) -> None:
+        """Register an OOT function to use when compiling the model.
+
+        ``fn`` must accept the op instance as its first argument and have the
+        same signature and behavior as the eager implementation.
+        :meth:`enter_torch_compile` selects it for exactly ``op_cls`` on the
+        active OOT platform, before calling the subclass's
+        :meth:`_torch_compile_forward`. Eager registration is independent.
+
+        Dynamo traces the function's body as part of the model compilation;
+        unsupported operations still fail with ``fullgraph=True``.
+        Register before calling :meth:`enter_torch_compile`. The selected
+        function is stored on the instance until :meth:`leave_torch_compile`.
+        """
+        cls._oot_compile_forward_registry.setdefault(platform_key, {})[op_cls] = fn
 
     def __init__(self) -> None:
         super().__init__()
@@ -384,6 +416,13 @@ class BaseFusedOp(nn.Module, ABC):
         # so module-level op instances never trigger platform detection at
         # import time. Subclass __init__ may overwrite it to pin a path.
         self._forward_method: Optional[Callable] = None
+        # Store plugin functions without binding them to this instance.
+        # _forward_oot and _forward_oot_compile pass self when calling them.
+        # Dynamo may look up the current or saved forward method by name when
+        # saving compiler guards. Both methods are defined on BaseFusedOp, so
+        # these lookups work without adding plugin function names to the class.
+        self._resolved_oot_forward: Optional[Callable] = None
+        self._resolved_oot_compile_forward: Optional[Callable] = None
         # torch.compile mode bookkeeping (see enter/leave_torch_compile).
         self._original_forward_method: Optional[Callable] = None
         self.is_torch_compile = False
@@ -432,6 +471,9 @@ class BaseFusedOp(nn.Module, ABC):
 
     def forward_cake(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no Cake backend")
+
+    def forward_plugin(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no plugin backend")
 
     def forward_flashinfer(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flashinfer backend")
@@ -538,7 +580,14 @@ class BaseFusedOp(nn.Module, ABC):
         if oot_key is not None:
             registered = self._oot_forward_registry.get(oot_key, {}).get(type(self))
             if registered is not None:
-                return registered.__get__(self)
+                # A registered method may belong to another instance. Extract
+                # its function so this op is passed as self when it is called.
+                self._resolved_oot_forward = (
+                    registered.__func__
+                    if isinstance(registered, types.MethodType)
+                    else registered
+                )
+                return self._forward_oot
             method = self._platform_method(oot_key)
             if method is not None:
                 return method
@@ -562,6 +611,10 @@ class BaseFusedOp(nn.Module, ABC):
         method = self._platform_method(_platform_key())
         return method if method is not None else self.forward_native
 
+    def _forward_oot(self, *args, **kwargs):
+        """Call the selected eager OOT function, passing this op as self."""
+        return self._resolved_oot_forward(self, *args, **kwargs)
+
     def _forward_backend_dynamic(self, *args, **kwargs):
         """Per-call backend selection for ops with input-dependent gates."""
         for backend in self._dynamic_backend_candidates:
@@ -579,8 +632,12 @@ class BaseFusedOp(nn.Module, ABC):
 
     # --- torch.compile mode ---
 
+    def _forward_oot_compile(self, *args, **kwargs):
+        """Call the selected OOT compile function, passing this op as self."""
+        return self._resolved_oot_compile_forward(self, *args, **kwargs)
+
     def _torch_compile_forward(self, num_tokens: int) -> Optional[Callable]:
-        """The forward to use while the outer model is under ``torch.compile``.
+        """Compile forward when no OOT compile implementation is registered.
 
         Returning ``None`` keeps the current dispatch (used by the TopK /
         FusedMoE overrides, whose optimized paths stay active for
@@ -605,7 +662,21 @@ class BaseFusedOp(nn.Module, ABC):
         # _resolve_forward_method().
         get_fused_op_backend()
         self._original_forward_method = self._forward_method
-        compile_forward = self._torch_compile_forward(num_tokens=num_tokens)
+        oot_key = _oot_dispatch_key()
+        registered = (
+            self._oot_compile_forward_registry.get(oot_key, {}).get(type(self))
+            if oot_key is not None
+            else None
+        )
+        if registered is not None:
+            self._resolved_oot_compile_forward = (
+                registered.__func__
+                if isinstance(registered, types.MethodType)
+                else registered
+            )
+            compile_forward = self._forward_oot_compile
+        else:
+            compile_forward = self._torch_compile_forward(num_tokens=num_tokens)
         if compile_forward is not None:
             self._forward_method = compile_forward
         elif self._forward_method is None:
@@ -618,6 +689,7 @@ class BaseFusedOp(nn.Module, ABC):
             return
         self._forward_method = self._original_forward_method
         self._original_forward_method = None
+        self._resolved_oot_compile_forward = None
         self.is_torch_compile = False
 
     # --- dispatch ---

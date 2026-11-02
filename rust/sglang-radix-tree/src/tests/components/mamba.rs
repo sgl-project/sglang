@@ -1,6 +1,7 @@
 use super::*;
+use crate::cache_action::{BackupKV, FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
-use crate::test_utils::{accumulate_step, action_kinds};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action};
 use crate::unified_lru_list::UnifiedLRUList;
 
 fn mamba_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
@@ -64,6 +65,8 @@ fn insert_params_mamba<'k>(
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -160,7 +163,7 @@ fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
 }
 
 #[test]
-#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for state slots")]
 fn get_or_fill_uuid_rejects_mamba() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [node] = chain::<1>(&mut tc);
@@ -560,10 +563,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
     let backups = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup),
-            _ => None,
-        })
+        .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
         .collect::<Vec<_>>();
     assert_eq!(backups.len(), 1);
     assert_eq!(backups[0].node_ids, vec![leaf]);
@@ -587,7 +587,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
         !pending
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
 }
 
@@ -607,7 +607,7 @@ fn write_back_reinsert_defers_the_mamba_backup_to_eviction() {
         !result
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
 }
 
@@ -644,6 +644,140 @@ fn tombstone_refill_moves_the_node_from_host_to_device_lru() {
 fn insert_without_a_mamba_value_panics() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.insert(&insert_params_mamba(&vec![1], &[10], None));
+}
+
+#[test]
+fn missing_mamba_insert_keeps_the_existing_checkpoint_when_allowed() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    tc.insert(&params);
+
+    let mut repeat = insert_params_mamba(&key, &[10, 11], None);
+    repeat.allow_missing_mamba = true;
+    let result = tc.insert(&repeat);
+    assert!(result.mamba_exist);
+    let leaf = tc
+        .arena
+        .resolve(result.last_device_node_id.expect("inserted leaf"))
+        .expect("live leaf");
+    assert!(
+        tc.arena
+            .node(leaf)
+            .try_host_value(MAMBA)
+            .expect("host checkpoint")
+            .equal(&Tensor::from_slice(&[42i64]))
+    );
+}
+
+#[test]
+fn insert_host_only_checkpoint_keeps_no_gpu_slot() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    let result = tc.insert(&params);
+    assert!(!result.mamba_exist);
+    let leaf = tc
+        .arena
+        .resolve(result.last_device_node_id.expect("inserted leaf"))
+        .expect("live leaf");
+    assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
+    assert!(
+        tc.arena
+            .node(leaf)
+            .try_host_value(MAMBA)
+            .expect("host checkpoint")
+            .equal(&Tensor::from_slice(&[42i64]))
+    );
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(leaf)));
+    let matched = tc.match_prefix(&match_params(&key));
+    assert_eq!(matched.best_match_node_id, tc.arena.node(leaf).id);
+    assert_eq!(
+        matched.last_device_node_id,
+        tc.arena.node(tc.arena.root()).id
+    );
+    assert_eq!(matched.mamba_host_hit_length, 1);
+}
+
+#[test]
+fn host_only_checkpoint_keeps_the_device_kv_prefix() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    tc.insert(&params);
+    let matched = tc.match_prefix(&match_params(&key));
+    let leaf = tc
+        .arena
+        .resolve(matched.last_device_node_id)
+        .expect("device prefix leaf");
+    assert_eq!(matched.best_match_node_id, tc.arena.node(leaf).id);
+    assert_eq!(matched.device_prefix_len, key.len());
+    assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
+    assert!(tc.arena.node(leaf).has_host_value(MAMBA));
+    assert!(matched.mamba_host_hit_length >= 1);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn host_only_checkpoint_counts_gpu_kv_in_front_and_host_kv_at_the_boundary() {
+    // a is GPU Full with no mamba. b is the host checkpoint: Full was evicted
+    // and backed up, mamba stays on host. The match stands on b, so a is a
+    // device hit and b is a host hit. Nothing past b is included.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let root = tc.arena.root();
+    let a = tc
+        .arena
+        .alloc_child(root, vec![1, 2, 3], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_device_value(a, FULL, Tensor::from_slice(&[10i64, 11, 12]));
+    let b = tc
+        .arena
+        .alloc_child(a, vec![4, 5], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_host_value(b, FULL, Tensor::from_slice(&[13i64, 14]));
+    set_mamba_host(&mut tc, b, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    // Full KV past the checkpoint has no mamba state, so it stays outside the hit.
+    let _c = tc
+        .arena
+        .alloc_child(b, vec![6, 7], /* priority = */ 0, None)
+        .unwrap();
+    tc.arena
+        .set_host_value(_c, FULL, Tensor::from_slice(&[15i64, 16]));
+
+    let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(matched.best_match_node_id, tc.arena.node(b).id);
+    assert_eq!(matched.last_device_node_id, tc.arena.node(a).id);
+    assert_eq!(matched.device_prefix_len, 3);
+    assert_eq!(matched.host_hit_length, 2);
+    assert_eq!(matched.full_kv_hit_length, 7);
+    assert!(tc.arena.node(b).try_device_value(MAMBA).is_none());
+    assert!(tc.arena.node(a).try_device_value(MAMBA).is_none());
 }
 
 #[test]
@@ -984,7 +1118,7 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
         !inserted
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
     assert!(
         tc.arena
@@ -1569,6 +1703,94 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
     assert!(transfers[1].nodes_to_load.is_none());
 }
 
+fn host_only_params() -> CacheInitParams {
+    CacheInitParams {
+        page_size: 1,
+        enable_hicache: true,
+        mamba_cache_chunk_size: Some(256),
+        mamba_host_only_checkpoint: true,
+        ..CacheInitParams::default()
+    }
+}
+
+#[test]
+fn host_only_load_back_build_copies_into_the_request_slot_only() {
+    let mut tc = UnifiedTreeCore::new(host_only_params(), vec![FULL, MAMBA]);
+    let [a] = chain::<1>(&mut tc);
+    set_mamba_host(&mut tc, a, 8);
+    let component = MambaComponent::new(&host_only_params());
+    let transfers = component
+        .build_hicache_transfers(
+            &tc,
+            a,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64]).squeeze()),
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert!(
+        transfers[0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[3i64]))
+    );
+    assert!(transfers[0].nodes_to_load.is_none());
+    assert!(
+        component
+            .build_hicache_transfers(
+                &tc,
+                a,
+                CacheTransferPhase::LoadBack,
+                /* mamba_pool_idx = */ None,
+                /* host_indices = */ None,
+                /* token_ids = */ None,
+                /* prefetch_tokens = */ 0,
+                /* staging_tokens = */ 0,
+                /* last_hash = */ None,
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn host_only_load_back_commit_keeps_the_node_off_the_device_tier() {
+    let mut tc = UnifiedTreeCore::new(host_only_params(), vec![FULL, MAMBA]);
+    let [a] = chain::<1>(&mut tc);
+    set_mamba_host(&mut tc, a, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    let mut cache_actions = Vec::new();
+    tc.commit_hicache_transfers(
+        tc.arena.node(a).id,
+        CacheTransferPhase::LoadBack,
+        HashMap::from([(
+            MAMBA,
+            vec![PoolTransfer {
+                name: PoolName::Mamba,
+                host_indices: Some(Tensor::from_slice(&[8i64])),
+                device_indices: Some(Tensor::from_slice(&[3i64])),
+                ..Default::default()
+            }],
+        )]),
+        &mut cache_actions,
+        None,
+        None,
+    )
+    .expect("live test node");
+    assert!(tc.arena.node(a).try_device_value(MAMBA).is_none());
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(a)));
+    assert!(!tc.device_lru_list(MAMBA).in_list(Some(a)));
+    assert_eq!(tc.evictable_size_(MAMBA), 0);
+    assert!(cache_actions.is_empty());
+}
+
 #[test]
 fn backup_host_commit_stores_the_host_slot_once() {
     let mut tc = mamba_core(/* page_size = */ 1);
@@ -2123,13 +2345,10 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
             .has_host_value(MAMBA)
     );
     assert!(insert_result.mamba_exist);
-    let CacheAction::FreeComponentHostSlot {
+    let FreeComponentHostSlot {
         component_type,
         host_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a FreeComponentHostSlot action");
-    };
+    } = expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert_eq!(*component_type, MAMBA);
     assert!(host_indices[0].equal(&Tensor::from_slice(&[50i64])));
 
@@ -2186,6 +2405,37 @@ fn new_combines_the_chunk_and_tree_page_grids() {
 #[should_panic(expected = "requires mamba_cache_chunk_size")]
 fn new_panics_without_a_chunk_size() {
     MambaComponent::new(&CacheInitParams::default());
+}
+
+#[test]
+fn evict_excess_path_states_counts_host_only_checkpoints() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_hicache: true,
+            mamba_cache_chunk_size: Some(256),
+            mamba_max_states_per_path: Some(1),
+            mamba_host_only_checkpoint: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    );
+    let [a, b] = chain::<2>(&mut tc);
+    set_mamba_host(&mut tc, a, 7);
+    set_mamba_host(&mut tc, b, 8);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(b).id)
+        .expect("live test node");
+    let freed = result
+        .host_frees
+        .remove(&MAMBA)
+        .expect("the excess host checkpoint frees its slot");
+    assert_eq!(freed.len(), 1);
+    assert!(freed[0].equal(&Tensor::from_slice(&[7i64])));
+    assert!(tc.arena.node(a).try_host_value(MAMBA).is_none());
+    assert!(tc.arena.node(b).try_host_value(MAMBA).is_some());
 }
 
 #[test]
@@ -2260,14 +2510,14 @@ fn insert_commit_emits_the_path_cap_action_only_when_capped() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let [CacheAction::MambaEvictExcessPathStates { tail_node_id }] =
-        result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one MambaEvictExcessPathStates, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let MambaEvictExcessPathStates { tail_node_id } =
+        expect_action::<MambaEvictExcessPathStates>(action.as_ref());
     assert_eq!(*tail_node_id, leaf);
 
     let mut uncapped = mamba_core(/* page_size = */ 1);

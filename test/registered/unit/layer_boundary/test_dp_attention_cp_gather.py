@@ -28,6 +28,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_RESIDUAL_OPS,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.boundary_fixtures import (
     make_test_stages,
     postprocess_output,
@@ -37,7 +38,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 HIDDEN = 4
 DP_SIZE = 2
@@ -213,6 +214,28 @@ class TestDpCpGather(CustomTestCase):
                 else group.held_rows[0]
             )
             with ExitStack() as stack:
+                stack.enter_context(patch.object(cp_base, "_STRATEGY", None))
+                # Ordinary CP-configured batches may defer the FFN sum. Let
+                # the real MoE output-contract helpers read a published config.
+                stack.enter_context(
+                    get_context().override_server_args(
+                        tp_size=tp_size,
+                        attn_dp_size=DP_SIZE,
+                        enable_prefill_cp=True,
+                        attn_cp_size=CP_SIZE,
+                        cp_strategy="zigzag",
+                    )
+                )
+                stack.enter_context(
+                    get_parallel().override(
+                        tp_rank=parallel.tp_rank,
+                        attn_dp_rank=dp,
+                        attn_cp_rank=cp,
+                        attn_tp_rank=tp,
+                        tp_group=parallel.tp_group,
+                        moe_tp_group=parallel.tp_group,
+                    )
+                )
                 for target, value in [
                     ((comm, "get_parallel"), lambda: parallel),
                     ((comm, "get_lora"), lambda: SimpleNamespace(enable_lora=False)),

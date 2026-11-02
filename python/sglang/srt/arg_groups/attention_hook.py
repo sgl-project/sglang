@@ -14,8 +14,10 @@ from sglang.srt.arg_groups.overrides import (
     _cutedsl_prefill_backend_fill,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
+    _hybrid_swa_memory_backend_disable,
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
@@ -27,6 +29,9 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
     use_mla_backend,
+)
+from sglang.srt.arg_groups.platform_hook import (
+    handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
@@ -117,6 +122,8 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
+
+    handle_sail_attention_backend_compatibility(server_args)
 
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
@@ -269,6 +276,9 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
+
+    # Needs the final prefill and decode backends.
+    run_post_process_pass(server_args, _hybrid_swa_memory_backend_disable)
 
     # XPU platforms backends
     if cfg.dcp_size > 1 and get_platform().is_xpu:
@@ -668,6 +678,7 @@ def handle_deterministic_inference(server_args: Any):
             if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                run_post_process_pass(server_args, _deterministic_rocm_rccl_check)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
             else:
                 # CUDA: use NCCL tree algorithm
