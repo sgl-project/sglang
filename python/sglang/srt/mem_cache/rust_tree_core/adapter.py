@@ -297,7 +297,7 @@ def _transfer_from_binding(
     ``names`` renames the core's host pools to the cache's."""
     name, host_indices, device_indices, nodes_to_load, keys, hit_policy = transfer
     return PoolTransfer(
-        name=names.get(name) or PoolName(name),
+        name=names.get(name) or name,
         host_indices=host_indices,
         device_indices=device_indices,
         keys=keys,

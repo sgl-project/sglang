@@ -10,6 +10,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HostPoolName,
     PoolTransfer,
+    host_pool_name,
     merge_source_transfers,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
@@ -33,6 +34,9 @@ class PoolEntry:
     # Controller ids -> the device pool's rows, for a sub-pool whose ids map
     # through its allocator (`KVStorage.host_ids`); None when they index it.
     device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+    def __post_init__(self):
+        self.name = host_pool_name(self.name)
 
 
 class HostPoolGroup:
@@ -76,7 +80,9 @@ class HostPoolGroup:
         self._refresh_transfer_capabilities()
 
     def get_entry(self, name: HostPoolName | None = None) -> PoolEntry:
-        return self.anchor_entry if name is None else self.entry_map[name]
+        return (
+            self.anchor_entry if name is None else self.entry_map[host_pool_name(name)]
+        )
 
     def get_pool(self, name: HostPoolName):
         return self.get_entry(name).host_pool
