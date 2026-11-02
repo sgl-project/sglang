@@ -74,6 +74,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    ragged_capture_num_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
@@ -419,7 +420,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
-            and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
+            and (is_cuda() or _is_npu or (is_cuda_alike() and target_is_dsv41))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -901,7 +902,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        # An idle rank only needs fabricated compact rows to replay the same
+        # token-keyed graph as busy ranks.  In eager mode it must keep zero
+        # local tokens and merely participate in the DP/EP collectives.  If we
+        # build a uniform layout without a ragged graph runner, the verify path
+        # creates ``verify_num_draft_tokens`` dummy inputs while DP padding
+        # still assigns this rank zero tokens, which results in negative
+        # padding (for example, ``0 - 6``).
+        if (
+            batch.global_num_tokens is None
+            or not self._verify_planner.is_compact_mode
+            or ragged_capture_num_tokens(model_runner=self.model_runner) is None
+        ):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
@@ -1115,6 +1127,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids
@@ -1355,7 +1368,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        """
 
+        """
         next_draft_input = make_next_draft_input(
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
