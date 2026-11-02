@@ -2137,7 +2137,7 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    from sgl_kernel_npu.operators.dsv4 import mhc_pre
+    from sgl_kernel_npu.operators.norm import mhc_pre
 
     y, post, comb = mhc_pre(
         x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
