@@ -481,7 +481,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False):
+    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = True):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.root_hidden_size = self.hidden_size**0.5
@@ -503,7 +503,7 @@ class Gemma4VisionPooler(nn.Module):
         kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
 
         weights = F.one_hot(kernel_idxs.long(), length).float() / k_squared
-        output = weights.transpose(1, 2).to(x.dtype) @ x
+        output = (weights.transpose(1, 2) @ x.float()).to(x.dtype)
         mask = torch.logical_not((weights == 0).all(dim=1))
         return output, mask
 
@@ -531,6 +531,8 @@ class Gemma4VisionPooler(nn.Module):
         if hidden_states.shape[1] == length:
             mask = padding_positions
         else:
+            # Padding positions clamp to (0, 0) when pooled,
+            # so unless zeroed here every padding patch lands in the first token.
             if self.mask_pad_before_pool:
                 hidden_states = hidden_states.masked_fill(
                     padding_positions.unsqueeze(-1), 0.0
@@ -538,7 +540,9 @@ class Gemma4VisionPooler(nn.Module):
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
             )
-        hidden_states = hidden_states * self.root_hidden_size
+        # Scaled values can exceed the float16 range, so scale and return float32;
+        # Gemma4VisionEncoder standardizes and then casts back, as transformers does.
+        hidden_states = hidden_states.float() * self.root_hidden_size
         return hidden_states, mask
 
 
@@ -555,7 +559,7 @@ class Gemma4VisionEncoder(nn.Module):
         config: Gemma4VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        mask_pad_before_pool: bool = False,
+        mask_pad_before_pool: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -622,6 +626,8 @@ class Gemma4VisionEncoder(nn.Module):
         )
 
         if self.standardize:
+            # std_bias cancels large values, so this must run before the cast below.
             pooled = (pooled - self.std_bias) * self.std_scale
+        pooled = pooled.to(inputs_embeds.dtype)
 
         return pooled, pooler_mask
