@@ -247,9 +247,17 @@ def fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    is_gated: bool = True,
 ) -> torch.Tensor:
+    def relu2(x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x).square()
+
     def act(x: torch.Tensor, *, routed: bool = False):
-        if activation == "silu":
+        if not is_gated:
+            if activation != "relu2":
+                raise ValueError(f"Unsupported ungated activation: {activation}")
+            activation_fn = relu2
+        elif activation == "silu":
             activation_fn = silu_and_mul
         elif activation == "gelu":
             activation_fn = gelu_and_mul
