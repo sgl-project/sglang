@@ -10,7 +10,7 @@ cache they are handed.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
@@ -50,7 +50,7 @@ def admit_preallocation(
     *,
     evictable,
     full_budget_tokens: int,
-    swa_budget_tokens: Optional[int] = None,
+    window_budget_tokens: Optional[Mapping[str, int]] = None,
 ) -> bool:
     """Whether a decode-node preallocation is admitted (``admission``, with its
     decode reservation, crediting what the cache could evict) and its rows
@@ -63,13 +63,13 @@ def admit_preallocation(
             take,
             evictable=evictable,
             full_budget_tokens=full_budget_tokens,
-            swa_budget_tokens=swa_budget_tokens,
+            window_budget_tokens=window_budget_tokens,
         )
     if not allocator.prealloc_fits(
         admission,
         evictable=evictable,
         full_budget_tokens=full_budget_tokens,
-        swa_budget_tokens=swa_budget_tokens,
+        window_budget_tokens=window_budget_tokens,
     ):
         return False
     return reclaim_for_prealloc(tree_cache, allocator, take) is None

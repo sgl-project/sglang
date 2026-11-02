@@ -1622,7 +1622,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
                 token_demand(allocator, full_demand, swa_demand),
                 evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=full_demand,
-                swa_budget_tokens=swa_demand,
+                window_budget_tokens={allocator.target_window_pool(): swa_demand},
             )
         )
 
@@ -1640,7 +1640,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
                 token_demand(allocator, page_size, page_size),
                 evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=full_budget,
-                swa_budget_tokens=swa_budget,
+                window_budget_tokens={allocator.target_window_pool(): swa_budget},
             )
         )
         # The request may not exceed its side's budget.
@@ -1649,7 +1649,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
                 token_demand(allocator, page_size, page_size),
                 evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=page_size - 1,
-                swa_budget_tokens=swa_budget,
+                window_budget_tokens={allocator.target_window_pool(): swa_budget},
             )
         )
         # Holding back nearly all of each side's own availability at once
@@ -1659,7 +1659,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
                 token_demand(allocator, page_size, page_size),
                 evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=page_size,
-                swa_budget_tokens=page_size,
+                window_budget_tokens={allocator.target_window_pool(): page_size},
             )
         )
 

@@ -147,30 +147,43 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return None
 
+    def window_capacity_and_available(self, sub_pool: str) -> Tuple[int, int]:
+        """Window sub-pool ``sub_pool``'s token capacity and what a take from it
+        can serve now, as the scheduler's window budget reads them."""
+        if sub_pool not in self.window_pool_names():
+            raise KeyError(f"no window sub-pool {sub_pool!r}")
+        _, window = self.swa_capacity_and_available(
+            full_capacity=self.size_full, swa_capacity=self.size_swa
+        )
+        return window
+
     def prealloc_fits(
         self,
         demand: KVDemand,
         *,
         evictable: Mapping[str, int],
         full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
+        window_budget_tokens: Optional[Mapping[str, int]] = None,
     ) -> bool:
         """Whether a decode-node preallocation of this size fits.
 
-        The budgets are the scheduler's policy: what each side has left once
-        decode headroom and retraction are reserved. Separate buffers make the
-        two sides independent, so each is checked against its own budget and
-        ``evictable`` (what the prefix cache could free per pool) is not
-        read -- what it could reclaim is already inside that budget. ``state_slots`` live in a pool of their own here,
-        which the caller has already made room in. A pool that cuts both sides
+        The budgets are the scheduler's policy: what the owner and each window
+        have left once decode headroom and retraction are reserved, by window
+        sub-pool name. Separate buffers make the sides independent, so each is
+        checked against its own budget and ``evictable`` (what the prefix cache
+        could free per pool) is not read -- what it could reclaim is already
+        inside that budget. ``state_slots`` live in a pool of their own here,
+        which the caller has already made room in. A pool that cuts every side
         (and state slots) from one buffer overrides this to price them
         together, since a per-side budget cannot express a shared byte
         envelope.
         """
         demand = demand.checked(self.window_pool_names())
-        return demand.full_tokens <= full_budget_tokens and (
-            swa_budget_tokens is None
-            or all(t <= swa_budget_tokens for t in demand.window_tokens.values())
+        budgets = window_budget_tokens or {}
+        return demand.full_tokens <= full_budget_tokens and all(
+            tokens <= budgets[name]
+            for name, tokens in demand.window_tokens.items()
+            if name in budgets
         )
 
     def admit_preallocation(
@@ -181,7 +194,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         *,
         evictable: Mapping[str, int],
         full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
+        window_budget_tokens: Optional[Mapping[str, int]] = None,
     ) -> bool:
         """Whether a decode-node preallocation is admitted (``admission``,
         with its decode reservation) and its rows (``take``) can be taken
@@ -191,7 +204,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             admission,
             evictable=evictable,
             full_budget_tokens=full_budget_tokens,
-            swa_budget_tokens=swa_budget_tokens,
+            window_budget_tokens=window_budget_tokens,
         )
 
     def get_extend_allocation_demand(

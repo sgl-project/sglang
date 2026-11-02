@@ -1014,7 +1014,8 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, int(self.cur_rem_tokens) - self.page_size)
             if self.is_hybrid_swa:
                 _rem_tokens = min(
-                    _rem_tokens, int(self.memory_budget.remaining_swa) - self.page_size
+                    _rem_tokens,
+                    int(self.memory_budget.remaining_window_tokens) - self.page_size,
                 )
         return _rem_tokens
 

@@ -33,6 +33,14 @@ class PureSWARadixCache(RadixCache):
     def swa_evictable_size(self):
         return self.evictable_size_
 
+    def window_evictable_size(self, sub_pool: str) -> int:
+        # Every layer is a window layer: the tree's one pool is the window's.
+        return (
+            self.evictable_size_
+            if sub_pool in self.token_to_kv_pool_allocator.window_pool_names()
+            else 0
+        )
+
     def swa_protected_size(self):
         return self.protected_size_
 
