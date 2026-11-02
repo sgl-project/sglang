@@ -120,7 +120,7 @@ class KvChecksumComputer:
             all_lens += self._state_item_lens
             all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
         if expected_device == "npu":
-            from sgl_kernel_npu.mem_cache.checksum import adler32_strided_checksum
+            from sgl_kernel_npu.operators.mem_cache import adler32_strided_checksum
         else:
             from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 

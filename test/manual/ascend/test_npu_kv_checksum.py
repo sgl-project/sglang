@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import torch
 import torch_npu  # noqa: F401
-from sgl_kernel_npu.mem_cache.checksum import adler32_strided_checksum
+from sgl_kernel_npu.operators.mem_cache import adler32_strided_checksum
 
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
@@ -82,7 +82,7 @@ class TestNPUKvChecksum(unittest.TestCase):
             [kv_idx, state_idx, state_idx],
         )
         with patch(
-            "sgl_kernel_npu.mem_cache.checksum.adler32_strided_checksum",
+            "sgl_kernel_npu.operators.mem_cache.adler32_strided_checksum",
             wraps=adler32_strided_checksum,
         ) as npu_checksum:
             self.assertEqual(computer.compute(kv_idx, state_idx), expected)
