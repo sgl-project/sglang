@@ -1,0 +1,24 @@
+can not use command: npu-smi info
+test_current_qwen_forward_with_local_valid_rows (test_contracts.RuntimeContractTest.test_current_qwen_forward_with_local_valid_rows) ... ok
+test_legacy_parallel_interface (test_contracts.RuntimeContractTest.test_legacy_parallel_interface) ... ok
+test_measurement_persists_requested_and_active_dispatcher_modes (test_contracts.RuntimeContractTest.test_measurement_persists_requested_and_active_dispatcher_modes) ... ok
+test_parallel_publication_and_current_signature (test_contracts.RuntimeContractTest.test_parallel_publication_and_current_signature) ... ok
+test_tp_reduction_for_stage_based_and_historical_layers (test_contracts.RuntimeContractTest.test_tp_reduction_for_stage_based_and_historical_layers) ... ok
+test_client_embeds_provenance_and_rejects_changes (test_contracts.ServingCaptureTest.test_client_embeds_provenance_and_rejects_changes) ... ok
+test_launch_records_identity_before_start (test_contracts.ServingCaptureTest.test_launch_records_identity_before_start) ... ok
+test_historical_summaries_are_unchanged (test_contracts.SummaryContractTest.test_historical_summaries_are_unchanged) ... ok
+test_legacy_and_unknown_hardware_need_explicit_evidence (test_contracts.SummaryContractTest.test_legacy_and_unknown_hardware_need_explicit_evidence) ... ok
+test_module_rejects_incomparable_runs (test_contracts.SummaryContractTest.test_module_rejects_incomparable_runs) ... ok
+test_serving_requires_and_checks_server_identity (test_contracts.SummaryContractTest.test_serving_requires_and_checks_server_identity) ... ok
+test_empty_rank_counts (test_workload.WorkloadTest.test_empty_rank_counts) ... ok
+test_layout_and_all_rank_validation (test_workload.WorkloadTest.test_layout_and_all_rank_validation) ... can not use command: npu-smi info
+can not use command: npu-smi info
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+ok
+test_timing_uses_inference_mode (test_workload.WorkloadTest.test_timing_uses_inference_mode) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 7.359s
+
+OK
