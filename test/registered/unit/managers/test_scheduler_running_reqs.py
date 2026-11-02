@@ -211,6 +211,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_hisparse = False
         s.chunked_req = None
         s.invariant_checker = _invariant_checker(s)
+        s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
         s._engine_paused = False
