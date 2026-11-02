@@ -1,9 +1,7 @@
 """Add ``warning_once`` and ``info_once`` to ``logging.Logger``.
 
-SGLang code calls ``logger.warning_once`` / ``logger.info_once``, which are not
-part of ``logging``: transformers adds them to ``logging.Logger`` when it is
-imported. Installing them at startup keeps those calls working in code paths
-that never import transformers.
+transformers adds them when it is imported; sglang calls them on paths that
+never import transformers.
 """
 
 import functools

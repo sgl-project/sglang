@@ -24,10 +24,8 @@ def _preload_common_modules(extra_modules: list[str]) -> None:
     """Load the expensive common stack without creating a CUDA context."""
     if _has_cuda_driver():
         # A child forked after the parent called cuInit or loaded a CUDA kernel
-        # library (flashinfer, sgl_kernel) crashes on its first driver call.
-        # Keep the parent off the driver: torch.cuda.is_available() asks NVML
-        # instead of calling cuInit, and the extra modules, which may load
-        # kernel libraries, are left to the children.
+        # library (flashinfer, sgl_kernel) crashes on its first driver call, so
+        # the parent checks CUDA through NVML and leaves extra modules to children.
         os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
         if extra_modules:
             print(

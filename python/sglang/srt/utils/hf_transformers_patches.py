@@ -18,8 +18,8 @@ for transformers v5 bugs, fixes for remote-model-code (trust_remote_code)
 that hasn't been updated for v5 yet, and CI-only patches (e.g. neutralize
 HF API calls to avoid rate limits).
 
-Import this module early (before any ``from_pretrained`` call) to activate
-all patches.  It is safe to import multiple times -- patches are idempotent.
+Call ``apply_all_hf_patches()`` before any ``from_pretrained`` call; it is
+idempotent.
 """
 
 import importlib.abc
@@ -28,8 +28,8 @@ import inspect
 import logging
 import sys
 
-# Plain logger: importing sglang.srt.utils here pulls torch/transformers/triton
-# into every `import sglang` (this module runs from sglang/__init__.py).
+# Plain logger: importing sglang.srt.utils here would pull torch and triton
+# into every importer of this module.
 logger = logging.getLogger(__name__)
 
 _applied = False
@@ -43,11 +43,7 @@ _applied = False
 def apply_all_hf_patches():
     """Apply all transformers compatibility patches (idempotent).
 
-    Call this once at import time.  It is safe to call multiple times.
-
-    No-op when the ``transformers`` package is not installed -- frontend-only
-    sglang users should not be forced to install transformers just to import
-    the top-level ``sglang`` package.
+    No-op when the ``transformers`` package is not installed.
     """
     global _applied
     if _applied:
@@ -244,8 +240,6 @@ def _add_llama_flash_attention_2(modeling_llama):
 
 
 class _PatchLlamaModelingOnImport(importlib.abc.MetaPathFinder):
-    """Runs ``_add_llama_flash_attention_2`` right after modeling_llama executes."""
-
     def find_spec(self, fullname, path, target=None):
         if fullname != _LLAMA_MODELING:
             return None
@@ -260,11 +254,8 @@ class _PatchLlamaModelingOnImport(importlib.abc.MetaPathFinder):
         exec_module = spec.loader.exec_module
 
         def exec_and_patch(module):
-            # modeling_llama -> modeling_utils -> quantizers -> torchao: torchao
-            # warns about incompatible torch versions, and its
-            # register_as_pytree_constant() calls on Enum types make
-            # torch.utils._pytree log a deprecation warning once per Enum and per
-            # rank. Neither is actionable here, so both are muted for this import.
+            # This import reaches torchao, whose torch-version warning and per-Enum
+            # pytree deprecation logs (once per rank) are not actionable; mute both.
             muted = [
                 logging.getLogger("torchao"),
                 logging.getLogger("torch.utils._pytree"),
