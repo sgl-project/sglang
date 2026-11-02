@@ -203,7 +203,7 @@ def test_retraction_holds_prompt_kv_after_media_release() -> None:
     override = get_context().override_server_args()
     override.install()
     try:
-        allocator = MagicMock(device=torch.device("cpu"), page_size=1)
+        allocator = MagicMock(device=torch.device("cpu"), page_size=1, storage=None)
         tree = RadixCache.create_simulated(mock_allocator=allocator)
         tree.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.zeros(1, 16, dtype=torch.int64),

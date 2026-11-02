@@ -1807,7 +1807,7 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter
+                    i, len(self.running_batch.reqs) - release_counter, requeue=True
                 )
             else:
                 keep_indices.append(i)
