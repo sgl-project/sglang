@@ -110,11 +110,13 @@ def offer_future_relay_buffers(relay: FutureRelayBuffers) -> None:
     _offered_relay = relay
 
 
-def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> bool:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
+
+    return whether a decode graph owns input resolution and sequence-length publication
     """
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
@@ -151,6 +153,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
         future_map._resolve_spec_extras(batch)
+    return False
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2

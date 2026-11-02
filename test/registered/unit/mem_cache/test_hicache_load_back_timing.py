@@ -9,7 +9,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -60,6 +60,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         stub = object.__new__(UnifiedRadixCache)
+        stub.components = {}
         stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
         stub.ongoing_load_back = {
             node_id: (object(), None, None) for node_id in ack.node_ids

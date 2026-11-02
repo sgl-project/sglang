@@ -47,6 +47,7 @@ class KernelBackend(str, Enum):
     HELION = "helion"
     KDA = "KDA"  # Kernel Design Agents generated implementation
     CAKE = "cake"  # Cake-generated implementation, distributed by FlashInfer
+    PLUGIN = "plugin"  # out-of-tree kernel library (plugin_kernels)
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)

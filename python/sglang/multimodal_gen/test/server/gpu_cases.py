@@ -1364,6 +1364,12 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         ),
+        # 85x48 image tokens pad to the 1024x1024 warmup's 4096 (2048 per rank)
+        # over another grid, so RoPE tables kept from the warmup corrupt it
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1360x768",
+        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
@@ -1661,6 +1667,7 @@ STANDALONE_FILES = {
     ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1675,10 +1682,12 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
     ],
 }
@@ -1710,6 +1719,9 @@ STANDALONE_FILE_EST_TIMES = {
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
+        # Initial H200 full-process observation: 97 s; refresh on H100 CI.
+        # This is a partitioning estimate, not a performance gate.
+        "../single_test_file/test_nomas_offline.py": 100.0,
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
@@ -1730,12 +1742,17 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
+        # two spawned ranks on a tiny random-init transformer, no model load;
+        # measured 48 s in CI
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
+        "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }

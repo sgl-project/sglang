@@ -309,6 +309,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
             one_shot_pull_threshold=0,
             two_shot_pull_threshold=0,
             mc=tuned.eager.mc._replace(min_bytes=0, max_bytes=0),
+            two_shot_push_threshold=0,
         )
         comm.config = tuned._replace(eager=eager)
         assert not comm.should_custom_ar(inp[0])

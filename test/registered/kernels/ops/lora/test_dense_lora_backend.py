@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 from sglang.srt.runtime_context import reset_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 pytestmark = pytest.mark.skipif(

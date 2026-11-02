@@ -23,7 +23,10 @@ from sglang.srt.layers.layer_boundary.row_transport import (
     RowTransport,
     TransportRows,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    post_experts_output_is_complete,
+)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
@@ -529,9 +532,14 @@ class MoeTransport(MoeRowTransport):
         self.input = None
         if isinstance(hidden_states, MoEOutput):
             completion = MoeFinalize(hidden_states)
+            # Without a declared group, only an a2a combine that already summed
+            # the experts finalizes locally; a fallback that did not still owes it.
+            summed = self.rows.group is None and post_experts_output_is_complete(
+                is_tp_path=False
+            )
             return (
                 completion.complete(reduce=False)
-                if self.mlp_reduce_scatter
+                if self.mlp_reduce_scatter or summed
                 else completion
             )
         if self.rows.group is not None and not self.mlp_reduce_scatter:

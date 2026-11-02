@@ -22,15 +22,17 @@ from sglang.srt.configs.linear_attn_model_registry import (
     import_backend_class,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_sail
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,13 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.dsa_backend import (
+            SailDeepseekSparseAttnBackend,
+        )
+
+        return SailDeepseekSparseAttnBackend(runner)
+
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)
@@ -176,6 +185,11 @@ def _create_nsa_compat(runner):
 
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
+    if (_is_hip or _is_npu) and get_exec().kernel.dsv4_prefill_backend == "cutedsl_h16":
+        platform = "HIP" if _is_hip else "NPU"
+        raise ValueError(
+            f"DeepSeek-V4 cutedsl_h16 prefill requires CUDA SM90, not {platform}."
+        )
     if _is_npu:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
             DeepseekV4AscendAttnBackend,
@@ -214,6 +228,16 @@ def create_triton_backend(runner):
     return TritonAttnBackend(runner)
 
 
+@register_attention_backend("unlimited_ocr_v2")
+def create_unlimited_ocr_v2_backend(runner):
+    """Build the DASH block-sparse attention backend for Unlimited-OCR v2."""
+    from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
+        UnlimitedOCRV2AttnBackend,
+    )
+
+    return UnlimitedOCRV2AttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -230,6 +254,13 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+            SailFlashMLABackend,
+        )
+
+        return SailFlashMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
@@ -240,10 +271,19 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+        assert (
+            major == 8 and (_is_sail or not runner.use_mla_backend)
+        ) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend,
+            )
+
+            return SailFlashAttentionBackend(runner)
+
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
@@ -362,7 +402,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     from sglang.srt.configs.dots3 import Dots3Config
-    from sglang.srt.configs.model_config import is_minimax_sparse
+    from sglang.srt.configs.model_config import (
+        is_minimax_sparse,
+        uses_minimax_m3_nvfp4_native_stack,
+    )
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):
         return runner.model_config.hf_text_config.wrap_attention_backend(
@@ -370,6 +413,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if is_minimax_sparse(runner.model_config.hf_config):
+        if uses_minimax_m3_nvfp4_native_stack(runner.model_config.quantization):
+            from sglang.srt.layers.attention.minimax_sparse_nvfp4_backend import (
+                MiniMaxSparseNvfp4AttnBackend,
+            )
+
+            return MiniMaxSparseNvfp4AttnBackend(runner)
         from sglang.srt.layers.attention.minimax_sparse_backend import (
             MiniMaxHybridAttnBackend,
             MiniMaxSparseAttnBackend,

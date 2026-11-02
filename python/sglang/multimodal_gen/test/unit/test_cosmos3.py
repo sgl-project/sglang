@@ -60,6 +60,8 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
+    sequence_shard_padding,
+    shard_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -1277,6 +1279,57 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
                     )
 
 
+class TestCosmos3DecodeFastPath(unittest.TestCase):
+    """The VAE decode runs on the fast path exactly when the quality allows it."""
+
+    def test_fast_path_follows_request_quality(self):
+        class _VAE(torch.nn.Module):
+            supports_decode_on_frames = False
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.config = types.SimpleNamespace(scaling_factor=1.0)
+
+            def decode(self, z):
+                return z[:, :3].clamp(-1, 1)
+
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = _VAE()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage._latents_mean = stage._latents_std = None
+        stage.log_info = stage.log_debug = lambda *_args, **_kwargs: None
+        stage.use_declared_component = lambda **_kwargs: contextlib.nullcontext()
+        gates = []
+
+        @contextlib.contextmanager
+        def record_gate(vae, enabled):
+            gates.append((vae, enabled))
+            yield
+
+        for quality in ("lossless", "high", "exact"):
+            batch = types.SimpleNamespace(
+                data_type=DataType.VIDEO,
+                latents=torch.zeros(1, 4, 2, 3, 3),
+                extra={},
+                sampling_params=Cosmos3SamplingParams(prompt="a", quality=quality),
+                action_latents=None,
+                audio_latents=None,
+                metrics=None,
+                rollout_trajectory_data=None,
+            )
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.cosmos3.use_vae_fast_path",
+                record_gate,
+            ):
+                stage.forward(batch, types.SimpleNamespace())
+        self.assertEqual(
+            gates, [(stage.vae, True), (stage.vae, True), (stage.vae, False)]
+        )
+
+
 class TestCosmos3MRoPE(unittest.TestCase):
     """mRoPE position-ID computation for vision / sound / action token grids."""
 
@@ -2191,6 +2244,31 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
         self.assertIn("seconds long", final)
 
 
+class TestCosmos3SequenceSharding(unittest.TestCase):
+    def test_sequence_sharding_helpers(self):
+        """Every GEN modality (video, control, action, sound) rides one pad-and-
+        shard rule under Ulysses: tokens pad with zeros, RoPE positions pad by
+        repeating the last entry, each rank gets one contiguous chunk, and
+        degree 1 returns the input itself."""
+        self.assertEqual(sequence_shard_padding(10, 1), 0)
+        self.assertEqual(sequence_shard_padding(10, 4), 2)
+        self.assertEqual(sequence_shard_padding(12, 4), 0)
+        tokens = torch.arange(10.0).view(1, 10, 1)
+        self.assertEqual(
+            shard_sequence(tokens, 4, 0, dim=1, pad_last=False).flatten().tolist(),
+            [0.0, 1.0, 2.0],
+        )
+        self.assertEqual(
+            shard_sequence(tokens, 4, 3, dim=1, pad_last=False).flatten().tolist(),
+            [9.0, 0.0, 0.0],
+        )
+        positions = torch.arange(10).view(1, 1, 10).expand(3, 1, 10)
+        last = shard_sequence(positions, 4, 3, dim=2, pad_last=True)
+        self.assertEqual(last.shape, (3, 1, 3))
+        self.assertEqual(last[0, 0].tolist(), [9, 9, 9])
+        self.assertIs(shard_sequence(tokens, 1, 0, dim=1, pad_last=False), tokens)
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip is None, "requires CUDA"
 )
@@ -2232,6 +2310,47 @@ class TestCosmos3VideoPreprocess(CustomTestCase):
                 self.assertEqual(actual.shape, (1, 3, 45 if force_cpu else 5, 24, 40))
                 outputs.append(actual[:, :, :5].cpu())
         self.assertTrue(torch.equal(outputs[0], outputs[1]))
+
+    def test_vae_cache_key(self):
+        """Video content and VAE settings distinguish Cosmos3 cache entries."""
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        class VAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = types.SimpleNamespace(
+                    latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+                )
+                self.calls = 0
+                self.use_tiling = False
+
+            @conditioning.cached_vae_encode
+            def encode(self, pixels):
+                self.calls += 1
+                mean = pixels * (2 if self.use_tiling else 1)
+                return DiagonalGaussianDistribution(
+                    torch.cat([mean, torch.zeros_like(mean)], dim=1)
+                )
+
+        stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        stage.vae = VAE().eval()
+        cache = conditioning.ConditioningCache(1024 * 1024)
+        video = torch.zeros(1, 3, 5, 16, 16, device="cuda")
+        video[:, :, 0] = 1
+        with torch.no_grad(), cache.scope():
+            self.assertTrue(torch.equal(stage._vae_encode(video), video))
+            hit = stage._vae_encode(video.clone())
+            self.assertTrue(torch.equal(hit, video))
+            self.assertEqual(stage.vae.calls, 1)
+            changed = video.clone()
+            changed[:, :, -1] = 0.5
+            self.assertTrue(torch.equal(stage._vae_encode(changed), changed))
+            self.assertEqual(stage.vae.calls, 2)
+            stage.vae.use_tiling = True
+            self.assertTrue(torch.equal(stage._vae_encode(video), video * 2))
+            self.assertEqual(stage.vae.calls, 3)
 
 
 if __name__ == "__main__":

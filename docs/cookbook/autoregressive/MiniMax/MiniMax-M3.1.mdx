@@ -63,14 +63,14 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 Pick your hardware + recipe to generate the launch command. The serving strategies cover the common operating points:
 
-- **Low-Latency** — fastest responses with a few users at once. On B300 it serves one request at a time through the MSA-V1 MonoKernel; on AMD it is a TP4 recipe for up to about 32 concurrent requests.
+- **Low-Latency** — fastest responses with a few users at once. On B300, GB300, B200 and GB200 it serves one request at a time through the MSA-V1 MonoKernel; on AMD it is a TP4 recipe for up to about 32 concurrent requests.
 - **Balanced** — good speed with several users at once. Use for typical multi-user serving.
 - **High-Throughput** — most tokens per second across many users. Best for batch jobs and many concurrent agent sessions.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/MiniMaxAI/minimax-m3.1.jsx";
 
-<Deployment config={config} />
+<Deployment config={config} agenticLink="agentic-long-context-deployment" />
 
 ## Playground
 
@@ -79,6 +79,19 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration; flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/MiniMaxAI/minimax-m3.1.jsx";
+
+<AgentX data={agentx} />
 
 ## 1. Model Introduction
 
@@ -105,7 +118,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ### MonoKernel (Low-Latency)
 
-The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--monokernel-backend msa`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
+The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 MonoKernel plugin with `--monokernel-backend msa`. The plugin supports Blackwell sm_100 and sm_103 (B200 / GB200 and B300 / GB300) at `--tp 4` only; it has been measured on B300. B200 and GB200 run the same command; their final verification is in progress. Each MoE layer of the DSpark verify step runs as two persistent kernels, MegaAttention then the token-parallel MoE, each fused with its TP4 all-reduce. The DSpark draft step runs as one cooperative kernel per rank. On 4x B300 with the acceptance length fixed at 5, decode reaches 1028 tokens/s at 1K context, 919 at 256K and 723 at 1M, against 479, 465 and 408 on the standard path.
 
 - **Batch size 1 only.** Prefill, plain decode and batches of more than one request run on the standard path, so throughput under concurrency is lower than the Balanced recipe. The recipe caps `--max-running-requests` at 8.
 - **Required flags.** The plugin needs `--page-size 128`, a DSpark chain of 8 draft tokens (`--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 --speculative-dspark-block-size 7`), and `--disable-attn-tp-gather`; without the last one SGLang pads the 7-row draft block and the server refuses to start. At startup the server lists every unsupported setting it finds, and the log confirms the plugin with `--monokernel-backend msa: minimax_m3_msa_v1 on sm_103, widths [8]`.
@@ -116,7 +129,7 @@ The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 Mo
 
 ### Memory and workload tuning
 
-- **`--mem-fraction-static 0.8`** is the validated value at `--tp 4` on B300, and also on B200. The pool it reserves holds the NVFP4 main KV cache, the sparse-attention index cache and the bf16 DSpark draft KV cache. B200 has 192 GB per GPU against B300's 288 GB. Its high-throughput recipe (`--tp 8 --attn-dp-size 2`) therefore uses `--mem-fraction-static 0.75` and `--cuda-graph-max-bs-prefill 16384`. With B300's settings, 8x B200 runs out of GPU memory capturing the 32k-token prefill CUDA graphs, and then while preprocessing images on GPU 0.
+- **`--mem-fraction-static 0.8`** is the validated value at `--tp 4` on B300, and also on B200. The pool it reserves holds the NVFP4 main KV cache, the sparse-attention index cache and the bf16 DSpark draft KV cache. B200 has 192 GB per GPU against B300's 288 GB. Its high-throughput recipe (`--tp 8 --attn-dp-size 2`) therefore uses `--mem-fraction-static 0.75` and `--cuda-graph-max-bs-prefill 16384`. With B300's settings, 8x B200 runs out of GPU memory capturing the 32k-token prefill CUDA graphs, and then while preprocessing images on GPU 0. GB200 has 186 GB per GPU and four GPUs per node, so its high-throughput recipe is the GB300 TP4 + EP4 command with the same `--cuda-graph-max-bs-prefill 16384`; its Balanced recipe is B200's. All GB200 recipes are in final verification.
 - **`--tokenizer-worker-num 8`.** With 100K-token prompts a single tokenizer process becomes the bottleneck: tokenization blocks the server's event loop and TTFT climbs under load even when the GPUs have headroom. Eight workers remove that ceiling, so every recipe above sets it.
 - **Hierarchical KV cache for multi-turn traffic.** `--enable-hierarchical-cache --hicache-size <GB per rank>` keeps evicted prefixes in host memory so a returning session reloads its prefix instead of recomputing it. Adding `--hicache-storage-backend mooncake` puts a Mooncake storage tier (L3) under it, which a set of replicas can share; pick **Mooncake** under **Storage** in the HiCache card of the [Playground](#playground). The Mooncake tier is validated on GB300 and B300, with DSpark and with DFlash speculative decoding. Other storage backends have not been validated. For the Mooncake master and environment setup, see [Deployment with Mooncake](../../../docs/advanced_features/hicache_best_practices#deployment-with-mooncake). When several replicas serve one endpoint, put the router in front with `--policy cache_aware` so a session's later turns reach the replica that holds its prefix.
 - **`--max-running-requests` and `--cuda-graph-max-bs-decode`** are both 128 in the recipes. Keep them equal so every decode batch the scheduler can form replays a captured CUDA graph.

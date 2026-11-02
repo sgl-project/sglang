@@ -156,6 +156,7 @@ impl TokenizerRegistry {
             always_thinks: false,
             reasoning_toggle: None,
             chat_encoding_spec: None,
+            deepseek: None,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;
@@ -177,8 +178,11 @@ impl TokenizerRegistry {
                             toggle_param: toggle_param.into(),
                             default_enabled,
                         });
-                if formatter.is_kimi_k3() {
-                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
+                // Kimi-K3's encoding spec, or DeepSeek's with the checkpoint its output is parsed with.
+                if let Some(processor) = formatter.processor() {
+                    let model = ChatModel::for_formatter(processor);
+                    me.chat_model.chat_encoding_spec = model.chat_encoding_spec;
+                    me.chat_model.deepseek = model.deepseek;
                 }
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
@@ -506,7 +510,12 @@ mod tests {
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let tok = dir.path().join("tokenizer.json");
-        std::fs::write(&tok, "{}").unwrap();
+        // DeepSeek-V4 loads the checkpoint tokenizer, so it must parse.
+        std::fs::write(
+            &tok,
+            include_str!("../../tests/fixtures/tiny_tokenizer.json"),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("chat_template.jinja"), "T").unwrap();
         let resolve = |model_type: &str| {
             let cfg = serde_json::json!({ "model_type": model_type }).to_string();
