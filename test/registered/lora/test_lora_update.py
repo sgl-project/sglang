@@ -43,7 +43,7 @@ register_cuda_ci(
 )
 register_amd_ci(
     est_time=380,
-    suite="stage-b-test-1-gpu-large-amd",
+    suite="extra-a-test-1-gpu-large-amd",
 )
 
 PROMPTS = [
