@@ -6496,6 +6496,7 @@ class Scheduler(
             "load_inquirer",
             "output_streamer",
             "batch_result_processor",
+            "deferred_responses",
         ):
             comp = getattr(self, name, None)
             if comp is not None and hasattr(comp, "disaggregation_mode"):
