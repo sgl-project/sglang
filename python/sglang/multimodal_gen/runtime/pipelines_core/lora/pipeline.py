@@ -167,6 +167,10 @@ class LoRAPipeline(ComposedPipelineBase):
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
     lora_adapters: dict[str, dict[str, torch.Tensor]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
+    loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
+    loaded_adapter_configs: dict[str, dict]  # nickname -> PEFT config at load
+    # nickname -> (size, mtime_ns) of the file at load
+    loaded_adapter_fingerprints: dict[str, tuple[int, int]]
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
@@ -198,6 +202,9 @@ class LoRAPipeline(ComposedPipelineBase):
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
+        self.loaded_adapter_files = {}
+        self.loaded_adapter_configs = {}
+        self.loaded_adapter_fingerprints = {}
         self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
@@ -334,7 +341,7 @@ class LoRAPipeline(ComposedPipelineBase):
         elif target is not None:
             if use_module_names_only:
                 if target == "all":
-                    module_names = ["transformer", "transformer_2"]
+                    module_names = ["transformer", "transformer_2", "critic"]
                 elif target in ["transformer", "transformer_2", "critic"]:
                     module_names = [target]
             else:
@@ -498,7 +505,7 @@ class LoRAPipeline(ComposedPipelineBase):
         model half converted, and covers the dynamic ``set_lora`` API as well as
         a startup ``--lora-path``.
         """
-        for module_name in ("transformer", "transformer_2"):
+        for module_name in ("transformer", "transformer_2", "fake_score_transformer"):
             module = self.modules.get(module_name)
             if module is None:
                 continue
@@ -797,6 +804,7 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count = 0
         missing_layers_by_adapter = [[] for _ in lora_nicknames]
         applied_count_by_adapter = [0 for _ in lora_nicknames]
+        use_cache = merge_cache is not None and merge_weights
         for name, layer in lora_layers.items():
             adapted_before = adapted_count
             # Apply all LoRA adapters in order
@@ -829,7 +837,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     layer.lora_rank = inferred_rank
                     layer.lora_alpha = inferred_alpha
 
-                    use_cache = merge_cache is not None and merge_weights
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
@@ -843,8 +850,6 @@ class LoRAPipeline(ComposedPipelineBase):
                         clear_existing=clear_existing
                         and adapted_count == adapted_before,
                     )
-                    if use_cache and idx == len(lora_nicknames) - 1:
-                        self._merge_via_cache(name, layer, merge_cache)
                     adapted_count += 1
                     applied_count_by_adapter[idx] += 1
                 else:
@@ -863,6 +868,9 @@ class LoRAPipeline(ComposedPipelineBase):
                                     layer.unmerge_lora_weights()
                                 layer.clear_lora_weights()
                             layer.disable_lora = True
+            # Merge once every adapter is set, even if the last one skips this layer.
+            if use_cache and adapted_count > adapted_before:
+                self._merge_via_cache(name, layer, merge_cache)
 
         if rank == 0:
             total_layers = len(lora_layers)
@@ -1009,6 +1017,8 @@ class LoRAPipeline(ComposedPipelineBase):
         if rank != 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
+        stat = os.stat(os.path.realpath(lora_local_path))
+        adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(
@@ -1079,6 +1089,9 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_adapters[lora_nickname] = new_adapter
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
+        self.loaded_adapter_files[lora_nickname] = lora_local_path
+        self.loaded_adapter_configs[lora_nickname] = adapter_config
+        self.loaded_adapter_fingerprints[lora_nickname] = adapter_fingerprint
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
@@ -1158,8 +1171,14 @@ class LoRAPipeline(ComposedPipelineBase):
             elif (
                 alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
             ):
-                self.loaded_adapter_alphas[nickname] = alpha
+                # Reload: fused GQA groups bake the alpha into lora_B at load time.
                 adapter_updated = True
+                self.load_lora_adapter(
+                    self.loaded_adapter_paths[nickname],
+                    nickname,
+                    rank,
+                    lora_alpha=alpha,
+                )
 
         # Group by target to apply separately
         target_to_indices = {}
@@ -1213,10 +1232,24 @@ class LoRAPipeline(ComposedPipelineBase):
                     module_name,
                     tgt_nicknames,
                     tgt_strengths,
-                    merge_weights_by_module[module_name],
+                    merge_weights_by_module[module_name]
+                    # auto already kept this adapter unmerged; that state matches
+                    and not (
+                        merge_mode == "auto"
+                        and len(tgt_nicknames) == 1
+                        and self._auto_merge_rounds_away(
+                            module_name,
+                            lora_layers_dict,
+                            tgt_nicknames,
+                            tgt_paths,
+                            rank,
+                            tgt_strengths,
+                            measure=False,
+                        )
+                    ),
                     adapter_updated,
                 )
-                for module_name, _ in target_modules
+                for module_name, lora_layers_dict in target_modules
             ):
                 logger.info("LoRA configuration matches exactly, skipping")
                 continue
@@ -1260,7 +1293,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         merge_cache = self._merge_cache_for(
                             module_name,
                             lora_layers_dict,
-                            tgt_paths,
+                            tgt_nicknames,
                             tgt_strengths,
                             enabled=cache_merged and effective_merge_weights,
                         )
@@ -1320,9 +1353,11 @@ class LoRAPipeline(ComposedPipelineBase):
         paths: list[str | None],
         rank: int,
         strengths: list[float],
+        measure: bool = True,
     ) -> bool:
         """Whether merge_mode "auto" should keep this adapter unmerged on the
-        module. It is attached unmerged to measure, which is where it stays."""
+        module. It is attached unmerged to measure, which is where it stays.
+        With ``measure=False`` only a cached result is used."""
         key = (
             module_name,
             tuple(paths),
@@ -1330,6 +1365,8 @@ class LoRAPipeline(ComposedPipelineBase):
             tuple(self.loaded_adapter_alphas.get(n) for n in nicknames),
         )
         if key not in self.auto_merge_rounding_loss:
+            if not measure:
+                return False
             self._apply_lora_to_layers(
                 lora_layers,
                 nicknames,
@@ -1377,13 +1414,15 @@ class LoRAPipeline(ComposedPipelineBase):
         self,
         module_name: str,
         lora_layers: dict[str, BaseLayerWithLoRA],
-        lora_paths: list[str | None],
+        nicknames: list[str],
         strengths: list[float],
         enabled: bool,
     ) -> LoraMergeCache | None:
         if not enabled or envs.SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE:
             return None
-        if any(path is None for path in lora_paths):
+        # Key on the resolved local file: the user-facing path may be a repo id.
+        files = [self.loaded_adapter_files.get(nickname) for nickname in nicknames]
+        if any(file is None for file in files):
             return None
         if any(layer.weight.device.type != "cpu" for layer in lora_layers.values()):
             # Cache entries are CPU mappings. Rebinding a resident accelerator
@@ -1393,11 +1432,24 @@ class LoRAPipeline(ComposedPipelineBase):
             # Sharded weights would need per-rank stores; not worth it until a
             # multi-GPU consumer deployment exists.
             return None
+        # The effective alpha and PEFT config change the merged delta too. Use the
+        # config snapshotted at load, since the weights were normalized with it.
         adapters = [
-            (path, strength, self.server_args.lora_alpha)
-            for path, strength in zip(lora_paths, strengths)
+            (
+                file,
+                strength,
+                (
+                    self.loaded_adapter_alphas.get(n),
+                    self.loaded_adapter_configs.get(n),
+                ),
+            )
+            for file, n, strength in zip(files, nicknames, strengths)
         ]
-        key = lora_merge_cache_key([self.server_args.model_path, module_name], adapters)
+        key = lora_merge_cache_key(
+            [self.server_args.model_path, module_name],
+            adapters,
+            [self.loaded_adapter_fingerprints.get(n) for n in nicknames],
+        )
         expected = sum(
             layer.weight.numel() * layer.weight.element_size()
             for layer in lora_layers.values()

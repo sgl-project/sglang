@@ -1756,6 +1756,11 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for name, param in model.state_dict().items():
+        # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+        # MXFP8 weight scales to 2**-127.
+        if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
+            param.fill_(127)
+            continue
         if torch.is_floating_point(param):
             # Neutral FP4 global scales keep fused gate/up projections compatible.
             if name.endswith(("weight_scale_inv", "weight_scale_2")):
