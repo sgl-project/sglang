@@ -34,23 +34,15 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
-        *,
-        backend=None,
     ):
-        self.backend = backend
         self._layer_weight_specs = layer_weight_specs
         self._handles = handles
         self._local_start = local_start
         self._local_end = local_end
         self._dwdp_size = dwdp_size
         self._device_id = device_id
-        if backend is None:
-            self._granularity = get_device_granularity(device_id)
-            self._prop = make_device_allocation_prop(device_id, handle_types=None)
-            self.device = torch.device("cuda", device_id)
-        else:
-            self._granularity = backend.granularity
-            self.device = backend.device
+        self._granularity = get_device_granularity(device_id)
+        self._prop = make_device_allocation_prop(device_id, handle_types=None)
         self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
@@ -71,17 +63,9 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
-        *,
-        backend=None,
     ) -> WeightBuffer:
         buf = cls(
-            layer_weight_specs,
-            handles,
-            local_start,
-            local_end,
-            dwdp_size,
-            device_id,
-            backend=backend,
+            layer_weight_specs, handles, local_start, local_end, dwdp_size, device_id
         )
         for li, ws in layer_weight_specs.items():
             buf._layouts[li] = {}
@@ -98,19 +82,9 @@ class WeightBuffer:
 
         assignments = {li: buf.buffer_index_for_layer(li) for li in layer_weight_specs}
         slot_sizes = compute_slot_sizes(buf._layouts, assignments)
-        if backend is None:
-            buf._page_pool = PagePool.create(
-                slot_sizes, device_id, page_size=buf._pool_page_size
-            )
-        else:
-            buf._page_pool = PagePool(
-                slot_sizes,
-                device_id,
-                granularity=buf._granularity,
-                page_size=buf._pool_page_size,
-                allocate_page=backend.allocate,
-                release_page=backend.release_page,
-            )
+        buf._page_pool = PagePool.create(
+            slot_sizes, device_id, page_size=buf._pool_page_size
+        )
 
         for li in buf._moe_layer_indices:
             buf._setup_layer(li)
@@ -136,15 +110,12 @@ class WeightBuffer:
             spec = weight_specs[name]
             handle = self._handles.get_handle(layer_idx, name)
 
-            if self.backend is None:
-                reservation = VmmReservation(
-                    layout.total_size,
-                    self._prop,
-                    self._device_id,
-                    alignment=self._granularity,
-                )
-            else:
-                reservation = self.backend.reserve(layout.total_size)
+            reservation = VmmReservation(
+                layout.total_size,
+                self._prop,
+                self._device_id,
+                alignment=self._granularity,
+            )
             self._reservations[layer_idx].append(reservation)
             va_base = reservation.base
 
@@ -171,21 +142,13 @@ class WeightBuffer:
                 page_pool_offset += layout.post_pages
 
             tensor_start = va_base + layout.pre_padding
-            if self.backend is None:
-                full_tensor = tensor_from_pointer(
-                    tensor_start,
-                    layout.num_experts * layout.expert_bytes,
-                    shape=spec.full_shape,
-                    dtype=spec.dtype,
-                    device_id=self._device_id,
-                )
-            else:
-                full_tensor = self.backend.tensor(
-                    tensor_start,
-                    layout.num_experts * layout.expert_bytes,
-                    shape=spec.full_shape,
-                    dtype=spec.dtype,
-                )
+            full_tensor = tensor_from_pointer(
+                tensor_start,
+                layout.num_experts * layout.expert_bytes,
+                shape=spec.full_shape,
+                dtype=spec.dtype,
+                device_id=self._device_id,
+            )
 
             self._tensors[layer_idx][name] = full_tensor
 
@@ -239,17 +202,13 @@ class WeightBuffer:
     def release(self) -> None:
         if self._released:
             return
-        if self.backend is None:
-            self._released = True
-            for reservations in self._reservations.values():
-                for reservation in reservations:
-                    reservation.close()
-        else:
-            self.backend.close_mappings()
+        self._released = True
+        for reservations in self._reservations.values():
+            for reservation in reservations:
+                reservation.close()
         self._reservations.clear()
         self._tensors.clear()
         self._remote_slices.clear()
         if self._page_pool is not None:
             self._page_pool.release()
             self._page_pool = None
-        self._released = True

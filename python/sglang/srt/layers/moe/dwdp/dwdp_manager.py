@@ -17,11 +17,10 @@ from sglang.srt.layers.moe.dwdp.layout import (
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -36,16 +35,7 @@ class DwdpManager:
     def __init__(self, server_args: ServerArgs):
         self.dwdp_size = get_parallel().dwdp_size
         self.dwdp_rank = get_parallel().tp_rank
-        self._backend = None
-        if is_npu():
-            from sglang.srt.hardware_backend.npu.dwdp.vmm import NPUBackend
-
-            self.device_id = torch.npu.current_device()
-            self._backend = NPUBackend(self.device_id, get_parallel().tp_group)
-            self._device_module = torch.npu
-        else:
-            self.device_id = torch.cuda.current_device()
-            self._device_module = torch.cuda
+        self.device_id = torch.cuda.current_device()
         self.layout: Optional[DwdpExpertLayout] = None
 
         self._weight_manager: Optional[DWDPWeightManager] = None
@@ -88,11 +78,8 @@ class DwdpManager:
 
         local_params = {}
         for li, experts in moe_layers:
-            for name in _EXPERT_WEIGHT_NAMES:
-                param = getattr(experts, name)
-                local_params[li, name] = (
-                    param if self._backend is not None else param.data
-                )
+            local_params[(li, "w13_weight")] = experts.w13_weight.data
+            local_params[(li, "w2_weight")] = experts.w2_weight.data
         layer_weight_specs = build_layer_weight_specs(
             local_params, self.layout.num_routed_experts
         )
@@ -104,7 +91,6 @@ class DwdpManager:
             group=group,
             layout=self.layout,
             device_id=self.device_id,
-            backend=self._backend,
         )
 
         weight_buffer = WeightBuffer.create(
@@ -114,7 +100,6 @@ class DwdpManager:
             local_end=self.layout.local_expert_end,
             dwdp_size=self.dwdp_size,
             device_id=self.device_id,
-            backend=self._backend,
         )
 
         self._fill_edge_bytes(weight_buffer, transport.peer_views)
@@ -128,7 +113,6 @@ class DwdpManager:
             dwdp_rank=self.dwdp_rank,
             dwdp_size=self.dwdp_size,
             transport=transport,
-            device_module=self._device_module,
         )
 
         for li, experts in moe_layers:
@@ -140,8 +124,6 @@ class DwdpManager:
             )
         self._allgather_small_params(moe_layers, group)
 
-        if self._backend is not None:
-            self._backend.ready(len(moe_layers))
         logger.info("DWDP setup complete.")
 
     def prefetch_first_layers(self) -> None:
@@ -160,14 +142,9 @@ class DwdpManager:
         if self._weight_manager is not None:
             self._weight_manager.release()
             self._weight_manager = None
-        elif self._backend is not None:
-            self._backend.prepare_release(None, {})
-            self._backend.close()
 
     @staticmethod
     def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
         decoder = model.model if hasattr(model, "model") else model
         moe_layers = []
         for layer_idx, layer in enumerate(decoder.layers):
@@ -211,7 +188,7 @@ class DwdpManager:
                     if key in peer_views:
                         full_tensor[nxt].copy_(peer_views[key][nxt - ps])
 
-        self._device_module.synchronize(weight_buffer.device_id)
+        torch.cuda.synchronize(weight_buffer.device_id)
 
     def _allgather_small_params(
         self, moe_layers: List[Tuple[int, FusedMoE]], group
@@ -224,8 +201,6 @@ class DwdpManager:
                 shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]
                 dist.all_gather(shards, data, group=group.device_group)
                 full = torch.cat(shards, dim=0)[:num_total].contiguous()
-                if self._backend is not None:
-                    full = self._backend.postprocess_tensor(pname, full, experts)
                 experts.replace_expert_tensor(pname, full)
 
                 logger.debug(
