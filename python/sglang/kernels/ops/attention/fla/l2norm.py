@@ -14,6 +14,152 @@ from sglang.kernels.ops.attention.fla.utils import input_guard
 BT_LIST = [8, 16, 32, 64, 128]
 
 
+@triton.jit(do_not_specialize=["TQ", "TK"])
+def fused_l2norm_qk_kernel(
+    q,
+    k,
+    q_out,
+    k_out,
+    eps,
+    TQ,
+    TK,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+
+    rows = i_t * BT + tl.arange(0, BT)
+    cols = tl.arange(0, BD)
+    col_mask = cols < D
+
+    q_mask = (rows[:, None] < TQ) & col_mask[None, :]
+    q_offs = rows[:, None] * D + cols[None, :]
+    b_q = tl.load(q + q_offs, mask=q_mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(b_q * b_q, axis=1)
+    b_q_out = b_q / tl.sqrt(q_var + eps)[:, None]
+    tl.store(q_out + q_offs, b_q_out.to(q_out.dtype.element_ty), mask=q_mask)
+
+    k_mask = (rows[:, None] < TK) & col_mask[None, :]
+    k_offs = rows[:, None] * D + cols[None, :]
+    b_k = tl.load(k + k_offs, mask=k_mask, other=0.0).to(tl.float32)
+    k_var = tl.sum(b_k * b_k, axis=1)
+    b_k_out = b_k / tl.sqrt(k_var + eps)[:, None]
+    tl.store(k_out + k_offs, b_k_out.to(k_out.dtype.element_ty), mask=k_mask)
+
+
+@triton.jit(do_not_specialize=["TQ", "TK"])
+def fused_l2norm_qk_kernel1(
+    q,
+    k,
+    q_out,
+    k_out,
+    D,
+    BD: tl.constexpr,
+    eps,
+    TQ,
+    TK,
+):
+    i_t = tl.program_id(0)
+    cols = tl.arange(0, BD)
+    mask = cols < D
+    offs = i_t * D + cols
+
+    if i_t < TQ:
+        b_q = tl.load(q + offs, mask=mask, other=0.0).to(tl.float32)
+        q_var = tl.sum(b_q * b_q, axis=0)
+        b_q_out = b_q / tl.sqrt(q_var + eps)
+        tl.store(q_out + offs, b_q_out.to(q_out.dtype.element_ty), mask=mask)
+
+    if i_t < TK:
+        b_k = tl.load(k + offs, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(b_k * b_k, axis=0)
+        b_k_out = b_k / tl.sqrt(k_var + eps)
+        tl.store(k_out + offs, b_k_out.to(k_out.dtype.element_ty), mask=mask)
+
+
+def can_fuse_l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> bool:
+    if q.device != k.device or q.dtype != k.dtype:
+        return False
+    if not q.is_cuda or q.dtype not in (torch.bfloat16, torch.float32):
+        return False
+    if q.shape != k.shape:
+        return False
+    q_rows = q.numel() // q.shape[-1]
+    # Wide-shape sweep is positive through D=512 except for the launch-bound
+    # D=512, rows<32 corner. Keep unbenchmarked larger head dims on the existing
+    # two-kernel path.
+    if q.shape[-1] > 512 or (q.shape[-1] == 512 and q_rows < 32):
+        return False
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        return False
+    # `view(-1, D)` in the kernel wrapper must be valid without an implicit copy.
+    if not q.is_contiguous() or not k.is_contiguous():
+        return False
+    return True
+
+
+def fused_l2norm_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: Optional[torch.dtype] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not can_fuse_l2norm_qk(q, k):
+        raise ValueError("Incompatible Q/K tensors for fused_l2norm_qk")
+
+    q_shape_og = q.shape
+    k_shape_og = k.shape
+    q_flat = q.view(-1, q.shape[-1])
+    k_flat = k.view(-1, k.shape[-1])
+    TQ, TK, D = q_flat.shape[0], k_flat.shape[0], q_flat.shape[-1]
+
+    if output_dtype is None:
+        q_out = torch.empty_like(q_flat)
+        k_out = torch.empty_like(k_flat)
+    else:
+        q_out = torch.empty_like(q_flat, dtype=output_dtype)
+        k_out = torch.empty_like(k_flat, dtype=output_dtype)
+
+    MAX_FUSED_SIZE = 65536 // q.element_size()
+    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BD:
+        raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+
+    if D <= 512:
+        BT = 16
+        fused_l2norm_qk_kernel[(triton.cdiv(max(TQ, TK), BT),)](
+            q_flat,
+            k_flat,
+            q_out,
+            k_out,
+            eps,
+            TQ=TQ,
+            TK=TK,
+            D=D,
+            BT=BT,
+            BD=BD,
+            num_warps=8,
+            num_stages=3,
+        )
+    else:
+        fused_l2norm_qk_kernel1[(max(TQ, TK),)](
+            q_flat,
+            k_flat,
+            q_out,
+            k_out,
+            eps=eps,
+            D=D,
+            BD=BD,
+            TQ=TQ,
+            TK=TK,
+            num_warps=8,
+            num_stages=3,
+        )
+
+    return q_out.view(q_shape_og), k_out.view(k_shape_og)
+
+
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
