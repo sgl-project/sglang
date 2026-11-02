@@ -1249,6 +1249,37 @@ class TestJointLRUEviction(unittest.TestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
+    def test_allocation_reclaim_takes_the_joint_order_and_stops_at_the_first_fit(
+        self,
+    ):
+        # The order a plain eviction of everything takes.
+        full_cache, full_allocator = self._tree()
+        full_order = self._record_victims(full_cache)
+        full_cache.evict(self._params(full_allocator, 12, 12))
+
+        cache, allocator = self._tree()
+        owner = allocator.full_attn_allocator.sub_pool_name
+        pages = 1
+        while allocator.units_fit({owner: pages}):
+            pages += 1
+        demand = {owner: pages}
+        victims = self._record_victims(cache)
+        # Whether the demand already fit when each victim was taken.
+        fit_before = []
+        select = cache.tree_core.next_joint_eviction_victim
+
+        def checked():
+            fit_before.append(allocator.fits_after_frees(demand))
+            return select()
+
+        cache.tree_core.next_joint_eviction_victim = checked
+        self.assertTrue(cache.reclaim(demand))
+        # The joint order, stopped at the first victim after which it fits.
+        self.assertTrue(victims)
+        self.assertLess(len(victims), len(full_order))
+        self.assertEqual(victims, full_order[: len(victims)])
+        self.assertEqual(fit_before, [False] * len(victims))
+
     def test_a_window_slot_named_by_its_length_keeps_the_joint_order(self):
         # Unified pools name a window's tree slot by its length, not SWA.
         orders = []
