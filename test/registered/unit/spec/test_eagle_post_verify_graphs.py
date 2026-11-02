@@ -11,6 +11,7 @@ acceptance, and stay unchanged through the next round; rounds that run eagerly i
 between draw from the same forced-length generator."""
 
 import unittest
+import warnings
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -494,17 +495,28 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         )
         generator = torch.Generator(device="cuda").manual_seed(0)
         stream = torch.cuda.Stream()
+
+        def commit_probe(worker, batch, accept_lens, *args, **kwargs):
+            # A no-op mock produces an empty side-stream CUDA graph. Keep this
+            # a real device operation so replay and join are checked as well.
+            committed.copy_(accept_lens)
+
         with (
+            warnings.catch_warnings(),
             torch.cuda.stream(stream),
             patch.object(spec_utils, "SIMULATE_ACC_LEN", sim_acc_len),
             patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
             patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", "real-draft-token"),
-            patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            patch.object(
+                spec_utils, "commit_mamba_states_after_verify", side_effect=commit_probe
+            ),
             patch(
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
         ):
+            warnings.filterwarnings("error", message="The CUDA Graph is empty.*")
             for bs in BATCH_SIZES:
+                committed = torch.empty(bs, dtype=torch.int32, device="cuda")
                 # the verify graph's logits buffer: one per batch size, refilled
                 logits_buf = torch.empty(bs * TOKENS, VOCAB, device="cuda")
                 previous = None
@@ -523,6 +535,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     graphs.join()
                     if graphed:
                         self.assertIsNotNone(got)
+                        torch.testing.assert_close(committed, want[1])
                     else:
                         self.assertIsNone(got)
                         got = _eager(batch, verify_input, logits, worker_rng)
