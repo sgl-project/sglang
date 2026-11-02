@@ -10,8 +10,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_STANDALONE,
-    DEFAULT_TARGET_MODEL_STANDALONE,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -26,6 +25,10 @@ register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
 class StandaloneAdaptiveMixin:
     """Use singleton BS slots so switching does not depend on model acceptance."""
 
+    # Ungated, small checkpoints with identical token-to-id mappings. Different
+    # hidden sizes also exercise STANDALONE's lack of target hidden-state fusion.
+    model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+    draft_model = "Qwen/Qwen2.5-0.5B-Instruct"
     disable_cuda_graph = False
     base_url = DEFAULT_URL_FOR_TEST
     prompt = "Count from 1 to 400, separated by commas. Output only the numbers."
@@ -58,7 +61,7 @@ class StandaloneAdaptiveMixin:
             "--speculative-algorithm",
             "STANDALONE",
             "--speculative-draft-model-path",
-            DEFAULT_DRAFT_MODEL_STANDALONE,
+            cls.draft_model,
             "--speculative-adaptive",
             "--speculative-adaptive-config",
             str(config_path),
@@ -82,7 +85,7 @@ class StandaloneAdaptiveMixin:
         if cls.disable_cuda_graph:
             args.append("--disable-cuda-graph")
         cls.process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_STANDALONE,
+            cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=args,
