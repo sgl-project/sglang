@@ -2757,7 +2757,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return self._check_pp_prefetch_progress(request)
 
         if request not in self.ongoing_prefetch:
-            return True
+            # The ACK drain may have landed a declined read; wait for its re-issue.
+            return not self.storage_prefetch_retries.holds_admission(request.rid)
 
         operation = self.ongoing_prefetch[request].operation
 
@@ -2777,8 +2778,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.revoke_pending_prefetch(request)
             return True
         self._handle_prefetch_result(operation)
-        # A declined graft re-issues on the next pass; admitting now recomputes it.
-        return not self.storage_prefetch_retries.refetch_pending(request.rid)
+        return not self.storage_prefetch_retries.holds_admission(request.rid)
 
     def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
         # This function **owns**:
@@ -2849,11 +2849,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices=host_indices[:completed_tokens],
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
-            if insert_result.rotation_tail_declined:
-                # Another chain took this prefix during the read; the re-issue
-                # anchors on it and inherits its rotation, before admission.
+            if insert_result.rotation_tail_declined and not operation.deadline_expired:
+                # A chain with another rotation took this prefix during the read;
+                # a re-issue inherits that rotation. best_effort does not wait for it.
                 self.storage_prefetch_retries.refetch(
-                    request.rid, operation.storage_start + completed_tokens
+                    request.rid,
+                    operation.storage_start + completed_tokens,
+                    hold_admission=self.prefetch_stop_policy != "best_effort",
                 )
             loaded_from_storage = 0
         else:

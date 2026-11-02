@@ -74,7 +74,7 @@ def _shard_storage_io(
     *, pool: PageInterleaveHostPool, page_get: Callable, page_set: Callable
 ) -> tuple[Callable, Callable]:
     """Logical-page KV sharding: each rank reads and writes only its own
-    pages of a storage batch, as local host rows. Keys are rank-free."""
+    pages of a storage batch, as local host rows. Keys carry no owner rank."""
 
     def get_owned(operation, hash_values, host_indices, extra_info=None) -> int:
         positions, rows = pool.owned_storage_pages(host_indices)
@@ -85,9 +85,10 @@ def _shard_storage_io(
                 operation, [hash_values[i] for i in positions], rows, extra_info
             )
         except Exception:
-            # Only owners call the backend: one rank raising would leave the
-            # others blocked on the next prefetch ack collective.
-            logger.exception("Sharded storage read failed.")
+            # Keep the prefix before this rank's first owned page.
+            logger.exception(
+                "Sharded storage read failed for request %s.", operation.request_id
+            )
             hits = 0
         # This rank's logical prefix; the MIN over ranks is the landed prefix.
         return positions[hits] if hits < len(positions) else len(hash_values)
@@ -658,15 +659,19 @@ class HiCacheController:
             check_kv_shard_storage(
                 storage_backend=storage_backend,
                 host_memory_mode=self.host_memory_mode,
-                extra_config=storage_backend_extra_config,
+                extra_config=storage_backend_extra_config or {},
             )
-            if self.mem_pool_host is not self.storage_host_pool and any(
-                entry.host_pool is not self.storage_host_pool
-                for entry in self.mem_pool_host.entries
-            ):
-                raise ValueError(
-                    "HiCache storage with KV sharding supports only the KV host pool."
-                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                other_pools = [
+                    entry.name.value
+                    for entry in self.mem_pool_host.entries
+                    if entry.host_pool is not self.storage_host_pool
+                ]
+                if other_pools:
+                    raise ValueError(
+                        "HiCache storage with KV sharding supports only the KV "
+                        f"host pool, not {other_pools}."
+                    )
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.

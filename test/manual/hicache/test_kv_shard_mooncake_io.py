@@ -101,7 +101,7 @@ class TestKVShardMooncakeIO(unittest.TestCase):
             end_layer=device_pool.end_layer,
             **host_kwargs,
         )
-        host = PageInterleaveHostPool(native, placement)
+        host = PageInterleaveHostPool(native, placement, kv_dtype=device_pool.dtype)
         # Keep the captured device tensors alive until their host mirror dies.
         self.addCleanup(lambda: device_pool)
         self.addCleanup(host.destroy)

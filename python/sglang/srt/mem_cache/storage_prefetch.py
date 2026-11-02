@@ -17,6 +17,8 @@ class _StoragePrefetchRetry:
     immediate: bool
     storage_hit_end: Optional[int] = None
     due_step: Optional[int] = None
+    # Admission waits for this re-issue, which the next retry pass fires or drops.
+    hold_admission: bool = False
 
 
 class StoragePrefetchRetries:
@@ -31,12 +33,20 @@ class StoragePrefetchRetries:
     def poll_miss(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
         self._pending[req_id] = _StoragePrefetchRetry(False, storage_hit_end)
 
-    def refetch(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
-        self._pending[req_id] = _StoragePrefetchRetry(True, storage_hit_end)
+    def refetch(
+        self,
+        req_id: str,
+        storage_hit_end: Optional[int] = None,
+        *,
+        hold_admission: bool = False,
+    ) -> None:
+        self._pending[req_id] = _StoragePrefetchRetry(
+            True, storage_hit_end, hold_admission=hold_admission
+        )
 
-    def refetch_pending(self, req_id: str) -> bool:
+    def holds_admission(self, req_id: str) -> bool:
         retry = self._pending.get(req_id)
-        return retry is not None and retry.immediate
+        return retry is not None and retry.hold_admission
 
     def cancel(self, req_id: str) -> None:
         self._pending.pop(req_id, None)

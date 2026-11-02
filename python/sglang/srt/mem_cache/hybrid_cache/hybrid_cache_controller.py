@@ -1900,7 +1900,13 @@ class HybridCacheController(BaseHiCacheController):
                 break
             if prefix_keys is not None:
                 prefix_keys = prefix_keys + batch_hashes
-            operation.completed_tokens += self.page_size * len(batch_hashes)
+            written_pages = len(batch_hashes)
+            if isinstance(self.storage_host_pool, PageInterleaveHostPool):
+                positions, _ = self.storage_host_pool.owned_storage_pages(
+                    batch_host_indices
+                )
+                written_pages = len(positions)
+            operation.completed_tokens += self.page_size * written_pages
 
     def _page_backup_with_stable_layout(self, operation):
         # Write primary KV only on its selected shard writer. Rank-sharded

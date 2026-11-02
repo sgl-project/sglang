@@ -1,4 +1,4 @@
-"""HiCache copy kernels on a KV-sharded stripe.
+"""HiCache copy kernels on KV-sharded pools, where each rank owns a subset of pages.
 
 Emulates the N ranks of a shard group on one GPU: each rank's device pool is a
 stock pool holding only its owned pages at local rows, and each rank's host
@@ -135,6 +135,7 @@ class TestStripedHostRoundTrip(CustomTestCase):
                         **kwargs,
                     ),
                     pool.placement,
+                    kv_dtype=pool.dtype,
                 )
             )
         for h in hosts:
@@ -164,7 +165,7 @@ class TestStripedHostRoundTrip(CustomTestCase):
             for buf, want in zip(_buffers(pools[r]), expected):
                 buf[rows] = want[owners == r]
 
-        # Backup: mirrored host slots, each rank copies only its stripe.
+        # Backup: mirrored host slots, each rank copies only its owned pages.
         start_owner = int(chain[0]) // PS % N
         host = hosts[0].alloc(chain.numel(), start_owner=start_owner)
         for h in hosts[1:]:
