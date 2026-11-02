@@ -2524,7 +2524,8 @@ def expand_to_masked_slab(
         NUM_WORKERS=num_workers,
         num_warps=4,
     )
-    # Capture relies on max_m = cap * ep_group_size; eager also checks counts.
+    # Capture relies on max_m covering every source token that could route to
+    # one expert; eager also checks the actual counts.
     if check_overflow and int(overflow.item()) != 0:
         raise RuntimeError(
             f"DeepEP v2 masked slab overflow: an expert received more than max_m="

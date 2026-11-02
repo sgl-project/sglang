@@ -305,6 +305,11 @@ class Glm47MoeDetector(BaseFormatDetector):
       <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>
     """
 
+    _STREAMING_PARTIAL_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)", re.DOTALL
+    )
+    _TOOL_CALL_END_PATTERN = re.compile(r"</tool_call>|$")
+
     def __init__(self):
         super().__init__()
         self.use_full_assistant_constraint = False
@@ -326,6 +331,8 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
         )
+        self._open_call: Optional[tuple[str, int]] = None
+        self._end_scan_pos = 0
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -541,6 +548,30 @@ class Glm47MoeDetector(BaseFormatDetector):
         func_args_raw = match.group(2).strip() if match.group(2) else ""
         is_tool_end = match.group(3) or ""
         return func_name, func_args_raw, is_tool_end
+
+    def _match_tool_call(self, text: str) -> Optional[tuple[str, str, str, int]]:
+        """Same as `_extract_match_groups` plus end() on the streaming pattern.
+
+        Once an open call reaches its args, text only grows at the end, so the
+        name and args start stay put and only the new tail needs scanning for
+        the closer. Rescanning the whole buffer every chunk is O(n^2) for a
+        long arg.
+        """
+        if self._open_call is None:
+            match = self._STREAMING_PARTIAL_PATTERN.search(text)
+            if match is None:
+                return None
+            if match.group(2) is None or match.group(3):
+                return *self._extract_match_groups(match), match.end()
+            self._open_call = match.group(1).strip(), match.start(2)
+            self._end_scan_pos = match.start(2)
+        func_name, args_start = self._open_call
+        end = self._TOOL_CALL_END_PATTERN.search(text, self._end_scan_pos)
+        if end.group():
+            self._open_call = None
+        else:
+            self._end_scan_pos = max(args_start, len(text) - len(self.eot_token) + 1)
+        return func_name, text[args_start : end.start()].strip(), end.group(), end.end()
 
     def _send_tool_name_if_needed(
         self, func_name: str, has_arg_key: bool, is_tool_end: str
@@ -771,19 +802,12 @@ class Glm47MoeDetector(BaseFormatDetector):
         try:
             # Try to match a partial or complete tool call
             # Use a single flexible regex pattern that handles all cases
-            partial_match = re.search(
-                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
-                current_text,
-                re.DOTALL,
-            )
+            partial_match = self._match_tool_call(current_text)
 
             if not partial_match:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
+            func_name, func_args_raw, is_tool_end, match_end = partial_match
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
@@ -833,7 +857,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         func_name,
                         func_args_raw,
                         tools,
-                        partial_match.end(),
+                        match_end,
                         current_text,
                     )
                     calls.extend(finalize_calls)
