@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
@@ -52,6 +51,7 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -1768,7 +1768,9 @@ def build_swa_draft_pools(
 
 
 def _shares_kv_storage(draft: MHABufferInfo, target: MHABufferInfo) -> bool:
-    # A fused draft's K and V are views into the target's arena allocation.
+    # Every view of an arena slices its one raw allocation.
+    if not draft.buffers.k or not target.buffers.k:
+        return False
     return (
         draft.buffers.k[0].untyped_storage().data_ptr()
         == target.buffers.k[0].untyped_storage().data_ptr()
@@ -1841,15 +1843,16 @@ def build_hicache_draft_sidecars(
     """Compose the full and SWA draft-sidecar paths."""
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
-    infos = draft_kv_pool.get_device_pool_infos()
-    if any(info.pool_name == PoolName.SWA for info in infos):
+    names = {info.pool_name for info in draft_kv_pool.get_device_pool_infos()}
+    if PoolName.SWA in names:
         builder = build_swa_draft_pools
-    elif any(isinstance(info.buffer_info, DSV4PagedBufferInfo) for info in infos):
+    elif PoolName.KV in names or draft_kv_pool.layer_router.wrapped_view() is not None:
+        # Hybrid linear drafts describe their KV through the wrapped child.
+        builder = build_full_draft_pools
+    else:
         raise NotImplementedError(
             "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
         )
-    else:
-        builder = build_full_draft_pools
     return builder(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,

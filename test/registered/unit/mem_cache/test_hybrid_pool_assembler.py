@@ -2083,8 +2083,11 @@ class TestDraftSidecarDispatchByInfos(CustomTestCase):
                 draft_device_pools=(draft,), tree_cache=None
             )
 
-    def _stub(self, *infos):
-        return SimpleNamespace(get_device_pool_infos=lambda: infos)
+    def _stub(self, *infos, wrapped=None):
+        return SimpleNamespace(
+            get_device_pool_infos=lambda: infos,
+            layer_router=SimpleNamespace(wrapped_view=lambda: wrapped),
+        )
 
     def test_window_kv_selects_the_swa_builder(self):
         self.assertEqual(self._dispatch(_swa_kv_pool([1], [0])), "swa")
@@ -2097,15 +2100,17 @@ class TestDraftSidecarDispatchByInfos(CustomTestCase):
         kv = SimpleNamespace(pool_name=PoolName.KV, buffer_info=object())
         self.assertEqual(self._dispatch(self._stub(kv)), "full")
         # Hybrid linear drafts describe their KV through the wrapped child.
-        self.assertEqual(self._dispatch(self._stub()), "full")
+        self.assertEqual(self._dispatch(self._stub(wrapped=object())), "full")
 
-    def test_paged_draft_without_window_kv_is_rejected(self):
+    def test_draft_without_kv_or_window_kv_is_rejected(self):
+        """A DeepSeek-V4 draft whose window lives in a request ring describes no KV."""
         compressed = SimpleNamespace(
             pool_name=PoolName.DEEPSEEK_V4_C4,
             buffer_info=MagicMock(spec=DSV4PagedBufferInfo),
         )
-        with self.assertRaisesRegex(NotImplementedError, "non-unified draft SWA"):
-            self._dispatch(self._stub(compressed))
+        for infos in ((), (compressed,)):
+            with self.assertRaisesRegex(NotImplementedError, "non-unified draft SWA"):
+                self._dispatch(self._stub(*infos))
 
 
 class TestFusedDraftStorageIdentity(CustomTestCase):
