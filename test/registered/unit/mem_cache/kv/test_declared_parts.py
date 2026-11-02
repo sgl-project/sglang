@@ -351,7 +351,7 @@ class TestDeclaredParts(CustomTestCase):
                     batch.maybe_evict_swa()
                     cache.evict(
                         EvictParams(
-                            window_num_tokens={TARGET_WINDOW: 80, DRAFT_WINDOW: 80}
+                            window_num_tokens={"window_16": 80, "draft_swa": 80}
                         )
                     )
                     for ct, window in (
@@ -374,7 +374,7 @@ class TestDeclaredParts(CustomTestCase):
                 cache.evict(
                     EvictParams(
                         num_tokens=80,
-                        window_num_tokens={TARGET_WINDOW: 80, DRAFT_WINDOW: 80},
+                        window_num_tokens={"window_16": 80, "draft_swa": 80},
                     )
                 )
                 self.assertEqual(storage.accounting_violations(), [])
@@ -2083,7 +2083,7 @@ class TestDeclaredParts(CustomTestCase):
                     def walk(params, **kwargs):
                         result = original(params, **kwargs)
                         evicted.append(
-                            result.window_num_tokens_evicted.get(TARGET_WINDOW, 0)
+                            result.window_num_tokens_evicted.get("window_16", 0)
                         )
                         return result
 
@@ -2573,7 +2573,7 @@ class TestDeclaredParts(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=80,
-                window_num_tokens={ComponentType.of("WINDOW_8"): 8, DRAFT_WINDOW: 4},
+                window_num_tokens={"window_8": 8, "draft_swa": 4},
             )
         )
         # The evicted end holes are credited before any flush: the planned
@@ -2752,7 +2752,7 @@ class TestDeclaredParts(CustomTestCase):
         key = RadixKey(array("q", range(32)))
         ids = alloc.alloc(32)
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        cache.evict(EvictParams(window_num_tokens={DRAFT_WINDOW: 4}))
+        cache.evict(EvictParams(window_num_tokens={"draft_swa": 4}))
         old_full = alloc.full_attn_allocator.ids.translate(ids).clone()
         incoming = alloc.alloc(32)
         self.assertIsNotNone(incoming)
@@ -2766,7 +2766,7 @@ class TestDeclaredParts(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=64,
-                window_num_tokens={TARGET_WINDOW: 64, DRAFT_WINDOW: 64},
+                window_num_tokens={"window_16": 64, "draft_swa": 64},
             )
         )
         self.assertEqual(

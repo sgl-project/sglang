@@ -626,7 +626,11 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.flush_pending_backups()
         self.cache.writing_check()
         self.cache.evict(
-            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+            EvictParams(
+                window_num_tokens={
+                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
+                }
+            )
         )
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
@@ -716,7 +720,11 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.flush_pending_backups()
         self.cache.writing_check()
         self.cache.evict(
-            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+            EvictParams(
+                window_num_tokens={
+                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
+                }
+            )
         )
         req = self._request(tokens + list(range(17, 21)))
         verdict = self._adder().add_one_req(
@@ -748,7 +756,11 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.flush_pending_backups()
         self.cache.writing_check()
         self.cache.evict(
-            EvictParams(window_num_tokens={ComponentType.SWA: len(tokens)})
+            EvictParams(
+                window_num_tokens={
+                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
+                }
+            )
         )
         # Window rows that end up below the load's reservation, freed once the
         # load is queued so that compaction moves the reserved rows into them.

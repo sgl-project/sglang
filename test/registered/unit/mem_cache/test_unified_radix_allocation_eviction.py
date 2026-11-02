@@ -183,7 +183,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             (
                 True,
                 KVDemand(full_tokens=100, window_tokens={"swa": 100}),
-                EvictParams(num_tokens=60, window_num_tokens={swa: 90}),
+                EvictParams(num_tokens=60, window_num_tokens={"swa": 90}),
             ),
             (True, KVDemand(full_tokens=40, window_tokens={"swa": 10}), None),
         ]:

@@ -751,7 +751,9 @@ class UnifiedRadixCache(BasePrefixCache):
             EvictParams(
                 num_tokens=short.get(self.slot_id(TREE_TOKEN), 0),
                 window_num_tokens={
-                    ct: short[ct] for ct in self.window_slots() if ct in short
+                    name: short[ct]
+                    for ct, name in self._window_sub_pools_by_slot().items()
+                    if ct in short
                 },
                 mamba_num=short.get(self.slot_id(TREE_STATE), 0),
             ),
@@ -835,9 +837,7 @@ class UnifiedRadixCache(BasePrefixCache):
         params = EvictParams(
             num_tokens=units.get(owner, 0) * page,
             window_num_tokens={
-                self.window_slot_of(name): units[name] * page
-                for name in windows
-                if units.get(name, 0)
+                name: units[name] * page for name in windows if units.get(name, 0)
             },
             mamba_num=0 if state is None else units.get(state, 0),
         )
@@ -861,16 +861,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
         """Per tree component, what ``params`` asks of it."""
-        windows = self.window_slots()
-        unknown = set(params.window_num_tokens) - set(windows)
-        assert not unknown, f"no window slots {sorted(unknown)} in this tree"
         request = {ct: 0 for ct in self.tree_components}
         request[BASE_COMPONENT_TYPE] = params.num_tokens
         state = self.slot_id(TREE_STATE)
         if state is not None:
             request[state] = params.mamba_num
-        for ct in windows:
-            request[ct] = params.window_num_tokens.get(ct, 0)
+        for name, tokens in params.window_num_tokens.items():
+            request[self.window_slot_of(name)] = tokens
         return request
 
     def _pool_available(self, component_type: ComponentType) -> int:
@@ -919,7 +916,8 @@ class UnifiedRadixCache(BasePrefixCache):
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
             window_num_tokens_evicted={
-                ct: tracker.get(ct, 0) for ct in self.window_slots()
+                name: tracker.get(ct, 0)
+                for ct, name in self._window_sub_pools_by_slot().items()
             },
         )
 

@@ -222,7 +222,11 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                         EvictParams(
                             num_tokens=rng.randrange(0, 32),
                             mamba_num=rng.randrange(0, 4) if self.cfg.has_mamba else 0,
-                            window_num_tokens={ComponentType.SWA: rng.randrange(0, 32)},
+                            window_num_tokens={
+                                cache.window_sub_pool_of_slot(
+                                    ComponentType.SWA
+                                ): rng.randrange(0, 32)
+                            },
                         )
                     )
             except AssertionError:

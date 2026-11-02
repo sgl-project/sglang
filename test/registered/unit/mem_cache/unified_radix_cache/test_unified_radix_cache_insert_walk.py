@@ -385,7 +385,11 @@ class TestResumableInsertWalkSWA(ResumableInsertWalkSWAFixtures, CustomTestCase)
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
         self.assertIsNotNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
-        cache.evict(EvictParams(window_num_tokens={ComponentType.SWA: sw}))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={cache.window_sub_pool_of_slot(ComponentType.SWA): sw}
+            )
+        )
         self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
         self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.SWA))
         self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.FULL))

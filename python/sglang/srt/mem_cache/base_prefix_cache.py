@@ -164,14 +164,12 @@ def window_sub_pool_of(allocator) -> str:
 
 @dataclasses.dataclass
 class EvictParams:
-    """How much to evict from each component: tokens of the token component,
-    tokens of each window slot by its component id, and state entries."""
+    """How much to evict: tokens of the token sub-pool, tokens of each window
+    sub-pool by its name, and state entries."""
 
     num_tokens: int = 0
     mamba_num: int = 0
-    window_num_tokens: dict[ComponentType, int] = dataclasses.field(
-        default_factory=dict
-    )
+    window_num_tokens: dict[str, int] = dataclasses.field(default_factory=dict)
 
 
 def evictable_by_sub_pool(tree_cache, allocator=None) -> dict[str, int]:
@@ -192,20 +190,19 @@ def evictable_by_sub_pool(tree_cache, allocator=None) -> dict[str, int]:
 
 @dataclasses.dataclass
 class EvictResult:
-    """What an eviction freed from each component."""
+    """What an eviction freed: tokens of the token sub-pool, tokens of each
+    window sub-pool by its name, and state entries."""
 
     num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
-    window_num_tokens_evicted: dict[ComponentType, int] = dataclasses.field(
-        default_factory=dict
-    )
+    window_num_tokens_evicted: dict[str, int] = dataclasses.field(default_factory=dict)
 
     def add(self, other: EvictResult) -> None:
         self.num_tokens_evicted += other.num_tokens_evicted
         self.mamba_num_evicted += other.mamba_num_evicted
-        for component, tokens in other.window_num_tokens_evicted.items():
-            self.window_num_tokens_evicted[component] = (
-                self.window_num_tokens_evicted.get(component, 0) + tokens
+        for name, tokens in other.window_num_tokens_evicted.items():
+            self.window_num_tokens_evicted[name] = (
+                self.window_num_tokens_evicted.get(name, 0) + tokens
             )
 
 
@@ -573,7 +570,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 if tokens > 0:
                     short = max(0, tokens - self.window_available_size(name))
                     if short:
-                        shortfall.window_num_tokens[self.window_slot_of(name)] = short
+                        shortfall.window_num_tokens[name] = short
         elif any(t > 0 for t in demand.window_tokens.values()):
             tokens = max(demand.window_tokens.values())
             available = (

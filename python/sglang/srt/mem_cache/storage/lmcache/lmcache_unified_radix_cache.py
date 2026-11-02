@@ -494,9 +494,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if swa_allocator.available_size() < swa_tail_tokens:
             self.evict(
                 EvictParams(
-                    window_num_tokens=dict.fromkeys(
-                        self.window_slots(), swa_tail_tokens
-                    )
+                    window_num_tokens={
+                        name: swa_tail_tokens for name, _ in self.window_sub_pools()
+                    }
                 )
             )
 
