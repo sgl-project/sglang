@@ -2221,23 +2221,6 @@ _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
-# duplicate GroupCoordinator for prefill in PD-Multiplexing
-_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
-
-
-@contextmanager
-def pdmux_prefill_tp_group():
-    """Use the duplicate TP communicator for the prefill stream.
-
-    PD multiplexing keeps prefill and decode on separate communicators with
-    the same ranks. Only the TP handle changes within this scope.
-    """
-    assert _PDMUX_PREFILL_TP_GROUP is not None, (
-        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-    )
-    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
-        yield
-
 
 def get_tp_group() -> GroupCoordinator:
     return get_parallel().tp_group
@@ -2579,7 +2562,6 @@ def init_distributed_environment(
 
 def initialize_model_parallel(
     backend: Optional[str] = None,
-    duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2707,28 +2689,6 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
-
-    if duplicate_tp_group:
-        global _PDMUX_PREFILL_TP_GROUP
-        assert _PDMUX_PREFILL_TP_GROUP is None, (
-            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        )
-        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="pdmux_prefill_tp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
-        tp_pynccl_comm = _TP.get_available_pynccl_comm()
-        pdmux_pynccl_comm = _PDMUX_PREFILL_TP_GROUP.get_available_pynccl_comm()
-        if tp_pynccl_comm is not None:
-            tp_pynccl_comm.disabled = False
-        if pdmux_pynccl_comm is not None:
-            pdmux_pynccl_comm.disabled = False
 
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
@@ -3340,11 +3300,6 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
-
-    global _PDMUX_PREFILL_TP_GROUP
-    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
-        _PDMUX_PREFILL_TP_GROUP.destroy()
-    _PDMUX_PREFILL_TP_GROUP = None
 
 
 def destroy_distributed_environment():

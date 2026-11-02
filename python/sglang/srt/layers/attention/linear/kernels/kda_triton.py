@@ -184,6 +184,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        ring_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -218,6 +219,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            ring_indices=ring_indices,
         )
 
     def extend(

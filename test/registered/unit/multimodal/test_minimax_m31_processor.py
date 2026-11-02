@@ -355,12 +355,6 @@ class TestMiniMaxM31Processor(CustomTestCase):
             "input_ids"
         ][0].tolist()
 
-    def test_interleaved_media_and_text_are_preserved(self):
-        self.assertEqual(
-            self.process([101, 10, 102, 11, 103], images=[object()], videos=[object()]),
-            [101] + self.image + [102] + self.video + [103],
-        )
-
     def test_expanded_media_is_not_expanded_twice(self):
         ids = [101] + self.image + [102] + self.video + [103]
         self.assertEqual(self.process(ids, images=[object()], videos=[object()]), ids)

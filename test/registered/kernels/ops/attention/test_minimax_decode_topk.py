@@ -118,6 +118,29 @@ def test_decode_topk_adversarial(kind):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("nb", [300, 512, 2000, 3000, 9000])
+@pytest.mark.parametrize("levels", [2, 4, 1])
+def test_decode_topk_ties_pick_lowest_ids(nb, levels):
+    """Exactly equal scores are broken by block id (lower id wins), the same rule as
+    the small-row path, so repeated calls select the same blocks: one-element-per-
+    thread rows (nb <= 512) and register-bucket rows (nb > 512)."""
+    torch.manual_seed(nb + levels)
+    block_size = 128
+    H, B, topk = 2, 3, 16
+    score = torch.randint(0, levels, (H, B, nb), device="cuda").float()
+    seq_lens = torch.full((B,), nb * block_size, device="cuda", dtype=torch.int32)
+    # reference: order by (score desc, id asc), keep topk, emit ascending
+    want = torch.sort(
+        torch.argsort(-score, dim=-1, stable=True)[..., :topk], dim=-1
+    ).values.to(torch.int32)
+    first = minimax_decode_topk(score, seq_lens, block_size, topk)
+    assert torch.equal(first, want), (first, want)
+    for _ in range(20):
+        assert torch.equal(
+            minimax_decode_topk(score, seq_lens, block_size, topk), first
+        )
+
+
 @pytest.mark.parametrize("seq_len", [1, 128, 129, 2048, 2049])
 def test_decode_topk_small_num_blocks(seq_len):
     # num_blocks around / below topk -> naive identity path and boundary.

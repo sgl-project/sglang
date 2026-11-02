@@ -73,6 +73,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
@@ -110,7 +111,9 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler.process_input_requests = MagicMock()
                 scheduler._engine_paused = False
                 scheduler.running_batch = batch
-                scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
+                scheduler.should_process_last_batch_early = MagicMock(
+                    return_value=False
+                )
                 scheduler.run_batch = MagicMock(return_value=result)
                 scheduler._apply_war_barrier = MagicMock()
                 scheduler.is_generation = False

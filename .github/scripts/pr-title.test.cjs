@@ -187,6 +187,12 @@ test('kernel sync helper title', async () => {
   });
   assert.deepEqual(await validate(title), []);
 });
+test('sgl-amd-mono pin helper title', async () => {
+  const title = expand(titleTemplate('scripts/release/commit_and_pr_sgl_amd_mono.sh'), {
+    NEW_SHORT_SHA: 'abcdef12',
+  });
+  assert.deepEqual(await validate(title), []);
+});
 for (const path of ['.github/workflows/sync-lmsys-sglang-blogs.yml',
                     '.github/workflows/weekly-update-est-time.yml']) {
   test(`automated title in ${path}`, async () => {

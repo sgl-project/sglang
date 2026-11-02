@@ -14,7 +14,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
@@ -53,6 +52,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -644,7 +644,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
             self.attn_mha,
             KVWriteLoc.for_batch(forward_batch),
             k_nope,
@@ -1230,39 +1230,6 @@ class SarvamMLAForCausalLM(nn.Module):
             )
         return hidden_states
 
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states = layer(
-                    positions, forward_batch.hidden_states, forward_batch
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        return None
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
@@ -1405,41 +1372,7 @@ class SarvamMLAForCausalLM(nn.Module):
 
 
 class SarvamMoEForCausalLM(BailingMoEForCausalLM):
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.word_embeddings(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states = layer(
-                    positions, forward_batch.hidden_states, forward_batch
-                )
-
-        if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-
-            return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-
-        return None
+    pass
 
 
 EntryClass = [SarvamMLAForCausalLM, SarvamMoEForCausalLM]

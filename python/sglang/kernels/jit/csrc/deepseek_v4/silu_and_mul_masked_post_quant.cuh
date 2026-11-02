@@ -289,7 +289,7 @@ struct SiluAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()
@@ -382,7 +382,7 @@ struct SiluAndMulClampKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"gate_up_dim"};  // 2 * out_dim
     auto H = SymbolicSize{"out_dim"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input  (gate || up)
         .with_dtype<DType>()
@@ -531,7 +531,7 @@ struct SiluAndMulContigPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, D})  // input (gate/up, natural or gran=8 interleaved on last dim)
         .with_dtype<bf16_t>()

@@ -705,10 +705,10 @@ class TboForwardBatchPreparer:
         # Unified memory refuses two-batch overlap, so the plan's reads stay in
         # `req_to_token`, which each child indexes at its own rows; each child
         # writes its own tokens of the plan's window.
-        output_dict["kv_loc_plan"] = batch.kv_loc_plan
-        if batch.kv_loc_plan is not None:
-            output_dict["kv_loc_cols"] = batch.kv_loc_plan.cols_slice(
-                batch.kv_loc_cols, slice(start_token_index, end_token_index)
+        output_dict["iteration_ids"] = batch.iteration_ids
+        if batch.iteration_ids is not None:
+            output_dict["iteration_cols"] = batch.iteration_ids.cols_slice(
+                batch.iteration_cols, slice(start_token_index, end_token_index)
             )
 
         attention_tp_size = get_parallel().attn_tp_size
@@ -780,7 +780,7 @@ class TboForwardBatchPreparer:
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
             "full_prefill_cuda_graph_capture",  # forward-level flag, inherited by both child batches
-            "split_index",  # for split prefill
+            "uocr_graph_io_deferred",
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches

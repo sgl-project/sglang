@@ -31,6 +31,10 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
+from sglang.srt.layers.quantization.unquant import (
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -97,7 +101,16 @@ def _project_candidate_logits(
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
         weight = lm_head.weight
-        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        hidden = hidden.to(weight.dtype)
+        # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
+        backend = get_bf16_gemm_backend()
+        if (
+            (backend.is_cutedsl() or backend.is_gemv())
+            and hidden.is_cuda
+            and weight.dtype == torch.bfloat16
+        ):
+            return bf16_gemm_dispatch(hidden, weight[:num_org], None)
+        return torch.matmul(hidden, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.
@@ -704,7 +717,7 @@ class DFlashGroupedConv(nn.Module):
         base_kernel = torch.zeros(2, self.taps, hidden_size)
         base_kernel[:, 0] = 1.0
         self.base_kernel = nn.Parameter(base_kernel)
-        self.kernel_projection = nn.Linear(
+        self.kernel_projection = ReplicatedLinear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
 
@@ -725,7 +738,7 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)[0].reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (

@@ -30,11 +30,17 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 @contextmanager
-def attention_scope(batch, backend, *, full_graph=False, raw_num_tokens=None):
+def attention_scope(
+    batch, backend, *, full_graph=False, raw_num_tokens=None, zero_padded_tail=True
+):
     with (
         forward_context(ForwardContext(backend)),
         set_forward_batch(batch),
-        prefill_graph_scope(full_graph=full_graph, raw_num_tokens=raw_num_tokens),
+        prefill_graph_scope(
+            full_graph=full_graph,
+            raw_num_tokens=raw_num_tokens,
+            zero_padded_tail=zero_padded_tail,
+        ),
     ):
         yield
 
@@ -186,6 +192,45 @@ def test_direct_backend_dispatch(sparse):
     ):
         kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
         assert layer(q, q, q, batch, **kwargs) is result
+
+
+@pytest.mark.parametrize("breakable", [False, True])
+@pytest.mark.parametrize("tokens", [0, 2])
+@pytest.mark.parametrize("zero_padded_tail", [False, True])
+def test_prefill_padding_policy_preserves_real_rows_and_idle_zeroing(
+    breakable, tokens, zero_padded_tail
+):
+    layer = RadixAttention(1, 2, 1.0, 1, 0)
+    batch = make_batch(tokens=tokens)
+    q = torch.zeros(4, 1, 2)
+    output = torch.full_like(q, float("nan"))
+    backend = SimpleNamespace(
+        forward=lambda query, *args, **kwargs: torch.ones_like(query)
+    )
+    with (
+        attention_scope(
+            batch,
+            backend,
+            full_graph=not breakable,
+            raw_num_tokens=tokens,
+            zero_padded_tail=zero_padded_tail,
+        ),
+        patch(
+            "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
+            return_value=breakable,
+        ),
+        patch(
+            "sglang.srt.layers.radix_attention.allocate_attention_outputs",
+            return_value=(output, None),
+        ),
+    ):
+        result = layer(q, q, q, batch)
+    assert result is output
+    assert torch.all(output[:tokens] == 1)
+    if zero_padded_tail or tokens == 0:
+        assert torch.count_nonzero(output[tokens:]) == 0
+    else:
+        assert torch.isnan(output[tokens:]).all()
 
 
 def test_output_dtype_follows_values():

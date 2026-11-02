@@ -710,6 +710,96 @@ def test_event_plan_and_budget():
         check_cache_budget(config, 10080, free_bytes=9 * 2**30)
 
 
+def test_free_bytes_counts_freed_memory_held_by_the_allocator(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        _free_bytes,
+    )
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10, 100))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 50)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 20)
+    assert _free_bytes(torch.device("cuda", 0)) == 40
+
+
+@pytest.mark.parametrize(
+    "frames, flush, ok", [(13, False, True), (17, False, False), (4, True, True)]
+)
+def test_sequence_parallel_indivisible_segment_rejected_by_input_validation(
+    monkeypatch, frames, flush, ok
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas import (
+        stages,
+    )
+    from sglang.multimodal_gen.runtime.realtime.nomas import NOMAS_FLUSH_CONDITION
+
+    monkeypatch.setattr(
+        stages.RealtimeInputValidationStage, "forward", lambda self, batch, args: batch
+    )
+    # 352x640 is 220 tokens per latent frame: 4 latents split over 8 ranks, 5 do not.
+    monkeypatch.setattr(stages, "get_ulysses_ctx", lambda: (8, 0))
+    batch = SimpleNamespace(
+        height=352,
+        width=640,
+        num_frames=frames,
+        prompt="road",
+        segments=None,
+        continuation_prompts=None,
+        prompt_format="plain",
+        condition_inputs={NOMAS_FLUSH_CONDITION: flush},
+        session=None,
+        extra={},
+    )
+    args = SimpleNamespace(pipeline_config=NomasPipelineConfig())
+    stage = object.__new__(stages.NomasInputValidationStage)
+    if ok:
+        stage.forward(batch, args)
+    else:
+        with pytest.raises(ValueError, match="sequence-parallel"):
+            stage.forward(batch, args)
+
+
+@torch.inference_mode()
+def test_camera_chunk_of_one_reads_each_frames_value_without_attention(monkeypatch):
+    module = tiny_model().action_modules[0]
+    assert module.chunk_size == 1
+    x, camera = torch.randn(1, 12, 256), torch.randn(1, 3, 64)  # 3 frames x 4 tokens
+    _, value = (
+        module.keyboard_attn_kv(module.keyboard_embed(camera))
+        .view(1, 3, 2, 16, 64)
+        .unbind(2)
+    )
+    q, k = torch.randn(1, 12, 16, 64), torch.randn(1, 3, 16, 64)
+    attended = torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                q[:, 4 * f : 4 * f + 4].transpose(1, 2),
+                k[:, f : f + 1].transpose(1, 2),
+                value[:, f : f + 1].transpose(1, 2),
+            )
+            .transpose(1, 2)
+            .flatten(2)
+            for f in range(3)
+        ],
+        dim=1,
+    )
+    expected = x + module.proj_keyboard(attended)
+
+    def unused(*args):
+        raise AssertionError("a one-key softmax needs no query")
+
+    monkeypatch.setattr(module.img_attn_q, "forward", unused)
+    torch.testing.assert_close(
+        module(x, camera, 4, None), expected, atol=1e-6, rtol=1e-6
+    )
+    # A sequence-parallel rank holds a token slice that starts mid-frame.
+    torch.testing.assert_close(
+        module(x[:, 5:11], camera, 4, None, token_offset=5),
+        expected[:, 5:11],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_action_windows_and_camera_gate_follow_upstream():
     """Malformed action timing must degrade to full attention, not reject the
     request, and a camera-on segment must not carry a gate mask."""
