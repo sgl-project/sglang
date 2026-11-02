@@ -64,6 +64,7 @@ def _layer():
 def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend.state_pool = None
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.state_layer_cache = lambda layer_id: cache
     backend.req_to_token_pool = SimpleNamespace(

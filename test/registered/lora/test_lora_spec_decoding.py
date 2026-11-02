@@ -1,25 +1,15 @@
-"""E2E test for multi-adapter LoRA + EAGLE-family speculative decoding.
+"""Multi-adapter EAGLE decoding: adapt the target, never the shared draft.
 
-Adapters apply to the target model only; one shared draft runs unadapted.
+Guard startup, adapter effects in uniform/mixed batches, graph and eager
+target-verify (proved by counters), and accept length above one.
 
-Deliberately asserts serving properties rather than exact output text.
-Greedy decoding is not bitwise reproducible across batch shapes or server
-restarts here -- reduction order changes flip a token and greedy amplifies
-it -- so text equality between configurations is a flaky assertion, not a
-correctness oracle. Losslessness is verified out of band by
-test/manual/lora/run_spec_lora_matrix.py, which measures that noise floor
-first. What this guards is what CI can hold stable:
-
-- the server starts at all with multiple adapters + speculation (it used to
-  crash loading the target's adapters into the draft model);
-- adapters are actually applied during target-verify (adapter output differs
-  from base output);
-- a mixed-adapter batch, and a batch wider than the cuda-graph capture, are
-  served without error (the eager verify path used to crash on
-  extend_seq_lens_cpu=None);
-- speculation is really running (accept length above 1).
+Cross-configuration text equality is not an oracle: reduction-order changes
+can flip greedy tokens across batch shapes or restarts. Losslessness is
+checked separately by test/manual/lora/run_spec_lora_matrix.py after measuring
+that noise floor.
 """
 
+import re
 import unittest
 
 import requests
@@ -42,13 +32,46 @@ PROMPTS = [
     "List three primary colors.",
     "Write a one-sentence story about a brave detective on Mars.",
 ]
-# Ranks 8 and 64: a mixed-rank batch is what the per-request lora_ranks
-# indexing has to get right, and uniform ranks would hide a mixup.
+# Ranks 8 and 64 expose mistakes in per-request lora_ranks indexing.
 ADAPTERS = [
     ("fact", "algoprog/fact-generation-llama-3.1-8b-instruct-lora"),
     ("guard", "nvidia/llama-3.1-nemoguard-8b-topic-control"),
 ]
+# Row kinds of a mixed batch: base first, then every adapter.
+ROUTES = [None] + [name for name, _ in ADAPTERS]
 SAMPLING = {"temperature": 0, "max_new_tokens": 32}
+# Captures the 9-request mixed batch below but not the 24-request one. The
+# default limit on an 80 GB GPU (48 with EAGLE) captures both.
+DECODE_GRAPH_MAX_BS = 12
+WIDE_BATCH = 24
+
+
+def _decode_passes(base_url, *, require_samples=False):
+    """Count graph/eager target-verify forwards; require samples after decoding."""
+    response = requests.get(base_url + "/metrics", timeout=30)
+    if response.status_code != 200:
+        raise AssertionError(
+            f"/metrics returned HTTP {response.status_code}: {response.text[:200]}"
+        )
+    samples = {
+        mode: [
+            float(value)
+            for value in re.findall(
+                r'^sglang:cuda_graph_passes_total\{[^}]*mode="'
+                + mode
+                + r'"[^}]*\}\s+([0-9.eE+-]+)$',
+                response.text,
+                re.MULTILINE,
+            )
+        ]
+        for mode in ("decode_cuda_graph", "decode_none")
+    }
+    if require_samples and not any(samples.values()):
+        raise AssertionError(
+            "/metrics has no decode samples of sglang:cuda_graph_passes_total; "
+            "the server needs --enable-metrics"
+        )
+    return {mode: sum(values) for mode, values in samples.items()}
 
 
 class TestEagle3MultiLoRA(CustomTestCase):
@@ -80,6 +103,8 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 # batches below co-batch base requests with adapter requests.
                 f"--max-loras-per-batch={len(ADAPTERS) + 1}",
                 "--mem-fraction-static=0.7",
+                f"--cuda-graph-max-bs-decode={DECODE_GRAPH_MAX_BS}",
+                "--enable-metrics",
                 "--lora-paths",
             ]
             + [f"{name}={path}" for name, path in ADAPTERS],
@@ -102,7 +127,31 @@ class TestEagle3MultiLoRA(CustomTestCase):
             self.assertTrue(item["text"].strip(), f"empty output in {results}")
         return [item["text"] for item in results]
 
+    def _generate_mixed(self, prompts):
+        """Serve every prompt under every route in one batch; outputs by route."""
+        texts = self._generate(
+            [p for p in prompts for _ in ROUTES],
+            [r for _ in prompts for r in ROUTES],
+        )
+        return {route: texts[i :: len(ROUTES)] for i, route in enumerate(ROUTES)}
+
+    def _assert_adapters_applied(self, by_route, where):
+        # The base rows come from the same batch, so a silently dropped
+        # adapter would reproduce them exactly.
+        for name, _ in ADAPTERS:
+            self.assertNotEqual(
+                by_route[name],
+                by_route[None],
+                f"adapter {name} matched the base model on every prompt of "
+                f"{where}; LoRA was likely not applied during target-verify",
+            )
+
+    def _decode_passes_since(self, before):
+        after = _decode_passes(self.base_url, require_samples=True)
+        return {mode: after[mode] - before[mode] for mode in after}
+
     def test_adapters_are_applied_under_speculation(self):
+        before = _decode_passes(self.base_url)
         base = self._generate(PROMPTS, [None] * len(PROMPTS))
         for name, _ in ADAPTERS:
             adapted = self._generate(PROMPTS, [name] * len(PROMPTS))
@@ -112,19 +161,27 @@ class TestEagle3MultiLoRA(CustomTestCase):
                 f"adapter {name} matched the base model on every prompt; LoRA "
                 "was likely not applied during target-verify",
             )
-
-    def test_mixed_adapter_and_wide_batches_are_served(self):
-        routes = [None] + [name for name, _ in ADAPTERS]
-        self._generate(
-            [p for p in PROMPTS for _ in routes],
-            [r for _ in PROMPTS for r in routes],
+        self._assert_adapters_applied(self._generate_mixed(PROMPTS), "a mixed batch")
+        passes = self._decode_passes_since(before)
+        self.assertGreater(
+            passes["decode_cuda_graph"], 0, f"no target-verify graph replay: {passes}"
         )
-        # Wider than the default cuda-graph capture, so target-verify falls
-        # back to the eager path.
-        wide = 24
-        self._generate(
-            [PROMPTS[i % len(PROMPTS)] for i in range(wide)],
-            [routes[i % len(routes)] for i in range(wide)],
+        self.assertEqual(
+            passes["decode_none"],
+            0,
+            f"a batch within the capture limit ran eager target-verify: {passes}",
+        )
+
+        before = _decode_passes(self.base_url)
+        prompts = [PROMPTS[i % len(PROMPTS)] for i in range(WIDE_BATCH // len(ROUTES))]
+        self._assert_adapters_applied(
+            self._generate_mixed(prompts), f"a {WIDE_BATCH}-request eager batch"
+        )
+        passes = self._decode_passes_since(before)
+        self.assertGreater(
+            passes["decode_none"],
+            0,
+            f"the {WIDE_BATCH}-request batch never ran eager target-verify: {passes}",
         )
 
     def test_speculation_is_active(self):

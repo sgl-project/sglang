@@ -353,6 +353,41 @@ def test_loader_composes_unequal_fused_sections():
     }
 
 
+def test_alpha_override_reloads_fused_sections():
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=8)
+    expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"]
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    pipeline.lora_initialized = True
+    for attr in (
+        "cur_adapter_name",
+        "cur_adapter_path",
+        "cur_adapter_strength",
+        "cur_adapter_config",
+        "lora_layers",
+        "lora_layers_critic",
+        "lora_layers_transformer_2",
+        "is_lora_merged",
+        "auto_merge_rounding_loss",
+    ):
+        setattr(pipeline, attr, {})
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
+        patch(f"{loader_mod}.load_file", return_value=_qkv_state_dict()),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.set_lora(
+            "adapter", None, target="transformer", merge_mode="dynamic", lora_alpha=8
+        )
+
+    # the GQA composition bakes alpha into lora_B, so an override must reload
+    torch.testing.assert_close(
+        pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"], expected
+    )
+
+
 def test_loader_stacks_equal_fused_sections():
     pipeline = _make_loader_pipeline()
     state_dict = {
