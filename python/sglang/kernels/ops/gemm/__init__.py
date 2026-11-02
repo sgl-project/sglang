@@ -521,6 +521,23 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.fp8_block32_sm90",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.fp8_block32_sm90:fp8_block32_gemm",
+        capabilities=_SM90,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description=(
+                "C[M,N] = act_fp8[M,K] @ weight_fp8[N,K].T with fp32 block-[32, 32] "
+                "scales applied after every K=32 WGMMA atom. Serving dispatch is "
+                "NVIDIA H20-3e only."
+            ),
+        ),
+        description="Block-32 FP8 GEMM for NVIDIA H20-3e (SM90 JIT).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.w8a8_block_fp8_matmul_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_triton",
