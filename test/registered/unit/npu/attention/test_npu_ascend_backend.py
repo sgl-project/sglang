@@ -4,6 +4,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -32,6 +33,10 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+    AscendTorchNativeAttnBackend,
+)
+from sglang.srt.layers.radix_attention import RadixAttention
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -552,6 +557,77 @@ class TestGenerateAlibiBias(unittest.TestCase):
             device=torch.device("cpu"),
         )
         self.assertEqual(result.dtype, torch.bfloat16)
+
+
+class TestEncoderDecoderGraphRouting(unittest.TestCase):
+    def test_compiled_decode_writes_self_kv_and_reads_encoder_prefix(self):
+        """The shared decode entry must compile without scalar-dependent cache slices."""
+        torch.manual_seed(42)
+        keys, values = torch.randn(2, 33, 2, 8), torch.randn(2, 33, 2, 8)
+        keys[:, 0] = values[:, 0] = float("nan")
+        table = torch.arange(32).reshape(4, 8)
+        table[0] = -99999
+        query = torch.randn(3, 2, 8)
+        new_keys, new_values = torch.randn_like(query), torch.randn_like(query) + 3
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2, 0]),
+            seq_lens=torch.tensor([2, 1, 0]),
+            encoder_lens=torch.tensor([2, 1, 8]),
+            out_cache_loc=torch.tensor([11, 17, 0]),
+        )
+
+        def write_cache(layer, location, key, value):
+            keys[layer.layer_id].index_copy_(0, location.loc.long(), key)
+            values[layer.layer_id].index_copy_(0, location.loc.long(), value)
+
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_fia = backend.use_fa = backend.is_hybrid_swa = (
+            False
+        )
+        backend.graph_mode = backend.enable_torch_compile = True
+        backend.native_attn = AscendTorchNativeAttnBackend()
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=table)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda layer_id: keys[layer_id],
+            get_value_buffer=lambda layer_id: values[layer_id],
+            set_kv_buffer=write_cache,
+        )
+        backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=None)
+        compiled = torch.compile(
+            backend.forward_decode, backend="eager", fullgraph=True
+        )
+        for cross in (False, True):
+            layer = RadixAttention(2, 8, 0.23, 2, int(cross), is_cross_attention=cross)
+            expected_keys, expected_values = (
+                keys[int(cross)].clone(),
+                values[int(cross)].clone(),
+            )
+            if not cross:
+                expected_keys[batch.out_cache_loc] = new_keys
+                expected_values[batch.out_cache_loc] = new_values
+            expected = torch.zeros_like(query)
+            for row in range(2):
+                start = 0 if cross else int(batch.encoder_lens[row])
+                count = int((batch.encoder_lens if cross else batch.seq_lens)[row])
+                slots = table[int(batch.req_pool_indices[row]), start : start + count]
+                k = expected_keys[slots].transpose(0, 1).double()
+                v = expected_values[slots].transpose(0, 1).double()
+                weights = (
+                    query[row].double().unsqueeze(1) @ k.transpose(-1, -2) * 0.23
+                ).softmax(-1)
+                expected[row] = (weights @ v).squeeze(1).float()
+            actual = compiled(
+                query,
+                None if cross else new_keys,
+                None if cross else new_values,
+                layer,
+                batch,
+            ).view_as(query)
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(keys[int(cross)], expected_keys, equal_nan=True)
+            torch.testing.assert_close(
+                values[int(cross)], expected_values, equal_nan=True
+            )
 
 
 if __name__ == "__main__":

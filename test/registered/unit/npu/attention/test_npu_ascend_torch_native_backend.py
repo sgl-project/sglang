@@ -815,5 +815,198 @@ class TestRunSdpaForwardDecode(unittest.TestCase):
         self.assertEqual(result.dtype, torch.float32)
 
 
+def encoder_decoder_reference(
+    query,
+    keys,
+    values,
+    table,
+    rows,
+    lengths,
+    encoder_lengths,
+    cross,
+    scale,
+    mapping=None,
+):
+    query, keys, values, table, rows, lengths, encoder_lengths = [
+        tensor.cpu()
+        for tensor in (query, keys, values, table, rows, lengths, encoder_lengths)
+    ]
+    result = torch.zeros(
+        query.shape[0], query.shape[1], values.shape[-1], dtype=torch.float64
+    )
+    for row in range(query.shape[0]):
+        count = int(encoder_lengths[row] if cross else lengths[row])
+        if lengths[row] == 0 or count == 0:
+            continue
+        start = 0 if cross else int(encoder_lengths[row])
+        slots = table[int(rows[row]), start : start + count].long()
+        if mapping is not None:
+            slots = mapping.cpu()[slots]
+        key = keys[slots].transpose(0, 1).double()
+        value = values[slots].transpose(0, 1).double()
+        repeats = query.shape[1] // key.shape[0]
+        key = key.repeat_interleave(repeats, 0)
+        value = value.repeat_interleave(repeats, 0)
+        scores = query[row].double().unsqueeze(1) @ key.transpose(-1, -2) * scale
+        result[row] = (scores.softmax(-1) @ value).squeeze(1)
+    return result.to(query.dtype)
+
+
+class TestEncoderDecoderGraph(unittest.TestCase):
+    def test_graph_spans_match_independent_reference(self):
+        """Graph SDPA must use encoder offsets and ignore poisoned padding slots."""
+        for cross in (False, True):
+            for kv_heads in (2, 4):
+                for value_dimension in (40, 64):
+                    with self.subTest(
+                        cross=cross, kv_heads=kv_heads, value_dimension=value_dimension
+                    ):
+                        torch.manual_seed(42)
+                        query = torch.randn(3, 4, 64)
+                        keys = torch.randn(81, kv_heads, 64, dtype=torch.float64)
+                        values = torch.randn(
+                            81, kv_heads, value_dimension, dtype=torch.float64
+                        )
+                        keys[0] = float("nan")
+                        values[0] = float("nan")
+                        table = (torch.randperm(80)[:48] + 1).reshape(4, 12)
+                        table[0] = -99999
+                        table[:, 8:] = -99999
+                        rows = torch.tensor([2, 1, 0])
+                        lengths = torch.tensor([3, 1, 0])
+                        encoder_lengths = torch.tensor([2, 0, 12])
+                        mapping = torch.cat(
+                            (torch.zeros(1, dtype=torch.long), torch.randperm(80) + 1)
+                        )
+                        output = torch.empty(3, 4, value_dimension)
+                        actual = AscendTorchNativeAttnBackend().run_sdpa_forward_decode(
+                            query,
+                            output,
+                            keys,
+                            values,
+                            table,
+                            rows,
+                            lengths,
+                            encoder_lens=encoder_lengths,
+                            is_cross_attention=cross,
+                            scaling=0.17,
+                            enable_gqa=kv_heads != 4,
+                            full_to_swa_mapping=mapping,
+                            is_encoder_decoder_graph=True,
+                        )
+                        expected = encoder_decoder_reference(
+                            query,
+                            keys,
+                            values,
+                            table,
+                            rows,
+                            lengths,
+                            encoder_lengths,
+                            cross,
+                            0.17,
+                            mapping,
+                        )
+                        self.assertIs(actual, output)
+                        torch.testing.assert_close(
+                            actual, expected, atol=1e-5, rtol=1e-5
+                        )
+                        self.assertTrue(torch.isfinite(actual).all())
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires Ascend NPU"
+    )
+    def test_graph_replay_updates_requests_lengths_and_kv(self):
+        """Replay must follow live request rows and cache contents after slot reuse."""
+        for cross in (False, True):
+            with self.subTest(cross=cross):
+                torch.manual_seed(42)
+                query = torch.randn(3, 2, 64, device="npu", dtype=torch.float16)
+                keys = torch.randn(81, 2, 64, device="npu", dtype=torch.float16)
+                values = torch.randn_like(keys)
+                keys[0] = float("nan")
+                values[0] = float("nan")
+                table = (torch.randperm(80, device="npu")[:48] + 1).reshape(4, 12)
+                table[0] = -99999
+                table[:, 8:] = -99999
+                rows = torch.tensor([2, 1, 0], device="npu")
+                lengths = torch.tensor([3, 1, 0], device="npu")
+                encoder_lengths = torch.tensor([2, 3, 12], device="npu")
+                output = torch.empty_like(query)
+                backend = AscendTorchNativeAttnBackend()
+                for _ in range(3):
+                    backend.run_sdpa_forward_decode(
+                        query,
+                        output,
+                        keys,
+                        values,
+                        table,
+                        rows,
+                        lengths,
+                        encoder_lens=encoder_lengths,
+                        is_cross_attention=cross,
+                        scaling=0.125,
+                        is_encoder_decoder_graph=True,
+                    )
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    backend.run_sdpa_forward_decode(
+                        query,
+                        output,
+                        keys,
+                        values,
+                        table,
+                        rows,
+                        lengths,
+                        encoder_lens=encoder_lengths,
+                        is_cross_attention=cross,
+                        scaling=0.125,
+                        is_encoder_decoder_graph=True,
+                    )
+                for step in range(3):
+                    rows.copy_(
+                        torch.tensor([3, 2 if step != 1 else 1, 0], device="npu")
+                    )
+                    lengths[0] = 2 + step
+                    encoder_lengths[0] = 2 + step
+                    table[3, :8].copy_(torch.randperm(80, device="npu")[:8] + 1)
+                    query.add_(0.05)
+                    values.mul_(0.95)
+                    before = encoder_decoder_reference(
+                        query,
+                        keys,
+                        values,
+                        table,
+                        rows,
+                        lengths,
+                        encoder_lengths,
+                        cross,
+                        0.125,
+                    )
+                    start = 0 if cross else int(encoder_lengths[0].item())
+                    slot = int(table[3, start].item())
+                    keys[slot].add_(2 * query[0])
+                    expected = encoder_decoder_reference(
+                        query,
+                        keys,
+                        values,
+                        table,
+                        rows,
+                        lengths,
+                        encoder_lengths,
+                        cross,
+                        0.125,
+                    )
+                    self.assertFalse(
+                        torch.allclose(expected, before, atol=0.002, rtol=0.002)
+                    )
+                    graph.replay()
+                    torch.npu.synchronize()
+                    torch.testing.assert_close(
+                        output.cpu(), expected, atol=0.002, rtol=0.002
+                    )
+                    self.assertTrue(torch.isfinite(output).all().item())
+
+
 if __name__ == "__main__":
     unittest.main()

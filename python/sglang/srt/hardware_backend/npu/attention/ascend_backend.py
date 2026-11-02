@@ -3250,6 +3250,11 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     logit_cap=layer.logit_cap,
                     logit_capping_method=layer.logit_capping_method,
+                    is_encoder_decoder_graph=(
+                        self.graph_mode
+                        and forward_batch.encoder_lens is not None
+                        and layer.logit_cap == 0
+                    ),
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
