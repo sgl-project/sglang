@@ -679,7 +679,7 @@ def npu_mla_preprocess(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
             q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_event(m.alt_stream)
+            torch.npu.current_stream().wait_stream(m.alt_stream)
         else:
             (
                 q_pe,
