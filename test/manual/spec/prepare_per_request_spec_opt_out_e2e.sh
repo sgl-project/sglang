@@ -42,7 +42,7 @@ import os
 from huggingface_hub import snapshot_download
 models = os.environ.get("OPT_OUT_MODELS", "Qwen/Qwen2.5-1.5B-Instruct,Qwen/Qwen2.5-0.5B-Instruct").split(",")
 for model in models:
-    path = snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja"])
+    path = snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "*.bin", "*.txt", "*.model", "*.jinja"])
     print("MODEL_CACHE_READY", model, path, flush=True)
 PY
   echo PREFLIGHT_PASS
