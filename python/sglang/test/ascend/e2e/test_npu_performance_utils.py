@@ -929,7 +929,14 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    if self.tpot and metrics.get("mean_tpot"):
+    # The perf knobs below are declared on the perf test bases; callers from
+    # other bases (e.g. accuracy cases) may not define them, so read them
+    # defensively instead of relying on class attributes.
+    tpot = getattr(self, "tpot", None)
+    output_token_throughput = getattr(self, "output_token_throughput", None)
+    ttft = getattr(self, "ttft", None)
+    mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
+    if tpot and metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
@@ -937,10 +944,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "tpot_baseline",
-            float(self.tpot),
+            float(tpot),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.output_token_throughput and metrics.get("total_tps"):
+    if output_token_throughput and metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
@@ -948,10 +955,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "throughput_baseline",
-            float(self.output_token_throughput),
+            float(output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.ttft and metrics.get("mean_ttft"):
+    if ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
@@ -959,10 +966,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "ttft_baseline",
-            float(self.ttft),
+            float(ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
+    if mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
@@ -970,7 +977,7 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "e2e_latency_baseline",
-            float(self.mean_e2e_latency),
+            float(mean_e2e_latency),
             labels={"test_case": tc_name, "type": "perf"},
         )
 
@@ -997,31 +1004,31 @@ def assert_metrics(self, metrics):
             labels={"test_case": tc_name, "type": "perf"},
         )
 
-    if self.tpot:
-        if self.tpot < TPOT_THRESHOLD:
+    if tpot:
+        if tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot + TPOT_TOLERANCE_LOW,
+                tpot + TPOT_TOLERANCE_LOW,
             )
         else:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot * TPOT_TOLERANCE_HIGH,
+                tpot * TPOT_TOLERANCE_HIGH,
             )
-    if self.output_token_throughput:
+    if output_token_throughput:
         self.assertGreaterEqual(
             float(metrics["total_tps"]),
-            self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
+            output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
-    if self.ttft:
+    if ttft:
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
-            self.ttft * TTFT_TOLERANCE,
+            ttft * TTFT_TOLERANCE,
         )
-    if self.mean_e2e_latency:
+    if mean_e2e_latency:
         self.assertLessEqual(
             float(metrics["mean_e2e_latency"]),
-            self.mean_e2e_latency * E2E_TOLERANCE,
+            mean_e2e_latency * E2E_TOLERANCE,
         )
     # Once an accept_rate baseline is set, a missing "Accept length" line
     # (e.g. server_info request failed or spec decoding inactive) or a
