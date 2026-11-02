@@ -97,7 +97,7 @@ def _reference(target, draft, candidates, coins, final_coins, *, block):
 
 @pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize(
-    "steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099), (3, 131073)]
+    "steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099), (3, 32768), (3, 131073)]
 )
 def test_matches_reference(steps, vocab, block):
     torch.manual_seed(42)

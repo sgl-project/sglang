@@ -4,8 +4,9 @@ import triton.language as tl
 
 # Vocabulary tile of the final-token draw. Each (request, tile) pair runs in its own program.
 _FINAL_BLOCK_V = 4096
-# Below this size, keeping the draw in the acceptance kernel avoids two launches.
-_MAX_INLINE_VOCAB = 16384
+# Up to this size, keeping the draw in the acceptance kernel avoids two launches,
+# which cost more than the scan when the sampler runs outside a CUDA graph.
+_MAX_INLINE_VOCAB = 32768
 
 
 @triton.jit
@@ -383,9 +384,9 @@ def chain_speculative_sampling_triton(
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
-    # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
+    # Cap the reduction tile and widen the program for it to avoid register spills.
     block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
-    num_warps = 8 if block_verification and block_reduce > 4096 else 4
+    num_warps = 8 if block_reduce > 4096 else 4
     residual_scale = (
         torch.empty(batch_size, dtype=torch.float32, device=target_probs.device)
         if vocab_size > _MAX_INLINE_VOCAB
