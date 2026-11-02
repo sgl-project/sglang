@@ -1900,6 +1900,7 @@ class ModelRunner:
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
+                is_draft=self.is_draft_worker,
             ) as recorder_outputs,
         ):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
