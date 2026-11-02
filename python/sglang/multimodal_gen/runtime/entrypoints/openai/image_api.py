@@ -485,6 +485,7 @@ async def edits(
         output_dir = stack.enter_context(temp_dir_if_disabled(server_args.output_path))
 
         input_paths = []
+        mask_path = None
         try:
             for idx, img in enumerate(image_list):
                 filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
@@ -496,6 +497,16 @@ async def edits(
                     uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
+            if mask is not None:
+                mask_name = sanitize_upload_filename(
+                    getattr(mask, "filename", None) or "mask", "mask"
+                )
+                mask_path = await save_image_to_path(
+                    mask,
+                    os.path.join(uploads_dir, f"{request_id}_mask_{mask_name}"),
+                    prefer_remote_source=server_args.input_save_path is None,
+                    uploads_root=uploads_dir,
+                )
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -526,6 +537,7 @@ async def edits(
             save_output=write_output_files,
             return_image_bytes=True,
             image_path=input_paths,
+            mask_path=mask_path,
             seed=seed,
             generator_device=generator_device,
             negative_prompt=negative_prompt,
