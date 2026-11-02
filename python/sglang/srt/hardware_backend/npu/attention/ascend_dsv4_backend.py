@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import contextmanager
+from copy import copy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -1954,6 +1955,57 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
+    @contextmanager
+    def prefill_query_chunk(
+        self, begin: int, end: int, num_tokens: int, compress_ratio: int
+    ):
+        """Read a query tile against the already populated full prefill caches."""
+        original = self.forward_metadata
+        assert original.actual_seq_lengths_kv.numel() == 1
+        assert 0 <= begin < end <= num_tokens
+        chunk = copy(original)
+        # Eager init creates a new ForwardMetadata for each batch. Scheduling
+        # metadata can be reused across its layers; indexer results cannot.
+        cache = getattr(original, "npu_prefill_chunk_metadata", None)
+        if cache is None:
+            cache = original.npu_prefill_chunk_metadata = {}
+        key = (begin, end, num_tokens, compress_ratio)
+        cached = cache.get(key)
+        if cached is None:
+            chunk.actual_seq_lengths_q_pa = original.actual_seq_lengths_q_pa.new_tensor(
+                [0, end - begin]
+            )
+            # Sparse attention right-aligns queries with KV. The tile must end
+            # at its own absolute position, not the end of the full request.
+            chunk.actual_seq_lengths_kv = original.actual_seq_lengths_kv - (
+                num_tokens - end
+            )
+        else:
+            (
+                chunk.actual_seq_lengths_q_pa,
+                chunk.actual_seq_lengths_kv,
+                chunk.kernel_metadata,
+            ) = cached
+        if getattr(original, "c4_topk_indices", None) is not None:
+            chunk.c4_topk_indices = original.c4_topk_indices[begin:end]
+        self.forward_metadata = chunk
+        try:
+            if cached is None:
+                chunk.kernel_metadata = self._kernel_metadata_from_parts(
+                    bs=1,
+                    actual_seq_lengths_q_pa=chunk.actual_seq_lengths_q_pa,
+                    actual_seq_lengths_kv=chunk.actual_seq_lengths_kv,
+                    attention_only_ratio=compress_ratio,
+                )
+                cache[key] = (
+                    chunk.actual_seq_lengths_q_pa,
+                    chunk.actual_seq_lengths_kv,
+                    chunk.kernel_metadata,
+                )
+            yield
+        finally:
+            self.forward_metadata = original
+
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
         return self._kernel_metadata_from_parts(
@@ -1968,6 +2020,7 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
+        attention_only_ratio: Optional[int] = None,
     ) -> dict:
         fm = self.forward_metadata
         common = {
@@ -2015,10 +2068,12 @@ class DeepseekV4AscendAttnBackend(
             c1a_metadata = metadata_op(**(c1a_kwargs | host_inputs))
         else:
             metadata_op, _ = _sparse_attn_ops()
-            c1a_metadata = metadata_op(**c1a_kwargs)
+            c1a_metadata = (
+                metadata_op(**c1a_kwargs) if attention_only_ratio in (None, 0) else None
+            )
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
-        if self._dsv4_has_c4:
+        if self._dsv4_has_c4 and attention_only_ratio in (None, 4):
             c4a_overrides = {
                 "cmp_ratio": 4,
                 "has_cmp_kv": True,
@@ -2028,6 +2083,8 @@ class DeepseekV4AscendAttnBackend(
             metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
+            if attention_only_ratio == 4:
+                return kernel_metadata
             if actual_seq_lengths_q_pa is not None:
                 # the indexer metadata op wants a fresh contiguous tensor without the leading 0
                 actual_q = actual_seq_lengths_q_pa[1:].clone()
@@ -2051,7 +2108,7 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
 
-        if self._dsv4_has_c128:
+        if self._dsv4_has_c128 and attention_only_ratio in (None, 128):
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             metadata_op, _ = _sparse_attn_ops()
