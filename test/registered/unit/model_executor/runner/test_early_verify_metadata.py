@@ -106,14 +106,19 @@ def test_runner_stages_only_captured_unpadded_early_variant_keys():
 
     assert not stage(3)  # padded to 4 at replay
     assert not stage(4)  # glue graph not captured yet
-    assert not stage(2, max_seq_len=14)  # 14 + 3 > 16: the filtered variant
-    assert not stage(2, max_seq_len=None)  # unknown length: the filtered fallback
+    assert stage(2, max_seq_len=14)  # 14 + 3 > 16: the filtered variant
+    assert stage(2, max_seq_len=None)  # unknown length: the filtered fallback
     assert stage(2, max_seq_len=13)
-    key = runner._glue_key(
-        2, str(ForwardMode.TARGET_VERIFY), DSV41_CANDIDATE_UNFILTERED
-    )
-    assert key[-1] == DSV41_CANDIDATE_UNFILTERED
-    assert calls == [("discard", None)] * 4 + [("stage", key, HEAD)]
+    mode = str(ForwardMode.TARGET_VERIFY)
+    filtered = runner._glue_key(2, mode, DSV41_CANDIDATE_FILTERED)
+    unfiltered = runner._glue_key(2, mode, DSV41_CANDIDATE_UNFILTERED)
+    assert filtered[-1] == DSV41_CANDIDATE_FILTERED
+    assert unfiltered[-1] == DSV41_CANDIDATE_UNFILTERED
+    assert calls == [("discard", None)] * 2 + [
+        ("stage", filtered, HEAD),
+        ("stage", filtered, HEAD),
+        ("stage", unfiltered, HEAD),
+    ]
 
 
 def test_runner_takes_only_an_unpadded_captured_replay():
@@ -229,7 +234,7 @@ def _building_backend():
 def test_every_capture_and_replay_writes_the_first_captured_early_object(monkeypatch):
     """The install replaces the in-graph op that translates the step's write
     locations; every later install writes them into the tensor the graph reads. The
-    filtered variant's Raw entry of the same key is never touched."""
+    in-graph Raw entry of the same key is never touched."""
     monkeypatch.setattr(
         capture_mode, "_capture_attention_variant", DSV41_CANDIDATE_UNFILTERED
     )
