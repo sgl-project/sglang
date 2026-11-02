@@ -449,7 +449,6 @@ def test_reclassified_public_entry_points_are_inventoried():
         "gemm.sm120_fp8_gemv",
         "gemm.fp8_blockwise_gemm",
         "gemm.gptq_marlin",
-        "layernorm.rmsnorm_hf",
         "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",

@@ -158,6 +158,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
         scheduler.running_reqs = RunningReqs()
+        scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
             device="cpu",
@@ -203,11 +204,14 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         return scheduler
 
     def _batch(self) -> ScheduleBatch:
-        return ScheduleBatch(
+        batch = ScheduleBatch(
             reqs=[],
             forward_mode=ForwardMode.EXTEND,
             out_cache_loc=torch.tensor([3], dtype=torch.int64),
         )
+        # A launched step, as process_batch_result expects.
+        batch.add_inflight_step()
+        return batch
 
     def test_pending_result_uses_version_captured_when_batch_ran(self) -> None:
         """A pending result keeps the forward-time version across a serving update."""
