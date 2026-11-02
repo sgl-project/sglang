@@ -17,10 +17,12 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from PIL import Image
 
+from sglang.srt.configs.model_config import STARTLUX_FORMAT
 from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
     OpenAIServingDecisions,
     QuestionView,
+    _encode_labels,
     default_labels,
     label_context,
     label_mass,
@@ -28,6 +30,7 @@ from sglang.srt.entrypoints.openai.serving_decisions import (
     render_question,
     render_text,
 )
+from sglang.srt.entrypoints.systemone import startlux
 from sglang.srt.entrypoints.systemone.joint_schema import (
     REFERENCE_MAX_LENGTH,
     encode_joint_schema,
@@ -79,6 +82,18 @@ class SystemOneServing(OpenAIServingDecisions):
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
         if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
+        if self._startlux_config is None:
+            # Only a StartLux checkpoint reads a none candidate, and ignoring the
+            # request for one would answer without it.
+            for field, value in (
+                ("none_check", request.none_check),
+                ("allow_none", request.allow_none),
+            ):
+                if value is not None:
+                    return (
+                        f"{field} reads a StartLux-Decision none candidate, which only "
+                        "a checkpoint with a lodestar decision_config.json has"
+                    )
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -121,6 +136,8 @@ class SystemOneServing(OpenAIServingDecisions):
             return self._joint_schema_request(request, views), (request, views)
         if self.pointer_head is not None:
             return self._pointer_request(request, views), (request, views)
+        if self._startlux_config is not None:
+            return self._encoded_startlux_questions(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
             if self.decision_config is None
@@ -128,6 +145,112 @@ class SystemOneServing(OpenAIServingDecisions):
         )
         # Lazy, so the async handler can yield to other requests between questions.
         return encode(request, views), (request, views)
+
+    @property
+    def _startlux_config(self) -> Optional[Dict[str, Any]]:
+        """The decision config of a StartLux checkpoint, or None for every other model."""
+        if self.decision_config is None:
+            return None
+        if self.decision_config.get("format") != STARTLUX_FORMAT:
+            return None
+        return self.decision_config
+
+    def _startlux_none_candidates(self, request: SystemOneRequest) -> bool:
+        """Whether a choice question reads the extra "None of the above" option.
+
+        The checkpoint's own server reads it by default, and an answer that may abstain
+        needs it read.
+        """
+        if request.allow_none:
+            return True
+        if request.none_check is None:
+            return True
+        return request.none_check
+
+    def _encoded_startlux_questions(
+        self, request: SystemOneRequest, views: List[QuestionView]
+    ) -> Iterator[EncodedQuestion]:
+        """Prompt and letter ids for each question, as the StartLux checkpoint was trained."""
+        config = self._startlux_config
+        codes = config["codes"]
+        letter_ids = dict(zip(codes, config["token_ids"]))
+        read_none = self._startlux_none_candidates(request)
+        chat_template_kwargs = {
+            **self._chat_template_kwargs(dict(request.chat_template_kwargs)),
+            # The checkpoint reads the answer letters after the empty think block.
+            "enable_thinking": False,
+        }
+        for question_id, question, view in zip(
+            request.questions, request.questions.values(), views
+        ):
+            try:
+                row = startlux.from_systemone(
+                    request.state,
+                    _startlux_spec(question),
+                    allow_none=read_none and view.kind == "choice",
+                )
+                if row["type"] not in config["temperature_by_type"]:
+                    raise ValueError(
+                        "the checkpoint has no temperature for this question type"
+                    )
+                options = len(row["options"])
+                if options > config["max_options_per_pass"]:
+                    raise ValueError(
+                        f"it has {options} options, but one read-out covers at most "
+                        f"{config['max_options_per_pass']}. A longer choice list needs "
+                        "the checkpoint's own grouping rounds, which this route does "
+                        "not run"
+                    )
+                if request.images:
+                    raise ValueError(
+                        "this route does not read images for a StartLux checkpoint; "
+                        "run the checkpoint's own protocol layer against this server"
+                    )
+                labels = codes[:options]
+                prompt_ids, label_ids, _ = self._encode_startlux_question(
+                    startlux.question_content(row), labels, chat_template_kwargs
+                )
+                if label_ids != [letter_ids[label] for label in labels]:
+                    raise ValueError(
+                        "the served tokenizer does not encode the answer letters as "
+                        "the token ids of the checkpoint readout"
+                    )
+            except ValueError as e:
+                raise ValueError(f"question {question_id!r}: {e}") from e
+            yield prompt_ids, label_ids, []
+
+    def _encode_startlux_question(
+        self,
+        content: str,
+        labels: List[str],
+        chat_template_kwargs: Dict[str, Any],
+    ) -> EncodedQuestion:
+        """Render one StartLux question and check the position its answer is read at."""
+        tokenizer = self.tokenizer_manager.tokenizer
+        prompt = self._apply_chat_template(
+            content, chat_template_kwargs, startlux.SYSTEM
+        )
+        if not prompt.endswith(startlux.THINK_OFF_SUFFIX):
+            raise ValueError(
+                "the chat template does not end the prompt with the thinking-off "
+                f"assistant prefix {startlux.THINK_OFF_SUFFIX!r} this checkpoint was "
+                "trained with"
+            )
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        context_len = self.tokenizer_manager.context_len
+        if len(prompt_ids) + self.tokenizer_manager.num_reserved_tokens >= context_len:
+            raise ValueError(
+                f"the prompt has {len(prompt_ids)} tokens, which does not fit the "
+                f"context length of {context_len} tokens"
+            )
+        label_ids = _encode_labels(
+            tokenizer=tokenizer,
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            labels=labels,
+            added_tokens=self.added_tokens,
+        )
+        return prompt_ids, label_ids, []
 
     def _joint_schema_request(
         self, request: SystemOneRequest, views: List[QuestionView]
@@ -416,6 +539,10 @@ class SystemOneServing(OpenAIServingDecisions):
             return await self._answer_pointer(
                 adapted_request, request, views, raw_request
             )
+        if self._startlux_config is not None:
+            return await self._answer_startlux(
+                adapted_request, request, views, raw_request
+            )
         _, _, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
@@ -439,13 +566,127 @@ class SystemOneServing(OpenAIServingDecisions):
             answers=answers,
             usage=SystemOneUsage(input_tokens=result.prompt_tokens),
         )
-        # A decision checkpoint's readout has no full-vocabulary distribution.
-        exclude = (
-            None
-            if self.decision_config is None
-            else {"answers": {"__all__": {"x_label_mass"}}}
-        )
+        # A decision checkpoint's readout has no full-vocabulary distribution, and a
+        # model that reads no none candidate reports no none probability.
+        excluded = {"none_probability"}
+        if self.decision_config is not None:
+            excluded.add("x_label_mass")
+        exclude = {"answers": {"__all__": excluded}}
         return ORJSONResponse(content=response.model_dump(exclude=exclude))
+
+    async def _answer_startlux(
+        self,
+        adapted_request: Iterator[EncodedQuestion],
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        raw_request: Request,
+    ) -> ORJSONResponse:
+        """Read every question at its own trained temperature, in as few passes as that allows."""
+        temperatures = (self._startlux_config or {})["temperature_by_type"]
+        encoded = list(adapted_request)
+        question_temperatures = [
+            temperatures[startlux.TEMPERATURE_KEYS[view.kind]] for view in views
+        ]
+        scores: List[List[float]] = [[] for _ in views]
+        prompt_tokens = 0
+        for temperature in sorted(set(question_temperatures)):
+            positions = [
+                i
+                for i, value in enumerate(question_temperatures)
+                if value == temperature
+            ]
+            _, _, result = await self._score(
+                adapted_request=iter([encoded[i] for i in positions]),
+                raw_request=raw_request,
+                temperature=temperature,
+            )
+            prompt_tokens += result.prompt_tokens
+            for offset, position in enumerate(positions):
+                scores[position] = result.scores[offset]
+        read_none = self._startlux_none_candidates(request)
+        answers = {}
+        for view, probabilities, question_id in zip(views, scores, request.questions):
+            answers[question_id] = _startlux_answer(
+                view=view,
+                probabilities=probabilities,
+                none_candidate=read_none and view.kind == "choice",
+                allow_none=bool(request.allow_none),
+                question_id=question_id,
+            )
+        response = SystemOneResponse(
+            model=self.tokenizer_manager.served_model_name,
+            answers=answers,
+            usage=SystemOneUsage(input_tokens=prompt_tokens),
+        )
+        # The readout scores the answer letters only, so there is no label mass.
+        excluded = {"x_label_mass"}
+        if not read_none:
+            excluded.add("none_probability")
+        return ORJSONResponse(
+            content=response.model_dump(exclude={"answers": {"__all__": excluded}})
+        )
+
+
+def _startlux_spec(question: SystemOneQuestion) -> Dict[str, Any]:
+    """The question as the StartLux renderer describes it."""
+    if isinstance(question, SystemOneChoiceQuestion):
+        return {
+            "type": "choice",
+            "instructions": question.instructions,
+            "criteria": question.criteria,
+        }
+    if isinstance(question, SystemOneNoulQuestion):
+        criteria = question.criteria
+        return {
+            "type": "noul",
+            "instructions": question.instructions,
+            "criteria": {
+                "true": criteria.true if criteria is not None else None,
+                "false": criteria.false if criteria is not None else None,
+            },
+        }
+    return {
+        "type": "score",
+        "instructions": question.instructions,
+        "criteria": list(question.criteria),
+    }
+
+
+def _startlux_answer(
+    view: QuestionView,
+    probabilities: List[float],
+    none_candidate: bool,
+    allow_none: bool,
+    question_id: str,
+):
+    """The answer of one StartLux read-out, in the shape its own server returns."""
+    if not all(math.isfinite(value) for value in probabilities):
+        # A server fault, reported as 500 rather than as a client error.
+        raise RuntimeError(f"question {question_id!r} scored non-finite values")
+    if view.kind == "yes_no":
+        return SystemOneNoulAnswer(noul=probabilities[0])
+    if view.kind == "score":
+        return SystemOneScoreAnswer(
+            score=math.fsum(i * p for i, p in enumerate(probabilities)),
+            confidence=startlux.score_confidence(probabilities),
+            legend=_legend(view),
+            probabilities=dict(zip(view.names, probabilities)),
+        )
+    none_probability, abstained = None, False
+    if none_candidate:
+        # The none candidate was scored with the listed options; report it separately.
+        probabilities, none_probability, abstained = startlux.split_none(probabilities)
+    choice = (
+        None
+        if (abstained and allow_none)
+        else view.names[probabilities.index(max(probabilities))]
+    )
+    return SystemOneChoiceAnswer(
+        choice=choice,
+        confidence=startlux.choice_confidence(probabilities),
+        probabilities=dict(zip(view.names, probabilities)),
+        none_probability=none_probability,
+    )
 
 
 def _view(question: SystemOneQuestion) -> QuestionView:
