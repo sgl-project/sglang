@@ -466,8 +466,6 @@ def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
 @pytest.mark.parametrize(
     "key, sgld_options, error",
     [
-        # A FastH3 file loaded as base H3 died in the worker on to_gate_compress.
-        ("blocks.0.attn.to_gate_compress.weight", {}, "SGLDNativeModelLoader"),
         # The single-file loader builds no quant config, so this was silently ignored.
         (
             "blocks.0.attn.to_q.weight",
@@ -487,6 +485,33 @@ def test_unservable_h3_file_is_rejected_before_worker_load(
         _h3_runtime_that_must_not_start().load_model(
             model_path=str(path), sgld_options=sgld_options
         )
+
+
+@pytest.mark.parametrize(
+    "name, backend",
+    [
+        ("fasth3_8step.safetensors", "video_sparse_attn_h3"),
+        # VSA-H3 does not tile the ComfyUI Ref2VA layout: stay dense.
+        ("fasth3_omniref_8step.safetensors", None),
+    ],
+)
+def test_fasth3_single_file_defaults_to_its_trained_attention(
+    tmp_path, name, backend
+) -> None:
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _default_fasth3_attention,
+    )
+
+    path = tmp_path / name
+    save_file({"blocks.0.attn.to_gate_compress.weight": torch.zeros(1)}, path)
+    options = {}
+    _default_fasth3_attention(str(path), options)
+    assert options.get("attention_backend") == backend
+    explicit = {"attention_backend": "fa"}
+    _default_fasth3_attention(str(path), explicit)
+    assert explicit == {"attention_backend": "fa"}
 
 
 def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
