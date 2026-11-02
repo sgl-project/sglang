@@ -491,7 +491,8 @@ class TestFusedExperts:
     @pytest.mark.parametrize("K", [256])
     @pytest.mark.parametrize("E", [8])
     @pytest.mark.parametrize("topk", [4])
-    def test_int4_moe(self, M, N, K, E, topk, group_size=128):
+    @pytest.mark.parametrize("activation", ["silu", "gelu"])
+    def test_int4_moe(self, M, N, K, E, topk, activation, group_size=128):
         a = torch.rand(M, K, dtype=dtype) / math.sqrt(K)
 
         awq_w13_weight = torch.randint(-127, 128, (E, K, 2 * N // 8)).to(torch.int)
@@ -524,7 +525,13 @@ class TestFusedExperts:
         score = torch.rand((M, E), dtype=dtype)
 
         ref_out = torch_naive_fused_moe(
-            a, bf16_w13_weight, bf16_w2_weight, score, topk, False
+            a,
+            bf16_w13_weight,
+            bf16_w2_weight,
+            score,
+            topk,
+            False,
+            activation=activation,
         )
         topk_weight, topk_ids = make_routing(M, E, topk, dtype=dtype, score=score)
         awq_w13_weight_pack, awq_w13_zero_pack, awq_w13_scales_pack = (
@@ -550,6 +557,7 @@ class TestFusedExperts:
             w1_zp=awq_w13_zero_pack,
             w2_zp=awq_w2_zero_pack,
             is_vnni=True,
+            activation=activation,
             inplace=False,
         )
 

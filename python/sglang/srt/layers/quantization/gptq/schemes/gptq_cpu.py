@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
     GPTQIntelAMXLinearKernel,
     GPTQIntelAMXMoEKernel,
@@ -19,6 +21,7 @@ from sglang.srt.layers.parameter import (
     RowvLLMParameter,
 )
 
+from .gptq_cpu_padding import GPTQCPUGroupPadding
 from .gptq_linear import GPTQLinearScheme
 from .gptq_scheme import GPTQMoESchemeBase
 
@@ -61,12 +64,27 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
     ):
         _check_cpu_amx_support(self.quant_config)
 
-        if input_size_per_partition % self.quant_config.group_size != 0:
-            raise ValueError(
-                "The input size is not aligned with the quantized "
-                "weight shape. This can be caused by too large "
-                "tensor parallel size."
+        row_parallel = input_size != input_size_per_partition
+        tp_rank = get_group_rank_size(layer.tp_group)[0] if row_parallel else 0
+        padding = GPTQCPUGroupPadding(
+            input_size=input_size,
+            shard_size=input_size_per_partition,
+            group_size=self.quant_config.group_size,
+            tp_rank=tp_rank,
+        )
+        layer.gptq_cpu_padding = padding
+
+        def loader(name):
+            if not (padding.left or padding.right or padding.channelwise):
+                return weight_loader
+            return partial(
+                padding.load_weight,
+                name=name,
+                weight_loader=weight_loader,
+                row_parallel=row_parallel,
+                presharded=layer.use_presharded_weights,
             )
+
         output_size_per_partition = sum(output_partition_sizes)
         if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
             raise ValueError(
@@ -75,17 +93,12 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
                 "tensor parallel size."
             )
 
-        if self.quant_config.group_size != -1:
-            group_size = self.quant_config.group_size
-        else:
-            group_size = input_size
-
-        scale_and_zero_size = input_size_per_partition // group_size
+        scale_and_zero_size = padding.num_groups
         scale_and_zero_input_dim = 0
 
         qweight = PackedvLLMParameter(
             data=torch.empty(
-                input_size_per_partition // self.quant_config.pack_factor,
+                padding.physical_size // self.quant_config.pack_factor,
                 output_size_per_partition,
                 dtype=torch.int32,
             ),
@@ -93,19 +106,13 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
             output_dim=1,
             packed_dim=0,
             packed_factor=self.quant_config.pack_factor,
-            weight_loader=weight_loader,
+            weight_loader=loader("qweight"),
         )
 
         g_idx = RowvLLMParameter(
-            data=torch.tensor(
-                [
-                    i // self.quant_config.group_size
-                    for i in range(input_size_per_partition)
-                ],
-                dtype=torch.int32,
-            ),
+            data=padding.group_indices(),
             input_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=loader("g_idx"),
         )
         qzeros_args = {
             "data": torch.empty(
@@ -113,7 +120,7 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
                 output_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
             ),
-            "weight_loader": weight_loader,
+            "weight_loader": loader("qzeros"),
         }
         weight_scale_args = {
             "data": torch.empty(
@@ -121,7 +128,7 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
                 output_size_per_partition,
                 dtype=params_dtype,
             ),
-            "weight_loader": weight_loader,
+            "weight_loader": loader("scales"),
         }
         if scale_and_zero_input_dim is None:
             scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
