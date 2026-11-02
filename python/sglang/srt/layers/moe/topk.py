@@ -2756,9 +2756,14 @@ def _post_process_topk_ids(
             and not eplb_remap_enabled
             and (use_per_rank_shared_slots or not _skip_hip_pad_mask)
         )
-        _fold_pad_weights_into_append = (
-            _fold_pad_into_append and not use_per_rank_shared_slots
-        )
+        # Both fused append kernels (the non-per-rank fused_append_shared_experts
+        # and the per-rank deepep append+remap) zero the padded weights in place
+        # when asked, folding the trailing _zero_topk_weights_padded_region pass.
+        # Only do so where that pass would have run: SGLANG_MORI_NO_PAD_MASK
+        # deliberately leaves padded weights live, and on the per-rank path the
+        # id fold still engages there (aiter needs in-range ids) -- so gate the
+        # weight fold on _skip_hip_pad_mask, not just on the id fold.
+        _fold_pad_weights_into_append = _fold_pad_into_append and not _skip_hip_pad_mask
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
@@ -2846,6 +2851,9 @@ def _post_process_topk_ids(
             num_token_non_padded=(
                 num_token_non_padded if _fold_pad_into_append else None
             ),
+            # Fill padded ids whenever the fold engaged, but only zero their
+            # weights when the trailing pass would have (i.e. not NO_PAD_MASK).
+            zero_pad_weights=_fold_pad_weights_into_append,
         )
     elif _aiter_append:
         N = router_logits.shape[1]
@@ -2910,6 +2918,11 @@ def _post_process_topk_ids(
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
+        #
+        # Skipped when _fold_pad_weights_into_append engaged (either fused append
+        # kernel -- non-per-rank fused_append_shared_experts or per-rank deepep
+        # append+remap): that kernel was asked to zero both the routed and the
+        # shared weights on padded rows, making this a redundant per-layer launch.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
