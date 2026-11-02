@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -97,6 +98,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
         scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True

@@ -155,6 +155,8 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # Hands requests out of the scheduler's prefill_launched_reqs.
+    leave_prefill_launched: Callable = lambda reqs: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -463,6 +465,7 @@ class SchedulerBatchResultProcessor:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
+                            self.leave_prefill_launched([req])
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     if discard_finish_reason is None:
