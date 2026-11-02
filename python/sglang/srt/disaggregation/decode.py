@@ -3870,12 +3870,12 @@ class SchedulerDisaggregationDecodeMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
-            self.tree_cache.check_hicache_events()
+            self._check_hicache_events()
         elif (
             getattr(self.tree_cache, "linker", None) is not None
             and self.tree_cache.linker.pending_offloads
         ):
-            self.tree_cache.check_hicache_events()
+            self._check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
