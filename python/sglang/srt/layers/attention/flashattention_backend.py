@@ -60,8 +60,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
@@ -233,14 +232,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
-            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
-                phase="target_verify",
-                spec_algorithm=SpeculativeAlgorithm.from_string(
-                    get_spec().speculative_algorithm
-                ),
-                is_draft_worker=True,
-                num_draft_tokens=int(self.speculative_num_draft_tokens),
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=int(self.speculative_num_draft_tokens)
             )
         self.speculative_step_id = speculative_step_id
 

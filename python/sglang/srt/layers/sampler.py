@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import argmax as sampler_argmax
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
@@ -216,7 +217,7 @@ class Sampler(nn.Module):
                 )
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
-                batch_next_token_ids = torch.argmax(logits, -1)
+                batch_next_token_ids = sampler_argmax(logits)
             _trace_e2e_sampler(
                 "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
             )
@@ -275,30 +276,26 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # Deterministic inference must derive the returned logprobs
-                # from F.log_softmax — the same kernel prefill rescoring uses —
-                # not log(softmax(x)) below: the two disagree at ~1e-6 despite
-                # being mathematically equivalent, which breaks bitwise
-                # prefill/decode logprob alignment.
-                if (
-                    return_logprob
-                    and self.enable_deterministic
-                    and logprobs_via_logsoftmax_kernel is None
-                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
-                    and target_logprobs is None
-                ):
-                    logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
-                        logits, dim=-1
-                    )
-
-                # In-place op to save memory
-                logits[:] = (
-                    torch.softmax(logits, dim=-1)
-                    if self.enable_deterministic
-                    else sampler_softmax(logits)
-                )
+                if self.enable_deterministic:
+                    logits.div_(sampling_info.temperatures)
+                    # Deterministic inference must derive the returned logprobs
+                    # from F.log_softmax — the same kernel prefill rescoring uses —
+                    # not log(softmax(x)) below: the two disagree at ~1e-6 despite
+                    # being mathematically equivalent, which breaks bitwise
+                    # prefill/decode logprob alignment.
+                    if (
+                        return_logprob
+                        and logprobs_via_logsoftmax_kernel is None
+                        and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                        and target_logprobs is None
+                    ):
+                        logprobs_via_logsoftmax_kernel = (
+                            torch.nn.functional.log_softmax(logits, dim=-1)
+                        )
+                    logits[:] = torch.softmax(logits, dim=-1)
+                else:
+                    # Temperature fused; the probs overwrite the logits in place.
+                    sampler_softmax(logits, sampling_info.temperatures, out=logits)
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
