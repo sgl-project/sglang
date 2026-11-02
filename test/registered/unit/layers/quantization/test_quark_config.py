@@ -492,12 +492,17 @@ class TestQuarkMxfp4MoEShuffleImports(CustomTestCase):
 
     def _reload_without_env(self, *, is_gfx95, is_gfx1250):
         previous = os.environ.pop("SGLANG_USE_AITER", None)
+        arch = "gfx950" if is_gfx95 else "gfx1250" if is_gfx1250 else "gfx942"
         try:
             with (
                 patch.dict(sys.modules, _fake_aiter_shuffle_modules()),
                 patch("sglang.srt.utils.is_hip", lambda: True),
                 patch("sglang.srt.utils.is_gfx95_supported", lambda: is_gfx95),
                 patch("sglang.srt.utils.is_gfx1250_supported", lambda: is_gfx1250),
+                patch(
+                    "torch.cuda.get_device_properties",
+                    lambda _: SimpleNamespace(gcnArchName=arch),
+                ),
             ):
                 return importlib.reload(quark_moe)
         finally:
