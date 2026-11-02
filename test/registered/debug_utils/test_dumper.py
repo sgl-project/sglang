@@ -22,6 +22,7 @@ from sglang.srt.debug_utils.dumper import (
     _deepcopy_or_clone,
     _detect_recompute_status,
     _Dumper,
+    _evaluate_filter,
     _format_tags,
     _get_default_exp_name,
     _Grafter,
@@ -967,6 +968,28 @@ class TestKvFilter:
         d = _make_test_dumper(tmp_path, filter="layer_id ===")
         with pytest.raises(SyntaxError):
             d.dump("tensor", torch.randn(3))
+
+    def test_filter_blocks_regex_globals_escape(self):
+        # search/match used to be raw function objects; True.__class__ chains
+        # and __globals__ must not be reachable from filter expressions.
+        tags = {"name": "attn"}
+        dangerous = [
+            "search.__globals__",
+            "match.__globals__",
+            "search.__globals__['__builtins__']['__import__']('os')",
+            "(search.__globals__['__builtins__']['__import__']('pathlib').Path('/tmp/x').write_text('x') > 0)",
+            "__import__('os')",
+            "().__class__.__bases__[0].__subclasses__()",
+        ]
+        for expr in dangerous:
+            with pytest.raises((ValueError, AttributeError, TypeError, SyntaxError)):
+                _evaluate_filter(expr, tags)
+
+        # Legitimate helpers still work.
+        assert _evaluate_filter("search(r'attn|mlp', name)", tags) is True
+        assert _evaluate_filter("search(r'norm', name)", tags) is False
+        assert _evaluate_filter("layer_id is None", tags) is True
+        assert _evaluate_filter("layer_id == 0", {"layer_id": 0}) is True
 
     def test_no_filter_dumps_all(self, tmp_path):
         d = _make_test_dumper(tmp_path)
@@ -3190,16 +3213,15 @@ class TestGrafterFilterMatching:
     def test_filter_expression_undefined_helper_raises(self):
         """Referencing an undefined helper inside a filter (e.g. a function
         the user expected to be in scope) should NOT be silently treated as
-        False. The filter namespace is a `_DefaultNoneDict` (unknown keys
-        resolve to None), so calling an undefined helper raises TypeError
-        (`'NoneType' object is not callable`) — loud enough to surface the
-        misconfiguration."""
+        False. The restricted AST evaluator only allows calls to allowlisted
+        helpers, so an unknown call raises ValueError — loud enough to
+        surface the misconfiguration."""
         grafter = _Grafter(
             config=_unit_grafter_config(
                 grafter_b2t_filter="totally_undefined_helper(name)"
             ),
         )
-        with pytest.raises(TypeError, match=r"NoneType.* not callable"):
+        with pytest.raises(ValueError, match=r"Only search\(\), match\(\)"):
             grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
 
     def test_filter_can_use_re_search(self):
