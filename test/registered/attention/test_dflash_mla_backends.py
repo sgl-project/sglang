@@ -95,6 +95,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             qk_rope_head_dim=ROPE,
             hidden_size=HIDDEN,
             context_len=CAPACITY,
+            dtype=torch.bfloat16,
         )
         model_config.hf_config = model_config.hf_text_config = config
         model_config.qk_nope_head_dim = NOPE
