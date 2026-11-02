@@ -694,6 +694,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 mask_dtype=torch.bool,
             )
 
+        # Graph PLE lookup needs the IDs from before multimodal embedding clamps them.
+        if is_first_rank and forward_batch.contains_mm_inputs():
+            input_ids = input_ids.clone()
+
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
         hidden_states = general_mm_embed_routine(

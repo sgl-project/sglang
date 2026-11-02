@@ -19,6 +19,7 @@ from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -115,12 +116,18 @@ def has_hybrid_graph_handlers(
     )
 
 
+def _graph_layer_id(layer) -> int:
+    if isinstance(layer, RadixAttention):
+        return int(layer.graph_layer_id)
+    return int(layer.layer_id)
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
     layer_model=None,
 ) -> tuple[list[Any], list[Any]]:
-    """Pad PP-local attention metadata so global layer_id remains a valid index.
+    """Index attention by execution layer, independently of shared KV cache IDs.
 
     Models that re-execute layers pre-expand these lists into position-indexed
     lookup tables (the same layer at several positions); such tables are
@@ -136,7 +143,7 @@ def index_attention_layers_by_global_id(
                 _align_pipeline_layers(mha_companion_layers, layer_model),
             )
         return attention_layers, mha_companion_layers
-    max_layer_id = max(int(layer.layer_id) for layer in populated)
+    max_layer_id = max(_graph_layer_id(layer) for layer in populated)
     # Keep trailing pure MoE layers represented as well. Their graph handler
     # lives in moe_layers, and shrinking this list loses decoder alignment.
     indexed_size = max(
@@ -150,7 +157,7 @@ def index_attention_layers_by_global_id(
             if companion is not None:
                 raise ValueError("MHA companion has no primary attention layer")
             continue
-        layer_id = int(attention.layer_id)
+        layer_id = _graph_layer_id(attention)
         if layer_id < 0:
             raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
         if indexed_attention[layer_id] is not None:
