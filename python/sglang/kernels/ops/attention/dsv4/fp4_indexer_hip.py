@@ -26,12 +26,12 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import MqaLogitsBuffers, MqaLogitsPlan
+
     from sglang.kernels.ops.attention.dsv4.compress import (
         CompressorDecodePlan,
         CompressorPrefillPlan,
     )
-    from aiter.ops.opus.pa_mqa_logits_mxfp4 import MqaLogitsBuffers, MqaLogitsPlan
-
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         PrefillScheduleBuffers,
     )
@@ -113,6 +113,8 @@ class FP4RowgroupPrefillWorkspace(NamedTuple):
     request_page_table: torch.Tensor
     max_seq_len: int
     query_start_locs: Dict[Tuple[int, int], torch.Tensor]
+
+
 class FP4OpusWorkspace(NamedTuple):
     guarded_page_table: torch.Tensor
     # Plan-owned copy of the row windows: a graph replay reads this pointer.
@@ -573,6 +575,8 @@ def rowgroup_paged_mqa_logits(
         plan=plan,
     )
     return logits
+
+
 def prepare_opus_fp4_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
