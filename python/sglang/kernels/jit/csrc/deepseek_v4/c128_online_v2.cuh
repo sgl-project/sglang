@@ -165,6 +165,7 @@ struct Compress128OnlinePrefillParams {
   const PlanC* __restrict__ plan_w;         // trailing partial segments
   uint32_t num_compress;
   uint32_t num_write;
+  uint32_t cp_rows_per_rank;
 };
 
 struct Compress128SharedBuffer {
@@ -269,7 +270,13 @@ constexpr float kPadScore = -FLT_MAX;
 /// `kWrite=true`  (write pass)   : handles trailing partial segments.
 ///   Reads optional prior state from `read_page_1` (-1 = fallback to
 ///   `read_page_0`), writes new running state to `read_page_0`.
-template <int64_t kHeadDim, typename BufferFloat, bool kWrite, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    bool kWrite,
+    bool kUsePDL,
+    bool kRankMajor = false,
+    int64_t kCPSize = 8>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     void flash_c128_online_prefill_v2(const __grid_constant__ Compress128OnlinePrefillParams params) {
   using namespace device;
@@ -328,7 +335,9 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
     const uint32_t j = i + warp_offset;
     if (j >= chunk_offset && j < pos_in_chunk_end) {
       const int32_t ragged_id = chunk_start_ragged + static_cast<int32_t>(j);
-      const auto kv_src_ptr = kv_score_input + ragged_id * kElementSize + split_offset;
+      const int64_t input_row =
+          kRankMajor ? device::compress::cp_input_row(ragged_id, params.cp_rows_per_rank, kCPSize) : ragged_id;
+      const auto kv_src_ptr = kv_score_input + input_row * kElementSize + split_offset;
       const auto score_src_ptr = kv_src_ptr + kHeadDim;
       const auto bias_src_ptr = score_bias_base + j * kHeadDim + split_offset;
       kv[i].load(kv_src_ptr, lane_id);
@@ -443,11 +452,12 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
 // the online C128 running state buffer can be fp32/bf16.
 // ---------------------------------------------------------------------------
 
-template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL, bool kRankMajor = false, int64_t kCPSize = 8>
 struct FlashCompress128OnlineKernel {
   static constexpr auto decode_kernel = flash_c128_online_decode_v2<kHeadDim, BufferFloat, kUsePDL>;
   template <bool kWrite>
-  static constexpr auto prefill_kernel = flash_c128_online_prefill_v2<kHeadDim, BufferFloat, kWrite, kUsePDL>;
+  static constexpr auto prefill_kernel =
+      flash_c128_online_prefill_v2<kHeadDim, BufferFloat, kWrite, kUsePDL, kRankMajor, kCPSize>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
   static constexpr uint32_t kDecodeBlockSize = kHeadDim / 4;
@@ -459,8 +469,8 @@ struct FlashCompress128OnlineKernel {
       const tvm::ffi::TensorView ape,
       const tvm::ffi::TensorView plan_d_) {
     using namespace host;
-
     auto B = SymbolicSize{"batch_size"};
+    RuntimeCheck(!kRankMajor, "rank-major compressor is prefill-only");
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
@@ -537,6 +547,9 @@ struct FlashCompress128OnlineKernel {
     const auto num_c = static_cast<uint32_t>(C.unwrap());
     const auto num_w = static_cast<uint32_t>(W.unwrap());
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
+    if constexpr (kRankMajor) {
+      RuntimeCheck(num_q_tokens > 0 && num_q_tokens % kCPSize == 0, "rank-major input needs equal CP buckets");
+    }
     const auto params = Compress128OnlinePrefillParams{
         .kv_score_buffer = kv_score_buffer.data_ptr(),
         .kv_score_input = kv_score_input.data_ptr(),
@@ -546,6 +559,7 @@ struct FlashCompress128OnlineKernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .cp_rows_per_rank = kRankMajor ? num_q_tokens / kCPSize : 0,
     };
 
     // The two passes MUST be serialized in stream order: pass 1 reads slots

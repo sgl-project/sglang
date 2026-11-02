@@ -8,6 +8,7 @@ import torch.nn as nn
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
@@ -18,7 +19,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip, _use_aiter
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -145,11 +146,86 @@ class Compressor(BaseFusedOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
+    def supports_rank_major_scores(self, x, kv_score, forward_batch):
+        """Qualified zero-prefix, equal-bucket CP2/4/8 SM90 prefill only."""
+        if not envs.SGLANG_OPT_COMPRESSOR_RANK_MAJOR.get():
+            return False
+        if _is_hip or _is_npu or "metax" in torch.__version__:
+            return False
+        from sglang.srt.layers.cp import is_interleave
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        meta = getattr(forward_batch, "attn_cp_metadata", None)
+        parallel = get_parallel()
+        backend = get_attn_backend()
+        controller = getattr(backend, "online_c128_mtp", None)
+        total = getattr(meta, "total_seq_lens", 0)
+        actual = getattr(meta, "per_rank_actual_token", None)
+        logical = getattr(meta, "per_rank_logical_token", None) or actual
+        return (
+            is_interleave()
+            and parallel.attn_cp_size in (2, 4, 8)
+            and parallel.attn_tp_size == 1
+            and parallel.attn_dp_size == 1
+            and getattr(forward_batch, "batch_size", None) == 1
+            and getattr(forward_batch, "forward_mode", None) == ForwardMode.EXTEND
+            and getattr(forward_batch, "extend_prefix_lens_cpu", None) == [0]
+            and getattr(forward_batch, "spec_info", None) is None
+            and not getattr(forward_batch, "return_logprob", True)
+            and not getattr(forward_batch, "return_hidden_states_before_norm", False)
+            and getattr(meta, "gather_index", None) is None
+            and (self.ratio, self.head_dim) in ((4, 128), (4, 512), (128, 512))
+            and total >= envs.SGLANG_OPT_COMPRESSOR_RANK_MAJOR_MIN_TOKENS.get()
+            and total <= 65536
+            and x.ndim == kv_score.ndim == 2
+            and x.is_cuda
+            and kv_score.is_cuda
+            and x.device == kv_score.device
+            and x.dtype == torch.bfloat16
+            and kv_score.dtype == torch.float32
+            and x.is_contiguous()
+            and kv_score.is_contiguous()
+            and not x.requires_grad
+            and not kv_score.requires_grad
+            and x.shape[0] == kv_score.shape[0]
+            and actual is not None
+            and len(actual) == parallel.attn_cp_size
+            and total == max(logical) * parallel.attn_cp_size
+            and max(actual) <= kv_score.shape[0]
+            and tuple(kv_score.shape)
+            == (x.shape[0], (4 if self.ratio == 4 else 2) * self.head_dim)
+            and actual == [max(actual)] * parallel.attn_cp_size
+            and logical == [max(logical)] * parallel.attn_cp_size
+            and max(logical) <= max(actual)
+            and not torch.cuda.is_current_stream_capturing()
+            and torch.cuda.get_device_capability(x.device) == (9, 0)
+            and not getattr(backend, "enable_deepseek_v4_fp4_indexer", False)
+            and (controller is None or not controller.enabled())
+            and not (
+                getattr(backend.token_to_kv_pool, "uniform_fp8", False)
+                and not self.is_in_indexer
+            )
+            and getattr(
+                getattr(backend, "_forward_compress_all_in_one", None), "__module__", ""
+            )
+            == "sglang.srt.layers.attention.dsv4.compressor_v2"
+        )
+
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
+            if self.supports_rank_major_scores(x, kv_score, forward_batch):
+                from sglang.kernels.ops.attention.dsv4.compress import RankMajorScores
+                from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+
+                # Match InterleaveCPStrategy: discard GEMM-only local padding
+                # before the equal-length collective (e.g.6256 ->6250 at50K).
+                cp_size = get_parallel().attn_cp_size
+                rows = forward_batch.attn_cp_metadata.total_seq_lens // cp_size
+                gathered = attn_cp_interleave_gather(kv_score[:rows])
+                return RankMajorScores(gathered, cp_size)
             kv_score = cp_materialize_global_token_order(
                 kv_score,
                 forward_batch,
