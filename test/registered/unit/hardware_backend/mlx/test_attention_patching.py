@@ -1161,13 +1161,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.ingest_requests = lambda: []
+        scheduler.increment_scheduler_iterations = lambda: None
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
-        scheduler.forward_ct = 0
-        scheduler._sched_idled = False
-        scheduler.profiler_manager = SimpleNamespace(
-            _profile_batch_predicate=lambda batch: None
-        )
+        scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
@@ -1209,6 +1206,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             tree_cache=tree_cache,
             hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             req_to_token_pool=None,
+            kv_weight_version_tracker=None,
             decode_offload_manager=None,
             metrics_collector=None,
             metrics_reporter=None,

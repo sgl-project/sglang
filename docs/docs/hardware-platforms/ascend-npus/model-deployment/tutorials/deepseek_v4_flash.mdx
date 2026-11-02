@@ -132,7 +132,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 ### Single-node PD mixed deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. In such scenarios, DeepSeek-V4-Flash can be launched with half of an Ascend A3 Series
+with limited hardware resources. In such scenarios, DeepSeek-V4-Flash can be launched with half of an A3 Series
 node (4 cards, 8 dies). The configuration below was validated with `--tp-size 8`.
 
 ```bash Command
