@@ -1670,6 +1670,15 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                if pp_proxy_tensors is not None:
+                    # The recv allocated these on another stream, and the scheduler
+                    # can drop them before this forward runs (async batch depth > pp
+                    # size / 2 queues enough forwards). Without record_stream the
+                    # allocator hands their memory to the next recv, which then
+                    # overwrites what this forward reads.
+                    for tensor in pp_proxy_tensors.tensors.values():
+                        if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
+                            tensor.record_stream(self.forward_stream)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
