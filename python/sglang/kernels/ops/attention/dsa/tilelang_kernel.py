@@ -913,9 +913,8 @@ def sparse_mla_fwd_decode_partial_fp8(
     threads=256,
 ):
     assert d_v in (256, 512), f"only support d_v=256 or d_v=512, got {d_v}"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    num_blocks = (topk + block_I - 1) // block_I
+    assert num_blocks % inner_iter == 0, "partial groups must cover whole KV blocks"
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -933,7 +932,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     has_tail = d_tail > 0
     dim_quant_fp8 = d_v + d_tail
     rope_offset_fp8 = d_v
-    n_groups = topk // (BI * inner_iter)
+    n_groups = num_blocks // inner_iter
 
     if sm_scale is None:
         sm_scale = (1.0 / (d_v + d_tail)) ** 0.5 * 1.44269504
@@ -1041,7 +1040,14 @@ def sparse_mla_fwd_decode_partial_fp8(
                 topk_block_i = group_i * inner_iter + k_i
 
                 for bi_i in T.Parallel(BI):
-                    idx = indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                    column = topk_block_i * BI + bi_i
+                    if topk % BI == 0:
+                        idx = indices[b_i, s_i, g_i, column]
+                    else:
+                        # Virtual -1 padding avoids widening/copying the index table.
+                        idx = T.if_then_else(
+                            column < topk, indices[b_i, s_i, g_i, column], -1
+                        )
                     valid = idx >= 0
                     page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
                     mask[bi_i] = valid
@@ -1198,12 +1204,25 @@ def tilelang_sparse_fwd(
                 q = q.to(kv.dtype)
             if not _is_hip:
                 block_I, threads, block_per_cu = 32, 128, 1
-                cu = torch.cuda.get_device_properties(q.device).multi_processor_count
+                props = torch.cuda.get_device_properties(q.device)
+                cu = props.multi_processor_count
+                # With several waves of query CTAs, larger KV tiles reduce the
+                # serial loop without needing more splits. Keep other layouts
+                # and architectures on their existing dispatch.
+                if (
+                    (props.major, props.minor) == (9, 0)
+                    and num_heads == 16
+                    and d_v == 512
+                    and tail_dim == 0
+                    and topk >= 2048
+                    and q.shape[0] >= 4 * cu
+                ):
+                    block_I = 128
             elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
-            ni = topk // block_I
+            ni = (topk + block_I - 1) // block_I
             inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
