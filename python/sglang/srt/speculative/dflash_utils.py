@@ -22,7 +22,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sglang.kernels.ops.speculative.dflash_simulated_accept import (
+        dflash_simulated_accept,
+    )
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
@@ -944,13 +950,14 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_token_mode: str,
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
-) -> None:
+    prefix_lens: Optional[torch.Tensor] = None,
+    new_seq_lens: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
-    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None.
+    Returns ``new_seq_lens`` if it was rewritten from the forced lengths, else None."""
     bs, block_size = candidates.shape
-    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
-        # The sampling-verify branch does not materialize the target argmax.
-        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+    real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -958,19 +965,47 @@ def apply_dflash_simulated_acceptance(
     )
     forced_accept_len = forced_commit_len - 1
 
+    target_bonus_tokens = None
+    if real_draft_tokens and target_predict is None:
+        # The sampling and selector branches do not materialize the target
+        # argmax; only the forced row of each request is read.
+        vocab_size = next_token_logits.shape[-1]
+        target_bonus_tokens = torch.argmax(
+            next_token_logits.view(bs, block_size, vocab_size)[:, forced_accept_len],
+            dim=-1,
+        )
+    elif real_draft_tokens:
+        target_bonus_tokens = target_predict[:, forced_accept_len]
+
+    if _is_cuda and candidates.is_cuda:
+        dflash_simulated_accept(
+            candidates=candidates,
+            target_bonus_tokens=target_bonus_tokens,
+            forced_num_accept_tokens=forced_commit_len,
+            num_correct_drafts_out=accept_len,
+            num_accept_tokens_out=commit_lens,
+            bonus_tokens_out=bonus,
+            out_tokens=out_tokens,
+            fixed_token=fixed_token_id,
+            prefix_lens=prefix_lens,
+            new_seq_lens_out=new_seq_lens,
+        )
+        return new_seq_lens
+
     accept_len.fill_(forced_accept_len)
     commit_lens.fill_(forced_commit_len)
 
-    if simulate_acc_token_mode != "real-draft-token":
+    if not real_draft_tokens:
         bonus.fill_(fixed_token_id)
         out_tokens.fill_(fixed_token_id)
-        return
+        return None
 
     out_tokens.zero_()
     if forced_accept_len > 0:
         out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
-    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    bonus.copy_(target_bonus_tokens.to(dtype=bonus.dtype))
     out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+    return None
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

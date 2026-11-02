@@ -54,6 +54,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="speculative.dflash_simulated_accept",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.dflash_simulated_accept:dflash_simulated_accept",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(

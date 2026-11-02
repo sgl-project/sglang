@@ -2287,7 +2287,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
-            apply_dflash_simulated_acceptance(
+            # new_seq_lens, if the Triton accept wrote it, holds the real
+            # accept; it comes back rewritten from the forced lengths, or None.
+            new_seq_lens = apply_dflash_simulated_acceptance(
                 candidates=candidates,
                 target_predict=target_predict,
                 accept_len=accept_len,
@@ -2298,10 +2300,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 next_token_logits=next_token_logits,
+                prefix_lens=prefix_lens,
+                new_seq_lens=new_seq_lens,
             )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
