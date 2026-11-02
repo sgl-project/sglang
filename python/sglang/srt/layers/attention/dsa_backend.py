@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
+    take_dcp_row_consumer,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
@@ -619,6 +620,7 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._asm_one_scale: Optional[torch.Tensor] = None
         # Keep graph-captured buffers alive per stream.
         self._triton_sparse_mla_workspaces: dict[
             int, list[tuple[torch.Tensor, torch.Tensor]]
@@ -3582,20 +3584,59 @@ class DeepseekSparseAttnBackend(
             dcp_size=self.dcp_size,
             dcp_rank=self.dcp_rank,
         )
-        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
-        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
-        out, lse = triton_sparse_mla_decode_splitk(
-            q_nope=q_nope,
-            q_rope=q_rope,
-            kv=kv_cache,
-            indices=local_page_table.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            workspace=workspace,
-            return_lse=True,
-            lengths=owned_counts,
-        )
-        return out.view(rows, heads, v_head_dim), lse
+        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
+
+        if is_asm_q8(q_nope, q_rope):
+            from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
+                asm_sparse_mla_dcp,
+            )
+            from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_owned_csr
+
+            # Only the q-replicate absorb writes [q_nope | q_rope] as one fp8
+            # row; the gathered fp8 Q is [q_pe | q_nope] and stays on Triton.
+            q8 = q_nope.as_strided(
+                (rows, heads, q_nope.shape[2] + q_rope.shape[2]),
+                (q_nope.stride(0), q_nope.stride(1), 1),
+            )
+            indptr, indices = dcp_owned_csr(self._dcp_page_table_cache)
+            if self._asm_one_scale is None:
+                self._asm_one_scale = torch.ones(
+                    1, dtype=torch.float32, device=q_nope.device
+                )
+
+            def attend(lo: int, hi: int):
+                return asm_sparse_mla_dcp(
+                    q8[lo:hi],
+                    kv_cache,
+                    indptr[lo : hi + 1],
+                    indices,
+                    sm_scale,
+                    v_head_dim,
+                    self._asm_one_scale,
+                )
+
+        else:
+            stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+            workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+
+            def attend(lo: int, hi: int):
+                out, lse = triton_sparse_mla_decode_splitk(
+                    q_nope=q_nope[lo:hi],
+                    q_rope=q_rope[lo:hi],
+                    kv=kv_cache,
+                    indices=local_page_table[lo:hi].unsqueeze(1),
+                    sm_scale=sm_scale,
+                    d_v=v_head_dim,
+                    workspace=workspace,
+                    return_lse=True,
+                    lengths=owned_counts[lo:hi],
+                )
+                return out.view(hi - lo, heads, v_head_dim), lse
+
+        consumer = take_dcp_row_consumer(rows)
+        if consumer is None:
+            return attend(0, rows)
+        return consumer.run(attend), None
 
     def _forward_intel_xpu_sparse_decode(
         self,

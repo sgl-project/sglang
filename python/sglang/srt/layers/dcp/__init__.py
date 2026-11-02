@@ -29,6 +29,8 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
 )
 from sglang.srt.layers.dcp.comm import (
+    DcpA2aChunkPipeline,
+    DcpA2aChunkPlanner,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -55,6 +57,8 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 # planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
+    "DcpA2aChunkPipeline",
+    "DcpA2aChunkPlanner",
     "DecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
     "init_fi_a2a_workspace",
