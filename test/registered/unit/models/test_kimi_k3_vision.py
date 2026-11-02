@@ -643,6 +643,38 @@ def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():
     assert _can_skip_pre_embed_feature_move(model.get_image_feature)
 
 
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_kimi_k3_rejects_frame_budget_before_vision_dp_collectives(tp_rank):
+    from unittest.mock import Mock
+
+    from sglang.srt.environ import envs
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = _K3TowerStub()
+    model.mm_projector = lambda image_embeds: image_embeds
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=torch.empty(16, 2),
+        model_specific_data={"image_grid_thw": torch.tensor([[4, 2, 2]])},
+    )
+    group = Mock()
+    with (
+        envs.SGLANG_K3_VISION_MAX_FRAMES_PER_BATCH.override(3),
+        get_parallel().override(
+            attn_tp_size=2, attn_tp_rank=tp_rank, attn_tp_group=group
+        ),
+        pytest.raises(ValueError, match="temporal item does not fit"),
+    ):
+        model.get_image_feature([item])
+
+    group.broadcast.assert_not_called()
+    group.all_gather.assert_not_called()
+
+
 def test_kimi_k3_rejects_aggregated_items():
     """One item must carry exactly one logical image: the DP owner
     assignment and the bounded CUDA-IPC lease accounting are per-item, so
