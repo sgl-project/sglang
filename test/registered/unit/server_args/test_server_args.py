@@ -3208,7 +3208,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
-    def _resolve_standalone_adaptive(self, cfg_path: str, **overrides):
+    def _resolve_standalone_adaptive(self, cfg_path: str, **overrides) -> ServerArgs:
         args = ServerArgs(model_path="dummy")
         args.speculative_algorithm = "STANDALONE"
         args.speculative_draft_model_path = "dummy-draft"
@@ -3256,6 +3256,11 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             )
 
         self.assertFalse(resolution_result(args, "speculative_adaptive"))
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
+        self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 4)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 8)
+        # The adaptive config's maximum is 6; static fallback must reserve 8.
+        self.assertEqual(max_speculative_num_draft_tokens(args), 8)
 
 
 class TestAscendOpsArgs(CustomTestCase):
