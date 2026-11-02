@@ -114,6 +114,15 @@ class MuseSpark1xRMSNorm(nn.Module):
                 else torch.ops.sgl_kernel.rmsnorm_cpu(x_2d, weight, self.eps)
             )
             return output.reshape(x.shape)
+        # Form the effective weight in its checkpoint dtype before converting.
+        # Matching an FP32 residual stream enables PyTorch's fused CUDA RMSNorm.
+        if (
+            x.is_cuda
+            and dtype == torch.float32
+            and weight is not None
+            and weight.dtype in (torch.bfloat16, torch.float16)
+        ):
+            weight = weight.float()
         return F.rms_norm(x, (self.hidden_size,), weight, self.eps).to(dtype)
 
 
