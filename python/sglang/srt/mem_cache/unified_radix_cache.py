@@ -220,9 +220,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
-        self._write_back_eviction_headroom_tokens = max(
-            0, envs.SGLANG_OPT_HICACHE_WRITE_BACK_EVICTION_HEADROOM_TOKENS.get()
-        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -720,8 +717,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _with_write_back_headroom(self, params: EvictParams) -> EvictParams:
         """Grow nonzero Full/SWA shortfalls by the write_back reserve, capped by evictable."""
-        headroom = self._write_back_eviction_headroom_tokens
-        if headroom == 0 or not self.is_write_back:
+        headroom = envs.SGLANG_OPT_HICACHE_WRITE_BACK_EVICTION_HEADROOM_TOKENS.get()
+        if headroom <= 0 or not self.is_write_back:
             return params
 
         def grow(shortfall: int, evictable: int) -> int:
