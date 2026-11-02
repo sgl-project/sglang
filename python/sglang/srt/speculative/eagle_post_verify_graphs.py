@@ -27,8 +27,8 @@ _SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
 # Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
 # past it runs SGLang's eager path.
 _MAX_POST_VERIFY_STATES = 64
-# SGLANG_Q35MF_MKH_N3C: a round's inputs and its forced length staged in one launch.
-_ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
+# SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
+_ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
 def simulated_acc_len_generator(seed: int) -> torch.Generator:
