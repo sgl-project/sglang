@@ -432,6 +432,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         ),
                         forward_context(ForwardContext(None), forward_batch=batch),
                         patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+                        patch.object(mega_moe, "_mega_moe_buffer"),
                         # The fused padded-row fill requires Triton/GPU.
                         patch(
                             "sglang.srt.multimodal.dsv41.vl_routing.is_cuda",
@@ -470,7 +471,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             # The collective boundary owns the result even on an idle rank.
             return x.new_empty((0, kwargs["hidden_size"]))
 
-        with patch.object(mega_moe, "run_mega_routed_experts", run_experts):
+        with (
+            patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+            patch.object(mega_moe, "_mega_moe_buffer"),
+        ):
             out = mega_moe._run_mega_routed(
                 moe, hidden, None, torch.empty(0, dtype=torch.long), num_tokens=0
             )

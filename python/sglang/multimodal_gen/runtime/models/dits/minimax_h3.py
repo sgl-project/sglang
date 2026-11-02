@@ -24,6 +24,10 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
+    BitExactFusionGate,
+    aten_head_rmsnorm,
+    can_use_aten_head_rmsnorm,
+    can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
@@ -39,6 +43,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
+    tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -66,6 +71,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     vsa_h3_fold_gate,
 )
@@ -84,7 +92,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _ring_attention_varlen,
+    ulysses_head_group_pipelined_attention,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -504,6 +515,10 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
     return nn.functional.silu(gate) * up
 
 
+# ROCm: replays aten's rms_norm reduction, so the first call checks it against eager
+_ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
+
+
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -530,6 +545,22 @@ def _apply_qk_norm(
             head_dim=head_dim,
         )
         return q, k
+    if (
+        q_norm.eps is not None
+        and k_norm.eps is not None
+        and not torch.compiler.is_compiling()
+        and can_use_aten_head_rmsnorm(q, q_norm.weight)
+        and can_use_aten_head_rmsnorm(k, k_norm.weight)
+    ):
+        return _ATEN_HEAD_RMSNORM.run(
+            lambda: (
+                aten_head_rmsnorm(q, q_norm.weight, q_norm.eps),
+                aten_head_rmsnorm(k, k_norm.weight, k_norm.eps),
+            ),
+            lambda: (q_norm(q), k_norm(k)),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return q_norm(q), k_norm(k)
 
 
@@ -614,6 +645,47 @@ def _apply_rope_qk(
         True,
     )
     return q, k
+
+
+# ROCm: also replays the bf16 rotary_embedding kernel in the norm's pass
+_ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE")
+
+
+def _apply_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: nn.RMSNorm,
+    k_norm: nn.RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    def unfused():
+        normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
+
+    if (
+        q_norm.eps is not None
+        and k_norm.eps is not None
+        and not torch.compiler.is_compiling()
+        and can_use_aten_head_rmsnorm(q, q_norm.weight)
+        and can_use_aten_head_rmsnorm(k, k_norm.weight)
+        and can_use_aten_head_rmsnorm_rope(q, cos_sin_cache, positions)
+    ):
+        return _ATEN_HEAD_RMSNORM_ROPE.run(
+            lambda: (
+                aten_head_rmsnorm(
+                    q, q_norm.weight, q_norm.eps, cos_sin_cache, positions
+                ),
+                aten_head_rmsnorm(
+                    k, k_norm.weight, k_norm.eps, cos_sin_cache, positions
+                ),
+            ),
+            unfused,
+            equal=tensors_equal,
+            logger=logger,
+        )
+    return unfused()
 
 
 def _apply_rope(
@@ -735,6 +807,96 @@ def _minimax_h3_pipelined_dense_attention(
         ulysses_pipelined_attention,
     )
 
+    attend = _minimax_h3_group_attend(
+        impl,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+    )
+    return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+
+
+def _minimax_h3_group_attend(
+    impl,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+):
+    """One head group's attention over the gathered packed sequence.
+
+    Trailing alignment rows (cu_seqlens ``[0, used, total]``) only reach their
+    own rows, so they stay zero; the real rows run cuDNN SDPA varlen's own
+    per-segment call, written straight into the output when the backend can.
+    """
+    used = max_seqlen
+    pad_only_tail = (
+        isinstance(impl, DynamicCudnnSDPAImpl)
+        and cu_seqlens_host is not None
+        and len(cu_seqlens_host) == 3
+        and cu_seqlens_host[:2] == (0, used)
+        and cu_seqlens_host[2] > used
+    )
+
+    def attend(q_group, k_group, v_group):
+        if not pad_only_tail:
+            return impl.forward_varlen(
+                q_group,
+                k_group,
+                v_group,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
+        out = torch.empty_like(q_group)
+        real = [t[:used].unsqueeze(0) for t in (q_group, k_group, v_group)]
+        dst = out[:used].unsqueeze(0)
+        if not impl.forward_into(*real, dst, None):
+            dst.copy_(impl.forward(*real, None))
+        out[used:].zero_()
+        return out
+
+    return attend
+
+
+# aiter's varlen kernel gives a head group the same bytes as those heads inside
+# the full call (checked at H3's shapes on MI355X)
+_COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+
+
+def _minimax_h3_collective_pipelined_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor | None:
+    """Dense attention with the collective Ulysses exchange pipelined over head
+    groups, for backends the copy-engine pipeline does not serve.
+
+    Returns None (caller keeps the sequential exchange) unless pipelining is
+    enabled. Auto picks two groups: every further group adds a partial
+    attention wave (MI355X, 14 heads per rank: two groups save 1.5 ms per
+    layer, seven cost 2.8 ms).
+    """
+    groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+    if groups < 0:
+        groups = 2
+    world_size, _ = get_ulysses_ctx()
+    if (
+        groups in (0, 1)
+        or attention._attention_backend_enum
+        not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+        or q.shape[1] % (world_size * groups)
+        or torch.compiler.is_compiling()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    impl = attention._attention_impl
+
     def attend(q_group, k_group, v_group):
         return impl.forward_varlen(
             q_group,
@@ -745,7 +907,7 @@ def _minimax_h3_pipelined_dense_attention(
             cu_seqlens_host=cu_seqlens_host,
         )
 
-    return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+    return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
 
 
 def _minimax_h3_qknorm_rope_pipelined_attention(
@@ -835,15 +997,18 @@ def _minimax_h3_attention_core_impl(
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
     if ulysses_active and not ring_active and gate_compress is None:
-        out = _minimax_h3_pipelined_dense_attention(
-            attention,
-            q,
-            k,
-            v,
+        pipeline_kwargs = dict(
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
+        out = _minimax_h3_pipelined_dense_attention(
+            attention, q, k, v, **pipeline_kwargs
+        )
+        if out is None:
+            out = _minimax_h3_collective_pipelined_attention(
+                attention, q, k, v, **pipeline_kwargs
+            )
         if out is not None:
             return out
 
@@ -1391,14 +1556,15 @@ class MiniMaxH3Attention(nn.Module):
                     round_norm_before_rope=True,
                 )
             else:
-                q, k = _apply_qk_norm(
+                q, k = _apply_qk_norm_rope(
                     q,
                     k,
                     self.q_norm,
                     self.k_norm,
                     self.head_dim,
+                    cos_sin_cache,
+                    positions,
                 )
-                q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
         gate_compress = None
         if (
