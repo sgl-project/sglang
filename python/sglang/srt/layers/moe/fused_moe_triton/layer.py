@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW8A8Fp8MoE,
+    CompressedTensorsW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
@@ -805,6 +806,13 @@ class FusedMoE(torch.nn.Module):
 
         quant_config_dict: dict = {}
 
+        # compressed-tensors reports its scheme on the layer rather than the
+        # quant method, so a compressed-tensors W8A8 INT8 MoE needs its own
+        # probe. It drives the same wire format as W8A8Int8MoEMethod.
+        ct_int8 = isinstance(
+            self.quant_method, CompressedTensorsFusedMoEMethod
+        ) and isinstance(self.scheme, CompressedTensorsW8A8Int8MoE)
+
         # SAIL DeepEP reads the dispatch dtype from this same
         # dispatcher_output_dtype field, which keeps every rank on one config.
         if (
@@ -816,7 +824,7 @@ class FusedMoE(torch.nn.Module):
             )
         ):
             quant_config_dict["dispatcher_output_dtype"] = "fp8"
-        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod) or ct_int8:
             quant_config_dict["dispatcher_output_dtype"] = "int8"
         elif isinstance(self.quant_method, Mxfp4MoEMethod):
             quant_config_dict["dispatcher_output_dtype"] = (
@@ -833,15 +841,18 @@ class FusedMoE(torch.nn.Module):
 
         is_channel_quant = False
         if isinstance(self.quant_config, CompressedTensorsConfig):
-            linear_scheme = self.quant_config.target_scheme_map.get("Linear", {})
-            weight_scheme = linear_scheme.get("weights") if linear_scheme else None
-            if (
-                weight_scheme is not None
-                and weight_scheme.strategy == QuantizationStrategy.CHANNEL
-            ):
-                is_channel_quant = True
+            # Resolve from the scheme picked for this expert layer rather than the
+            # global "Linear" target: a regex-targeted expert group can carry a
+            # different strategy, and a mismatch breaks both ways -- DeepEP would
+            # quantize activations in 128-groups while the channelwise runner
+            # expects one scale per token, or the reverse.
+            scheme_weight_quant = getattr(self.scheme, "weight_quant", None)
+            is_channel_quant = (
+                scheme_weight_quant is not None
+                and scheme_weight_quant.strategy == QuantizationStrategy.CHANNEL
+            )
 
-        if isinstance(self.quant_method, W8A8Int8MoEMethod):
+        if isinstance(self.quant_method, W8A8Int8MoEMethod) or ct_int8:
             is_channel_quant = True
 
         quant_config_dict["is_channel_quant"] = is_channel_quant
