@@ -110,6 +110,18 @@ class NodePlan:
     window_pages_cache: dict[tuple[int, int, int, int], tuple[int, ...]] = field(
         default_factory=dict
     )
+    cu_seqlens_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = (
+        field(default_factory=dict)
+    )
+    max_seqlen_cache: dict[tuple[int, int, int], int] = field(default_factory=dict)
+    attn_metadata_cache: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    indexer_lengths_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+    max_kv_cache: int | None = None
+    indexer_metadata_cache: dict[
+        tuple[tuple[int, ...], int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    select_all_cache: dict[int, torch.Tensor] = field(default_factory=dict)
+    residue_cache: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 def build_node_plan(pre) -> NodePlan:
@@ -335,8 +347,13 @@ def compress_nodes(
     nodes = torch.zeros(
         (plan.n + 1, 1, 1, 2 * coff * head), dtype=torch.float32, device=device
     )
-    residue = ((plan.start.long() + plan.depths) % int(module.ratio)).to(torch.int32)
-    hidden_nodes = hidden.index_select(0, plan.hidden_ids)
+    ratio = int(module.ratio)
+    residue = plan.residue_cache.get(ratio)
+    if residue is None:
+        residue = ((plan.start.long() + plan.depths) % ratio).to(torch.int32)
+        plan.residue_cache[ratio] = residue
+    # build_node_plan keeps hidden_ids as arange(n); avoid a redundant gather.
+    hidden_nodes = hidden[: plan.n]
     compressor_tree_project, compressor_tree = _load_compressor_ops()
     compressor_tree_project(
         hidden_nodes,
@@ -392,6 +409,32 @@ def compress_nodes(
 # ---------------------------------------------------------------------------
 
 
+def _cached_cu_seqlens(
+    plan: NodePlan, seq: torch.Tensor, ratio: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (int(ratio), int(seq.data_ptr()), int(seq.numel()))
+    cached = plan.cu_seqlens_cache.get(key)
+    if cached is not None:
+        return cached
+    cu_ori = torch.cat((seq.new_zeros(1), seq.cumsum(0, dtype=torch.int32)))
+    cu_cmp = torch.cat(
+        (seq.new_zeros(1), (seq // int(ratio)).cumsum(0, dtype=torch.int32))
+    )
+    cached = (cu_ori, cu_cmp)
+    plan.cu_seqlens_cache[key] = cached
+    return cached
+
+
+def _cached_max_seqlen(plan: NodePlan, seq: torch.Tensor, ratio: int) -> int:
+    key = (int(ratio), int(seq.data_ptr()), int(seq.numel()))
+    cached = plan.max_seqlen_cache.get(key)
+    if cached is not None:
+        return cached
+    value = max(1, int(seq.max().item()) if seq.numel() else 0)
+    plan.max_seqlen_cache[key] = value
+    return value
+
+
 def build_tree_attn_metadata(
     *, query, metadata, plan, ratio, window, cmp_sparse_indices, compressed
 ):
@@ -403,10 +446,7 @@ def build_tree_attn_metadata(
     ``compressed`` are retained for signature parity with the vendor path.
     """
     seq = metadata.node_seqused_kv.to(torch.int32)
-    cu_ori = torch.cat((seq.new_zeros(1), seq.cumsum(0, dtype=torch.int32)))
-    cu_cmp = torch.cat(
-        (seq.new_zeros(1), (seq // int(ratio)).cumsum(0, dtype=torch.int32))
-    )
+    cu_ori, cu_cmp = _cached_cu_seqlens(plan, seq, ratio)
     if _tree_backend() != "sgl_kernel_npu":
         _ensure_vendor_ops()
         cmp_topk = (
@@ -414,6 +454,19 @@ def build_tree_attn_metadata(
             if cmp_sparse_indices is not None and int(ratio) == 4
             else 0
         )
+        cache_key = (
+            int(query.shape[1]),
+            int(query.shape[2]),
+            int(ratio),
+            int(window),
+            cmp_topk,
+            compressed is not None,
+            int(seq.data_ptr()),
+            int(seq.numel()),
+        )
+        cached = plan.attn_metadata_cache.get(cache_key)
+        if cached is not None:
+            return cached, cu_ori, cu_cmp
         kwargs = dict(
             num_heads_q=query.shape[1],
             num_heads_kv=1,
@@ -421,7 +474,7 @@ def build_tree_attn_metadata(
             seqused_q=seq.new_empty(0),
             batch_size=plan.n,
             max_seqlen_q=1,
-            max_seqlen_kv=max(1, int(seq.max().item()) if seq.numel() else 0),
+            max_seqlen_kv=_cached_max_seqlen(plan, seq, ratio),
             cmp_topk=cmp_topk,
             has_ori_kv=True,
             has_cmp_kv=compressed is not None,
@@ -450,7 +503,9 @@ def build_tree_attn_metadata(
                 "torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata or "
                 "torch.ops.custom.npu_sparse_attn_sharedkv_metadata"
             )
-        return op(**kwargs), cu_ori, cu_cmp
+        metadata_tensor = op(**kwargs)
+        plan.attn_metadata_cache[cache_key] = metadata_tensor
+        return metadata_tensor, cu_ori, cu_cmp
     metadata_tensor = torch.zeros(1024, dtype=torch.int32, device=query.device)
     return metadata_tensor, cu_ori, cu_cmp
 
@@ -598,15 +653,20 @@ def attend_nodes(
 
 def tree_indexer_select_all(plan: NodePlan, topk: int, device) -> torch.Tensor:
     """Host-capacity shortcut: when history/4 <= topk every block is selected."""
-    lengths = (plan.start.long() + plan.depths + 1) // 4
+    cached = plan.select_all_cache.get(int(topk))
+    if cached is not None:
+        return cached
+    lengths = _cached_indexer_lengths(plan)[0]
     positions = torch.arange(topk, dtype=torch.int32, device=device).expand(
         plan.n, -1
     )
-    return torch.where(
+    selected = torch.where(
         positions < lengths.unsqueeze(1).to(torch.int32),
         positions,
         torch.full_like(positions, -1),
     ).unsqueeze(1)
+    plan.select_all_cache[int(topk)] = selected
+    return selected
 
 
 def quantize_indexer_nodes(node_kv: torch.Tensor):
@@ -627,12 +687,32 @@ def _tree_indexer_lengths(plan: NodePlan):
     return seq // 4, seq % 4
 
 
+def _cached_indexer_lengths(plan: NodePlan) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = plan.indexer_lengths_cache
+    if cached is None:
+        cached = _tree_indexer_lengths(plan)
+        plan.indexer_lengths_cache = cached
+    return cached
+
+
+def _cached_max_kv(plan: NodePlan) -> int:
+    cached = plan.max_kv_cache
+    if cached is None:
+        cached = int(plan.start.max().item() + plan.depths.max().item() + 1)
+        plan.max_kv_cache = cached
+    return cached
+
+
 def _tree_indexer_metadata(
     *, query: torch.Tensor, plan: NodePlan, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the vendor candidate-block schedule for the tree indexer."""
-    lengths, residual = _tree_indexer_lengths(plan)
-    max_kv = int(plan.start.max().item() + plan.depths.max().item() + 1)
+    cache_key = (tuple(query.shape), int(topk))
+    cached = plan.indexer_metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    lengths, residual = _cached_indexer_lengths(plan)
+    max_kv = _cached_max_kv(plan)
     _ensure_vendor_ops()
     namespace = _vendor_namespace()
     op = getattr(namespace, "npu_quant_lightning_indexer_v2_metadata", None)
@@ -663,7 +743,9 @@ def _tree_indexer_metadata(
         cmp_ratio=4,
         device=str(query.device),
     )
-    return lengths, residual, schedule
+    cached = (lengths, residual, schedule)
+    plan.indexer_metadata_cache[cache_key] = cached
+    return cached
 
 
 def _invoke_tree_indexer(
@@ -708,7 +790,7 @@ def _sgl_kernel_tree_indexer(**kwargs) -> torch.Tensor:
     plan = kwargs["plan"]
     query = kwargs["query"]
     if kwargs["lengths"] is None or kwargs["residual"] is None:
-        kwargs["lengths"], kwargs["residual"] = _tree_indexer_lengths(plan)
+        kwargs["lengths"], kwargs["residual"] = _cached_indexer_lengths(plan)
     if kwargs["schedule"] is None:
         # The Triton op validates the metadata ABI and ignores its contents.
         kwargs["schedule"] = torch.zeros(
