@@ -102,6 +102,87 @@ class TestInt8CheckpointCodec(unittest.TestCase):
         # int8 data (1B) + small per-(head,k) bf16 scale -> well under bf16; ~2x slots
         self.assertLess(store.bytes_per_slot(), bf16_per_slot * 0.6)
 
+    def test_extended_conv_state_round_trip_preserves_native_layout(self):
+        from types import SimpleNamespace
+
+        # The extended asymmetric shape catches transposes; exact equality catches cropped or
+        # zero-filled extension rows.
+        conv = torch.arange(L * 8 * 7 * 5, dtype=torch.float32).reshape(L, 8, 7, 5)
+        temporal = _rand_state(8)
+        active = SimpleNamespace(
+            mamba_cache=SimpleNamespace(conv=[conv], temporal=temporal)
+        )
+        checkpoint = MambaCheckpointPool(
+            num_layers=L,
+            num_slots=4,
+            num_heads=H,
+            head_v_dim=V,
+            head_k_dim=K,
+            conv_shapes=[(7, 5)],
+            conv_dtype=conv.dtype,
+            temporal_dtype=temporal.dtype,
+            device="cpu",
+        )
+
+        source_slot = torch.tensor([2])
+        checkpoint_slot = torch.tensor([1])
+        expected_conv = conv[:, source_slot].clone()
+        checkpoint.store_from_active(active, source_slot, checkpoint_slot)
+        self.assertTrue(
+            torch.equal(checkpoint.conv[0][:, checkpoint_slot], expected_conv)
+        )
+
+        conv[:, 4] = 0
+        checkpoint.load_to_active(active, checkpoint_slot, torch.tensor([4]))
+        self.assertTrue(torch.equal(conv[:, 4], expected_conv[:, 0]))
+
+    def test_factory_uses_active_conv_shape_for_allocation_and_estimate(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import (
+            maybe_init_int8_mamba_checkpoint_pool,
+        )
+
+        ckpt_size = 3
+        active_conv_shape = (5, 5)
+        cache_params = SimpleNamespace(
+            shape=SimpleNamespace(temporal=(H, V, K), conv=[(3, 5)]),
+            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.bfloat16),
+        )
+        server_args = SimpleNamespace(
+            enable_int8_mamba_checkpoint=True,
+            int8_mamba_ckpt_size=ckpt_size,
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.mamba_checkpoint_pool.get_exec",
+            return_value=SimpleNamespace(mamba=server_args),
+        ):
+            pool = maybe_init_int8_mamba_checkpoint_pool(
+                mamba_size=2,
+                cache_params=cache_params,
+                conv_shapes=[active_conv_shape],
+                mamba_layer_ids=list(range(L)),
+                device="cpu",
+            )
+
+        self.assertEqual(
+            tuple(pool.conv[0].shape), (L, ckpt_size + 1, *active_conv_shape)
+        )
+        estimate = MambaCheckpointPool.estimate_mem_usage_bytes(
+            num_layers=L,
+            num_slots=ckpt_size,
+            num_heads=H,
+            head_v_dim=V,
+            head_k_dim=K,
+            conv_shapes=[active_conv_shape],
+            conv_dtype=torch.bfloat16,
+            temporal_dtype=torch.bfloat16,
+        )
+        self.assertEqual(estimate["conv"], L * (ckpt_size + 1) * 25 * 2)
+        self.assertEqual(pool.mem_usage_bytes(), estimate["total"])
+
     def test_estimate_matches_actual_mem(self):
         # the pre-allocation estimate (used to fit-check HBM before building the
         # pool) must equal the real allocated footprint, for any temporal dtype
