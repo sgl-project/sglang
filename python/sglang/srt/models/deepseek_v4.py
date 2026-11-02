@@ -41,6 +41,9 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
+from sglang.kernels.ops.kvcache.dsv4_unified_kv_store import (
+    SWA_STORE_TAKES_ROW_STRIDE,
+)
 from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
@@ -2339,15 +2342,14 @@ class MQALayer(MqaAttentionBase):
                 # store run unchanged; we fuse just the norm+RoPE. swa_loc is not
                 # computed -- it only addresses the kernel store this path drops.
                 #
-                # On gfx1250 kv stays the strided slice of qkv_a: the kernel
-                # norms it in place and the ring store takes the row stride.
-                # Elsewhere the ring store requires a contiguous buffer.
+                # kv stays the strided slice of qkv_a when the ring store takes
+                # the row stride: the kernel norms it in place.
                 #
                 # Under fp8, verify takes the decode arm below instead: the ring
                 # rows are per token (swa_loc is built for verify too) and are
                 # written before attention either way, so the kernel stores them
                 # itself, off the strided kv.
-                if not _is_gfx1250_supported:
+                if not SWA_STORE_TAKES_ROW_STRIDE:
                     kv = kv.contiguous()
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, True

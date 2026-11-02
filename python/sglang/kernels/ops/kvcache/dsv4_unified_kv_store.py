@@ -17,7 +17,8 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
 )
 from sglang.srt.utils import is_gfx1250_supported
 
-_is_gfx1250_supported = is_gfx1250_supported()
+# Only the gfx1250 SWA store takes a row-strided kv; elsewhere kv must be contiguous.
+SWA_STORE_TAKES_ROW_STRIDE = is_gfx1250_supported()
 
 
 @triton.jit
@@ -84,7 +85,7 @@ def store_swa_into_unified(
 
     has_final = final_pos is not None
     fp_arg = final_pos if has_final else positions
-    if _is_gfx1250_supported:
+    if SWA_STORE_TAKES_ROW_STRIDE:
         assert kv.stride(1) == 1 and kv.dtype == unified_kv.dtype
     else:
         assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
