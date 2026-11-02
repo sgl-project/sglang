@@ -250,6 +250,8 @@ def _get_module(
 
 
 def _run(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
+    if x.shape[0] == 0:
+        return
     n, k = w.shape
     use_mma = x.shape[0] >= _mma_min_m(n, k, w.dtype)
     _get_module(n, k, w.dtype, out.dtype, use_mma).run(x, w, out)
