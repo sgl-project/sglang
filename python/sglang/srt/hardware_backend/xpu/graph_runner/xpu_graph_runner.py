@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-logger = logging.getLogger(__name__)
 _fake_ops_registered = False
 
 
