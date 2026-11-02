@@ -412,7 +412,9 @@ def _assert_smallest_index_ties(scores_cpu, our_raw, batch, seq_lens, k):
         L = int(seq_lens[i])
         row = scores_cpu[i, :L].tolist()
         expected = sorted(range(L), key=lambda j: (-row[j], j))[:k]
-        assert sorted(our_raw[i]) == sorted(expected), f"row {i}: tie choice is not by smallest index"
+        assert sorted(our_raw[i]) == sorted(expected), (
+            f"row {i}: tie choice is not by smallest index"
+        )
 
 
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
@@ -452,7 +454,14 @@ def _mode_check() -> None:
     assert mode != MODE_FAST
     k = 2048
     for dist in NARROW_DISTRIBUTIONS:
-        for batch, seq in [(6, 8192), (4, 16384), (4, CUDA_MAX_NON_CLUSTER_SEQ), (4, 65536), (12, 40960), (34, 131076)]:
+        for batch, seq in [
+            (6, 8192),
+            (4, 16384),
+            (4, CUDA_MAX_NON_CLUSTER_SEQ),
+            (4, 65536),
+            (12, 40960),
+            (34, 131076),
+        ]:
             torch.manual_seed(_narrow_seed(dist, batch, seq))
             width = (seq + 3) & ~3
             scores = _single_bin_scores(dist, batch, width, "cuda")[:, :seq]
@@ -460,10 +469,14 @@ def _mode_check() -> None:
             scores_cpu, lens_cpu = scores.cpu(), seq_lens.cpu()
             runs = [_run_raw(scores, seq_lens, k) for _ in range(3)]
             ref_raw = _reference(scores, seq_lens, k)
-            _assert_topk_close(scores_cpu, ref_raw, runs[0], batch, lens_cpu, k, max_permit_error=0)
+            _assert_topk_close(
+                scores_cpu, ref_raw, runs[0], batch, lens_cpu, k, max_permit_error=0
+            )
             if mode == MODE_DETERMINISTIC:
                 for other in runs[1:]:
-                    assert [sorted(r) for r in other] == [sorted(r) for r in runs[0]], dist
+                    assert [sorted(r) for r in other] == [sorted(r) for r in runs[0]], (
+                        dist
+                    )
                 _assert_smallest_index_ties(scores_cpu, runs[0], batch, lens_cpu, k)
         print(f"mode {mode} {dist}: ok", flush=True)
 
