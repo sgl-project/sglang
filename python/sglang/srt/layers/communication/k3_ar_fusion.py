@@ -135,8 +135,20 @@ def _max_buffer_rows() -> int:
     schedule = ctx.get_schedule()
     chunked = schedule.chunked_prefill_size
     if chunked is not None and chunked > 0:
-        return int(chunked)
-    return int(schedule.max_prefill_tokens or 0)
+        base_rows = int(chunked)
+    else:
+        base_rows = int(schedule.max_prefill_tokens or 0)
+    
+    # When attention-DP is enabled, multiple DP ranks can be batched together,
+    # so the runtime token count can exceed the per-chunk limit. Scale the
+    # buffer by attn_dp_size to ensure sufficient capacity.
+    from sglang.srt.runtime_context import get_parallel
+    
+    attn_dp_size = get_parallel().attn_dp_size
+    if attn_dp_size > 1:
+        base_rows *= attn_dp_size
+    
+    return base_rows
 
 
 def _create_buffer(
