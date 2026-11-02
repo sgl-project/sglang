@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     DIM_ROPE,
     fp8_dtype,
 )
+from sglang.kernels.ops.attention.utils import check_out_buffer
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -104,25 +105,6 @@ def _get_entries() -> tuple:
 # by the JIT wrapper. torch._C._cuda_getCurrentStream returns a packed stream
 # id and must not be used here.
 _get_current_stream_raw = torch._C._cuda_getCurrentRawStream
-
-
-# Module-level cache for kernel-write-only output tensors. The active s_q rows
-# are overwritten every call; buffers grow monotonically by device/head shape.
-def _check_out_buffer(
-    t: torch.Tensor,
-    name: str,
-    shape: tuple,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    if tuple(t.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
-    if t.dtype != dtype:
-        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
-    if t.device != device:
-        raise ValueError(f"{name} must be on device {device}, got {t.device}")
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
 
 
 # Internal custom-op wrappers so the JIT kernel calls participate in
@@ -442,17 +424,17 @@ def sparse_mla_q8kv8_prefill_fwd(
     if out is None:
         out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
     else:
-        _check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
+        check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
 
     if max_logits is None:
         max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:
-        _check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
+        check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
 
     if lse is None:
         lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:
-        _check_out_buffer(lse, "lse", (s_q, h_q), torch.float32, device)
+        check_out_buffer(lse, "lse", (s_q, h_q), torch.float32, device)
 
     # The three output tensors are written independently by the kernel; any
     # aliasing among them would corrupt results, so reject it explicitly.

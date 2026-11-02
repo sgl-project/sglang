@@ -181,7 +181,12 @@ class TestDSABackendDPPadding(CustomTestCase):
     def test_trtllm_prefill_narrows_metadata_to_live_cp_queries(self):
         self._check_trtllm_padding(is_prefill=True)
 
-    def _check_trtllm_padding(self, *, is_prefill):
+    def test_q8kv8_sm100_takes_trtllm_gen_inputs(self):
+        """The q8kv8_sm100 backend sends the SM100 kernel the inputs trtllm-gen
+        would get and restores the DP padding rows."""
+        self._check_trtllm_padding(is_prefill=False, use_q8kv8_sm100=True)
+
+    def _check_trtllm_padding(self, *, is_prefill, use_q8kv8_sm100=False):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
@@ -249,6 +254,21 @@ class TestDSABackendDPPadding(CustomTestCase):
         flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla = fake_decode
         flashinfer.decode = flashinfer_decode
 
+        q8kv8 = ModuleType("sglang.kernels.ops.attention.sparse_mla_q8kv8_sm100")
+        q8kv8_captured = {}
+
+        def fake_q8kv8(query, kv_cache, block_tables, bmm1_scale, *, seq_lens):
+            q8kv8_captured.update(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                bmm1_scale=bmm1_scale,
+                seq_lens=seq_lens,
+            )
+            return torch.full((2, 1, 2, 2), 2, dtype=torch.bfloat16)
+
+        q8kv8.sparse_mla_q8kv8_sm100_trtllm = fake_q8kv8
+
         def fake_transform(*, page_table, topk_indices, page_size):
             self.assertEqual(page_table.shape[0], 2)
             self.assertEqual(topk_indices.shape[0], 2)
@@ -261,6 +281,7 @@ class TestDSABackendDPPadding(CustomTestCase):
                 {
                     "flashinfer": flashinfer,
                     "flashinfer.decode": flashinfer_decode,
+                    q8kv8.__name__: q8kv8,
                 },
             ),
             patch(
@@ -287,12 +308,20 @@ class TestDSABackendDPPadding(CustomTestCase):
                 save_kv_cache=False,
                 topk_indices=topk_indices,
                 is_prefill=is_prefill,
+                use_q8kv8_sm100=use_q8kv8_sm100,
             )
 
-        self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
-        self.assertEqual(captured["seq_lens"].tolist(), [8, 12])
+        args = q8kv8_captured if use_q8kv8_sm100 else captured
+        self.assertEqual(bool(captured), not use_q8kv8_sm100)
+        self.assertEqual(args["query"].shape, (2, 1, 2, 3))
+        self.assertEqual(args["seq_lens"].tolist(), [8, 12])
+        if use_q8kv8_sm100:
+            # trtllm-gen's top-k padding (-1 slots) and fused scale.
+            self.assertEqual(args["block_tables"].tolist(), [[[0, 0, -1, -1]]] * 2)
+            self.assertEqual(args["kv_cache"].shape, (24, 1, 1, 3))
+            self.assertEqual(args["bmm1_scale"], 1.0)
         self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
-        self.assertTrue(torch.all(output[:2] == 1))
+        self.assertTrue(torch.all(output[:2] == (2 if use_q8kv8_sm100 else 1)))
         self.assertTrue(torch.all(output[2:] == 0))
 
 

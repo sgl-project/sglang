@@ -172,3 +172,22 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
+
+
+def check_out_buffer(
+    t: torch.Tensor,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Raise ValueError unless a caller-provided output buffer has exactly this
+    shape, dtype and device and is contiguous."""
+    if tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
+    if t.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {t.device}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
