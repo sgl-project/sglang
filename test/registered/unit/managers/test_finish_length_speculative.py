@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
@@ -143,6 +144,29 @@ class TestFinishLengthSpeculative(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(req.finished_len, 2)
         self.assertEqual(list(req.output_ids_through_stop), [10, EOS_ID])
+
+    def test_speculative_abort_caps_emitted_tokens_at_max_new_tokens(self):
+        # Issue #44839: Speculative decoding draft accepts tokens crossing max_new_tokens=3,
+        # but an abort occurs before or during finish check. Output tokens must be clamped
+        # to max_new_tokens and not emit the over-accepted tokens.
+        req = _make_req([10, 11, 12, 13, 14, 15, 16], max_new_tokens=3)
+        req.to_finish = FINISH_ABORT("client disconnect")
+        req.update_finish_state(new_accepted_len=5)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertEqual(req.finished_len, 3)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12])
+        self.assertEqual(len(req.output_ids_through_stop), 3)
+
+    def test_speculative_abort_within_budget_keeps_len(self):
+        # Abort before reaching max_new_tokens preserves tokens generated so far
+        req = _make_req([10, 11], max_new_tokens=5)
+        req.to_finish = FINISH_ABORT("client disconnect")
+        req.update_finish_state(new_accepted_len=2)
+        self.assertTrue(req.finished())
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.finished_len)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11])
 
 
 # Incident replay with production token ids. Spec verification has no EOS
