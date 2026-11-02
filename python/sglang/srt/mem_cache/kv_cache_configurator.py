@@ -2434,6 +2434,12 @@ class KVCacheConfigurator:
             "SGLANG_ENABLE_ELASTIC_MEM_POOL needs both full-attention and SWA "
             "layers on this rank; pure-SWA models are not supported"
         )
+        if torch.device(self.device).type == "xpu":
+            from sglang.srt.mem_cache.elastic.xpu_memory_pool import (
+                ElasticXPUMHATokenToKVPool,
+            )
+
+            return ElasticXPUMHATokenToKVPool
         from sglang.srt.mem_cache.elastic.elastic_memory_pool import (
             ElasticMHATokenToKVPool,
         )

@@ -111,6 +111,15 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
+For MHA models, `intel_xpu` also accepts `--page-size 1`. This needs an
+sgl-kernel-xpu with the page-size-1 fallback (sgl-kernel-xpu#454), which gathers
+each request's KV into a dense buffer per call, so it is slower than the paged
+kernel; use it only where page size 1 is required, e.g. elastic KV pools
+(`SGLANG_ENABLE_ELASTIC_MEM_POOL`). Models with attention sinks, such as gpt-oss,
+also need the kernel's non-paged path to accept sinks; builds that reject them
+fail with `No-page attention does not support sink logits`, and
+`--attention-backend triton --page-size 1` works instead.
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import os
 from typing import Any, Iterable, Optional
 
 from sglang.srt.arg_groups.overrides import (
@@ -760,9 +762,11 @@ def handle_elastic_mem_pool(server_args: Any) -> None:
     if not envs.SGLANG_ENABLE_ELASTIC_MEM_POOL.get():
         return
     cfg = resolving_view(server_args)
-    assert cfg.device == "cuda", (
-        f"SGLANG_ENABLE_ELASTIC_MEM_POOL supports cuda devices, got {cfg.device}"
+    assert cfg.device in ("cuda", "xpu"), (
+        f"SGLANG_ENABLE_ELASTIC_MEM_POOL supports cuda and xpu devices, got {cfg.device}"
     )
+    if cfg.device == "xpu":
+        _validate_elastic_mem_pool_xpu(cfg)
     # Elastic pools need the Python UnifiedTreeCore, which alone provides
     # component_evictable_device_indices, even where the general tree default
     # is Rust. Keep an explicit backend choice for the check below.
@@ -791,6 +795,35 @@ def handle_elastic_mem_pool(server_args: Any) -> None:
     for name, enabled in incompatible:
         assert not enabled, (
             f"SGLANG_ENABLE_ELASTIC_MEM_POOL is not compatible with {name}"
+        )
+
+
+def _validate_elastic_mem_pool_xpu(cfg: Any) -> None:
+    assert importlib.util.find_spec("kvcached") is not None, (
+        "SGLANG_ENABLE_ELASTIC_MEM_POOL on XPU requires kvcached built with "
+        "KVCACHED_BACKEND=xpu"
+    )
+    incompatible = [
+        # kvcached's own SGLang autopatch would replace the same pools.
+        (
+            "kvcached's SGLang autopatch (ENABLE_KVCACHED / KVCACHED_AUTOPATCH)",
+            any(
+                os.getenv(name, "false").lower() in ("true", "1")
+                for name in ("ENABLE_KVCACHED", "KVCACHED_AUTOPATCH")
+            ),
+        ),
+        (
+            # intel_xpu keeps page size 1 only when sgl-kernel-xpu has the
+            # page-size-1 fallback; otherwise _intel_xpu_page_constraint forces 128.
+            "--page-size > 1; pass --page-size 1, and for intel_xpu install an "
+            "sgl-kernel-xpu with the page-size-1 fallback (sgl-kernel-xpu#454) "
+            "or use --attention-backend triton",
+            cfg.page_size is not None and cfg.page_size != 1,
+        ),
+    ]
+    for name, enabled in incompatible:
+        assert not enabled, (
+            f"SGLANG_ENABLE_ELASTIC_MEM_POOL on XPU is not compatible with {name}"
         )
 
 
