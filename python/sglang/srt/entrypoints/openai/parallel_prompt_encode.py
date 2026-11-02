@@ -325,6 +325,11 @@ class _SegmentEncoder:
             self.npattern,
             self.intra,
         ) = plan
+        # A multimodal processor can enable padding on the shared backend right after
+        # the gate in encode_prompt_segments, and the cache would keep the padded ids.
+        self.private_backend = type(self.backend).from_str(self.backend.to_str())
+        self.private_backend.no_padding()
+        self.private_backend.no_truncation()
         added = self.backend.get_added_tokens_decoder()
         self.added_tokens = [t.content for t in added.values() if t.content]
         self.raw_ids = {
@@ -335,13 +340,13 @@ class _SegmentEncoder:
         # This regex scans every rendered prompt with the GIL held, so it holds only
         # the tokens that the chat template writes. Thousands of reserved tokens would
         # slow it, and added tokens like "\n" would cut normal text into many pieces.
-        cut_tokens = _alternation(
-            [
-                token
-                for token in self.raw_ids
-                if token in chat_template and self.cut_id(token) is not None
-            ]
-        )
+        template_cuts = [
+            token
+            for token in self.raw_ids
+            if token in chat_template and self.cut_id(token) is not None
+        ]
+        cut_tokens = _alternation(template_cuts)
+        self.join_token = min(template_cuts, key=len, default=None)
         # A capturing group keeps the added tokens in the output of split().
         self.split_added = (
             re.compile(f"({cut_tokens.pattern})").split if cut_tokens else None
@@ -395,7 +400,33 @@ class _SegmentEncoder:
                 ids.append(item)
         return ids
 
-    def _encode(self, texts):
+    def _encode_joined(self, texts):
+        """Encode the texts of a short prompt as one input. One input stays on the
+        calling thread, and two or more enter the rayon pool, which costs more than it
+        gains at this size. The join token is a cut point, so its id separates the ids
+        of each text. Return None if a text also produced that id."""
+        min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        if (
+            self.join_token is None
+            or len(texts) < 2
+            or sum(map(len, texts)) >= min_chars
+        ):
+            return None
+        ids = self.private_backend.encode_batch(
+            [self.join_token.join(texts)], add_special_tokens=False
+        )[0].ids
+        join_id = self.raw_ids[self.join_token]
+        if ids.count(join_id) != len(texts) - 1:
+            return None
+        ids.append(join_id)
+        encoded, start = {}, 0
+        for text in texts:
+            end = ids.index(join_id, start)
+            encoded[text] = tuple(ids[start:end])
+            start = end + 1
+        return encoded
+
+    def _encode_batched(self, texts):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         chunks, counts = [], []
         for text in texts:
@@ -406,14 +437,17 @@ class _SegmentEncoder:
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        encodings = self.private_backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
             encoded[text] = tuple(
                 chain.from_iterable(e.ids for e in encodings[start : start + count])
             )
             start += count
+        return encoded
 
+    def _encode(self, texts):
+        encoded = self._encode_joined(texts) or self._encode_batched(texts)
         with self.lock:
             for text, ids in encoded.items():
                 if (

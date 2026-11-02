@@ -480,7 +480,8 @@ class OpenAIServingChat(OpenAIServingBase):
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
         # Concurrent first requests would each build the encoder.
-        _segment_encoder_for(self.tokenizer_manager.tokenizer)
+        if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get():
+            _segment_encoder_for(self.tokenizer_manager.tokenizer)
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )

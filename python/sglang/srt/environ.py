@@ -1844,8 +1844,8 @@ class Envs:
     # Encode rendered chat prompts through the per-tokenizer segment cache when the
     # tokenizer allows it, and cut long ones into chunks for the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
-    # A shorter text stays one chunk. Below this size, rayon dispatch and the id merge
-    # use up the gain.
+    # Shorter prompts use the single-call encode; below this the gain is eaten
+    # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)

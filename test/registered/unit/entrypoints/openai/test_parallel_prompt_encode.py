@@ -641,8 +641,11 @@ class TestPromptSegments(_EncodeCase):
             ["<|user|", "<|user|>", "|>"],
             ["[gMASK]", "<sop>", "<|user|>", "hello <think> world", "<|assistant|>"],
         ]
+        # A chat template gives the encoder a join token for short texts.
+        joined = _tokenizer(chat_template="".join(_SPECIALS))
         for segments in edge_cases + _fuzz_segments():
             self._assert_segments_match_encode(self.tokenizer, segments)
+            self._assert_segments_match_encode(joined, segments)
 
     def test_text_between_cut_points_is_encoded_once_whatever_the_length(self):
         self._set_min_chars(1 << 20)
@@ -731,6 +734,24 @@ class TestPromptSegments(_EncodeCase):
                 self._assert_falls_back(tokenizer, segments, encode_kwargs)
         with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
             self._assert_falls_back(self.tokenizer, segments, {})
+
+    def test_padding_on_the_shared_backend_does_not_reach_the_ids(self):
+        """A multimodal processor calls the same tokenizer with padding=True."""
+        backend = self.tokenizer._tokenizer
+        backend.enable_padding()
+        backend.enable_truncation(2)
+        ppe._segment_encoder_for(self.tokenizer)
+        backend.no_padding()
+        backend.no_truncation()
+        parts = ("<|user|>", "hello", "<|assistant|>", "the quick brown fox jumps")
+
+        def segments():
+            # The encoder reads this generator after the gate.
+            backend.enable_padding()
+            yield from parts
+
+        ids = ppe.encode_prompt_segments(self.tokenizer, segments())
+        self.assertEqual(ids, self.tokenizer.encode("".join(parts)))
 
     def test_the_cache_keeps_to_its_token_budget(self):
         with (
