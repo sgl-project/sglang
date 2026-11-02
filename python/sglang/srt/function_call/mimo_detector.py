@@ -36,7 +36,13 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
         if tool.function.name == func_name:
             props = get_schema_properties(tool.function.parameters)
             if param_name in props:
-                return props[param_name].get("type", "string")
+                param_type = props[param_name].get("type", "string")
+                if isinstance(param_type, list):
+                    # JSON Schema union type (e.g. ["string", "null"]):
+                    # use the first non-null entry for value conversion
+                    non_null = [t for t in param_type if t != "null"]
+                    return non_null[0] if non_null else "string"
+                return param_type
     return "string"
 
 
