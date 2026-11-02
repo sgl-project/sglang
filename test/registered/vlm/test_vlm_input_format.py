@@ -257,7 +257,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
     model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
     chat_template = "qwen2-vl"
 
-    def test_colliding_low_hash_bits_do_not_reuse_image_kv(self):
+    def test_caller_hashes_do_not_reuse_different_image_kv(self):
         prompt = self.processor.apply_chat_template(
             [
                 {
@@ -274,31 +274,41 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
         red = Image.new("RGB", (224, 224), "red")
         blue = Image.new("RGB", (224, 224), "blue")
         params = dict(temperature=0.0, max_new_tokens=16)
-        # these distinct caller hashes collapse to the same legacy 30-bit pad
-        self.engine.flush_cache()
-        cold_blue = self.engine.generate(
-            prompt=prompt,
-            image_data=[blue],
-            mm_hashes=["40000007"],
-            sampling_params=params,
-        )
-        self.engine.flush_cache()
-        red_output = self.engine.generate(
-            prompt=prompt, image_data=[red], mm_hashes=["7"], sampling_params=params
-        )
-        warm_blue = self.engine.generate(
-            prompt=prompt,
-            image_data=[blue],
-            mm_hashes=["40000007"],
-            sampling_params=params,
-        )
-        self.assertIn("red", red_output["text"].lower())
-        self.assertIn("blue", cold_blue["text"].lower())
-        self.assertEqual(warm_blue["text"], cold_blue["text"])
-        self.assertLess(
-            warm_blue["meta_info"]["cached_tokens"],
-            warm_blue["meta_info"]["prompt_tokens"] - 1,
-        )
+        # cover identical hints and distinct hints with the same legacy low bits
+        for blue_hash in ("7", "40000007"):
+            with self.subTest(blue_hash=blue_hash):
+                self.engine.flush_cache()
+                cold_blue = self.engine.generate(
+                    prompt=prompt,
+                    image_data=[blue],
+                    mm_hashes=[blue_hash],
+                    sampling_params=params,
+                )
+                self.engine.flush_cache()
+                red_output = self.engine.generate(
+                    prompt=prompt,
+                    image_data=[red],
+                    mm_hashes=["7"],
+                    sampling_params=params,
+                )
+                warm_blue = self.engine.generate(
+                    prompt=prompt,
+                    image_data=[blue],
+                    mm_hashes=[blue_hash],
+                    sampling_params=params,
+                )
+                warm_red = self.engine.generate(
+                    prompt=prompt,
+                    image_data=[red],
+                    mm_hashes=["7"],
+                    sampling_params=params,
+                )
+                self.assertIn("red", red_output["text"].lower())
+                self.assertIn("blue", cold_blue["text"].lower())
+                self.assertEqual(warm_blue["text"], cold_blue["text"])
+                self.assertEqual(warm_red["text"], red_output["text"])
+                self.assertEqual(warm_blue["meta_info"]["cached_tokens"], 0)
+                self.assertGreater(warm_red["meta_info"]["cached_tokens"], 0)
 
     @classmethod
     def _init_visual(cls):

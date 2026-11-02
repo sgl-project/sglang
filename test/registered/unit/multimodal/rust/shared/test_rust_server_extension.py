@@ -669,6 +669,11 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
+        patch.object(
+            server_module,
+            "build_processor_fingerprint",
+            return_value="sha256:" + "12" * 32,
+        ),
     ):
         yield build_args
 
@@ -695,7 +700,10 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(is_multimodal=True),
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
+            ),
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -1154,6 +1162,7 @@ class TestRustServerExtension(CustomTestCase):
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
+                model_path="test/model",
             ),
         )
         with (
@@ -1170,14 +1179,16 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer.launch(scheduler)
             extension.Server.assert_not_called()
 
-            mm_processor.return_value.resolve_spec.return_value = sentinel.spec
+            spec = Mock()
+            spec.rust_json.return_value = "{}"
+            mm_processor.return_value.resolve_spec.return_value = spec
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
         instance.server.start_mm_workers.assert_called_once_with(
             sentinel.worker_spec, 8
         )
-        self.assertIs(instance.mm_spec, sentinel.spec)
+        self.assertIs(instance.mm_spec, spec)
         self.assertTrue(instance._multimodal_enabled)
 
     @unittest.skipUnless(
@@ -1210,7 +1221,12 @@ class TestRustServerExtension(CustomTestCase):
             # Affinity is per thread: launch on a thread of its own, as the
             # scheduler's launch thread, so the test runner keeps its mask.
             scheduler = SimpleNamespace(
-                model_config=SimpleNamespace(is_multimodal=True)
+                processor=sentinel.processor,
+                model_config=SimpleNamespace(
+                    is_multimodal=True,
+                    hf_config=sentinel.config,
+                    model_path="test/model",
+                ),
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)

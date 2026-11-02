@@ -39,6 +39,7 @@ def _item(modality, rows, offsets):
 class TestPrecomputedEmbeddingValidation(unittest.TestCase):
     def setUp(self):
         self.processor = object.__new__(_StubProcessor)
+        self.processor.processor_fingerprint = "sha256:" + "12" * 32
 
     def _validate(self, items, embeddings):
         self.processor.output = MultimodalProcessorOutput(
@@ -81,6 +82,34 @@ class TestPrecomputedEmbeddingValidation(unittest.TestCase):
         )
 
         self.assertEqual(len(output.mm_items), 3)
+
+    def test_caller_identity_cannot_override_precomputed_tensor(self):
+        self.processor.use_cuda_ipc = False
+        self.processor._resolve_processor = Mock(return_value=(None, None))
+        keys = []
+        for feature in (
+            torch.zeros(2, 4),
+            torch.ones(2, 4),
+            torch.zeros(2, 4, dtype=torch.bfloat16),
+        ):
+            payload = {
+                "format": "precomputed_embedding",
+                "feature": feature,
+                "offsets": [(1, 2)],
+                "hash": 7,
+                "identity": b"x" * 32,
+                "processor_fingerprint": "sha256:" + "00" * 32,
+            }
+            items, _, _ = self.processor.process_and_combine_mm_data(
+                BaseMultiModalProcessorOutput(
+                    input_text="", input_ids=[7, 99, 99, 8], images=[payload]
+                ),
+                None,
+            )
+            keys.append(items[0].cache_key)
+        self.assertTrue(all(len(key) == 32 for key in keys))
+        self.assertEqual(len(set(keys)), 3)
+        self.assertNotIn(b"x" * 32, keys)
 
     def test_rejects_item_shorter_than_prompt_offsets(self):
         with self.assertRaisesRegex(RuntimeError, "expected 3 rows.*got 2"):

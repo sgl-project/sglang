@@ -148,10 +148,10 @@ class TestEarlyEmbeddings(CustomTestCase):
     def test_early_embedding_must_match_the_item_length(self):
         """A stale embedding of another length must not replace the vision pass."""
         early = p.EarlyEmbeddings(encode=lambda items: None)
-        early._by_hash[42] = torch.zeros(5, 4)
+        early._by_key[b"a" * 32] = torch.zeros(5, 4)
         self.assertTrue(early.has_prefetched())
-        self.assertIsNotNone(early.prefetched(42, 5))
-        self.assertIsNone(early.prefetched(42, 6))
+        self.assertIsNotNone(early.prefetched(b"a" * 32, 5))
+        self.assertIsNone(early.prefetched(b"a" * 32, 6))
         self.assertIsNone(early.prefetched(None, 5))
 
 

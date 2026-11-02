@@ -74,7 +74,7 @@ def _backend(conv_pool, ssm_pool):
     )
     backend._state_ids = IdSpace(key=("state", None))
     pool = SimpleNamespace(layer_transfer_counter=None, start_layer=0)
-    pool.layer_router = KVLayerRouter.from_layer_maps(pool, ())
+    pool.layer_router = KVLayerRouter.from_layer_maps(pool, (), owner="state")
     pool.layer_router.bind_part(
         sub_pool="state",
         part=STATE_PART,
