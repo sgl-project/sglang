@@ -46,7 +46,7 @@ _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []
 
 def register_linear_attn_model(spec: LinearAttnModelSpec) -> None:
     _LINEAR_ATTN_MODEL_REGISTRY.append(spec)
-    logger.info(
+    logger.debug(
         "Registered linear attn model: config=%s, backend=%s, archs=%s",
         spec.config_class.__name__,
         spec.backend_class_name.rsplit(".", 1)[-1],

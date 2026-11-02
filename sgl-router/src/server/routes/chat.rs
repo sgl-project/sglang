@@ -594,6 +594,7 @@ async fn lookup_prefix_matches(
             Some(PrefixLookupResult {
                 outcome,
                 query_blocks,
+                pending_winners: Vec::new(),
                 block_hashes: None,
             })
         }

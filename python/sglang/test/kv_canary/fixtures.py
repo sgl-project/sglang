@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import get_device
+from sglang.test.tree_slots import index_slots, tree_slots_of
 
 # Resolve the active accelerator (cuda/xpu/...) instead of hardcoding cuda: a torch
 # build without CUDA cannot allocate cuda tensors or call torch.cuda.*. Tests that
@@ -282,12 +283,14 @@ def make_unified_radix_cache(
     cache.tree_components = tree_components
     cache.components = {ct: None for ct in tree_components}
     cache.is_swa_enabled = ComponentType.SWA in tree_components
+    index_slots(cache, tree_components)
     cache.tree_core = UnifiedTreeCore(
         CacheInitParams(
             disable=False,
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
+            tree_slots=tree_slots_of(tree_components),
         ),
         {ct: MagicMock() for ct in tree_components},
     )

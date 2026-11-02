@@ -126,12 +126,14 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
     allocator = SimpleNamespace(alloc=lambda n: None, free=lambda ids: None)
     params = CacheInitParams(
         disable=False,
-        req_to_token_pool=cast(
-            ReqToTokenPool,
-            SimpleNamespace(mamba_pool=target_mamba, mamba_allocator=allocator),
-        ),
+        req_to_token_pool=cast(ReqToTokenPool, SimpleNamespace()),
         token_to_kv_pool_allocator=cast(
-            BaseTokenToKVPoolAllocator, SimpleNamespace(swa_attn_allocator=allocator)
+            BaseTokenToKVPoolAllocator,
+            SimpleNamespace(
+                swa_attn_allocator=allocator,
+                state=SimpleNamespace(pool=target_mamba, slots=allocator),
+                state_slots=allocator,
+            ),
         ),
         page_size=16,
         mtp_draft_device_pools=drafts,

@@ -71,8 +71,8 @@ Do not mark the goal complete until the completion check at the end of this skil
 Known SGLang gates:
 
 - `pr-test.yml` requires the `run-ci` label for relevant PR changes. If its existing gate job failed because the label was absent, add `run-ci` when authorized and rerun failed jobs in that existing run; adding the label alone does not necessarily create a new `pr-test.yml` run.
-- `pr-test-extra.yml` requires both `run-ci` and `run-ci-extra`. It listens for relevant label events, so adding a missing label may create a fresh run. Prefer that fresh current-head run; rerun failed jobs in an existing current run only when needed.
-- AMD-extra workflows may use the same `run-ci` plus `run-ci-extra` gate. Verify the actual selected file.
+- `pr-test-extra.yml` requires both `run-ci` and `run-ci-nv-extra`; `pr-test-amd-extra.yml` requires `run-ci` and `run-ci-amd-extra`. These workflows do not trigger on label events. Use `/run-extra-ci nv` or `/run-extra-ci amd` to add the matching label and rerun the selected current-head workflow.
+- The shared `run-ci-extra` label is retired and does not pass updated gates. Older workflow runs retain their original revision; update the branch and push to create a fresh run before using the dedicated label. Verify the actual selected workflow file.
 - Treat draft, cooldown, maintenance, and missing-label failures as gate/infrastructure conditions, not code regressions. Fix only the safe gate condition in scope; wait for cooldown or maintenance windows rather than burning retries immediately.
 
 Adding the known CI opt-in labels is within scope. Do not add unrelated labels, mark the PR ready, alter reviewers, merge, or mutate other PR metadata.
