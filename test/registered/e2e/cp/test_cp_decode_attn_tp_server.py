@@ -50,10 +50,15 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
     # Keep an absolute bound as well as exact greedy token equality; do not
     # discard positions after a divergence or normalize away a scale error.
     logprob_atol = 0.02
-    # VERIFY vs teacher-forced prefill, and fused vs fallback, run different
-    # kernels over FP8 weights and the FP8 KV cache, so they differ by more
-    # than logprob_atol even with identical greedy tokens.
-    cross_path_logprob_atol = 1.5
+    # VERIFY and teacher-forced prefill run different kernels over FP8 weights
+    # and the FP8 KV cache. Measured on B300 (PR #47980): up to 0.44 on plain
+    # TP8 and 0.89 on CP8 with identical greedy tokens.
+    rescore_logprob_atol = 1.0
+    # Fused and fallback are separate server layouts. Valid layouts of this
+    # FP8 MoE model differ by 0.10-0.31 on average with isolated multi-nat
+    # spikes (TP8 vs attention DP, no CP: mean up to 0.21, max 9.5), so bound
+    # the mean; exact greedy tokens still catch a broken reduction.
+    fusion_parity_mean_atol = 0.4
 
     @classmethod
     def setUpClass(cls):
@@ -132,7 +137,7 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
         self.assertGreater(remaining, 0)
         return prefix + (filler * (remaining // len(filler) + 1))[:remaining] + suffix
 
-    def _assert_logprobs(self, actual, expected, label, atol=None):
+    def _assert_logprobs(self, actual, expected, label, atol=None, mean_atol=None):
         self.assertEqual(len(actual), len(expected), label)
         self.assertEqual(
             [row[1] for row in actual], [row[1] for row in expected], label
@@ -141,6 +146,10 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
         expected_values = np.asarray([row[0] for row in expected], dtype=np.float64)
         self.assertTrue(np.isfinite(actual_values).all(), label)
         self.assertTrue(np.isfinite(expected_values).all(), label)
+        if mean_atol is not None:
+            mean_diff = np.abs(actual_values - expected_values).mean()
+            self.assertLessEqual(mean_diff, mean_atol, f"{label}: mean={mean_diff:.4f}")
+            return
         np.testing.assert_allclose(
             actual_values,
             expected_values,
@@ -172,7 +181,7 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                 output["meta_info"]["output_token_logprobs"],
                 score["meta_info"]["input_token_logprobs"][len(prompt) :],
                 "VERIFY versus teacher-forced CP prefill",
-                atol=self.cross_path_logprob_atol,
+                atol=self.rescore_logprob_atol,
             )
 
     def _exercise(self, log_path):
@@ -361,7 +370,7 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                                     actual,
                                     expected,
                                     f"fusion parity {case}",
-                                    atol=self.cross_path_logprob_atol,
+                                    mean_atol=self.fusion_parity_mean_atol,
                                 )
                     self.assertIsNone(self.process.poll())
                     print(
