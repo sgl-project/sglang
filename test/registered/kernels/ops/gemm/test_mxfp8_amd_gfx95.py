@@ -2,10 +2,14 @@
 
 import types
 import unittest
+from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import bf16_dequant_blockscaled_linear
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
+    _mxfp8_linear_split_k,
+    bf16_dequant_blockscaled_linear,
+)
 from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
@@ -147,6 +151,38 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 xq, xs = fp8_grid_quantize(x)
                 out_q = mxfp8_native_blockscaled_linear(xq, w_sh, ws8, input_scale=xs)
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
+
+
+# (M, N, K) -> split on a 256-CU gfx950 at the decode tiling BLOCK_M = BLOCK_N = 64, BLOCK_K = 128
+SPLIT_K_CASES = [
+    ((1, 1280, 6144), 8),  # MiniMax-M3 TP8 qkv: 20 workgroups
+    ((1, 4096, 12288), 16),  # 64 workgroups over 96 k-tiles
+    ((1, 256, 4096), 8),  # capped so each program keeps >= 4 k-tiles
+    ((1, 6144, 1024), 1),  # K < 4096
+    ((1, 6144, 1536), 1),
+    ((136, 6144, 6144), 1),  # 3 x 96 workgroups already fill the CUs
+    ((1, 24576, 6144), 1),
+    ((0, 1280, 6144), 1),  # empty batch
+]
+
+
+class TestMxfp8LinearSplitK(CustomTestCase):
+    def _split_k(self, m, n, k):
+        return _mxfp8_linear_split_k(
+            M=m, N=n, K=k, BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, num_cu=256
+        )
+
+    def test_splits_only_underfilled_grids_with_long_k(self):
+        for (m, n, k), split in SPLIT_K_CASES:
+            self.assertEqual(self._split_k(m, n, k), split, (m, n, k))
+
+    def test_batch_invariant_mode_never_splits(self):
+        with mock.patch(
+            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+            return_value=True,
+        ):
+            for (m, n, k), _ in SPLIT_K_CASES:
+                self.assertEqual(self._split_k(m, n, k), 1, (m, n, k))
 
 
 def _aiter_mxfp8_gemm_available() -> bool:
