@@ -176,7 +176,6 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.model_runner = model_runner
         runner.captured_req_width = 1
         runner.ragged_verify_mode = False
-        runner.enable_pdmux = False
         runner.pp_size = 1
         runner.dllm_uses_input_embeds = False
         runner.in_graph_metadata_prep_done = None
