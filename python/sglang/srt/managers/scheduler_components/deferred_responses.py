@@ -36,6 +36,9 @@ class DeferredResponses:
     def held_reqs(self) -> List[Req]:
         return [req for req, _ in self.held.values()]
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {"deferred": self.held_reqs()}
+
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
         if self.disaggregation_mode != DisaggregationMode.NULL:
             raise ValueError("deferred responses do not support PD disaggregation")

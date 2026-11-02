@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
 _fake_ops_registered = False
 
 
