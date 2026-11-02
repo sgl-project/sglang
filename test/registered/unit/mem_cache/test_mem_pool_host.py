@@ -273,7 +273,10 @@ class TestHostKVCache(CustomTestCase):
             enable_memory_saver=False,
         )
         index_host = MHATokenToKOnlyPoolHost(
-            index_pool, self.host_pool, "layer_first", pin_memory=False
+            buffer_info=index_pool.get_device_pool_infos()[0].buffer_info,
+            anchor_host=self.host_pool,
+            layout="layer_first",
+            pin_memory=False,
         )
         group = HostPoolGroup(
             [

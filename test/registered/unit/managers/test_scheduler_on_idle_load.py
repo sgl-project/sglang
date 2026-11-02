@@ -20,7 +20,13 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
+from sglang.srt.models.unlimited_ocr_v2_support.request_receiver import (
+    UocrRequestReceiver,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )
@@ -42,6 +48,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.load_inquirer = MagicMock()
         s.metrics_reporter = MagicMock()
         s.dp_attn_adapter = MagicMock()
+        s.request_receiver = object.__new__(SchedulerRequestReceiver)
         s._last_stall_publish_ts = float("-inf")
         return s
 
@@ -104,7 +111,9 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
         scheduler._engine_paused = False
-        scheduler.async_shm_materializer = materializer
+        receiver = object.__new__(UocrRequestReceiver)
+        object.__setattr__(receiver, "async_shm_materializer", materializer)
+        scheduler.request_receiver = receiver
         scheduler._last_stall_publish_ts = 0.0
         scheduler.publish_load_snapshot = MagicMock(return_value=None)
         scheduler.load_publisher = MagicMock()

@@ -28,6 +28,7 @@ class HostPoolConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 class HostPoolGroupConfig(msgspec.Struct, frozen=True, kw_only=True):
     root: Any
+    pool_infos: dict[PoolName, DevicePoolInfo]
     transfer_page_size: int
     layer_mapping: dict[int, int]
     transfer_layer_id_max: int
@@ -129,16 +130,16 @@ def _prepare_sidecar(
         if (
             draft_buffers.page_size,
             draft_buffers.compress_ratio,
-            draft_buffers.key_format,
+            draft_buffers.key_layout,
             draft_buffers.kernel_page_bytes,
         ) != (
             buffers.page_size,
             buffers.compress_ratio,
-            buffers.key_format,
+            buffers.key_layout,
             buffers.kernel_page_bytes,
         ):
             raise ValueError(
-                f"{target.pool_name}: draft[{depth}] index key format differs from target"
+                f"{target.pool_name}: draft[{depth}] index key layout differs from target"
             )
         device_to_host[len(model_layer_ids) + depth] = len(packed_buffers)
         transfer_layers.add(len(model_layer_ids) + depth)
@@ -225,6 +226,7 @@ def prepare_host_pool_config(
     )
     return HostPoolGroupConfig(
         root=root,
+        pool_infos=targets,
         transfer_page_size=transfer_page_size,
         layer_mapping=mapping,
         transfer_layer_id_max=transfer_layer_id_max + len(drafts),
