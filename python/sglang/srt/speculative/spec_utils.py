@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
@@ -23,7 +24,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -195,11 +195,8 @@ def fast_sample(
         scores = probs.float() / q
 
     if num_samples == 1:
-        # row_argmax is FP32-only; the seeded path keeps float64 scores.
-        if scores.dtype == torch.float32:
-            sample_index = row_argmax(scores).unsqueeze(-1)
-        else:
-            sample_index = scores.argmax(dim=-1, keepdim=True)
+        # The seeded path's float64 scores fall back to torch.argmax.
+        sample_index = sampling_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -1060,9 +1057,11 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
 _VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+    VerifyTrackIndices()
+    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+    else None
 )
 
 
