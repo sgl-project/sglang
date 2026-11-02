@@ -259,6 +259,7 @@ class MiMoVisionTransformer(nn.Module):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
+        self.out_hidden_size = vision_config.out_hidden_size
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         mlp_hidden_size: int = vision_config.intermediate_size
         self.patch_embed = MiMoVisionPatchEmbed(
