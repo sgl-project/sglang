@@ -18,6 +18,7 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -75,6 +76,52 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+
+class TestC128PageSize(unittest.TestCase):
+    def test_configured_page_size_reaches_npu_c128_kv_pool(self):
+        for page_size in (16, 32):
+            with (
+                self.subTest(page_size=page_size),
+                patch(
+                    "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.get_schedule",
+                    return_value=SimpleNamespace(c128_page_size=page_size),
+                ),
+                patch.object(DeepSeekV4TokenToKVPool, "__init__", return_value=None),
+                patch(
+                    "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.NPUDeepSeekV4SingleKVPool"
+                ) as kv_pool_cls,
+            ):
+                pool = DSV4NPUTokenToKVPool()
+                pool.qk_nope_head_dim = 128
+                pool.qk_rope_head_dim = 64
+                pool._make_kv_pool(
+                    size=256,
+                    page_size=1,
+                    dtype=torch.bfloat16,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    global_page_size=128,
+                )
+                self.assertEqual(pool.c128_page_size, page_size)
+                self.assertEqual(
+                    kv_pool_cls.call_args.kwargs["kernel_page_size"], page_size
+                )
+
+    def test_invalid_page_size_is_rejected(self):
+        for page_size in (0, -16, 1, 24):
+            with (
+                self.subTest(page_size=page_size),
+                patch(
+                    "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.get_schedule",
+                    return_value=SimpleNamespace(c128_page_size=page_size),
+                ),
+                patch.object(DeepSeekV4TokenToKVPool, "__init__", return_value=None),
+            ):
+                with self.assertRaisesRegex(ValueError, "positive multiple of 16"):
+                    DSV4NPUTokenToKVPool()
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
