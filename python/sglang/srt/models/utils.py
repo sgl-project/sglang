@@ -606,6 +606,8 @@ def apply_qk_norm(
     """
 
     batch_size = q.size(0)
+    if batch_size == 0:
+        return q, k
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
 
