@@ -524,6 +524,32 @@ def _verify_index_topk_partial_kernel(
 
 
 @triton.jit
+def _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT: tl.constexpr):
+    """A row's topk block ids from its candidate keys (NO_KEY when empty): the forced init
+    [0, init_blocks) and local [n_blocks - local_blocks, n_blocks) blocks, then the highest
+    scores, lower block id on ties; ascending, with the -1 tail the sparse decode kernels
+    expect."""
+    NO_KEY: tl.constexpr = -9223372036854775808
+    BIG: tl.constexpr = 0x7FFFFFFF
+    n_init = tl.minimum(init_blocks, n_blocks)
+    local_start = tl.maximum(tl.maximum(n_blocks - local_blocks, 0), n_init)
+    n_forced = n_init + n_blocks - local_start
+    t = tl.arange(0, KT)
+    kept = tl.full([KT], BIG, tl.int32)
+    for j in tl.static_range(KT):
+        if j < topk - n_forced:
+            best = tl.max(key, axis=0)
+            pick = tl.where(best != NO_KEY, (~best).to(tl.int32), BIG)
+            kept = tl.where(t == j, pick, kept)
+            key = tl.where(key == best, NO_KEY, key)
+    forced = tl.where(
+        t < n_forced, tl.where(t < n_init, t, local_start + t - n_init), BIG
+    )
+    ids = -tl.topk(-tl.reshape(tl.join(kept, forced), [2 * KT]), KT)
+    return tl.where(ids == BIG, -1, ids)
+
+
+@triton.jit
 def _verify_index_topk_merge_kernel(
     part_k_ptr,  # [num_heads * rows, NC] int64 keys
     part_n_ptr,  # [num_reqs] splits of each request
@@ -557,27 +583,8 @@ def _verify_index_topk_merge_kernel(
     )
     # Empty entries have negative ids.
     key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
-    BIG: tl.constexpr = 0x7FFFFFFF
-
-    # Forced blocks: init [0, init_blocks) and local [n_blocks - local_blocks, n_blocks).
-    n_init = tl.minimum(init_blocks, n_blocks)
-    local_start = tl.maximum(tl.maximum(n_blocks - local_blocks, 0), n_init)
-    n_forced = n_init + n_blocks - local_start
+    ids = _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT)
     t = tl.arange(0, KT)
-    kept = tl.full([KT], BIG, tl.int32)
-    # Highest score first, lower block id on ties.
-    for j in tl.static_range(KT):
-        if j < topk - n_forced:
-            best = tl.max(key, axis=0)
-            pick = tl.where(best != NO_KEY, (~best).to(tl.int32), BIG)
-            kept = tl.where(t == j, pick, kept)
-            key = tl.where(key == best, NO_KEY, key)
-    forced = tl.where(
-        t < n_forced, tl.where(t < n_init, t, local_start + t - n_init), BIG
-    )
-    # Ascending ids with the -1 tail the sparse decode kernels expect.
-    ids = -tl.topk(-tl.reshape(tl.join(kept, forced), [2 * KT]), KT)
-    ids = tl.where(ids == BIG, -1, ids)
     tl.store(topk_ptr + r.to(tl.int64) * stride_t + t, ids, mask=t < topk)
 
 
@@ -816,26 +823,8 @@ def _cp_merge_kernel(
     # A key with a negative block id is empty. That includes the zeros the runtime's
     # custom all-gather writes instead of gathering during CUDA-graph warmup.
     key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
-    BIG: tl.constexpr = 0x7FFFFFFF
-    # Forced blocks: init [0, init_blocks) and local [n_blocks - local_blocks, n_blocks).
-    n_init = tl.minimum(init_blocks, n_blocks)
-    local_start = tl.maximum(tl.maximum(n_blocks - local_blocks, 0), n_init)
-    n_forced = n_init + n_blocks - local_start
+    ids = _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT)
     t = tl.arange(0, KT)
-    kept = tl.full([KT], BIG, tl.int32)
-    # Highest score first, lower block id on ties.
-    for i in tl.static_range(KT):
-        if i < topk - n_forced:
-            best = tl.max(key, axis=0)
-            pick = tl.where(best != NO_KEY, (~best).to(tl.int32), BIG)
-            kept = tl.where(t == i, pick, kept)
-            key = tl.where(key == best, NO_KEY, key)
-    forced = tl.where(
-        t < n_forced, tl.where(t < n_init, t, local_start + t - n_init), BIG
-    )
-    # Ascending ids with the -1 tail the sparse decode kernels expect.
-    ids = -tl.topk(-tl.reshape(tl.join(kept, forced), [2 * KT]), KT)
-    ids = tl.where(ids == BIG, -1, ids)
     tl.store(topk_ptr + r.to(tl.int64) * topk + t, ids, mask=t < topk)
 
 
@@ -1142,23 +1131,8 @@ def _cp_merge_ipc_kernel(
     n_blocks = tl.minimum(
         (tl.load(seq_lens_ptr + r).to(tl.int32) + BLOCK_N - 1) // BLOCK_N, max_blocks
     )
-    BIG: tl.constexpr = 0x7FFFFFFF
-    n_init = tl.minimum(init_blocks, n_blocks)
-    local_start = tl.maximum(tl.maximum(n_blocks - local_blocks, 0), n_init)
-    n_forced = n_init + n_blocks - local_start
+    ids = _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT)
     t = tl.arange(0, KT)
-    kept = tl.full([KT], BIG, tl.int32)
-    for i in tl.static_range(KT):
-        if i < topk - n_forced:
-            best = tl.max(key, axis=0)
-            pick = tl.where(best != NO_KEY, (~best).to(tl.int32), BIG)
-            kept = tl.where(t == i, pick, kept)
-            key = tl.where(key == best, NO_KEY, key)
-    forced = tl.where(
-        t < n_forced, tl.where(t < n_init, t, local_start + t - n_init), BIG
-    )
-    ids = -tl.topk(-tl.reshape(tl.join(kept, forced), [2 * KT]), KT)
-    ids = tl.where(ids == BIG, -1, ids)
     tl.store(topk_ptr + r.to(tl.int64) * topk + t, ids, mask=t < topk)
 
 
