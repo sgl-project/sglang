@@ -1132,11 +1132,19 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        from sglang.srt.model_loader.weight_utils import SafetensorsRowSource
+
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+        dst = param.data[rows] if self._shared else param.data
+        if isinstance(loaded_weight, SafetensorsRowSource):
+            # Page-cache eviction was measured with per-rank host shards only.
+            loaded_weight.read_rows_into(
+                dst,
+                self.row_start,
+                drop_page_cache=self.host_table is not None and not self._shared,
+            )
         else:
-            param.data.copy_(loaded_weight[rows])
+            dst.copy_(loaded_weight[rows])
         if self.host_table is not None:
             self.host_table.dirty = True
 
