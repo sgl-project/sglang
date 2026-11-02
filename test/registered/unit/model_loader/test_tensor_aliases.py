@@ -295,6 +295,17 @@ class TestRebaseTensorAliases(unittest.TestCase):
         self.assertEqual(rebase_tensor_aliases(model, aliases), (1, []))
         self.assertFalse(dict.get(model.attn.cache, "conv").is_meta)
 
+    def test_an_alias_follows_a_holder_that_replaced_its_container(self):
+        model = nn.Module()
+        model.w = nn.Parameter(torch.arange(4.0), requires_grad=False)
+        model.cache = [model.w[:2]]
+        aliases = find_tensor_aliases(model)
+        model.cache = collections.deque(model.cache)
+        replace(model, "w", torch.full((4,), 9.0))
+
+        self.assertEqual(rebase_tensor_aliases(model, aliases), (1, []))
+        torch.testing.assert_close(model.cache[0], torch.full((2,), 9.0))
+
     def test_conjugate_and_negative_views_are_refused(self):
         for make in (torch.conj, torch._neg_view):
             with self.subTest(view=make.__name__):

@@ -24,7 +24,9 @@ How it goes through containers:
   OrderedDict, defaultdict, torch.Size, an enum with a tuple mixin). Items are
   read and replaced as the builtin type stores them, so a subclass that
   overrides iteration or item access can neither hide an item nor change
-  what is stored; its other attributes are not looked at.
+  what is stored; its other attributes are not looked at. A walk reads a
+  container as it goes, as iterating it would: it sees items added to a list
+  meanwhile, and a dict that changes size meanwhile raises.
 - Dict keys of any type are followed; a path holds the key object itself.
 - Everything else is a leaf, not looked into: tensors, modules, enum members
   (but container ones), strings, sets, and other objects with their
@@ -33,6 +35,11 @@ How it goes through containers:
   path is a place a caller may have to update. A container already on the
   current path (a cycle) is not entered again, nor is one below
   ``max_depth`` containers; ``on_cut`` hears of both.
+
+Following a path found earlier (``get_at``, ``get_item``, ``replace_item``)
+reads and replaces items the same way. A holder on the path that is not a
+tuple, list or dict, such as a deque that replaced a list since, is
+subscripted as it is.
 """
 
 from __future__ import annotations
@@ -110,22 +117,29 @@ def is_container(value: Any) -> bool:
     return isinstance(value, _CONTAINERS)
 
 
+def _iter_items(container: Any) -> Iterator[Tuple[Any, Any]]:
+    """(index or key, item) of a tuple, list or dict as the builtin type
+    stores them, read as the iteration goes."""
+    if isinstance(container, dict):
+        return iter(dict.items(container))
+    if isinstance(container, list):
+        return enumerate(list.__iter__(container))
+    if isinstance(container, tuple):
+        return enumerate(tuple.__iter__(container))
+    raise TypeError(f"not a tuple, list or dict: {type(container).__name__}")
+
+
 def container_items(container: Any) -> List[Tuple[Any, Any]]:
     """(index or key, item) of a tuple, list or dict, as the builtin type
     stores them."""
-    if isinstance(container, dict):
-        return list(dict.items(container))
-    if isinstance(container, list):
-        return list(enumerate(list.__iter__(container)))
-    if isinstance(container, tuple):
-        return list(enumerate(tuple.__iter__(container)))
-    raise TypeError(f"not a tuple, list or dict: {type(container).__name__}")
+    return list(_iter_items(container))
 
 
 def get_item(container: Any, key: Any) -> Any:
     """The item at ``key`` of a tuple, list or dict, as the builtin type
-    stores it. Raises KeyError or IndexError if there is none (without
-    calling a dict subclass's ``__missing__``), TypeError for other values."""
+    stores it: KeyError or IndexError if there is none (a dict subclass's
+    ``__missing__`` is not called). Other holders are subscripted as they
+    are: TypeError if they cannot be."""
     if isinstance(container, dict):
         item = dict.get(container, key, _MISSING)
         if item is _MISSING:
@@ -135,21 +149,22 @@ def get_item(container: Any, key: Any) -> Any:
         return list.__getitem__(container, key)
     if isinstance(container, tuple):
         return tuple.__getitem__(container, key)
-    raise TypeError(f"not a tuple, list or dict: {type(container).__name__}")
+    return container[key]
 
 
 def replace_item(container: Any, key: Any, value: Any) -> None:
-    """Replace the item at ``key`` of a list or dict as the builtin type
-    stores it. Raises KeyError or IndexError if there is none; a tuple cannot
-    be changed (TypeError): its holder needs a new one."""
+    """Store ``value`` at ``key`` of a list or dict as the builtin type
+    stores it; meant for a key just read (get_item), which it does not look
+    up again. A tuple cannot be changed (TypeError): its holder needs a new
+    one. Other holders are assigned to as they are."""
     if isinstance(container, dict):
-        if not dict.__contains__(container, key):
-            raise KeyError(key)
         dict.__setitem__(container, key, value)
     elif isinstance(container, list):
         list.__setitem__(container, key, value)
-    else:
+    elif isinstance(container, tuple):
         raise TypeError(f"cannot replace an item of a {type(container).__name__}")
+    else:
+        container[key] = value
 
 
 def walk_value(
@@ -179,7 +194,7 @@ def walk_value(
         on_path.add(id(value))
         containers.append(value)
         try:
-            for key, item in container_items(value):
+            for key, item in _iter_items(value):
                 yield from walk(item, path + (key,))
         finally:
             containers.pop()

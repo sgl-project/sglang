@@ -254,25 +254,87 @@ class TestAccess(unittest.TestCase):
         cache = collections.defaultdict(list)
         with self.assertRaises(KeyError):
             get_item(cache, "x")
-        with self.assertRaises(KeyError):
-            replace_item(cache, "x", 1)
         self.assertEqual(dict(cache), {})
 
+    def test_a_holder_that_replaced_a_container_is_subscripted_as_it_is(self):
+        model = nn.Module()
+        t = torch.zeros(2)
+        model.queue = collections.deque([t])
+        model.mapping = collections.UserDict(k=t)
+
+        self.assertIs(get_at(model, Place("", ("queue", 0))), t)
+        self.assertIs(get_at(model, Place("", ("mapping", "k"))), t)
+        replace_item(model.queue, 0, 1)
+        replace_item(model.mapping, "k", 2)
+        self.assertEqual((model.queue[0], model.mapping["k"]), (1, 2))
+        with self.assertRaises(TypeError):
+            get_item(3, 0)
+
     def test_replace_item(self):
+        class Ignoring(dict):
+            def __setitem__(self, key, value):
+                pass
+
+        class IgnoringList(list):
+            def __setitem__(self, index, value):
+                pass
+
         ordered = collections.OrderedDict(a=1, b=2)
         ordered.move_to_end("a")
         listed = [1, 2]
+        hidden, ignoring, ignoring_list = Hidden(x=1), Ignoring(x=1), IgnoringList([1])
 
         replace_item(ordered, "a", 3)
         replace_item(listed, 1, 4)
-        replace_item(Hidden(x=1), "x", 5)
+        replace_item(hidden, "x", 5)
+        replace_item(ignoring, "x", 6)
+        replace_item(ignoring_list, 0, 7)
 
         self.assertEqual(list(ordered.items()), [("b", 2), ("a", 3)])
         self.assertEqual(listed, [1, 4])
+        self.assertEqual(
+            [dict.get(hidden, "x"), dict.get(ignoring, "x"), list(ignoring_list)],
+            [5, 6, [7]],
+        )
         with self.assertRaises(IndexError):
             replace_item(listed, 2, 0)
         with self.assertRaises(TypeError):
             replace_item((1,), 0, 2)
+
+    def test_one_key_lookup_per_access(self):
+        class Key:
+            hashes = 0
+
+            def __hash__(self):
+                Key.hashes += 1
+                return 0
+
+        key = Key()
+        cache = {key: 1}
+        Key.hashes = 0
+
+        get_item(cache, key)
+        replace_item(cache, key, 2)
+
+        self.assertEqual(Key.hashes, 2)
+        self.assertEqual(cache[key], 2)
+
+
+class TestLiveWalk(unittest.TestCase):
+    def test_a_walk_reads_containers_as_it_goes(self):
+        t = torch.zeros(2)
+        listed = [t]
+        found = []
+        for path, value, _ in walk_value(listed, ("l",), max_depth=5):
+            found.append(path)
+            if len(listed) == 1:
+                listed.append(t)  # seen by the walk, as by iterating the list
+        self.assertEqual(found, [("l", 0), ("l", 1)])
+
+        keyed = {"a": t}
+        with self.assertRaises(RuntimeError):
+            for _ in walk_value(keyed, ("d",), max_depth=5):
+                keyed["b"] = t
 
 
 if __name__ == "__main__":
