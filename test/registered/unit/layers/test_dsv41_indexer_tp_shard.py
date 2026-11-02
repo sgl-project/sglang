@@ -160,7 +160,11 @@ class TestPrefillQueryView(CustomTestCase):
                     )
         self.assertEqual(data.rows_per_request, [5, 0, 3])
 
+    @patch("torch.version.cuda", None)
     def test_shard_and_budget_tiles_share_mma_alignment(self):
+        # Test the host-side alignment math, not GPU-specific wave rounding.
+        # A CUDA-built torch can be present in CPU CI; probing its SM count
+        # would initialize CUDA in the fork worker.
         for heads in (16, 32, 64):
             alignment = flat_index_logits_row_alignment(heads)
             tile = flat_index_logits_rows_per_tile(
