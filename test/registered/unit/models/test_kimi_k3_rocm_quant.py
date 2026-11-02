@@ -251,6 +251,55 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         self.assertIsNone(k3_merge_kda_inproj_fp8(**mods))
 
     @staticmethod
+    def _process(linear) -> None:
+        """What QuarkW8A8Fp8.process_weights_after_loading leaves: an [in, out] view."""
+        linear.weight = linear.weight.t()
+        linear.weight_scale = linear.weight_scale.view(-1, 1)
+
+    def _restored_processed_state(self) -> dict:
+        """A ShardedStateLoader restore: processed modules holding a merged tail."""
+        mods = _kda_inproj_linears()
+        k3_merge_kda_inproj_fp8(**mods)
+        for name in ("qkvg_proj", "f_a_proj", "b_proj", "f_b_proj"):
+            self._process(mods[name])
+        return mods
+
+    def test_processed_state_keeps_the_restored_tail(self):
+        mods = self._restored_processed_state()
+        weight = mods["qkvg_proj"].weight
+        before = weight.float().clone()
+
+        sizes, f_b = k3_merge_kda_inproj_fp8(**mods)
+
+        self.assertEqual(sizes, [24, 8, 8, 3, 21])
+        self.assertIsNone(f_b)
+        self.assertIs(mods["qkvg_proj"].weight, weight)
+        torch.testing.assert_close(weight.float(), before, rtol=0, atol=0)
+
+    def test_processed_narrow_b_proj_dequantized_to_bf16(self):
+        mods = self._restored_processed_state()
+        b_proj = mods["b_proj"]
+        b_proj.weight = b_proj.weight.t().to(torch.bfloat16).t()
+        b_proj.weight_scale = None
+
+        sizes, _ = k3_merge_kda_inproj_fp8(**mods)
+
+        self.assertEqual(sizes, [24, 8, 8, 3, 21])
+
+    def test_mixed_processed_and_checkpoint_layouts_raise(self):
+        mods = _kda_inproj_linears()
+        self._process(mods["qkvg_proj"])
+        with self.assertRaises(RuntimeError):
+            k3_merge_kda_inproj_fp8(**mods)
+
+    def test_processed_state_without_a_tail_skips_the_merge(self):
+        with envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.override(False):
+            mods = _kda_inproj_linears()
+        for name in ("qkvg_proj", "f_a_proj", "b_proj", "f_b_proj"):
+            self._process(mods[name])
+        self.assertIsNone(k3_merge_kda_inproj_fp8(**mods))
+
+    @staticmethod
     def _kda_attention() -> torch.nn.Module:
         mods = _kda_inproj_linears()
         attn = torch.nn.Module()
@@ -281,6 +330,21 @@ class TestMergeKdaInprojFp8(CustomTestCase):
             "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0",
             _unsupported_derived_weight_cache_error(model),
         )
+
+    def test_processed_state_runs_f_b_on_its_projection(self):
+        attn = self._kda_attention()
+        mods = self._restored_processed_state()
+        attn.__dict__.update(
+            fused_qkvg_proj=mods["qkvg_proj"],
+            f_a_proj=mods["f_a_proj"],
+            b_proj=mods["b_proj"],
+            f_b_proj=mods["f_b_proj"],
+        )
+
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(attn))
+
+        self.assertEqual(attn._qkvgbfa_sizes, [24, 8, 8, 3, 21])
+        self.assertIsNone(attn._bfa_f_b_w)
 
     def test_rerun_keeps_the_merge(self):
         """A second post_load_weights must keep the FP8 merge, not fall back to the

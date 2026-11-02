@@ -2137,7 +2137,13 @@ class KimiK3DeltaAttention(nn.Module):
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
 
                 # Fused KDA decode consumes f_a and applies f_b itself.
-                forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                if defer_f_b:
+                    forget_gate = f_a
+                elif self._bfa_f_b_w is None:
+                    # Restored from an already-processed state: no BF16 f_b cache.
+                    forget_gate = self.f_b_proj(f_a.contiguous())[0]
+                else:
+                    forget_gate = gemm(f_a, self._bfa_f_b_w)
                 return qkv, beta, forget_gate, g_proj_states
 
             if self._bfa_w is not None:

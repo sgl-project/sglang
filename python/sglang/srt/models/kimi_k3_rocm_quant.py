@@ -78,21 +78,26 @@ def k3_kv_b_for_absorb(
     return channel_quant_to_tensor_quant(weight, weight_scale)
 
 
-def _is_quark_channel_fp8(module: nn.Module) -> bool:
-    """Quark per-channel FP8 with dynamic activations, before post-processing."""
+def _is_quark_channel_fp8_scheme(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, in any weight layout."""
     from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
-    if not (
+    return (
         isinstance(module.quant_method, QuarkLinearMethod)
         and isinstance(module.scheme, QuarkW8A8Fp8)
-    ):
+        and module.scheme.weight_qscheme == "per_channel"
+        and not module.scheme.is_static_input_scheme
+    )
+
+
+def _is_quark_channel_fp8(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, before post-processing."""
+    if not _is_quark_channel_fp8_scheme(module):
         return False
     weight, scale = module.weight, module.weight_scale
     return (
-        module.scheme.weight_qscheme == "per_channel"
-        and not module.scheme.is_static_input_scheme
-        and weight.dim() == 2
+        weight.dim() == 2
         and weight.dtype == torch.float8_e4m3fn
         and isinstance(scale, torch.Tensor)
         and scale.numel() == weight.shape[0]
@@ -125,21 +130,33 @@ def k3_merge_kda_inproj_fp8(
     f_a_proj: nn.Module,
     b_proj: nn.Module,
     f_b_proj: nn.Module,
-) -> Optional[tuple[list[int], torch.Tensor]]:
+) -> Optional[tuple[list[int], Optional[torch.Tensor]]]:
     """Write Quark FP8 [f_a | b | pad] rows and channel scales into qkvg_proj.
 
     Fills the tail reserved by k3_kda_inproj_fp8_tail_rows in place. Returns
     (split sizes of the merged output, BF16 f_b for the tiny GEMM), or None
-    when no tail was reserved. Must run before ``process_weights_after_loading``,
-    while weights are [out, in].
+    when no tail was reserved. Reads the [out, in] checkpoint layout, so it
+    normally runs before ``process_weights_after_loading``.
+
+    Loaders that restore a saved, already-processed state (ShardedStateLoader,
+    RemoteModelLoader) process first; the tail then already holds the merged
+    rows, so only the sizes are returned and f_b is None (f_b_proj runs it).
     """
-    weight = qkvg_proj.weight.data
+    mods = (qkvg_proj, f_a_proj, b_proj, f_b_proj)
     wide = sum(qkvg_sizes)
+    if _is_processed_quark_channel_fp8(qkvg_proj):
+        return _kda_inproj_fp8_processed_sizes(
+            qkvg_proj=qkvg_proj,
+            qkvg_sizes=qkvg_sizes,
+            f_a_proj=f_a_proj,
+            b_proj=b_proj,
+            f_b_proj=f_b_proj,
+        )
+    weight = qkvg_proj.weight.data
     tail = weight.shape[0] - wide
     if tail == 0:
         return None
     scale = qkvg_proj.weight_scale.data
-    mods = (qkvg_proj, f_a_proj, b_proj, f_b_proj)
     n_fa, n_b = f_a_proj.weight.shape[0], b_proj.weight.shape[0]
     if not (
         all(_is_quark_channel_fp8(m) for m in mods)
@@ -160,3 +177,40 @@ def k3_merge_kda_inproj_fp8(
     sizes = [*qkvg_sizes, n_fa, n_b, tail - n_fa - n_b]
     f_b = _k3_channel_fp8_to_bf16(f_b_proj, f_b_proj.weight.data).contiguous()
     return sizes, f_b
+
+
+def _is_processed_quark_channel_fp8(module: nn.Module) -> bool:
+    """QuarkW8A8Fp8.process_weights_after_loading leaves a transposed [in, out] view."""
+    weight = module.weight
+    return (
+        _is_quark_channel_fp8_scheme(module)
+        and weight.dim() == 2
+        and weight.shape[1] > 1
+        and weight.stride(1) != 1
+    )
+
+
+def _kda_inproj_fp8_processed_sizes(
+    *,
+    qkvg_proj: nn.Module,
+    qkvg_sizes: list[int],
+    f_a_proj: nn.Module,
+    b_proj: nn.Module,
+    f_b_proj: nn.Module,
+) -> Optional[tuple[list[int], None]]:
+    """Split sizes of a qkvg_proj whose merged tail was restored already processed."""
+    in_dim, rows = qkvg_proj.weight.shape
+    tail = rows - sum(qkvg_sizes)
+    if tail == 0:
+        return None
+    n_fa, n_b = f_a_proj.weight.shape[1], b_proj.weight.shape[1]
+    if not (
+        all(_is_processed_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj))
+        and f_a_proj.weight.shape[0] == b_proj.weight.shape[0] == in_dim
+        and tail >= n_fa + n_b
+    ):
+        raise RuntimeError(
+            "fused_qkvg_proj has a processed [f_a | b] tail but the KDA in-proj "
+            "weights are not the processed Quark per-channel FP8 layout it holds."
+        )
+    return [*qkvg_sizes, n_fa, n_b, tail - n_fa - n_b], None
