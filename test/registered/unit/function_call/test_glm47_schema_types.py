@@ -138,7 +138,7 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             {"kind": "count", "value": 7},
         )
 
-    def test_plain_strings_still_stream_before_value_completes(self):
+    def test_plain_strings_buffer_until_value_completes(self):
         tools = [
             Tool(
                 type="function",
@@ -155,12 +155,12 @@ class TestGlm47SchemaTypes(unittest.TestCase):
         first = detector.parse_streaming_increment(
             "<tool_call>inspect<arg_key>value</arg_key><arg_value>hello", tools
         )
-        self.assertIn('"hello', "".join(call.parameters for call in first.calls))
+        self.assertEqual(first.calls, [])
         last = detector.parse_streaming_increment(
             " world</arg_value></tool_call>", tools
         )
         self.assertEqual(
-            json.loads("".join(call.parameters for call in first.calls + last.calls)),
+            json.loads("".join(call.parameters for call in last.calls)),
             {"value": "hello world"},
         )
 
@@ -350,10 +350,10 @@ class TestGlm47SchemaTypes(unittest.TestCase):
         first = detector.parse_streaming_increment(
             "<tool_call>plain<arg_key>value</arg_key><arg_value>hello", tools
         )
-        self.assertIn('"hello', "".join(call.parameters for call in first.calls))
+        self.assertEqual(first.calls, [])
         last = detector.parse_streaming_increment("</arg_value></tool_call>", tools)
         self.assertEqual(
-            json.loads("".join(call.parameters for call in first.calls + last.calls)),
+            json.loads("".join(call.parameters for call in last.calls)),
             {"value": "hello"},
         )
 
