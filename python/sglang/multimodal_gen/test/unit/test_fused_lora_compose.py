@@ -353,7 +353,7 @@ def test_loader_composes_unequal_fused_sections():
     }
 
 
-def test_alpha_override_reloads_fused_sections():
+def test_alpha_override_reloads_fused_sections(tmp_path):
     pipeline = _make_loader_pipeline()
     _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=8)
     expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"]
@@ -371,9 +371,11 @@ def test_alpha_override_reloads_fused_sections():
         "auto_merge_rounding_loss",
     ):
         setattr(pipeline, attr, {})
+    adapter_file = str(tmp_path / "adapter.safetensors")
+    save_file({"placeholder": torch.zeros(1)}, adapter_file)
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
-        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
         patch(f"{loader_mod}.load_file", return_value=_qkv_state_dict()),
         patch(f"{loader_mod}.dist.is_initialized", return_value=False),
         patch(f"{loader_mod}.dist.get_rank", return_value=0),
