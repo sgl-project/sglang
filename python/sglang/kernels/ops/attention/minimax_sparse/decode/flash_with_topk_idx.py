@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_gfx95_supported, is_xpu
@@ -84,6 +85,7 @@ _DECODE_SCORE_HEURISTICS = {
     prune_configs_by=(
         None if _ON_HIP else {"early_config_prune": _prune_decode_configs}
     ),
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _decode_score_kernel(
@@ -398,6 +400,7 @@ def _decode_score_paged_kernel(
         "SCORE_TYPE",
     ],
     prune_configs_by={"early_config_prune": _prune_decode_configs},
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _decode_score_attn_kernel(
@@ -683,6 +686,7 @@ def _decode_score_attn_kernel(
     ],
     key=["BLOCK_SIZE_D"],
     restore_value=["o_ptr"],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _merge_attn_out_kernel(
@@ -751,6 +755,7 @@ def _merge_attn_out_kernel(
         triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
     ],
     key=["topk"],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _topk_index_partial_kernel(

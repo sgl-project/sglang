@@ -9,9 +9,23 @@ import sys
 
 import pytest
 import torch
+from triton.runtime.autotuner import Autotuner, Heuristics
 
+from sglang.kernels.ops.attention.fla.utils import SUPPORTS_AUTOTUNE_CACHE
+from sglang.kernels.ops.attention.minimax_sparse.decode import (
+    flash_with_topk_idx as decode_flash_with_topk_idx,
+)
+from sglang.kernels.ops.attention.minimax_sparse.decode import (
+    topk_sparse as decode_topk_sparse,
+)
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill import (
+    flash_with_topk_idx as prefill_flash_with_topk_idx,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill import (
+    topk_sparse as prefill_topk_sparse,
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -361,6 +375,29 @@ def test_sparse_gqa_deterministic(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat,
     assert torch.equal(o1, o2), (
         f"non-deterministic: max diff {(o1.float() - o2.float()).abs().max().item():.4e}"
     )
+
+
+@pytest.mark.skipif(
+    not SUPPORTS_AUTOTUNE_CACHE, reason="triton.autotune has no cache_results"
+)
+def test_sparse_autotuners_cache_results():
+    """Every sparse-attention autotuner must persist its winner across restarts."""
+    autotuners = {}
+    for module in (
+        decode_flash_with_topk_idx,
+        decode_topk_sparse,
+        prefill_flash_with_topk_idx,
+        prefill_topk_sparse,
+    ):
+        for name, kernel in vars(module).items():
+            while isinstance(kernel, Heuristics):
+                kernel = kernel.fn
+            if isinstance(kernel, Autotuner):
+                autotuners[f"{module.__name__}.{name}"] = kernel
+
+    assert autotuners
+    uncached = [name for name, kernel in autotuners.items() if not kernel.cache_results]
+    assert not uncached, uncached
 
 
 if __name__ == "__main__":
