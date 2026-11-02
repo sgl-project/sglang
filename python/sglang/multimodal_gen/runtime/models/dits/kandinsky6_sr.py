@@ -11,6 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion import residual_gate_fp32
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
     WIDE_INPUT_INSTRUCT_TYPES,
     Kandinsky6SRArchConfig,
@@ -93,12 +94,12 @@ class Kandinsky6SRDecoderBlock(Kandinsky6TransformerBlock):
         out = self.self_attention(
             out.to(compute_dtype), rotary_emb=rope, attn_mask_meta=attn_mask_meta
         )
-        visual_embed = visual_embed.float() + gate.float() * out.float()
+        visual_embed = residual_gate_fp32(visual_embed, out, gate)
 
         shift, scale, gate = torch.chunk(ff_params, 3, dim=-1)
         out = _modulate(self.feed_forward_norm, visual_embed, shift, scale)
         out = self.feed_forward(out.to(compute_dtype))
-        return visual_embed + gate.float() * out.float()
+        return residual_gate_fp32(visual_embed, out, gate)
 
 
 class Kandinsky6SRTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):

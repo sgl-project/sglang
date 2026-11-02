@@ -14,7 +14,7 @@ def _matrix_rope_kernel(
     rope,
     out,
     pairs,
-    SEQ: tl.constexpr,
+    SEQ,
     HEADS: tl.constexpr,
     HALF_DIM: tl.constexpr,
     BATCH_STRIDE: tl.constexpr,
@@ -108,4 +108,96 @@ def apply_matrix_rope(
                 BLOCK=512,
                 enable_fp_fusion=False,
             )
+    return output
+
+
+@triton.jit
+def _qknorm_matrix_rope_kernel(
+    x,
+    weight,
+    rope,
+    out,
+    eps,
+    SEQ,
+    HEADS: tl.constexpr,
+    HALF_DIM: tl.constexpr,
+    BATCH_STRIDE: tl.constexpr,
+    SEQ_STRIDE: tl.constexpr,
+    PAIR_STRIDE: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    COL_STRIDE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    token = row // HEADS
+    pair = tl.arange(0, HALF_DIM)
+    base = row * (2 * HALF_DIM)
+    v0 = tl.load(x + base + 2 * pair).to(tl.float32)
+    v1 = tl.load(x + base + 2 * pair + 1).to(tl.float32)
+    inv = tl.rsqrt((tl.sum(v0 * v0, 0) + tl.sum(v1 * v1, 0)) / (2 * HALF_DIM) + eps)
+    # eager: fp32 rms-norm, round to the storage dtype, then fp32 matrix products
+    x0 = (v0 * inv * tl.load(weight + 2 * pair)).to(out.dtype.element_ty).to(tl.float32)
+    x1 = (
+        (v1 * inv * tl.load(weight + 2 * pair + 1))
+        .to(out.dtype.element_ty)
+        .to(tl.float32)
+    )
+    pos = token // SEQ * BATCH_STRIDE + token % SEQ * SEQ_STRIDE + pair * PAIR_STRIDE
+    r00 = tl.load(rope + pos)
+    r01 = tl.load(rope + pos + COL_STRIDE)
+    r10 = tl.load(rope + pos + ROW_STRIDE)
+    r11 = tl.load(rope + pos + ROW_STRIDE + COL_STRIDE)
+    tl.store(out + base + 2 * pair, x0 * r00 + x1 * r01)
+    tl.store(out + base + 2 * pair + 1, x0 * r10 + x1 * r11)
+
+
+def can_qknorm_matrix_rope(
+    x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor
+) -> bool:
+    if not (
+        x.is_cuda
+        and torch.version.hip is None
+        and not torch.is_grad_enabled()
+        and x.ndim == 4
+        and x.is_contiguous()
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == torch.float32
+        and weight.is_contiguous()
+        and rope.dtype == torch.float32
+        and rope.device == x.device
+        and rope.ndim == 6
+    ):
+        return False
+    batch, seq, _, dim = x.shape
+    return (
+        dim == 128
+        and weight.shape == (dim,)
+        and rope.shape[0] in (1, batch)
+        and rope.shape[1:] == (seq, 1, dim // 2, 2, 2)
+    )
+
+
+def qknorm_matrix_rope(
+    x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Fused fp32 RMSNorm + storage-dtype rounding + matrix RoPE on [B,S,H,128]."""
+    batch, seq, heads, dim = x.shape
+    output = torch.empty_like(x)
+    with torch.cuda.device(x.device):
+        _qknorm_matrix_rope_kernel[(batch * seq * heads,)](
+            x,
+            weight,
+            rope,
+            output,
+            eps,
+            seq,
+            HEADS=heads,
+            HALF_DIM=dim // 2,
+            BATCH_STRIDE=rope.stride(0) if rope.shape[0] != 1 else 0,
+            SEQ_STRIDE=rope.stride(1),
+            PAIR_STRIDE=rope.stride(3),
+            ROW_STRIDE=rope.stride(4),
+            COL_STRIDE=rope.stride(5),
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
     return output
