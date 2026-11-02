@@ -4837,7 +4837,7 @@ def try_cutedsl_nvfp4_gemm(
 ) -> Optional[torch.Tensor]:
     """Run SM100 CuTe DSL PDL-safe NVFP4 GEMM when enabled, or return None for fallback."""
     if (
-        os.environ.get("SGLANG_USE_CUTEDSL_NVFP4_DOWN_GEMM", "1") != "1"
+        os.environ.get("SGLANG_USE_CUTEDSL_NVFP4_DOWN_GEMM", "0") != "1"
         and os.environ.get("SGLANG_USE_CUTEDSL_NVFP4_GEMM", "0") != "1"
     ):
         return None
