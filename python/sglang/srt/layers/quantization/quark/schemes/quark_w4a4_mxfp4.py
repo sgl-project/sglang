@@ -41,19 +41,6 @@ _ASM_FP4_UNSAFE_MAX_N = 128
 
 # gemm_afp4wfp4 raises a Triton BLOCK_SIZE_K below 128 back to 128.
 _AFP4WFP4_MIN_BLOCK_K = 128
-# DEFAULT.json M_LEQ_128 entry at ROCm/aiter@285579b62; used only if AITER's config lookup fails.
-_AFP4WFP4_FALLBACK_CONFIG = {
-    "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 512,
-    "GROUP_SIZE_M": 1,
-    "num_warps": 4,
-    "num_stages": 3,
-    "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 16,
-    "cache_modifier": None,
-    "NUM_KSPLIT": 1,
-}
 
 
 def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
@@ -65,6 +52,34 @@ def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
     while block_k > _AFP4WFP4_MIN_BLOCK_K and k % block_k:
         block_k //= 2
     return block_k if k % block_k == 0 else None
+
+
+_aiter_afp4wfp4_get_config = None
+if _is_hip:
+    try:
+        # The config getter gemm_afp4wfp4 itself calls when given no config.
+        from aiter.ops.triton.gemm_afp4wfp4 import (
+            _get_config as _aiter_afp4wfp4_get_config,
+        )
+    except ImportError:
+        pass
+
+
+@functools.lru_cache(maxsize=1024)
+def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
+    # None keeps AITER's own config selection.
+    if not is_gfx95_supported() or _aiter_afp4wfp4_get_config is None:
+        return None
+    try:
+        config, _ = _aiter_afp4wfp4_get_config(m, n, k_packed)
+    except (KeyError, AssertionError):
+        # No config file or M bucket for this shape.
+        return None
+    if config["NUM_KSPLIT"] != 1:
+        # Split-K configs are left to AITER's get_splitk, which searches for an even K split.
+        return None
+    block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=2 * k_packed)
+    return config if block_k is None else {**config, "BLOCK_SIZE_K": block_k}
 
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
@@ -201,46 +216,6 @@ if _is_hip:
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
-
-    try:
-        from aiter.ops.triton.utils.gemm_config_utils import (
-            get_gemm_config as _aiter_get_gemm_config,
-        )
-    except ImportError:
-        _aiter_get_gemm_config = None
-
-    def _afp4wfp4_aiter_config(m: int, n: int, k: int) -> Optional[dict]:
-        """gemm_afp4wfp4's own config for ``k`` FP4 elements; None if the lookup fails."""
-        if _aiter_get_gemm_config is None:
-            return None
-        try:
-            # The config family gemm_afp4wfp4 reads, keyed by unpacked K.
-            config, _ = _aiter_get_gemm_config("GEMM-AFP4WFP4", m, n, k)
-        except Exception:
-            # An AITER upgrade that changes this lookup falls back instead of failing the forward.
-            return None
-        if "NUM_KSPLIT" not in config or "BLOCK_SIZE_K" not in config:
-            return None
-        return config
-
-    @functools.lru_cache(maxsize=None)
-    def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
-        # None keeps AITER's own config selection.
-        if not is_gfx95_supported():
-            return None
-        k = 2 * k_packed
-        config = _afp4wfp4_aiter_config(m=m, n=n, k=k)
-        if config is None:
-            logger.warning_once(
-                "AITER's gemm_afp4wfp4 config lookup failed; using a fixed config "
-                "for the Quark MXFP4 dense GEMM, which may be slower."
-            )
-            config = dict(_AFP4WFP4_FALLBACK_CONFIG)
-        elif config["NUM_KSPLIT"] != 1:
-            # Split-K configs are left to AITER's get_splitk, which searches for an even K split.
-            return None
-        block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=k)
-        return config if block_k is None else {**config, "BLOCK_SIZE_K": block_k}
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,

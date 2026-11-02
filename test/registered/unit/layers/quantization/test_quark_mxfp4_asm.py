@@ -133,5 +133,53 @@ class TestAfp4wfp4EvenKBlock(CustomTestCase):
         self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=160))
 
 
+class TestAfp4wfp4EvenKConfig(CustomTestCase):
+    def _config(self, get_config, m=16, n=7168, k_packed=384):
+        quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
+        try:
+            with (
+                mock.patch.object(
+                    quark_w4a4_mxfp4, "_aiter_afp4wfp4_get_config", get_config
+                ),
+                mock.patch.object(
+                    quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+                ),
+            ):
+                return quark_w4a4_mxfp4._afp4wfp4_even_k_config(
+                    m=m, n=n, k_packed=k_packed
+                )
+        finally:
+            quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
+
+    def test_narrows_the_kernels_own_config(self):
+        aiter_config = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 512, "NUM_KSPLIT": 1}
+        get_config = mock.Mock(return_value=(aiter_config, False))
+
+        config = self._config(get_config, m=4096)
+
+        # gemm_afp4wfp4's _get_config takes packed K, as gemm_afp4wfp4 passes it.
+        get_config.assert_called_once_with(4096, 7168, 384)
+        self.assertEqual(config, {**aiter_config, "BLOCK_SIZE_K": 256})
+
+    def test_failed_lookup_keeps_the_default_path(self):
+        for error in (KeyError("no M bucket"), AssertionError("no DEFAULT.json")):
+            with self.subTest(error=type(error).__name__):
+                self.assertIsNone(self._config(mock.Mock(side_effect=error)))
+        self.assertIsNone(self._config(None))
+
+    def test_other_lookup_errors_propagate(self):
+        with self.assertRaises(TypeError):
+            self._config(mock.Mock(side_effect=TypeError("changed signature")))
+
+    def test_split_k_config_is_left_to_aiter(self):
+        split_k = {"BLOCK_SIZE_K": 512, "NUM_KSPLIT": 4}
+        self.assertIsNone(self._config(mock.Mock(return_value=(split_k, False))))
+
+    def test_cache_is_bounded(self):
+        self.assertIsNotNone(
+            quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_info().maxsize
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

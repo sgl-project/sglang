@@ -2,7 +2,6 @@
 outputs must match a dequantized reference whatever the previous kernel left in LDS."""
 
 import unittest
-from unittest import mock
 
 import torch
 
@@ -87,17 +86,6 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
 
     def test_matches_dequantized_reference(self):
         self._assert_matches_reference()
-
-    def test_matches_reference_without_aiter_config_lookup(self):
-        from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
-
-        # An AITER without the config lookup must fall back to an even-K config, not AITER's.
-        quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
-        try:
-            with mock.patch.object(quark_w4a4_mxfp4, "_aiter_get_gemm_config", None):
-                self._assert_matches_reference()
-        finally:
-            quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
 
 
 if __name__ == "__main__":
