@@ -530,6 +530,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_platform,
     get_serving,
     publish,
 )
@@ -2347,6 +2348,20 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _warmup_with_image(model_info: dict) -> bool:
+    return (
+        bool(model_info.get("has_image_understanding", False))
+        and not get_disagg().language_only
+        and not get_disagg().language_model_only
+        # Encoder SWA bounded replay serves image requests on CUDA only.
+        and (
+            not get_exec().features.enable_encoder_swa_bounded_replay
+            or get_platform().is_cuda
+        )
+        and not is_mps()
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2380,13 +2395,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     # A language-only worker may advertise VLM capability for encoder
     # disaggregation, but its local warmup must stay on the text path.
-    is_vlm = (
-        bool(model_info.get("has_image_understanding", False))
-        and not get_disagg().language_only
-        and not get_disagg().language_model_only
-        and not get_exec().features.enable_encoder_swa_bounded_replay
-        and not is_mps()
-    )
+    is_vlm = _warmup_with_image(model_info)
     if model_info["is_generation"]:
         if is_vlm and not get_serving().skip_tokenizer_init:
             request_name = "/v1/chat/completions"
