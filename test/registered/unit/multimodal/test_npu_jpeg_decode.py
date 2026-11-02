@@ -41,9 +41,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
             patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(jpeg, "decode_jpeg") as decode,
         ):
-            result = common._load_image(
-                image_bytes=self.data, device_image_decode=False
-            )
+            result = common._load_image(image_bytes=self.data, gpu_image_decode=False)
         self.assertIsInstance(result, Image.Image)
         self.assertEqual(result.size, (64, 32))
         decode.assert_not_called()
@@ -54,7 +52,9 @@ class TestNpuJpegDispatch(unittest.TestCase):
             patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(jpeg, "decode_jpeg", return_value=output) as decode,
         ):
-            self.assertIs(common._load_image(image_bytes=self.data), output)
+            self.assertIs(
+                common._load_image(image_bytes=self.data, npu_image_decode=True), output
+            )
         decode.assert_called_once_with(self.data)
 
     def test_processor_disabled_and_fancy_keep_pil(self):
@@ -62,10 +62,11 @@ class TestNpuJpegDispatch(unittest.TestCase):
             with (
                 self.subTest(mode=mode),
                 patch.object(common, "_image_decode_backend", return_value="npu"),
+                patch.object(common, "is_cuda", return_value=False),
                 patch.object(jpeg, "decode_jpeg") as decode,
             ):
                 result = common._load_image(
-                    image_bytes=self.data, device_image_decode=mode
+                    image_bytes=self.data, gpu_image_decode=mode
                 )
                 self.assertIsInstance(result, Image.Image)
                 decode.assert_not_called()
@@ -73,6 +74,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
     def test_non_npu_preserves_existing_loader(self):
         with (
             patch.object(common, "_image_decode_backend", return_value="cpu"),
+            patch.object(common, "is_cuda", return_value=False),
             patch.object(jpeg, "decode_jpeg") as decode,
         ):
             self.assertIsInstance(
@@ -88,7 +90,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "device failed"):
-                common._load_image(image_bytes=self.data)
+                common._load_image(image_bytes=self.data, npu_image_decode=True)
 
     def test_file_input_is_resolved_before_dispatch(self):
         output = object()
@@ -97,12 +99,57 @@ class TestNpuJpegDispatch(unittest.TestCase):
             patch.object(common, "get_image_bytes", return_value=self.data) as read,
             patch.object(jpeg, "decode_jpeg", return_value=output) as decode,
         ):
-            self.assertIs(common._load_image(image_file="image.jpg"), output)
+            self.assertIs(
+                common._load_image(image_file="image.jpg", npu_image_decode=True),
+                output,
+            )
         read.assert_called_once_with("image.jpg")
         decode.assert_called_once_with(self.data)
 
 
 class TestNpuJpegEligibility(unittest.TestCase):
+    def test_950_uses_pil_without_constructing_dvpp_resources(self):
+        for name in ("Ascend950PR", "Ascend950DT"):
+            get_name = Mock(return_value=name)
+            with (
+                self.subTest(name=name),
+                patch.object(common, "_image_decode_backend", return_value="npu"),
+                patch.object(
+                    torch,
+                    "npu",
+                    types.SimpleNamespace(current_device=lambda: 5, get_device_name=get_name),
+                    create=True,
+                ),
+                patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
+                patch.object(jpeg, "_decoder") as construct,
+            ):
+                data = image_bytes()
+                result = common._load_image(image_bytes=data, npu_image_decode=True)
+                self.assertIsInstance(result, Image.Image)
+                np.testing.assert_array_equal(
+                    np.asarray(result), np.asarray(Image.open(io.BytesIO(data)))
+                )
+                get_name.assert_called_once_with(5)
+                construct.assert_not_called()
+
+    def test_device_query_failure_remains_visible(self):
+        with (
+            patch.object(
+                torch,
+                "npu",
+                types.SimpleNamespace(
+                    current_device=lambda: 5,
+                    get_device_name=Mock(side_effect=RuntimeError("device unavailable")),
+                ),
+                create=True,
+            ),
+            patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
+            patch.object(jpeg, "_decoder") as construct,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "device unavailable"):
+                jpeg.decode_jpeg(image_bytes())
+            construct.assert_not_called()
+
     def test_unsupported_headers_do_not_construct_decoder(self):
         exif = Image.Exif()
         exif[274] = 6
@@ -134,7 +181,10 @@ class TestNpuJpegEligibility(unittest.TestCase):
             patch.object(
                 torch,
                 "npu",
-                types.SimpleNamespace(current_device=lambda: 5),
+                types.SimpleNamespace(
+                    current_device=lambda: 5,
+                    get_device_name=lambda device: "Ascend910_9362",
+                ),
                 create=True,
             ),
             patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
@@ -166,6 +216,7 @@ class TestNpuJpegEligibility(unittest.TestCase):
         ]
         with (
             patch.object(common, "_image_decode_backend", return_value="npu"),
+            patch.object(common, "is_cuda", return_value=False),
             patch.object(jpeg, "_decoder", side_effect=AssertionError("device work")),
         ):
             for index, data in enumerate(cases):

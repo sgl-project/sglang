@@ -101,7 +101,11 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             return []
         images = []
         for data in image_data:
-            img, _ = load_image(data)
+            img, _ = load_image(
+                data,
+                self.gpu_image_decode,
+                npu_image_decode=self._get_npu_image_decode_mode(),
+            )
             if img.mode != "RGB":
                 img = img.convert("RGB")
             images.append(img)

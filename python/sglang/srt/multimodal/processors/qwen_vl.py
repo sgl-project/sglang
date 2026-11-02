@@ -330,6 +330,55 @@ async def preprocess_video(
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+    npu_image_decode = True
+
+    def _get_npu_image_decode_mode(self):
+        mode = super()._get_npu_image_decode_mode()
+        if self.server_args.device != "npu" or self.npu_image_decode is not True:
+            return mode
+        processor = self._processor
+        if (
+            type(self) is not QwenVLImageProcessor
+            or getattr(self.hf_config, "model_type", None) != "qwen2_5_vl"
+            or type(processor).__module__
+            != "transformers.models.qwen2_5_vl.processing_qwen2_5_vl"
+            or type(processor).__name__ != "Qwen2_5_VLProcessor"
+        ):
+            return mode
+        image_processor = getattr(processor, "image_processor", None)
+        image_type = type(image_processor)
+        if (
+            image_type.__module__
+            != "transformers.models.qwen2_vl.image_processing_qwen2_vl"
+            or image_type.__name__ != "Qwen2VLImageProcessor"
+        ):
+            return mode
+        mean = getattr(image_processor, "image_mean", None)
+        std = getattr(image_processor, "image_std", None)
+        if (
+            getattr(image_processor, "backend", None) == "torchvision"
+            and getattr(image_processor, "patch_size", None) == 14
+            and getattr(image_processor, "temporal_patch_size", None) == 2
+            and getattr(image_processor, "merge_size", None) == 2
+            and getattr(image_processor, "do_resize", None) is True
+            and getattr(image_processor, "do_rescale", None) is True
+            and getattr(image_processor, "do_normalize", None) is True
+            and getattr(image_processor, "do_convert_rgb", None) is True
+            and getattr(image_processor, "resample", None) == 3
+            and getattr(getattr(image_processor, "size", None), "shortest_edge", None)
+            == 3136
+            and getattr(getattr(image_processor, "size", None), "longest_edge", None)
+            == 12845056
+            and isinstance(mean, (list, tuple))
+            and tuple(mean) == (0.48145466, 0.4578275, 0.40821073)
+            and isinstance(std, (list, tuple))
+            and tuple(std) == (0.26862954, 0.26130258, 0.27577711)
+            and getattr(image_processor, "rescale_factor", None) == 1 / 255
+            and not self.image_config
+        ):
+            return True
+        return mode
+
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE

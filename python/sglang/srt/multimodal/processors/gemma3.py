@@ -15,6 +15,49 @@ from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTok
 class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
     models = [Gemma3ForConditionalGeneration]
 
+    npu_image_decode = True
+
+    def _get_npu_image_decode_mode(self):
+        mode = super()._get_npu_image_decode_mode()
+        if self.server_args.device != "npu" or self.npu_image_decode is not True:
+            return mode
+        hf = self._processor
+        if (
+            type(self) is not Gemma3SGLangImageProcessor
+            or getattr(self.hf_config, "model_type", None) != "gemma3"
+            or type(hf).__module__ != "transformers.models.gemma3.processing_gemma3"
+            or type(hf).__name__ != "Gemma3Processor"
+        ):
+            return mode
+        img = getattr(hf, "image_processor", None)
+        if (
+            type(img).__module__ != "transformers.models.gemma3.image_processing_gemma3"
+            or type(img).__name__ != "Gemma3ImageProcessor"
+        ):
+            return mode
+        mean = getattr(img, "image_mean", None)
+        std = getattr(img, "image_std", None)
+        size = getattr(img, "size", None)
+        if (
+            getattr(img, "backend", None) == "torchvision"
+            and getattr(size, "height", None) == 896
+            and getattr(size, "width", None) == 896
+            and getattr(img, "resample", None) == 2
+            and getattr(img, "do_resize", None) is True
+            and getattr(img, "do_normalize", None) is True
+            and getattr(img, "do_rescale", None) is True
+            and getattr(img, "do_convert_rgb", None) is None
+            and getattr(img, "do_pan_and_scan", None) is None
+            and isinstance(mean, (list, tuple))
+            and tuple(mean) == (0.5, 0.5, 0.5)
+            and isinstance(std, (list, tuple))
+            and tuple(std) == (0.5, 0.5, 0.5)
+            and getattr(img, "rescale_factor", None) == 1 / 255
+            and not self.image_config
+        ):
+            return True
+        return mode
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.IM_START_TOKEN_ID = hf_config.boi_token_index

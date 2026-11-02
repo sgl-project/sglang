@@ -99,4 +99,9 @@ def decode_jpeg(data: bytes):
     import torch
     import torch_npu  # noqa: F401 - registers the NPU device backend
 
-    return _decoder(torch.npu.current_device()).decode(data)
+    device = torch.npu.current_device()
+    # CANN's VPC color-conversion API does not support Ascend 950PR/950DT.
+    # Inspect the actual worker device before constructing any DVPP resources.
+    if torch.npu.get_device_name(device).startswith("Ascend950"):
+        return None
+    return _decoder(device).decode(data)

@@ -47,7 +47,7 @@ This document provides a list of commonly used environment variables and aims to
 
 ## Device JPEG decoding on NPU
 
-On Linux Ascend systems, tensor-capable image processors allow eligible JPEGs to be decoded with DVPP JPEGD and converted to RGB with DVPP VPC by default. The processor's `device_image_decode` policy controls both CUDA and NPU JPEG decoding: `False` uses CPU/PIL, while `True` allows the selected device backend. Unsupported inputs retain PIL decoding.
+On Linux Ascend systems, verified image processors can decode eligible JPEGs with DVPP JPEGD and convert them to RGB with DVPP VPC. The independent `npu_image_decode` processor policy defaults to `False`. Qwen2.5-VL, Gemma3, and GLM4v opt in only for their verified Hugging Face processor types and image configurations. Other NPU paths use CPU/PIL. The existing `gpu_image_decode` policy continues to control CUDA decoding.
 
 ### Install and run
 
@@ -66,18 +66,20 @@ python -m sglang.launch_server \
   --dtype bfloat16 --host 127.0.0.1 --port 30000
 ```
 
-Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. Model processors can set `device_image_decode = False` to require PIL inputs. Existing processor opt-outs and `nvjpeg_fancy` mode are preserved; the NPU path does not implement the CUDA-specific fancy mode.
+Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. Model processors can set `npu_image_decode = False` to require PIL inputs on NPU. CUDA keeps its existing model opt-outs and `nvjpeg_fancy` mode; changing the NPU policy does not select or disable CUDA decoding.
 
-If you maintain a custom processor, rename its `gpu_image_decode` override to `device_image_decode`, preserving its value. Update keyword calls to `load_image` and `_load_image` in the same way. The NPU-specific environment variable from earlier revisions of this change is no longer used; no environment variable is required to enable this path.
+Custom processors keep their existing `gpu_image_decode` overrides and loader keyword arguments. The low-level `load_image` and `_load_image` APIs accept a separate keyword-only `npu_image_decode=False` argument; callers opting in must handle device tensors. SGLang processors additionally validate their actual preprocessing chain before opting in. This policy is a Python strategy variable, not an environment variable. `SGLANG_ENABLE_NPU_IMAGE_DECODE` from earlier revisions is no longer used.
 
 ### Supported inputs and quality
 
 - The device path accepts 8-bit baseline SOF0, three-component YCbCr 4:2:0 JPEGs with width and height from 32 through 4096, and at most 32 MiB of encoded data. Inputs outside these device-path limits retain CPU/PIL decoding.
 - For odd dimensions, an internal JPEGD input copy rounds the SOF0 width or height up by one within the existing MCU grid. Compressed scan data is unchanged, and the RGB output is cropped to the original dimensions.
 - PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
-- Processors that disable tensor decoding or request `nvjpeg_fancy` keep their existing loading behavior.
+- Ascend 950PR/950DT retain PIL decoding because the required [VPC color-conversion API](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/acce/dvpp/aclpythondevg_01_0307.html) does not support these products. The loader checks the actual worker device before creating DVPP resources.
+- Ascend 950PR/950DT retain PIL decoding because the required [VPC color-conversion API](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/acce/dvpp/aclpythondevg_01_0307.html) does not support these products. The loader checks the actual worker device before creating DVPP resources.
+- NPU processor paths without verified tensor compatibility retain PIL inputs. CUDA-specific `nvjpeg_fancy` is independent of the NPU policy.
 - The HF `Glm4vProcessor` keeps image preprocessing on CPU because its patch reshapes exceed Ascend's dimension limit. Device JPEG decoding and the placement of later preprocessing are separate choices.
-- When you select the PIL image-processing backend, the base processor transfers device-decoded image tensors to CPU before calling the HF processor.
+- When the actual image-processing backend is PIL, including when selected through `auto`, the base processor transfers NPU-decoded image tensors to CPU before calling the HF processor.
 - JPEGD produces NV12; VPC converts it to RGB888 with full-range BT.601. A device copy and Torch layout conversion produce an owned contiguous `uint8` CHW RGB tensor on the worker's current NPU.
 - Device execution failures are surfaced as request errors. The decoder borrows the caller's NPU context and releases its own stream, channel, and buffers.
 

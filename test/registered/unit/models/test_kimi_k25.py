@@ -672,6 +672,7 @@ def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
+        device="cpu",
         base_gpu_id=0,
         rl_on_policy_target=None,
         tp_size=1,

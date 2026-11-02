@@ -227,11 +227,17 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 captured.append(kwargs["images"])
                 return {}
 
-        for use_pil in (False, True):
-            with self.subTest(use_pil=use_pil):
+        for use_pil, device_type in (
+            (False, "npu"),
+            (True, "npu"),
+            (True, "cuda"),
+            (True, "cpu"),
+        ):
+            with self.subTest(use_pil=use_pil, device_type=device_type):
                 copies, captured = [], []
                 cpu_copy, non_tensor = object(), object()
                 decoded = InputTensor()
+                decoded.device = SimpleNamespace(type=device_type)
                 original_images = [decoded, non_tensor]
                 processor = self._processor()
                 processor._processor = Processor()
@@ -244,8 +250,9 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 processor.FEATURE_NAMES = []
                 with patch(f"{BASE}.torch.Tensor", InputTensor):
                     processor.process_mm_data("test", images=original_images)
-                self.assertEqual(copies, [decoded] if use_pil else [])
-                self.assertIs(captured[0][0], cpu_copy if use_pil else decoded)
+                should_copy = use_pil and device_type == "npu"
+                self.assertEqual(copies, [decoded] if should_copy else [])
+                self.assertIs(captured[0][0], cpu_copy if should_copy else decoded)
                 self.assertIs(captured[0][1], non_tensor)
                 # A CPU staging copy must not replace the caller's decoded input.
                 self.assertIs(original_images[0], decoded)

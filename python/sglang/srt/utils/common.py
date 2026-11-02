@@ -2018,7 +2018,7 @@ class VideoData:
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-DeviceImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
+GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
 def smart_to_rgb(
@@ -2061,7 +2061,7 @@ def smart_to_rgb(
 
 
 def is_jpeg_with_cuda(
-    image_bytes: bytes = b"", device_image_decode: DeviceImageDecodeMode = True
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
 ) -> bool:
     """
     Check three conditions:
@@ -2069,7 +2069,7 @@ def is_jpeg_with_cuda(
     2. whether input is recognized as JPEG.
     3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
     """
-    if not device_image_decode or not is_cuda():
+    if not gpu_image_decode or not is_cuda():
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
@@ -2086,7 +2086,7 @@ def _warn_fancy_jpeg_fallback(error: str) -> None:
 
 
 def _image_decode_backend() -> str:
-    """Honor the serving backend; standalone loaders use available hardware."""
+    """Resolve the serving backend; standalone loaders use available hardware."""
     if get_context().is_config_namespace_published("device"):
         return get_runtime_device().device
     if is_cpu():
@@ -2101,7 +2101,9 @@ def _image_decode_backend() -> str:
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
-    device_image_decode: DeviceImageDecodeMode = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
+    *,
+    npu_image_decode: bool = False,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode eligible JPEGs with nvJPEG or Ascend DVPP to a device tensor,
@@ -2110,16 +2112,19 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    backend = _image_decode_backend() if device_image_decode else "cpu"
-    if device_image_decode is True and backend == "npu":
-        from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
+    backend = _image_decode_backend()
+    if backend == "npu":
+        # NPU and GPU policies are independent. Unsupported NPU inputs use PIL;
+        # execution errors propagate, and never try a different accelerator.
+        if npu_image_decode:
+            from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
 
-        image_tensor = decode_jpeg(image_bytes)
-        if image_tensor is not None:
-            return image_tensor
-    if backend == "cuda" and is_jpeg_with_cuda(image_bytes, device_image_decode):
+            image_tensor = decode_jpeg(image_bytes)
+            if image_tensor is not None:
+                return image_tensor
+    elif is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
-            if device_image_decode == "nvjpeg_fancy":
+            if gpu_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
                     decode_jpeg_with_fancy_upsampling,
                 )
@@ -2131,7 +2136,7 @@ def _load_image(
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
-            if device_image_decode == "nvjpeg_fancy":
+            if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
             else:
                 logger.warning(
@@ -2156,7 +2161,9 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-    device_image_decode: DeviceImageDecodeMode = True,
+    gpu_image_decode: GPUImageDecodeMode = True,
+    *,
+    npu_image_decode: bool = False,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -2172,32 +2179,43 @@ def load_image(
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(
-            image_bytes=image_file, device_image_decode=device_image_decode
+            image_bytes=image_file,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
         image = _load_image(
-            image_file=image_file, device_image_decode=device_image_decode
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
-            device_image_decode=device_image_decode,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
         image = _load_image(
-            image_file=image_file, device_image_decode=device_image_decode
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
         image = _load_image(
-            image_file=image_file, device_image_decode=device_image_decode
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
         image = _load_image(
-            image_file=image_file, device_image_decode=device_image_decode
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            npu_image_decode=npu_image_decode,
         )
     else:
         raise ValueError(f"Invalid image: {image_file}")

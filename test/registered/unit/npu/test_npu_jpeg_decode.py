@@ -51,7 +51,7 @@ class TestNpuJpegDecode(unittest.TestCase):
                     expected = (
                         np.asarray(image.convert("RGB")).transpose(2, 0, 1).copy()
                     )
-                result = _load_image(image_bytes=data)
+                result = _load_image(image_bytes=data, npu_image_decode=True)
                 self.assertEqual(result.device, self.device)
                 self.assertEqual(result.dtype, torch.uint8)
                 self.assertEqual(tuple(result.shape), (3, h, w))
@@ -89,7 +89,7 @@ class TestNpuJpegDecode(unittest.TestCase):
             Image.new("RGB", (64, 32), color).save(
                 buffer, format="JPEG", quality=95, subsampling=2
             )
-            result = _load_image(image_bytes=buffer.getvalue())
+            result = _load_image(image_bytes=buffer.getvalue(), npu_image_decode=True)
             self.assertEqual(result.device, self.device)
             self.assertEqual(result.dtype, torch.uint8)
             self.assertEqual(tuple(result.shape), (3, 32, 64))
@@ -110,8 +110,8 @@ class TestNpuJpegDecode(unittest.TestCase):
         buffer = io.BytesIO()
         Image.new("RGB", (65, 33), (31, 127, 235)).save(buffer, format="PNG")
         data = buffer.getvalue()
-        baseline = _load_image(image_bytes=data, device_image_decode=False)
-        enabled = _load_image(image_bytes=data)
+        baseline = _load_image(image_bytes=data, gpu_image_decode=False)
+        enabled = _load_image(image_bytes=data, npu_image_decode=True)
         self.assertIsInstance(enabled, Image.Image)
         np.testing.assert_array_equal(np.asarray(enabled), np.asarray(baseline))
 
@@ -122,6 +122,9 @@ class TestNpuJpegDecode(unittest.TestCase):
         )
 
         class Processor(BaseMultimodalProcessor):
+            def _get_npu_image_decode_mode(self):
+                return self.server_args.device == "npu"
+
             async def process_mm_data_async(self, *args, **kwargs):
                 raise NotImplementedError
 

@@ -222,7 +222,12 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    device_image_decode = True  # Allow device JPEG decoding by default.
+    gpu_image_decode = True  # Enable GPU decoding by default.
+    npu_image_decode = False  # Only verified NPU processor paths opt in.
+
+    def _get_npu_image_decode_mode(self):
+        return False
+
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
@@ -247,15 +252,6 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        for owner in cls.__mro__:
-            if "gpu_image_decode" in owner.__dict__:
-                raise TypeError(
-                    f"{cls.__name__}: rename {owner.__name__}.gpu_image_decode "
-                    "to device_image_decode"
-                )
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -489,12 +485,12 @@ class BaseMultimodalProcessor(ABC):
             if isinstance(self._processor, PreprocessFingerprintProvider)
             else None
         )
-        return {
+        payload = {
             "wrapper_class": (
                 f"{type(self._processor).__module__}."
                 f"{type(self._processor).__qualname__}"
             ),
-            "device_image_decode": self.device_image_decode,
+            "gpu_image_decode": self.gpu_image_decode,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
@@ -502,6 +498,10 @@ class BaseMultimodalProcessor(ABC):
             "audio_config": self.audio_config,
             "wrapped_processor": wrapped_processor,
         }
+        # Keep the existing CPU/CUDA cache identity unchanged.
+        if getattr(getattr(self, "server_args", None), "device", None) == "npu":
+            payload["npu_image_decode"] = self._get_npu_image_decode_mode()
+        return payload
 
     def clear_preprocess_cache(self) -> None:
         """Drop artifacts and reject cache writes from pre-flush work.
@@ -873,10 +873,16 @@ class BaseMultimodalProcessor(ABC):
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
-            if self.disable_fast_image_processor:
-                # PIL backends convert tensors to NumPy and require CPU storage.
+            if (
+                self.disable_fast_image_processor
+                or getattr(getattr(processor, "image_processor", None), "backend", None)
+                == "pil"
+            ):
+                # auto can resolve to PIL too; only NPU tensors need staging.
                 images = [
-                    image.cpu() if isinstance(image, torch.Tensor) else image
+                    image.cpu()
+                    if isinstance(image, torch.Tensor) and image.device.type == "npu"
+                    else image
                     for image in images
                 ]
             kwargs["images"] = images
@@ -994,6 +1000,9 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        *,
+        gpu_image_decode=None,
+        npu_image_decode=False,
     ):
         """
         Load a single multimodal data.
@@ -1006,7 +1015,12 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.device_image_decode)
+                gpu_mode = (
+                    cls.gpu_image_decode
+                    if gpu_image_decode is None
+                    else gpu_image_decode
+                )
+                img, _ = load_image(data, gpu_mode, npu_image_decode=npu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded to a device tensor.
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1079,9 +1093,10 @@ class BaseMultimodalProcessor(ABC):
 
     def _load_single_item_for_processor(self, data, modality, *args):
         # Current device is thread-local; IO workers need this instance's device.
+        npu_mode = self._get_npu_image_decode_mode()
         bind_npu = (
             modality == Modality.IMAGE
-            and self.device_image_decode is True
+            and npu_mode is True
             and self.server_args.device == "npu"
             and not self._is_preprocessed_input(data)
         )
@@ -1091,7 +1106,13 @@ class BaseMultimodalProcessor(ABC):
             else nullcontext()
         )
         with context:
-            return self._load_single_item(data, modality, *args)
+            return self._load_single_item(
+                data,
+                modality,
+                *args,
+                gpu_image_decode=self.gpu_image_decode,
+                npu_image_decode=npu_mode,
+            )
 
     def _submit_mm_data_loading_tasks_simple(
         self,

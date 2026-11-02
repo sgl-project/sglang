@@ -26,9 +26,9 @@ MODALITIES = (Modality.IMAGE, Modality.AUDIO, Modality.VIDEO)
 
 
 class _StubProcessor(BaseMultimodalProcessor):
-    # device_image_decode=False keeps the decode on PIL so the test needs no GPU. The
+    # gpu_image_decode=False keeps the decode on PIL so the test needs no GPU. The
     # abstract methods are never called: only the _load_single_item classmethod is.
-    device_image_decode = False
+    gpu_image_decode = False
 
 
 def _session_raising(exc):

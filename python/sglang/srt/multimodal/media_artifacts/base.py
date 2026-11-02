@@ -159,15 +159,17 @@ class MediaArtifactCacheMixin:
             data.load()
             return data
         server_args = getattr(self, "server_args", None)
+        get_npu_mode = getattr(self, "_get_npu_image_decode_mode", None)
+        npu_mode = get_npu_mode() if get_npu_mode is not None else False
         context = (
             torch.npu.device(server_args.base_gpu_id)
-            if self.device_image_decode is True
-            and server_args is not None
-            and server_args.device == "npu"
+            if npu_mode and server_args is not None and server_args.device == "npu"
             else nullcontext()
         )
         with context:
-            image, _ = load_image(data, self.device_image_decode)
+            image, _ = load_image(
+                data, self.gpu_image_decode, npu_image_decode=npu_mode
+            )
         if isinstance(image, Image.Image):
             image.load()
         return image
