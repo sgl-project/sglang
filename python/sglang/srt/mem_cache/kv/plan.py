@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     TensorPartDecl,
     WindowLifetime,
+    primary_window,
     window_sub_pool_name,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
@@ -238,11 +239,12 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         window when the target declares none: the window a single-window reader
         sizes and retains by."""
         drafts = set() if self.fused_draft is None else set(self.fused_draft.new_bands)
-        windows = [
-            s for s in self.drive_order() if isinstance(s.lifetime, WindowLifetime)
-        ]
-        target = [s for s in windows if s.name not in drafts]
-        return (target or windows or [None])[0]
+        windows = [s for s in self.sub_pools if isinstance(s.lifetime, WindowLifetime)]
+        candidates = [s for s in windows if s.name not in drafts] or windows
+        if not candidates:
+            return None
+        length = primary_window(s.lifetime.window for s in candidates)
+        return next(s for s in candidates if s.lifetime.window == length)
 
     def owner(self) -> PlannedSubPool:
         """The sub-pool that owns the token id space."""

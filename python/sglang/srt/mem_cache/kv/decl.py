@@ -6,7 +6,7 @@ lifetime and allocation unit share one sub-pool.
 """
 
 import math
-from typing import ClassVar, Optional, Sequence, Tuple, Union
+from typing import ClassVar, Iterable, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -141,6 +141,16 @@ def window_sub_pool_name(window: Optional[int]) -> str:
     """The sub-pool name of a window, from its own length alone: a window the
     model does not state the length of is ``window``."""
     return "window" if window is None else f"window_{window}"
+
+
+def primary_window(windows: Iterable[Optional[int]]) -> Optional[int]:
+    """Of the window lengths the target's layers declare, the one a
+    single-window reader sizes and retains by: the longest (a window that
+    states no length counts as longest). None without windows."""
+    windows = list(windows)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: WindowLifetime(window=w).retention())
 
 
 def kv_layer_decls(

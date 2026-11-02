@@ -1612,7 +1612,6 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
     kv_args.state_types = []
     kv_args.state_sub_pools = []
@@ -1631,7 +1630,6 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
-    static = isinstance(storage, StaticKVStorage)
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
@@ -1645,8 +1643,7 @@ def setup_state_kv_args(
             list(region.conv_shard_groups),
             list(region.slice_outer_counts),
             list(region.layer_ids),
-            # A static pool's entries are slices of its pools, not sub-pools.
-            sub_pool=None if static else entry.sub_pool,
+            sub_pool=storage.entry_sub_pool(entry),
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout

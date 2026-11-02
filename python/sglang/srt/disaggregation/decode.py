@@ -774,21 +774,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             ):
                 raise ValueError("Host receive supports full KV and paged window pools")
-            # A unified pool's window entry names its sub-pool, whose host pool
-            # goes by the same name; a static pool's one window entry names
-            # none and lands in the window host pool.
+            # A unified pool's window entry names its sub-pool; a static pool's
+            # one window entry names none and stands for its window pool.
+            window_names = [
+                (
+                    sub_pool
+                    if sub_pool is not None
+                    else window_sub_pool_of(self.token_to_kv_pool_allocator)
+                )
+                for sub_pool in entry_sub_pools
+            ]
             window_sub_pools = [
                 storage.wire_entries()[i].sub_pool if sub_pool is None else sub_pool
                 for i, sub_pool in enumerate(entry_sub_pools)
             ]
-            window_host_pools = [
-                (
-                    PoolName.SWA
-                    if sub_pool is None
-                    else storage.plan.sub_pool(sub_pool).external.host_pool
-                )
-                for sub_pool in entry_sub_pools
-            ]
+            window_host_pools = [storage.host_pool_name(name) for name in window_names]
             if any(
                 spec.indices_from_pool not in (PoolName.KV, *window_host_pools)
                 for spec in self.tree_cache.sidecar_pool_specs
@@ -837,12 +837,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 zip(window_sub_pools, window_host_pools)
             ):
                 host_pool = group.get_pool(name)
-                # A static pool's one window entry keeps its window's tail.
-                window = window_lengths[
-                    entry_sub_pools[i]
-                    if entry_sub_pools[i] is not None
-                    else window_sub_pool_of(self.token_to_kv_pool_allocator)
-                ]
+                window = window_lengths[window_names[i]]
                 reserved = min(
                     decode_retraction_max_tokens(
                         self.req_to_token_pool, storage.view(sub_pool)
@@ -2691,18 +2686,9 @@ def alloc_for_decode_prealloc(
             evicted_seqlen = fill_len - tail
             assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
             req.kv.set_evicted_seqlen(
-                _window_tree_component(allocator, name), evicted_seqlen
+                storage.window_tree_component(name), evicted_seqlen
             )
     return kv_loc
-
-
-def _window_tree_component(allocator, name: str) -> ComponentType:
-    """The prefix-tree slot of window pool ``name``: a unified pool's window
-    sub-pool's slot, or a static pool's one window."""
-    windows = getattr(allocator, "window_allocators", None)
-    if windows is None:
-        return ComponentType.SWA
-    return allocator.window_component(windows[name])
 
 
 def _alloc_for_decode_prealloc_dsv4(

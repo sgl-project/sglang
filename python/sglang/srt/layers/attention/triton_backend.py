@@ -467,8 +467,8 @@ class TritonAttnBackend(AttentionBackend):
         ]
         if not names:
             return {}
-        plan = model_runner.token_to_kv_pool_allocator.storage.plan
-        return {name: plan.sub_pool(name).lifetime.window for name in names}
+        router = model_runner.token_to_kv_pool.layer_router
+        return {name: router.sub_pool(name).window for name in names}
 
     def _builds_rails_per_window(
         self, model_runner: ModelRunner, kv_indptr_buf: Optional[torch.Tensor]
@@ -494,9 +494,9 @@ class TritonAttnBackend(AttentionBackend):
             return True
         # One attn_logits buffer serves every window layer: their value widths
         # must agree, and each window must be stated.
-        plan = model_runner.token_to_kv_pool_allocator.storage.plan
+        router = model_runner.token_to_kv_pool.layer_router
         widths = {
-            plan.sub_pool(name).geometry.v_head_dim
+            router.view(name).get_v_head_dim()
             for name in (self.runner_ids.window_kv_sub_pool, *self.other_windows)
         }
         return len(widths) == 1 and None not in self.other_windows.values()

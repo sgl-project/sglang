@@ -27,7 +27,12 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
-from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
+from sglang.srt.mem_cache.kv.decl import (
+    MHAGeometry,
+    WindowLayers,
+    kv_layer_decls,
+    primary_window,
+)
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -236,6 +241,27 @@ class TestUnifiedWindowLengths(CustomTestCase):
         check_state_wire(widened, narrow)
         with self.assertRaisesRegex(RuntimeError, "shorter window tail"):
             check_state_wire(narrow, widened)
+
+    def test_storage_answers_windows_for_its_consumers(self):
+        """Readers outside the storage get each window's facts from it: a
+        layer's route carries its window, the target's window follows one
+        rule, and a sub-pool's room is the planner's."""
+        storage = _storage()
+        router = storage.allocator.get_kvcache().layer_router
+        for i, window in enumerate(_WINDOWS):
+            name = f"window_{window}"
+            self.assertEqual(router.sub_pool(name).window, window)
+            self.assertEqual(router.layer(i + 1).route.window, window)
+        self.assertIsNone(router.layer(0).route.window)
+        self.assertEqual(storage.primary_window_name(), f"window_{_TARGET_WINDOW}")
+        self.assertEqual(primary_window(_WINDOWS), _TARGET_WINDOW)
+        self.assertEqual(primary_window((8, None, 4)), None)
+        for name in (storage.owner, *storage.retained_window_lengths()):
+            self.assertEqual(
+                storage.available_units(name),
+                storage.allocator.units_available(name),
+                name,
+            )
 
     def test_window_retirement_names_its_window(self):
         """A pool of several windows has no default window to retire."""

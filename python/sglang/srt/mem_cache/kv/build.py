@@ -265,6 +265,12 @@ def build_kv_storage(
             if plan.primary_window() is None
             else {IdSpaceKind.SLIDING_WINDOW: plan.primary_window().name}
         ),
+        # Routes carry each window sub-pool's attention window.
+        windows={
+            s.name: s.lifetime.window
+            for s in token_sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        },
     )
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None

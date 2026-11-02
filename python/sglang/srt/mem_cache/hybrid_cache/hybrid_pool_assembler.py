@@ -1568,7 +1568,7 @@ def build_unified_host_stack(
     page_size = params.page_size
     owner = storage.owner
     sub_pools = storage.sub_pools()
-    slot_ids = tree_slot_ids(storage.plan.tree_slots())
+    slot_ids = tree_slot_ids(storage.tree_slots())
     owner_component = slot_ids[sub_pools[0].external.tree_component]
     layer_maps = {
         s.name: {
@@ -1732,7 +1732,7 @@ def build_unified_host_stack(
             )
         component_host_pools[component] = host_pools[s.name]
 
-    format_tag = storage.plan.storage_format_tag()
+    format_tag = storage.storage_format_tag()
     if format_tag is not None:
         host_pools[owner].storage_format_tag = format_tag
 
@@ -2041,16 +2041,14 @@ def validate_fused_hicache_draft(
         return
     storage = tree_cache.kv_storage()
     for pool in draft_device_pools or ():
-        if pool._arena is not storage.allocator.arena:
+        if not storage.holds_view(pool):
             raise ValueError("fused draft views must share the target storage arena")
     entries = tree_cache.cache_controller.mem_pool_host.entry_map
-    for sub_pool in storage.plan.sub_pools:
-        if sub_pool.spec.draft_region is None:
-            continue
-        entry = entries[sub_pool.external.host_pool]
+    for name in storage.draft_hosting_sub_pools():
+        entry = entries[storage.host_pool_name(name)]
         if not isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool):
             raise ValueError(
-                f"host pool {sub_pool.name!r} must preserve the complete declared entry"
+                f"host pool {name!r} must preserve the complete declared entry"
             )
 
 

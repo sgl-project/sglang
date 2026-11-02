@@ -156,9 +156,9 @@ class InsertResult:
 def window_sub_pool_of(allocator) -> str:
     """The sub-pool the model's sliding-window layers write: a unified
     pool's target window, else the static pools' window pool."""
-    storage = getattr(allocator, "storage", None)
-    window = None if storage is None else storage.plan.primary_window()
-    return "swa" if window is None else window.name
+    storage = allocator.storage
+    window = None if storage is None else storage.primary_window_name()
+    return "swa" if window is None else window
 
 
 @dataclasses.dataclass

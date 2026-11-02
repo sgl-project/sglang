@@ -617,8 +617,30 @@ class StaticKVStorage:
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._states().wire_entries
 
+    def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
+        """See `KVStorage.entry_sub_pool`: a static pool's entries are slices
+        of its pools, not sub-pools."""
+        return None
+
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
+
+    def primary_window_name(self) -> Optional[str]:
+        """See `KVStorage.primary_window_name`: the window pool."""
+        return "swa" if self._allocator.window_pool_names() else None
+
+    def host_pool_name(self, sub_pool: str) -> str:
+        """See `KVStorage.host_pool_name`: a window entry backs up to the
+        window host pool."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return PoolName.SWA if sub_pool == "swa" else PoolName.KV
+
+    def window_tree_component(self, sub_pool: str):
+        """See `KVStorage.window_tree_component`: the one window slot."""
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        return ComponentType.SWA
 
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
