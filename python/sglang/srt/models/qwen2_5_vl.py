@@ -550,9 +550,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                torch.repeat_interleave(
-                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-                )
+                torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
@@ -649,9 +647,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                torch.repeat_interleave(
-                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-                )
+                torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
