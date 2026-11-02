@@ -904,6 +904,49 @@ def terminate_and_kill_process_tree(
     wait_for_gpu_release(pids)
 
 
+def _assert_pd_server_gpus_visible(other_args, env: Optional[dict]) -> None:
+    """Fail before launch when the server's GPUs are not all visible here.
+
+    A runner that has lost a GPU otherwise fails a rank deep in startup with
+    `invalid device ordinal`, which reads like a code bug. Counts only TP x PP
+    on one node, a lower bound on what the server uses, so this never rejects
+    a launch that could have started.
+    """
+    # A server env that remaps devices sees a different set than this process.
+    if env is not None and any(
+        env.get(var, os.environ.get(var)) != os.environ.get(var)
+        for var in (
+            "CUDA_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+        )
+    ):
+        return
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    parser.add_argument("--tp-size", "--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pp-size", "--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--base-gpu-id", type=int, default=0)
+    parser.add_argument("--gpu-id-step", type=int, default=1)
+    parser.add_argument("--nnodes", type=int, default=1)
+    try:
+        args, _ = parser.parse_known_args([str(x) for x in other_args])
+    except (argparse.ArgumentError, SystemExit, ValueError):
+        return
+    if args.nnodes != 1:
+        return
+    world_size = args.tp_size * args.pp_size
+    needed = args.base_gpu_id + (world_size - 1) * args.gpu_id_step + 1
+    visible = torch.cuda.device_count()
+    if 0 < visible < needed:
+        raise RuntimeError(
+            f"PD server needs GPUs up to index {needed - 1} "
+            f"(base_gpu_id={args.base_gpu_id}, tp_size={args.tp_size}, "
+            f"pp_size={args.pp_size}, gpu_id_step={args.gpu_id_step}) but only "
+            f"{visible} GPUs are visible. The machine is short of GPUs; "
+            f"check the runner's hardware rather than the code under test."
+        )
+
+
 def popen_launch_pd_server(
     model: str,
     base_url: str,
@@ -916,6 +959,7 @@ def popen_launch_pd_server(
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
+    _assert_pd_server_gpus_visible(other_args, env)
 
     command = [
         "python3",
