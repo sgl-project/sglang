@@ -100,6 +100,23 @@ _real_ds41_ops = dsv4_backend._ds41_ops
 dsv4_backend._ds41_ops = lambda: DS41
 
 
+def setUpModule():
+    # This suite describes the original A5 packed path. A3 has separate BF16
+    # contract tests; do not let the host running this suite select its ABI.
+    global _arch_patches
+    _arch_patches = [
+        patch.object(module, "is_npu_arch35", return_value=True)
+        for module in (dsv4_backend, dsv4_memory_pool)
+    ]
+    for arch_patch in _arch_patches:
+        arch_patch.start()
+
+
+def tearDownModule():
+    for arch_patch in reversed(_arch_patches):
+        arch_patch.stop()
+
+
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
     backend._dsv4_compress_ratios = (0,) + tuple(ratios)
@@ -328,12 +345,17 @@ class TestPoolFactory(unittest.TestCase):
             self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
 
     def test_window_layout_resolves_the_row_format(self):
-        fake = SimpleNamespace(compression_ratios=(0, 1, 2))
-        self.assertIs(
-            DSV4NPUTokenToKVPool._window_kv_layout(fake),
-            NPUDSV4KVLayout.V41_SWA_FP8,
+        fake = SimpleNamespace(
+            compression_ratios=(0, 1, 2), _is_v41_model=lambda: True
         )
-        fake_v4 = SimpleNamespace(compression_ratios=(0, 4, 128))
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(fake),
+                NPUDSV4KVLayout.V41_SWA_FP8,
+            )
+        fake_v4 = SimpleNamespace(
+            compression_ratios=(0, 4, 128), _is_v41_model=lambda: False
+        )
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
@@ -348,15 +370,18 @@ class TestPoolFactory(unittest.TestCase):
     def test_compressed_kv_layout_tags_every_ratio(self):
         fake = SimpleNamespace(
             compression_ratios=(0, 1, 2),
+            _is_v41_model=lambda: True,
             kv_layout=KVLayout.V4,
             compressed_kv_layout_option=None,
         )
-        self.assertIs(
-            DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
-            NPUDSV4KVLayout.V41_CMP_FP4,
-        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
+                NPUDSV4KVLayout.V41_CMP_FP4,
+            )
         fake_v4 = SimpleNamespace(
             compression_ratios=(0, 4, 128),
+            _is_v41_model=lambda: False,
             kv_layout=KVLayout.V4,
             compressed_kv_layout_option=None,
         )
@@ -1535,15 +1560,17 @@ class TestEagerGraphMetadataParity(unittest.TestCase):
 class TestVerifyGraphGuards(unittest.TestCase):
     """The `_apply_dsv4_graph_metadata` verify arm and the startup guards.
 
-    DSpark owns the V4.1 verify replay, EAGLE fails loudly, a stage without
+    V4.1 owns its verify replay, a stage without
     low ratios (V4 model or draft worker) keeps its silent bypass, and COMPACT
     ragged verify is rejected at startup.
     """
 
     _REFRESHES = (
+        "_refresh_cycle_state_block_table",
         "_refresh_graph_seq_metadata",
-        "_refresh_graph_compress_page_tables_direct",
-        "_refresh_graph_decode_compress_1d_direct",
+        "_refresh_v4_compress_page_tables",
+        "_refresh_graph_decode_rows",
+        "_refresh_graph_dsv41_index_page_tables",
         "_refresh_graph_explicit_state_block_tables",
         "_refresh_graph_swa_metadata_direct",
         "_refresh_graph_dspark_sparse_metadata",
@@ -1561,7 +1588,10 @@ class TestVerifyGraphGuards(unittest.TestCase):
         backend = _low_ratio_backend()
         backend._dsv4_has_low_ratio = has_low_ratio
         backend._is_dspark_algorithm = dspark
-        backend.forward_metadata = SimpleNamespace()
+        backend.forward_metadata = SimpleNamespace(
+            start_pos=torch.zeros(1, dtype=torch.int32),
+            seqused=torch.zeros(1, dtype=torch.int32),
+        )
         calls = []
         for name in self._REFRESHES:
             setattr(backend, name, (lambda ctx, _n=name: calls.append(_n)))
@@ -1578,6 +1608,10 @@ class TestVerifyGraphGuards(unittest.TestCase):
             forward_batch=SimpleNamespace(),
             graph_mode=_Mode("target_verify" if verify else "decode"),
             is_idle_replay=is_idle,
+            live_seq_lens=torch.tensor([8], dtype=torch.int32),
+            tokens_per_bs=6,
+            device="cpu",
+            ragged_layout=None,
             # c4/c128 are absent for V4.1, so both verify sub-arms are skipped.
             has_compress=False,
             active_target_verify=False,
@@ -1606,12 +1640,9 @@ class TestVerifyGraphGuards(unittest.TestCase):
         _, verify_calls = self._run_replay(verify=False)
         self.assertEqual(verify_calls, [])
 
-    def test_eagle_on_v41_fails_loudly_instead_of_corrupting(self):
-        # The verify arm refreshes the c4/c128 buffers only, so a V4.1 verify
-        # graph would scatter this step's compressed rows to the previous
-        # step's slots and silently corrupt the pools.
-        with self.assertRaisesRegex(RuntimeError, "target-verify"):
-            self._run_replay(dspark=False)
+    def test_verify_row_refresh_is_not_algorithm_specific(self):
+        _, verify_calls = self._run_replay(dspark=False)
+        self.assertEqual(verify_calls, ["refresh"])
 
     def _ensure_static_mode(self, mode, arch35=True):
         with (

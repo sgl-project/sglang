@@ -18,6 +18,8 @@ import torch
 class NPUDSV4KVLayout(str, enum.Enum):
     V4_BF16 = "v4_bf16"
     V4_FP8 = "v4_fp8"
+    # A3 uses the same unquantized row for SWA and C1/C2, with BF16 index K.
+    V41_BF16 = "v41_bf16"
     V41_SWA_FP8 = "v41_fp8"
     V41_CMP_FP4 = "v41_fp4"
 
@@ -32,6 +34,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         """Values sharing one quant scale; None rows are written unquantized."""
         return {
             NPUDSV4KVLayout.V4_BF16: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             NPUDSV4KVLayout.V4_FP8: 64,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 16,
@@ -43,6 +46,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         (arch35 window rows), str for kv_compress_epilog_v2 (V4.1 rows)."""
         return {
             NPUDSV4KVLayout.V4_BF16: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             # epilog v1 mode; the deployed wheel's encoding, not the one in
             # the current ops-transformer source (which also dropped layout=1).
             NPUDSV4KVLayout.V4_FP8: 2,
@@ -59,6 +63,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
     def row_alignment(self) -> int:
         return {
             NPUDSV4KVLayout.V4_BF16: None,
+            NPUDSV4KVLayout.V41_BF16: None,
             NPUDSV4KVLayout.V4_FP8: 128,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 32,
@@ -73,7 +78,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         (no bf16 tail): dataCol = head_dim (mxfp8) or head_dim // 2 (packed
         mxfp4, two e2m1 per byte), scales are G * bf16.
         """
-        if self is NPUDSV4KVLayout.V4_BF16:
+        if self in (NPUDSV4KVLayout.V4_BF16, NPUDSV4KVLayout.V41_BF16):
             return nope_dim + rope_dim, torch.bfloat16
         if self is NPUDSV4KVLayout.V4_FP8:
             raw = nope_dim + rope_dim * 2 + -(-nope_dim // self.quant_group)
@@ -97,6 +102,8 @@ class NPUDSV4KVLayout(str, enum.Enum):
         and 2 share the same packed-fp4 row shape. The V4.1 scale is one uint8
         e8m0 per 32 values.
         """
+        if self is NPUDSV4KVLayout.V41_BF16:
+            return head_dim, 0, torch.bfloat16, torch.float32
         if self in (NPUDSV4KVLayout.V41_SWA_FP8, NPUDSV4KVLayout.V41_CMP_FP4):
             assert head_dim % 32 == 0, head_dim
             return head_dim // 2, head_dim // 32, torch.uint8, torch.uint8
