@@ -283,16 +283,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # Required cache history, shared by retention, budgeting and transfers:
-        # the window slot's.
-        self._sliding_window_size = next(
-            (
-                slot.window
-                for slot in params.tree_slots
-                if slot_ids[slot.component] == self.slot_id(TREE_WINDOW)
-            ),
-            None,
-        )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
@@ -1315,16 +1305,27 @@ class UnifiedRadixCache(BasePrefixCache):
                     or ct not in lock.receipt.component_lock_uuids
                 ):
                     continue
-                if ct == self.slot_id(TREE_WINDOW):
-                    self.release_swa(lock)
-                else:
-                    result = self.tree_core.dec_window_lock_only(
-                        lock.node, ct, lock.receipt
-                    )
-                    self._apply_eviction_result(result)
-                    # The receipt already tracks individually relinquished locks
-                    # (including state COW sources). Final unlock skips exactly these.
-                    lock.receipt.skipped_lock_components += (ct,)
+                result = self.tree_core.dec_window_lock_only(
+                    lock.node, ct, lock.receipt
+                )
+                self._apply_eviction_result(result)
+                # The receipt already tracks individually relinquished locks
+                # (including state COW sources). Final unlock skips exactly these.
+                lock.receipt.skipped_lock_components += (ct,)
+            # The lower locks on the node (e.g. Mamba's) go once every window
+            # has gone, as a single window's early release takes them with it.
+            receipt = lock.receipt
+            windows = self.window_slots()
+            if any(ct in receipt.component_lock_uuids for ct in windows) and all(
+                ct in receipt.skipped_lock_components
+                or ct not in receipt.component_lock_uuids
+                for ct in windows
+            ):
+                result, released = self.tree_core.dec_locks_below_windows(
+                    lock.node, receipt
+                )
+                self._apply_eviction_result(result)
+                receipt.skipped_lock_components += released
             return
         if (
             lock is not None
@@ -4107,7 +4108,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @property
     def sliding_window_size(self):
-        return self._sliding_window_size
+        """The history a tree keeping one window retains for it; None with no
+        window, or with several, each of which has its own
+        (`window_retain_size`)."""
+        windows = self.window_slots()
+        if len(windows) != 1:
+            return None
+        return self.components[windows[0]].sliding_window_size
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         """Tokens at the end of a matched prefix to re-prefill because their SWA
@@ -4134,13 +4141,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return swa.sliding_window_size
 
-    def swa_retain_floor(self, req, *, window=None) -> int | None:
-        if not self.is_mamba_enabled or self._sliding_window_size is None:
+    def swa_retain_floor(self, req, *, window: int) -> int | None:
+        """The lowest position ``window``'s retirement must keep for the
+        request's latest state checkpoint."""
+        if not self.is_mamba_enabled:
             return None
         checkpoint = req.kv.mamba_last_track_seqlen
         if checkpoint is None:
             return None
-        return checkpoint - (self._sliding_window_size if window is None else window)
+        return checkpoint - window
 
     def kv_storage(self):
         """The storage the tree's values are rows of, and its effects go to."""

@@ -69,6 +69,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.unified_cache.components import slot_width as _slot_width
+from sglang.srt.mem_cache.unified_cache.components import (
+    windows_stand_alone,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -489,9 +492,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         slot_ids = tree_slot_ids(params.tree_slots)
         for slot in params.tree_slots:
             self._family_slot_ids.setdefault(slot.family, slot_ids[slot.component])
-        self._independent_windows = (
-            sum(slot.family == TREE_WINDOW for slot in params.tree_slots) > 1
-        )
+        self._independent_windows = windows_stand_alone(params.tree_slots)
         self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
@@ -906,6 +907,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             cache_actions=result.cache_actions,
         )
         return result
+
+    def dec_locks_below_windows(
+        self, node_id: NodeId, params: DecLockRefParams
+    ) -> tuple[DecSwaLockOnlyResult, tuple[ComponentType, ...]]:
+        """Release the locks a request holds on ``node_id`` of the components
+        that rank below the windows in eviction priority (e.g. Mamba), once
+        every window has released its own early; return the result and the
+        components released, for the receipt to skip at the final unlock."""
+        result = DecSwaLockOnlyResult()
+        node = self.node_by_id(node_id)
+        self._assert_receipt_anchor(node, params)
+        window = self.component_of(TREE_WINDOW)
+        if node is self.root_node or window is None:
+            return result, ()
+        window_priority = window.eviction_priority(is_leaf=False)
+        released = []
+        for comp in reversed(self.components):
+            ct = comp.component_type
+            if ct in params.skipped_lock_components:
+                continue
+            if comp.eviction_priority(is_leaf=False) < window_priority:
+                comp.release_component_lock(node, params)
+                released.append(ct)
+        return result, tuple(released)
 
     def dec_swa_lock_only(
         self,

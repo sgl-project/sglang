@@ -549,6 +549,56 @@ class TestThreeWindowTree(CustomTestCase):
         self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
         self.assertEqual(storage.accounting_violations(), [])
 
+    def test_every_window_releases_its_prefix_lock_alike(self):
+        """Each window releases a request's prefix lock once the request has
+        decoded past it, the first window like the others; the token lock
+        stays until the request's final unlock."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        w16, w8, w4 = cache.window_slots()
+        key = RadixKey(array("q", range(16)))
+        cache.insert(InsertParams(key=key, value=a.alloc(16).clone()))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        node = cache.tree_core.node_by_id(match.last_device_node)
+        lock = cache.lock(match.last_device_node)
+        req = SimpleNamespace(
+            session=None,
+            lock=lock,
+            decode_batch_idx=10,
+            kv=ReqKvInfo(req_pool_idx=1, cache_protected_len=16),
+        )
+
+        def held():
+            return [node.component_data[ct].lock_ref for ct in (w16, w8, w4)]
+
+        # Past the 8- and 4-token windows only: those two let go.
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [1, 0, 0])
+        # Past the first window too: it lets go the same way.
+        req.decode_batch_idx = 16
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [0, 0, 0])
+        self.assertFalse(lock.swa_released)
+        self.assertTrue({w16, w8, w4} <= set(lock.receipt.skipped_lock_components))
+        full = node.component_data[ComponentType.FULL]
+        self.assertEqual(full.lock_ref, 1)
+        # Released once: a later call changes nothing.
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [0, 0, 0])
+        cache.unlock(lock)
+        self.assertEqual(full.lock_ref, 0)
+        cache.sanity_check()
+
     def test_first_window_is_one_window_among_others(self):
         """The tree's first window is read, evicted and reclaimed through the
         same per-slot interface as every further window."""

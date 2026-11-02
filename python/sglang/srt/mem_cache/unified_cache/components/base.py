@@ -63,6 +63,16 @@ _FIXED_UUID_RANGE_INDEX = {
 _COMPONENT_UUID_COUNTERS: dict[ComponentType, int] = {}
 
 
+def windows_stand_alone(tree_slots) -> bool:
+    """Whether a tree's window slots each keep their own values apart from the
+    token slot's. A tree keeping one window keeps it coupled to the token
+    slot: a window value is the token value's translation, a recovered window
+    may adopt the incoming token ids, and the window's early release also
+    drops the lower locks on its node. With several windows no window is
+    coupled, and every window follows the same rules."""
+    return sum(slot.family == "window" for slot in tree_slots) > 1
+
+
 def slot_width(tree_components: tuple[ComponentType, ...]) -> int:
     """The length of a node's per-component storage: an entry per fixed id,
     and per further id up to the tree's largest."""

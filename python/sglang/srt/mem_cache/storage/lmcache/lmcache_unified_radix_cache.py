@@ -71,7 +71,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req_to_token_pool=self.req_to_token_pool,
             tree_components=self.tree_components,
             mamba_component=self._mamba_component,
-            sliding_window_size=self._sliding_window_size,
+            sliding_window_size=self.sliding_window_size,
         )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
@@ -483,7 +483,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return allocator.alloc(num_tokens)
 
         # Allocate SWA only for the trailing window; older pages use dummy page 0.
-        assert self._sliding_window_size is not None
+        assert self.sliding_window_size is not None
         swa_tail_tokens = min(
             num_tokens,
             self.lmcache_connector.aligned_swa_window_size(),

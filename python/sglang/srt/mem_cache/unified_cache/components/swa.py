@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     next_component_uuid,
+    windows_stand_alone,
 )
 
 if TYPE_CHECKING:
@@ -97,9 +98,7 @@ class SWAComponent(TreeComponent):
         # The host pool of the slot's HiCache copies: the window sub-pool's
         # own under unified memory, else the window host pool.
         self.pool_name = PoolName.SWA if slot.host_pool is None else slot.host_pool
-        self._independent = (
-            sum(slot.family == "window" for slot in params.tree_slots) > 1
-        )
+        self._independent = windows_stand_alone(params.tree_slots)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         # The history a prefix keeps, which every reader of the window needs
         # (a fused draft's reads included); not the model's attention window.
@@ -367,9 +366,8 @@ class SWAComponent(TreeComponent):
             node = node.parent
 
         window_host_hit_lengths = {**result.window_host_hit_lengths, ct: swa_host_hit}
-        if ct != self.tree_core.slot_id(TREE_WINDOW):
-            # The request's branch point is the native window slot's.
-            return result._replace(window_host_hit_lengths=window_host_hit_lengths)
+        # The branch point reads only the match's joint lengths, which no
+        # window's finalizer changes, so every window gives the same one.
         return result._replace(
             window_host_hit_lengths=window_host_hit_lengths,
             swa_branching_seqlen=branching_seqlen,
@@ -810,10 +808,12 @@ class SWAComponent(TreeComponent):
                 for node in self._collect_unbacked_swa_nodes(x)
             )
             if needed:
-                if ct == self.tree_core.slot_id(TREE_WINDOW):
+                if not self._independent and ct == self.tree_core.slot_id(TREE_WINDOW):
+                    # The tree's one window defers its backup to the controller
+                    # and resumes the tombstone after it, as the native core
+                    # does.
                     return InternalStateBackup(node_id=x.id, num_tokens=needed)
-                # Other window slots use Python's inherited inline path; the
-                # shared finish hook resumes the native window slot only.
+                # Stand-alone windows back up inline, each alike.
                 if (
                     self._swa_kv_pool_host is not None
                     and self._swa_kv_pool_host.available_size() < needed
