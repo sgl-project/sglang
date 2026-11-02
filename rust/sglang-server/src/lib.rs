@@ -17,18 +17,28 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::handlers::{AbortEnding, Aborted};
+pub use api_server::http::generate_hook::{
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
+    GenerateTerminal,
+};
+pub use api_server::http::pre_generate::abortable_before_generate;
+#[cfg(feature = "test-support")]
+pub use api_server::http::pre_generate::test_support;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::MmData;
+pub use message::request::{GenerateRequest, MmData};
+pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
+pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 
 use std::sync::Arc;
@@ -151,9 +161,18 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 }
 
 /// Wraps the HTTP app before it serves: an embedding package's own middleware
-/// or routes ([`Server::start_with_http_layer`]). It wraps every route but the
+/// or routes ([`Server::start_with_extensions`]). It wraps every route but the
 /// PD bootstrap registry's, inside the access log.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
+
+/// When a `/generate` request's timing starts, as a request extension: an
+/// [`HttpLayer`] that does part of the request's work before `/generate` runs,
+/// work Python's TokenizerManager does after its timer starts, inserts this
+/// when it starts that work, so `e2e_latency` and the time to first token
+/// cover it as Python's do. Without it the timing starts once `/generate` has
+/// normalized the body.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestStart(pub std::time::Instant);
 
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
@@ -187,13 +206,14 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
     ) -> PyResult<Self> {
-        Self::start_with_http_layer(
+        Self::start_with_extensions(
             server_args,
             port_offset,
             to_scheduler_cap,
             from_scheduler_cap,
             stage_channel_cap,
             cores,
+            None,
             None,
         )
     }
@@ -280,6 +300,42 @@ impl Server {
             .map_err(|e| value_error("mm spec", e))
     }
 
+    /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
+    /// health answers 503 at once, requests are still admitted, and the
+    /// listeners close once none is left in flight (see [`Server::drain_complete`]).
+    /// `force` (Python's `SGL_FORCE_SHUTDOWN`) closes them without waiting, as
+    /// does a failed last health probe. Idempotent.
+    #[pyo3(signature = (force = false))]
+    pub fn begin_drain(&self, force: bool) {
+        self.rt.begin_drain(force);
+    }
+
+    /// Whether a drain has begun and every listener has closed since: the
+    /// scheduler may stop.
+    pub fn drain_complete(&self) -> bool {
+        self.rt.drain_complete()
+    }
+
+    /// Begin the drain from a runtime thread whenever signal `signum` is
+    /// caught: returns a non-blocking fd for `signal.set_wakeup_fd`, which
+    /// stays open for the life of the process. Unlike a Python signal handler,
+    /// this does not wait for the scheduler thread. Once the drain's listeners
+    /// have closed, a datagram goes to the abstract Unix socket `notify`.
+    #[pyo3(signature = (signum, force = false, notify = None))]
+    pub fn drain_signal_fd(
+        &self,
+        signum: u8,
+        force: bool,
+        notify: Option<String>,
+    ) -> PyResult<i32> {
+        use std::os::fd::IntoRawFd;
+
+        self.rt
+            .drain_signal_fd(signum, force, notify)
+            .map(IntoRawFd::into_raw_fd)
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
+    }
+
     /// Signal all threads to stop (best effort).
     pub fn shutdown(&self) {
         self.rt.request_shutdown();
@@ -287,10 +343,12 @@ impl Server {
 }
 
 impl Server {
-    /// [`Server::start`], with `http_layer` wrapping the HTTP app (see
-    /// [`HttpLayer`]).
+    /// [`Server::start`] with a model package's extensions, the boot of the
+    /// package's own server class: `http_layer` wraps the HTTP app (see
+    /// [`HttpLayer`]), and `generate_hook` adds the package's keys to native
+    /// `/generate` frames (see [`GenerateHook`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn start_with_http_layer(
+    pub fn start_with_extensions(
         server_args: ServerArgs,
         port_offset: Option<u16>,
         to_scheduler_cap: usize,
@@ -298,6 +356,7 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
         http_layer: Option<HttpLayer>,
+        generate_hook: Option<Arc<dyn GenerateHook>>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -322,8 +381,10 @@ impl Server {
                 stage_channel_cap,
                 cores,
                 metrics_listener: port_offset.unwrap_or(0) == 0,
+                ..Default::default()
             },
             server_args: std::sync::Arc::new(server_args),
+            generate_hook,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;

@@ -34,7 +34,7 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -72,24 +72,43 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     return dsv4_prefill_backend == "flashmla_sparse_q8"
 
 
-class SparsePrefillWorkspace:
+class SparsePrefillKVBuffer:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    The workspace contents are fully overwritten before every attention call,
-    so token buckets and compression ratios can safely share one buffer. Sparse
-    prefill executes eagerly and serially on the supported paths, which makes it
-    safe to replace the scratch allocation when a larger extent is needed.
+    Callers overwrite the rows they read, except head rows ``get_with_head``
+    reports as filled, so token buckets and compression ratios can safely share
+    one buffer. Sparse prefill executes eagerly and serially on the supported
+    paths, which makes it safe to replace the scratch allocation when a larger
+    extent is needed.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        self._head_source: Optional[tuple] = None
 
     def get(
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
+        self._head_source = None
+        return self._reserve(num_tokens, dtype)
+
+    def get_with_head(
+        self, num_tokens: int, head_source: tuple
+    ) -> Tuple[torch.Tensor, bool]:
+        """Returns the rows and whether the head already holds ``head_source``."""
+        buffer = self._reserve(num_tokens, torch.bfloat16)
+        head_filled = head_source == self._head_source
+        self._head_source = head_source
+        return buffer, head_filled
+
+    def forget_head(self) -> None:
+        """Per forward: the next forward's tensors may reuse freed addresses."""
+        self._head_source = None
+
+    def _reserve(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
@@ -99,6 +118,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self._head_source = None
         return self._buffer[:num_tokens]
 
 

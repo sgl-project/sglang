@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import torch
 
+import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
 import sglang.srt.layers.moe.topk as topk_mod
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import (
@@ -18,7 +19,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _IS_HIP = is_hip()
@@ -126,6 +127,24 @@ class TestTopkPaddedRegion(CustomTestCase):
                 torch.tensor(4.0, device=self.DEVICE, dtype=torch.float32),
                 0.0,
             )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "fused padded-row fill needs a GPU")
+class TestFillPaddedRowsStrided(CustomTestCase):
+    def test_matches_eager(self):
+        # A cap of 3 takes the strided branch from 6 rows and hits every residue.
+        with patch.object(fill_mod, "_MAX_PROGRAMS", 3):
+            for rows in range(1, 14):
+                for n_valid in range(rows + 3):
+                    self._check(rows, 8, n_valid)
+        self._check(4096, 1024, 4000)  # the strided branch at the real cap
+
+    def _check(self, rows, cols, n_valid):
+        x = torch.randn((rows, cols), device="cuda").to(torch.bfloat16)
+        count = torch.tensor([n_valid], device="cuda", dtype=torch.int32)
+        expected = _eager_fill_padded_rows(x, count, 0.0)
+        _fill_padded_rows(x, count, 0.0)
+        self.assertTrue(torch.equal(x, expected))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")

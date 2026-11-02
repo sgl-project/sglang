@@ -36,7 +36,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ERROR_MSG = (
     "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens)."
@@ -281,6 +281,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req = _make_req()
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
+            uocr_doc_hooks=None,
             disaggregation_mode=DisaggregationMode.NULL,
             waiting_queue=[],
             processed_tokens_counter=0,

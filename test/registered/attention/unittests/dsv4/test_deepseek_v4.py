@@ -12,7 +12,6 @@ extra-K softmax reference. Compressor math correctness (i.e. verifying the
 gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
-import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -20,13 +19,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-_FLASH_MLA_AVAILABLE = (
-    importlib.util.find_spec("sgl_kernel") is not None
-    and importlib.util.find_spec("sgl_kernel.flash_mla") is not None
-)
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
@@ -46,13 +38,13 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-@unittest.skipIf(not _FLASH_MLA_AVAILABLE, "flash_mla is required for DSV4 SWA")
 class TestDSV4AttentionBackendCorrectness(CustomTestCase):
     CASES = make_dsv4_cases("dsv4")
     CUDA_GRAPH_DECODE_CASES = (
@@ -661,14 +653,21 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             self._make_core_metadata(0), indexer_metadata=None
         )
         capture_metadata.sparse_prefill_cache = object()
+        captured_swa_loc = torch.zeros(2, dtype=torch.int32)
+        capture_metadata.core_attn_metadata.swa_out_cache_loc = captured_swa_loc
         replay_metadata = DSV4Metadata(
             self._make_core_metadata(1000), indexer_metadata=None
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend.prefill_candidates = object.__new__(DenseBlocksBackend)
-        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.token_to_kv_pool = SimpleNamespace(
+            request_window=None,
+            swa_req_ring_size=None,
+            translate_loc_from_full_to_swa=lambda loc: loc + 100,
+        )
         backend.low_ratios = ()
+        backend.has_c4 = backend.has_c128 = True
         calls = []
 
         def fake_build_forward_metadata(
@@ -679,7 +678,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend._build_forward_metadata = fake_build_forward_metadata
         forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
-        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(
+            name="static",
+            max_seq_len_override=None,
+            out_cache_loc=torch.tensor([5, 6], dtype=torch.int64),
+        )
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
@@ -692,6 +695,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertTrue(calls[0][2])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
+        # The captured layer stores read the SWA locations by address.
+        self.assertIs(
+            capture_metadata.core_attn_metadata.swa_out_cache_loc, captured_swa_loc
+        )
+        self.assertEqual(captured_swa_loc.tolist(), [105, 106])
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
@@ -723,12 +731,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
 
-    def test_sparse_prefill_workspace_reuses_and_grows(self):
+    def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-            SparsePrefillWorkspace,
+            SparsePrefillKVBuffer,
         )
 
-        workspace = SparsePrefillWorkspace(torch.device("cpu"))
+        workspace = SparsePrefillKVBuffer(torch.device("cpu"))
         first = workspace.get(3)
         reused = workspace.get(2)
         grown = workspace.get(7)

@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.ops.attention.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
+    minimax_qknorm_rope_grouped_fp8,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -170,6 +171,59 @@ def test_combined_main_index_grouped(nq, nkv, niq, idx_v, T, pos_dtype):
         assert (
             out[:, off_ik + 1 :].float() - x[:, off_ik + 1 :].float()
         ).abs().max() == 0.0
+
+
+# Input scale cancels in the norm, so the Q gain is what reaches the E4M3 edges:
+# 1000 pushes most values past 448, -1 + 2^-8 puts them in the subnormal range.
+@pytest.mark.parametrize(
+    "nq,nk,niq,q_gain",
+    [(8, 1, 4, 1000.0), (8, 1, 4, -1.0 + 2**-8), (64, 8, 16, None)],
+)
+def test_fp8_epilogue_matches_bf16_cast(nq, nk, niq, q_gain):
+    """The FP8 Q outputs equal the BF16 result cast by `Tensor.to`, bit for bit,
+    and the BF16 write-back is unchanged by the epilogue."""
+    torch.manual_seed(11)
+    T, max_pos = 64, 8192
+    cache = _build_cache(max_pos)
+    positions = torch.randint(0, max_pos, (T,), device=dev, dtype=torch.int32)
+    weights = [torch.randn(HEAD_DIM, device=dev).bfloat16() * 0.1 for _ in range(4)]
+    if q_gain is not None:
+        # The kernel applies 1 + weight, so this sets the gain of both Q groups.
+        weights[0] = weights[2] = torch.full_like(weights[0], q_gain)
+    off_iq = nq + 2 * nk
+    groups = list(zip(weights, (0, nq, off_iq, off_iq + niq), (nq, nk, niq, 1)))
+    base = torch.randn(T, (off_iq + niq + 1) * HEAD_DIM, device=dev).bfloat16()
+
+    bf16_only = base.clone()
+    minimax_qknorm_rope_grouped(bf16_only, groups, cache, positions, EPS)
+    with_fp8 = base.clone()
+    fp8_q = torch.empty(T, nq, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev)
+    fp8_idx_q = torch.empty(T, niq, HEAD_DIM, dtype=torch.float8_e4m3fn, device=dev)
+    minimax_qknorm_rope_grouped_fp8(
+        with_fp8,
+        groups,
+        cache,
+        positions,
+        EPS,
+        fp8_a=fp8_q,
+        group_a=0,
+        fp8_b=fp8_idx_q,
+        group_b=2,
+    )
+
+    assert torch.equal(bf16_only, with_fp8)
+    rows = with_fp8.reshape(T, -1, HEAD_DIM)
+    q_abs = rows[:, :nq].float().abs()
+    if q_gain is not None and q_gain > 0:
+        assert (q_abs > 448).any(), "the case never leaves the E4M3 range"
+    elif q_gain is not None:
+        assert ((q_abs > 0) & (q_abs < 2**-6)).any(), "no subnormal E4M3 values"
+    for out, expected in (
+        (fp8_q, rows[:, :nq]),
+        (fp8_idx_q, rows[:, off_iq : off_iq + niq]),
+    ):
+        expected = expected.to(torch.float8_e4m3fn)
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
 
 
 if __name__ == "__main__":

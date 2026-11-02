@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBacken
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     CompressedGather,
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -184,7 +184,7 @@ def _make_backend(
         sparse_prefill_cache=None, late_layer_tail=None
     )
     backend.req_to_token = req_to_token
-    backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
+    backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(device)
     backend.softmax_scale = 512**-0.5
     backend.head_dim_v = 512
     backend.dsv4_prefill_backend = dsv4_prefill_backend
@@ -437,36 +437,26 @@ def _patched_sparse_kernels(
         )
         return out, meta, meta
 
-    sgl_kernel_pkg = types.ModuleType("sgl_kernel")
-    flash_mla_mod = types.ModuleType("sgl_kernel.flash_mla")
-    flash_mla_mod.flash_mla_sparse_fwd = fake_flash_mla_sparse_fwd
-    sgl_kernel_pkg.flash_mla = flash_mla_mod
-
     q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
     q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
     q8_mod.q8kv8_padded_num_heads = q8kv8_padded_num_heads
     q8_mod.cast_q_fp8_for_q8kv8_prefill = cast_q_fp8_for_q8kv8_prefill
 
-    old_modules = {
-        name: sys.modules.get(name)
-        for name in (
-            "sgl_kernel",
-            "sgl_kernel.flash_mla",
-            q8_module_name,
-        )
-    }
-    sys.modules["sgl_kernel"] = sgl_kernel_pkg
-    sys.modules["sgl_kernel.flash_mla"] = flash_mla_mod
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    old_q8_module = sys.modules.get(q8_module_name)
+    old_flash_mla_sparse_fwd = flash_mla_interface.flash_mla_sparse_fwd
+    flash_mla_interface.flash_mla_sparse_fwd = fake_flash_mla_sparse_fwd
     sys.modules[q8_module_name] = q8_mod
     try:
         yield
     finally:
-        for name, old_value in old_modules.items():
-            if old_value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = old_value
+        flash_mla_interface.flash_mla_sparse_fwd = old_flash_mla_sparse_fwd
+        if old_q8_module is None:
+            sys.modules.pop(q8_module_name, None)
+        else:
+            sys.modules[q8_module_name] = old_q8_module
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
@@ -729,11 +719,10 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
 @pytest.mark.parametrize("ratio", [0, 1, 2, 4, 128])
 @pytest.mark.parametrize("scenario", ["first", "next", "replay", "tail", "large"])
 def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
-    from sgl_kernel.flash_mla import (
+    from sglang.kernels.ops.attention.flash_mla_interface import (
         FlashMLASchedMeta,
         flash_mla_with_kvcache,
     )
-
     from sglang.srt.mem_cache.dsv41_request_window import window_layout
     from sglang.srt.runtime_context import get_platform
 
