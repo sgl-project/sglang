@@ -166,6 +166,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if self.enable_torch_compile:
             set_torch_compile_config()
 
+        # Select device capabilities before allocating static inputs.
+        self.backend = resolve_decode_backend(self)
+
         # Static buffers
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -294,8 +297,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         # Capture
         try:
             with model_capture_mode():
@@ -323,7 +324,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # Helpers
     # -----------------------------------------------------------------
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
         # variant_label is _GREEDY_VARIANT or None.

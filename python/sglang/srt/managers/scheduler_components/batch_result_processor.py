@@ -83,7 +83,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+        UocrSchedulerRuntime,
+    )
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -152,7 +154,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
-    uocr_doc_hooks: Optional[UocrDocHooks] = None
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -423,8 +425,8 @@ class SchedulerBatchResultProcessor:
                             req, up_to_tick=batch.forward_iter
                         )
                     elif (
-                        self.uocr_doc_hooks is not None
-                        and self.uocr_doc_hooks.consume_spliced_prefill(req)
+                        self.uocr_runtime is not None
+                        and self.uocr_runtime.consume_spliced_prefill(req)
                     ):
                         # The overlap pages' text is already the first outputs.
                         req.update_finish_state()

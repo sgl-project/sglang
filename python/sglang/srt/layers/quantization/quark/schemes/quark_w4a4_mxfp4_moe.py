@@ -45,8 +45,12 @@ logger = logging.getLogger(__name__)
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = is_gfx95_supported()
+# This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
+# MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
+_use_aiter = _is_hip and (
+    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+)
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _use_aiter:
@@ -980,9 +984,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if _use_triton_w4a16:
             self._process_weights_triton_w4a16(layer)
             return
-        if not getattr(self, "_owns_moe_runner", False):
+        if not getattr(self, "_owns_moe_weight_layout", False):
             raise RuntimeError(
-                "Quark MXFP4 weight preshuffling requires an owned AITER runner."
+                "Quark MXFP4 weight preshuffling requires a backend that owns "
+                "the resulting weight layout."
             )
 
         if (
@@ -1074,6 +1079,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 )
             )
 
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1084,15 +1093,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         self._owns_moe_runner = False
+        self._owns_moe_weight_layout = False
         if _use_triton_w4a16:
             return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
-        if moe_runner_backend.is_aiter():
+        if moe_runner_backend.is_gluon():
+            # Gluon consumes the serialized MXFP4 weights through the
+            # whole-layer DeepseekV2MoE backend before this scheme's ordinary
+            # routed-expert apply path.
+            self.runner = None
+            self._owns_moe_weight_layout = True
+        elif moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
+            self._owns_moe_weight_layout = True
         else:
             raise NotImplementedError(
                 "Quark MXFP4 MoE currently requires the AITER runner; "

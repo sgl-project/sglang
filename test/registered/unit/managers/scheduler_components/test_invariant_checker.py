@@ -206,7 +206,9 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             pool_stats_observer=observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_chunked_req=lambda: self.chunked_req,
+            get_request_lists=lambda: {
+                "chunked": [] if self.chunked_req is None else [self.chunked_req]
+            },
             scheduler_stage_metrics=None,
         )
 

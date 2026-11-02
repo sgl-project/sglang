@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
         BaseIndexerMetadata,
     )
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
@@ -249,6 +250,12 @@ class AttentionBackend(ABC):
     # captures depends on the context length.
     prefill_cuda_graph_default_max_seq_len: Optional[int] = None
     dllm_attention = None
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        """Decode graph variants to capture, or None for one graph per batch size."""
+        return None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.

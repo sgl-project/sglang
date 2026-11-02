@@ -47,7 +47,7 @@ class SchedulerLoadInquirer:
     get_stats: Callable
     get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
-    get_disagg_prefill_inflight_queue: Callable
+    get_disagg_prefill_transfer_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
@@ -189,7 +189,7 @@ class SchedulerLoadInquirer:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
-            prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
+            prefill_inflight = len(self.get_disagg_prefill_transfer_queue())
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
             decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)

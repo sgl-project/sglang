@@ -328,6 +328,28 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
         # the target's tactics when the draft worker loads; load and save them by hand.
         tuner = AutoTuner.get()
+        if (
+            reuse_cache
+            and not mr.is_draft_worker
+            and get_exec().moe.moe_runner_backend == "flashinfer_mxfp4"
+            and "flashinfer::trtllm_fp4_block_scale_moe" not in skip_ops
+        ):
+            from sglang.srt.layers.moe.flashinfer_kimi_k3_tactics import (
+                load_kimi_k3_prefill_tactics,
+            )
+
+            # Load serving-derived defaults first: an explicit user cache below
+            # must retain precedence, including a differently tuned 16K bucket.
+            load_kimi_k3_prefill_tactics(
+                tuner,
+                model_type=mr.model_config.hf_config.model_type,
+                tp_size=get_parallel().tp_size,
+                pp_size=get_parallel().pp_size,
+                ep_size=get_parallel().moe_ep_size,
+                chunk_size=max_prefill_buffer_tokens(),
+                dtype=mr.dtype,
+                device=mr.device,
+            )
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
         mega_context = empty_context()
