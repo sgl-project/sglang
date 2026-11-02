@@ -651,8 +651,11 @@ class KVStorage:
 
     def tree_slots(self) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slot per sub-pool, in the order the tree drives
-        their eviction; a window slot keeps the window's retained length."""
-        return self._plan.tree_slots(window_reaches=self._window_reaches)
+        their eviction; a window slot keeps the window's retained length
+        (`retained_window_lengths`). A window the model leaves unstated has
+        none until its length is bound, which the builder does before any
+        tree is built."""
+        return self._plan.tree_slots(window_lengths=self._retained_lengths())
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
@@ -737,6 +740,14 @@ class KVStorage:
         the window its layers declare, widened by a reader reaching further
         back. The prefix tree retains, backs up and restores this much, a PD
         peer sends it, and a decode node binds and receives it."""
+        lengths = self._retained_lengths()
+        for s in self._plan.sub_pools:
+            if isinstance(s.lifetime, WindowLifetime) and s.name not in lengths:
+                raise ValueError(f"window {s.name!r} states no retention length")
+        return lengths
+
+    def _retained_lengths(self) -> Dict[str, int]:
+        """`retained_window_lengths` for the windows whose length is known."""
         lengths = {}
         for s in self._plan.sub_pools:
             if isinstance(s.lifetime, WindowLifetime):
@@ -745,9 +756,8 @@ class KVStorage:
                     if s.lifetime.window is not None
                     else self._unstated_window
                 )
-                if window is None:
-                    raise ValueError(f"window {s.name!r} states no retention length")
-                lengths[s.name] = max(window, self._window_reaches.get(s.name, 0))
+                if window is not None:
+                    lengths[s.name] = max(window, self._window_reaches.get(s.name, 0))
         return lengths
 
     def window_tails(

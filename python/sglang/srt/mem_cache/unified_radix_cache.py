@@ -4134,10 +4134,6 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return swa.sliding_window_size
 
-    def window_retain_size(self, sub_pool: str) -> int:
-        """Resolved retained history used by this window's readers and cache."""
-        return self.components[self.window_slot_of(sub_pool)].sliding_window_size
-
     def swa_retain_floor(self, req, *, window=None) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:
             return None
@@ -4212,10 +4208,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._window_sub_pools_by_slot()[slot]
 
     def window_sub_pools(self) -> tuple[tuple[str, int], ...]:
-        return tuple(
-            (name, self.components[slot].sliding_window_size)
-            for slot, name in self._window_sub_pools_by_slot().items()
-        )
+        """This tree keeps a slot for every window it retains."""
+        return self.window_lengths()
+
+    def window_retain_size(self, sub_pool: str) -> int:
+        """The tail a running request keeps of ``sub_pool`` (`window_lengths`)."""
+        return dict(self.window_lengths())[sub_pool]
 
     def _sub_pool_roles(self):
         return self.token_to_kv_pool_allocator.sub_pool_roles()
