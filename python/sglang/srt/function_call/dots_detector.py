@@ -44,10 +44,6 @@ class DotsToolDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<dots_function_call>"
         self.eot_token = "</dots_function_call>"
-        self.func_call_regex = re.compile(
-            rf"{re.escape(self.bot_token)}\s*(.*?)\s*{re.escape(self.eot_token)}",
-            re.DOTALL,
-        )
         self.invoke_regex = re.compile(
             r"<invoke\s+name\s*=\s*(?P<name>[^>]+)>(?P<body>.*?)</invoke>",
             re.DOTALL,
@@ -177,6 +173,18 @@ class DotsToolDetector(BaseFormatDetector):
             raise TypeError("dots JSON tool call must be an object")
         return [parsed]
 
+    def _iter_blocks(self, text: str):
+        # Linear scan on purpose: a `bot\s*(.*?)\s*eot` regex backtracks
+        # cubically over whitespace when the end marker never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            content_start = start + len(self.bot_token)
+            end = text.find(self.eot_token, content_start)
+            if end == -1:
+                return
+            yield text[content_start:end]
+            start = text.find(self.bot_token, end + len(self.eot_token))
+
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
@@ -186,9 +194,9 @@ class DotsToolDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
         calls: list[ToolCallItem] = []
-        for block in self.func_call_regex.finditer(text):
+        for block in self._iter_blocks(text):
             try:
-                for parsed in self._parse_block(block.group(1), tools):
+                for parsed in self._parse_block(block, tools):
                     calls.extend(self.parse_base_json(parsed, tools))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 logger.warning("Failed to parse dots tool call: %s", exc)
