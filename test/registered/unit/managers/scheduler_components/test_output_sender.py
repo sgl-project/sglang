@@ -44,6 +44,30 @@ class TestSenderWrapper(CustomTestCase):
             worker_ipc, routed_output
         )
 
+    @patch(
+        "sglang.srt.managers.scheduler_components.output_sender.sock_send_with_timestamp"
+    )
+    @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
+    def test_default_sender_keeps_single_frame_path(
+        self, mock_sock_send, mock_timestamped_send
+    ):
+        SenderWrapper(MagicMock()).send_output(AbortReq(rid="off"))
+
+        mock_sock_send.assert_called_once()
+        mock_timestamped_send.assert_not_called()
+
+    @patch(
+        "sglang.srt.managers.scheduler_components.output_sender.sock_send_with_timestamp"
+    )
+    @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
+    def test_timestamped_sender_uses_multipart_path(
+        self, mock_sock_send, mock_timestamped_send
+    ):
+        SenderWrapper(MagicMock(), timestamped=True).send_output(AbortReq(rid="on"))
+
+        mock_timestamped_send.assert_called_once()
+        mock_sock_send.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
