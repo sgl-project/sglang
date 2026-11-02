@@ -5,6 +5,7 @@ while importing sglang, and an eager init outlasts uvicorn's worker healthcheck.
 
 import multiprocessing
 import os
+import sys
 
 import pytest
 
@@ -50,3 +51,7 @@ def test_spawned_worker_inherits_lazy(monkeypatch):
     proc.start()
     assert queue.get(timeout=60) == "LAZY"
     proc.join(timeout=60)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
