@@ -868,10 +868,8 @@ struct TopKStreaming : TopKRadixBase<12> {
 // CUDA only: thread-block clusters and distributed shared memory have no CDNA
 // equivalent.
 //
-// Still truncates an overflowing threshold bin, unlike the register, streaming
-// and ROCm split paths: the candidate set is split across kClusterSize ranks
-// and no single block resolves the row, so refining needs cluster-wide
-// histogram and emit counters rather than the block-local ones refine_ties uses.
+// When the threshold bin overflows, rank 0 retries the row with the exact
+// streaming path. All ranks preserve their true candidate counts until then.
 // ---------------------------------------------------------------------------
 
 #if SUPPORT_CLUSTER
@@ -896,6 +894,23 @@ struct TopKCluster : TopKRadixBase<10> {
     };
     TieValue tie_values[kMaxNumTie];
   };
+  static_assert(sizeof(Smem) >= sizeof(TopKStreaming::Smem));
+  static_assert(alignof(Smem) >= alignof(TopKStreaming::Smem));
+
+  SGL_DEVICE static bool handle_overflow(TopKProblem problem, Smem* smem) {
+    const auto cluster = cooperative_groups::this_cluster();
+    const auto smem_0 = cluster.map_shared_rank(smem, 0);
+    const bool overflow = smem_0->count_eq > kMaxNumTie;
+    // Peers must not reuse or retire DSMEM while rank 0 reads the count.
+    cluster.sync();
+    if (!overflow) return false;
+    if (blockIdx.y == 0) {
+      // The cluster scan already waited for the producer through PDL.
+      TopKStreaming::forward<false>(problem, smem);
+    }
+    cluster.sync();
+    return true;
+  }
 
   SGL_DEVICE static void barrier_cluster_arrive_relaxed() {
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
@@ -976,7 +991,7 @@ struct TopKCluster : TopKRadixBase<10> {
       });
       __syncthreads();
       const auto local_count_gt = smem->count_gt;
-      const auto local_count_eq = min(smem->count_eq, kMaxNumTie);
+      const auto local_count_eq = smem->count_eq;
       if (tx == 0) {
         const auto gt = atomicAdd(&smem_0->count_gt, local_count_gt);
         const auto eq = atomicAdd(&smem_0->count_eq, local_count_eq);
@@ -995,6 +1010,8 @@ struct TopKCluster : TopKRadixBase<10> {
       }
 
       cluster.sync();  // bar 3
+
+      if (handle_overflow(problem, smem)) return;
 
       const auto start_write = local_start_gt;
       const auto num_write = local_count_gt;
@@ -1037,6 +1054,8 @@ struct TopKCluster : TopKRadixBase<10> {
       });
 
       cluster.sync();  // bar-3
+
+      if (handle_overflow(problem, smem)) return;
 
       // Phase 4: Handle ties.
       const auto count_gt = smem->count_gt;
