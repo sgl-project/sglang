@@ -138,6 +138,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    "--hicache-storage-backend",
+    "npu_memcache",
+    "--hicache-storage-backend-extra-config",
+    '{"meta_service_url":"tcp://127.0.0.1:5007", "config_store_url":"tcp://127.0.0.1:6007", "log_level":"info", "world_size":8, "protocol": "device_sdma", "dram_size": "20GB"}'
 ]
 
 # Decode node launch arguments.

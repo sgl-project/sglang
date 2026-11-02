@@ -233,10 +233,10 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiN
     dataset_path = None
     input_len = 131072
     output_len = 1024
-    # num_prompts = 90
-    # max_concurrency = 54
-    num_prompts = 20
-    max_concurrency = 10
+    num_prompts = 90
+    max_concurrency = 54
+    # num_prompts = 20
+    # max_concurrency = 10
     random_range_ratio = 1
     request_rate = 3
     repeat_rate = 0.9
