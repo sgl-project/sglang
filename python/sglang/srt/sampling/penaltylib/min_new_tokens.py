@@ -4,6 +4,16 @@ from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils.common import is_pin_memory_available
 
 
+def _stop_token_ids(req) -> set:
+    ids = (req.sampling_params.stop_token_ids or set()) | (req.eos_token_ids or set())
+    tok = req.tokenizer
+    if tok is not None:
+        ids |= tok.additional_stop_token_ids or set()
+        if tok.eos_token_id is not None:
+            ids.add(tok.eos_token_id)
+    return ids
+
+
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
     Min new tokens penalizer penalizes tokens based on the length of the output.
@@ -15,13 +25,25 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )
 
     def _prepare(self):
+        reqs = self.orchestrator.reqs()
+        if not reqs:
+            self.min_new_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            self.stop_token_penalties = torch.zeros(
+                (0, self.orchestrator.vocab_size),
+                dtype=torch.float32,
+                device=self.orchestrator.device,
+            )
+            self.len_output_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            return
+
         pin_memory = is_pin_memory_available(self.orchestrator.device)
         self.min_new_tokens = (
             torch.tensor(
-                data=[
-                    req.sampling_params.min_new_tokens
-                    for req in self.orchestrator.reqs()
-                ],
+                data=[req.sampling_params.min_new_tokens for req in reqs],
                 dtype=torch.int32,
                 pin_memory=pin_memory,
             )
@@ -34,21 +56,12 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 torch.tensor(
                     data=[
                         token_id
-                        for token_id in (
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.eos_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | (
-                                {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
-                                else set()
-                            )
-                        )
+                        for token_id in _stop_token_ids(req)
                         if token_id is not None
                     ],
                     dtype=torch.int64,
                 )
-                for req in self.orchestrator.reqs()
+                for req in reqs
             ],
             batch_first=True,
             padding_value=self.orchestrator.vocab_size,
@@ -59,7 +72,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             self.orchestrator.device, non_blocking=True
         )
         self.stop_token_penalties = torch.zeros(
-            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
+            size=(len(reqs), self.orchestrator.vocab_size + 1),
             dtype=torch.float32,
             device=self.orchestrator.device,
         ).scatter_add_(
@@ -74,7 +87,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         )[:, : self.orchestrator.vocab_size]
 
         self.len_output_tokens = torch.zeros(
-            size=(len(self.orchestrator.reqs()), 1),
+            size=(len(reqs), 1),
             dtype=torch.int32,
             device=self.orchestrator.device,
         )
