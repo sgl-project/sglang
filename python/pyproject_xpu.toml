@@ -44,7 +44,8 @@ dependencies = [
   "outlines_core==0.1.26",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",

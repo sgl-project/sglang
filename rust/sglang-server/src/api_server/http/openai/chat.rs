@@ -41,15 +41,17 @@ use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media,
+    contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
+    submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreEvent, CoreOutput};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::multimodal::MmItem;
+use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
@@ -117,13 +119,13 @@ async fn chat_completions(
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "image, audio, video, and file message content is not supported",
-            false,
-        );
-    }
+    let images = match chat_images(
+        &request.messages,
+        state.server_args.model_config.is_multimodal,
+    ) {
+        Ok(images) => images,
+        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+    };
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
@@ -317,6 +319,12 @@ async fn chat_completions(
             // Python's thinking mode: the grammar starts after the reasoning,
             // which the scheduler also counts.
             require_reasoning: reasoning_options.force_reasoning == Some(true),
+            mm: (!images.is_empty()).then(|| {
+                Box::new(MmData {
+                    image_data: images.clone(),
+                    ..Default::default()
+                })
+            }),
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -366,6 +374,24 @@ async fn chat_completions(
         )
         .await
     }
+}
+
+/// The chat's images for the multimodal pipeline, in the order Python's
+/// `process_content_for_template_format` collects them, or why the request is
+/// refused: only a multimodal model takes media, and only images so far.
+fn chat_images<T: serde::Serialize>(
+    messages: &T,
+    is_multimodal: bool,
+) -> Result<Vec<MmItem>, String> {
+    let messages = serde_json::to_value(messages).unwrap_or_default();
+    if !contains_media(&messages) {
+        return Ok(Vec::new());
+    }
+    if !is_multimodal || contains_non_image_media(&messages) {
+        return Err("image, audio, video, and file message content is not supported".into());
+    }
+    let images = sglang_processor::extract_images(&messages)?;
+    Ok(images.into_iter().map(MmItem::Source).collect())
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
@@ -1105,8 +1131,8 @@ mod tests {
         post_json,
     };
     use super::{
-        OutputParsing, SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
@@ -1123,6 +1149,35 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    /// Images ride along in Python's order; other media, or any media for a
+    /// text-only model, is refused.
+    #[test]
+    fn chat_images_follow_python_and_refuse_other_media() {
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let messages = serde_json::json!([
+            {"role": "user", "content": [image("a"), {"type": "text", "text": "x"}]},
+            {"role": "user", "content": "plain"},
+            {"role": "user", "content": [image("b")]},
+        ]);
+        let urls: Vec<String> = chat_images(&messages, true)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.source().unwrap().to_owned())
+            .collect();
+        assert_eq!(urls, ["a", "b"]);
+        assert!(chat_images(&messages, false).is_err());
+        let video = serde_json::json!([{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "v"}}
+        ]}]);
+        assert!(chat_images(&video, true).is_err());
+        let text = serde_json::json!([{"role": "user", "content": "plain"}]);
+        assert!(chat_images(&text, false).unwrap().is_empty());
+        let no_url = serde_json::json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": null, "uuid": "cached"}
+        ]}]);
+        assert!(chat_images(&no_url, true).is_err());
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

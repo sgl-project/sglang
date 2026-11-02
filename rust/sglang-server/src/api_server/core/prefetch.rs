@@ -9,7 +9,7 @@
 //! may check a request's media first and resolve URI schemes of its own (see
 //! [`MmProcessor::fetch_media`]). Resolved bytes ride out-of-band as
 //! [`crate::message::request::MmData::prefetched`], which
-//! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
+//! [`crate::multi_modality::payload::resolve_media_work`] swaps back in.
 
 use std::sync::{Arc, LazyLock};
 

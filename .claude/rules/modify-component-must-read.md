@@ -7,4 +7,5 @@ Before modifying the following components, read the listed skill first.
 - **Any edit to a frozen core file** (currently `python/sglang/srt/model_executor/model_runner.py`) → [`large-class-style`](../skills/large-class-style/SKILL.md)
 - **Environment variables** (adding, renaming, or reviewing any `SGLANG_*` env var, migrating a legacy `SGL_*` alias, or touching `python/sglang/srt/environ.py`) → [`env-var-conventions`](../skills/env-var-conventions/SKILL.md)
 - **Chat rendering in `rust/sglang-processor`** (adding or changing a model under `rust/sglang-processor/src/render/`, or its parity fixtures) → [`processor-model-parity`](../skills/processor-model-parity/SKILL.md)
+- **Multimodal preprocessing in `rust/sglang-processor`** (anything under `rust/sglang-processor/src/mm/`, its `mm_parity` fixtures, or a `dynamo-multimodal` bump) → [`processor-mm-parity`](../skills/processor-mm-parity/SKILL.md)
 - **Scripted runtime** (anything related to the scripted runtime) → [`scripted-runtime-notes`](../skills/scripted-runtime-notes/SKILL.md)
