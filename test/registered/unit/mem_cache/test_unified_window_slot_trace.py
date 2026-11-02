@@ -117,6 +117,20 @@ def _sizes(cache, storage):
     }
 
 
+def _reprefill(cache):
+    """Tokens a match must leave to re-prefill when a matched window cannot be
+    reused as is (forced on: the decoder's bounded window replay)."""
+    read = getattr(cache, "window_reprefill_tail_tokens", None)
+    if read is None:
+        read = cache.swa_reprefill_tail_tokens
+    saved = cache.decoder_swa_bounded_replay
+    cache.decoder_swa_bounded_replay = True
+    try:
+        return read(None)
+    finally:
+        cache.decoder_swa_bounded_replay = saved
+
+
 def _tree_script(windows, backend):
     """Inserts, matches, locks and evictions; every result by name."""
     from sglang.srt.mem_cache.base_prefix_cache import (
@@ -136,7 +150,12 @@ def _tree_script(windows, backend):
         cut = rng.choice((16, 32, 48))
         tail = [20_000 + 100 * i + j for j in range(rng.choice((8, 16, 24)))]
         seqs.append(trunk[:cut] + tail)
-    out = {"backend": _backend_of(cache), "windows": _windows_of(cache), "steps": []}
+    out = {
+        "backend": _backend_of(cache),
+        "windows": _windows_of(cache),
+        "reprefill": _reprefill(cache),
+        "steps": [],
+    }
     steps = out["steps"]
     for seq in seqs:
         key = RadixKey(array("q", seq))
@@ -358,6 +377,8 @@ def _record():
     record["linker/python/two/True"] = _linker_script((16, 8), "python", True)
     record["tree/python/two"] = _tree_script((16, 8), "python")
     record["decode/python/two"] = _decode_script((16, 8), "python")
+    record["tree/python/three"] = _tree_script((16, 8, 4), "python")
+    record["decode/python/three"] = _decode_script((16, 8, 4), "python")
     record["host_stack"] = _host_stack_script()
     return json.loads(json.dumps(record, sort_keys=True))
 
