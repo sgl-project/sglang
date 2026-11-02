@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.mm_utils import apply_caller_mm_hashes
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
@@ -1077,6 +1078,7 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        apply_caller_mm_hashes(mm_inputs=mm_inputs, mm_hashes=self.recv_req.mm_hashes)
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
