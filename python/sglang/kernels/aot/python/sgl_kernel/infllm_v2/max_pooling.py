@@ -14,9 +14,11 @@ def max_pooling_1d_varlen(
     stride: int = 16,
     total_q: int = -1,
 ) -> torch.Tensor:
-    """Variable-length 1D max pooling over packed sequences.
+    """Drop-in replacement for infllm_v2.max_pooling_1d_varlen.
 
-    Drop-in replacement for ``infllm_v2.max_pooling_1d_varlen``.
+    Input is a stage-1 score buffer (num_heads x total_q x max_k) whose key
+    axis is allocated rounded up to a multiple of 128, so the row stride is
+    the buffer's actual width (``input.shape[2]``).
     """
     assert input.dtype in (torch.float16, torch.bfloat16)
     assert cu_seqlens_q.dtype == torch.int32
@@ -29,7 +31,7 @@ def max_pooling_1d_varlen(
     cu_seqlens_k = cu_seqlens_k.contiguous()
     cache_lens = cache_lens.contiguous()
 
-    max_seqlen_k = max_context_len // stride
+    max_seqlen_k = input.shape[2]
     out_len = (max_context_len + block_size - 1) // block_size
 
     stride = block_size // stride
