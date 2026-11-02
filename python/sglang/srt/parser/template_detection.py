@@ -812,10 +812,7 @@ def _declare_python_template_parsers(server_args, template, needs) -> None:
 
 
 def _checkpoint_python_chat_template(server_args, template):
-    """The Python chat template replacing the checkpoint's ``template``, if any.
-
-    Mirrors TemplateManager's selection when ``--chat-template`` is not set.
-    """
+    """Resolve templates whose automatic parsers need config-aware matching."""
     from sglang.srt.parser.python_chat_template import (
         may_replace_jinja_template,
         resolve_python_chat_template,

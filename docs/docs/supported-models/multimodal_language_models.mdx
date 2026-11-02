@@ -46,6 +46,12 @@ in the GitHub search bar.
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVIDIA Nemotron 3.5 Parse</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nvidia/Nemotron-3.5-Parse</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Document-image parsing with text, layout classes, content-normalized bounding boxes, tables and charts.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--trust-remote-code</code>. MTP is not supported.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Qwen-VL</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-VL-235B-A22B-Instruct</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Alibaba's vision-language extension of Qwen; for example, Qwen2.5-VL (7B and larger variants) can analyze and converse about image content.</td>
@@ -443,3 +449,58 @@ python -m sglang.launch_server \
 ```
 
 If higher serving performance is required and a certain degree of accuracy loss is acceptable, you may choose to use other attention backends, and you can also enable features like CUDA Graph and Chunked Prefill for better performance, but note that the model will fall back to using causal attention instead of bidirectional attention.
+
+## Nemotron 3.5 Parse
+
+On NVIDIA CUDA, launch the BF16 checkpoint on one GPU. The checkpoint's custom
+configuration and image processor require `--trust-remote-code`.
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path nvidia/Nemotron-3.5-Parse --trust-remote-code \
+  --served-model-name nemotron-parse --context-length 16384 --host 127.0.0.1 --port 30000
+```
+
+<Note>
+Some two-column outputs on A100 and H100 differ in formatting or reading order,
+or omit a line. On A100, `--mm-attention-backend sdpa` passed the tested reference
+pages. A reliable H100 workaround has not been confirmed.
+</Note>
+
+Send one page per request using the published task prompt. Keep special tokens in
+the response because they encode the layout classes and bounding boxes.
+
+```python
+import base64
+from pathlib import Path
+
+import requests
+
+image = base64.b64encode(Path("page.png").read_bytes()).decode()
+response = requests.post(
+    "http://127.0.0.1:30000/generate",
+    json={
+        "text": "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>",
+        "image_data": "data:image/png;base64," + image,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 8744,
+            "repetition_penalty": 1.1,
+            "skip_special_tokens": False,
+        },
+    },
+    timeout=300,
+)
+response.raise_for_status()
+raw_output = response.json()["text"]
+print(raw_output)
+```
+
+Use the checkpoint's [postprocessing helpers](https://huggingface.co/nvidia/Nemotron-3.5-Parse#postprocessing)
+to render Markdown and extract structured blocks. Coordinates are normalized to
+the page content; scale x by the original image width and y by its height.
+The checkpoint's auxiliary MTP head is not used by this integration.
+
+You can also use `/v1/chat/completions` with the same task prompt and an
+`image_url` content part. Set `skip_special_tokens` to `false` to retain the layout
+tokens. The built-in Parse template preserves image attachments.
