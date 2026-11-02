@@ -16,7 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
@@ -24,9 +24,20 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -87,6 +98,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
         scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -307,6 +319,49 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
+
+    def test_cache_flush_while_paused_is_published_before_resume(self):
+        """A cache flush during a retract pause (the weight-update window) must be
+        published by the paused loop, not held until continue_generation."""
+        scheduler = self._new_scheduler()
+        scheduler.tree_cache = RadixCache.create_simulated(enable_kv_cache_events=True)
+        scheduler.tree_cache.take_events()  # Drop the construction-time clear.
+        published = []
+        scheduler.kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=None,
+            tree_cache=scheduler.tree_cache,
+            send_metrics_from_scheduler=None,
+            max_running_requests=1,
+            max_total_num_tokens=1,
+            get_stats=lambda: None,
+        )
+        scheduler.kv_events_publisher.enable_kv_cache_events = True
+        scheduler.kv_events_publisher.kv_event_publisher = SimpleNamespace(
+            publish=published.append
+        )
+        scheduler.grammar_manager = MagicMock(grammar_queue=[])
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+        scheduler.draft_worker = None
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        self.assertTrue(scheduler.flush_cache(empty_cache=False))
+        scheduler._record_scheduler_state_for_paused_engine()
+
+        self.assertEqual(
+            [type(e).__name__ for batch in published for e in batch.events],
+            ["AllBlocksCleared"],
+            "flush_cache while paused was not published by the paused loop",
+        )
 
     def test_inplace_does_not_drain_overlap_queue(self):
         """in_place should not process the overlap result_queue."""
