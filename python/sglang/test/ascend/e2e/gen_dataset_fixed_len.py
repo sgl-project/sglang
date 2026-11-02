@@ -342,18 +342,13 @@ def generate_gsm8k_shared_prefix_dataset(
 ):
     """Generate a natural-text shared-prefix dataset from GSM8K.
 
-    bench_serving's generated-shared-prefix dataset builds prompts from
-    random token ids, which the DSPARK draft cannot predict - the measured
-    acceptance length collapses to ~1.6 vs the dev-measured 3.9 on natural
-    text. This generator instead pads one GSM8K QA pool (natural text,
-    repeated cyclically) slightly past input_len and writes batch_size
-    identical rows, so bench_serving's random-mode truncation leaves every
-    request byte-identical - the same 100%-cache shape as the dev
-    acceptance dataset (sharegpt_natural_shared_131072_100cache_480.json),
-    whose divergence points sit beyond the truncation length on purpose.
-
-    Output is a JSON array in the ShareGPT "conversations" layout that
-    bench_serving --dataset-name random consumes via sample_random_requests.
+    Random-token prompts collapse the DSPARK draft acceptance; this
+    generator pads one GSM8K QA pool (natural text, repeated cyclically)
+    slightly past input_len and writes batch_size identical rows, so every
+    request shares the same prefix - the dev shared-prefix acceptance
+    shape. output_format selects the payload layout: "sharegpt" (JSON
+    array of conversations records) or "aisbench" (one jsonl line per
+    row, consumed by the GSM8KDataset loader).
     """
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 

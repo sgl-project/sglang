@@ -15,17 +15,12 @@ logger = logging.getLogger(__name__)
 # Pure-prefill acceptance scenario for Kimi-K3 W4A8 32P (4-node mix):
 # cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s.
 #
-# The server config reproduces the dev CPP acceptance environment
-# (prefill_prefix.sh CPP mode, the topology that measured 18.2 s on 128k
-# cold prefill): PP4 x TP16 x DP2 with layer partition 24,24,24,21,
-# chunked-prefill 16384 (8192 per DP), no DSPARK, radix disabled, decode
-# graphs off, overlap schedule off. Do NOT merge this config with the
-# decode scenario: run 39917316049 crashed a DSPARK + decode-graph server
-# when the pure-prefill memory tuning was applied to it - the scenarios
-# need mutually exclusive configs and separate cases. The mixed TP64/DP4
-# topology is architecturally slower for single-stream 128k prefill
-# (2246 tok/s run 39882825354, 1336 tok/s run 39944680878, vs 7188 tok/s
-# here) - knobs cannot close a 3.2x topology gap.
+# Server config reproduces the dev CPP acceptance environment (PP4 x
+# TP16 x DP2, layer partition 24,24,24,21, no DSPARK, radix disabled,
+# decode graphs off). The pure-prefill and pure-decode server configs are
+# mutually exclusive, so each scenario is its own case/server; the mixed
+# TP64/DP4 topology is architecturally slower for single-stream 128k
+# prefill (one DP attention domain) and cannot reach the SLO.
 register_npu_ci(
     est_time=3600,
     suite="",
@@ -45,8 +40,6 @@ KIMI_K3_W4A8_32P_ENVS = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_BUFFSIZE": "2000",
-    # Dev CPP reference (aisbench_prefill_20261017): ROUND2/PER512, FIA on,
-    # and the 4-stage PP layer partition.
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -71,13 +64,7 @@ KIMI_K3_W4A8_32P_PREFILL_ARGS = [
     "modelslim",
     "--dtype",
     "bfloat16",
-    # CPP topology (TP16 x PP4 x DP2, layer partition 24,24,24,21) - the
-    # dev acceptance configuration in which 128k cold prefill measured
-    # 18.2 s. The mixed TP64/DP4 topology is architecturally slower for a
-    # single-stream 128k prefill (one DP attention domain lights up):
-    # 2246 tok/s with the decode-tier extras (run 39882825354) and 1336
-    # tok/s with the pure-prefill tuning (run 39944680878) - knobs cannot
-    # close a 3.2x topology gap.
+    # CPP topology: PP4 x TP16 x DP2, layer partition 24,24,24,21.
     "--tp-size",
     16,
     "--pp-size",
@@ -126,8 +113,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1Prefill(TestNpuPerfMultiNodePdMixTestCase
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
     dataset_type = AISBENCHMARK_DATASET_GSM8K
-    # Must be None so run_aisbench() generates the exact-length GSM8K dataset;
-    # the base-class default would silently fall back to the raw ShareGPT file.
+    # None lets run_aisbench() generate the exact-length GSM8K dataset.
     dataset_path = None
     input_len = 131072
     output_len = 1

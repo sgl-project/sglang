@@ -52,12 +52,10 @@ REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
 # API_TYPE raw = /v1/completions with the prompt sent verbatim (no chat
-# template) - the layout every dev perf measurement uses (Perf-1015 section
-# 4.0: "AIS接口为 /v1/completions，不套 chat template"). Default chat keeps
-# the historical VLLMCustomAPIChatStream behaviour for existing cases.
+# template); default chat keeps the VLLMCustomAPIChatStream behaviour.
 API_TYPE="chat"
-# Dev fixed-decode suite warmup passes: WARMUP_DP requests at batch 1 fill
-# the shared prefix on every DP rank (round-robin), WARMUP_SHAPE=1 adds one
+# Unscored warmup passes: WARMUP_DP requests at batch 1 fill the shared
+# prefix on every DP rank (round-robin); WARMUP_SHAPE=1 adds one
 # full-shape unscored pass. Both are disabled by default.
 WARMUP_DP=0
 WARMUP_SHAPE=0
@@ -298,22 +296,16 @@ EOF
   echo "============== ${model_config_file} - End ================"
 }
 
-# $1 = config file name (default ${TMP_CFG}); $2 = batch size (default ${BATCH_SIZE}).
-# The PyPI ais_bench CLI (3.1.20260330 in the CI image) has no --batch-size
-# argument (the dev benchmark master build does), so the per-invocation
-# concurrency must come from the model config's batch_size field
-# (run 41190678541: "unrecognized arguments: --batch-size").
+# $1 = config file name (default ${TMP_CFG}); $2 = batch size (default
+# ${BATCH_SIZE}). The PyPI ais_bench CLI has no --batch-size argument, so
+# per-invocation concurrency comes from the model config's batch_size field.
 function gen_model_config_file_vllm_api_raw() {
   local raw_cfg_name=${1:-${TMP_CFG}}
   local raw_cfg_batch=${2:-${BATCH_SIZE}}
   # Raw /v1/completions model config: the prompt row is sent verbatim with
-  # no chat template. This mirrors the dev perf suite (Perf-1015-aisbench-fixed
-  # fixed_decode.py builds on ais_bench VLLMCustomAPI, whose _get_url is
-  # v1/completions) and the historical dev GSM8K decode runs ("AIS接口为
-  # /v1/completions，不套 chat template"). The chat-template variant turns a
-  # natural-text continuation into an assistant QA task whose digit-heavy
-  # output collapses the DSPARK draft acceptance (CI run 41029888702: accept
-  # 4.9 -> 1.2-1.9, TPOT 44.4 ms vs dev 25.0 ms on the same server shape).
+  # no chat template. The chat-template variant turns a natural-text
+  # continuation into an assistant QA task whose digit-heavy output
+  # collapses the DSPARK draft acceptance.
   model_config_file=${MODEL_CONFIG_PATH}/${raw_cfg_name}.py
   echo "Writing raw-completions model config into file: ${model_config_file}"
 
@@ -678,14 +670,11 @@ EOF
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
 
             if [ "$API_TYPE" == "raw" ];then
-                # Dev-aligned perf invocation: the built-in warmup defaults
-                # to 1 request (ais_bench openicl_api_infer
-                # num_warmups default), which would leak into the measured
-                # window; dev disables it (--num-warmups 0) and runs its
-                # own unscored warmup passes instead (see the tail of this
-                # script). The CLI of the PyPI ais_bench has no --batch-size,
-                # so concurrency lives in each model config's batch_size and
-                # every invocation selects its config via --models.
+                # Disable the built-in warmup (defaults to 1 request, which
+                # would leak into the measured window); the unscored warmup
+                # passes run at the tail of this script instead. Concurrency
+                # lives in each model config's batch_size field; every
+                # invocation selects its config via --models.
                 if [ "${WARMUP_DP:-0}" -gt 0 ];then
                     gen_model_config_file_vllm_api_raw "${TMP_CFG}_warm" 1
                 fi
@@ -721,16 +710,12 @@ fi
 
 source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
 if [ -n "${CMD_BASE:-}" ];then
-    # Unscored warmup passes, mirroring the dev fixed-decode suite ordering
-    # (cache_fill -> shape_warm -> formal). cache_fill sends WARMUP_DP
-    # requests at batch 1 so round-robin routing materializes the shared
-    # prefix on every DP rank; shape_warm runs one full-shape pass so the
-    # hybrid-cache state settles before scoring. Each writes its own
-    # work-dir, so the formal summarizer output below remains the only
-    # parsed result. Runs AFTER the venv activation - the ais_bench entry
-    # point only exists on PATH inside the venv (run 41187594220 died with
-    # "ais_bench: command not found" because the warmup block originally
-    # sat before this source line).
+    # Unscored warmup passes before the measured run: cache_fill sends
+    # WARMUP_DP requests at batch 1 so round-robin routing materializes
+    # the shared prefix on every DP rank; shape_warm runs one full-shape
+    # pass so the hybrid-cache state settles before scoring. Each writes
+    # its own work-dir, so the formal summarizer output below remains the
+    # only parsed result.
     if [ "${WARMUP_DP:-0}" -gt 0 ];then
         echo "===== Warmup cache-fill: ${WARMUP_DP} request(s) x batch 1 (one per DP rank) ====="
         eval "${CMD_BASE} --models ${TMP_CFG}_warm --datasets ${DATASET_NAME} --num-prompts ${WARMUP_DP} --work-dir ${OUTPUT_PATH}/warmup_cache_fill"

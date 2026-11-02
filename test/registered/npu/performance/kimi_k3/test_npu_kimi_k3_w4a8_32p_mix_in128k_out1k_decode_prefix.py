@@ -16,42 +16,18 @@ logger = logging.getLogger(__name__)
 # (4-node mix): 131072 shared prefix in / 1024 out, C12/N12, mean
 # TPOT <= 30 ms.
 #
-# Benchmark: the dev's own method. Every dev scenario in Perf-1015
-# (including this 128k decode shape) is measured with aisbench in
-# fixed-count perf mode (dev suite Perf-1015-aisbench-fixed /
-# aisbench_fixed_decode_20261017: dev C12 = 25.03 ms mean TPOT, accept
-# 4.24, cache hit 99.9%). Aligning with that method requires two things
-# the previous plain-aisbench attempt (run 41029888702, TPOT 44.4 ms) was
-# missing:
-#   1. Raw /v1/completions, NO chat template (api_type="raw" ->
-#      run_aisbench.sh generates a VLLMCustomAPI model config; dev:
-#      "AIS接口为 /v1/completions，不套 chat template"). The chat template
-#      turns the natural-text continuation into an assistant QA task whose
-#      digit-heavy output collapses DSPARK acceptance to 1.2-1.9.
-#   2. Dev's warmup ordering: cache_fill (4 requests x batch 1,
-#      round-robin over DP0-3, prefix materialized on every DP rank) ->
-#      shape_warm (one full-shape unscored pass) -> formal single batch
-#      N=C=12 with the built-in warmup disabled (aisbench defaults to 1
-#      extra request). Dev's formal rounds start at a 99.9% prefix cache
-#      hit; without the warmup the formal requests race their own 128k
-#      prefill and decode/prefill interleaving skews TPOT.
+# Benchmark: aisbench fixed-count perf run aligned with the dev method:
+# raw /v1/completions (no chat template), a cache-fill warmup (4 requests
+# at batch 1, one per DP rank) plus one unscored full-shape pass, then a
+# single measured batch N=C=12 with the built-in warmup disabled. The
+# dataset is identical natural-text rows from one GSM8K QA pool padded
+# past 131072 tokens, so every request hits the same shared radix prefix
+# (~99.9% cache hit, the dev shared-prefix shape).
 #
-# Dataset: identical natural-text rows from one GSM8K QA pool padded past
-# 131072 tokens (generate_gsm8k_shared_prefix_dataset, aisbench layout) -
-# the same 100%-cache shared-prefix shape the dev suite uses (its ShareGPT
-# prefix is likewise one fixed text repeated for every request). The
-# aisbench main loader does not dedup identical rows (run 41027224138:
-# "Total data num: 12").
-#
-# Fallback if this regresses: benchmark_tool = BENCHSERVING +
-# dataset_name = "gsm8k-shared-prefix" (commit 5a0a303708, run
-# 41001026946, Mean TPOT 22.10 ms SUCCESS).
-#
-# The server config is the B103-proven accuracy baseline (DSPARK draft,
-# radix cache, decode graphs {1,4,16}) - this scenario MUST NOT share a
-# server with the pure-prefill case: the dev pure-prefill tuning
-# (mem-fraction 0.78 + chunked-prefill 65536) crashed this very server
-# shape with an ACL 507034 in DeepEP dispatch (run 39917316049).
+# The pure-prefill and pure-decode server configs are mutually exclusive,
+# so each scenario is its own case/server. This server mirrors the dev
+# 128k decode serve config (DSPARK draft, radix cache, decode graphs
+# {2,4,8,12,16}).
 register_npu_ci(
     est_time=3600,
     suite="",
@@ -79,23 +55,13 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    # Low-latency decode tier: LONG_SEQ_ROUND 2 is what the dev 25.9 ms C12
-    # TPOT was measured with (ROUND 64 is a throughput-oriented setting and
-    # wrong here). No DEEPEP_HCCL_BUFFSIZE: the combine-tiling bisect is now
-    # conclusive - HCCL 2000 without it captures fine (run 40820212836),
-    # while HCCL 200 and HCCL 2000 both crash aclnnMoeLowLatencyCombineV2
-    # EZ1008 WITH it (runs 40507429709, 40850443874). The dev bare-metal
-    # 1800 value is not viable in the CI pod.
+    # Low-latency decode tier (dev value); DEEPEP_HCCL_BUFFSIZE must stay
+    # unset - setting it crashes the DeepEP combine tiling in the CI pod.
     "HCCL_BUFFSIZE": "2000",
     "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ASCEND_USE_FIA": "1",
-    # Temporarily disabled: the current image's sglang/kernel build
-    # conflicts with FIAS_V2_BSND and the DSPARK draft acceptance drops to
-    # zero (accept len 1.00, runs 40820212836/40864543937), which the dev
-    # team confirmed. Re-enable once a fixed image ships.
-    # "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
@@ -124,9 +90,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
-    # Everything from here down mirrors the dev 128k-decode serve config
-    # (run.sh / the 128k single-batch decode restore script): this is the
-    # shape the dev 23.2-25.9 ms C12 TPOT was measured on.
+    # Everything below mirrors the dev 128k decode serve config.
     "--mamba-ssm-dtype",
     "bfloat16",
     "--mem-fraction-static",
@@ -137,8 +101,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     240,
     "--chunked-prefill-size",
     20480,
-    # C12 must land on a captured graph batch size, else decode falls back
-    # to eager mode.
+    # C12 must land on a captured decode graph batch size.
     "--cuda-graph-bs-decode",
     2,
     4,
@@ -189,9 +152,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    # Dev-aligned aisbench fixed-count perf run (see the module comment):
-    # raw completions, cache-fill + shape warmup, then one measured single
-    # batch N=C=12.
+    # Dev-aligned aisbench fixed-count perf run (see the module comment).
     benchmark_tool = AISBENCHMARK
     dataset_type = "gsm8k-shared-prefix"
     dataset_path = None
@@ -200,12 +161,10 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     num_prompts = 12
     max_concurrency = 12
     request_rate = 0
-    # Raw /v1/completions model config - the prompt goes out verbatim with
-    # no chat template (dev Perf-1015 section 4.0).
+    # Raw /v1/completions: the prompt goes out verbatim, no chat template.
     api_type = "raw"
-    # Warmup ordering copied from the dev fixed-decode suite: 4 requests at
-    # batch 1 spread the shared prefix over DP0-3, then one unscored
-    # full-shape pass settles the hybrid-cache state before scoring.
+    # Dev warmup ordering: prime the prefix on every DP rank, then one
+    # unscored full-shape pass, before the measured batch.
     warmup_dp = 4
     warmup_shape = 1
     tpot = 30.0
