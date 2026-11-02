@@ -2540,14 +2540,12 @@ class AiterAttnBackend(AttentionBackend):
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
                 if self.use_k3_mla_verify:
-                    from aiter.mla_verify import select_mla_verify_kernel
-
                     from sglang.srt.layers.attention.graph_variants import (
-                        k3_mla_verify_max_kv_len,
+                        select_k3_mla_verify_kernel,
                     )
 
-                    self._k3_mla_verify_kernel = select_mla_verify_kernel(
-                        bs, k3_mla_verify_max_kv_len(forward_batch, draft_num)
+                    self._k3_mla_verify_kernel = select_k3_mla_verify_kernel(
+                        forward_batch, draft_num
                     )
                 if (
                     _use_mla_ps_kernel

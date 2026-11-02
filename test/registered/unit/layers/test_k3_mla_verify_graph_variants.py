@@ -21,6 +21,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _fake_aiter_mla_verify(calls):
     mod = ModuleType("aiter.mla_verify")
+    mod.MLA_VERIFY_HK = "hk"
 
     def select_mla_verify_kernel(batch_size, max_kv_len):
         calls.append((batch_size, max_kv_len))
@@ -34,8 +35,18 @@ class TestK3MlaVerifyGraphVariants(CustomTestCase):
     def test_max_kv_len_adds_draft_tokens(self):
         batch = SimpleNamespace(seq_lens_cpu=torch.tensor([5, 900, 17]))
         self.assertEqual(k3_mla_verify_max_kv_len(batch, 8), 908)
-        batch = SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([3, 40]))
-        self.assertEqual(k3_mla_verify_max_kv_len(batch, 8), 48)
+
+    def test_missing_host_lengths_pick_hk_without_a_device_read(self):
+        calls = []
+        variants = K3MlaVerifyGraphVariants(num_draft_tokens=8)
+        # A device max would sync; seq_lens is never read.
+        batch = SimpleNamespace(batch_size=2, seq_lens_cpu=None, seq_lens=None)
+        with patch.dict(
+            sys.modules, {"aiter.mla_verify": _fake_aiter_mla_verify(calls)}
+        ):
+            self.assertIsNone(k3_mla_verify_max_kv_len(batch, 8))
+            self.assertEqual(variants.select(batch), "hk")
+        self.assertEqual(calls, [])
 
     def test_select_uses_batch_size_and_max_kv_len(self):
         calls = []

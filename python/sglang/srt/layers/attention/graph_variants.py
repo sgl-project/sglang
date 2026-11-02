@@ -45,13 +45,32 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
-def k3_mla_verify_max_kv_len(forward_batch: ForwardBatch, num_draft_tokens: int) -> int:
+def k3_mla_verify_max_kv_len(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> Optional[int]:
+    """Longest verify KV length from the host mirror, or None without one (a
+    device max would sync every step)."""
     seq_lens_cpu = forward_batch.seq_lens_cpu
-    if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
-        max_seq_len = int(seq_lens_cpu.max().item())
-    else:
-        max_seq_len = int(forward_batch.seq_lens.max().item())
-    return max_seq_len + num_draft_tokens
+    if (
+        seq_lens_cpu is None
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() == 0
+    ):
+        return None
+    return int(seq_lens_cpu.max()) + num_draft_tokens
+
+
+def select_k3_mla_verify_kernel(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> str:
+    """AITER's host pick of the K3 verify kernel; HipKittens serves any length, so
+    it is the pick when the host lengths are missing."""
+    from aiter.mla_verify import MLA_VERIFY_HK, select_mla_verify_kernel
+
+    max_kv_len = k3_mla_verify_max_kv_len(forward_batch, num_draft_tokens)
+    if max_kv_len is None:
+        return MLA_VERIFY_HK
+    return select_mla_verify_kernel(forward_batch.batch_size, max_kv_len)
 
 
 @dataclass(frozen=True)
@@ -62,12 +81,7 @@ class K3MlaVerifyGraphVariants:
     capture_labels: ClassVar[tuple[str, ...]] = ("gluon", "hk")
 
     def select(self, forward_batch: ForwardBatch) -> str:
-        from aiter.mla_verify import select_mla_verify_kernel
-
-        return select_mla_verify_kernel(
-            forward_batch.batch_size,
-            k3_mla_verify_max_kv_len(forward_batch, self.num_draft_tokens),
-        )
+        return select_k3_mla_verify_kernel(forward_batch, self.num_draft_tokens)
 
 
 def create_k3_mla_verify_graph_variants(
