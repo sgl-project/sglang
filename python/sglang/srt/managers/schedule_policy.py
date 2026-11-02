@@ -64,10 +64,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.unified_cache.components import (
-    CacheTransferPhase,
-    ComponentType,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -1489,16 +1485,9 @@ class PrefillAdder:
                             and self.tree_cache.linker.has_hit(req.rid)
                         )
                     ):
-                        # Host hits can include resident FULL behind host-only aux.
-                        # Reuse the FULL transfer spec to count only new slots.
-                        full_transfer = (
-                            self.tree_cache.tree_core.build_hicache_transfers(
-                                ComponentType.FULL,
-                                req.best_match_node,
-                                CacheTransferPhase.LOAD_BACK,
-                            )[0]
+                        full_load_tokens = self.tree_cache.full_load_back_tokens(
+                            req.best_match_node
                         )
-                        full_load_tokens = len(full_transfer.host_indices)
                     load_budget = dict(
                         state_slots=state_slots,
                         full_tokens=(

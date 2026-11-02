@@ -4159,6 +4159,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """The id of the tree's slot of ``family``; None when it has none."""
         return self._family_slot_ids.get(family)
 
+    def full_load_back_tokens(self, node_id: NodeId) -> int:
+        """Token rows a load-back of ``node_id``'s path copies to the device. A
+        host hit can include token KV still resident behind host-only window or
+        state values; those rows take no new device slots."""
+        transfer = self.tree_core.build_hicache_transfers(
+            self.slot_id(TREE_TOKEN), node_id, CacheTransferPhase.LOAD_BACK
+        )[0]
+        return len(transfer.host_indices)
+
     def component_of(self, family: str) -> Optional[TreeComponent]:
         """The component keeping the tree's slot of ``family``, if any."""
         slot_id = self._family_slot_ids.get(family)
