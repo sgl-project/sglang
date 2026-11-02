@@ -551,6 +551,9 @@ class OpenAIServingChat(OpenAIServingBase):
             - assistant_prefix: Content of the last assistant message (string only), or None
         """
         assistant_prefix = None
+        if isinstance(request.continue_final_message, str):
+            # The renderer owns the field boundary and needs the complete message.
+            return messages, None
         if messages and messages[-1].get("role") == "assistant":
             last_content = messages[-1].get("content")
             # Only process string content, ignore multimodal content (lists)
@@ -1107,6 +1110,46 @@ class OpenAIServingChat(OpenAIServingBase):
             return detector.parses_without_tools()
         return request.tool_choice != "none"
 
+    def _validate_continuation_target(
+        self, request: ChatCompletionRequest
+    ) -> str | None:
+        if not isinstance(request.continue_final_message, str):
+            return None
+        if request._format_add_generation_prompt is True:
+            return (
+                "add_generation_prompt=True conflicts with field-specific "
+                "continue_final_message."
+            )
+        if (
+            self.chat_encoding_spec is not None
+            or self._encoding_adapter is not None
+            or self.template_manager.chat_template_name is not None
+        ):
+            return (
+                "Field-specific continue_final_message requires the Hugging Face "
+                "chat-template renderer; this model's encoder is not supported."
+            )
+        if request.separate_reasoning:
+            if (
+                request.continue_final_message == "reasoning_content"
+                and not self.reasoning_parser
+            ):
+                return (
+                    "Continuing reasoning_content with separate_reasoning requires "
+                    "a supported reasoning parser."
+                )
+            if (
+                self.reasoning_parser
+                and not ReasoningParser.supports_field_continuation(
+                    self.reasoning_parser
+                )
+            ):
+                return (
+                    f"Reasoning parser {self.reasoning_parser!r} does not support "
+                    "field-specific continue_final_message."
+                )
+        return None
+
     @staticmethod
     def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
         """Whether the output opened the answer that the template's grammar
@@ -1125,6 +1168,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+
+        continuation_error = self._validate_continuation_target(request)
+        if continuation_error:
+            return continuation_error
 
         if (
             request.chat_template_kwargs
@@ -2038,6 +2085,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
+        continuation_error = self._validate_continuation_target(request)
+        if continuation_error:
+            raise ValueError(continuation_error)
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
@@ -2189,6 +2239,23 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            continuation_target = (
+                request.continue_final_message
+                if isinstance(request.continue_final_message, str)
+                else None
+            )
+            if continuation_target is not None:
+                for key, expected in (
+                    ("continue_final_message", continuation_target),
+                    ("add_generation_prompt", False),
+                ):
+                    if key in extra_template_kwargs:
+                        if extra_template_kwargs.pop(key) != expected:
+                            raise ValueError(
+                                f"chat_template_kwargs.{key} conflicts with "
+                                "continue_final_message."
+                            )
+
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:
                 if request.reasoning_effort == "low":
@@ -2224,6 +2291,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
+                    continuation_target=continuation_target,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2241,6 +2309,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
+                        continuation_target=continuation_target,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2287,8 +2356,11 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        continuation_target: Optional[str] = None,
         add_generation_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
+        if continuation_target is not None:
+            add_generation_prompt = False
         cache_key = None
         if use_cache:
             try:
@@ -2304,6 +2376,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools,
                         template_kwargs,
                         encode_kwargs,
+                        continuation_target,
                         add_generation_prompt,
                     ),
                 )
@@ -2317,6 +2390,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids, decoded_prompt = cached
                 return list(prompt_ids), decoded_prompt
 
+        continuation_kwargs = (
+            {"continue_final_message": continuation_target}
+            if continuation_target is not None
+            else {}
+        )
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -2325,11 +2403,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 return_dict=False,
+                **continuation_kwargs,
                 **template_kwargs,
             )
         else:
             segments = None
-            if self.template_manager.python_chat_template is not None:
+            if (
+                continuation_target is None
+                and self.template_manager.python_chat_template is not None
+            ):
                 segments = render_chat_segments(
                     self.tokenizer_manager.tokenizer,
                     self.template_manager.python_chat_template,
@@ -2349,6 +2431,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     add_generation_prompt=add_generation_prompt,
                     tools=tools,
                     return_dict=False,
+                    **continuation_kwargs,
                     **template_kwargs,
                 )
                 prompt_ids = parallel_prompt_encode(
@@ -2373,6 +2456,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply conversation template"""
+        continuation_error = self._validate_continuation_target(request)
+        if continuation_error:
+            raise ValueError(continuation_error)
         prompt = ""
         prompt_ids = []
         conv = generate_chat_conv(
@@ -3558,6 +3644,9 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
+
+        if isinstance(request.continue_final_message, str):
+            return request.continue_final_message == "reasoning_content"
 
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(
