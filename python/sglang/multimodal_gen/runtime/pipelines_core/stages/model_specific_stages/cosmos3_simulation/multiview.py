@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     closest_multiview_aspect_ratio,
     multiview_canvas,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -1118,7 +1119,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         for view in range(num_views):
             clip = pixels[:, :, view * frames_per_view : (view + 1) * frames_per_view]
             clip = clip.to(device=device, dtype=vae_dtype).div(127.5).sub(1.0)
-            with torch.no_grad():
+            with torch.no_grad(), use_gpu_conditioning_hash():
                 latent = self.vae.encode(clip).mode()
             latent = (latent - mean.to(latent)) / std.to(latent)
             latents.append(latent.to(dtype))

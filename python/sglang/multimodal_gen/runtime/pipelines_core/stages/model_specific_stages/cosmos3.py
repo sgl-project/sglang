@@ -30,7 +30,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     quality_allows,
 )
-from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _inference_cache,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_size,
@@ -1538,10 +1541,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 :, :, current_conditional_frames - 1 : current_conditional_frames
             ].expand(-1, -1, chunk_frames - current_conditional_frames, -1, -1)
 
-        control_latents = [
-            self._encode_transfer_video(control, latent_dtype)
-            for control in control_norms
-        ]
+        with use_gpu_conditioning_hash():
+            control_latents = [
+                self._encode_transfer_video(control, latent_dtype)
+                for control in control_norms
+            ]
         condition_latents = self._encode_transfer_video(target_norm, latent_dtype)
         noise = torch.randn(
             condition_latents.shape,

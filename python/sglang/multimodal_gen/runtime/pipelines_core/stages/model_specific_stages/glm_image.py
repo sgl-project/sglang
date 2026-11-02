@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -1292,11 +1293,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     condition_image, self.vae, device=device
                 )
                 condition_image = _repeat_to_batch(condition_image, batch_size)
-                condition_latent = retrieve_latents(
-                    self.vae.encode(condition_image),
-                    generator=generator,
-                    sample_mode="argmax",
-                )
+                with use_gpu_conditioning_hash(enabled=len(ar_condition_images) > 1):
+                    condition_latent = retrieve_latents(
+                        self.vae.encode(condition_image),
+                        generator=generator,
+                        sample_mode="argmax",
+                    )
                 condition_latent = (condition_latent - latents_mean) / latents_std
                 if condition_image_prior_token_id.dim() == 1:
                     condition_image_prior_token_id = (
