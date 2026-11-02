@@ -31,7 +31,11 @@ from sglang.srt.mem_cache.kv.advance import (
     coalesce_ranges,
     retire_window_rows,
 )
-from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer, NetworkWaiter
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkTransfer,
+    NetworkWaiter,
+    ReceiveHold,
+)
 from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -131,9 +135,12 @@ class KVStorage:
         self._parked_rows: Set[int] = set()
         self.scratch = scratch
         self._request_memory = request_memory
-        # Network transfers in flight, per request: the completion flag a
-        # stream waits on and the logical release every rank sets alike.
+        # Network transfers in flight, per request, one per send or receive:
+        # each is released where every rank sees it end.
         self._network_transfers: Dict[str, List[NetworkTransfer]] = {}
+        # Receive rows held for a destination publish still to come, per
+        # request: their logical release.
+        self._receive_holds: Dict[str, ReceiveHold] = {}
         # Readers reaching a window further back than its own layers (a fused
         # draft's front rows), by sub-pool, and the length of a window the
         # model does not state: bound once at startup (`bind_window_retention`).
@@ -987,15 +994,49 @@ class KVStorage:
         by the ``peer`` it was recorded with, alike on every rank."""
         self._allocator.set_network_waiter(waiter)
 
-    def move_epoch(self) -> int:
-        """How many page-move batches the pool has issued. Physical ids read
-        before a move stay valid while this is unchanged; a destination held
-        for a later send reads its ids again when it changed."""
-        return sum(band.moves for band in self._allocator.bands)
+    def hold_receive_rows(
+        self, req: Req, *, token_start: int, token_end: int, signal
+    ) -> None:
+        """A decode node took ``req``'s receive rows (its tokens
+        ``[token_start, token_end)``, every window's rows among them, and its
+        state slots) and will publish their physical ids to the peer later,
+        reading them back off the schedule stream. Until `end_receive_hold`
+        the rows count as rows a network transfer writes: a relief keeps them
+        in place whenever a layout serves its demand that way, and an
+        opportunistic compaction stops at them. If a relief must move them
+        anyway, the move bumps `move_epoch` and the publish orders its
+        readback after the schedule stream. ``signal`` is the allocation's
+        event. The rows are recorded by id and resolved only when a relief
+        reads them, before its first wait, so nothing else pays a device
+        read for them."""
+        release = ReceiveHold()
+        self._receive_holds[req.rid] = release
+        tokens = self.requests.req_to_token[req.kv.req_pool_idx, token_start:token_end]
+        roles = self._allocator.roles
+        members = [roles.owner, *self._allocator.window_allocators]
+        for sub_pool in members:
+            self._member(sub_pool).record_transfer(
+                signal, tokens, writes=True, release=release
+            )
+        if roles.state is not None and req.kv.holds_mamba:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            self._member(roles.state).record_transfer(
+                signal, slots, writes=True, release=release
+            )
+
+    def end_receive_hold(self, req: Req) -> None:
+        """The hold `hold_receive_rows` took ends: the publish recorded the
+        rows' transfer itself, or the request left before publishing."""
+        release = self._receive_holds.pop(req.rid, None)
+        if release is not None:
+            release.released = True
 
     def end_network_transfer(self, req: Req) -> None:
         """The request's network transfers ended, or its row is released (the
         release point of a failed transfer): every rank reaches this alike."""
+        self.end_receive_hold(req)
         for transfer in self._network_transfers.pop(req.rid, ()):
             transfer.released = True
 
@@ -1044,6 +1085,14 @@ class KVStorage:
             token_writes_unknown=token_writes_unknown,
             state_writes_unknown=state_writes_unknown,
         )
+
+    def move_epoch(self) -> int:
+        """How many page-move batches may have moved a held receive row (see
+        `hold_receive_rows`): ones issued while a hold was open and not fixed
+        in place. A held row's ids, resolved on another stream, stay valid
+        while it is unchanged; after such a move the reader must order itself
+        after the schedule stream."""
+        return sum(band.held_row_moves for band in self._allocator.bands)
 
     def retire_forward(self, forward_done: torch.cuda.Event) -> None:
         """The scheduler processed the result of the forward recorded with

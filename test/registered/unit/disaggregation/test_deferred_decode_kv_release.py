@@ -539,6 +539,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         metadata_buffer_index=idx,
         awaiting_publish=False,
         pending_metadata=None,
+        pending_receive=None,
     )
 
 
@@ -882,6 +883,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         host_staged=False,
         awaiting_publish=False,
         pending_metadata=None,
+        pending_receive=None,
         is_rebootstrap=False,
     )
 

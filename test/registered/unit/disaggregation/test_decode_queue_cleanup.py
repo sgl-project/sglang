@@ -3,6 +3,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
@@ -215,6 +216,7 @@ def _gated_decode_req(poll, restore_status):
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
         pending_metadata=None,
+        pending_receive=None,
     )
 
 
@@ -331,24 +333,35 @@ def _local_reduce(flags, group, op):
     return flags
 
 
-class _MovingStorage:
-    """The storage surface an inline publish uses: the page-move count and
-    network-transfer recording."""
+class _HoldingStorage:
+    """The storage surface a deferred publish uses: the move count, the
+    receive-row hold, and network-transfer recording (none: no rows move)."""
+
+    owner = "full"
 
     def __init__(self, epochs=(0,)):
         self._epochs = iter(epochs)
         self._epoch = 0
+        self.holds = {}
+        self.ended = []
         self.recorded = []
 
     def move_epoch(self):
         self._epoch = next(self._epochs, self._epoch)
         return self._epoch
 
+    def hold_receive_rows(self, req, *, token_start, token_end, signal):
+        self.holds[req.rid] = (token_start, token_end, signal)
+
+    def end_receive_hold(self, req):
+        self.holds.pop(req.rid, None)
+        self.ended.append(req.rid)
+
     def wire_entries(self):
         return ()
 
     def record_network_transfer(self, req, *, pages, page_size, states, writes, peer):
-        self.recorded.append([int(page) for page in pages])
+        self.recorded.append((req.rid, self.owner, list(np.asarray(pages))))
 
 
 class TestDeferredDestinationPublish(CustomTestCase):
@@ -360,6 +373,13 @@ class TestDeferredDestinationPublish(CustomTestCase):
             patcher = patch(f"sglang.srt.disaggregation.decode.torch.cuda.{target}")
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.storage = _HoldingStorage()
+        patcher = patch(
+            "sglang.srt.disaggregation.decode.kv_storage_of",
+            side_effect=lambda *_: self.storage,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _deferring_queue(self, decode_reqs):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -393,12 +413,16 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1,
             state=None,
-            storage=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
+            window_pool_names=lambda: (),
         )
-        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
         queue.transfer_queue = SimpleNamespace(
-            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+            queue=decode_queue(ListKind.PD_RECEIVING),
+            enable_staging=False,
+            enable_deferred_kv_release=False,
         )
         queue.tree_cache = MagicMock()
         queue.scheduler = MagicMock(
@@ -474,6 +498,28 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(queue._pending_publish, [])
         self.assertFalse(queue.has_published_destinations)
 
+    def test_deferred_publish_waits_for_a_page_move_since_its_allocation(self):
+        """A page move between the allocation and the deferred publish rebinds
+        the destination ids on the schedule stream, so the publish reads them
+        back after that stream instead of after the allocation alone."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        queue = self._deferring_queue([decode_req])
+        # A relief that could not keep the held rows moved pages in between.
+        self.storage = _HoldingStorage(epochs=(0, 1))
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        queue.note_destinations_queued(1)
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            queue.publish_pending_destinations()
+
+        queue._publish_stream.wait_event.assert_not_called()
+        queue._publish_stream.wait_stream.assert_called_once()
+        receiver.send_metadata.assert_called_once()
+        self.assertEqual(self.storage.ended, ["deferred"])
+
     def test_inline_publish_holds_the_send_until_the_forward_is_done(self):
         """Where the deferred publish is off (staging, HiSparse, no WAR
         barrier), overlap still reuses pages the in-flight forward may write, so
@@ -502,7 +548,15 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
 
-    def _inline_queue(self, decode_req, storage):
+    def test_inline_publish_holds_its_rows_until_the_send(self):
+        """REGRESSION: the inline publish recorded its rows as the peer's at
+        allocation but sent their ids a loop later. A relief that had to move
+        them waited, on the schedule stream, for a transfer the peer could not
+        start, so the next host read of that stream never returned. The rows
+        are held until the send instead, which reads their ids again after a
+        page move."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
         queue = self._deferring_queue([decode_req])
         queue._defer_publish = False
         ready = MagicMock()
@@ -510,63 +564,35 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.scheduler.enable_overlap = True
         queue.scheduler.device_module = SimpleNamespace(Event=lambda: ready)
         queue.scheduler.disagg_decode_prealloc_queue = queue
-        queue.token_to_kv_pool_allocator.storage = storage
+        # A page moves between the hold and the send.
+        self.storage = _HoldingStorage(epochs=(0, 1))
+
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertIn(decode_req.req.rid, self.storage.holds)
+        self.assertEqual(self.storage.recorded, [])
+        receiver.send_metadata.assert_not_called()
+
+        moved = queue.token_to_kv_pool_allocator
+        moved.translate_kv_indices_for_transfer = lambda indices: indices + 100
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
         transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         transfer.gloo_group = object()
         transfer.scheduler = queue.scheduler
-        return queue, transfer
-
-    def test_inline_publish_records_its_rows_at_the_send(self):
-        """BUG REGRESSION. The inline publish recorded its rows as the peer's
-        at allocation but sent their ids a loop later. A page move that could
-        not avoid them waited on the host for a receive the peer could not
-        start, and the scheduler, which sends the ids, never got there. The rows
-        are recorded only when the send goes; a page move in between makes the
-        send read their ids again."""
-        receiver = _PollingReceiver()
-        decode_req = self._decode_req(receiver)
-        storage = _MovingStorage(epochs=(0, 1))
-        queue, transfer = self._inline_queue(decode_req, storage)
-
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
-        self.assertEqual(storage.recorded, [])
-        self.assertIsNotNone(decode_req.pending_receive)
-        receiver.send_metadata.assert_not_called()
-
-        # A page move rebinds the rows before the send.
-        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer = (
-            lambda indices: indices + 100
-        )
         with patch(
             "sglang.srt.disaggregation.decode.all_reduce_flags",
             side_effect=_local_reduce,
         ):
             transfer.publish_pending_metadata()
 
+        receiver.send_metadata.assert_called_once()
         page_indices = receiver.send_metadata.call_args.args[0]
         self.assertEqual(page_indices.tolist(), [108, 109, 110, 111, 112])
-        self.assertEqual(storage.recorded, [[108, 109, 110, 111, 112]])
+        self.assertEqual(
+            self.storage.recorded,
+            [(decode_req.req.rid, "full", [108, 109, 110, 111, 112])],
+        )
+        self.assertEqual(self.storage.ended, [decode_req.req.rid])
         self.assertIsNone(decode_req.pending_receive)
-
-    def test_inline_publish_of_a_failed_receive_records_nothing(self):
-        """A receive that fails before its ids are sent leaves nothing a page
-        move could wait for."""
-        receiver = _PollingReceiver()
-        decode_req = self._decode_req(receiver)
-        storage = _MovingStorage()
-        queue, transfer = self._inline_queue(decode_req, storage)
-
-        queue.pop_preallocated()
-        receiver._poll = KVPoll.Failed
-        with patch(
-            "sglang.srt.disaggregation.decode.all_reduce_flags",
-            side_effect=_local_reduce,
-        ):
-            transfer.publish_pending_metadata()
-
-        receiver.send_metadata.assert_not_called()
-        self.assertEqual(storage.recorded, [])
 
     def test_recompute_waits_for_held_metadata_to_be_sent(self):
         receiver = _PollingReceiver()
@@ -599,16 +625,30 @@ class TestDeferredDestinationPublish(CustomTestCase):
             transfer.publish_pending_metadata()
         queue._submit_prefill_recompute.assert_called_once_with(decode_req)
 
-    def test_deferred_destination_closes_the_move_gate_until_queued(self):
-        """A later allocation in the same pop must not let unified-memory compaction
-        move a deferred request's pages before its publish reads them back."""
+    def test_deferred_destination_holds_its_rows_until_published(self):
+        """A later allocation in the same pop must not move a deferred
+        request's rows before its publish reads their ids back. Unified memory
+        keeps no pool-wide move gate: the deferral holds the request's receive
+        rows in place, which a relief keeps whenever it can, until the publish
+        has recorded the rows' transfer. The destination still counts as
+        published until the transfer queue takes it."""
         queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
 
         queue.pop_preallocated()
 
         self.assertTrue(queue.has_published_destinations)
+        start, end, signal = self.storage.holds["deferred"]
+        self.assertEqual((start, end), (0, 5))
+        self.assertIs(signal, queue._pending_publish[0].allocated)
         queue.note_destinations_queued(1)
         self.assertFalse(queue.has_published_destinations)
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            queue.publish_pending_destinations()
+        self.assertEqual(self.storage.holds, {})
+        self.assertEqual(self.storage.ended, ["deferred"])
 
     def test_released_receiver_keeps_the_publish_reduction_aligned(self):
         """A pending request the transfer queue released keeps its slot in the
@@ -633,6 +673,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertIs(queue._publish_destination.call_args.kwargs["decode_req"], live)
         self.assertTrue(released.awaiting_publish)
         self.assertFalse(live.awaiting_publish)
+        # Both holds end: the released one unpublished, the live one published.
+        self.assertEqual(self.storage.ended, ["deferred", "deferred"])
 
 
 class TestPublishedDestinationHandoff(CustomTestCase):

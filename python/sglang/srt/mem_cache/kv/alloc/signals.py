@@ -24,6 +24,14 @@ class TransferRelease:
         self.released = False
 
 
+class ReceiveHold(TransferRelease):
+    """Receive rows held in place until their destination is published: no
+    engine touches them yet, so nothing waits on them, but a relief keeps them
+    where they are when it can and an opportunistic compaction leaves them."""
+
+    __slots__ = ()
+
+
 class NetworkTransfer(TransferRelease):
     """One send or receive a network engine runs on a request's rows. It is
     released where the transfer's owner observes its end on every rank; a move
