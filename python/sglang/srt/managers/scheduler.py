@@ -25,18 +25,7 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Deque,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -299,6 +288,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -1384,7 +1374,7 @@ class Scheduler(
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD
         # transfer queue, HiSparse staging, or a requeue.
-        self.prefill_launched: List[Req] = []
+        self.prefill_launched_reqs = RequestList()
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2832,7 +2822,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
-            leave_prefill_launched=self._leave_prefill_launched,
+            leave_prefill_launched=self.prefill_launched_reqs.leave,
         )
 
     def init_internal_state(self) -> None:
@@ -4144,7 +4134,7 @@ class Scheduler(
             # in place above, nothing to merge.
             if not last_batch.is_empty() and last_batch is not running_batch:
                 # Its launched prefills start running at the merge.
-                self._leave_prefill_launched(last_batch.reqs)
+                self.prefill_launched_reqs.leave(last_batch.reqs)
                 self.running_reqs.join(last_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = last_batch
@@ -4679,7 +4669,7 @@ class Scheduler(
             "waiting": self.waiting_queue,
             "grammar": self.grammar_manager.grammar_queue,
             "chunked": [] if self.chunked_req is None else [self.chunked_req],
-            "prefill_launched": self.prefill_launched,
+            "prefill_launched": list(self.prefill_launched_reqs),
             "running": list(self.running_reqs),
         }
         # Read at call time: a PD role switch rebuilds the PD queues.
@@ -4707,23 +4697,16 @@ class Scheduler(
             lists.update(component_lists)
         return lists
 
-    def _hold_launched_prefill(self, batch: ScheduleBatch) -> None:
+    def _join_prefill_launched(self, batch: ScheduleBatch) -> None:
         """Launching a request's last prefill chunk moves it out of the chunked slot
-        into prefill_launched. A row that is running already stays; dLLM keeps its
-        requests in its own queue."""
+        into prefill_launched_reqs. A row that is running already stays; dLLM keeps
+        its requests in its own queue."""
         if self.dllm_config is None and batch.forward_mode.is_extend():
-            self.prefill_launched += [
+            self.prefill_launched_reqs.join(
                 r
                 for r in batch.reqs
                 if r is not batch.chunked_req and r not in self.running_reqs
-            ]
-
-    def _leave_prefill_launched(self, reqs: Iterable[Req]) -> None:
-        leaving = set(reqs)
-        if leaving:
-            self.prefill_launched = [
-                r for r in self.prefill_launched if r not in leaving
-            ]
+            )
 
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
@@ -4744,7 +4727,7 @@ class Scheduler(
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
-        self._hold_launched_prefill(batch)
+        self._join_prefill_launched(batch)
         self.invariant_checker.maybe_check_request_lists()
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
@@ -4753,7 +4736,7 @@ class Scheduler(
         batch.drop_inflight_step()
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
-        self._leave_prefill_launched(r for r in self.prefill_launched if r.finished())
+        self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -6267,7 +6250,7 @@ class Scheduler(
         self.running_batch.reqs = []
         # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
-        self._leave_prefill_launched(retract_reqs)
+        self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if req in unresumable:
                 abort_reason = FINISH_ABORT(

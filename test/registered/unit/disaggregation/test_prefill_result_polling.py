@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -130,7 +131,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
-    _leave_prefill_launched = Scheduler._leave_prefill_launched
 
     def __init__(
         self,
@@ -180,7 +180,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
-        self.prefill_launched = []
+        self.prefill_launched_reqs = RequestList()
         self.invariant_checker = Mock()
         self.uocr_runtime = None
         self.waiting_queue = []
@@ -1252,8 +1252,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _on_step_launch = Scheduler._on_step_launch
-    _hold_launched_prefill = Scheduler._hold_launched_prefill
-    _leave_prefill_launched = Scheduler._leave_prefill_launched
+    _join_prefill_launched = Scheduler._join_prefill_launched
 
     def __init__(self):
         self.scheduler_stage_metrics = None
@@ -1268,7 +1267,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.dllm_config = None
         self.running_reqs = RunningReqs()
-        self.prefill_launched = []
+        self.prefill_launched_reqs = RequestList()
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

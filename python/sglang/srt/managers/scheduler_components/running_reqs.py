@@ -1,48 +1,20 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterable, Iterator, Optional, Set
+from typing import TYPE_CHECKING, Iterable, Optional
+
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
-class RunningReqs:
+class RunningReqs(RequestList):
     """The running requests, in join order (the same on every rank).
 
-    A request runs from the launch of its whole prompt until it finishes; the
-    steps still computing for it are tracked apart. It leaves when it finishes,
-    is retracted or preempted, or a pause retracts it. Each change rebinds a new
-    dict, so leaving while iterating is safe.
+    A request runs from the merge of its launched prefill into a running batch
+    until it finishes; the steps still computing for it are tracked apart. It
+    leaves when it finishes, is retracted or preempted, or a pause retracts it.
     """
-
-    def __init__(self) -> None:
-        self._reqs: Dict[Req, None] = {}
-
-    def join(self, reqs: Iterable[Req]) -> None:
-        """Add the given requests; ones already running keep their place."""
-        joining = [req for req in reqs if req not in self._reqs]
-        if joining:
-            self._reqs = {**self._reqs, **dict.fromkeys(joining)}
-
-    def leave(self, reqs: Iterable[Req]) -> None:
-        """Drop the given requests; ones not running are ignored."""
-        self._drop({req for req in reqs if req in self._reqs})
-
-    def leave_finished(self) -> None:
-        self._drop({req for req in self._reqs if req.finished()})
-
-    def __iter__(self) -> Iterator[Req]:
-        return iter(self._reqs)
-
-    def __len__(self) -> int:
-        return len(self._reqs)
-
-    def __contains__(self, req: Req) -> bool:
-        return req in self._reqs
-
-    def _drop(self, leaving: Set[Req]) -> None:
-        if leaving:
-            self._reqs = {req: None for req in self._reqs if req not in leaving}
 
     def check(
         self,

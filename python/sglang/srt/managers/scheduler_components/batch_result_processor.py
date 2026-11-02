@@ -155,7 +155,7 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
-    # Hands requests out of the scheduler's prefill_launched list.
+    # Hands requests out of the scheduler's prefill_launched_reqs.
     leave_prefill_launched: Callable = lambda reqs: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):

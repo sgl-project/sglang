@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -96,7 +97,7 @@ def _empty_request_lists(s):
     s.waiting_queue = []
     s.grammar_manager = SimpleNamespace(grammar_queue=[])
     s.chunked_req = None
-    s.prefill_launched = []
+    s.prefill_launched_reqs = RequestList()
     s.disagg_prefill_transfer_queue = None
     s.disagg_prefill_bootstrap_queue = None
     s.disagg_decode_prealloc_queue = None
@@ -214,7 +215,7 @@ class TestRunningReqsHooks(CustomTestCase):
         _launch(s, mixed)
         _launch(s, _batch([_req("decode-only")], ForwardMode.DECODE))
 
-        self.assertEqual(s.prefill_launched, [a, new])
+        self.assertEqual(list(s.prefill_launched_reqs), [a, new])
         self.assertEqual(list(s.running_reqs), [decoding])
 
         _schedule_without_admission(s)
@@ -222,14 +223,14 @@ class TestRunningReqsHooks(CustomTestCase):
             Scheduler.get_next_batch_to_run(
                 s, ScheduleBatch(reqs=[], batch_is_full=False), mixed
             )
-        self.assertEqual(s.prefill_launched, [a])
+        self.assertEqual(list(s.prefill_launched_reqs), [a])
         self.assertEqual(list(s.running_reqs), [decoding, new])
 
         # dLLM keeps its requests in its own queue.
         s = _scheduler()
         s.dllm_config = object()
         _launch(s, _batch([_req("p")], ForwardMode.EXTEND))
-        self.assertEqual(s.prefill_launched, [])
+        self.assertEqual(list(s.prefill_launched_reqs), [])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
         # A grammar row under NGRAM processes the previous result early; once it
