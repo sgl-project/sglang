@@ -22,6 +22,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components import weight_updater
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -90,6 +98,9 @@ class TestPausedHiCacheReap(unittest.TestCase):
         s.is_fully_idle = self.calls.idle
         s.metrics_reporter = Mock()
         s.kv_events_publisher = Mock()
+        s.deferred_responses = DeferredResponses(
+            disaggregation_mode=mode, output_streamer=None, send_abort=None
+        )
         return s
 
     def test_paused_iteration_reaps_once_before_recording_state(self):
@@ -156,6 +167,7 @@ class TestPausedFlushAfterRetract(unittest.TestCase):
             hisparse_coordinator=None,
             enable_hierarchical_cache=True,
             enable_hicache_storage=storage,
+            enable_unified_cache_external_linker=False,
             enable_lmcache=False,
             enable_hisparse=False,
             enable_priority_scheduling=False,
@@ -171,6 +183,14 @@ class TestPausedFlushAfterRetract(unittest.TestCase):
                 current_scheduler_metrics_enabled=False, is_stats_logging_rank=False
             ),
             kv_events_publisher=MagicMock(),
+            running_reqs=RunningReqs(),
+            prefill_launched_reqs=RequestList(),
+            request_receiver=object.__new__(SchedulerRequestReceiver),
+            deferred_responses=DeferredResponses(
+                disaggregation_mode=DisaggregationMode.NULL,
+                output_streamer=None,
+                send_abort=None,
+            ),
         )
         s._process_storage_prefetch_retries = lambda: None
 
