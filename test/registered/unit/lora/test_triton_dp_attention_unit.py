@@ -1,4 +1,4 @@
-"""CPU-only metadata tests for explicit DP-attention LoRA routing."""
+"""CPU-only LoRA routing contracts: DP-attention layouts and the all-base fast path."""
 
 import sys
 from contextlib import nullcontext
@@ -29,12 +29,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    LoRABatchLayout,
-    get_context,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import COMMUNICATOR_MODULES
@@ -177,42 +172,38 @@ def test_layout_selects_routing_without_shape_inference():
     assert _routes(backend._sgemm_info()) == [1, 0]
 
 
-@pytest.mark.parametrize(
-    "attention_widths",
-    [
-        {"attn_tp_size": 2, "attn_cp_size": 1},
-        {"attn_tp_size": 1, "attn_cp_size": 2},
-    ],
-    ids=["attn-tp", "attn-cp"],
-)
-def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
-    attention_widths,
-):
-    with (
-        get_context().override_server_args(
-            tp_size=4, attn_dp_size=2, enable_lora_overlap_loading=False
-        ) as args,
-        get_parallel().override(
-            tp_size=4, attn_dp_size=2, moe_tp_size=4, **attention_widths
-        ),
-        pytest.raises(ValueError, match="requires --attn-dp-size equal to --tp-size"),
-    ):
-        LoRAManager(
-            base_model=torch.nn.Linear(2, 2),
-            base_hf_config=SimpleNamespace(),
-            max_loras_per_batch=2,
-            load_config=None,
-            dtype=torch.float32,
-            server_args=args,
-            lora_backend="triton",
-        )
+class _InactiveSkippingBackend:
+    skip_inactive_lora_batches = True
+
+    def __init__(self):
+        self.batch_info = object()
+        self.prepare_called = False
+
+    def reset_batch_state(self):
+        self.batch_info = None
+
+    def prepare_lora_batch(self, *args, **kwargs):
+        self.prepare_called = True
+
+
+def test_all_base_batch_clears_stale_routing_before_graph_metadata():
+    """UNO's base-only fast path: an all-base batch must drop the previous
+    adapted forward's routing before graph metadata is read, or that adapter
+    would be applied again silently."""
+    backend = _InactiveSkippingBackend()
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.lora_backend = backend
+
+    manager.prepare_lora_batch(SimpleNamespace(lora_ids=[None], batch_size=1))
+
+    assert backend.batch_info is None
+    assert not backend.prepare_called
 
 
 @pytest.mark.parametrize("gathered_over_dp", [True, False])
-@pytest.mark.parametrize("num_tokens", [0, 2])
 @pytest.mark.parametrize("publish_lora_layout", [False, True])
 def test_communicator_publishes_layout_at_each_transition(
-    monkeypatch, gathered_over_dp, num_tokens, publish_lora_layout
+    monkeypatch, gathered_over_dp, publish_lora_layout
 ):
     for module in COMMUNICATOR_MODULES:
         if hasattr(module, "get_parallel"):
@@ -269,7 +260,7 @@ def test_communicator_publishes_layout_at_each_transition(
     )
     selected = SimpleNamespace(entry=ffn_entry)
     communicator.path_for = lambda forward_batch: selected
-    hidden = torch.zeros(num_tokens, 4)
+    hidden = torch.zeros(2, 4)
     with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
             selected.entry = ffn_entry

@@ -15,9 +15,7 @@ from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
 )
-from sglang.srt.disaggregation.decode_hicache_mixin import (
-    HiCacheRestoreGatedKVReceiver,
-)
+from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreGatedKVReceiver
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import publish, reset_context
@@ -174,6 +172,7 @@ class TestHeldDestinationPublication(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             scheduler_stage_metrics=None,
+            tree_cache=SimpleNamespace(linker=None),
             enable_decode_hicache=False,
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,

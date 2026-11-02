@@ -11,7 +11,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 # runner so the declared resource and the server topology stay aligned.
 register_cuda_ci(
     est_time=900,
-    stage="extra-b",
+    stage="nightly",
     runner_config="4-gpu-b200",
 )
 
