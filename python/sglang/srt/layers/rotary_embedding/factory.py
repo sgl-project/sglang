@@ -77,8 +77,9 @@ if _use_aiter:
 
 @functools.lru_cache(maxsize=1)
 def _aiter_rope_unsupported_arch() -> bool:
-    """aiter's rope kernels (csrc/kernels/rope/rope_common.h) depend on ck_tile
-    types that do not build on gfx1250; fall back to sglang's native rope there."""
+    """gfx1250 keeps sglang's rope modules: its MLA paths read cos_sin_cache,
+    which aiter's rope modules do not have. DeepseekScalingRotaryEmbedding
+    calls the aiter rope kernel directly instead."""
     if not _is_hip:
         return False
     try:
