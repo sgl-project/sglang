@@ -34,7 +34,12 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
-from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.rust_server.config import (
+    _build_server_args,
+    _frontend_cpu_key,
+    _frontend_cpu_share,
+    _partition_cores,
+)
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
@@ -208,12 +213,29 @@ class RustServer:
 
     @classmethod
     def _partition_cores(
-        cls, mm_workers: int = 0
+        cls, mm_workers: int = 0, cpu_share: Tuple[int, int] = (0, 1)
     ) -> tuple[Optional[List[int]], Optional[List[int]]]:
         return _partition_cores(
             mm_workers=mm_workers,
             server_core_budget=cls._server_core_budget,
+            cpu_share=cpu_share,
         )
+
+    @classmethod
+    def gather_frontend_cpu_share(cls, hosts_listener: bool) -> Tuple[int, int]:
+        """Collective: every rank calls once; returns this listener's
+        ``(index, count)`` among the listeners on its node with the same CPU
+        affinity mask, for ``_partition_cores``."""
+        if get_exec().moe.is_ep_joiner:
+            # Stays out for the reason `gather_server_endpoints` does: the
+            # serving ranks never enter this collective again. The joiner's
+            # listener partitions its whole mask, as before this split.
+            return 0, 1
+        world_group = get_parallel().world_group
+        cpu_keys = world_group.all_gather_object(
+            _frontend_cpu_key() if hosts_listener else None
+        )
+        return _frontend_cpu_share(cpu_keys, rank=world_group.rank_in_group)
 
     @classmethod
     def _port_offset(cls) -> int:
@@ -233,7 +255,16 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
-        host = get_serving().host
+        if get_exec().moe.is_ep_joiner:
+            # An elastic-EP joiner stays out: the serving ranks gathered at
+            # their own startup and never enter this collective again, so a
+            # joiner's gather cannot meet them (a scale joiner's returns at
+            # once with unset slots, a recover joiner's waits on them; see
+            # #47505). With no endpoints the joiner's listener fans nothing
+            # out, and the serving ranks' table is untouched.
+            return []
+        bind_host = get_serving().host
+        host = bind_host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another
             # node; advertise the address the interfaces answer on.
@@ -254,22 +285,45 @@ class RustServer:
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
+            address = NetworkAddress(host, port)
             config = {
                 "dp_rank": select_kv_publisher_dp_rank(
                     get_parallel().attn_dp_size,
                     get_parallel().attn_dp_rank,
                     get_parallel().dp_rank,
                 ),
-                "endpoint": NetworkAddress(host, port).to_url(),
+                "endpoint": address.to_url(),
             }
+            if bind_host == "0.0.0.0" and address.is_ipv6:
+                config["address_error"] = (
+                    f"DP rank {config['dp_rank']} listens on IPv4 at {bind_host} "
+                    f"but advertises {address.to_url()}; set --host to :: or "
+                    "SGLANG_HOST_IP to an IPv4 address"
+                )
         gathered = get_parallel().world_group.all_gather_object(config)
-        return sorted(
+        table = sorted(
             (entry for entry in gathered if entry is not None),
             key=lambda entry: entry["dp_rank"],
         )
+        # Validate the collective result so every rank fails together, including
+        # ranks that host no listener, instead of leaving peers in the gather.
+        errors = [entry["address_error"] for entry in table if "address_error" in entry]
+        if errors:
+            raise ValueError("SGLANG_RUST_SERVER: " + "; ".join(errors))
+        attn_dp_size = get_parallel().attn_dp_size
+        if attn_dp_size > 1:
+            ranks = [entry["dp_rank"] for entry in table]
+            if ranks != list(range(attn_dp_size)):
+                raise ValueError(
+                    "SGLANG_RUST_SERVER: expected one Rust listener for each of "
+                    f"{attn_dp_size} attention-DP ranks, gathered {ranks}"
+                )
+        return table
 
     @classmethod
-    def launch(cls, scheduler: Scheduler) -> RustServer:
+    def launch(
+        cls, scheduler: Scheduler, frontend_cpu_share: Tuple[int, int] = (0, 1)
+    ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
@@ -292,7 +346,8 @@ class RustServer:
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
-            )
+            ),
+            cpu_share=frontend_cpu_share,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python

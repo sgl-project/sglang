@@ -20,84 +20,18 @@ from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmulSwigluQuant,
 )
 from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
     _get_float4_e2m1fn_x2_dtype,
-    _get_float8_e8m0fnu_dtype,
+    _require_e8m0_dtype,
+)
+from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    prepare_w4a8_mxfp_weight,
 )
 
 logger = logging.getLogger(__name__)
 
 
-_E8M0_DTYPE = None
 _DEFAULT_DYNAMIC_QUANT = object()
-
-
-def _require_e8m0_dtype():
-    """Resolve the e8m0 block-scale dtype, failing loudly if it is unavailable.
-
-    The grouped matmuls validate their scale-dtype arguments against torch_npu's
-    own dtype enum (``torch_npu.float8_e8m0fnu``, 293 on A5) and reject the torch
-    dtype object with "weight_scale_dtype only supports float8_e8m0fnu or None,
-    but the actual value is Float8_e8m0fnu" — hence torch_npu first, torch only
-    as a fallback. Dense ``npu_quant_matmul`` accepts either, which is why
-    ``_get_float8_e8m0fnu_dtype`` reads it off torch.
-
-    The MXFP8 ops take the scale dtype explicitly; passing None silently changes
-    how they interpret the scales, so a missing dtype must raise rather than
-    propagate.
-
-    torch_npu is imported lazily (and cached) so this module stays importable on
-    CUDA/CPU/AMD/XPU CI.
-    """
-    global _E8M0_DTYPE
-    if _E8M0_DTYPE is None:
-        from sglang.srt.utils import is_npu
-
-        if is_npu():
-            import torch_npu
-
-            _E8M0_DTYPE = getattr(torch_npu, "float8_e8m0fnu", None)
-        if _E8M0_DTYPE is None:
-            _E8M0_DTYPE = _get_float8_e8m0fnu_dtype()
-        if _E8M0_DTYPE is None:
-            raise RuntimeError(
-                "float8_e8m0fnu dtype not found — MXFP8 MoE requires Ascend A5 "
-                "with a torch_npu build exposing float8_e8m0fnu (torch_npu >= 2.9)."
-            )
-    return _E8M0_DTYPE
-
-
-def reshape_w4a8_mxfp_weight_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP4 scales from ``[E, N, K/32]`` to the A5 GMM layout."""
-    if scale.dim() != 3:
-        return scale
-    num_experts, n, k32 = scale.shape
-    if k32 % 2 != 0:
-        raise ValueError(
-            "MXFP4 scale K dimension must be divisible by 2 for the "
-            f"[E, K/64, N, 2] layout, got {tuple(scale.shape)}."
-        )
-    return scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
-
-
-def prepare_w4a8_mxfp_weight(
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    *,
-    npu_format=None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert W4A8 MXFP weights and scales to the shared A5 GMM layout."""
-    cast_args = {
-        "customize_dtype": torch.float8_e4m3fn,
-        "input_dtype": _get_float4_e2m1fn_x2_dtype(),
-    }
-    if npu_format is None:
-        weight = npu_format_cast(weight, **cast_args)
-    else:
-        weight = npu_format_cast(weight, npu_format, **cast_args)
-    return weight.transpose(-1, -2), reshape_w4a8_mxfp_weight_scale_for_npu(
-        weight_scale
-    )
 
 
 def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -317,10 +251,6 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         self._validate_weight_prefix(layer, weight_prefix)
-
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        if fp4_dtype is None:
-            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
 
         weight = getattr(layer, f"{weight_prefix}_weight")
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
