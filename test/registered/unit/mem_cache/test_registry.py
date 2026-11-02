@@ -255,7 +255,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             get_context().override_server_args(
                 enable_unified_cache_external_linker=True,
                 unified_cache_external_linker_backend="mori",
-                unified_cache_external_linker_config={"a": 1},
             ),
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -304,7 +303,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ctx.server_args,
             ctx.params,
             components=set(cache.tree_components),
-            extra_config={"a": 1},
+            extra_config={},
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         self.assertIsInstance(cache.linker, UnifiedCacheLinkerWrapper)

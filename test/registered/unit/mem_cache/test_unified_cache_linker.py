@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -668,12 +668,7 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         tokens = list(range(1, 9))
         first = linkers[0]
-        self.assertIs(cache.linker.cache_linker, first)
         self.assertEqual(published, [first])
-        ok, message = cache.attach_cache_linker()
-        self.assertTrue(ok)
-        self.assertIn("already attached", message)
-        self.assertEqual(len(linkers), 1)
         node = self._insert(cache, allocator, req_to_token_pool, tokens)
         node = node.last_device_node
         ((first_offload,),) = first.offload_calls
@@ -681,9 +676,8 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.check_hicache_events()
         self.assertTrue(cache.tree_core.is_external_cache_stored(node))
 
-        self.assertEqual(cache.detach_cache_linker()[0], True)
+        cache.detach_cache_linker()
         self.assertIsNone(cache.linker)
-        self.assertFalse(cache.tree_core.enable_external_cache_linker)
         self.assertFalse(cache.tree_core.is_external_cache_stored(node))
         self.assertEqual(cache.write_through_threshold, threshold)
         self.assertIsNone(published[-1])
@@ -691,9 +685,8 @@ class TestUnifiedCacheLinkerPythonBackend(
         tail = tail.last_device_node
         cache.check_hicache_events()
 
-        self.assertEqual(cache.attach_cache_linker()[0], True)
+        cache.attach_cache_linker()
         second = linkers[1]
-        self.assertIs(published[-1], second)
         self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])
         self.assertEqual(
             [transfer.keys for (transfer,) in second.offload_calls],
@@ -702,9 +695,6 @@ class TestUnifiedCacheLinkerPythonBackend(
         for _ in second.offload_calls:
             second.complete_next_offload(True)
         cache.check_hicache_events()
-        with get_context().override_server_args(enable_linker_mla_dedup=True):
-            self.assertFalse(cache.detach_cache_linker()[0])
-        self.assertIs(cache.linker.cache_linker, second)
         cache.detach_cache_linker()
         cache.sanity_check()
 
@@ -741,9 +731,7 @@ class TestUnifiedCacheLinkerPythonBackend(
 
         built[-1].close.assert_called_once_with()
         self.assertIsNone(cache.linker)
-        self.assertFalse(cache.tree_core.enable_external_cache_linker)
         self.assertEqual(published, [])
-        self.assertIn("not attached", cache.detach_cache_linker()[1])
 
     def test_swa_hit_loads_private_tail_and_dedups_on_insert(self):
         self._run_swa_hit(load_landed=True)

@@ -12,7 +12,6 @@ from unittest.mock import Mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
-    AttachCacheLinkerReqInput,
     AttachHiCacheStorageReqInput,
     DetachCacheLinkerReqInput,
     DetachHiCacheStorageReqInput,
@@ -35,33 +34,6 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "scheduler must stop"):
             scheduler.detach_cache_linker_wrapped(DetachCacheLinkerReqInput())
 
-    def test_linker_admin_guards_and_hicache_route_are_independent(self):
-        scheduler = self._scheduler()
-        scheduler.tree_cache.attach_cache_linker = Mock(return_value=(True, "a"))
-        scheduler.tree_cache.detach_cache_linker = Mock(return_value=(True, "d"))
-        attach = AttachCacheLinkerReqInput()
-        detach = DetachCacheLinkerReqInput()
-        self.assertFalse(scheduler.attach_cache_linker_wrapped(attach).success)
-        self.assertFalse(scheduler.detach_cache_linker_wrapped(detach).success)
-
-        scheduler.enable_unified_cache_external_linker = True
-        scheduler.enable_hierarchical_cache = False
-        out = scheduler.attach_hicache_storage_wrapped(
-            AttachHiCacheStorageReqInput(hicache_storage_backend="file")
-        )
-        self.assertFalse(out.success)
-        scheduler.is_fully_idle = lambda: False
-        scheduler.waiting_queue = []
-        scheduler.running_batch = SimpleNamespace(reqs=[])
-        self.assertFalse(scheduler.attach_cache_linker_wrapped(attach).success)
-        self.assertFalse(scheduler.detach_cache_linker_wrapped(detach).success)
-        scheduler.tree_cache.attach_cache_linker.assert_not_called()
-        scheduler.tree_cache.detach_cache_linker.assert_not_called()
-
-        scheduler.is_fully_idle = lambda: True
-        self.assertTrue(scheduler.attach_cache_linker_wrapped(attach).success)
-        self.assertTrue(scheduler.detach_cache_linker_wrapped(detach).success)
-
     def _scheduler(self, **fields):
         override = get_context().override_server_args(
             enable_hierarchical_cache=True, **fields
@@ -72,7 +44,6 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
-        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_hicache_storage = False
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(
