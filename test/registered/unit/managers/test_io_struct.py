@@ -446,11 +446,17 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req = copy.deepcopy(self.base_req)
         req.sampling_params = [{"n": 3}, {"n": 3}]
         req.background = True
+        req.require_reasoning = True
+        req.use_audio_in_video = True
+        req.routing_key = "test_key"
         req.normalize_batch_and_arguments()
 
         self.assertGreater(len(req.text), 2)
         for i in range(len(req.rid)):
             self.assertTrue(req[i].background)
+            self.assertTrue(req[i].require_reasoning)
+            self.assertTrue(req[i].use_audio_in_video)
+            self.assertEqual(req[i].routing_key, "test_key")
 
         first = req[0]
         self.assertIs(req[0], first)
