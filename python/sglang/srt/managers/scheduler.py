@@ -3705,6 +3705,7 @@ class Scheduler(
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
+            self.tree_cache.release_retracted_turn(req)
             req.session.abort_req()
         if self.uocr_runtime is not None:
             self.uocr_runtime.on_req_dropped(req)
