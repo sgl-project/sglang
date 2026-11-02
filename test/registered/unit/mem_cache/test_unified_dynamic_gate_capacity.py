@@ -105,17 +105,18 @@ class TestDynamicGateCapacity(CustomTestCase):
         a.free_swa(slots[:40])
         scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
-            disagg_prefill_inflight_queue=[],
-            disagg_prefill_pending_chunk_rids=set(),
+            disagg_prefill_transfer_queue=SimpleNamespace(
+                queue=[], pending_chunk_rids=set()
+            ),
         )
         pin_every_band(a, disagg_transfers_in_flight(scheduler))
         x = a.full_attn_allocator
         opened = x.schedulable_available_size()
-        scheduler.disagg_prefill_pending_chunk_rids.add("request")
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.add("request")
         closed = x.schedulable_available_size()
         self.assertLess(closed, opened)
         self.assertEqual(closed, x._available_tokens())
-        scheduler.disagg_prefill_pending_chunk_rids.clear()
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.clear()
         self.assertEqual(x.schedulable_available_size(), opened)
         self.assertEqual(a.verify_byte_accounting(), [])
 

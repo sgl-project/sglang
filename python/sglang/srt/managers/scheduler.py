@@ -95,6 +95,7 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
+    PrefillTransferQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
@@ -237,6 +238,9 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
@@ -488,8 +492,6 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
-    # Allocate per instance only when a consumer first defers a response.
-    _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_crop_transfer: Optional["UnlimitedOcrCropTransfer"] = None
     uocr_doc_hooks: Optional[UocrDocHooks] = None
@@ -781,6 +783,8 @@ class Scheduler(
         self.init_kv_weight_version_tracker()
 
         self.init_output_streamer()
+
+        self.init_deferred_responses()
 
         self.init_batch_result_processor()
 
@@ -1558,7 +1562,7 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_inflight_queue = None
+        self.disagg_prefill_transfer_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1687,10 +1691,7 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_inflight_queue: List[Req] = []
-            # Requests with a sent chunk that are not yet on the inflight queue.
-            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            self.disagg_prefill_transfer_queue = PrefillTransferQueue()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2746,8 +2747,8 @@ class Scheduler(
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),
-            get_disagg_prefill_inflight_queue=lambda: (
-                self.disagg_prefill_inflight_queue
+            get_disagg_prefill_transfer_queue=lambda: (
+                self.disagg_prefill_transfer_queue.queue
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
@@ -2792,62 +2793,18 @@ class Scheduler(
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
 
-    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
-        """Hold a finished response until completion; see deferred_output."""
-        if self.disaggregation_mode != DisaggregationMode.NULL:
-            raise ValueError("deferred responses do not support PD disaggregation")
-        if not req.finished() or req.finished_output:
-            raise ValueError("only finished, unstreamed responses can be deferred")
-        if self._deferred_responses is None:
-            self._deferred_responses = {}
-        if req.rid in self._deferred_responses:
-            raise ValueError(f"response {req.rid!r} is already deferred")
-        self._deferred_responses[req.rid] = (req, completion)
-        req.defer_output = True
-        self.output_streamer.defer_outputs = True
-
-    def stream_released_deferred_outputs(self) -> None:
-        ready = []
-        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
-            if not completion.done():
-                continue
-            del self._deferred_responses[rid]
-            req.defer_output = False
-            try:
-                completion.result()
-            except Exception as exc:
-                logger.exception("Deferred response failed for %s", rid)
-                self._abort_deferred_response(
-                    req, FINISH_ABORT(str(exc), status_code=500).to_json()
-                )
-            else:
-                ready.append(req)
-        if ready:
-            self.output_streamer.stream_output(
-                ready, any(req.return_logprob for req in ready)
-            )
-
-    def has_pending_deferred_outputs(self) -> bool:
-        return bool(self._deferred_responses)
-
-    def _abort_deferred_response(
-        self, req: Req, finished_reason: Optional[FinishReasonDict]
-    ) -> None:
-        req.defer_output = False
-        req.finished_output = True
-        self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+    def init_deferred_responses(self) -> None:
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=self.disaggregation_mode,
+            output_streamer=self.output_streamer,
+            send_abort=lambda req, finished_reason: self.send_abort_output(
+                _make_abort_req(req, finished_reason=finished_reason), req
+            ),
         )
 
-    def _abort_deferred_responses(self, recv_req: AbortReq) -> None:
-        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
-                del self._deferred_responses[rid]
-                try:
-                    completion.cancel()
-                except Exception:
-                    logger.exception("Failed to cancel deferred work for %s", rid)
-                self._abort_deferred_response(req, recv_req.finished_reason)
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        """Hold a finished response until completion; see deferred_output."""
+        self.deferred_responses.defer(req, completion)
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -5445,8 +5402,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5610,8 +5566,7 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        self.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5636,7 +5591,7 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
-                or self._deferred_responses
+                or self.deferred_responses.has_pending()
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -5699,7 +5654,7 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        if self.has_pending_deferred_outputs():
+        if self.deferred_responses.has_pending():
             # Held responses are released by polling, not by a socket event:
             # keep polling, and yield the GIL to the completion's worker.
             time.sleep(0)
@@ -5709,8 +5664,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        if self.deferred_responses.has_pending():
+            self.deferred_responses.stream_released()
             time.sleep(0)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
@@ -5750,7 +5705,7 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
+            # Grammar queue and prefill transfer queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.async_shm_materializer is not None:
@@ -5760,7 +5715,7 @@ class Scheduler(
                     ignore_waiting=ignore_waiting
                 )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_transfer_queue.queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6044,7 +5999,7 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
-            *(req for req, _ in (self._deferred_responses or {}).values()),
+            *self.deferred_responses.held_reqs(),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -6074,8 +6029,7 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
-        if self._deferred_responses:
-            self._abort_deferred_responses(recv_req)
+        self.deferred_responses.abort(recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -6167,9 +6121,9 @@ class Scheduler(
                         prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
+            for req in self.disagg_prefill_transfer_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    logger.debug(f"Abort transfer queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -6271,7 +6225,7 @@ class Scheduler(
             # last_batch itself; its requests are already listed above.
             and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
+            # already in the transfer queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL

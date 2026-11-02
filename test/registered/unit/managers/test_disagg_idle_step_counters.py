@@ -179,7 +179,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         self.prepare_pp_scheduler(scheduler)
                         if pending_transfer:
                             if name == "prefill":
-                                scheduler.disagg_prefill_inflight_queue = [object()]
+                                scheduler.disagg_prefill_transfer_queue.queue = [
+                                    object()
+                                ]
                             else:
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
@@ -568,7 +570,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.last_batch = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -599,7 +603,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
-        scheduler.process_disagg_prefill_inflight_queue = Mock()
+        scheduler.process_disagg_prefill_transfer_queue = Mock()
         scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.on_idle = Mock()
         return scheduler
@@ -628,7 +632,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        )
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
 
 

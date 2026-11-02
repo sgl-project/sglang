@@ -10,9 +10,9 @@ Life cycle of a request in the prefill server
 2. Waiting Queue
     a. Use PrefillAdder to pop requests
     b. Run forward
-    c. Add the request to Inflight Queue
+    c. Add the request to Transfer Queue
 
-3. Inflight Queue
+3. Transfer Queue
     a. Poll (non-blocking) the sender of the request
     b. Once the transfer has finished, return the request
 """
@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 import numpy as np
 import torch
@@ -576,6 +576,16 @@ class PrefillBootstrapQueue:
             self.kv_manager.register_buffer_to_engine()
 
 
+class PrefillTransferQueue:
+    """The prefill requests whose KV is being sent to the decode side."""
+
+    def __init__(self):
+        # The prefill requests that are in the middle of kv sending
+        self.queue: List[Req] = []
+        # Requests with a sent chunk that are not yet on the transfer queue.
+        self.pending_chunk_rids: Set[str] = set()
+
+
 class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
@@ -727,7 +737,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self._sched_idled = True
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            self.process_disagg_prefill_transfer_queue()
 
             # Update last_batch
             self.last_batch = batch
@@ -867,7 +877,7 @@ class SchedulerDisaggregationPrefillMixin:
                     batch_result = self.run_batch(batch)
                     if self._war_barrier_is_coarse():
                         # Defer a whole-forward barrier past result processing: it and
-                        # the inflight queue mutate no request in this forward (a
+                        # the transfer queue mutate no request in this forward (a
                         # continuing chunked one is only read).
                         war_barrier_pending = True
                     else:
@@ -880,7 +890,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # Poll until the oldest result is ready on all TP ranks while there
                 # is input to take or a transfer to retire; otherwise block.
                 if self.enable_continuous_input_polling or (
-                    poll_transfers_while_waiting and self.disagg_prefill_inflight_queue
+                    poll_transfers_while_waiting
+                    and self.disagg_prefill_transfer_queue.queue
                 ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (
@@ -891,7 +902,7 @@ class SchedulerDisaggregationPrefillMixin:
                     ):
                         waiting_for_batch_result = True
                         if poll_transfers_while_waiting:
-                            self.process_disagg_prefill_inflight_queue()
+                            self.process_disagg_prefill_transfer_queue()
                         if war_barrier_pending:
                             self._apply_war_barrier()
                             war_barrier_pending = False
@@ -904,7 +915,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            self.process_disagg_prefill_transfer_queue()
 
             if war_barrier_pending:
                 self._apply_war_barrier()
@@ -951,7 +962,7 @@ class SchedulerDisaggregationPrefillMixin:
         result: GenerationBatchResult,
     ) -> None:
         """
-        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        Transfer kv for prefill completed requests and add it into the transfer queue
         Adapted from process_batch_result_prefill
         """
         (
@@ -998,7 +1009,7 @@ class SchedulerDisaggregationPrefillMixin:
                 draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
                     "cpu", non_blocking=False
                 )
-        # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        # Transfer kv for prefill completed requests and add it into the transfer queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
@@ -1084,7 +1095,7 @@ class SchedulerDisaggregationPrefillMixin:
                     i, req, logits_output
                 )
                 self.checkpoint_disagg_prefill(req)
-                self.disagg_prefill_inflight_queue.append(req)
+                self.disagg_prefill_transfer_queue.queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
@@ -1201,7 +1212,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_disagg_prefill_inflight_queue(
+    def process_disagg_prefill_transfer_queue(
         self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
     ) -> List[Req]:
         """
@@ -1210,20 +1221,20 @@ class SchedulerDisaggregationPrefillMixin:
         Only these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own sender reports.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
+        if len(self.disagg_prefill_transfer_queue.queue) == 0:
             return []
 
         done_reqs = []
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            [req.disagg_kv_sender for req in self.disagg_prefill_transfer_queue.queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
 
         undone_reqs: List[Req] = []
-        # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        # Check .poll() for the reqs in the transfer queue. If Success, respond to the client and remove it from the queue
+        for req, poll in zip(self.disagg_prefill_transfer_queue.queue, polls):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1302,7 +1313,7 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
+                    f"Unexpected poll state {poll} for req {req.rid} in transfer queue"
                 )
 
         for req in done_reqs:
@@ -1339,7 +1350,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
 
-        self.disagg_prefill_inflight_queue = undone_reqs
+        self.disagg_prefill_transfer_queue.queue = undone_reqs
 
         return done_reqs
 
@@ -1383,7 +1394,7 @@ class SchedulerDisaggregationPrefillMixin:
         call this: a stale entry holds the unified-memory compaction gate closed
         for the process lifetime.
         """
-        self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+        self.disagg_prefill_transfer_queue.pending_chunk_rids.discard(req.rid)
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
@@ -1878,11 +1889,11 @@ class SchedulerDisaggregationPrefillMixin:
                 )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
-        # already put the request on `disagg_prefill_inflight_queue`.
+        # already put the request on the transfer queue.
         if last_chunk:
-            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            self.disagg_prefill_transfer_queue.pending_chunk_rids.discard(req.rid)
         else:
-            self.disagg_prefill_pending_chunk_rids.add(req.rid)
+            self.disagg_prefill_transfer_queue.pending_chunk_rids.add(req.rid)
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

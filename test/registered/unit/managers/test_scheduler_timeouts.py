@@ -27,6 +27,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -74,6 +77,11 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
+    s.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
@@ -162,7 +170,6 @@ class TestQueuedAbort(CustomTestCase):
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
         s.disaggregation_mode = DisaggregationMode.NULL
-        s._deferred_responses = {}
         s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
@@ -216,7 +223,9 @@ class TestRunningTimeout(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        s.disagg_prefill_inflight_queue = []
+        s.disagg_prefill_transfer_queue = SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        )
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])

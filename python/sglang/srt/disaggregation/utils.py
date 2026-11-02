@@ -188,8 +188,8 @@ def disagg_transfers_in_flight(scheduler):
     def busy() -> bool:
         if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             return bool(
-                scheduler.disagg_prefill_inflight_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
+                scheduler.disagg_prefill_transfer_queue.queue
+                or scheduler.disagg_prefill_transfer_queue.pending_chunk_rids
             )
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager

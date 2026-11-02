@@ -4,8 +4,12 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -318,7 +322,11 @@ class _SchedulerStub:
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
-        self._deferred_responses = None
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):

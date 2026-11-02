@@ -78,7 +78,7 @@ class FakeKVSender(BaseKVSender):
         return self.poll()
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        # A send() that never comes must not pin the prefill inflight queue forever.
+        # A send() that never comes must not pin the prefill transfer queue forever.
         # No deadline before init(): the request is still in the bootstrap queue.
         if not self.inited:
             return None

@@ -4,7 +4,7 @@ The source decides when lazy compaction may relocate physical pages. A page is
 exposed to the peer from the moment its address is published until the transfer
 concludes, and for part of that lifetime the request sits in NEITHER end's
 queue. Both cases below are exactly those windows: an earlier version of the
-predicates looked only at `disagg_prefill_inflight_queue` /
+predicates looked only at `disagg_prefill_transfer_queue.queue` /
 `disagg_decode_transfer_queue` (plus `scheduler.chunked_req`) and reported idle
 here, letting compaction move pages under in-flight RDMA -- silent KV
 corruption with no crash.
@@ -64,8 +64,9 @@ class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
-        self.disagg_prefill_inflight_queue: List[object] = []
-        self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+        self.disagg_prefill_transfer_queue = SimpleNamespace(
+            queue=[], pending_chunk_rids=set()
+        )
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
         self.disagg_decode_prealloc_queue = _FakePreallocQueue()
         self.decode_offload_manager = None
@@ -102,7 +103,7 @@ class TestDecodeMoveGate(CustomTestCase):
 class TestPrefillMoveGate(CustomTestCase):
     def test_closed_after_final_chunk_clears_chunked_req(self):
         """Scheduling the final chunk clears `scheduler.chunked_req`, but the
-        request only reaches `disagg_prefill_inflight_queue` later in the result
+        request only reaches `disagg_prefill_transfer_queue.queue` later in the result
         path. Earlier middle chunks may still be draining in that window, so the
         source must not key off `chunked_req` alone.
         """
@@ -112,20 +113,20 @@ class TestPrefillMoveGate(CustomTestCase):
 
         # A middle chunk went out for rid "r0".
         scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.add("r0")
         self.assertTrue(busy())
 
         # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
         scheduler.chunked_req = None
-        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
+        self.assertFalse(scheduler.disagg_prefill_transfer_queue.queue)
         self.assertTrue(busy())
 
         # Last chunk sent: the request is on the inflight queue, which covers it.
-        scheduler.disagg_prefill_inflight_queue.append(object())
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        scheduler.disagg_prefill_transfer_queue.queue.append(object())
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.discard("r0")
         self.assertTrue(busy())
 
-        scheduler.disagg_prefill_inflight_queue.clear()
+        scheduler.disagg_prefill_transfer_queue.queue.clear()
         self.assertFalse(busy())
 
     def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
@@ -139,12 +140,12 @@ class TestPrefillMoveGate(CustomTestCase):
         busy = disagg_transfers_in_flight(scheduler)
 
         scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.add("r0")
         self.assertTrue(busy())
 
         # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
         scheduler.chunked_req = None
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
+        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.discard("r0")
         self.assertFalse(busy(), "abort cleanup must let compaction resume")
 
 
@@ -305,16 +306,18 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 scheduler.disagg_decode_transfer_queue = None
                 scheduler.disagg_decode_prealloc_queue = None
                 check_pins(False)
-                scheduler.disagg_prefill_pending_chunk_rids.add("prefill")
+                scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.add(
+                    "prefill"
+                )
                 check_pins(True)
-                scheduler.disagg_prefill_pending_chunk_rids.clear()
+                scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.clear()
                 hicache.busy = True
                 check_pins(True)
                 hicache.busy = False
                 check_pins(False)
 
                 scheduler.disaggregation_mode = DisaggregationMode.DECODE
-                scheduler.disagg_prefill_inflight_queue = None
+                scheduler.disagg_prefill_transfer_queue = None
                 scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
                 scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
                 check_pins(False)
