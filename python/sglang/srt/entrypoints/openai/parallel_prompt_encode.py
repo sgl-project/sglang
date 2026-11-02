@@ -160,13 +160,12 @@ def _build_plan(tokenizer):
     """Return (backend, specials_added, pattern, normalized_pattern, intra)
     or None."""
     try:
+        from tokenizers import Tokenizer
         from transformers import PreTrainedTokenizerBase
     except ImportError:
         return None
     backend = getattr(tokenizer, "_tokenizer", None)
-    if not getattr(tokenizer, "is_fast", False) or backend is None:
-        return None
-    if not hasattr(backend, "encode_batch") or not hasattr(backend, "to_str"):
+    if not getattr(tokenizer, "is_fast", False) or not isinstance(backend, Tokenizer):
         return None
     # Only the stock HF fast path: encode -> _encode_plus -> backend.encode_batch.
     if type(tokenizer).encode is not PreTrainedTokenizerBase.encode:
@@ -258,11 +257,6 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
 
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
-    return parallel_prompt_encode_batch(tokenizer, [text], encode_kwargs)[0]
-
-
-def parallel_prompt_encode_batch(tokenizer, texts, encode_kwargs=None):
-    """Encode a list of texts, applying the parallel threshold to their total length."""
     global _parallel_ok, _parallel_pid
     pid = os.getpid()
     if pid != _parallel_pid:
@@ -272,28 +266,26 @@ def parallel_prompt_encode_batch(tokenizer, texts, encode_kwargs=None):
     if (
         _parallel_ok is False
         or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
-        or not all(isinstance(text, str) for text in texts)
-        or sum(len(text) for text in texts)
-        < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        or not isinstance(text, str)
+        or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         or set(encode_kwargs) - {"add_special_tokens"}
     ):
-        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
+        return tokenizer.encode(text, **encode_kwargs)
     plan = _plan_for(tokenizer)
     if plan is None:
-        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
+        return tokenizer.encode(text, **encode_kwargs)
     backend, specials_added, pattern, npattern, intra = plan
     if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
+        return tokenizer.encode(text, **encode_kwargs)
     if (
         backend.truncation is not None
         or backend.padding is not None
         or backend.encode_special_tokens
     ):
-        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
-    chunks_by_text = [split_prompt(text, pattern, npattern, intra) for text in texts]
-    chunks = list(chain.from_iterable(chunks_by_text))
+        return tokenizer.encode(text, **encode_kwargs)
+    chunks = split_prompt(text, pattern, npattern, intra)
     if len(chunks) < 2:
-        return [tokenizer.encode(text, **encode_kwargs) for text in texts]
+        return tokenizer.encode(text, **encode_kwargs)
 
     check = _parallel_ok is None
     if check:
@@ -310,14 +302,7 @@ def parallel_prompt_encode_batch(tokenizer, texts, encode_kwargs=None):
                 "this process (TOKENIZERS_PARALLELISM off or process forked after "
                 "tokenizers used its pool); using the original encode."
             )
-    ids_by_text, start = [], 0
-    for text_chunks in chunks_by_text:
-        end = start + len(text_chunks)
-        ids_by_text.append(
-            list(chain.from_iterable(e.ids for e in encodings[start:end]))
-        )
-        start = end
-    return ids_by_text
+    return list(chain.from_iterable(e.ids for e in encodings))
 
 
 def _cuts_at(token, added_tokens):
@@ -346,6 +331,10 @@ class _SegmentEncoder:
             t.content: i for i, t in added.items() if t.content and not t.normalized
         }
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
+        # A capturing group keeps the added tokens in the output of split().
+        self.split_added = (
+            re.compile(f"({self.pattern.pattern})").split if self.pattern else None
+        )
         self.cuts = {}
         self.lock = threading.Lock()
         self.cache = OrderedDict()
@@ -459,3 +448,18 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
     ):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments)
+
+
+def encode_rendered_prompt(tokenizer, text, encode_kwargs=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, text, encode_kwargs)`` for a
+    prompt that a chat template rendered to text. It cuts the prompt at its added
+    tokens, so the text between them comes from the ``encode_prompt_segments`` cache.
+    An added token that ``_cuts_at`` rejects rejoins the text around it."""
+    encoder = (
+        _segment_encoder_for(tokenizer)
+        if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
+        else None
+    )
+    if encoder is None or encoder.split_added is None:
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    return encode_prompt_segments(tokenizer, encoder.split_added(text), encode_kwargs)

@@ -53,10 +53,10 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    _segment_encoder_for,
     encode_prompt_segments,
-    parallel_prompt_encode,
+    encode_rendered_prompt,
 )
-from sglang.srt.entrypoints.openai.prompt_segment_cache import PromptSegmentCache
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -479,18 +479,13 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        # Concurrent first requests would each build the encoder.
+        _segment_encoder_for(self.tokenizer_manager.tokenizer)
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
-        )
-        # Encodes only the messages of a prompt that it has not seen. None when
-        # per-message encoding is not exact for this tokenizer.
-        self._prompt_segment_cache = (
-            PromptSegmentCache.create(self.tokenizer_manager.tokenizer)
-            if envs.SGLANG_OPT_USE_CHAT_PROMPT_SEGMENT_CACHE.get()
-            else None
         )
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
@@ -2359,13 +2354,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                segment_cache = self._prompt_segment_cache
-                if segment_cache is not None and segment_cache.enabled:
-                    prompt_ids = segment_cache.encode(rendered_prompt, encode_kwargs)
-                else:
-                    prompt_ids = parallel_prompt_encode(
-                        self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-                    )
+                prompt_ids = encode_rendered_prompt(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None

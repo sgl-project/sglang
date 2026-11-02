@@ -339,8 +339,6 @@ class Envs:
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
-    # Encode a chat prompt one message at a time and reuse the ids across turns.
-    SGLANG_OPT_USE_CHAT_PROMPT_SEGMENT_CACHE = EnvBool(True)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
@@ -1819,10 +1817,11 @@ class Envs:
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     # Group replies by tokenizer worker; disable for per-request delivery.
     SGLANG_BATCH_TOKENIZER_OUTPUTS = EnvBool(True)
-    # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
+    # Encode rendered chat prompts through the per-tokenizer segment cache when the
+    # tokenizer allows it, and cut long ones into chunks for the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
-    # Shorter prompts use the single-call encode; below this the gain is eaten
-    # by rayon dispatch and the id merge.
+    # A shorter text stays one chunk. Below this size, rayon dispatch and the id merge
+    # use up the gain.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
