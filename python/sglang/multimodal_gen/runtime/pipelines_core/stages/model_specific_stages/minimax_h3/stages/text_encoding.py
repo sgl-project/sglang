@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -373,6 +374,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             }
         }
 
+    @use_gpu_conditioning_hash()
     def _encode_ref2va(
         self,
         batch: Req,

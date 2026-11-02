@@ -81,6 +81,20 @@ def conditioning_cache_group(*, enabled):
 
 
 @contextmanager
+def use_gpu_conditioning_hash(*, enabled: bool = True):
+    """Opt into GPU hashing; disabled scopes preserve the parent policy."""
+    cache = _active_cache.get()
+    if not enabled or cache is None:
+        yield
+        return
+    token = cache._gpu_conditioning_hash.set(True)
+    try:
+        yield
+    finally:
+        cache._gpu_conditioning_hash.reset(token)
+
+
+@contextmanager
 def prefer_conditioning_cache():
     # retain reusable negative conditioning ahead of changing positive prompts
     token = _prefer_cache.set(True)
@@ -113,6 +127,14 @@ def _tensor_digest(tensor):
     return digest.digest()
 
 
+def _gpu_tensor_digest(tensor):
+    if not tensor.is_cuda:
+        return _tensor_digest(tensor)
+    from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensor_blake3
+
+    return gpu_tensor_blake3(tensor)
+
+
 def _fingerprint(value):
     if isinstance(value, torch.Tensor):
         if (
@@ -121,13 +143,16 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
+        cache = _active_cache.get()
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            _tensor_digest(value.detach().contiguous()),
+            _gpu_tensor_digest(value.detach().contiguous())
+            if cache is not None and cache._gpu_conditioning_hash.get()
+            else _tensor_digest(value.detach().contiguous()),
         )
     if isinstance(value, Image.Image):
         return (
@@ -308,6 +333,9 @@ class ConditioningCache:
         self._models = weakref.WeakKeyDictionary()
         self._next_model = 0
         self._group_entries = ContextVar("conditioning_group_entries", default=None)
+        self._gpu_conditioning_hash = ContextVar(
+            "conditioning_gpu_conditioning_hash", default=False
+        )
         self.group_hits = 0
 
     def clear(self):
