@@ -489,6 +489,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             register_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
             source=self.buffers,
+            # CP graphs consume CP-local proxies; CP prepare owns their padding.
+            zero_pp_proxy_padding=not (
+                self.prefill_backend_name == Backend.BREAKABLE
+                and supports_prefill_cp_bcg(model_runner.server_args)
+            ),
         )
 
         self.attention_layers = self.model_runner.attention_layers
@@ -824,6 +829,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         buffers = self.buffers.pp_proxy_tensors
         if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
+        if getattr(self, "enable_cp_bcg_capture", False):
+            # CP graphs run on this rank's CP-local rows.
+            assert self.prefill_cp_bcg_input is not None
+            num_tokens = self.prefill_cp_bcg_input.bucket_local_tokens[num_tokens]
         return PPProxyTensors(
             {name: buffer[:num_tokens] for name, buffer in buffers.items()}
         )
@@ -2408,6 +2417,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
+        if getattr(self, "enable_cp_bcg_capture", False):
+            # execute_prefill_cp_bcg already trimmed to CP-local rows.
+            return output
         return _slice_output_rows(output, self.raw_num_tokens)
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:

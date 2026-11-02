@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
+from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -567,14 +568,19 @@ def capture_prefill_graph(
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     parallel = get_parallel()
+    # The CP breakable path hands PP stage boundaries over in the eager
+    # CP-local layout; other prefill graphs pad the global token axis instead.
     if (
-        prefill_backend == Backend.BREAKABLE
-        and parallel.enable_prefill_cp
+        parallel.enable_prefill_cp
         and parallel.pp_size > 1
+        and not (
+            prefill_backend == Backend.BREAKABLE
+            and supports_prefill_cp_bcg(model_runner.server_args)
+        )
     ):
         logger.warning(
-            "Disable prefill CUDA graph because pipeline parallelism combined "
-            "with prefill context parallelism is not validated."
+            "Disable prefill CUDA graph because pipeline parallelism with prefill "
+            "context parallelism requires the CP breakable path."
         )
         return result(eager_runner)
     context_length = model_runner.model_config.context_len
