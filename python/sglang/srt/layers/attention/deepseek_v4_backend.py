@@ -35,6 +35,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     fp8_dtype,
     gather_dequant_requant_fp8_paged_dsv4,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_row_alignment,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -85,6 +88,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1035,6 +1039,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     if t.shape[0] == num_rows:
         return t
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
+
+# Arbitrary floor: below it the dense scores are short enough that the
+# all-gather's fixed latency eats most of what sharding saves.
+_INDEXER_TP_SHARD_MIN_ROWS = 512
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -3923,7 +3932,14 @@ class DeepseekV4AttnBackend(
                 self.full_topk_indexer.topk_decode(inputs)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
-                layer, x, q_lora, req, pos, forward_batch, rows_per_request
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                forward_batch,
+                rows_per_request,
+                allow_row_shard=rows_per_request is None,
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
@@ -3984,9 +4000,18 @@ class DeepseekV4AttnBackend(
         pos,
         forward_batch,
         rows_per_request,
+        *,
+        allow_row_shard: bool = False,
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
+        # Only the eager caller opts in. Graph breaks also have replicated rows,
+        # but must not introduce these collectives into the prefill graph path.
+        row_shard = (
+            self._indexer_row_shard(layer, num_rows=x.shape[0])
+            if allow_row_shard
+            else None
+        )
         if rows_per_request is not None:
             rows_per_request_device = async_h2d(
                 rows_per_request, dtype=torch.int32, device=x.device
@@ -4031,6 +4056,25 @@ class DeepseekV4AttnBackend(
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
+            row_shard=row_shard,
+        )
+
+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:
+        # Every input here is the same on all attention-TP ranks, so either all
+        # of them reach the all-gather or none does.
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+            or parallel.attn_tp_size == 1
+            or parallel.attn_cp_size != 1
+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS
+        ):
+            return None
+        return RowShard(
+            group=parallel.attn_tp_group,
+            rank=parallel.attn_tp_rank,
+            world=parallel.attn_tp_size,
+            row_align=flat_index_logits_row_alignment(layer.indexer.n_heads),
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
@@ -4081,6 +4125,7 @@ class DeepseekV4AttnBackend(
             pos[:real],
             forward_batch,
             None,
+            allow_row_shard=False,
         )
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)

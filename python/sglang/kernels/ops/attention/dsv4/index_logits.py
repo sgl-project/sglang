@@ -58,6 +58,11 @@ def index_weights_dtype() -> torch.dtype:
 FLAT_LOGITS_WIDTH_ALIGN = 64
 
 
+def flat_index_logits_row_alignment(heads: int) -> int:
+    """Query rows per 128-head-row MMA tile of the flat score kernel."""
+    return 128 // heads
+
+
 def flat_index_logits_rows_per_tile(
     rows: int,
     width: int,
@@ -69,7 +74,7 @@ def flat_index_logits_rows_per_tile(
     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
     half the budget, which leaves room for the per-row selection scratch that
     grows with the tile."""
-    row_alignment = 128 // heads
+    row_alignment = flat_index_logits_row_alignment(heads)
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
         row_bytes=mqa_logits_row_bytes(width),
