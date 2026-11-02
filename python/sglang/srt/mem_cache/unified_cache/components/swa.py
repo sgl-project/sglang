@@ -297,7 +297,7 @@ class SWAComponent(TreeComponent):
                     on_refresh=(
                         joint_lru.window_stamper()
                         if joint_lru is not None
-                        and self.component_type == ComponentType.SWA
+                        and self.component_type == self.tree_core.joint_window_type
                         else None
                     ),
                 )

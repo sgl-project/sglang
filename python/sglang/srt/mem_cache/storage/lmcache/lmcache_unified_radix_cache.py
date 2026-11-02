@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
@@ -772,7 +773,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
-            name = self.components[ComponentType.SWA].window_sub_pool
+            name = self.component_of(TREE_WINDOW).window_sub_pool
             req.kv.set_evicted_seqlen(
                 name, max(req.kv.get_evicted_seqlen(name), swa_missing_end)
             )

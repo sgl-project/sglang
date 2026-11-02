@@ -2,6 +2,7 @@
 
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import index_slots
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -265,6 +266,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         cache.tree_components = (ComponentType.FULL,) + (
             (ComponentType.MAMBA,) if has_state else ()
         )
+        index_slots(cache, cache.tree_components)
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
         counter = MagicMock(name="layer_done_counter")

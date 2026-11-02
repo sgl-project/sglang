@@ -527,6 +527,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The joint_lru policy keeps the joint LRU, on the unified memory pool's
         # Full/SWA trees only (uses_joint_lru).
         self._keeps_joint_lru = uses_joint_lru(params, self.component_types)
+        # The window slot the joint order covers (the tree's one window).
+        self.joint_window_type: Optional[ComponentType] = (
+            self.slot_id(TREE_WINDOW) if self._keeps_joint_lru else None
+        )
 
         self.kv_events = KVCacheEventRecorder(
             enabled=params.enable_kv_cache_events,
@@ -1656,9 +1660,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             lambda lru, node: lru.insert_after(child, node),
             skip_existing=True,
         )
-        if self.joint_lru is not None and self.lru_lists[ComponentType.SWA].in_list(
-            new_node
-        ):
+        if self.joint_lru is not None and self.lru_lists[
+            self.joint_window_type
+        ].in_list(new_node):
             self.joint_lru.inherit_swa(new_node, child)
         # Other policies count the suffix as just accessed; under joint_lru it
         # keeps its Full recency too.
@@ -1784,23 +1788,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru_op(lru, node)
 
     def start_joint_eviction(self) -> None:
-        """Begin a joint Full/SWA eviction walk over one heap of eligible Full
-        leaves and SWA entries, ordered by their access times."""
+        """Begin a joint eviction walk over one heap of eligible token leaves
+        and window entries, ordered by their access times."""
         assert self._joint_walk is None, "joint eviction already in progress"
         assert self.joint_lru is not None, "joint eviction needs a joint_lru tree"
-        # SWA victims evict through the SWA walk without collapsing Full leaves.
-        self.components_by_type[ComponentType.SWA].evict_device_start(
+        window = self.joint_window_type
+        # Window victims evict through the window walk without collapsing
+        # token leaves.
+        self.components_by_type[window].evict_device_start(
             2**63 - 1, collapse_leaves=False
         )
         heap = [
             self._joint_eviction_entry(node, BASE_COMPONENT_TYPE, node.id)
             for node in self.evictable_device_leaves
         ]
-        # Equal SWA times (a split's fragments) keep the SWA LRU order.
-        lru = self.lru_lists[ComponentType.SWA]
+        # Equal window times (a split's fragments) keep the window LRU order.
+        lru = self.lru_lists[window]
         node, rank = lru.get_lru_no_lock(), 0
         while node is not None:
-            heap.append(self._joint_eviction_entry(node, ComponentType.SWA, rank))
+            heap.append(self._joint_eviction_entry(node, window, rank))
             node, rank = lru.get_prev_no_lock(node), rank + 1
         heapq.heapify(heap)
         self._joint_walk = _JointEvictionWalk(heap)
@@ -1827,7 +1833,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 self._joint_eviction_entry(parent, BASE_COMPONENT_TYPE, parent.id),
             )
         walk.last_full_parent = None
-        lru = self.lru_lists[ComponentType.SWA]
+        lru = self.lru_lists[self.joint_window_type]
         while walk.heap:
             _, component_type, _, node = heapq.heappop(walk.heap)
             if component_type == BASE_COMPONENT_TYPE:
@@ -1839,12 +1845,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru.in_list(node) and node.component_data[component_type].lock_ref == 0
             ):
                 self.components_by_type[component_type]._evict_device_cursor = node
-                return ComponentType.SWA, node.id
+                return component_type, node.id
         return None
 
     def end_joint_eviction(self) -> None:
         assert self._joint_walk is not None, "joint eviction not started"
-        self.evict_device_end(ComponentType.SWA)
+        self.evict_device_end(self.joint_window_type)
         self._joint_walk = None
 
     def evict_device_start(
@@ -2470,9 +2476,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type
         if (
-            ct == ComponentType.SWA
+            self.joint_lru is not None
+            and ct == self.joint_window_type
             and EvictLayer.DEVICE in target
-            and self.joint_lru is not None
         ):
             self.joint_lru.drop_swa(node)
         for layer, lru_lists in (
@@ -3195,7 +3201,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
-        if component_type == ComponentType.SWA and self.joint_lru is not None:
+        if self.joint_lru is not None and component_type == self.joint_window_type:
             self.joint_lru.stamp_swa(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.

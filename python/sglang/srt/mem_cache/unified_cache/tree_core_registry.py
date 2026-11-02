@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
     TREE_WINDOW,
-    tree_slot_ids,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
@@ -46,12 +45,12 @@ _RUST_TREE_CORE_MANIFEST = (
 )
 logger = logging.getLogger(__name__)
 
-# The slot ids the native core stores, and the family it keeps each by; a
-# tree's single window slot plays the window role (`tree_slot_ids`).
-NATIVE_SLOTS = {
-    ComponentType.FULL: TREE_TOKEN,
-    ComponentType.SWA: TREE_WINDOW,
-    ComponentType.MAMBA: TREE_STATE,
+# The id the native core stores each family's slot by. The native core keeps
+# one slot per family; the Rust adapter maps the tree's slot ids to these.
+NATIVE_FAMILY_IDS = {
+    TREE_TOKEN: ComponentType.FULL,
+    TREE_WINDOW: ComponentType.SWA,
+    TREE_STATE: ComponentType.MAMBA,
 }
 
 
@@ -62,13 +61,8 @@ def several_window_slots(tree_slots) -> bool:
 
 
 def non_native_slots(tree_slots) -> list:
-    """The slots the native core does not store."""
-    slot_ids = tree_slot_ids(tree_slots)
-    return [
-        slot
-        for slot in tree_slots
-        if NATIVE_SLOTS.get(slot_ids[slot.component]) != slot.family
-    ]
+    """The slots of a family the native core does not store."""
+    return [slot for slot in tree_slots if slot.family not in NATIVE_FAMILY_IDS]
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:

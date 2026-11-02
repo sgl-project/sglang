@@ -51,9 +51,13 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 
 ```python
 node.component_data[ComponentType.FULL]   # FullComponent data
-node.component_data[ComponentType.SWA]    # SWAComponent data
+node.component_data[window_slot]          # SWAComponent data, one per window slot
 node.component_data[ComponentType.MAMBA]  # MambaComponent data
 ```
+
+A slot's id comes from its name (`tree_slot_ids`): a window slot goes by its
+sub-pool's name; `window_slot` is the cache's `slot_id(TREE_WINDOW)` or one of
+`window_slots()`.
 
 **`UnifiedLRUList`** — One doubly-linked list per auxiliary component, threaded through the same tree nodes via `lru_prev[component_type]`/`lru_next[component_type]`. Host LRUs use a separate pointer slot range so device and host lists do not collide. Supports O(1) insert/remove/promote and O(L) scan for eviction (L = locked nodes skipped). Full eviction is driven by `evictable_device_leaves` / `evictable_host_leaves`, not a Full LRU.
 
