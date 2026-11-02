@@ -7,7 +7,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -45,9 +44,6 @@ class _SwaCache(RadixCache):
 
     def supports_swa(self):
         return True
-
-    def window_slots(self):
-        return (ComponentType.SWA,)
 
     def swa_retain_floor(self, req):
         # Read once per window retirement the scheduler runs.
@@ -91,7 +87,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
                     torch.equal(free.call_args.args[0], torch.arange(256, 272))
                 )
                 self.assertEqual(free.call_args.kwargs, {"start_pos": 256})
-                self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 272)
+                self.assertEqual(req.kv.get_evicted_seqlen("swa"), 272)
                 free.reset_mock()
 
                 # Not due: the window's own cursor gates the retirement.
@@ -137,7 +133,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
 
         free.assert_called_once()
         self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(64)))
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 64)
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 64)
 
 
 if __name__ == "__main__":

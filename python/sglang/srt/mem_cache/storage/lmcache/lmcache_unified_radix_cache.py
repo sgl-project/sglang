@@ -772,9 +772,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
+            name = self.components[ComponentType.SWA].window_sub_pool
             req.kv.set_evicted_seqlen(
-                ComponentType.SWA,
-                max(req.kv.get_evicted_seqlen(ComponentType.SWA), swa_missing_end),
+                name, max(req.kv.get_evicted_seqlen(name), swa_missing_end)
             )
 
     def _publish_external_loaded_prefix(self, req: Req, *, token_ids_len: int) -> None:
@@ -813,7 +813,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                component_evicted_seqlens=req.kv.copy_evicted_seqlens(),
+                component_evicted_seqlens=self.insert_window_cursors(req.kv),
                 inserted_len=len(key),
                 priority=req.priority or 0,
             )

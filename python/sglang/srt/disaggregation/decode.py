@@ -131,7 +131,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -2391,23 +2390,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def pre_allocated_token_counts(
-        self, windows: Sequence[ComponentType] = ()
-    ) -> Tuple[int, Dict[ComponentType, int]]:
+        self, windows: Sequence[str] = ()
+    ) -> Tuple[int, Dict[str, int]]:
         """KV slots held by transfer-queue requests: KV reserved for an
         incoming transfer, not yet in the running batch; the full pool's, and
-        each window slot's in ``windows`` by that window's own cursor. Pages
+        each window sub-pool's in ``windows`` by that window's own cursor. Pages
         are charged the way the pool stats charge a request's private KV."""
         page_size = self.token_to_kv_pool_allocator.page_size
         full_tokens = 0
-        window_tokens = {component: 0 for component in windows}
+        window_tokens = {sub_pool: 0 for sub_pool in windows}
         for decode_req in self.transfer_queue.queue:
             if decode_req.host_staged:
                 continue
             kv = decode_req.req.kv
             full_tokens += kv_private_tokens(kv, page_size)
-            for component in windows:
-                window_tokens[component] += kv_private_window_tokens(
-                    kv, page_size, component
+            for sub_pool in windows:
+                window_tokens[sub_pool] += kv_private_window_tokens(
+                    kv, page_size, sub_pool
                 )
         return full_tokens, window_tokens
 
@@ -2817,7 +2816,7 @@ def alloc_for_decode_prealloc_hisparse(
         )
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        req.kv.set_evicted_seqlen(window_sub_pool_of(allocator), swa_evicted_seqlen)
     else:
         kv_loc = allocator.alloc_logical_only(
             prefix_lens=prefix_lens,
@@ -2891,9 +2890,7 @@ def alloc_for_decode_prealloc(
         for name, tail in window_tails.items():
             evicted_seqlen = fill_len - tail
             assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
-            req.kv.set_evicted_seqlen(
-                storage.window_tree_component(name), evicted_seqlen
-            )
+            req.kv.set_evicted_seqlen(name, evicted_seqlen)
     return kv_loc
 
 
@@ -2936,7 +2933,7 @@ def _alloc_for_decode_prealloc_dsv4(
         )
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        req.kv.set_evicted_seqlen(window_sub_pool_of(allocator), swa_evicted_seqlen)
     else:
         kv_loc = allocator.alloc_extend(
             prefix_lens=async_h2d([total_prefix_len], dtype=torch.int64, device=device),

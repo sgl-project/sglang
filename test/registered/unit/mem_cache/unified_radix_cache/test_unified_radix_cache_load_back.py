@@ -354,7 +354,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req = self._make_req(req_to_token_pool)
         req.swa_branching_seqlen = 8
         req.kv.cache_protected_len = 4
-        req.kv.set_evicted_seqlen(ComponentType.SWA, 3)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], 3)
 
         for is_finished in (False, True):
             params = InsertParams(component_evicted_seqlens={ComponentType.MAMBA: 6})

@@ -481,7 +481,7 @@ class TestDeclaredParts(CustomTestCase):
                                 ).allocated_count(),
                                 window + interval + 4,
                             )
-                    self.assertGreater(req.kv.get_evicted_seqlen(DRAFT_WINDOW), 0)
+                    self.assertGreater(req.kv.get_evicted_seqlen("draft_swa"), 0)
                     self.assertEqual(a.full_attn_allocator.allocated_count(), 64)
                     a.free(torch.cat(chunks))
                     self.assertEqual(storage.accounting_violations(), [])
@@ -532,7 +532,7 @@ class TestDeclaredParts(CustomTestCase):
                         tree_core_backend="python",
                     )
                 )
-                first, further = cache.window_slots()
+                first, further = (name for name, _ in cache.window_sub_pools())
                 req = SimpleNamespace(
                     seqlen=1,
                     decode_batch_idx=1,
@@ -1881,9 +1881,9 @@ class TestDeclaredParts(CustomTestCase):
 
                             storage.requests.req_to_token[0, :32] = ids
                             kv = ReqKvInfo(req_pool_idx=0)
-                            kv.set_evicted_seqlen(TARGET_WINDOW, 16)
+                            kv.set_evicted_seqlen("window_16", 16)
                             if window < 16:
-                                kv.set_evicted_seqlen(DRAFT_WINDOW, 24)
+                                kv.set_evicted_seqlen("draft_swa", 24)
                             storage.free_row(kv, [(0, 32)])
                         if grouped:
                             a.free_group_end()

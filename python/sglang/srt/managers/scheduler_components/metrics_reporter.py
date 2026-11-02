@@ -1459,7 +1459,7 @@ class SchedulerMetricsReporter:
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         full_tokens, window_tokens = (
             self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts(
-                tuple(window.component for window in pool_stats.windows)
+                tuple(window.sub_pool for window in pool_stats.windows)
             )
         )
         self.stats.prealloc_full_token_usage = (
@@ -1468,7 +1468,7 @@ class SchedulerMetricsReporter:
         # Each window's pending rows, by that window's own cursor.
         self.stats.prealloc_window_token_usage = {
             window.name: (
-                window_tokens[window.component] / window.capacity
+                window_tokens[window.sub_pool] / window.capacity
                 if window.capacity
                 else 0.0
             )

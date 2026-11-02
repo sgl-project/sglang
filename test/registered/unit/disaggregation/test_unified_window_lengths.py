@@ -281,7 +281,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
         storage = _storage()
         req = SimpleNamespace(kv=ReqKvInfo())
         storage.acquire([req])
-        with self.assertRaisesRegex(ValueError, "tree component"):
+        with self.assertRaisesRegex(ValueError, "window's sub-pool"):
             storage.advance(req, 20, window=_TARGET_WINDOW)
         storage.requests.free(req)
 
@@ -356,7 +356,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     self.assertTrue(bool(torch.all(resume.unit_ids > 0)), name)
                     self.assertEqual(len(resume.unit_ids), sent[name], name)
                     self.assertEqual(
-                        req.kv.get_evicted_seqlen(storage.window_tree_component(name)),
+                        req.kv.get_evicted_seqlen(name),
                         seq_len - tail,
                         name,
                     )

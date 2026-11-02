@@ -17,7 +17,6 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     WindowPoolStats,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
@@ -35,7 +34,7 @@ def _transfer_req(fill_len, *, swa_tail_len=None, host_staged=False):
     # a tail-preallocating SWA pool the head [0, fill - tail) already evicted.
     kv = ReqKvInfo(kv_allocated_len=fill_len, kv_committed_len=fill_len)
     if swa_tail_len is not None:
-        kv.set_evicted_seqlen(ComponentType.SWA, fill_len - swa_tail_len)
+        kv.set_evicted_seqlen("window_128", fill_len - swa_tail_len)
     return SimpleNamespace(req=SimpleNamespace(kv=kv), host_staged=host_staged)
 
 
@@ -56,23 +55,23 @@ class TestPreAllocatedTokenCounts(CustomTestCase):
             ]
         )
         self.assertEqual(
-            queue.pre_allocated_token_counts((ComponentType.SWA,)),
-            (5 * PAGE, {ComponentType.SWA: 2 * PAGE + PAGE}),
+            queue.pre_allocated_token_counts(("window_128",)),
+            (5 * PAGE, {"window_128": 2 * PAGE + PAGE}),
         )
 
     def test_each_window_is_charged_by_its_own_cursor(self):
-        further = ComponentType.of("WINDOW_64")
+        further = "window_64"
         req = _transfer_req(PAGE * 4, swa_tail_len=PAGE * 2)
         req.req.kv.set_evicted_seqlen(further, PAGE * 3)
         self.assertEqual(
-            _queue([req]).pre_allocated_token_counts((ComponentType.SWA, further)),
-            (4 * PAGE, {ComponentType.SWA: 2 * PAGE, further: PAGE}),
+            _queue([req]).pre_allocated_token_counts(("window_128", further)),
+            (4 * PAGE, {"window_128": 2 * PAGE, further: PAGE}),
         )
 
     def test_empty_transfer_queue_holds_nothing(self):
         self.assertEqual(
-            _queue([]).pre_allocated_token_counts((ComponentType.SWA,)),
-            (0, {ComponentType.SWA: 0}),
+            _queue([]).pre_allocated_token_counts(("window_128",)),
+            (0, {"window_128": 0}),
         )
 
 
@@ -91,11 +90,10 @@ def _reporter(*, counts, pool_stats):
     return reporter
 
 
-def _window(name, capacity, component=ComponentType.SWA):
+def _window(name, capacity):
     return WindowPoolStats(
         name=name,
         sub_pool=name,
-        component=component,
         capacity=capacity,
         available_size=0,
         evictable_size=0,
@@ -127,7 +125,7 @@ class TestDecodeQueueStats(CustomTestCase):
 
     def test_hybrid_swa_ratios_use_each_pool_capacity(self):
         reporter = _reporter(
-            counts=(250, {ComponentType.SWA: 40}), pool_stats=_swa_pool_stats(1000, 200)
+            counts=(250, {"window_128": 40}), pool_stats=_swa_pool_stats(1000, 200)
         )
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.25)
@@ -138,10 +136,9 @@ class TestDecodeQueueStats(CustomTestCase):
     def test_each_window_share_uses_its_own_rows(self):
         """Every window is charged its own pending rows against its own
         capacity."""
-        further = ComponentType.of("WINDOW_64")
         reporter = _reporter(
-            counts=(250, {ComponentType.SWA: 40, further: 10}),
-            pool_stats=_swa_pool_stats(1000, 200, _window("window_64", 100, further)),
+            counts=(250, {"window_128": 40, "window_64": 10}),
+            pool_stats=_swa_pool_stats(1000, 200, _window("window_64", 100)),
         )
         self._update(reporter)
         self.assertEqual(
@@ -164,7 +161,7 @@ class TestDecodeQueueStats(CustomTestCase):
 
     def test_zero_capacity_reports_zero_like_token_usage(self):
         reporter = _reporter(
-            counts=(0, {ComponentType.SWA: 0}), pool_stats=_swa_pool_stats(0, 0)
+            counts=(0, {"window_128": 0}), pool_stats=_swa_pool_stats(0, 0)
         )
         self._update(reporter)
         self.assertEqual(reporter.stats.prealloc_full_token_usage, 0.0)

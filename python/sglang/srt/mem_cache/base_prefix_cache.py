@@ -556,7 +556,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
-            window_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
+            window_evicted_seqlen=kv.get_evicted_seqlen(window_sub_pool_of(allocator)),
             window_dead_lo=kv.window_dead_lo(global_page_size),
         )
 
@@ -567,8 +567,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
         """Evict so that an allocation of ``demand`` can be served: here, the
         shortfall of each pool the allocator reads, evicted as counts. A
-        cache without window slots keeps a single pool, which serves the
-        demand's tokens and windows alike."""
+        cache that keeps no window sub-pools of its own keeps a single pool,
+        which serves the demand's tokens and windows alike."""
         allocator = self.token_to_kv_pool_allocator
         shortfall = EvictParams(mamba_num=demand.state_slots)
         if demand.full_tokens > 0:
@@ -578,7 +578,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 else allocator.available_size()
             )
             shortfall.num_tokens = max(0, demand.full_tokens - available)
-        if self.window_slots():
+        if self.window_sub_pools():
             for name, tokens in demand.window_tokens.items():
                 if tokens > 0:
                     short = max(0, tokens - self.window_available_size(name))
@@ -799,17 +799,30 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def window_lengths(self) -> tuple[tuple[ComponentType, int], ...]:
-        """Each window slot's id and the history a running request keeps
+    def window_lengths(self) -> tuple[tuple[str, int], ...]:
+        """Each window sub-pool and the history a running request keeps
         behind its frontier in it."""
-        return ((ComponentType.SWA, self.swa_retain_window),)
+        return (
+            (
+                window_sub_pool_of(self.token_to_kv_pool_allocator),
+                self.swa_retain_window,
+            ),
+        )
 
     def window_retention(self, req):
-        """Running-request window components, retention lengths and prefix floors."""
+        """Running-request window sub-pools, retention lengths and prefix floors."""
         return tuple(
-            (component, window, self.swa_retain_floor(req))
-            for component, window in self.window_lengths()
+            (sub_pool, window, self.swa_retain_floor(req))
+            for sub_pool, window in self.window_lengths()
         )
+
+    def insert_window_cursors(self, kv: Any) -> dict[ComponentType, int]:
+        """A request's window cursors as the tree's insert takes them, by
+        tree slot."""
+        return {
+            self.window_slot_of(sub_pool): seqlen
+            for sub_pool, seqlen in kv.evicted_seqlens().items()
+        }
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         # Caches whose matched SWA is not reusable as is override this.

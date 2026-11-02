@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -486,7 +485,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)
-        kv = ReqKvInfo(req_pool_idx=0, component_evicted_seqlens={ComponentType.SWA: 3})
+        kv = ReqKvInfo(req_pool_idx=0, window_evicted_seqlens={"swa": 3})
         self.allocator.free_swa(indices[:3])
 
         cache.free_kv_row(kv, [(1, 5)])
@@ -498,7 +497,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
         allocator = _SinglePoolAllocator()
         cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
-        kv = ReqKvInfo(req_pool_idx=0, component_evicted_seqlens={ComponentType.SWA: 4})
+        kv = ReqKvInfo(req_pool_idx=0, window_evicted_seqlens={"swa": 4})
 
         cache.free_kv_row(kv, [(2, 6)])
 
@@ -520,7 +519,7 @@ class TestFreeKvRow(CustomTestCase):
         cache = _RowCache(allocator, indices)
         kv = ReqKvInfo(
             req_pool_idx=0,
-            component_evicted_seqlens={ComponentType.SWA: 6},
+            window_evicted_seqlens={"swa": 6},
             window_evict_floor=4,
         )
         cache.free_kv_row(kv, [(2, 8)])

@@ -62,7 +62,6 @@ class TestCheckTreeCacheGate(CustomTestCase):
                     WindowPoolStats(
                         name="window_128",
                         sub_pool="window_128",
-                        component=ComponentType.SWA,
                         capacity=1024,
                         available_size=1024,
                         evictable_size=0,
@@ -142,17 +141,16 @@ class TestEveryWindowIsConserved(CustomTestCase):
     def test_a_further_window_leak_is_reported_by_its_own_counts(self):
         """Each window is checked with its own slot's protected, session-held
         and uncached counts; a leak in a further window is caught."""
-        further = ComponentType.of("WINDOW_64")
         tree_cache = MagicMock()
         tree_cache.window_protected_size.side_effect = {
-            ComponentType.SWA: 16,
-            further: 8,
-        }.get
+            "window_128": 16,
+            "window_64": 8,
+        }.__getitem__
         observer = MagicMock()
         observer.session_held_window_tokens.side_effect = {
-            ComponentType.SWA: 0,
-            further: 4,
-        }.get
+            "window_128": 0,
+            "window_64": 4,
+        }.__getitem__
         checker = SchedulerInvariantChecker(
             disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
@@ -165,11 +163,10 @@ class TestEveryWindowIsConserved(CustomTestCase):
             scheduler_stage_metrics=None,
         )
 
-        def window(name, component, available):
+        def window(name, available):
             return WindowPoolStats(
                 name=name,
                 sub_pool=name,
-                component=component,
                 capacity=128,
                 available_size=available,
                 evictable_size=100,
@@ -181,16 +178,12 @@ class TestEveryWindowIsConserved(CustomTestCase):
             "sglang.srt.managers.scheduler_components.invariant_checker.is_swa_req_ring",
             return_value=False,
         ):
-            leak, msg = checker._check_window_pool(
-                window("window_128", ComponentType.SWA, 12)
-            )
+            leak, msg = checker._check_window_pool(window("window_128", 12))
             self.assertFalse(leak, msg)
-            leak, msg = checker._check_window_pool(
-                window("window_64", further, 16), uncached=0
-            )
+            leak, msg = checker._check_window_pool(window("window_64", 16), uncached=0)
             self.assertFalse(leak, msg)
             # One token of the further window is owned by nobody.
-            leak, msg = checker._check_window_pool(window("window_64", further, 15))
+            leak, msg = checker._check_window_pool(window("window_64", 15))
             self.assertTrue(leak)
             self.assertIn("[window_64]", msg)
 
@@ -203,12 +196,12 @@ class TestPrivateSwaTokens(CustomTestCase):
             req_pool_idx=0,
             kv_allocated_len=280,
             window_evict_floor=278,
-            component_evicted_seqlens={ComponentType.SWA: 278},
+            window_evicted_seqlens={"swa": 278},
         )
-        self.assertEqual(kv_private_window_tokens(kv, 1, ComponentType.SWA), 280)
+        self.assertEqual(kv_private_window_tokens(kv, 1, "swa"), 280)
         kv.kv_allocated_len = 450
-        kv.set_evicted_seqlen(ComponentType.SWA, 300)
-        self.assertEqual(kv_private_window_tokens(kv, 1, ComponentType.SWA), 428)
+        kv.set_evicted_seqlen("swa", 300)
+        self.assertEqual(kv_private_window_tokens(kv, 1, "swa"), 428)
 
 
 class TestShardedFullPoolInvariant(CustomTestCase):

@@ -670,7 +670,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         # The window already slid past [0, 6): those SWA slots are freed.
         allocator.free_swa(kv_indices[:evicted_len])
-        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], evicted_len)
 
         cache.checkpoint(req, up_to=req.extend_end)
 
@@ -707,7 +707,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         tokens = self._make_seq(1, 8)
         evicted_len = 4
         req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
-        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], evicted_len)
 
         cache.checkpoint(req, up_to=req.extend_end)
 
@@ -873,7 +873,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         lock_result = cache.inc_lock_ref(last_device_node)
         req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
-        req.kv.set_evicted_seqlen(ComponentType.SWA, 0)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], 0)
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
@@ -1339,10 +1339,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA),
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             expected_evicted,
             f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(ComponentType.SWA)}",
+            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0])}",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
@@ -1408,7 +1408,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA),
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )
@@ -1658,7 +1658,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             match_prefix(cache, tokens).device_prefix_len, branching_seqlen
         )
         expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), expected_evicted)
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]), expected_evicted
+        )
 
         # The cached branch keeps SWA for its last window; the forward overshoot
         # past it is released, and the request keeps its own live window.
@@ -2328,10 +2330,10 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(
-            boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             self.cfg.sliding_window_size,
             f"leaf ending at {boundary} keeps only "
-            f"{boundary - req.kv.get_evicted_seqlen(ComponentType.SWA)} live SWA tokens against a "
+            f"{boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0])} live SWA tokens against a "
             f"{self.cfg.sliding_window_size} window",
         )
         self.assertEqual(
@@ -2381,7 +2383,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
         retire_window(req, owned - 1, cache)
         insert_boundary = (owned - 1) // page_size * page_size
         self.assertGreaterEqual(
-            insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            insert_boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             self.cfg.sliding_window_size,
         )
         req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))

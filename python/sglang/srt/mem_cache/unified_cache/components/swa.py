@@ -71,6 +71,16 @@ class SWAComponent(TreeComponent):
 
     family = TREE_WINDOW
 
+    @property
+    def window_sub_pool(self) -> str:
+        """The window sub-pool this slot keeps: the name a request's cursor
+        for this window goes by."""
+        name = self.__dict__.get("_window_sub_pool")
+        if name is None:
+            name = self.storage_and_sub_pool()[1]
+            self.__dict__["_window_sub_pool"] = name
+        return name
+
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
     ):
@@ -998,7 +1008,7 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.set_evicted_seqlen(
-            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+            self.component_type, req.kv.get_evicted_seqlen(self.window_sub_pool)
         )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
@@ -1029,7 +1039,7 @@ class SWAComponent(TreeComponent):
             retain_floor=self.cache.swa_retain_floor(
                 req, window=self.sliding_window_size
             ),
-            component_type=self.component_type,
+            window_sub_pool=self.window_sub_pool,
             shares_prefixes=True,
         )
 
@@ -1038,7 +1048,7 @@ class SWAComponent(TreeComponent):
     ) -> None:
         self._free_out_of_window_slots(req, pre_len)
         insert_params.set_evicted_seqlen(
-            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+            self.component_type, req.kv.get_evicted_seqlen(self.window_sub_pool)
         )
 
     def cleanup_after_caching_req(
@@ -1298,8 +1308,8 @@ class SWAComponent(TreeComponent):
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
             req.kv.set_evicted_seqlen(
-                self.component_type,
-                max(req.kv.get_evicted_seqlen(self.component_type), boundary),
+                self.window_sub_pool,
+                max(req.kv.get_evicted_seqlen(self.window_sub_pool), boundary),
             )
         return transfer
 

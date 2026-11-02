@@ -177,7 +177,6 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             EvictResult,
         )
 
-        swa = ComponentType.SWA
         for supports_swa, demand, expected in [
             (False, KVDemand(full_tokens=100), EvictParams(num_tokens=70)),
             (False, KVDemand(full_tokens=30), None),
@@ -197,9 +196,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                 cache = SimpleNamespace(
                     token_to_kv_pool_allocator=allocator,
                     supports_swa=lambda: supports_swa,
-                    window_slots=lambda: (swa,) if supports_swa else (),
+                    window_sub_pools=lambda: (("swa", 4),) if supports_swa else (),
                     window_available_size=lambda name: allocator.swa_available_size(),
-                    window_slot_of=lambda name: swa,
                     evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
                 )
                 BasePrefixCache.evict_for_alloc(cache, demand)

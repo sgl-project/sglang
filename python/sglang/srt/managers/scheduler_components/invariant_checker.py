@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     SchedulerStageMetricsRecorder,
@@ -190,8 +189,8 @@ class SchedulerInvariantChecker:
             window.name,
             window.available_size,
             window.evictable_size,
-            self.tree_cache.window_protected_size(window.component),
-            self.pool_stats_observer.session_held_window_tokens(window.component),
+            self.tree_cache.window_protected_size(window.sub_pool),
+            self.pool_stats_observer.session_held_window_tokens(window.sub_pool),
             window.capacity,
             uncached,
         )
@@ -294,18 +293,18 @@ class SchedulerInvariantChecker:
         return owners
 
     def _get_total_uncached_sizes(
-        self, windows: Sequence[ComponentType] = ()
-    ) -> Tuple[int, Dict[ComponentType, int]]:
+        self, windows: Sequence[str] = ()
+    ) -> Tuple[int, Dict[str, int]]:
         """The full footprint of the KV rows requests own, and each window
         slot's in ``windows``."""
         full_uncached = 0
-        window_uncached = {component: 0 for component in windows}
+        window_uncached = {sub_pool: 0 for sub_pool in windows}
         for req in self._requests_owning_rows():
             assert req.kv.cache_protected_len % self.page_size == 0
             full_uncached += kv_private_tokens(req.kv, self.page_size)
-            for component in windows:
-                window_uncached[component] += kv_private_window_tokens(
-                    req.kv, self.page_size, component
+            for sub_pool in windows:
+                window_uncached[sub_pool] += kv_private_window_tokens(
+                    req.kv, self.page_size, sub_pool
                 )
 
             if req.beam_group is not None:
@@ -320,13 +319,13 @@ class SchedulerInvariantChecker:
 
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, window_uncached = self._get_total_uncached_sizes(
-            tuple(window.component for window in ps.windows)
+            tuple(window.sub_pool for window in ps.windows)
         )
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
         window_checks = [
-            self._check_window_pool(window, uncached=window_uncached[window.component])
+            self._check_window_pool(window, uncached=window_uncached[window.sub_pool])
             for window in ps.windows
         ]
         window_leaks = [msg for leak, msg in window_checks if leak]

@@ -16,7 +16,6 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,7 +97,7 @@ class TestPureSWARadixCache(CustomTestCase):
             kv=ReqKvInfo(
                 req_pool_idx=0,
                 window_evict_floor=4,
-                component_evicted_seqlens={ComponentType.SWA: 6},
+                window_evicted_seqlens={"swa": 6},
             ),
         )
 
@@ -132,7 +131,7 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
                 req_pool_idx=0,
                 cache_protected_len=2,
                 window_evict_floor=3,
-                component_evicted_seqlens={ComponentType.SWA: 6},
+                window_evicted_seqlens={"swa": 6},
             ),
         )
 
@@ -155,7 +154,7 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
         # pre_len 20 - window 4 = 16, page-aligned: [0, 16) slides out. A
         # prefix-sharing cache would keep max(window, page) and stop at 8.
         self.assertEqual(cache.token_to_kv_pool_allocator.window_freed, list(range(16)))
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 16)
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 16)
 
 
 class TestPureSWADecodeReclaim(CustomTestCase):

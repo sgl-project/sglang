@@ -4193,17 +4193,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _sub_pool_roles(self):
         return self.token_to_kv_pool_allocator.sub_pool_roles()
 
-    def window_lengths(self) -> tuple[tuple[ComponentType, int], ...]:
+    def window_lengths(self) -> tuple[tuple[str, int], ...]:
         return tuple(
-            (slot, component.sliding_window_size)
-            for slot, component in self.components.items()
-            if isinstance(component, SWAComponent)
+            (name, self.components[slot].sliding_window_size)
+            for slot, name in self._window_sub_pools_by_slot().items()
         )
 
     def window_retention(self, req):
         return tuple(
-            (slot, window, self.swa_retain_floor(req, window=window))
-            for slot, window in self.window_lengths()
+            (sub_pool, window, self.swa_retain_floor(req, window=window))
+            for sub_pool, window in self.window_lengths()
         )
 
     def supports_mamba(self) -> bool:

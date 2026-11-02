@@ -277,6 +277,7 @@ class UnifiedCacheLinkerWrapper:
         # A store without SWA pages tombstones restored tails instead.
         self._swa_pool = swa.pool_name if swa is not None else PoolName.SWA
         self._skip_swa = swa is not None and self._swa_pool not in cache_linker.pools
+        self._window = swa
         self._components = tuple(
             component
             for component in cache._components_tuple
@@ -473,9 +474,9 @@ class UnifiedCacheLinkerWrapper:
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
         # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
         if self._skip_swa:
+            name = self._window.window_sub_pool
             req.kv.set_evicted_seqlen(
-                ComponentType.SWA,
-                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+                name, max(req.kv.get_evicted_seqlen(name), prefix_len)
             )
 
         # match placed the SWA branch point before this tail was known; a point

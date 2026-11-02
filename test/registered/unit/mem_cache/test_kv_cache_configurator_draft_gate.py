@@ -602,7 +602,7 @@ class TestSWARetainWindow(CustomTestCase):
                 steps.append(
                     (
                         committed,
-                        req.kv.get_evicted_seqlen(ComponentType.SWA),
+                        req.kv.get_evicted_seqlen("swa"),
                         bool((mapping[read] > 0).all()),
                     )
                 )
@@ -667,7 +667,7 @@ class TestSWARetainWindow(CustomTestCase):
             req.extra_key = None
             with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
                 checkpoint_kv_cache(req, cache)
-            self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), frontier)
+            self.assertEqual(req.kv.get_evicted_seqlen("swa"), frontier)
             cache.unlock(req.lock)
             cache.sanity_check()
 

@@ -334,7 +334,7 @@ class KVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
-        component_type=None,
+        window_sub_pool: Optional[str] = None,
     ) -> None:
         """Apply checkpoint tracking and retire rows outside the read window.
 
@@ -348,17 +348,12 @@ class KVStorage:
         if frontier is None:
             raise ValueError("window retirement needs a token frontier")
 
-        if component_type is None:
-            raise ValueError("window retirement names the window's tree component")
+        if window_sub_pool is None:
+            raise ValueError("window retirement names the window's sub-pool")
 
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
-        slot_ids = self._tree_slot_ids
-        sub_pool = next(
-            s.name
-            for s in self._plan.sub_pools
-            if slot_ids.get(s.external.tree_component) == component_type
-        )
+        sub_pool = window_sub_pool
         free_swa_out_of_window_slots(
             req,
             frontier,
@@ -369,7 +364,7 @@ class KVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
-            component_type=component_type,
+            window_sub_pool=sub_pool,
             free_segment=lambda ids, start_pos: self._allocator.free_window_segment(
                 sub_pool, ids, start_pos=start_pos
             ),
@@ -457,13 +452,11 @@ class KVStorage:
 
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
-        slot_ids = self._tree_slot_ids
         dead_lo = kv.window_dead_lo(self._allocator.page_size)
         for sub_pool in self._sub_pools:
             if sub_pool.name not in self._allocator.window_allocators:
                 continue
-            component = slot_ids[sub_pool.external.tree_component]
-            dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
+            dead_hi = max(dead_lo, kv.get_evicted_seqlen(sub_pool.name))
             for start, end in ranges:
                 lo = min(max(dead_lo, start), end)
                 hi = min(max(dead_hi, start), end)
@@ -717,12 +710,6 @@ class KVStorage:
     def host_pool_name(self, sub_pool: str) -> str:
         """The host pool a sub-pool's rows back up to and load from."""
         return self._plan.sub_pool(sub_pool).external.host_pool
-
-    def window_tree_component(self, sub_pool: str):
-        """The prefix-tree slot of a window sub-pool."""
-        return self._tree_slot_ids[
-            self._plan.sub_pool(sub_pool).external.tree_component
-        ]
 
     def storage_format_tag(self) -> Optional[str]:
         """The tag a persisted host copy of this storage's layout carries."""
