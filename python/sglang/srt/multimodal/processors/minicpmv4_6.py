@@ -31,7 +31,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.minicpmv import MiniCPMV4_6ForConditionalGeneration
+from sglang.srt.models.minicpmv import (
+    MiniCPMOcrForConditionalGeneration,
+    MiniCPMV4_6ForConditionalGeneration,
+)
 from sglang.srt.multimodal.cache import (
     CONTENT_HASH_PREFIX,
     resolve_multimodal_item_hash,
@@ -160,6 +163,7 @@ class MiniCPMV4_6ImageProcessor:
         patch_size: int = 14,
         slice_mode: bool = True,
         downsample_mode: str = "16x",
+        align_merge_factor: int = 4,
         use_image_id: bool = True,
         image_mean: Sequence[float] = IMAGENET_STANDARD_MEAN,
         image_std: Sequence[float] = IMAGENET_STANDARD_STD,
@@ -170,6 +174,9 @@ class MiniCPMV4_6ImageProcessor:
         self.patch_size = patch_size
         self.slice_mode = slice_mode
         self.downsample_mode = downsample_mode
+        # 4.6 keeps a 2x2 slot even in 4x, so alignment stays patch*4.
+        # OCR's HF processor uses one merge in 4x (patch*2) and two in 16x.
+        self.align_merge_factor = align_merge_factor
         self.use_image_id = use_image_id
         self.image_mean = torch.tensor(image_mean, dtype=torch.float32).view(3, 1, 1)
         self.image_std = torch.tensor(image_std, dtype=torch.float32).view(3, 1, 1)
@@ -182,8 +189,7 @@ class MiniCPMV4_6ImageProcessor:
     ) -> Tuple[int, int]:
         height, width = image_size
         scale = self.scale_resolution
-        # factor 4 = two successive 2x2 spatial merges (mid-ViT + DownsampleMLP)
-        divisor = self.patch_size * 4
+        divisor = self.patch_size * self.align_merge_factor
         if (height * width > scale * scale) or allow_upscale:
             aspect_ratio = width / height
             height = int(scale / math.sqrt(aspect_ratio))
@@ -315,7 +321,10 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
     format don't fit 4.6.
     """
 
-    models = [MiniCPMV4_6ForConditionalGeneration]
+    models = [
+        MiniCPMV4_6ForConditionalGeneration,
+        MiniCPMOcrForConditionalGeneration,
+    ]
     support_dynamic_frame_expansion = False
     gpu_image_decode = False
     video_image_id = True
@@ -333,6 +342,11 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             getattr(vision_cfg, "patch_size", 14) if vision_cfg is not None else 14
         )
         downsample_mode = getattr(hf_config, "downsample_mode", "16x")
+        # OCR find_best_resize: one 2x2 merge in 4x, two in 16x.
+        if getattr(hf_config, "model_type", None) == "minicpm_ocr":
+            align_merge_factor = 2 if downsample_mode == "4x" else 4
+        else:
+            align_merge_factor = 4
         # Per-image preprocessor; reused for video frames (HF ref's
         # video slicing geometry matches image slicing exactly).
         self.image_processor = MiniCPMV4_6ImageProcessor(
@@ -341,6 +355,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             patch_size=patch_size,
             slice_mode=True,
             downsample_mode=downsample_mode,
+            align_merge_factor=align_merge_factor,
             use_image_id=True,
         )
 

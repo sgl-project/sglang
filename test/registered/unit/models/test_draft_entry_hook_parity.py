@@ -27,6 +27,7 @@ GATE_WITHOUT_COUNT = frozenset(
         "MiniCPMV",
         "MiniCPMV4_6ForConditionalGeneration",
         "MiniCPMV4_7ForConditionalGeneration",
+        "MiniCPMOcrForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForCausalLMMTP",
         "Qwen3_5ForConditionalGeneration",
