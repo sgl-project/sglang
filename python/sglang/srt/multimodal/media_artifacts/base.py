@@ -42,7 +42,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.utils import load_image, smart_to_rgb
 
 
 @runtime_checkable
@@ -156,11 +156,29 @@ class MediaArtifactCacheMixin:
             return torch.from_numpy(data)
         if isinstance(data, Image.Image):
             data.load()
-            return data
+            return self._ensure_rgb_image(data)
         image, _ = load_image(data, self.gpu_image_decode)
         if isinstance(image, Image.Image):
             image.load()
+            return self._ensure_rgb_image(image)
         return image
+
+    def _ensure_rgb_image(self, image: Image.Image) -> Image.Image:
+        """Convert a decoded PIL image to RGB.
+
+        HF image processors assume 3-channel input; a grayscale, paletted, or
+        alpha-bearing image crashes at the normalize step (see #44748). This
+        mirrors the ``discard_alpha_channel=True`` default of the legacy
+        ``BaseMultimodalProcessor._load_multimodal_inputs`` path, which never
+        reaches this cache-layer hook. Snapshot identity is computed from the
+        raw source before decode, so this conversion does not change the
+        content digest or artifact key.
+        """
+        if image.mode == "RGB":
+            return image
+        if getattr(self, "smart_rgb_conversion", False):
+            return smart_to_rgb(image)
+        return image.convert("RGB")
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:
         """Capture immutable media content before decode and preprocessing.
