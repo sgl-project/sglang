@@ -30,6 +30,9 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -434,6 +437,11 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def test_scheduler_waiting_abort_delegates_release_once(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.chunked_req = None
         scheduler.mm_receiver = None
         scheduler.waiting_queue = [MagicMock(rid="req")]
@@ -447,7 +455,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.dllm_config = None
         scheduler.grammar_manager = MagicMock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
