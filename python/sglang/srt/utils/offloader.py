@@ -1,8 +1,10 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Optional
+from typing import TYPE_CHECKING, Callable, Generator, List, Optional
+from weakref import WeakValueDictionary
 
+import msgspec
 import torch
 from torch.func import functional_call
 
@@ -14,6 +16,7 @@ from sglang.srt.distributed.naive_distributed import (
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_stream,
 )
@@ -24,23 +27,46 @@ from sglang.srt.utils.host_shared_memory import (
     set_host_shared_memory_manager,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+
 logger = logging.getLogger(__name__)
 
 _SubmoduleAccessor = Callable[[torch.nn.Module], torch.nn.Module]
 _WhitelistParamNamesCreator = Callable[[torch.nn.Module], List[str]]
 
 
+class OffloaderContext(msgspec.Struct, frozen=True):
+    """Runner-local information passed to a plugin's weight-placement factory."""
+
+    device: str
+    gpu_id: int
+    tp_rank: int
+    model_config: "ModelConfig"
+    is_draft_worker: bool
+
+
 class BaseOffloader(ABC):
+    """One weight-placement policy per runner.
+
+    Draft runners call ``wrap_modules`` but not either post-load method.
+    """
+
     def wrap_modules(
         self,
         all_modules_generator: Generator[torch.nn.Module, None, None],
         submodule_accessor: Optional[_SubmoduleAccessor] = None,
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
+        """Wrap one ``make_layers`` stack; either accessor may be ``None``."""
         return list(all_modules_generator)
 
     def post_init(self):
         pass
+
+    def post_load_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """Finalize target weight placement before memory sizing and capture."""
+        return model
 
     @property
     def forbid_copy_engine_usage(self):
@@ -51,8 +77,31 @@ class NoopOffloader(BaseOffloader):
     pass
 
 
-# For simplicity use singleton, but can surely support multi instance
+# The active construction-time policy used by make_layers. Runners retain their
+# own instances so creating a draft runner does not replace the target's policy.
 _instance: Optional[BaseOffloader] = NoopOffloader()
+_live_offloaders: WeakValueDictionary[int, BaseOffloader] = WeakValueDictionary()
+_offloader_factory: Optional[Callable[[OffloaderContext], Optional[BaseOffloader]]] = (
+    None
+)
+
+
+def register_offloader_factory(
+    factory: Callable[[OffloaderContext], Optional[BaseOffloader]],
+) -> None:
+    """Register one factory during general plugin loading in each process.
+
+    Re-registering the same callable is harmless; a different factory raises.
+    The factory creates a fresh offloader for each runner, or returns ``None``
+    to retain native selection for that runner. Read resolved configuration
+    through RuntimeContext; ``context`` carries the runner-specific fields.
+    """
+    global _offloader_factory
+    if not callable(factory):
+        raise TypeError("The offloader factory must be callable")
+    if _offloader_factory is not None and _offloader_factory is not factory:
+        raise RuntimeError("A different offloader factory is already registered")
+    _offloader_factory = factory
 
 
 def get_offloader():
@@ -63,9 +112,43 @@ def get_offloader():
 def set_offloader(instance: BaseOffloader):
     global _instance
     _instance = instance
+    _live_offloaders[id(instance)] = instance
 
 
-def create_offloader():
+def forbid_copy_engine_usage() -> bool:
+    """Honor every live runner's restriction on the shared copy engine.
+
+    A draft runner replacing the construction-time global must not discard a
+    target offloader's restriction: its asynchronous copies can still be in
+    flight. Weak references avoid keeping retired runners' placement state alive.
+    """
+    return any(policy.forbid_copy_engine_usage for policy in _live_offloaders.values())
+
+
+def create_offloader(context: Optional[OffloaderContext] = None) -> BaseOffloader:
+    if _offloader_factory is not None:
+        if context is None:
+            raise ValueError("A registered offloader factory requires OffloaderContext")
+        offloader = _offloader_factory(context)
+        if offloader is not None:
+            if not isinstance(offloader, BaseOffloader):
+                raise TypeError(
+                    "The offloader factory must return BaseOffloader or None"
+                )
+            if (
+                get_exec().offload.cpu_offload_gb > 0
+                or get_exec().offload.offload_group_size > 0
+            ):
+                raise ValueError(
+                    "A plugin offloader cannot be combined with --cpu-offload-gb "
+                    "or --offload-group-size"
+                )
+            if get_model().is_startup_weight_load_overlap:
+                raise ValueError(
+                    "A plugin offloader cannot be combined with "
+                    "--startup-weight-load-mode=overlap"
+                )
+            return offloader
     if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
