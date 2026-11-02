@@ -83,7 +83,7 @@ def _allocator_answers(allocator, names, state):
             windows = _windows(names, values)
             key = f"admits/{full}/{list(values)}/{slots}/{ev_name}"
             out[key] = allocator.admits(
-                full, windows, slots, evictable=dict(evictables[ev_name])
+                KVDemand(full, windows, slots), evictable=dict(evictables[ev_name])
             )
             demand = KVDemand(full, windows, slots)
             out[f"ceiling/{full}/{list(values)}/{slots}"] = (

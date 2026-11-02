@@ -624,13 +624,13 @@ class TestThreeWindowTree(CustomTestCase):
             key = RadixKey(array("q", range(start, start + 16)))
             cache.insert(InsertParams(key=key, value=ids.clone()))
             start += 16
-        reclaimable = cache._reclaimable_units()
+        evictable = evictable_by_sub_pool(cache)
         pages = next(
             (
                 n
                 for n in range(1, 64)
                 if not a.units_fit({"window_4": n})
-                and a.admits_units({"window_4": n}, reclaimable)
+                and a.admits(cache._units_demand({"window_4": n}), evictable=evictable)
             ),
             None,
         )

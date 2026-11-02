@@ -134,9 +134,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                 tokens = rng.randint(1, 48)
                 slots = rng.randint(0, 2)
                 admitted = allocator.admits(
-                    tokens,
-                    demand_windows(allocator, tokens, tokens),
-                    slots,
+                    KVDemand(tokens, demand_windows(allocator, tokens, tokens), slots),
                     evictable=evictable_by_sub_pool(cache),
                 )
                 before = _evictable(cache)
@@ -177,9 +175,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                     params = KVDemand(state_slots=need)
                     demand = {state: need}
                     admitted = allocator.admits(
-                        0,
-                        {window: 0},
-                        need,
+                        KVDemand(0, {window: 0}, need),
                         evictable=evictable_by_sub_pool(cache),
                     )
                 else:
@@ -192,8 +188,10 @@ class TestReclaimVictimLoop(CustomTestCase):
                         params = KVDemand(window_tokens={window: need})
                     demand = {name: -(-need // page)}
                     admitted = allocator.admits(
-                        need if component == "owner" else 0,
-                        {window: 0 if component == "owner" else need},
+                        KVDemand(
+                            need if component == "owner" else 0,
+                            {window: 0 if component == "owner" else need},
+                        ),
                         evictable=evictable_by_sub_pool(cache),
                     )
                 before = _evictable(cache)

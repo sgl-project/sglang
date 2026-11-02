@@ -31,6 +31,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows
@@ -254,7 +255,10 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                         capacity = allocator.available_size()
                         self.assertTrue(
                             allocator.admits(
-                                capacity, demand_windows(allocator, capacity, capacity)
+                                KVDemand(
+                                    capacity,
+                                    demand_windows(allocator, capacity, capacity),
+                                )
                             )
                         )
                         # Admission may see room past the advertised capacity
@@ -262,7 +266,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                         # serves.
                         more = capacity + page_size
                         if allocator.admits(
-                            more, demand_windows(allocator, more, more)
+                            KVDemand(more, demand_windows(allocator, more, more))
                         ):
                             taken = allocator.alloc(more)
                             self.assertIsNotNone(taken)

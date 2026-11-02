@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_decls
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
@@ -119,7 +120,9 @@ class TestStateAdmissionLimits(unittest.TestCase):
                     self.assertFalse(allocator.verify_byte_accounting())
                     self.assertEqual(allocator.full_attn_allocator.allocated_count(), 6)
                     self.assertFalse(
-                        allocator.admits(507, demand_windows(allocator, 507, 1))
+                        allocator.admits(
+                            KVDemand(507, demand_windows(allocator, 507, 1))
+                        )
                     )
 
     def test_fractional_pending_tokens_round_up_at_the_physical_boundary(self):
@@ -132,13 +135,13 @@ class TestStateAdmissionLimits(unittest.TestCase):
         )
         while low < high:
             mid = (low + high + 1) // 2
-            if allocator.admits(mid, {}, 1):
+            if allocator.admits(KVDemand(mid, {}, 1)):
                 low = mid
             else:
                 high = mid - 1
         self.assertGreater(low, 0)
-        self.assertTrue(allocator.admits(low, {}, 1))
-        self.assertFalse(allocator.admits(low + 0.5, {}, 1))
+        self.assertTrue(allocator.admits(KVDemand(low, {}, 1)))
+        self.assertFalse(allocator.admits(KVDemand(low + 0.5, {}, 1)))
 
     def test_held_window_admission_is_its_take(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles

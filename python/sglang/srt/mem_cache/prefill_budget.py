@@ -461,13 +461,15 @@ class ChainPrefillBudget(PrefillBudget):
         alone, in an empty pool)."""
         pending = not empty_pool
         return self.allocator.admits(
-            full_tokens + (self.total_offset if pending else 0),
-            {
-                name: window_tokens[name]
-                + (self.window_offsets[name] if pending else 0)
-                for name, _ in self.windows
-            },
-            state_slots + (self.pending_state_slots if pending else 0),
+            KVDemand(
+                full_tokens + (self.total_offset if pending else 0),
+                {
+                    name: window_tokens[name]
+                    + (self.window_offsets[name] if pending else 0)
+                    for name, _ in self.windows
+                },
+                state_slots + (self.pending_state_slots if pending else 0),
+            ),
             evictable=(
                 None
                 if empty_pool

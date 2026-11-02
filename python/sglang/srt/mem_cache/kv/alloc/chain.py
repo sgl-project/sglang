@@ -636,19 +636,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def admits(
         self,
-        full_tokens: float,
-        window_tokens: Dict[str, float],
-        state_slots: int = 0,
+        demand: KVDemand,
         *,
         evictable: Optional[Dict[str, int]] = None,
         empty_pool: bool = False,
     ) -> bool:
-        """Whether a demand fits once ``evictable`` cached entries are evicted
+        """Whether ``demand`` fits once ``evictable`` cached entries are evicted
         (or in an empty pool): FULL tokens against the FULL cap and the owner's
-        ids, every window sub-pool's tokens (``window_tokens`` names each one),
-        state slots in full, then one layout search over the shared bytes.
-        Every admission question asks this, so an admitted demand is one the
-        take serves."""
+        ids, every window sub-pool's tokens (the demand names each one), state
+        slots in full, then one layout search over the shared bytes.
+        ``evictable`` is what the prefix cache could free per sub-pool, in
+        tokens (slots for state). Every admission question asks this, so an
+        admitted demand is one the take serves. Token counts may be expected
+        values (fractional); a page holds whole tokens."""
+        full_tokens = demand.full_tokens
+        window_tokens = dict(demand.window_tokens)
+        state_slots = demand.state_slots
         if set(window_tokens) != set(self.window_pool_names()):
             raise ValueError(
                 f"admission must name every window: got {sorted(window_tokens)}, "
@@ -707,12 +710,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
         demand = demand.checked(self.window_pool_names())
-        return self.admits(
-            demand.full_tokens,
-            dict(demand.window_tokens),
-            demand.state_slots,
-            empty_pool=True,
-        )
+        return self.admits(demand, empty_pool=True)
 
     def prealloc_fits(
         self,
@@ -760,7 +758,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 - swa_budget_tokens,
             )
         return self.admits(
-            full_tokens, windows, demand.state_slots, evictable=evictable
+            KVDemand(full_tokens, windows, demand.state_slots), evictable=evictable
         )
 
     def reclaim_for_load_back(self, tree_cache, demand: KVDemand) -> str | None:
@@ -781,29 +779,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             f"needed=(full={demand.full_tokens}, "
             f"windows={dict(demand.window_tokens)}, "
             f"state_slots={demand.state_slots})"
-        )
-
-    def admits_units(
-        self, demands: Dict[str, int], reclaimable: Dict[str, int]
-    ) -> bool:
-        """`admits` for a demand in the allocator's units (pages, slots for
-        state), crediting ``reclaimable`` units per sub-pool."""
-        owner = self.full_attn_allocator
-        page = self.page_size
-        state = self.mamba_allocator
-        windows = {
-            w.sub_pool_name: demands.get(w.sub_pool_name, 0) * page
-            for w in self._windows
-        }
-        evictable = {
-            name: n if state is not None and name == state.sub_pool_name else n * page
-            for name, n in reclaimable.items()
-        }
-        return self.admits(
-            demands.get(owner.sub_pool_name, 0) * page,
-            windows,
-            0 if state is None else demands.get(state.sub_pool_name, 0),
-            evictable=evictable,
         )
 
     def fits_after_frees(self, demands: Dict[str, int]) -> bool:
@@ -869,18 +844,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
         def fits(new_tokens):
             return self.admits(
-                input_tokens + new_tokens + self.page_size,
-                {
-                    name: estimate_window_tokens(
-                        input_tokens,
-                        new_tokens,
-                        sliding_window_size=window,
-                        page_size=self.page_size,
-                        allocation_limit=chunk_size,
-                    )
-                    for name, window in windows.items()
-                },
-                state_slots,
+                KVDemand(
+                    input_tokens + new_tokens + self.page_size,
+                    {
+                        name: estimate_window_tokens(
+                            input_tokens,
+                            new_tokens,
+                            sliding_window_size=window,
+                            page_size=self.page_size,
+                            allocation_limit=chunk_size,
+                        )
+                        for name, window in windows.items()
+                    },
+                    state_slots,
+                ),
                 empty_pool=True,
             )
 
