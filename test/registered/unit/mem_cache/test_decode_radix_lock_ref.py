@@ -412,7 +412,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
         )
         req.lock = lock
-        req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()

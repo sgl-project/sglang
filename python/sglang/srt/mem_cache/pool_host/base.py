@@ -506,6 +506,19 @@ class HostKVCache(abc.ABC):
         """
         return host_indices, device_indices
 
+    def peer_write_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Slots a transfer peer writes for these allocated slots.
+
+        Normal host pools expose physical indices directly. Shared compacting
+        pools override this and `set_peer_write_gate`.
+        """
+        return indices
+
+    def set_peer_write_gate(self, gate) -> None:
+        """Install a predicate that is False while a transfer peer may write
+        slots given by `peer_write_indices`; normal host pools never move
+        slots, so they ignore it."""
+
     def backup_from_device_all_layer_physical(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> None:

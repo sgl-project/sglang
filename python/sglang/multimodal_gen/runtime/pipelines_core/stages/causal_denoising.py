@@ -824,6 +824,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             else:
                 current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
 
+            self.check_cancelled(batch)
             if progress_bar is not None:
                 progress_bar.update()
 

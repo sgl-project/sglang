@@ -608,6 +608,11 @@ class TreeComponent(ABC):
             tracker, device_frees, host_frees, cache_actions=cache_actions
         )
 
+    def collapses_leaves(self) -> bool:
+        """Whether this component's device eviction of a device leaf may evict the
+        whole leaf, Full included."""
+        return True
+
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
         assert self.is_evict_device_ongoing, (

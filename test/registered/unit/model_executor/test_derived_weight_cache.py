@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
-    _unsupported_derived_weight_cache_error,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -45,14 +44,6 @@ class TestDerivedWeightCache(unittest.TestCase):
                 (False, "derived scales require restart"),
             )
         self.assertTrue(torch.equal(model[0].weight, original))
-
-    def test_model_without_derived_cache_keeps_updates_enabled(self):
-        model = torch.nn.Module()
-        with patch(
-            "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
-            return_value=False,
-        ):
-            self.assertIsNone(_unsupported_derived_weight_cache_error(model))
 
 
 if __name__ == "__main__":

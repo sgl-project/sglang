@@ -25,6 +25,8 @@ from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -553,6 +555,8 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if is_cp_sharded_padded():
+            kv_capacity = from_cp_sharded(kv_capacity)
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
         if kv_capacity < self.model_config.context_len:
@@ -628,7 +632,9 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
+        uocr_graph_io_deferred: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -655,6 +661,8 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                uocr_graph_io_deferred=uocr_graph_io_deferred,
+                pp_loras=pp_loras,
             )
             if folded is not None:
                 apply_folded_extend(folded, forward_batch)
@@ -707,6 +715,7 @@ class TpModelWorker(BaseTpWorker):
                     if folded is None
                     else self.model_runner.runner_ids.own_plan(batch)
                 ),
+                kv_weight_version_record=out.kv_weight_version_record,
             )
             if (
                 batch is not None
@@ -784,31 +793,3 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
-
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            batch.split_forward_batch = forward_batch
-
-        out = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
-        )
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        if logits_output:
-            next_token_ids = self.model_runner.sample(
-                logits_output, batch.split_forward_batch
-            )
-        else:
-            next_token_ids = None
-        self._maybe_finalize_elastic_cuda_graph_scale()
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            expert_distribution_metrics=out.expert_distribution_metrics,
-        )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result

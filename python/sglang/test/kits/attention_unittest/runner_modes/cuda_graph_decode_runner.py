@@ -282,6 +282,7 @@ def _init_cuda_graph_capture_metadata(backend, capture_batch_size: int, batch):
 
 
 def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
+    """Metadata-only setup; real decode capture is in `_run_cuda_graph_decode_case`."""
     from types import SimpleNamespace
 
     fb_view = SimpleNamespace(
@@ -391,75 +392,111 @@ def _run_cuda_graph_decode_case(
         max_context_len=max_context_len,
     )
 
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-        _init_cuda_graph_capture_metadata(backend, capture_batch_size, capture_batch)
-        # Capture forward is a JIT warmup that mirrors production: the
-        # captured CUDA graph records kernel launches against buffers
-        # that *will* be populated by `init_forward_metadata_replay_cuda_graph`
-        # at replay. The capture-time output itself is discarded in
-        # production — and we discard it here too. Backends like FA3/FA4
-        # legitimately assign-but-don't-populate metadata buffers at
-        # capture, which makes the capture-time output undefined; only
-        # the replay output is contractually required to match the
-        # reference.
-        adapter.run_forward(graph_fixture, capture_batch, capture_inputs)
-        backend.on_after_cuda_graph_warmup()
-
-        adapter.restore_state(graph_fixture, graph_initial_state)
-        replay_pad_prefix_lens = (capture_prefix_len,) * (
-            capture_batch_size - case.batch_size
-        )
-        replay_case = adapter.make_case(
-            case,
-            f"{case.name}_cuda_graph_replay",
-            case.prefix_lens + replay_pad_prefix_lens,
-        )
-        replay_inputs = adapter.make_replay_inputs(
-            replay_case,
-            graph_fixture,
-            replay_pad_prefix_lens,
-            graph_replay_inputs,
-            dtype=dtype,
-            device=device,
-        )
-        replay_batch = adapter.make_forward_batch(
-            replay_case,
-            graph_fixture.runner,
-            max_context_len=max_context_len,
-            device=device,
-        )
-        adapter.prepare_inputs(
-            graph_fixture,
-            replay_case,
-            replay_batch,
-            replay_inputs,
-            max_context_len=max_context_len,
-        )
-        _init_cuda_graph_replay_metadata(backend, capture_batch_size, replay_batch)
-        replay_actual = adapter.run_forward(
-            graph_fixture,
-            replay_batch,
-            replay_inputs,
-        )
-
-    replay_expected = adapter.expected_output(
-        graph_fixture,
+    replay_pad_prefix_lens = (capture_prefix_len,) * (
+        capture_batch_size - case.batch_size
+    )
+    replay_case = adapter.make_case(
+        case,
+        f"{case.name}_cuda_graph_replay",
+        case.prefix_lens + replay_pad_prefix_lens,
+    )
+    replay_inputs = adapter.make_replay_inputs(
         replay_case,
-        replay_inputs,
-        graph_initial_state,
+        graph_fixture,
+        replay_pad_prefix_lens,
+        graph_replay_inputs,
+        dtype=dtype,
+        device=device,
     )
-    torch.testing.assert_close(
-        replay_actual,
-        replay_expected,
-        atol=adapter.atol,
-        rtol=adapter.rtol,
-    )
-    torch.testing.assert_close(
-        replay_actual[: case.num_input_tokens],
-        eager_actual,
-        atol=adapter.atol,
-        rtol=adapter.rtol,
-    )
+
+    caller_stream = torch.cuda.current_stream(device=device)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(caller_stream)
+    graphs = []
+    try:
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(stream),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            backend.init_cuda_graph_state(
+                max_bs=capture_batch_size,
+                max_num_tokens=capture_batch.input_ids.numel(),
+            )
+            # Capture the same key twice without resetting; both graphs must survive.
+            for _ in range(2):
+                adapter.restore_state(graph_fixture, graph_initial_state)
+                backend.init_forward_metadata_out_graph(capture_batch, in_capture=True)
+                backend.init_forward_metadata_in_graph(capture_batch)
+                adapter.run_forward(graph_fixture, capture_batch, capture_inputs)
+                backend.on_after_cuda_graph_warmup()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    backend.init_forward_metadata_in_graph(capture_batch)
+                    output = adapter.run_forward(
+                        graph_fixture, capture_batch, capture_inputs
+                    )
+                graphs.append((graph, output))
+
+            replay_batch = adapter.make_forward_batch(
+                replay_case,
+                graph_fixture.runner,
+                max_context_len=max_context_len,
+                device=device,
+            )
+            # Kernels also capture the forward inputs and batch slots by address.
+            for name, value in replay_inputs.items():
+                if isinstance(value, torch.Tensor):
+                    capture_inputs[name].copy_(value)
+            for name in (
+                "input_ids",
+                "positions",
+                "req_pool_indices",
+                "seq_lens",
+                "seq_lens_cpu",
+                "out_cache_loc",
+            ):
+                getattr(capture_batch, name).copy_(getattr(replay_batch, name))
+            capture_batch.seq_lens_sum = replay_batch.seq_lens_sum
+            replay_batch.iteration_ids.bind_replay(
+                capture_batch,
+                graph_fixture.runner.runner_ids,
+                slots=capture_batch.out_cache_loc,
+            )
+
+            for graph, output in graphs:
+                adapter.restore_state(graph_fixture, graph_initial_state)
+                adapter.prepare_inputs(
+                    graph_fixture,
+                    replay_case,
+                    capture_batch,
+                    replay_inputs,
+                    max_context_len=max_context_len,
+                )
+                replay_expected = adapter.expected_output(
+                    graph_fixture,
+                    replay_case,
+                    replay_inputs,
+                    graph_initial_state,
+                )
+                backend.init_forward_metadata_out_graph(capture_batch)
+                graph.replay()
+                replay_actual = output.clone()
+                assert_cg_metadata_well_formed(backend, bs=capture_batch_size)
+                torch.testing.assert_close(
+                    replay_actual,
+                    replay_expected,
+                    atol=adapter.atol,
+                    rtol=adapter.rtol,
+                )
+                torch.testing.assert_close(
+                    replay_actual[: case.num_input_tokens],
+                    eager_actual,
+                    atol=adapter.atol,
+                    rtol=adapter.rtol,
+                )
+    finally:
+        caller_stream.wait_stream(stream)
 
 
 def run_dense_cuda_graph_decode_case(

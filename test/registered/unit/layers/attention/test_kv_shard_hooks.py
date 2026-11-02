@@ -56,7 +56,6 @@ def _batch(mode: ForwardMode):
     [
         (ForwardMode.EXTEND, True),
         (ForwardMode.MIXED, True),
-        (ForwardMode.SPLIT_PREFILL, True),
         (ForwardMode.DECODE, False),
         (ForwardMode.IDLE, False),
         (ForwardMode.TARGET_VERIFY, False),

@@ -17,6 +17,10 @@ name = "sglang_server"
 # rlib:   so optional standalone bins / integration tests can link the core.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# `pre_generate::test_support`: the app an HTTP layer's tests serve it from.
+test-support = []
+
 [dependencies]
 async-stream = { workspace = true }
 bytes = { workspace = true }
@@ -38,13 +42,13 @@ axum = { version = "0.8.9", features = ["json", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
-core_affinity = "0.8"
 sglang-processor = { path = "../sglang-processor", features = ["openai"] }
 flume = "0.12.0"
 http = "1.5.0"
 itertools = "0.14"
-# POSIX shm (`shm_open` family) for the MM feature fan-out (`utils::shm`).
-rustix = { version = "1", features = ["fs", "mm", "shm"] }
+# POSIX shm (`shm_open` family) for the MM feature fan-out (`utils::shm`), and
+# thread CPU affinity (`utils::threads`).
+rustix = { version = "1", features = ["fs", "mm", "pipe", "shm", "thread"] }
 # Same major as the workspace pyo3: the zero-copy drain (`recv_requests`) moves
 # Rust vectors into numpy arrays.
 numpy = "0.29.0"
@@ -70,3 +74,5 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }
+# Paused virtual time for deadline tests.
+tokio = { workspace = true, features = ["test-util"] }

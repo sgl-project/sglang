@@ -15,7 +15,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
@@ -42,7 +41,6 @@ def can_encode_while_decoding(
         and not server_args.enable_torch_compile
         and type(server_args.pipeline_config).post_decoding
         is PipelineConfig.post_decoding
-        and current_platform.is_cuda()
     )
 
 

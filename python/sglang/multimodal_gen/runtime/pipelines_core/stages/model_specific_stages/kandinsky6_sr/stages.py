@@ -350,6 +350,11 @@ class Kandinsky6SRDenoisingStage(DenoisingStage):
             with self.progress_bar(
                 total=total, batch=batch, desc="Kandinsky6 SR denoising"
             ) as progress:
+
+                def on_step():
+                    self.check_cancelled(batch)
+                    progress.update()
+
                 denoised = denoise_chunks(
                     chunks,
                     transformer,
@@ -360,7 +365,7 @@ class Kandinsky6SRDenoisingStage(DenoisingStage):
                     step_context=lambda step: set_forward_context(
                         current_timestep=step, attn_metadata=None, forward_batch=batch
                     ),
-                    on_step=progress.update,
+                    on_step=on_step,
                 )
         self._finish_active_component_use()
         batch.extra[SR_DENOISED_KEY] = denoised

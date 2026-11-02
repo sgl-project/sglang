@@ -234,7 +234,7 @@ struct FusedParallelQKNormAcrossHead {
     constexpr auto K = Trait::kLocalKDim;
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, Q})  // q
         .with_strides({-1, 1})
         .with_dtype<DType>()

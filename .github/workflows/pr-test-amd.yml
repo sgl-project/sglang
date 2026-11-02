@@ -5,8 +5,16 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
-    - cron: '0 */12 * * *' # rocm10: twice daily (UTC)
-    - cron: '30 17 * * *'  # rocm724/rocm720: once daily (UTC)
+    # Daily AMD order (UTC), rocm10 first, all ending before the 02:00-11:00 PR peak:
+    # images (09:00-11:00) -> rocm10 PR test (13:00) -> rocm10 nightly (16:00)
+    # -> rocm724/rocm720 PR test (19:00) -> rocm724/rocm720 nightly (21:00)
+    # -> MILES (22:00).
+    # rocm10 runs every day. rocm724 runs on even days of the month and rocm720 on
+    # odd days, here and in nightly-test-amd.yml, so the PR test and the nightly
+    # of one ROCm version always land on the same day.
+    - cron: '0 1,13 * * *'  # rocm10: every 12 hours, 13:00 first after the 09:00 UTC rocm10 image
+    - cron: '0 19 2-30/2 * *'  # rocm724: even days of the month
+    - cron: '0 19 1-31/2 * *'  # rocm720: odd days of the month
   pull_request:
     paths:
       - "python/**"
@@ -164,10 +172,10 @@ jobs:
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
-      # Keep rocm10 on the twice-daily cadence. The 17:30 UTC schedule runs
-      # rocm724 and rocm720 once daily. Dispatch/call inputs select one version
+      # Keep rocm10 on the twice-daily cadence. The 19:00 UTC schedules run
+      # rocm724 on even days and rocm720 on odd days. Dispatch/call inputs select one version
       # or all three, while a pull_request falls through to the rocm10 default.
-      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '30 17 * * *' && '["rocm724","rocm720"]' || '["rocm10"]' }}
+      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 19 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 19 1-31/2 * *' && '["rocm720"]' || '["rocm10"]' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -229,14 +237,17 @@ jobs:
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             sgl_kernel:
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             jit_kernel:
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**"
               - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
@@ -246,6 +257,7 @@ jobs:
               - "test/registered/kernels/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+              - "docker/rocm.Dockerfile"
 
   # =============================================== extra (scheduled) ====================================================
   # Chain the label-gated AMD extra tier into the scheduled run, mirroring
@@ -257,8 +269,12 @@ jobs:
   # the opt-in extra suite.
   call-pr-test-amd-extra:
     name: call-pr-test-amd-extra
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
+    # always() keeps the skipped call-gate on schedule runs from skipping this job.
     if: |
+      always() && !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
       !(inputs.target_stage || inputs.target_stage_select)
     strategy:
@@ -616,7 +632,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-mi35x:
-    name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, matrix.runner, matrix.part) }}
+    name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -633,7 +649,6 @@ jobs:
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         runner: [linux-mi35x-gpu-1]
-        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -653,9 +668,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}

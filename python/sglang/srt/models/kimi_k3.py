@@ -2423,7 +2423,7 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
     )
 
 
-def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
+def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
@@ -2431,12 +2431,12 @@ def _carries_bank_slices(config: KimiLinearConfig, sp_collective: bool) -> bool:
     neither a later pipeline rank nor a draft model's capture of the target's
     hidden states can take them; it is decided at construction. Nor can a
     dense layer after an SP-MoE one, whose FFN reads every row of the bank:
-    every layer from the first MoE layer on must be one. ``sp_collective``:
-    whether K3's SP collective is enabled on this rank."""
+    every layer from the first MoE layer on must be one. This layout also
+    works with NCCL: custom collective kernels only fuse the local bank
+    read with the gather, and are not required to keep the bank sharded."""
     if not (
         _shards_moe_rows()
         and config.attn_res_block_size is not None
-        and sp_collective
         and envs.SGLANG_K3_SP_ATTN_RES.get()
         and get_parallel().pp_size == 1
     ):
@@ -2481,9 +2481,7 @@ def _stage_facts(
     ffn_ops = dict(read=NormReadout(reads_before_dp_gather=True))
     if config.attn_res_block_size is not None:
         if bank is None:
-            bank = AttnBankState.facts(
-                reads_slices=_carries_bank_slices(config, sp_collective)
-            )
+            bank = AttnBankState.facts(reads_slices=_carries_bank_slices(config))
         attn_ops = dict(
             read=bank.attn_readout,
             update=bank.attn_update,
@@ -2648,7 +2646,7 @@ class KimiK3DecoderLayer(nn.Module):
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
-                reads_slices=_carries_bank_slices(config, sp_collective),
+                reads_slices=_carries_bank_slices(config),
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2751,7 +2749,7 @@ class KimiK3LinearModel(nn.Module):
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
-        self.carries_bank_slices = _carries_bank_slices(config, sp_collective)
+        self.carries_bank_slices = _carries_bank_slices(config)
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (

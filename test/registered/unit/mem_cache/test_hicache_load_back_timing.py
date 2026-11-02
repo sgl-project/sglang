@@ -60,6 +60,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         stub = object.__new__(UnifiedRadixCache)
+        stub.components = {}
         stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
         stub.ongoing_load_back = {
             node_id: (object(), None, None) for node_id in ack.node_ids
