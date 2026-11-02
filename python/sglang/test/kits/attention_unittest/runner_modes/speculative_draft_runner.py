@@ -316,7 +316,6 @@ def _configure_runner_for_eagle_draft(
         "enable_cudagraph_gc": True,
         "enable_dp_lm_head": False,
         "enable_memory_saver": False,
-        "enable_pdmux": False,
         "enable_profile_cuda_graph": False,
         "enable_torch_compile": False,
         "enable_two_batch_overlap": False,
