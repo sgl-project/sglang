@@ -184,9 +184,10 @@ class DFlashDraftInputV2(SpecInput):
         )
         topup_pages = min(envs.SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES.get(), 8)
         if topup_pages > 0 and batch.hisparse_coordinator is not None:
-            print_warning_once(
-                "SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES is ignored under HiSparse."
-            )
+            if envs.SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES.is_set():
+                print_warning_once(
+                    "SGLANG_OPT_DFLASH_DECODE_TOPUP_PAGES is ignored under HiSparse."
+                )
             topup_pages = 0
         if topup_pages > 0 and num_needed_tokens > 0 and page_size > 1:
             nxt_kv_lens, num_needed_tokens = self._top_up_decode_alloc_lens(
