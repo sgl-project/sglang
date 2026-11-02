@@ -656,6 +656,7 @@ class TestFusedDraftDecision(CustomTestCase):
         dcp_size=1,
         hicache=False,
         retraction_backup=None,
+        decode_offload=False,
         draft_parallel_layout=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
@@ -726,7 +727,8 @@ class TestFusedDraftDecision(CustomTestCase):
                 kvc,
                 "get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_retraction_backup=retraction_backup
+                    disaggregation_decode_retraction_backup=retraction_backup,
+                    disaggregation_decode_enable_offload_kvcache=decode_offload,
                 ),
             ),
             patch.object(kvc, "get_spec", return_value=spec),
@@ -927,6 +929,15 @@ class TestFusedDraftDecision(CustomTestCase):
         self.assertIsNone(declined.placement)
         self.assertIn(
             "--disaggregation-decode-retraction-backup=host_pool", declined.declined
+        )
+
+    def test_decode_offload_keeps_the_private_pool(self):
+        """Decode KV offload writes the draft's own host objects, as a prefill
+        with L3 storage does; a fused draft has no pool of its own."""
+        declined = self._decide(algorithm="DSPARK", decode_offload=True)
+        self.assertIsNone(declined.placement)
+        self.assertIn(
+            "--disaggregation-decode-enable-offload-kvcache", declined.declined
         )
 
 
