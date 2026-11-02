@@ -99,6 +99,8 @@ def _fill_padded_rows(
     if num_token_non_padded.device != x.device:
         raise ValueError("num_token_non_padded and x must be on the same device")
     n_rows, n_cols = x.shape
+    if x.numel() == 0:
+        return
     strided = _use_strided(n_rows, n_cols * x.element_size())
     _fill_padded_rows_kernel[(_MAX_PROGRAMS if strided else n_rows,)](
         x,
