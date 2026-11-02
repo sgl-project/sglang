@@ -462,9 +462,10 @@ class DPDispatcher:
         self.pending_gauge = None
         if enable_metrics:
             from prometheus_client import Gauge
+            from sglang.srt.observability.metrics_collector import format_metric_name
 
             self.pending_gauge = Gauge(
-                name="sglang:encoder_dp_pending_requests",
+                name=format_metric_name("sglang:encoder_dp_pending_requests"),
                 documentation="Number of pending requests per encoder DP rank.",
                 labelnames=list(self.labels.keys()) + ["dp_rank"],
                 multiprocess_mode="mostrecent",
