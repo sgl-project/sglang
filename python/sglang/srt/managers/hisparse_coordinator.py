@@ -43,9 +43,6 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    HiSparseDSATokenToKVPool,
-)
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
@@ -569,8 +566,8 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
         self.is_m3_hisparse = isinstance(kvcache, MiniMaxSparseKVPool)
+        self.mem_pool_device = self.token_to_kv_pool_allocator.get_hisparse_kvcache()
         if self.is_dsv4_hisparse:
-            self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
             num_host_pages = (
                 self.token_to_kv_pool_allocator.size_full // self.compress_ratio
@@ -594,7 +591,6 @@ class HiSparseCoordinator:
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
             if self.is_m3_hisparse:
-                self.mem_pool_device = kvcache.main_pool
                 assert self.mem_pool_device.head_num == 1, (
                     "MiniMax M3 HiSparse requires one KV head per TP rank, "
                     f"got {self.mem_pool_device.head_num}. Increase the "
@@ -614,7 +610,6 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
-                self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0

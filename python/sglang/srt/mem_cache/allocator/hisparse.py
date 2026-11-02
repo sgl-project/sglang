@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import weakref
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -11,12 +10,13 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseDSATokenToKVPool,
+    HiSparseMHAMainPool,
+)
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_num_new_pages
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -117,6 +117,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def get_kvcache(self):
+        return self._kvcache
+
+    def get_hisparse_kvcache(self) -> HiSparseDSATokenToKVPool | HiSparseMHAMainPool:
+        if isinstance(self._kvcache, MiniMaxSparseKVPool):
+            return self._kvcache.main_pool
         return self._kvcache
 
     def alloc(self, need_size: int):
@@ -391,6 +396,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
+
+    def get_hisparse_kvcache(self) -> HiSparseC4DevicePool:
+        return self.hisparse_kvcache
 
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor

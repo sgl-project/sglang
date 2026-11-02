@@ -35,6 +35,9 @@ from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4CheckpointBufferInfo,
@@ -454,7 +457,7 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
         ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
-class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+class HiSparseC4DevicePool(HiSparseDevicePoolMappingMixin, DeepSeekV4SingleKVPool):
     def __init__(
         self,
         size: int,
@@ -496,27 +499,14 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         )
         self.compress_ratio = 4
 
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         mask = (full_indices + 1) % self.compress_ratio == 0
         compressed_indices = full_indices[mask] // self.compress_ratio
         return compressed_indices
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(
-            self.translate_loc_from_full_to_compressed(full_indices)
+        return (
+            super().translate_loc_to_hisparse_device(compressed_indices).to(torch.int32)
         )
 
     def set_key_buffer(
