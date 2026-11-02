@@ -79,6 +79,7 @@ class _Harness(deepseek_v4.MQALayer):
         self.alt_streams = None
         self.dsa_enable_prefill_cp = False
         self.use_fused_wo_a = False
+        self.use_fused_rope_quant = False
         self.use_npu_arch35_mxfp8_wo_a = False
         self.compressor = object()
         self.wo_a = SimpleNamespace(

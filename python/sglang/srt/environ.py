@@ -2035,9 +2035,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
-    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
-    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
+    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
+    # requires the corresponding FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
