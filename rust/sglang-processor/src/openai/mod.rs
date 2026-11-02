@@ -77,9 +77,10 @@ impl Responder {
         wire::engine_error_reply(error)
     }
 
-    /// The engine returned an output missing a field required by OpenAI.
-    pub fn malformed_output(missing: &str) -> Reply {
-        wire::malformed_output_reply(missing)
+    /// The engine returned an output missing a field required by OpenAI:
+    /// Python's catch-all 500, which does not name the field.
+    pub fn malformed_output(_missing: &str) -> Reply {
+        wire::malformed_output_reply()
     }
 }
 
