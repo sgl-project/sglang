@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
 MAX_ROWS = 1024
@@ -34,9 +35,7 @@ def _module(threads: int, split: int = 1):
     )
 
 
-@cache_once
-def _num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+_num_sms = cache_once(get_device_core_count)
 
 
 @cache_once
