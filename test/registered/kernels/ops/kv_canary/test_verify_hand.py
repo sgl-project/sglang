@@ -25,7 +25,12 @@ from sglang.kernels.ops.kv_canary.verify_ref import (
 from sglang.kernels.ops.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import get_device, get_device_module
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
@@ -56,9 +61,10 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 
 # ---------------------------------------------------------------------------
@@ -1282,7 +1288,7 @@ class TestLayoutAndScheduling:
             plan=plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
         assert _n_violations(log) == 0
         assert int(log.slot_run_counter[0].item()) == 1
@@ -1340,7 +1346,7 @@ class TestLayoutAndScheduling:
             check_verify_expected_token=True,
         )
         if runner is launch_canary_verify_kernel:
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
 
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)

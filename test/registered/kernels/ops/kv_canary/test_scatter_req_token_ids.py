@@ -9,7 +9,12 @@ from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     _SCATTER_BATCH_BLOCK,
     launch_scatter_req_token_ids_kernel,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import get_device, get_device_module
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kernels.kv_canary.scatter_req_token_ids_reference import (
     scatter_req_token_ids_torch_reference,
 )
@@ -17,9 +22,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 
 def _build_pool(*, max_reqs: int, max_context_len: int) -> torch.Tensor:
@@ -65,7 +71,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
         self.assertTrue(torch.equal(triton_pool, ref_pool))
         # Spot-check: req in slot 3 holds [10,20,30,0,0,...] etc.
@@ -87,7 +93,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=pool,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.equal(pool, pool_before))
 
     def test_scatter_single_req(self) -> None:
@@ -114,7 +120,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         self.assertTrue(torch.equal(triton_pool, ref_pool))
 
     def test_scatter_truncates_at_max_context_len(self) -> None:
@@ -137,7 +143,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=pool,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
         self.assertEqual(
             pool[1, :max_context_len].tolist(), list(range(max_context_len))
@@ -168,7 +174,7 @@ class TestScatterReqTokenIds(CustomTestCase):
             req_pool_indices=req_pool_indices,
             pool_out=ref_pool,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
         self.assertTrue(torch.equal(triton_pool, ref_pool))
         # Middle req contributes nothing; its pool row stays zero.
@@ -211,7 +217,7 @@ class TestScatterReqTokenIds(CustomTestCase):
                 req_pool_indices=req_pool_indices,
                 pool_out=ref_pool,
             )
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             self.assertTrue(torch.equal(triton_pool, ref_pool))
 
 

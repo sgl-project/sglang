@@ -20,7 +20,12 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.write import (
     launch_canary_write_kernel,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import get_device, get_device_module
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
@@ -53,9 +58,10 @@ from sglang.test.kernels.kv_canary._hand_oracle import (
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 
 def _int32_tensor(values: list[int]) -> torch.Tensor:
@@ -273,7 +279,7 @@ class TestSeedSlot:
             plan=verify_plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
     def test_seed_slot_resume_5_step_hardcoded(self) -> None:
@@ -568,7 +574,7 @@ class TestMockMode:
             plan=verify_plan,
             check_verify_expected_token=True,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
     @pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
@@ -1028,7 +1034,7 @@ class TestRealKvHash:
                 expected_input_tokens=None,
                 expected_input_positions=None,
             )
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             return read_slot_fields(canary_buf=buf, slot_idx=2)
 
         fields_a = _run_with(sources_a)
@@ -1140,6 +1146,10 @@ class TestMisc:
         assert int(cuda_log.write_index[0].item()) == 0
         assert int(ref_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(
+        _DEVICE.type != "cuda",
+        reason="CUDA JIT path only; other devices use the torch reference",
+    )
     def test_disabled_assert_inputs_passes_none_to_cuda(self) -> None:
         """Disabled input assertions pass None instead of dummy tensors."""
         canary_buf = torch.zeros(

@@ -12,7 +12,12 @@ from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import get_device
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
     make_canary_buf,
@@ -33,9 +38,10 @@ from sglang.test.kernels.kv_canary._invariants import WriteInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 _FUZZ_ITER_PER_SEED = 30
 

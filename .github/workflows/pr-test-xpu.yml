@@ -67,6 +67,8 @@ jobs:
               - "python/pyproject_xpu.toml"
               - "python/sglang/kernels/ops/speculative/@(reconstruct_tree|ngram_corpus).py"
               - "python/sglang/kernels/jit/csrc/ngram_corpus/**"
+              - "python/sglang/kernels/ops/kv_canary/**/!(*.md)"
+              - "python/sglang/test/kernels/kv_canary/**/!(*.md)"
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/e2e/xpu/**/!(*.md)"
               - "test/registered/disaggregation/test_disaggregation_xpu.py"

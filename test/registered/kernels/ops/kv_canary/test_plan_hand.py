@@ -11,7 +11,12 @@ from sglang.kernels.ops.kv_canary.plan_ref import (
 )
 from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import get_device, get_device_module
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.kernels.kv_canary._differential import run_plan_diff
 from sglang.test.kernels.kv_canary._fixtures import (
     allocate_plan_pair,
@@ -24,9 +29,10 @@ from sglang.test.kernels.kv_canary._invariants import PlanInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 
 def _tensor(values: list[int]) -> torch.Tensor:
@@ -107,7 +113,7 @@ def _run_label(
         req_to_verify_expected_tokens_valid_lens=None,
         kv_token_id_vs_position_offset=0,
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     return verify_plan, write_plan
 
 
@@ -828,7 +834,7 @@ class TestMisc:
                 req_to_verify_expected_tokens_valid_lens=None,
                 kv_token_id_vs_position_offset=0,
             )
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             runner(
                 verify_plan_out=verify_plan,
                 write_plan_out=write_plan,
@@ -843,7 +849,7 @@ class TestMisc:
                 req_to_verify_expected_tokens_valid_lens=None,
                 kv_token_id_vs_position_offset=0,
             )
-            torch.cuda.synchronize()
+            get_device_module().synchronize()
             n_active = int(write_plan.write_num_valid_reqs[0].item())
             tail_offsets = (
                 write_plan.write_offsets[n_active + 1 : 8].detach().cpu().tolist()
