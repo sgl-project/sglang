@@ -407,6 +407,60 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
+def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
+    """One long verify group among short rows: the balanced split and the per-row grid
+    must produce the same bits for every visible score, across graph replays."""
+    from sglang.srt.environ import envs
+
+    batch, width = 40, 20000
+    q, weights, slots, lens, table = _make_logits_case(batch, heads, width)
+    capacity = 32768
+    req = (torch.arange(batch, device=q.device) // 6).to(torch.int32)
+    # Positions past ``width`` map to slot 0, so a length past max_len stays readable.
+    req_table = torch.zeros(
+        (req.max().item() + 1, capacity * ratio), device=q.device, dtype=torch.int32
+    )
+    req_table[req.long(), : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+    lengths = torch.zeros(batch, device=q.device, dtype=torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def score(balanced):
+        with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(balanced):
+            return fp4_index_logits_paged(*args, candidate_mask)
+
+    with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(True):
+        for _ in range(3):
+            fp4_index_logits_paged(*args, candidate_mask)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = fp4_index_logits_paged(*args, candidate_mask)
+    for step, long_len in enumerate([width, 0, 1, 129, 20000 - 63, width]):
+        short = torch.tensor([0, 1, 63, 64, 65, 127, 128, 3000], device=q.device)
+        lengths.copy_(short[torch.arange(batch, device=q.device) % 8].to(torch.int32))
+        lengths[6 * (step % 6) : 6 * (step % 6) + 6] = long_len
+        lengths[-1] = capacity + 7  # past max_len: clamped, not read past the table
+        q.neg_()
+        graph.replay()
+        expected = score(False)
+        visible = (
+            torch.arange(capacity, device=q.device)[None, :]
+            < lengths.clamp(max=capacity)[:, None]
+        )
+        assert torch.equal(
+            actual[visible].view(torch.int32), expected[visible].view(torch.int32)
+        )
+        assert torch.equal(
+            score(True)[visible].view(torch.int32), expected[visible].view(torch.int32)
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
