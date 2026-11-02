@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _build_dsa_device_pool_group,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -158,6 +159,150 @@ class TestDevicePoolGroup(CustomTestCase):
         self.assertEqual(resolved[0].keys, ["b", "d"])
         self.assertEqual(resolved[0].host_indices.tolist(), [120, 121, 124, 125])
         self.assertEqual(resolved[0].hit_policy, PoolHitPolicy.TRAILING_PAGES)
+
+
+class TestDSADevicePoolPlaceholders(CustomTestCase):
+    @staticmethod
+    def _pool(index_widths):
+        return SimpleNamespace(
+            page_size=2,
+            layer_num=len(index_widths),
+            kv_buffer=[
+                torch.zeros((8, 3 + layer), dtype=torch.uint8)
+                for layer in range(len(index_widths))
+            ],
+            index_k_with_scale_buffer=[
+                (
+                    torch.zeros((0, 7), dtype=torch.uint8)
+                    if width is None
+                    else torch.zeros((4, width), dtype=torch.uint8)
+                )
+                for width in index_widths
+            ],
+        )
+
+    def test_shared_topk_keeps_sparse_target_layer_mapping(self):
+        target = self._pool([None, 7, None, 11])
+        group = _build_dsa_device_pool_group(target, 2)
+        self.assertEqual(group.num_layers, 4)
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.kv_buffer, target.kv_buffer)
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(indexer.layer_mapping, {1: 0, 3: 1})
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([2], 0))
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([2], 2))
+        for layer, original in ((1, 1), (3, 3)):
+            buffer = target.index_k_with_scale_buffer[original]
+            pointers, sizes, _ = indexer.get_prepared_layer_range_meta([2], layer)
+            self.assertEqual(pointers, [[buffer[2].data_ptr()]])
+            self.assertEqual(sizes, [[buffer.shape[1]]])
+        pointers, sizes = indexer.get_page_buffer_meta(torch.tensor([4, 5]))
+        self.assertEqual(
+            pointers,
+            [target.index_k_with_scale_buffer[i][2].data_ptr() for i in (1, 3)],
+        )
+        self.assertEqual(sizes, [7, 11])
+
+    def test_packed_draft_placeholders_keep_transfer_layers(self):
+        for target_widths, draft_widths in (
+            ([None, 7, None], [None, 17]),
+            ([7, None, None], [None, 17]),
+            ([None, None], [17]),
+            ([7, 11], [None]),
+        ):
+            with self.subTest(target=target_widths, drafts=draft_widths):
+                target = self._pool(target_widths)
+                drafts = tuple(self._pool([width]) for width in draft_widths)
+                group = _build_dsa_device_pool_group(target, 2, drafts)
+                indexer = group.entry_map[PoolName.INDEXER]
+                for layer in range(target.layer_num):
+                    buffers = [target.index_k_with_scale_buffer[layer]]
+                    if layer < len(drafts):
+                        buffers.append(drafts[layer].index_k_with_scale_buffer[0])
+                    expected = [buffer for buffer in buffers if buffer.numel()]
+                    meta = indexer.get_prepared_layer_range_meta([2], layer)
+                    if not expected:
+                        self.assertIsNone(meta)
+                    else:
+                        pointers, sizes, _ = meta
+                        self.assertEqual(
+                            pointers, [[buffer[2].data_ptr() for buffer in expected]]
+                        )
+                        self.assertEqual(
+                            sizes, [[buffer.shape[1] for buffer in expected]]
+                        )
+                # A draft without its own indexer still needs its main KV bytes.
+                kv = group.entry_map[PoolName.KV]
+                for layer, draft in enumerate(drafts):
+                    pointers, _, _ = kv.get_prepared_layer_range_meta([2], layer)
+                    self.assertEqual(
+                        pointers,
+                        [
+                            [
+                                target.kv_buffer[layer][2].data_ptr(),
+                                draft.kv_buffer[0][2].data_ptr(),
+                            ]
+                        ],
+                    )
+
+    def test_all_empty_indexers_omit_only_the_indexer_entry(self):
+        for draft_count in (0, 2):
+            with self.subTest(drafts=draft_count):
+                target = self._pool([None, None, None])
+                drafts = tuple(self._pool([None]) for _ in range(draft_count))
+                group = _build_dsa_device_pool_group(target, 2, drafts)
+                self.assertEqual(set(group.entry_map), {PoolName.KV})
+                self.assertEqual(group.num_layers, 3)
+                self.assertTrue(group.rank_replicated)
+                kv = group.entry_map[PoolName.KV]
+                self.assertEqual(len(kv.kv_buffer), 3 + draft_count)
+                transfer = PoolTransfer(
+                    name=PoolName.KV,
+                    keys=["page"],
+                    device_indices=torch.tensor([4, 5]),
+                )
+                resolved = group.resolve_transfers([transfer])
+                self.assertEqual([item.name for item in resolved], [PoolName.KV])
+                for layer in range(3):
+                    pointers, _, _ = kv.get_prepared_layer_range_meta([2], layer)
+                    expected = [target.kv_buffer[layer][2].data_ptr()]
+                    if layer < draft_count:
+                        expected.append(drafts[layer].kv_buffer[0][2].data_ptr())
+                    self.assertEqual(pointers, [expected])
+
+    def test_multilayer_drafts_keep_depth_mapping(self):
+        target = self._pool([None, 7, None])
+        drafts = (self._pool([None, 17]), self._pool([19]))
+        group = _build_dsa_device_pool_group(target, 2, drafts)
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertIsNone(indexer.get_prepared_layer_range_meta([2], 0))
+        for layer, buffers in (
+            (
+                1,
+                [
+                    target.index_k_with_scale_buffer[1],
+                    drafts[0].index_k_with_scale_buffer[1],
+                ],
+            ),
+            (2, [drafts[1].index_k_with_scale_buffer[0]]),
+        ):
+            pointers, sizes, _ = indexer.get_prepared_layer_range_meta([2], layer)
+            self.assertEqual(pointers, [[buffer[2].data_ptr() for buffer in buffers]])
+            self.assertEqual(sizes, [[buffer.shape[1] for buffer in buffers]])
+
+    def test_nonempty_indexers_retain_packed_offsets(self):
+        target = self._pool([7, 11])
+        drafts = (self._pool([17]), self._pool([23]))
+        group = _build_dsa_device_pool_group(target, 2, drafts)
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(indexer.layer_mapping, {0: (0, 2), 1: (1, 3)})
+        for layer, expected_sizes, expected_offsets in (
+            (0, [[7, 17]], [[0, 18]]),
+            (1, [[11, 23]], [[7, 35]]),
+        ):
+            _, sizes, offsets = indexer.get_prepared_layer_range_meta([2], layer)
+            self.assertEqual(sizes, expected_sizes)
+            self.assertEqual(offsets, expected_offsets)
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
