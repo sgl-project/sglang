@@ -169,6 +169,7 @@ class DsparkInfoDumper:
         max_records: int = INFO_DUMP_MAX_RECORDS,
         max_step_cpu_seconds: float = INFO_DUMP_MAX_STEP_CPU_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        on_step: Optional[Callable[[DecodeStepObservation, float], None]] = None,
     ) -> None:
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = int(verify_num_draft_tokens)
@@ -176,6 +177,7 @@ class DsparkInfoDumper:
         self.device = device
         self.mode_value = mode_value
         self._clock = clock
+        self._on_step = on_step
         self._max_step_cpu_seconds = max_step_cpu_seconds
 
         self._components: set[InfoComponent] = {
@@ -187,13 +189,14 @@ class DsparkInfoDumper:
         # Dedup within an attention-TP group only: records describe the
         # DP-rank-local batch, so under dp-attention every DP rank must keep
         # dumping (the SPS profiler reads one payload per DP rank).
-        self.enabled = bool(self._components) and self.attn_tp_rank == 0
+        self.enabled = bool(self._components or on_step) and self.attn_tp_rank == 0
         self._sps_window: list[tuple[float, float]] = []
         self._sps_mismatched = 0
 
         self._records: deque[DecodeStepRecord] = deque(maxlen=max_records)
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
+        self._cost_history: deque[tuple[int, int, int, int]] = deque(maxlen=3)
 
         self._device_module = torch.get_device_module(device)
         self._d2h_stream = None
@@ -237,6 +240,33 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
+        if self._on_step is not None:
+            self._cost_history.append(
+                (
+                    obs.forward_ct,
+                    obs.bs,
+                    obs.num_verify_tokens,
+                    obs.verify_tokens_dp_synced,
+                )
+            )
+            # Overlap launches i before waiting for result i-1. The host
+            # interval can therefore measure GPU work from i-2. Only learn
+            # once the entire pipeline has the same physical geometry.
+            if (
+                step_cpu_ms is not None
+                and len(self._cost_history) == 3
+                and all(
+                    step
+                    == (
+                        obs.forward_ct - 2 + i,
+                        obs.bs,
+                        obs.num_verify_tokens,
+                        obs.verify_tokens_dp_synced,
+                    )
+                    for i, step in enumerate(self._cost_history)
+                )
+            ):
+                self._on_step(obs, step_cpu_ms * 1e-3)
         self._drain_pending()
 
         future = (
@@ -267,6 +297,7 @@ class DsparkInfoDumper:
             return
         self._drain_pending()
         self._prev_stamp = None
+        self._cost_history.clear()
         self._current_segments = {}
         self._open_segments = {}
 
@@ -279,6 +310,7 @@ class DsparkInfoDumper:
         self._records.clear()
         self._pending = None
         self._prev_stamp = None
+        self._cost_history.clear()
         self._current_segments = {}
         self._open_segments = {}
         self._sps_window = []
@@ -338,6 +370,8 @@ class DsparkInfoDumper:
         pending = self._pending
         self._pending = None
         if pending is None:
+            return
+        if not self._components:
             return
 
         record = DecodeStepRecord(forward_ct=pending.forward_ct)
@@ -759,6 +793,9 @@ class DsparkStepObservers:
             device=device,
             mode_value=planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+            on_step=(
+                planner.observe_step_cost if planner.online_cost_enabled else None
+            ),
         )
         self._block_accept_recorder = create_block_accept_estimate_recorder(
             gamma=gamma, device=device, tp_rank=tp_rank
