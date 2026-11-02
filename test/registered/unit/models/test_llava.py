@@ -1,10 +1,17 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import UnidentifiedImageError
+from transformers import LlavaConfig
 
 from sglang.srt.models.llava import AutoModel, LlavaForConditionalGeneration
-from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
+from sglang.srt.multimodal.processors.llava import (
+    LlavaImageProcessor,
+    LlavaMultimodalProcessor,
+)
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -106,6 +113,35 @@ class TestLlavaImageProcessor(CustomTestCase):
             )
 
         self.assertIs(raised.exception.__cause__, media_error)
+
+
+class TestLlavaMultimodalProcessor(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_cache_flush_reaches_the_vision_processor(self):
+        """Flushes and weight updates clear the preprocess cache of the processor built
+        for a Llava architecture; it must not lack the base state and raise instead."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_process_config={},
+            mm_preprocess_cache_size_mb=1,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="tokenizer")
+        processor = LlavaMultimodalProcessor(
+            hf_config=LlavaConfig(),
+            server_args=server_args,
+            _processor=SimpleNamespace(tokenizer=None),
+            transport_mode="default",
+        )
+        self.addCleanup(processor.shutdown)
+        self.assertTrue(processor.mm_preprocess_cache.put("image", b"pixels"))
+
+        processor.clear_preprocess_cache()
+
+        self.assertNotIn("image", processor.mm_preprocess_cache)
 
 
 if __name__ == "__main__":
