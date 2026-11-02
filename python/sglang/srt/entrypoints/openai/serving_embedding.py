@@ -34,6 +34,11 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 _MEDIA_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+_MEDIA_PART_MODALITY = {
+    "image_url": "image",
+    "video_url": "video",
+    "audio_url": "audio",
+}
 _EMBEDDING_PART_TYPES = _MEDIA_PART_TYPES | {"text"}
 # The roles generate_chat_conv renders; it rejects any other role.
 _CONVERSATION_TEMPLATE_ROLES = frozenset({"system", "user", "assistant"})
@@ -156,12 +161,25 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                             f"Content part type {part.type!r} is not supported "
                             "for embeddings"
                         )
-                    if (
-                        part.type in _MEDIA_PART_TYPES
-                        and not self.tokenizer_manager.model_config.is_multimodal
-                    ):
+                    if part.type not in _MEDIA_PART_TYPES:
+                        continue
+                    model_config = self.tokenizer_manager.model_config
+                    if not model_config.is_multimodal:
                         return (
                             "Model only supports text input; "
+                            f"received unsupported content type {part.type!r}."
+                        )
+                    # The model's processor would drop media it has no encoder for.
+                    supported = (
+                        model_config.is_audio_understandable_model
+                        if part.type == "audio_url"
+                        # Video goes through the vision tower.
+                        else model_config.is_image_understandable_model
+                    )
+                    if not supported:
+                        return (
+                            f"Model does not support "
+                            f"{_MEDIA_PART_MODALITY[part.type]} input; "
                             f"received unsupported content type {part.type!r}."
                         )
         return None

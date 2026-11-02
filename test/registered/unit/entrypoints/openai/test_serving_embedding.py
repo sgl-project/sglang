@@ -520,6 +520,35 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             self.serving_embedding._validate_request(request),
         )
 
+    def test_media_is_rejected_when_model_lacks_that_modality(self):
+        """A vision model given audio (or an audio model given an image) would
+        render the placeholder and drop the media silently."""
+        cases = [
+            (
+                "is_audio_understandable_model",
+                {"type": "audio_url", "audio_url": {"url": "a.wav"}},
+                "audio",
+            ),
+            ("is_image_understandable_model", _image("y"), "image"),
+            ("is_image_understandable_model", _video("v"), "video"),
+        ]
+        for flag, part, modality in cases:
+            with self.subTest(modality=modality):
+                self._use_order_template()
+                model_config = self.tokenizer_manager.model_config
+                model_config.is_audio_understandable_model = True
+                model_config.is_image_understandable_model = True
+                setattr(model_config, flag, False)
+                request = EmbeddingRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": [_text("x"), part]}],
+                )
+
+                self.assertIn(
+                    f"does not support {modality} input",
+                    self.serving_embedding._validate_request(request),
+                )
+
     def test_media_is_rejected_for_string_format_template(self):
         """A "string" content-format template keeps only text parts."""
         self._use_order_template()
