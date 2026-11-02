@@ -95,9 +95,9 @@ def vocab_parallel_topk(
         )
 
     if tp_group is None:
-        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
     tp_size = int(tp_group.world_size)
     if tp_size == 1:
         return local_values, local_ids

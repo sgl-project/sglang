@@ -44,7 +44,7 @@ class TestUBTreeKernelCompatibility(CustomTestCase):
         )
         from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 
-        # These are the pre-UBTree positional call contracts. Supplying the tail
+        # These are the upstream positional call contracts. Supplying the tail
         # positionally must still bind to padding / ReplaySSM, not tree options.
         contracts = (
             (
@@ -62,7 +62,7 @@ class TestUBTreeKernelCompatibility(CustomTestCase):
                 "cu_seqlens is_kda lower_bound disable_state_update "
                 "intermediate_states_buffer intermediate_state_indices cache_steps "
                 "retrieve_parent_token cache_ring replayssm_rawv replayssm_rawk "
-                "replayssm_g replayssm_beta match_cutedsl_decode",
+                "replayssm_g replayssm_beta ring_indices match_cutedsl_decode",
                 {"tree_depths": object(), "force_factorized_tree": True},
             ),
         )
@@ -553,6 +553,7 @@ class TestUBTreeLoading(CustomTestCase):
         model = Qwen3UBTreeModel.__new__(Qwen3UBTreeModel)
         torch.nn.Module.__init__(model)
         model.projector_type = "linear"
+        model.layers = torch.nn.ModuleList()
         model.ubtree_selector = UBTreeSelector(config)
         model._ubtree_selector_loaded = False
         return model

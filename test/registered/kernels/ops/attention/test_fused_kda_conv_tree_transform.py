@@ -328,3 +328,9 @@ def test_fused_conv_tree_transform_matches_reference(
             # a different order from causal_conv1d_update, so one-BF16-ULP output
             # differences are expected while the result remains numerically equal.
             torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2, msg=name)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

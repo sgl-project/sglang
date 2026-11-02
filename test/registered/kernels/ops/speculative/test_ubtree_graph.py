@@ -6,9 +6,10 @@
 
 import gc
 import weakref
+from collections import Counter
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -20,7 +21,7 @@ from sglang.srt.speculative.ubtree_components.tree_graph import build_ubtree_pro
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _config():
@@ -397,7 +398,11 @@ def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
             return hidden + values[:, None], None
 
     embedding = torch.nn.Embedding(17, 8, device="cuda")
-    model = SimpleNamespace(layers=[Layer()], norm=torch.nn.Identity())
+    model = SimpleNamespace(
+        layers=[Layer()],
+        norm=torch.nn.Identity(),
+        draft_config=SimpleNamespace(is_mla=False),
+    )
     backend = SimpleNamespace(
         init_forward_metadata_in_graph=lambda *args: None,
         init_forward_metadata_out_graph=lambda *args, **kwargs: None,
@@ -807,22 +812,305 @@ def test_worker_rejects_penalties_before_prefill():
         worker.forward_batch_generation(batch)
 
 
+@pytest.mark.parametrize("capture_raises", [False, True])
+def test_sampling_capture_device_guard_is_scoped_to_cache_miss(
+    monkeypatch, capture_raises
+):
+    from sglang.srt.speculative.ubtree_components.sampling_graph import (
+        UBTreeSamplingGraphRunner,
+    )
+
+    # Keep the guard contract covered even on a one-GPU CI runner. Real
+    # cross-device stream/capture/replay is checked separately below.
+    runner = UBTreeSamplingGraphRunner.__new__(UBTreeSamplingGraphRunner)
+    runner.device = torch.device("cuda:1")
+    runner._captured = {}
+    info = SimpleNamespace(
+        temperatures=torch.ones(1, 1),
+        top_ks=torch.tensor([2]),
+        top_ps=torch.ones(1),
+        min_ps=torch.zeros(1),
+        need_min_p_sampling=False,
+        is_all_greedy=False,
+        sampling_seed=None,
+    )
+    metadata = (torch.tensor([0]), torch.tensor([7]), torch.arange(3), None)
+    result = object()
+    epilogue = SimpleNamespace(
+        node_count=3,
+        graph_metadata=Mock(return_value=metadata),
+        set_armed=Mock(),
+        read_result=Mock(return_value=result),
+    )
+    captured = SimpleNamespace(graph=Mock(), sampling_info=info)
+    depth, entries = 0, []
+
+    @contextmanager
+    def device_guard(device):
+        nonlocal depth
+        assert device == runner.device
+        entries.append(device)
+        depth += 1
+        try:
+            yield
+        finally:
+            depth -= 1
+
+    def capture(**kwargs):
+        assert depth == 1, "lazy capture must enter the worker device first"
+        if capture_raises:
+            raise RuntimeError("test capture failure")
+        return captured
+
+    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    monkeypatch.setattr(runner, "_capture", capture)
+    kwargs = dict(
+        logits=torch.zeros(3, 5),
+        hidden=torch.zeros(3, 8),
+        sampling_info=info,
+        epilogue=epilogue,
+        forward_batch=SimpleNamespace(batch_size=1),
+        can_run_cuda_graph=True,
+    )
+    if capture_raises:
+        with pytest.raises(RuntimeError, match="test capture failure"):
+            runner.run(**kwargs)
+        assert not runner._captured
+    else:
+        assert runner.run(**kwargs) is result
+        assert runner.run(**kwargs) is result
+        assert captured.graph.replay.call_count == 2
+    assert depth == 0
+    assert entries == [runner.device]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
-def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
+@pytest.mark.parametrize("width", range(2, 50))
+def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
+    from sglang.srt.speculative.ubtree_components.tree import (
+        _build_ubtree_batch_torch,
+        _tree_metadata,
+        build_ubtree_batch,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(317)
+    proposal_args = dict(
+        anchor_tokens=torch.tensor([63], device="cuda"),
+        candidate_ids=torch.arange(60, device="cuda").view(1, 15, 4),
+        edge_log_probs=torch.log_softmax(
+            torch.randn(1, 15, 4, 4, device="cuda", generator=generator), dim=-1
+        ),
+        budget=width - 1,
+        supertree_width=4,
+    )
+    proposal = build_ubtree_batch(**proposal_args)
+    reference = _build_ubtree_batch_torch(**proposal_args)
+    _assert_tree_batches_equal(proposal, reference)
+    assert torch.all(proposal.parent_ids[:, 1:] >= 0)
+    assert torch.all(proposal.parent_ids[:, 1:] < torch.arange(1, width, device="cuda"))
+    expected_metadata = _tree_metadata(proposal.parent_ids.cpu(), max_depth=16)
+    for value, expected in zip(
+        (
+            proposal.visibility,
+            proposal.retrieve_index,
+            proposal.retrieve_next_token,
+            proposal.retrieve_next_sibling,
+        ),
+        expected_metadata,
+    ):
+        torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0)
+
+    parent_values = [
+        [-1] + [(node - 1) // 2 for node in range(1, width)],
+        [-1] + [node - 1 if node < 16 else 0 for node in range(1, width)],
+    ]
+    parents = torch.tensor(parent_values, dtype=torch.long, device="cuda")
+
+    def build():
+        return _tree_metadata(parents, max_depth=16)
+
+    expected = _tree_metadata(parents.cpu(), max_depth=16)
+    actual = build()
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value.cpu(), reference, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = build()
+    # Change both ancestry and sibling links without changing storage.
+    parents[:, 1:] = 0
+    graph.replay()
+    expected = _tree_metadata(parents.cpu(), max_depth=16)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+@pytest.mark.parametrize("capture_sampling", [False, True])
+@pytest.mark.parametrize("full_tree", [False, True])
+@pytest.mark.parametrize(
+    "temperature,top_k,top_p,min_p,uniform",
+    [
+        (1.0, 3, 1.0, 0.0, False),
+        (0.7, 2, 0.85, 0.0, False),
+        (1.3, 3, 0.9, 0.6, False),
+        (1.0, 2, 1.0, 0.0, True),
+    ],
+)
+def test_sampling_and_tree_walk_match_joint_ar_distribution(
+    capture_sampling, full_tree, temperature, top_k, top_p, min_p, uniform
+):
+    from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+    from sglang.srt.speculative.ubtree_components.sampling_graph import (
+        _sample_target_tokens,
+    )
+    from sglang.srt.speculative.ubtree_components.tree import _tree_metadata
+
+    # Tokens 0/1 continue, token 2 is EOS. The complete binary proposal returns
+    # exactly the AR sequence up to EOS or three tokens. The sparse proposal
+    # also exercises a non-EOS mismatch at the root and at an internal node.
+    parents = [-1, 0, 0, 1, 1, 2, 2] if full_tree else [-1, 0, 1]
+    tokens = [0, 0, 1, 0, 1, 0, 1] if full_tree else [0, 0, 1]
+    prefixes = [()]
+    for node in range(1, len(parents)):
+        prefixes.append((*prefixes[parents[node]], tokens[node]))
+    node_logits = torch.tensor(
+        [
+            [0.0] * 3
+            if uniform
+            else [
+                -0.6 + 0.35 * sum(prefix),
+                0.8 - 0.2 * len(prefix) - 0.4 * sum(prefix),
+                -0.2 + 0.3 * len(prefix),
+            ]
+            for prefix in prefixes
+        ],
+        dtype=torch.float32,
+    )
+
+    def top_p_mask(probs):
+        sorted_probs = probs.sort(descending=True).values
+        cutoff = torch.searchsorted(sorted_probs.cumsum(0), top_p).clamp(max=2)
+        return probs >= sorted_probs[cutoff]
+
+    # Independent CPU-double oracle: enumerate conditional AR probabilities
+    # under the same proposal-dependent stopping rule, with ties retained.
+    probabilities = []
+    for logits in node_logits:
+        probs = torch.softmax(logits.double() / temperature, dim=0)
+        top_k_mask = probs >= probs.topk(top_k).values[-1]
+        if min_p:
+            probs *= top_k_mask
+            probs /= probs.sum()
+            probs *= top_p_mask(probs)
+            probs *= probs >= probs.max() * min_p
+        else:
+            probs *= top_k_mask & top_p_mask(probs)
+        probabilities.append(probs / probs.sum())
+    expected = {}
+
+    def enumerate_paths(node, mass):
+        for token, probability in enumerate(probabilities[node].tolist()):
+            if probability == 0:
+                continue
+            child = next(
+                (
+                    i
+                    for i in range(1, len(parents))
+                    if parents[i] == node and tokens[i] == token
+                ),
+                None,
+            )
+            if child is None:
+                expected[(*prefixes[node], token)] = mass * probability
+            else:
+                enumerate_paths(child, mass * probability)
+
+    enumerate_paths(0, 1.0)
+    assert sum(expected.values()) == pytest.approx(1.0)
+    num_draws, width = 32768, len(parents)
+    parent_tensor = torch.tensor([parents], device="cuda").repeat(num_draws, 1)
+    _, retrieve_index, next_token, next_sibling = _tree_metadata(
+        parent_tensor, max_depth=3
+    )
+    candidates = torch.tensor([tokens], device="cuda").repeat(num_draws, 1)
+    logits = node_logits.cuda().repeat(num_draws, 1)
+    info = SimpleNamespace(
+        temperatures=torch.tensor([[temperature]], device="cuda"),
+        top_ks=torch.tensor([top_k], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([top_p], device="cuda"),
+        min_ps=torch.tensor([min_p], device="cuda"),
+        need_min_p_sampling=min_p > 0,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(7183)
+    seed = torch.empty(1, dtype=torch.int64, device="cuda")
+    offset = torch.zeros_like(seed)
+    predict = torch.empty(num_draws * width, dtype=torch.int32, device="cuda")
+    accept_index = torch.empty((num_draws, 3), dtype=torch.int32, device="cuda")
+    num_correct_drafts = torch.empty(num_draws, dtype=torch.int32, device="cuda")
+
+    def draw():
+        seed.random_(generator=generator)
+        target_predict = _sample_target_tokens(
+            logits, info, num_draws * width, seed, offset
+        ).view(num_draws, width)
+        predict.zero_()
+        accept_index.fill_(-1)
+        verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=next_token,
+            retrieve_next_sibling=next_sibling,
+            target_predict=target_predict,
+            topk=-1,
+        )
+
+    draw()
+    if capture_sampling:
+        graph = torch.cuda.CUDAGraph()
+        graph.register_generator_state(generator)
+        with torch.cuda.graph(graph):
+            draw()
+        graph.replay()
+    values = predict[accept_index.clamp_min(0)].cpu().tolist()
+    lengths = (num_correct_drafts + 1).cpu().tolist()
+    observed = Counter(tuple(row[:length]) for row, length in zip(values, lengths))
+    assert observed.keys() <= expected.keys()
+    for path, probability in expected.items():
+        error = abs(observed[path] / num_draws - probability)
+        bound = 8 * (probability * (1 - probability) / num_draws) ** 0.5
+        assert error <= bound + 2 / num_draws, (path, error, probability)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+@pytest.mark.parametrize("foreign_device", [False, True])
+@pytest.mark.parametrize("precreate_stream", [False, True])
+def test_sampling_graph_refreshes_coins_parameters_and_logits(
+    monkeypatch, foreign_device, precreate_stream
+):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.runtime_context import get_parallel, get_resources
     from sglang.srt.speculative.ubtree_components import sampling_graph
     from sglang.srt.speculative.ubtree_components.sampling_graph import (
         UBTreeSamplingGraphRunner,
     )
 
+    if foreign_device and torch.cuda.device_count() < 2:
+        pytest.skip("A foreign current device requires two CUDA devices")
+
     @contextmanager
     def capture_context(stream):
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(torch.cuda.current_stream(stream.device))
         with torch.cuda.stream(stream):
             yield SimpleNamespace(stream=stream)
 
     # Keep real capture/replay; this one-device fixture has no TP process group.
     monkeypatch.setattr(sampling_graph, "graph_capture", capture_context)
+    # Exercise the real lazy stream factory without inheriting another test's
+    # already-created stream. Restore the resource registry on teardown.
+    monkeypatch.setattr(get_resources(), "streams", {})
 
     width, vocab_size = 33, 64
     epilogue = UBTreeVerifyEpilogue(
@@ -865,6 +1153,13 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
     runner = UBTreeSamplingGraphRunner("cuda")
     assert runner.device == logits.device
     runner._generator.manual_seed(314159)
+    if precreate_stream:
+        sampling_graph.get_or_create_global_graph_capture_stream()
+    caller_device = (
+        (runner.device.index + 1) % torch.cuda.device_count()
+        if foreign_device
+        else runner.device.index
+    )
 
     def run(graph=True):
         return runner.run(
@@ -876,9 +1171,9 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
             can_run_cuda_graph=graph,
         )
 
-    with patch(
-        "sglang.srt.speculative.ubtree_components.epilogue.get_tp_group",
-        return_value=SimpleNamespace(world_size=1),
+    with (
+        torch.cuda.device(caller_device),
+        get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
     ):
         samples = []
         for _ in range(4):
@@ -886,6 +1181,11 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
             captured = next(iter(runner._captured.values()))
             samples.append(captured.target_predict.clone())
         assert all(not torch.equal(samples[0], sample) for sample in samples[1:])
+        assert torch.cuda.current_device() == caller_device
+        assert (
+            sampling_graph.get_or_create_global_graph_capture_stream().device
+            == runner.device
+        )
         # A full-vocabulary top-k cutoff retains all equal-probability ties.
         assert torch.cat(samples).max().item() >= 20
         assert len(runner._captured) == 1
@@ -917,6 +1217,7 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
         epilogue.begin_tree_step(tree, metadata.seq_lens)
         result = run(graph=False)
         assert result.new_seq_lens.item() == 11
+        assert torch.cuda.current_device() == caller_device
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")

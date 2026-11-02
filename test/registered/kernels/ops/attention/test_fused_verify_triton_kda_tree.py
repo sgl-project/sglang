@@ -14,7 +14,7 @@ try:
 except ImportError:
     KERNEL_AVAILABLE = False
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
@@ -123,7 +123,7 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
 @pytest.mark.parametrize(
-    "width,cache_width", [(2, 2), (17, 17), (32, 32), (33, 33), (49, 49), (65, 65)]
+    "width,cache_width", [(width, width) for width in (*range(2, 50), 65)]
 )
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
@@ -140,11 +140,11 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     num_query_heads = num_value_heads = 4
     key_dim = value_dim = 32
 
-    wave_width = (width - 1 + 3) // 4
-    parent_values = [-1] + [0] * wave_width
-    for depth in range(2, 5):
-        previous_start = 1 + (depth - 2) * wave_width
-        parent_values.extend(range(previous_start, previous_start + wave_width))
+    # Exercise a full B16 accept path when the width permits it, with unrelated
+    # branches hanging from different ancestors of that path.
+    parent_values = [-1] + [
+        node - 1 if node < 16 else (node - 16) % 15 for node in range(1, width)
+    ]
     parents = torch.tensor(
         [parent_values[:width]] * batch_size, dtype=torch.int32, device=device
     )
@@ -170,6 +170,7 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         dtype=torch.float32,
         device=device,
     )
+    initial_state = state.clone()
     state_indices = torch.tensor([3], dtype=torch.int32, device=device)
     factor_indices = torch.tensor([2], dtype=torch.int32, device=device)
     cu_seqlens = torch.arange(0, total + 1, width, dtype=torch.int32, device=device)
@@ -244,10 +245,9 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         dtype=torch.float32,
         device=device,
     )
-    factorized_out = fused_sigmoid_gating_delta_rule_update(
-        **common,
+    factor_kwargs = dict(
         intermediate_states_buffer=None,
-        tree_max_depth=5,
+        tree_max_depth=16,
         tree_query_factors=tree_query_factors,
         tree_value_factors=tree_value_factors,
         force_factorized_tree=True,
@@ -258,7 +258,9 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         replayssm_beta=tree_beta,
         factor_cache_indices=factor_indices,
     )
+    factorized_out = fused_sigmoid_gating_delta_rule_update(**common, **factor_kwargs)
 
+    torch.testing.assert_close(state, initial_state, rtol=0, atol=0)
     torch.testing.assert_close(factorized_out, serial_out, rtol=2e-2, atol=2e-2)
     expected_k = k[0].reshape(batch_size, width, num_query_heads, key_dim)
     expected_v = v[0].reshape(batch_size, width, num_value_heads, value_dim)
@@ -279,9 +281,23 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
             assert torch.isnan(tree_g[factor_slot, :, width:]).all()
             assert torch.isnan(tree_beta[factor_slot, :, width:]).all()
 
-    path = [0] + [
-        1 + depth * wave_width for depth in range(4) if 1 + depth * wave_width < width
-    ]
+    path = list(range(min(width, 16)))
+    # Unrelated candidates must not affect this path, even if their raw commit
+    # entries are subsequently poisoned. Keep every ancestor on the path intact.
+    reject_nodes = torch.tensor(
+        [node for node in range(width) if node not in path],
+        dtype=torch.long,
+        device=device,
+    )
+    for values in (q, k, v, a, b):
+        values[:, reject_nodes] = 4 * torch.randn_like(values[:, reject_nodes])
+    perturbed_out = fused_sigmoid_gating_delta_rule_update(**common, **factor_kwargs)
+    torch.testing.assert_close(
+        perturbed_out[:, path], factorized_out[:, path], rtol=0, atol=0
+    )
+    torch.testing.assert_close(state, initial_state, rtol=0, atol=0)
+    for cache in (tree_rawv, tree_rawk, tree_g, tree_beta):
+        cache[factor_indices[0], :, reject_nodes] = float("nan")
     last_node = path[-1]
     track_node = path[len(path) // 2]
     accept_index = torch.tensor(
@@ -293,7 +309,7 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     track_indices = torch.tensor([4], dtype=torch.int32, device=device)
     track_nodes = torch.tensor([track_node], dtype=torch.int32, device=device)
     committed_state = state.clone().unsqueeze(0)
-    commit_kda_replayssm_tree_all_layers(
+    commit_kwargs = dict(
         checkpoint_state=committed_state,
         rawv_cache=tree_rawv.unsqueeze(0),
         rawk_cache=tree_rawk.unsqueeze(0),
@@ -308,6 +324,20 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         mamba_steps_to_track=track_nodes,
         null_block_id=-1,
     )
+    gated_lens = torch.zeros_like(accept_lens)
+    gated_kwargs = commit_kwargs | {"accept_lens": gated_lens}
+    commit_kda_replayssm_tree_all_layers(**gated_kwargs)
+    torch.testing.assert_close(committed_state[0], state, rtol=0, atol=0)
+    if width in (2, 16, 17, 31, 32, 33, 49, 65):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            commit_kda_replayssm_tree_all_layers(**gated_kwargs)
+        torch.testing.assert_close(committed_state[0], state, rtol=0, atol=0)
+        gated_lens.copy_(accept_lens)
+        graph.replay()
+    else:
+        commit_kda_replayssm_tree_all_layers(**commit_kwargs)
+    torch.testing.assert_close(committed_state[0, :3], state[:3], rtol=0, atol=0)
 
     torch.testing.assert_close(
         committed_state[0, state_indices[0]],
@@ -321,6 +351,40 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         rtol=1e-5,
         atol=1e-5,
     )
+
+    # First continue from the committed prefix, then reuse the same state and
+    # scratch slots for another request with a different prefix. Stale sibling
+    # data and the previous request's factors must not participate in either.
+    for reset_prefix in (False, True):
+        state.copy_(committed_state[0])
+        if reset_prefix:
+            state[state_indices[0]].copy_(initial_state[1])
+        before_verify = state.clone()
+        serial_out = fused_sigmoid_gating_delta_rule_update(
+            **common, intermediate_states_buffer=serial_states
+        )
+        factorized_out = fused_sigmoid_gating_delta_rule_update(
+            **common, **factor_kwargs
+        )
+        torch.testing.assert_close(state, before_verify, rtol=0, atol=0)
+        torch.testing.assert_close(factorized_out, serial_out, rtol=2e-2, atol=2e-2)
+        for cache in (tree_rawv, tree_rawk, tree_g, tree_beta):
+            cache[factor_indices[0], :, reject_nodes] = float("nan")
+        committed_state[0].copy_(state)
+        commit_kda_replayssm_tree_all_layers(**commit_kwargs)
+        torch.testing.assert_close(
+            committed_state[0, state_indices[0]],
+            serial_states[state_indices[0], last_node],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            committed_state[0, track_indices[0]],
+            serial_states[state_indices[0], track_node],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(committed_state[0, :3], state[:3], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
@@ -454,6 +518,7 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         MambaAttnBackendBase,
     )
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
@@ -486,6 +551,11 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     a = torch.randn_like(q)
     b = torch.randn(1, width, num_heads, dtype=torch.bfloat16, device=device)
 
+    state_pool = SimpleNamespace(
+        enable_linear_replayssm=False,
+        replayssm_request_ring=False,
+        size=batch_size,
+    )
     runner = SimpleNamespace(
         device=device,
         server_args=SimpleNamespace(enable_mis=False),
@@ -493,8 +563,17 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
         req_to_token_pool=SimpleNamespace(
             get_mamba_indices=lambda requests: requests.to(torch.int32).clone(),
             translate_mamba_indices=lambda slots: slots,
+            state_sub_pool="state",
+            holds_state_slots=True,
+            req_index_to_mamba_index_mapping=indices.clone(),
         ),
-        token_to_kv_pool=None,
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: state_pool,
+                part_indices=lambda part: {},
+            )
+        ),
+        runner_ids=SimpleNamespace(state_ids=lambda sub_pool: IdSpace(key="state")),
     )
     with get_context().override_server_args(
         speculative_algorithm="UBTREE",
@@ -514,6 +593,7 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
         forward_mode=ForwardMode.TARGET_VERIFY,
         spec_info=spec,
         seq_lens_cpu=None,
+        ragged_verify_layout=None,
     )
     backend.init_forward_metadata_out_graph(batch, in_capture=True)
     metadata = backend.forward_metadata
@@ -587,3 +667,9 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
         replay_out = graph_out.clone()
         eager_out = run(ref_query_factors, ref_value_factors, eager=True)
         torch.testing.assert_close(replay_out, eager_out, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -22,8 +22,8 @@ from sglang.kernels.ops.speculative.ubtree import (
     prepare_target_kv_move_metadata,
     prepare_unified_commit_metadata,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 
@@ -418,7 +418,7 @@ class UBTreeVerifyEpilogue:
         if broadcast_outputs:
             # All TP ranks must commit rank zero's sampled path, including its
             # hidden-state indices. Greedy requests retain the existing path.
-            tp_group = get_tp_group()
+            tp_group = get_parallel().tp_group
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)

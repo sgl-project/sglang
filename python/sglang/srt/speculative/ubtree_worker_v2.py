@@ -14,7 +14,6 @@ import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import _prepare_dflash_draft_block_unchecked
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -27,7 +26,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_spec, mamba_track_grid
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, eagle_prepare_for_verify
@@ -112,7 +116,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             num_nodes=resolved_verify_node_count,
             lm_head=target_model.lm_head,
             selector=selector,
-            tp_group=get_tp_group(),
+            tp_group=get_parallel().tp_group,
         )
         self._verify_epilogue = UBTreeVerifyEpilogue(
             max_bs=1,

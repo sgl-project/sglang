@@ -235,13 +235,16 @@ class UBTreeSamplingGraphRunner:
         )
         captured = self._captured.get(key)
         if captured is None:
-            captured = self._capture(
-                logits=logits,
-                hidden=hidden,
-                sampling_info=sampling_info,
-                epilogue=epilogue,
-                metadata=metadata,
-            )
+            # The lazy stream factory and Graph initialization also depend on
+            # the current device, before _run_tail enters its own device guard.
+            with torch.cuda.device(self.device):
+                captured = self._capture(
+                    logits=logits,
+                    hidden=hidden,
+                    sampling_info=sampling_info,
+                    epilogue=epilogue,
+                    metadata=metadata,
+                )
             self._captured[key] = captured
         self._stage_inputs(captured.sampling_info, sampling_info)
         epilogue.set_armed(True)

@@ -163,9 +163,9 @@ class TargetEmbeddingTokenFactorizer(nn.Module):
         if not torch.is_floating_point(weight):
             raise ValueError("UBTree does not support quantized target embeddings")
         if tp_group is None:
-            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.runtime_context import get_parallel
 
-            tp_group = get_tp_group()
+            tp_group = get_parallel().tp_group
         tp_size = int(tp_group.world_size)
         local_padded_count = int(shard.num_org_elements_padded)
         signature = (
