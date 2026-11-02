@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -24,6 +25,7 @@ from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
+from sglang.srt.utils.common import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
@@ -55,6 +57,10 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def is_war_barrier_enabled() -> bool:
+    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
 @dataclasses.dataclass

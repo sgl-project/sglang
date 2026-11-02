@@ -74,6 +74,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "qsa",
+    "unlimited_ocr_v2",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -154,6 +155,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "lora_triton",
     "lora_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "gluon",
     "megamoe",
     "intel_xpu",
 ]
@@ -187,7 +189,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
