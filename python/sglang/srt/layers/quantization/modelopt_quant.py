@@ -3207,6 +3207,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and (
                 moe_runner_backend.is_flashinfer_trtllm()
                 or moe_runner_backend.is_flashinfer_megamoe()
+                or self._is_cutedsl_v2_standard
             )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 
