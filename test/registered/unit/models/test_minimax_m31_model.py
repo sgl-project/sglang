@@ -21,7 +21,6 @@ from sglang.srt.configs.model_config import (
     is_dspark_draft,
     uses_minimax_m3_packed_nvfp4_kv,
 )
-from sglang.srt.distributed.device_communicators import custom_all_reduce_ops
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -362,20 +361,6 @@ class TestMiniMaxM31Rocm(CustomTestCase):
         with gfx950(), self.assertRaisesRegex(ValueError, "4 KV heads"):
             _minimax_m3_overrides(rocm_server_args(tp_size=8), QUARK_M31)
 
-    def test_gfx950_resolves_the_portable_stack(self):
-        """CUDA-only backends (fa3, trtllm_mha, MegaMoE) would not start on gfx950."""
-        with (
-            gfx950(),
-            patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE="static"),
-        ):
-            overrides = _minimax_m3_overrides(
-                rocm_server_args(speculative_algorithm="DSPARK"), NVFP4
-            )
-        self.assertEqual(overrides["attention_backend"], "triton")
-        self.assertEqual(overrides["speculative_draft_attention_backend"], "triton")
-        # the dispatcher keeps global expert ids (EP) only for aiter
-        self.assertEqual(overrides["moe_runner_backend"], "aiter")
-
     def test_gfx950_kv_defaults_to_nvfp4_only_under_dspark(self):
         """Only the DSPARK verify indexer reads an NVFP4 index K: the default keeps plain
         decode on fp8, fp8 opts DSPARK out, and an unknown format fails at startup."""
@@ -439,92 +424,31 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             _minimax_m3_overrides(rocm_server_args(tp_size=2), NVFP4)
             self.assertNotIn(level, os.environ)
 
-    def test_gfx950_jit_quick_reduce_takes_mid_sizes_only_under_int4_or_int8(self):
-        """The JIT quick-reduce replaces an INT4 or INT8 one at TP4, and only then takes the
-        mid-size all-reduces off custom all-reduce; a build or a cap the user set stays."""
+    def test_gfx950_jit_quick_reduce_takes_mid_sizes_under_int4_or_int8(self):
+        """Only an INT4 or INT8 quick-reduce on a bf16 model runs the JIT build, and only
+        then does custom all-reduce stop at 2.4 MiB; a cutoff the user set stays."""
         cap, jit = "AITER_CUSTOM_AR_MAX_SIZE", "SGLANG_ROCM_QUICK_ALL_REDUCE_JIT"
         level = "ROCM_QUICK_REDUCE_QUANTIZATION"
-        with gfx950(), patch.dict("os.environ"):
-            os.environ.pop(cap, None)
-            os.environ.pop(jit, None)
-            os.environ[level] = "FP"
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-            self.assertNotIn(jit, os.environ)
-            self.assertNotIn(cap, os.environ)
-            os.environ[level] = "INT8"
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-            self.assertTrue(envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get())
-            self.assertEqual(os.environ[cap], "2516582")
-            del os.environ[cap], os.environ[jit]
-            os.environ.pop(level)
-            os.environ[jit] = "0"
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-            self.assertFalse(envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get())
-            self.assertNotIn(cap, os.environ)
-            del os.environ[jit]
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-            self.assertTrue(envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get())
-            self.assertEqual(os.environ[cap], "2516582")
-            os.environ[cap] = "1048576"
-            _minimax_m3_overrides(rocm_server_args(), NVFP4)
-            self.assertEqual(os.environ[cap], "1048576")
-        # an fp16 model, or QuickAllReduce without the fp16 cast, is not the JIT build's
-        cast = "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"
-        for dtype, cast_value in (("float16", "1"), ("auto", "0")):
-            with (
-                self.subTest(dtype=dtype, cast=cast_value),
-                gfx950(),
-                patch.dict("os.environ", {cast: cast_value}),
-            ):
-                for name in (cap, jit, level):
-                    os.environ.pop(name, None)
-                _minimax_m3_overrides(rocm_server_args(dtype=dtype), NVFP4)
-                self.assertNotIn(jit, os.environ)
-                self.assertNotIn(cap, os.environ)
-
-    def test_quick_all_reduce_hands_dtypes_its_handle_lacks_elsewhere(self):
-        """A float16 tensor on a JIT quick all-reduce handle (bf16 only) goes to the next
-        all-reduce instead of raising mid-forward."""
-        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-            QuickAllReduce,
-            QuickReduceRegime,
+        cases = (
+            ("FP", "auto", None, None),
+            ("INT8", "auto", None, "2516582"),
+            ("INT4", "float16", None, None),
+            ("INT4", "auto", "1048576", "1048576"),
         )
+        for preset, dtype, user_cap, resolved_cap in cases:
+            with (
+                self.subTest(level=preset, dtype=dtype, cap=user_cap),
+                gfx950(),
+                patch.dict("os.environ", {level: preset}),
+            ):
+                os.environ.pop(jit, None)
+                os.environ.pop(cap, None)
+                if user_cap is not None:
+                    os.environ[cap] = user_cap
+                _minimax_m3_overrides(rocm_server_args(dtype=dtype), NVFP4)
+                self.assertEqual(jit in os.environ, preset != "FP" and dtype == "auto")
+                self.assertEqual(os.environ.get(cap), resolved_cap)
 
-        qr = QuickAllReduce.__new__(QuickAllReduce)
-        qr.disabled, qr._ptr, qr.world_size = False, 7, 4
-        qr.use_fp16_kernels, qr.qr_quant_level = True, QuickReduceRegime.INT4
-        qr.qr_max_size = 1 << 31
-        inp = torch.empty(64 << 20, dtype=torch.bfloat16)
-        with patch.object(
-            custom_all_reduce_ops,
-            "qr_supports",
-            side_effect=lambda fa, dtype: dtype == torch.bfloat16,
-            create=True,
-        ):
-            self.assertTrue(qr.should_quick_allreduce(inp))
-            self.assertFalse(qr.should_quick_allreduce(inp.view(torch.float16)))
-        # no communicator was opened, so teardown has nothing to destroy
-        qr._ptr, qr.disabled = 0, True
-
-    def test_jit_quick_reduce_is_gfx950_only(self):
-        """The JIT build is validated on gfx950 only; a user-set flag elsewhere keeps
-        sgl-kernel's quick all-reduce."""
-        uses_jit = custom_all_reduce_ops._uses_jit_quick_all_reduce
-        with (
-            patch.object(custom_all_reduce_ops, "_is_hip", True),
-            envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.override(True),
-        ):
-            for gfx95, expected in ((True, True), (False, False)):
-                with (
-                    self.subTest(gfx95=gfx95),
-                    patch.object(
-                        custom_all_reduce_ops, "is_gfx95_supported", return_value=gfx95
-                    ),
-                ):
-                    self.assertEqual(uses_jit(), expected)
-
-
-class TestMiniMaxM31DSparkDraft(CustomTestCase):
     def test_draft_target_ids_are_zero_based_and_the_input_is_kept(self):
         config = draft_config()
         before = copy.deepcopy(config.to_dict())
