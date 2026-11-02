@@ -29,6 +29,7 @@ use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
     CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
+use sglang_processor::openai::OpenAiSettings;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -721,6 +722,19 @@ fn parse_optional_positive_f64_header(
         )));
     }
     Ok(Some(parsed))
+}
+
+/// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
+fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
+    let workers = ctx.registry.workers_for(model);
+    let first = Arc::clone(workers.first()?.openai_settings()?);
+    let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
+            serving OpenAI requests through the engines' own routes");
+    }
+    agree.then_some(first)
 }
 
 #[cfg(test)]

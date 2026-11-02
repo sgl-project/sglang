@@ -5,6 +5,7 @@
 //! chat completions, completions, the native `/generate` endpoint, embeddings,
 //! classify and rerank.
 
+use super::model_openai_settings;
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
@@ -20,10 +21,9 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
-    lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
+    lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, Responder,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
@@ -669,19 +669,6 @@ fn lower_openai(
     lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
         .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
         .map_err(|unsupported| unsupported.0)
-}
-
-/// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
-fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
-    let workers = ctx.registry.workers_for(model);
-    let first = Arc::clone(workers.first()?.openai_settings()?);
-    let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
-            serving OpenAI requests through the engines' own routes");
-    }
-    agree.then_some(first)
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
