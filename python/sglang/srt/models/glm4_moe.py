@@ -59,6 +59,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -1285,6 +1286,13 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The GLM target Gluon kernels consume the rank-local appended shared
+        # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
+        # models whose kernels have not implemented that ABI.
+        return hf_config.n_shared_experts or 0
+
     def precompile_kernels_after_loading(self) -> None:
         if precompile_sm107_splitk_tactics():
             logger.info("Precompiled SM107 BF16 split-K GEMM tactics for GLM-5")
@@ -1301,6 +1309,15 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
+        # model-level loader decision as well as the layer-level decision so
+        # the checkpoint remap cannot append it to the routed expert bank.
+        if get_moe_runner_backend().is_gluon():
+            return 0
+        return super().num_fusable_shared_experts(hf_config)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
