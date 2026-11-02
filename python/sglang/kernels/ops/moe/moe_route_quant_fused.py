@@ -57,6 +57,61 @@ def _jit_module() -> Module:
 
 
 @cache_once
+def _jit_metadata_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        "moe_route_quant_metadata",
+        *args,
+        cuda_files=["moe/route_quant_metadata.cuh"],
+        cuda_wrappers=[("run", f"RouteQuantMetadataKernel<{args}>::run")],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
+@cache_once
+def metadata_available() -> bool:
+    import logging
+
+    try:
+        _jit_metadata_module()
+        return True
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Failed to load fused routing metadata; using ordinary routing: %s", error
+        )
+        return False
+
+
+def allocate_metadata(device, num_tokens=1):
+    # The native body reads only live permuted slots, so skip the memset.
+    def empty(n):
+        return torch.empty(n, device=device, dtype=torch.int32)
+
+    routes = num_tokens * 16
+    return [
+        empty(1),
+        empty(routes),
+        empty(routes * 8 + 1),
+        torch.empty((num_tokens, 16), device=device, dtype=torch.bfloat16),
+        empty(1792),
+        empty(896),
+        empty(routes),
+        empty(routes),
+        empty(1),
+    ]
+
+
+_arrivals: dict[torch.device, torch.Tensor] = {}
+
+
+def _arrival_counter(device) -> torch.Tensor:
+    device = torch.device(device)
+    if device not in _arrivals:
+        _arrivals[device] = torch.zeros(1, device=device, dtype=torch.int32)
+    return _arrivals[device]
+
+
+@cache_once
 def available() -> bool:
     import logging
 
@@ -101,6 +156,7 @@ def route_quant_fused(
     renormalize: bool,
     routed_scaling_factor: float,
     apply_scale: bool,
+    metadata=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, packed [M, topk]
     int32, x_q [M, 3584] fp8_e4m3, x_s [M, 28] int32 row-major packed UE8M0)``.
@@ -113,7 +169,13 @@ def route_quant_fused(
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_q = torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
     out_s = torch.empty((M, _NUM_GROUPS // 4), dtype=torch.int32, device=device)
-    _jit_module().run(
+    module = _jit_module() if metadata is None else _jit_metadata_module()
+    metadata_args = (
+        []
+        if metadata is None
+        else [metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)] + [_arrival_counter(device)]
+    )
+    module.run(
         scores,
         bias,
         out_w,
@@ -122,6 +184,7 @@ def route_quant_fused(
         x,
         out_q,
         out_s,
+        *metadata_args,
         topk,
         float(routed_scaling_factor),
         bool(renormalize),

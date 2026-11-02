@@ -9,6 +9,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.trtllm_prepared_fp4 import try_prepared_k3_mxfp4
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -22,6 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_out_wrapper,
@@ -1217,7 +1219,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
+            routed_kwargs = dict(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,
@@ -1249,6 +1251,13 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )
+            result = try_prepared_k3_mxfp4(
+                quant_info.w13_weight,
+                prepared_metadata=route_quant_handoff.take_metadata(routing),
+                **routed_kwargs,
+            )
+            if result is None:
+                result = trtllm_fp4_block_scale_routed_moe(**routed_kwargs)
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(
