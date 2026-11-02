@@ -1588,6 +1588,9 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # BF16 LM head (target and DSpark draft) at <= 16 rows through a weight-streaming
+    # Triton kernel instead of cuBLAS; each row's result is independent of the batch.
+    SGLANG_ENABLE_BF16_SKINNY_LM_HEAD = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
