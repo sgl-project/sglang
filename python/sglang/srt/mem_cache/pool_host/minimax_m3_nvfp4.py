@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -21,6 +22,9 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
 )
 from sglang.srt.utils import is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -521,7 +525,12 @@ class MiniMaxM3Nvfp4MainKVPoolHost(MiniMaxM3Nvfp4IndexKPoolHost):
 
 
 def nvfp4_main_host_size(
-    *, memory, main_pool, index_pool, draft_pools: tuple, page_size: int
+    *,
+    memory: Any,
+    main_pool: KVCache,
+    index_pool: KVCache,
+    draft_pools: tuple[KVCache, ...],
+    page_size: int,
 ) -> float:
     """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -562,7 +571,6 @@ def nvfp4_main_host_size(
         else int(main_pool.size * memory.hicache_ratio)
     )
     slots = (slots // page_size + 1) * page_size
-    # Read through the module so a patched budget applies.
     if slots * total_bytes > base.host_memory_budget_bytes():
         raise ValueError(
             "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
