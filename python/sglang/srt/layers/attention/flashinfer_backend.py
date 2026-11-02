@@ -123,6 +123,10 @@ if is_flashinfer_available():
         return merge_state_triton(v_a, s_a, v_b, s_b)
 
 
+# (head_dim_qk, head_dim_vo) pairs FlashInfer's SM100 CUTLASS FMHA supports.
+SM100_CUTLASS_FMHA_HEAD_DIMS = frozenset({(64, 64), (128, 128), (192, 128)})
+
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -525,21 +529,15 @@ class FlashInferAttnBackend(AttentionBackend):
         if get_platform().is_sm100:
             fmha_backend = "fa2"
             # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs. The
-            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
-            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
-            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
-            cutlass_supported_head_dims = {
-                (64, 64),
-                (128, 128),
-                (192, 128),
-            }
+            # due to TMA descriptor initialization issues on SM100 GPUs. Keep
+            # shapes CUTLASS does not instantiate (for example Qwen3.5's
+            # 256x256) on the FA2 fallback.
             head_dims = (
                 model_runner.model_config.head_dim,
                 model_runner.model_config.v_head_dim,
             )
             if (
-                head_dims in cutlass_supported_head_dims
+                head_dims in SM100_CUTLASS_FMHA_HEAD_DIMS
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"

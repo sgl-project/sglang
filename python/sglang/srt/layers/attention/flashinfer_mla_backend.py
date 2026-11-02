@@ -29,6 +29,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
 )
+from sglang.srt.layers.attention.flashinfer_backend import (
+    SM100_CUTLASS_FMHA_HEAD_DIMS,
+)
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -301,8 +304,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
+        model_config = model_runner.model_config
+        ragged_head_dims = (
+            model_config.qk_nope_head_dim + model_config.qk_rope_head_dim,
+            model_config.v_head_dim,
+        )
         if get_platform().is_sm100:
-            self.fmha_backend = "cutlass"
+            self.fmha_backend = (
+                "cutlass" if ragged_head_dims in SM100_CUTLASS_FMHA_HEAD_DIMS else "fa2"
+            )
         else:
             self.fmha_backend = "auto"
 
