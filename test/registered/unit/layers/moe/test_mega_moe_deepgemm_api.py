@@ -414,7 +414,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             patch.object(mega_moe, "_mega_moe_buffer", return_value=buf),
             patch.object(mega_moe, "_device_sm", 100),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
-            patch.object(mega_moe, "captures_routed_experts", return_value=False),
         ):
             mega_moe._local_eplb_load_row(moe).fill_(1)
             torch.testing.assert_close(
@@ -423,7 +422,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             for name, value in (
                 ("_device_sm", 90),
                 ("_mega_moe_mma_type", lambda experts: "mxf4xmxf4"),
-                ("captures_routed_experts", lambda moe: True),
             ):
                 with patch.object(mega_moe, name, value):
                     self.assertIsNone(mega_moe._local_eplb_load_row(moe))

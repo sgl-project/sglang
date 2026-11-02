@@ -27,11 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe.mega_gate import (
-    captures_routed_experts,
-    run_mega_gate,
-    should_use_mega_gate,
-)
+from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -461,20 +457,17 @@ def _run_mega_routed(
 
 
 def _local_eplb_load_row(moe: DeepseekV2MoE) -> Optional[torch.Tensor]:
-    """This rank's slice of the recorder's physical count row, for MegaMoE to add
-    the rows each local expert receives; the cross-rank sum at dump time restores
-    the global counts. None keeps the router's histogram of its own picks."""
+    # MegaMoE adds the rows each local expert receives to this rank's slice of the
+    # physical count row; the cross-rank sum at dump time gives the global counts.
     counts = get_global_expert_distribution_recorder().get_current_pass_count_buffer()
     if (
         counts is None
         # No current layer: the recorder hands out the whole table.
         or counts.dim() != 1
-        or counts.dtype != torch.int32
         or _device_sm == 90
         or _mega_moe_mma_type(moe.experts) != "fp8xfp4"
         # Per-rank shared slots are physical experts EPLB does not know about.
         or moe.num_fused_shared_experts > 0
-        or captures_routed_experts(moe)
     ):
         return None
     buf = _mega_moe_buffer(moe)
