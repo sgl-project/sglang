@@ -26,6 +26,7 @@ root = Path(__file__).parent.resolve()
 _BUILD_REQUIRES = [
     "setuptools>=80",
     "mlx==0.32.4",
+    # Must match MLX's nanobind pin so cross-module MLX array casts work.
     "nanobind==3.1.0",
     "cmake>=3.25",
     "ninja",
