@@ -23,9 +23,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.allocator.base import TokenDemand
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -240,9 +240,7 @@ class BuilderAdapter:
         self._sync_hold()
         names = self.allocator.window_pool_names()
         return bool(
-            self.allocator.ensure_capacity(
-                TokenDemand(full, dict.fromkeys(names, window))
-            )
+            self.allocator.ensure_capacity(KVDemand(full, dict.fromkeys(names, window)))
         )
 
     def prepare_state(self, n: int) -> None:

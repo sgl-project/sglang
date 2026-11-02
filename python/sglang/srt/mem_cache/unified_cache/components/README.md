@@ -144,7 +144,7 @@ Insert a key-value pair into the tree.
 
 ### `evict(params: EvictParams) → EvictResult`
 
-Free cached tokens to reclaim memory. `evict_for_alloc(demand: AllocDemand)` takes what an allocation will take instead, and evicts whatever lets it be served.
+Free cached tokens to reclaim memory. `evict_for_alloc(demand: KVDemand)` takes what an allocation will take instead, and evicts whatever lets it be served.
 
 | Aspect | Detail |
 |--------|--------|

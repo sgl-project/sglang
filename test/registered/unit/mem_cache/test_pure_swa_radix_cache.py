@@ -9,11 +9,11 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     EvictResult,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -174,7 +174,7 @@ class TestPureSWADecodeReclaim(CustomTestCase):
         allocator = cache.token_to_kv_pool_allocator
         allocator.swa_available_size = lambda: 2
         allocator.full_available_size = lambda: 2
-        cache.evict_for_alloc(AllocDemand(window_num_tokens=cache.all_windows(6)))
+        cache.evict_for_alloc(KVDemand(window_tokens={"swa": 6}))
 
         self.assertEqual(len(evicted), 1)
         self.assertEqual(evicted[0].num_tokens, 4)
