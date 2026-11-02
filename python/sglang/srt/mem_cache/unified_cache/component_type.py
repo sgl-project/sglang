@@ -100,3 +100,13 @@ ComponentType.MAMBA = ComponentType._create(2, "MAMBA")
 ComponentType.C128 = ComponentType._create(3, "C128")
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
+
+
+def tree_slot_ids(slots) -> dict[str, ComponentType]:
+    """Each of a prefix tree's slots' component id, by its component name: the
+    id the name goes by (`ComponentType.of`), whatever the other slots are.
+    The tree numbers its slots; the storage plan only names them. A boundary
+    that keeps one window of its own (the native tree core, the external cache
+    linker, LMCache) finds the tree's window slot by its family and maps it to
+    its own id there."""
+    return {s.component: ComponentType.of(s.component) for s in slots}

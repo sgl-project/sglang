@@ -424,11 +424,11 @@ class StaticKVStorage:
         "MAMBA": "mamba",
     }
 
-    def tree_sub_pool(self, component, *, family: Optional[str] = None) -> str:
-        """The sub-pool the tree's ``component`` holds values of. A window
-        component under another name (``family`` window) holds the one
-        window's rows."""
-        name = component.name
+    def tree_sub_pool(self, slot: str, *, family: Optional[str] = None) -> str:
+        """The sub-pool the tree's slot named ``slot`` holds values of. A window
+        slot under another name (``family`` window) holds the one window's
+        rows."""
+        name = slot
         if name in self._TREE_SUB_POOLS:
             return self._TREE_SUB_POOLS[name]
         if family == "window":

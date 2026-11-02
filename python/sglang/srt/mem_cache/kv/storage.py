@@ -9,7 +9,6 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-import functools
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -46,7 +45,6 @@ from sglang.srt.mem_cache.kv.plan import (
     SubPoolExternal,
     TreeSlot,
     WireEntry,
-    tree_slot_ids,
 )
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
@@ -385,20 +383,15 @@ class KVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    @functools.cached_property
-    def _tree_slot_ids(self):
-        """Each tree component name's id inside the prefix tree."""
-        return tree_slot_ids(self._plan.tree_slots())
-
-    def tree_sub_pool(self, component, *, family: Optional[str] = None) -> str:
-        """The sub-pool whose values the prefix tree's ``component`` (a
-        component id, `tree_slot_ids`) holds; ``family``, the slot's family,
-        is not needed here, as every slot is named by its sub-pool."""
-        slot_ids = self._tree_slot_ids
+    def tree_sub_pool(self, slot: str, *, family: Optional[str] = None) -> str:
+        """The sub-pool whose values the prefix tree's slot named ``slot`` (a
+        `TreeSlot.component`) holds; ``family``, the slot's family, is not
+        needed here, as every slot is named by its sub-pool. The tree numbers
+        its slots itself; the storage only knows their names."""
         for s in self._sub_pools:
-            if slot_ids.get(s.external.tree_component) == component:
+            if s.external.tree_component == slot:
                 return s.name
-        raise KeyError(f"no sub-pool backs the tree component {component!r}")
+        raise KeyError(f"no sub-pool backs the tree slot {slot!r}")
 
     def _band(self, sub_pool: str):
         """The band that hands out ``sub_pool``'s rows on their own: the

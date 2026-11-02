@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
     BASE_COMPONENT_TYPE,
     ComponentType,
+    tree_slot_ids,
 )
 
 if TYPE_CHECKING:
@@ -193,8 +194,6 @@ class TreeComponent(ABC):
         self.cache = cache
         # The tree slot this component keeps: its id, family and numbers.
         self.slot = slot
-        from sglang.srt.mem_cache.kv.plan import tree_slot_ids
-
         self.component_type = tree_slot_ids(params.tree_slots)[slot.component]
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
@@ -888,7 +887,9 @@ class TreeComponent(ABC):
         """The storage this component's values are rows of, and the sub-pool
         among them it holds."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type, family=self.family)
+        return storage, storage.tree_sub_pool(
+            self.component_type.name, family=self.family
+        )
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""

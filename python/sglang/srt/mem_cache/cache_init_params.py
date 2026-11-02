@@ -77,7 +77,7 @@ class CacheInitParams:
         """The tree slots' ids, in drive order."""
         if self.tree_slots is None:
             return None
-        from sglang.srt.mem_cache.kv.plan import tree_slot_ids
+        from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 
         slot_ids = tree_slot_ids(self.tree_slots)
         return tuple(slot_ids[slot.component] for slot in self.tree_slots)

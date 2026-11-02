@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv import HostPoolOptions
-from sglang.srt.mem_cache.kv.plan import tree_slot_ids
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -46,7 +45,10 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 from sglang.srt.utils import is_npu
 

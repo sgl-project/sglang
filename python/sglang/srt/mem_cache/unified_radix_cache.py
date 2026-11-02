@@ -79,7 +79,6 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
     TREE_WINDOW,
-    tree_slot_ids,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -93,6 +92,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
 # because other modules and tests import them from this module.
@@ -4161,6 +4161,12 @@ class UnifiedRadixCache(BasePrefixCache):
             for slot in tree_slots
             if slot.family == TREE_WINDOW
         )
+        # Each window slot's name, which the storage knows it by.
+        self._window_slot_names: dict[ComponentType, str] = {
+            slot_ids[slot.component]: slot.component
+            for slot in tree_slots
+            if slot.family == TREE_WINDOW
+        }
 
     def slot_id(self, family: str) -> Optional[ComponentType]:
         """The id of the tree's slot of ``family``; None when it has none."""
@@ -4192,7 +4198,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if names is None:
             storage = self.kv_storage()
             names = {
-                slot: storage.tree_sub_pool(slot, family=TREE_WINDOW)
+                slot: storage.tree_sub_pool(
+                    self._window_slot_names[slot], family=TREE_WINDOW
+                )
                 for slot in self._window_slots
             }
             self.__dict__["_window_slot_sub_pools"] = names
