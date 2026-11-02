@@ -130,14 +130,15 @@ def _fp8_q_asm_mla_selected(
 ) -> bool:
     # The native 16-head fp8-Q kernel covers up to _MLA_ASM_PS_MAX_QLEN tokens;
     # a wider window folds onto the 32-head kernel, which wins only at long context.
+    if not enabled:
+        return False
     if not 1 <= max_verify_qlen <= _MLA_FP8_Q_ASM_FOLD_MAX_QLEN:
         raise ValueError(
             f"fp8-Q asm MLA max verify qlen must be in "
             f"[1, {_MLA_FP8_Q_ASM_FOLD_MAX_QLEN}], got {max_verify_qlen}"
         )
     return (
-        enabled
-        and num_head == 12
+        num_head == 12
         and head_pad_mode == "zero"
         and kv_cache_dtype == fp8_dtype
         and decode_backend == "asm"

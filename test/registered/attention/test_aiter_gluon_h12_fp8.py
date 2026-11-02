@@ -491,6 +491,13 @@ class TestFp8QAsmSelection(CustomTestCase):
                 with self.assertRaises(ValueError):
                     self._selected(max_verify_qlen=max_qlen)
 
+    def test_disabled_ignores_max_window(self):
+        for max_qlen in (0, 9):
+            with self.subTest(max_qlen=max_qlen):
+                self.assertFalse(
+                    self._selected(enabled=False, max_verify_qlen=max_qlen)
+                )
+
     def test_requires_gfx950_h12_zero_pad_fp8(self):
         for override in (
             dict(gfx95=False),
