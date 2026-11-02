@@ -1,5 +1,5 @@
 // Decode/verify mHC post + next combine + RMSNorm (+ optional MXFP8 of the normed row).
-// A row is split over a cluster of Split CTAs (blockIdx.x is the rank, blockIdx.y the row);
+// A row is split over a cluster of Split CTAs (blockIdx.x is the rank, blockIdx.y the row; Split 1 uses blockIdx.x);
 // each thread owns kVPT 8-element vectors of the 5120 hidden columns.
 #pragma once
 #include <sgl_kernel/tensor.h>
@@ -72,8 +72,8 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   const int tid = threadIdx.x;
   const int lane = tid % 32;
   const int warp = tid / 32;
-  const int rank = blockIdx.x;
-  const int64_t row = blockIdx.y;
+  const int rank = Split > 1 ? blockIdx.x : 0;
+  const int64_t row = Split > 1 ? blockIdx.y : blockIdx.x;
 
   if constexpr (Split > 1) {
     if (tid == 0) {
@@ -289,7 +289,7 @@ struct MhcPostCombineNormDecode {
       CHECK_HOST(reinterpret_cast<uintptr_t>(ptr) % 16 == 0) << "BF16 pointers must be 16-byte aligned";
     }
     if (rows == 0) return;
-    CHECK_HOST(rows <= 65535) << "rows go in grid.y";
+    CHECK_HOST(Split == 1 || rows <= 65535) << "rows go in grid.y";
     const MhcPostCombineNormDecodeParams params{
         static_cast<const bf16_t*>(x.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),
@@ -303,7 +303,7 @@ struct MhcPostCombineNormDecode {
         quant ? static_cast<uint8_t*>(sf.data_ptr()) : nullptr,
         rows,
         eps};
-    LaunchKernel launch(dim3(Split, rows), Threads, dev.unwrap());
+    LaunchKernel launch(Split > 1 ? dim3(Split, rows) : dim3(rows), Threads, dev.unwrap());
     if (Split > 1) launch.enable_cluster(dim3(Split, 1, 1));
     if (quant)
       launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true>, params);

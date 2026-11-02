@@ -15,7 +15,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 MAX_ROWS = 1024
 SPLIT4_MAX_ROWS = 128
-SPLIT2_MAX_ROWS = 768
+SPLIT2_MAX_ROWS = 640
 
 
 @cache_once
