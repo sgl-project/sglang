@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
@@ -185,7 +186,9 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if use_mla_backend(args):
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        if use_mla_backend(args) or is_deepseek_v4(model_config_of(args).hf_config):
             declare_resolution(
                 args,
                 "set_default_server_args",
