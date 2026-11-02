@@ -92,6 +92,25 @@ class EmbeddingModelSpec:
             return BCGEligibility.STANDARD
         return BCGEligibility.DISABLED
 
+    @property
+    def pooling_may_read_prefix(self) -> bool:
+        """Whether pooling can read hidden states at positions a radix-cache
+        hit would not recompute.
+
+        A prefix hit recomputes only the suffix (at most the last token is
+        guaranteed, since the match is capped one short of the input), so
+        only last-token pooling stays correct.  CLS and MEAN read rows inside
+        the cached prefix; classification scores read pooled non-last rows;
+        and bidirectional attention makes even the cached KV itself depend on
+        the full original sequence, so no suffix of a different request may
+        reuse it.
+        """
+        if self.attention == AttentionPattern.BIDIRECTIONAL:
+            return True
+        if self.pooling in (PoolingStrategy.CLS, PoolingStrategy.MEAN):
+            return True
+        return self.execution == EmbeddingExecution.CLASSIFICATION
+
     def as_dict(self) -> dict[str, Any]:
         """Return a stable, JSON-serializable description of this contract."""
 
