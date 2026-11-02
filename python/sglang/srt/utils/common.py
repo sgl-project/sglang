@@ -4489,16 +4489,22 @@ def parse_lscpu_topology():
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
-    # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            parts = re.split(r"[,:]+", line)
-            line_info = list()
-            for p in parts:
-                line_info.append(int(p) if p.isdigit() else 0)
-            # (cpu, core, socket, node, L3)
-            cpu_info.append(line_info[:4] + [line_info[-1]])
+        # Parse only data lines (skip comments)
+        if line.startswith("#"):
+            continue
+        parts = line.split(",")
+        numa_parts = parts[:4]  # CPU, Core, Socket, Node
+        cache_str = parts[-1] if len(parts) > 4 else "0"
+        cache_parts = cache_str.split(":")
+        line_info = list()
+        # 5 elements expected: [cpu, core, socket, node, L3]
+        for p in numa_parts:
+            line_info.append(int(p) if p.isdigit() else 0)
+        l3_cache_index = int(cache_parts[-1]) if cache_parts[-1] else 0
+        line_info.append(l3_cache_index)
+        cpu_info.append(line_info)
 
     # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
