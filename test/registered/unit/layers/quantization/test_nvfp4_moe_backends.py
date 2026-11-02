@@ -26,6 +26,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
+# Binds on about a fifth of the gate values here (|gate| has std ~0.3).
+SWIGLU_LIMIT = 0.25
 
 
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 MoE backends require SM100+")
@@ -35,7 +37,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
-    def _run_backend(self, backend: str, intermediate_size: int = I):
+    def _run_backend(self, backend: str, intermediate_size: int = I, swiglu_limit=None):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -64,6 +66,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
                 gate_up_interleaved=False,
+                swiglu_limit=swiglu_limit,
             ).cuda()
 
             # Checkpoint-format shards through the real weight_loader;
@@ -137,12 +140,29 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
             ref = self._torch_moe_reference(
-                x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
+                x,
+                topk_weights,
+                topk_ids,
+                refs["w1"],
+                refs["w3"],
+                refs["w2"],
+                swiglu_limit=swiglu_limit,
             )
+            if swiglu_limit is not None:
+                # The clamp must move the result, or an unclamped kernel passes too.
+                unclamped = self._torch_moe_reference(
+                    x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
+                )
+                cos = torch.nn.functional.cosine_similarity(
+                    ref.flatten(), unclamped.flatten(), dim=0
+                )
+                self.assertLess(cos.item(), 0.99)
             assert_output_close(self, out, ref)
 
     @staticmethod
-    def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
+    def _torch_moe_reference(
+        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit=None
+    ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
@@ -163,6 +183,10 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 e = int(topk_ids[t, j])
                 gate = x_dq[t] @ w1_ref[e].T
                 up = x_dq[t] @ w3_ref[e].T
+                if swiglu_limit is not None:
+                    # DeepSeek-V4 clamp: gate from above only, up on both sides.
+                    gate = gate.clamp(max=swiglu_limit)
+                    up = up.clamp(-swiglu_limit, swiglu_limit)
                 act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
                 ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
@@ -182,6 +206,10 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_flashinfer_cutedsl_swiglu_limit(self):
+        """A clamped SwiGLU (DeepSeek-V4 swiglu_limit) must reach the CuteDSL kernel."""
+        self._run_backend("flashinfer_cutedsl", swiglu_limit=SWIGLU_LIMIT)
 
 
 if __name__ == "__main__":
