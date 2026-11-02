@@ -654,7 +654,7 @@ _NODE_COMMIT_KERNELS = None
 
 def _node_commit_kernels():
     """Lazily JIT the two Triton node-page kernels (never import Triton eagerly)."""
-    global _NODE_COMMIT_KERNELS
+    global _NODE_COMMIT_KERNELS, tl
     if _NODE_COMMIT_KERNELS is not None:
         return _NODE_COMMIT_KERNELS
     try:
@@ -721,7 +721,7 @@ def _node_commit_kernels():
             best = tl.max(priority, 0)
             chosen = tl.max(tl.where(matches & (priority == best), node, -1), 0)
             lanes = tl.arange(0, BLOCK)
-            for begin in range(0, row_bytes, BLOCK):
+            for begin in tl.range(0, row_bytes, BLOCK):
                 offset = begin + lanes
                 old = tl.load(
                     original + row * row_stride + offset, offset < row_bytes, other=0
@@ -748,7 +748,7 @@ def _node_commit_kernels():
             size = tl.load(d + 2)
             source = Staging + tl.load(d + 8) + row * size
             lanes = tl.arange(0, BLOCK)
-            for begin in range(0, size, BLOCK):
+            for begin in tl.range(0, size, BLOCK):
                 value = tl.load(source + begin + lanes, begin + lanes < size, other=0)
                 tl.store(target + row * stride + begin + lanes, value, begin + lanes < size)
 
