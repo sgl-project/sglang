@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
@@ -20,8 +20,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -64,6 +66,11 @@ def load_mlx_scheduler_module():
     with patch.dict(sys.modules, {spec.name: module, "mlx": mlx, "mlx.core": core}):
         spec.loader.exec_module(module)
     return module
+
+
+class _Request(SimpleNamespace):
+    # Requests are tracked by identity.
+    __hash__ = object.__hash__
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
@@ -179,7 +186,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         self.prepare_pp_scheduler(scheduler)
                         if pending_transfer:
                             if name == "prefill":
-                                scheduler.disagg_prefill_inflight_queue = [object()]
+                                scheduler.disagg_prefill_transfer_queue = [object()]
                             else:
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
@@ -427,7 +434,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
             reqs=[
-                SimpleNamespace(
+                _Request(
                     rid="request", finished=Mock(return_value=False), inflight_steps=0
                 )
             ],
@@ -537,6 +544,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
@@ -557,6 +566,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        scheduler.invariant_checker = Mock()
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
@@ -568,7 +578,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.last_batch = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -599,7 +609,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
-        scheduler.process_disagg_prefill_inflight_queue = Mock()
+        scheduler.process_disagg_prefill_transfer_queue = Mock()
         scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.on_idle = Mock()
         return scheduler
@@ -611,7 +621,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
         scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
-        scheduler._pp_recv_proxy_tensors = Mock()
+        scheduler._pp_recv_proxy_tensors = Mock(return_value=None)
         scheduler._pp_commit_comm_work = Mock()
         scheduler._pp_prepare_tensor_dict = Mock(return_value={})
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
@@ -628,7 +638,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
 
 
