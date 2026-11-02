@@ -504,14 +504,18 @@ def build_tree_accept_outs(
     accept_index = torch.full(
         (batch, query_width), -1, dtype=torch.long, device=device
     )
-    for depth in range(path_node_ids.shape[1]):
-        mask = valid[:, depth]
-        if not bool(mask.any()):  # HOST-SYNC: device->host any() to skip empty depth
-            continue
-        selected_rows = rows[mask]
-        nodes = path_node_ids[mask, depth].long()
-        out_tokens[selected_rows, depth] = verify_ids[selected_rows, nodes]
-        accept_index[selected_rows, depth] = selected_rows * query_width + nodes
+    depth_count = path_node_ids.shape[1]
+    if depth_count:
+        nodes = path_node_ids.clamp(min=0).long()
+        gathered_tokens = verify_ids.gather(1, nodes)
+        out_tokens[:, :depth_count] = torch.where(
+            valid, gathered_tokens, out_tokens[:, :depth_count]
+        )
+        accept_index[:, :depth_count] = torch.where(
+            valid,
+            rows.unsqueeze(1) * query_width + nodes,
+            accept_index[:, :depth_count],
+        )
 
     out_tokens[rows, num_accepted.long()] = bonus
     commit_lens = num_accepted + 1
@@ -565,23 +569,63 @@ class TreeMetadata:
     num_nodes: int
 
 
-def _ancestor_row(layout, req: int, node_id: int, max_depth: int) -> list[int]:
-    if node_id <= 0:
-        row = [0]
-    else:
-        row = []
-        cur = node_id
-        while cur > 0:
-            row.append(int(cur))
-            cur = int(layout.parents[req, cur - 1])  # HOST-SYNC: parent-link readback
-        row.append(0)
-        row.reverse()
-    if len(row) > max_depth + 1:
-        raise ValueError(
-            f"node {node_id} has {len(row)} ancestors but only {max_depth + 1} slots"
+def _build_ancestor_table(layout, max_depth: int) -> torch.Tensor:
+    """Build ``[batch, query_width, max_depth + 1]`` root-first node ids.
+
+    The parent walk is done with ``max_depth`` device-side gathers instead of
+    one device readback per request/node.  Padded nodes keep the existing
+    ``[0, node_id]`` behavior: a missing parent stops the chain at the root.
+    """
+    batch, budget = layout.tokens.shape
+    query_width = budget + 1
+    max_len = max_depth + 1
+    device = layout.parents.device
+    if budget == 0:
+        return torch.zeros((batch, query_width, 1), dtype=torch.long, device=device)
+
+    node_ids = torch.arange(query_width, dtype=torch.long, device=device).expand(
+        batch, -1
+    )
+    chain = torch.zeros(
+        (batch, query_width, max_len), dtype=torch.long, device=device
+    )
+    chain[:, :, 0] = node_ids
+    chain_len = (node_ids > 0).long() + 1
+    active = node_ids > 0
+    cur = node_ids
+    parent_index = (cur - 1).clamp(min=0, max=budget - 1)
+
+    for step in range(1, max_len):
+        parent_raw = layout.parents.long().gather(1, parent_index)
+        parent = torch.where(
+            parent_raw > 0, parent_raw, torch.zeros_like(parent_raw)
         )
-    row.extend([-1] * (max_depth + 1 - len(row)))
-    return row
+        chain[:, :, step] = torch.where(
+            cur > 0, parent, torch.zeros_like(parent)
+        )
+        positive = active & (parent_raw > 0)
+        chain_len = chain_len + positive.long()
+        cur = torch.where(positive, parent, cur)
+        active = positive
+        parent_index = (cur - 1).clamp(min=0, max=budget - 1)
+
+    if bool((chain_len > max_len).any()):
+        raise ValueError(
+            f"tree depth exceeds ancestor slots ({max_len}); "
+            "max_depth underestimates the layout"
+        )
+
+    reversed_chain = chain.flip(-1)
+    cols = torch.arange(max_len, dtype=torch.long, device=device)
+    gather_idx = (max_len - chain_len.unsqueeze(-1) + cols).clamp(
+        min=0, max=max_len - 1
+    )
+    ancestors = reversed_chain.gather(-1, gather_idx)
+    return torch.where(
+        cols < chain_len.unsqueeze(-1),
+        ancestors,
+        torch.full_like(ancestors, -1),
+    )
 
 
 def build_tree_metadata(
@@ -613,20 +657,7 @@ def build_tree_metadata(
     positions_2d = prefix_2d + depths
     seqused_2d = positions_2d + 1
 
-    ancestors = torch.full(
-        (batch, query_width, max_depth + 1),
-        -1,
-        dtype=torch.long,
-        device=device,
-    )
-    # HOST-SYNC: per-request/per-node host loop over the device layout.
-    for req in range(batch):
-        for node_id in range(query_width):
-            ancestors[req, node_id] = torch.tensor(
-                _ancestor_row(layout, req, node_id, max_depth),
-                dtype=torch.long,
-                device=device,
-            )
+    ancestors = _build_ancestor_table(layout, max_depth)
 
     node_req_ids = torch.arange(batch, device=device).repeat_interleave(query_width)
     node_cu = torch.arange(
@@ -662,19 +693,6 @@ def _align_up(value: int, alignment: int = 128) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _ancestors(layout, req: int, node_id: int) -> list[int]:
-    if node_id <= 0:
-        return [0]
-    row = []
-    cur = node_id
-    while cur > 0:
-        row.append(int(cur))
-        cur = int(layout.parents[req, cur - 1])  # HOST-SYNC: parent-link readback
-    row.append(0)
-    row.reverse()
-    return row
-
-
 def build_tree_ori_sparse_indices(
     layout,
     *,
@@ -685,6 +703,7 @@ def build_tree_ori_sparse_indices(
     budget: int | None = None,
     full_to_swa_mapping: torch.Tensor | None = None,
     draft_slots: torch.Tensor | None = None,
+    ancestors: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return [T, 1, W] int32 physical slots, W 128-aligned.
 
@@ -698,6 +717,8 @@ def build_tree_ori_sparse_indices(
     budget = layout_budget if budget is None else int(budget)
     if block_size < 1 or window < 1:
         raise ValueError("block_size and window must be positive")
+    if budget > layout_budget:
+        raise ValueError("sparse budget exceeds layout budget")
     if prefix_lens.shape[0] != batch:
         raise ValueError("prefix_lens batch mismatch")
     if block_table.shape[0] != batch:
@@ -705,45 +726,90 @@ def build_tree_ori_sparse_indices(
     query_width = budget + 1
     width = _align_up(window + budget, 128)
     device = prefix_lens.device
-    slots = torch.full(
-        (batch * query_width, 1, width), -1, dtype=torch.int32, device=device
-    )
+    if ancestors is None:
+        max_depth = int(layout.depths.max().item()) if layout_budget else 0
+        ancestors = _build_ancestor_table(layout, max_depth)
+    else:
+        ancestors = ancestors.to(device=device, dtype=torch.long)
+        if ancestors.dim() != 3 or ancestors.shape[:2] != (batch, query_width):
+            raise ValueError(
+                "ancestors must be [batch, query_width, max_depth + 1]"
+            )
 
-    # HOST-SYNC: per-request/per-node host loop over device layout and tables.
-    for req in range(batch):
-        prefix = int(prefix_lens[req])  # HOST-SYNC: scalar readback
-        for node_id in range(query_width):
-            depth = 0 if node_id == 0 else int(layout.depths[req, node_id - 1])  # HOST-SYNC: scalar readback
-            positions: list[int] = []
-            start = max(0, prefix + depth - window)
-            positions.extend(range(start, prefix))
-            positions.extend(prefix + ancestor for ancestor in _ancestors(layout, req, node_id))
-            seen = set()
-            slot_row = slots[req * query_width + node_id, 0]
-            col = 0
-            for pos in positions:
-                if pos in seen:
-                    continue
-                seen.add(pos)
-                if col >= width:
-                    raise ValueError(
-                        f"row sees more positions than slots ({width}) for req={req}, node={node_id}"
-                    )
-                if draft_slots is not None and pos >= prefix:
-                    node = pos - prefix
-                    if node >= draft_slots.shape[1]:
-                        raise ValueError(
-                            f"draft slot column {node} out of range {draft_slots.shape[1]}"
-                        )
-                    full_slot = int(draft_slots[req, node])  # HOST-SYNC: scalar readback
-                else:
-                    page = int(block_table[req, pos // block_size])  # HOST-SYNC: scalar readback
-                    full_slot = page * block_size + (pos % block_size)
-                if full_to_swa_mapping is not None:
-                    full_slot = int(full_to_swa_mapping[full_slot])  # HOST-SYNC: scalar readback
-                slot_row[col] = full_slot
-                col += 1
-    return slots
+    prefix = prefix_lens.to(torch.long)
+    depths = torch.cat(
+        (
+            torch.zeros((batch, 1), dtype=torch.long, device=device),
+            layout.depths[:, :budget].long(),
+        ),
+        dim=1,
+    )
+    start = (prefix.unsqueeze(1) + depths - window).clamp(min=0)
+    hist_positions = start.unsqueeze(-1) + torch.arange(
+        width, dtype=torch.long, device=device
+    )
+    hist_valid = hist_positions < prefix.unsqueeze(1).unsqueeze(1)
+    hist_len = (prefix.unsqueeze(1) - start).clamp(min=0, max=width)
+
+    table = block_table.long().unsqueeze(1).expand(-1, query_width, -1)
+    hist_page_idx = (hist_positions // block_size).clamp(
+        min=0, max=block_table.shape[1] - 1
+    )
+    hist_page = table.gather(2, hist_page_idx)
+    hist_full = hist_page * block_size + (hist_positions % block_size)
+    hist_swa = hist_full
+    if full_to_swa_mapping is not None:
+        mapping = full_to_swa_mapping.long()
+        hist_swa = mapping[
+            hist_swa.clamp(min=-1, max=mapping.numel() - 1)
+        ]
+
+    slot_values = torch.where(
+        hist_valid,
+        hist_swa,
+        torch.full_like(hist_swa, -1),
+    ).to(torch.int32)
+    slots = slot_values
+
+    ancestor_ids = ancestors.to(torch.long)
+    ancestor_valid = ancestor_ids >= 0
+    ancestor_node = ancestor_ids.clamp(min=0)
+    ancestor_pos = prefix.unsqueeze(1).unsqueeze(1) + ancestor_node
+    if draft_slots is not None:
+        if bool((ancestor_ids >= draft_slots.shape[1]).any()):
+            raise ValueError(
+                f"draft slot column out of range {draft_slots.shape[1]}"
+            )
+        draft = draft_slots.long().unsqueeze(1).expand(-1, query_width, -1)
+        ancestor_full = draft.gather(2, ancestor_node)
+    else:
+        ancestor_page_idx = (ancestor_pos // block_size).clamp(
+            min=0, max=block_table.shape[1] - 1
+        )
+        ancestor_page = table.gather(2, ancestor_page_idx)
+        ancestor_full = ancestor_page * block_size + (
+            ancestor_pos % block_size
+        )
+    if full_to_swa_mapping is not None:
+        ancestor_full = full_to_swa_mapping.long()[
+            ancestor_full.clamp(min=-1, max=full_to_swa_mapping.numel() - 1)
+        ]
+
+    ancestor_cols = hist_len.unsqueeze(-1) + torch.arange(
+        ancestors.shape[-1], dtype=torch.long, device=device
+    )
+    if bool((ancestor_valid & (ancestor_cols >= width)).any()):
+        raise ValueError("tree row sees more positions than available slots")
+    slots = slots.scatter(
+        2,
+        ancestor_cols.clamp(max=width - 1),
+        torch.where(
+            ancestor_valid,
+            ancestor_full,
+            torch.full_like(ancestor_full, -1),
+        ).to(torch.int32),
+    )
+    return slots.reshape(batch * query_width, 1, width)
 
 
 # ---------------------------------------------------------------------------
@@ -760,11 +826,6 @@ class TreeCommitPlan:
     new_seq_lens: torch.Tensor  # [r]
     state_source: torch.Tensor | None = None
     state_dest: torch.Tensor | None = None
-
-
-def _slot_of(block_table: torch.Tensor, req: int, pos: int, block_size: int) -> int:
-    page = int(block_table[req, pos // block_size])
-    return page * block_size + (pos % block_size)
 
 
 def plan_tree_commit(
@@ -792,20 +853,36 @@ def plan_tree_commit(
     source_rows = torch.full((batch, max_rows), -1, dtype=torch.long, device=device)
     dest_positions = torch.full((batch, max_rows), -1, dtype=torch.long, device=device)
     dest_slots = torch.full((batch, max_rows), -1, dtype=torch.long, device=device)
-    # HOST-SYNC: per-request host loop over device tensors.
-    for req in range(batch):
-        prefix = int(prefix_lens[req])  # HOST-SYNC: scalar readback
-        source_rows[req, 0] = verify_cache_loc[req, 0]
-        dest_positions[req, 0] = prefix
-        # The target verify already wrote the root/path rows into this
-        # window.  Use those columns as destinations instead of re-reading
-        # req_to_token, whose tree-depth columns may still be -1.
-        dest_slots[req, 0] = verify_cache_loc[req, 0]
-        for depth in range(int(num_accepted[req])):  # HOST-SYNC: scalar readback
-            node = int(path_node_ids[req, depth])  # HOST-SYNC: scalar readback
-            source_rows[req, depth + 1] = verify_cache_loc[req, node]
-            dest_positions[req, depth + 1] = prefix + depth + 1
-            dest_slots[req, depth + 1] = verify_cache_loc[req, depth + 1]
+
+    source_rows[:, 0] = verify_cache_loc[:, 0]
+    dest_positions[:, 0] = prefix_lens.long()
+    # The target verify already wrote the root/path rows into this window.
+    # Use those columns as destinations instead of re-reading req_to_token,
+    # whose tree-depth columns may still be -1.
+    dest_slots[:, 0] = verify_cache_loc[:, 0]
+
+    depth_count = max_rows - 1
+    if depth_count:
+        depth_offsets = torch.arange(
+            depth_count, dtype=torch.long, device=device
+        ).unsqueeze(0)
+        depth_valid = depth_offsets < num_accepted.unsqueeze(1)
+        path_nodes = path_node_ids[:, :depth_count].clamp(min=0).long()
+        source_rows[:, 1:] = torch.where(
+            depth_valid,
+            verify_cache_loc.gather(1, path_nodes),
+            source_rows[:, 1:],
+        )
+        dest_positions[:, 1:] = torch.where(
+            depth_valid,
+            prefix_lens.long().unsqueeze(1) + depth_offsets + 1,
+            dest_positions[:, 1:],
+        )
+        dest_slots[:, 1:] = torch.where(
+            depth_valid,
+            verify_cache_loc[:, 1:max_rows],
+            dest_slots[:, 1:],
+        )
 
     commit_lens = num_accepted + 1
     new_seq_lens = prefix_lens.to(torch.int64) + commit_lens
@@ -1051,6 +1128,9 @@ def plan_tree_pre(
         budget=config.budget,
         full_to_swa_mapping=full_to_swa_mapping,
         draft_slots=draft_slots,
+        ancestors=metadata.tree_ancestors.reshape(
+            layout.tokens.shape[0], metadata.query_width, -1
+        ),
     )
     return TreePrePlan(layout=layout, metadata=metadata, ori_sparse_indices=sparse)
 

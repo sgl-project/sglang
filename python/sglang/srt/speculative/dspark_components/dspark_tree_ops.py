@@ -541,25 +541,32 @@ class NodeRecord:
 
 
 def _window_pages(plan: NodePlan, table: torch.Tensor, ratio: int, rows: int):
-    req_ids = plan.req_ids.tolist()
-    starts = plan.start.tolist()
+    if plan.req_ids.numel() == 0:
+        return ()
+    # NodePlan.req_ids is built as request-major contiguous rows, so the first
+    # row of request r is r * max_q.  Keep the table on-device and only move
+    # the (small) unique page set back to the host.
     depth_limit = int(plan.max_q)
-    width = int(table.shape[1])
-    table_host = table.tolist()
-    pages: set[int] = set()
-    n_req = max(req_ids) + 1 if req_ids else 0
-    for req in range(n_req):
-        first = req_ids.index(req)
-        prefix = int(starts[first])
-        for pos in range(prefix, prefix + depth_limit):
-            cpos = pos // ratio
-            col = cpos // rows
-            if col >= width:
-                continue
-            page = int(table_host[req][col])
-            if page > 0:
-                pages.add(page)
-    return tuple(sorted(pages))
+    if depth_limit <= 0:
+        return ()
+    n_req = plan.req_ids.numel() // depth_limit
+    device = plan.start.device
+    first = torch.arange(n_req, dtype=torch.long, device=device) * depth_limit
+    starts = plan.start[first].long()
+    positions = starts.unsqueeze(1) + torch.arange(
+        depth_limit, dtype=torch.long, device=device
+    )
+    cols = (positions // ratio) // rows
+    table_width = int(table.shape[1])
+    valid = cols < table_width
+    rows_idx = torch.arange(n_req, dtype=torch.long, device=device).unsqueeze(1)
+    if table_width == 0:
+        return ()
+    page = table.long()[rows_idx, cols.clamp(max=table_width - 1)]
+    pages = page[valid & (page > 0)]
+    if pages.numel() == 0:
+        return ()
+    return tuple(int(x) for x in torch.unique(pages).tolist())
 
 
 def record_compressed_nodes(
@@ -818,15 +825,11 @@ def move_swa_kv(pool, plan) -> None:
     separately by the node page kernels.
     """
     mask = plan.source_rows >= 0
-    if not bool(mask.any()):
-        return
     source = plan.source_rows[mask].to(torch.int64)
     dest = plan.dest_slots[mask].to(torch.int64)
     src_swa = pool.translate_loc_from_full_to_swa(source)
     dst_swa = pool.translate_loc_from_full_to_swa(dest)
     valid = (src_swa >= 0) & (dst_swa >= 0)
-    if not bool(valid.any()):
-        return
     src_swa = src_swa[valid]
     dst_swa = dst_swa[valid]
     for layer_id in range(int(pool.layer_num)):
