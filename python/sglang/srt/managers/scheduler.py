@@ -416,6 +416,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Cap on rids printed per --log-schedule-decisions line.
+_MAX_LOGGED_RIDS = 16
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -495,6 +498,9 @@ class Scheduler(
     uocr_doc_hooks: Optional[UocrDocHooks] = None
     async_shm_materializer: Optional[AsyncShmMaterializer] = None
     deferred_overlap_release: Optional[DeferredOverlapRelease] = None
+    # Class-level defaults so stub schedulers built via __new__ skip the log.
+    log_schedule_decisions: bool = False
+    _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,
@@ -1376,6 +1382,8 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        # Read on every prefill pass, so cache it.
+        self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         self.running_reqs = RunningReqs()
@@ -4331,6 +4339,48 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _maybe_log_schedule_decision(
+        self,
+        *,
+        can_run_list: List[Req],
+        running_batch: ScheduleBatch,
+        adder: PrefillAdder,
+    ) -> None:
+        if not self.log_schedule_decisions:
+            return
+        if get_parallel().attn_tp_rank != 0 or get_parallel().attn_cp_rank != 0:
+            return
+        # KV budget this pass saw: free now plus what eviction could reclaim.
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        counters = (
+            len(self.waiting_queue),
+            len(running_batch.reqs),
+            len(adder.preempt_list),
+            pool_stats.full_available_size,
+            pool_stats.full_evictable_size,
+        )
+        if not can_run_list:
+            # A blocked queue retries every iteration; log only state changes.
+            if counters == self._last_empty_schedule_decision:
+                return
+            self._last_empty_schedule_decision = counters
+        else:
+            self._last_empty_schedule_decision = None
+
+        picked_rids = [req.rid for req in can_run_list[:_MAX_LOGGED_RIDS]]
+        num_hidden = len(can_run_list) - len(picked_rids)
+        more = f" (+{num_hidden} more)" if num_hidden > 0 else ""
+        num_left, num_running, num_preempted, kv_free, kv_evictable = counters
+        logger.info(
+            f"Schedule prefill: #picked={len(can_run_list)}, "
+            f"#left-in-queue={num_left}, "
+            f"#running={num_running}, "
+            f"#preempted={num_preempted}, "
+            f"kv-free-tokens={kv_free}, "
+            f"kv-evictable-tokens={kv_evictable}, "
+            f"picked-rids={picked_rids}{more}"
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4612,6 +4662,10 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+            # Empty passes are the key signal for head-of-line blocking.
+            self._maybe_log_schedule_decision(
+                can_run_list=can_run_list, running_batch=running_batch, adder=adder
+            )
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4623,6 +4677,11 @@ class Scheduler(
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        # After the re-queue, so #left-in-queue is what the next pass sees.
+        self._maybe_log_schedule_decision(
+            can_run_list=can_run_list, running_batch=running_batch, adder=adder
+        )
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
@@ -6723,8 +6782,8 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
+    # The PID suffix is parsed by debug_utils/log_parser.py; keep them in sync.
+    configure_logger(server_args, prefix=f"{prefix} PID%(process)d")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
