@@ -2036,12 +2036,23 @@ def _zero_topk_weights_padded_region(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def _biased_grouped_topk_postprocess(
+def _biased_grouped_topk_postprocess_compiled(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
+
+
+def _biased_grouped_topk_postprocess(
+    topk_ids, expert_location_dispatch_info, num_token_non_padded
+):
+    if expert_location_dispatch_info is None and num_token_non_padded is None:
+        return topk_ids
+
+    return _biased_grouped_topk_postprocess_compiled(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
 
 
 def biased_grouped_topk_gpu(

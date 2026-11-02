@@ -1087,6 +1087,53 @@ class TestTopKRoutingInputs(CustomTestCase):
             batch.num_token_non_padded.fill_(1)
             self.assertEqual(compiled(torch.ones(4)).tolist(), [1.0, 0.0, 0.0, 0.0])
 
+    def test_topk_postprocess_skips_only_when_both_metadata_values_are_absent(self):
+        info = expert_location_dispatch.ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=(
+                self.metadata.logical_to_rank_dispatch_physical_map[0]
+            ),
+            partial_logical_to_all_physical_map=self.metadata.logical_to_all_physical_map[
+                0
+            ],
+            partial_logical_to_all_physical_map_num_valid=(
+                self.metadata.logical_to_all_physical_map_num_valid[0]
+            ),
+            num_physical_experts=self.metadata.num_physical_experts,
+        )
+        cases = (
+            ("both absent", None, None, [[0, 2], [1, 3]], False),
+            ("remap only", info, None, [[2, 3], [0, 1]], True),
+            ("mask only", None, torch.tensor(1), [[0, 2], [-1, -1]], True),
+            (
+                "remap and mask",
+                info,
+                torch.tensor(1),
+                [[2, 3], [-1, -1]],
+                True,
+            ),
+        )
+        compiled_impl = topk_module._biased_grouped_topk_postprocess_compiled
+        with patch.object(
+            topk_module,
+            "_biased_grouped_topk_postprocess_compiled",
+            wraps=compiled_impl.__wrapped__,
+        ) as compiled:
+            for name, location_info, non_padded, expected, should_delegate in cases:
+                with self.subTest(name=name):
+                    # A non-contiguous view exercises the ordinary CPU mask path.
+                    topk_ids = torch.tensor([[0, 1], [2, 3]]).t()
+                    result = topk_module._biased_grouped_topk_postprocess(
+                        topk_ids, location_info, non_padded
+                    )
+                    self.assertEqual(result.tolist(), expected)
+                    if not should_delegate:
+                        self.assertIs(result, topk_ids)
+                        self.assertIsNone(non_padded)
+                        self.assertIsNone(location_info)
+
+        self.assertEqual(compiled.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
