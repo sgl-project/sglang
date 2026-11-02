@@ -433,12 +433,8 @@ class DllmManager:
         self.staging_queue: List[Req] = []
 
     def request_lists(self) -> Dict[str, List[Req]]:
-        # The staging requests are also in the waiting queue.
-        staging = set(self.staging_queue)
-        return {
-            "dllm_waiting": [req for req in self.waiting_queue if req not in staging],
-            "dllm_staging": self.staging_queue,
-        }
+        # The staging queue is the part of this queue the current round runs.
+        return {"dllm": self.waiting_queue}
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""

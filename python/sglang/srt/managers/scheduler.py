@@ -4656,9 +4656,9 @@ class Scheduler(
         ]
 
     def request_lists(self) -> Dict[str, List[Req]]:
-        """The lists that hold the live requests, by name, in the same order on
-        every rank. A request is in at most one; one that PD prefill or HiSparse
-        launched is in none until its result is processed."""
+        """The lists that hold the live requests, by name. A request is in at
+        most one; one that PD prefill or HiSparse launched is in none until its
+        result is processed."""
         lists = {
             "waiting": self.waiting_queue,
             "grammar": self.grammar_manager.grammar_queue,
