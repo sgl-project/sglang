@@ -1,4 +1,4 @@
-"""Qwen3.5-9B NEXTN speculative decoding on Intel XPU."""
+"""Qwen3.5-9B NEXTN and breadth-1 NGRAM decoding on Intel XPU."""
 
 import unittest
 
@@ -51,10 +51,18 @@ NEXTN_ARGS = [
     "--speculative-num-draft-tokens",
     "4",
 ]
+NGRAM_ARGS = [
+    "--speculative-algorithm",
+    "NGRAM",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--speculative-ngram-max-bfs-breadth",
+    "1",
+]
 
 
 @unittest.skipUnless(torch.xpu.is_available(), "Intel XPU is required")
-class TestQwen3_5_9BXPU_NextN(CustomTestCase):
+class TestQwen3_5_9BXPUSpecDecode(CustomTestCase):
     def generate(self, extra_args):
         process = popen_launch_server(
             MODEL,
@@ -80,15 +88,19 @@ class TestQwen3_5_9BXPU_NextN(CustomTestCase):
         finally:
             terminate_and_kill_process_tree(process)
 
-    def test_nextn_matches_greedy(self):
+    def test_speculative_modes_match_greedy(self):
         baseline = self.generate([])
-        speculative = self.generate(NEXTN_ARGS)
-
         self.assertEqual(baseline["meta_info"]["completion_tokens"], 64)
-        self.assertEqual(speculative["meta_info"]["completion_tokens"], 64)
-        self.assertEqual(speculative["text"], baseline["text"])
-        self.assertGreater(speculative["meta_info"]["spec_verify_ct"], 0)
-        self.assertGreater(speculative["meta_info"]["spec_num_correct_drafts"], 0)
+
+        for algorithm, args in (("NEXTN", NEXTN_ARGS), ("NGRAM", NGRAM_ARGS)):
+            with self.subTest(algorithm=algorithm):
+                speculative = self.generate(args)
+                self.assertEqual(speculative["meta_info"]["completion_tokens"], 64)
+                self.assertEqual(speculative["text"], baseline["text"])
+                self.assertGreater(speculative["meta_info"]["spec_verify_ct"], 0)
+                self.assertGreater(
+                    speculative["meta_info"]["spec_num_correct_drafts"], 0
+                )
 
 
 if __name__ == "__main__":
