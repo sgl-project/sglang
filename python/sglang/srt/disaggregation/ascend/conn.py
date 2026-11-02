@@ -220,10 +220,13 @@ class AscendKVManager(MooncakeKVManager):
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
+        # DSA state has one entry per full-attention layer, unlike the grouped
+        # main KV buffers. Use the same positional mapping for pointers and lens.
+        if state_type == StateType.DSA:
+            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
+
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
-        # state_type is accepted for parity with the common disaggregation path;
-        # the NPU kv_buf_groups slicing below is state-type agnostic.
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
         draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
