@@ -310,6 +310,9 @@ pub struct SamplingParams {
     /// grammar compilation, matching the legacy native gRPC contract.
     #[prost(string, repeated, tag = "28")]
     pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Commit one target token per iteration while retaining draft work.
+    #[prost(bool, optional, tag = "29")]
+    pub disable_speculative_decoding: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {

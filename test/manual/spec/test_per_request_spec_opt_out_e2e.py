@@ -100,6 +100,14 @@ def run():
     url = "http://127.0.0.1:30000"
     baseline = None
     summary = {}
+    mismatches = []
+
+    def compare_tokens(actual, expected, mode, row):
+        if actual != expected:
+            mismatch = dict(mode=mode, row=row, actual=actual, expected=expected)
+            mismatches.append(mismatch)
+            print("OUTPUT_MISMATCH", json.dumps(mismatch), flush=True)
+
     for mode in ("target", "eager", "graph"):
         trace = root / f"{mode}.jsonl"
         trace.write_text("")
@@ -187,7 +195,7 @@ def run():
                     },
                     timeout=180,
                 )
-                response.raise_for_status()
+                assert response.ok, response.text
                 rows = response.json()
                 assert len(rows) == 3, rows
                 tokens = []
@@ -215,10 +223,12 @@ def run():
                     actual = generate(flags, limits)
                     for i, flag in enumerate(flags):
                         if flag:
-                            assert actual[i] == baseline[i][: limits[i]], (mode, i)
+                            compare_tokens(actual[i], baseline[i][: limits[i]], mode, i)
                 response = requests.get(url + "/flush_cache", timeout=30)
-                response.raise_for_status()
-                assert generate([True] * 3) == baseline
+                assert response.ok, response.text
+                actual = generate([True] * 3)
+                for i in range(3):
+                    compare_tokens(actual[i], baseline[i], mode, i)
             # Probe idle checks after all requests have released their rows.
             time.sleep(2)
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -248,7 +258,9 @@ def run():
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
             log.close()
+    summary["output_mismatches"] = mismatches
     (root / "summary.json").write_text(json.dumps(summary, indent=2))
+    assert not mismatches, f"{len(mismatches)} target-only output comparisons failed"
     print("MODEL_E2E_AND_KV_SMOKE_PASS", flush=True)
 
 

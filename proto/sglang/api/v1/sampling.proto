@@ -101,6 +101,8 @@ message SamplingParams {
   // Literal alternatives. The server lowers these to an escaped regex before
   // grammar compilation, matching the legacy native gRPC contract.
   repeated string choice = 28;
+  // Commit one target token per iteration while retaining draft work.
+  optional bool disable_speculative_decoding = 29;
 }
 
 message WatermarkRequestConfig {

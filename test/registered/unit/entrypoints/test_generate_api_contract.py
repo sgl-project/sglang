@@ -18,6 +18,31 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGenerateContract(CustomTestCase):
+    def test_spec_opt_out_single_and_mixed_requests(self):
+        from sglang.api.v1.api_types import GenerateRequest
+
+        for flags in ([True], [False], [False, True, False]):
+            params = [{"disable_speculative_decoding": flag} for flag in flags]
+            body = {
+                "text": "hello" if len(flags) == 1 else ["hello"] * len(flags),
+                "sampling_params": params[0] if len(flags) == 1 else params,
+            }
+            self.assertIsNone(generate_contract_error(body))
+            decoded = GenerateRequest.from_json_value(body).to_json_value()
+            actual = decoded["sampling_params"]
+            if isinstance(actual, dict):
+                actual = [actual]
+            self.assertEqual([p["disable_speculative_decoding"] for p in actual], flags)
+        for invalid in ("true", 1, []):
+            self.assertIsNotNone(
+                generate_contract_error(
+                    {
+                        "text": "hello",
+                        "sampling_params": {"disable_speculative_decoding": invalid},
+                    }
+                )
+            )
+
     def test_every_media_container_form_is_accepted(self):
         for image_data in (
             "u",
