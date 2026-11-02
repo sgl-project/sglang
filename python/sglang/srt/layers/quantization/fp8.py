@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -553,6 +554,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and not envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
         )
         self.w8a8_block_fp8_linear = None
+        self.block_fp8_linear_takes_output = False
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
         # Set by a model-owned startup hook after opting into prefill tuning.
@@ -575,6 +577,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
+            # Only the DeepGEMM block linear can write a caller-owned output
+            # (see apply_into); the dispatcher may hand it back as a partial.
+            fn = self.w8a8_block_fp8_linear
+            self.block_fp8_linear_takes_output = (
+                fn.func if isinstance(fn, functools.partial) else fn
+            ) is deepgemm_w8a8_block_fp8_linear_with_fallback
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = (
@@ -1335,6 +1343,38 @@ class Fp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
+
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """RowParallelLinear's zero-copy contract: write the result into the
+        caller-owned ``output``. The DeepGEMM block-FP8 linear writes it
+        directly; every other path computes normally and copies."""
+        input_tensor, input_scale = x if isinstance(x, tuple) else (x, None)
+        if (
+            self.block_fp8_linear_takes_output
+            # The Blackwell block-as-MXFP8 view and DeepGEMM-packed activations
+            # run other kernels that return a fresh tensor.
+            and not (self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready)
+            and not (input_scale is not None and input_scale.dtype == torch.int32)
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+        ):
+            self.w8a8_block_fp8_linear(
+                input=input_tensor,
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=input_scale,
+                bias=bias,
+                output=output,
+            )
+            return output
+        return output.copy_(self.apply(layer, x, bias))
 
     def apply(
         self,
