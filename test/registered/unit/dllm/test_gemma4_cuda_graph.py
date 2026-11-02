@@ -160,7 +160,6 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.bs = 4
         runner.raw_num_token = 12
         runner.captured_req_width = 4
-        runner.enable_pdmux = False
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)
         runner._resolve_lora_variant = Mock(return_value=None)

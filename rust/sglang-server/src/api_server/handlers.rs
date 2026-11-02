@@ -14,6 +14,7 @@ mod test_utils;
 mod tokenize;
 
 pub(crate) use control::ProfileOutcome;
-pub(crate) use generate::{CoreCall, recv_indexed};
-pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata};
+pub use generate::{AbortEnding, Aborted};
+pub(crate) use generate::{CoreCall, PendingGeneration, recv_indexed};
+pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIMEOUT};
 pub(crate) use hicache::HiCacheManager;
