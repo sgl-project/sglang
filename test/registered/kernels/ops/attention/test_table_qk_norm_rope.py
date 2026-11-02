@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.rope import apply_rope_inplace
+from sglang.kernels.ops.attention.rotary_triton import triton_mrope_fused
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -71,6 +72,26 @@ def test_cuda_sequence_is_bit_exact(d, batch, hq, hk, padded, pos_dtype):
         assert_same_bits(storage[:, -8:], before[:, -8:])
 
 
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("batch,hq,hk", [(1, 32, 8), (32, 8, 1), (257, 64, 8)])
+def test_bf16_table_matches_triton_mrope_on_decode_positions(
+    batch, hq, hk, interleaved
+):
+    """With equal axes, a BF16 table must reproduce the split MRoPE decode path."""
+    d = 128
+    _, x, pos, qw, kw, cache = inputs(d, batch, hq, hk, 29)
+    cache = cache.bfloat16()
+    expected = x.clone()
+    q, k, _ = expected.split([hq * d, hk * d, hk * d], dim=-1)
+    fused_inplace_qknorm(q.view(batch, hq, d), k.view(batch, hk, d), qw, kw, 1e-6)
+    positions_3d = pos.unsqueeze(0).repeat(3, 1)
+    triton_mrope_fused(
+        q, k, cache, positions_3d, [24, 20, 20], d, d, interleaved, False, True, None
+    )
+    table_qk_norm_rope_(x, pos, qw, kw, cache, hq, hk, d, 1e-6, match_cuda=True)
+    assert_same_bits(x, expected)
+
+
 @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("eps", [1e-6, 1e-5])
 def test_extreme_values_and_rounding(d, eps):
@@ -115,7 +136,7 @@ def test_cuda_mode_rejects_invalid_inputs(invalid):
     elif invalid == "qkv_stride":
         x = x[:, ::2]
     elif invalid == "table":
-        cache = cache.bfloat16()
+        cache = cache.half()
     else:
         pos = pos.float()
     with pytest.raises(AssertionError):

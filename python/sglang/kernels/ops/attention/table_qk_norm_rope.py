@@ -18,6 +18,7 @@ def _table_qk_norm_rope_kernel(
     D: tl.constexpr,
     EPS: tl.constexpr,
     MATCH_CUDA: tl.constexpr,
+    BF16_TABLE: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
@@ -26,8 +27,8 @@ def _table_qk_norm_rope_kernel(
     HALF: tl.constexpr = D // 2
     half_ar = tl.arange(0, HALF)
     d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
+    cos = tl.load(cos_sin_ptr + pos * D + half_ar)
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar)
 
     is_q = h < NHQ
     col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
@@ -51,14 +52,23 @@ def _table_qk_norm_rope_kernel(
     w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
     x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
     x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
-    x1 = x1.to(tl.bfloat16).to(tl.float32)
-    x2 = x2.to(tl.bfloat16).to(tl.float32)
-    if MATCH_CUDA:
-        o1 = tl.fma(x1, cos, -mul_rn_f32(x2, sin))
-        o2 = tl.fma(x2, cos, mul_rn_f32(x1, sin))
-    else:
+    x1 = x1.to(tl.bfloat16)
+    x2 = x2.to(tl.bfloat16)
+    if BF16_TABLE:
+        # Same BF16 expression as triton_mrope_fused, so its codegen matches.
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
+    else:
+        x1 = x1.to(tl.float32)
+        x2 = x2.to(tl.float32)
+        cos = cos.to(tl.float32)
+        sin = sin.to(tl.float32)
+        if MATCH_CUDA:
+            o1 = tl.fma(x1, cos, -mul_rn_f32(x2, sin))
+            o2 = tl.fma(x2, cos, mul_rn_f32(x1, sin))
+        else:
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
     tl.store(row + half_ar, o1.to(tl.bfloat16))
     tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
 
@@ -85,8 +95,9 @@ def table_qk_norm_rope_(
     ``match_cuda`` preserves the reduction and rounding of the separate CUDA
     QK-norm and RoPE kernels for head dimensions 64/128/256. It requires BF16
     QKV with contiguous columns, contiguous BF16 weights, a contiguous FP32
-    rotary table, and contiguous int32/int64 positions on the same CUDA device.
-    Row-strided QKV is supported.
+    or BF16 rotary table, and contiguous int32/int64 positions on the same CUDA
+    device. Row-strided QKV is supported. A BF16 table rotates in BF16 to match
+    ``triton_mrope_fused`` on decode positions, where all three axes are equal.
     """
     if match_cuda:
         assert head_dim in (64, 128, 256)
@@ -96,7 +107,8 @@ def table_qk_norm_rope_(
         assert q_weight.shape == k_weight.shape == (head_dim,)
         assert q_weight.is_contiguous() and k_weight.is_contiguous()
         assert cos_sin_cache.ndim == 2 and cos_sin_cache.shape[1] == head_dim
-        assert cos_sin_cache.dtype == torch.float32 and cos_sin_cache.is_contiguous()
+        assert cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
+        assert cos_sin_cache.is_contiguous()
         assert positions.shape == (qkv.shape[0],) and positions.is_contiguous()
         assert positions.dtype in (torch.int32, torch.int64)
         assert qkv.is_cuda and all(
@@ -119,5 +131,6 @@ def table_qk_norm_rope_(
         D=head_dim,
         EPS=eps,
         MATCH_CUDA=match_cuda,
+        BF16_TABLE=cos_sin_cache.dtype == torch.bfloat16,
         num_warps=1 if match_cuda else 4,
     )
