@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.server_args import ServerArgs
 
 
@@ -774,8 +775,13 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         del grammar_barrier
+        # UNO's target-block path (batch=None, forward_batch=..., is_verify=True)
+        # has no PP relay — accept the keyword the non-overlap scheduler passes
+        # so it stops raising TypeError, and drop it here.
+        del pp_proxy_tensors
         self._validate_batch(batch)
 
         if batch.forward_mode == ForwardMode.EXTEND:
