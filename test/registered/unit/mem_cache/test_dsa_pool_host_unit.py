@@ -4,6 +4,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    alloc_with_pin_memory,
+)
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
 )
@@ -220,7 +224,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
             mla_host = MLATokenToKVPoolHost(
-                device_pool=device_pool,
+                buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=page_size,
@@ -229,10 +233,24 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 device="cpu",
                 allocator_type="default",
                 override_kv_cache_dim=device_pool.kv_cache_dim,
+                device_capacity_tokens=(
+                    device_pool.size
+                    if device_pool.host_capacity_tokens is None
+                    else device_pool.host_capacity_tokens
+                ),
+                start_layer=device_pool.start_layer,
+                end_layer=device_pool.end_layer,
+                target_layer_num=(
+                    (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                    // device_pool.layer_shard_size
+                    if device_pool.layer_shard_enabled
+                    else device_pool.layer_num
+                ),
+                layer_shard_enabled=device_pool.layer_shard_enabled,
             )
-            indexer_host = DSAIndexerPoolHost(
-                decl=make_dsa_indexer_pool_decl(device_pool),
-                anchor_host=mla_host,
+            indexer_host = _make_indexer_host(
+                device_pool,
+                mla_host,
                 pin_memory=pin_memory,
                 device="cpu",
                 allocator_type="default",
