@@ -42,16 +42,21 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
-  --backend sglang \\
-  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
-  --model {{MODEL_NAME}} \\
-  --dataset-name {{DATASET}} \\
-  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --random-range-ratio 1.0 \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --seed 42 --warmup-requests 0 \\
-  --flush-cache`,
+`bench() {
+  python3 -m sglang.bench_serving \\
+    --backend sglang \\
+    --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+    --model {{MODEL_NAME}} \\
+    --dataset-name {{DATASET}} \\
+    --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+    --random-range-ratio 1.0 \\
+    --num-prompts "$1" --max-concurrency {{MAX_CONCURRENCY}} \\
+    --seed 42 --warmup-requests 0 \\
+    --flush-cache
+}
+bench 16                # warm-up: 16 full-length requests, not reported
+bench {{NUM_PROMPTS}}   # measured
+# At concurrency 64 the cards report the median-throughput run of 3 warm-up + measured repeats.`,
     accuracy: {
       gsm8k_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
@@ -140,8 +145,10 @@ done`,
             { value: 4, disable: { hw: ["h200"], nodes: ["multi-2"] }, disableReason: "SGLang rejects prefill CP with pipeline parallelism, which the two-node H200 recipe uses." }] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 2, 4,
-            { value: 8, disable: { hw: ["gb300"] },
-              disableReason: "DP-Attention 8 needs 8 ranks; the GB300 recipe runs TP4." }],
+            { value: 8, disable: [
+              { when: { hw: ["gb300"] }, reason: "DP-Attention 8 needs 8 ranks; the GB300 recipe runs TP4." },
+              { when: { hw: ["vera-rubin"], nodes: ["single"] }, reason: "DP-Attention 8 needs 8 ranks; the one-tray Vera Rubin recipe runs TP4." },
+            ] }],
           labels: { "auto": "Auto", "false": "Off" } },
       ],
     },
@@ -155,7 +162,8 @@ done`,
       },
       ep: { label: "EP", values: [null, 1,
         { value: 4, hide: { hw: ["b300", "b200", "h200"] } },
-        { value: 8, hide: { hw: ["gb300"] } }] },
+        { value: 8, hide: { hw: ["gb300"] },
+          disable: [{ when: { hw: ["vera-rubin"], nodes: ["single"] }, reason: "EP 8 needs 8 ranks; the one-tray Vera Rubin recipe runs TP4." }] }] },
     },
 
     speculative: {
