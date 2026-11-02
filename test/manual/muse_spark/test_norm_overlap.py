@@ -239,6 +239,46 @@ class TestHostSchedule(unittest.TestCase):
                             )
                         self.assertEqual(f.events.count("record"), 0 if capture else 3)
 
+    def test_int4_selection_is_cpu_only(self):
+        # Load the production selection predicates without GPU dependencies.
+        tree = ast.parse(SOURCE.read_text())
+        functions = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in ("_quantization_name", "_uses_gptq_int4_experts")
+        ]
+        scope = {}
+        exec(
+            compile(
+                ast.Module(
+                    body=[
+                        *ast.parse("from __future__ import annotations").body,
+                        *functions,
+                    ],
+                    type_ignores=[],
+                ),
+                str(SOURCE),
+                "exec",
+            ),
+            scope,
+        )
+        configs = [
+            SimpleNamespace(get_name=lambda: "gptq"),
+            SimpleNamespace(get_name=lambda: "auto-round", packing_format="auto_gptq"),
+            SimpleNamespace(get_name=lambda: "auto-round", backend="gptq"),
+        ]
+        for cpu in (False, True):
+            scope["_is_cpu"] = cpu
+            for config in configs:
+                self.assertEqual(scope["_uses_gptq_int4_experts"](config), cpu)
+            self.assertFalse(scope["_uses_gptq_int4_experts"](None))
+        # The INT4 caller uses the non-NVFP4 CPU path. Its order stays serial:
+        # projection -> gate -> routing -> norm -> experts, with no CUDA stream.
+        f = Fixture(device="cpu", nvfp4=False, projection=True)
+        f.run(torch.randn(3, 32))
+        self.assertEqual(f.events, ["project", "gate", "route", "norm", "experts"])
+
     def test_cpu_fallback_and_empty(self):
         for projection in (False, True):
             for norm in (False, True):
