@@ -623,8 +623,12 @@ def test_deterministic(args):
         cached_token_data = cached_logprobs[0]
         cached_logprob = cached_token_data[0]
         cached_token_id = cached_token_data[1]
+        cached_tokens = cached_response["meta_info"].get("cached_tokens", 0)
 
-        print(f"✓ Generated with cache:")
+        print(f"✓ Generated with cache (cached_tokens={cached_tokens}):")
+        if cached_tokens == 0:
+            print("TEST FAILED - Radix cache did not hit")
+            return [0]
         print(f"  Token ID: {cached_token_id}")
         print(f"  Logprob:  {cached_logprob:.10f}")
 
