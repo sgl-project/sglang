@@ -50,6 +50,14 @@ cp pyproject_xpu.toml pyproject.toml
 uv pip install -v ".[dev,diffusion]"
 ```
 
+pip ignores the `[tool.uv.*]` sections of `pyproject.toml`. To install with pip instead of uv, pass the package indexes explicitly:
+
+```bash Command
+pip install -v ".[dev,diffusion]" \
+    --extra-index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://docs.sglang.io/whl/xpu/
+```
+
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.
