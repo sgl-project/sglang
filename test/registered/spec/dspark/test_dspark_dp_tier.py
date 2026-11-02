@@ -98,6 +98,11 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
         proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+        proposer._persistent_dp_meta = True
+        proposer._dp_meta_host = None
+        proposer._dp_meta_device = None
+        proposer._dp_meta_copied = []
+        proposer._dp_meta_slot = 0
 
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         batch = SimpleNamespace(
