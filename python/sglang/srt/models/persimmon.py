@@ -230,8 +230,8 @@ class PersimmonModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        forward_batch: ForwardBatch,
         positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.pp_group.is_first_rank:
