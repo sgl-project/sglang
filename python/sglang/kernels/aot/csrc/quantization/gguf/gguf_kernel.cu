@@ -5,6 +5,14 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
+#ifndef USE_MUSA
+#include <c10/cuda/CUDACachingAllocator.h>
+
+#include <mutex>
+
+#include "llama_mmq/sgl_llama_mmq.h"
+#endif
+
 // dont use clang-format here, it breaks the include order
 // clang-format off
 #include "utils.h"
@@ -137,11 +145,18 @@ torch::Tensor ggml_mul_mat_vec_a8(
   return Y;
 }
 
+#ifdef USE_MUSA
+// dp4a MMQ (mmq.cuh): standard and k-quant types only.
 torch::Tensor ggml_mul_mat_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input
     int64_t type,
     int64_t row) {
+  TORCH_CHECK(
+      type == 2 || type == 3 || type == 6 || type == 7 || type == 8 || (type >= 10 && type <= 14),
+      "ggml_mul_mat_a8: GGML type ",
+      type,
+      " is not supported by this MMQ kernel");
   int col = X.sizes()[1];
   int padded = (col + 512 - 1) / 512 * 512;
   int batch = X.sizes()[0];
@@ -279,6 +294,88 @@ torch::Tensor ggml_mul_mat_a8(
   });
   return Y;
 }
+#else
+// CUDA: llama.cpp's MMQ (int8 tensor cores on Turing and newer, llama_mmq/), for every GGML type it
+// supports (standard, k-quant and i-quant types; IQ1_M through patches/0002). The kernel reads up to
+// sgl_llama_mmq::weight_tail_bytes() past the end of the last weight row, as ggml pads its buffers: those
+// bytes must be readable and finite. GGUFLinearMethod pads the weights at load time; for weights without
+// the padding a zero-padded copy is made on every call.
+namespace {
+void* llama_mmq_alloc(size_t nbytes, cudaStream_t stream) {
+  return c10::cuda::CUDACachingAllocator::raw_alloc_with_stream(nbytes, stream);
+}
+void llama_mmq_free(void* ptr) {
+  c10::cuda::CUDACachingAllocator::raw_delete(ptr);
+}
+}  // namespace
+
+torch::Tensor ggml_mul_mat_a8(
+    torch::Tensor W,  // quant weight [>= row, row_bytes]
+    torch::Tensor X,  // input [M, K]
+    int64_t type,
+    int64_t row) {
+  static std::once_flag allocator_installed;
+  std::call_once(allocator_installed, [] { sgl_llama_mmq::set_allocator(llama_mmq_alloc, llama_mmq_free); });
+
+  int64_t qk = 0, block_bytes = 0;
+  TORCH_CHECK(
+      sgl_llama_mmq::type_supported(type) && sgl_llama_mmq::type_info(type, &qk, &block_bytes),
+      "ggml_mul_mat_a8: GGML type ",
+      type,
+      " is not supported by MMQ");
+  TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kUInt8 && W.dim() == 2, "ggml_mul_mat_a8: W must be 2D uint8");
+  TORCH_CHECK(X.is_cuda() && X.dim() == 2, "ggml_mul_mat_a8: X must be a 2D CUDA tensor");
+  TORCH_CHECK(
+      X.scalar_type() == torch::kFloat || X.scalar_type() == torch::kHalf || X.scalar_type() == torch::kBFloat16,
+      "ggml_mul_mat_a8: X must be float32, float16 or bfloat16");
+  TORCH_CHECK(W.device() == X.device(), "ggml_mul_mat_a8: W and X must be on the same device");
+  TORCH_CHECK(row >= 0 && row <= W.size(0), "ggml_mul_mat_a8: row ", row, " out of range for W rows ", W.size(0));
+  const int64_t row_bytes = W.size(1);
+  TORCH_CHECK(row_bytes % block_bytes == 0, "ggml_mul_mat_a8: W row bytes ", row_bytes, " not a multiple of ", block_bytes);
+  const int64_t K = row_bytes / block_bytes * qk;
+  TORCH_CHECK(X.size(1) == K, "ggml_mul_mat_a8: X has ", X.size(1), " columns, W rows hold ", K, " values");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  const int64_t M = X.size(0);
+  torch::Tensor Y = torch::empty({M, row}, X.options());
+  if (M == 0 || row == 0) {
+    return Y;
+  }
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  // Rows must be addressable with a block-multiple stride and the storage must extend over the tail padding.
+  const int64_t tail_bytes = sgl_llama_mmq::weight_tail_bytes(type, K);
+  bool weight_ok = W.stride(1) == 1 && W.stride(0) >= row_bytes && W.stride(0) % block_bytes == 0;
+  if (weight_ok) {
+    const int64_t needed = (row - 1) * W.stride(0) + row_bytes + tail_bytes;
+    const int64_t available = static_cast<int64_t>(W.storage().nbytes()) - W.storage_offset();
+    weight_ok = available >= needed;
+  }
+  torch::Tensor Wk = W;
+  if (!weight_ok) {
+    TORCH_WARN_ONCE(
+        "ggml_mul_mat_a8: the weight storage does not extend ",
+        tail_bytes,
+        " bytes past the last row (ggml's row padding); a zero-padded copy is made on every call. "
+        "Pad the weight storage once at load time.");
+    torch::Tensor buf = torch::zeros({row * row_bytes + tail_bytes}, W.options());
+    Wk = buf.narrow(0, 0, row * row_bytes).view({row, row_bytes});
+    Wk.copy_(W.narrow(0, 0, row));
+  }
+
+  const torch::Tensor Xk = X.stride(1) == 1 ? X : X.contiguous();
+  const sgl_llama_mmq::XType xtype = Xk.scalar_type() == torch::kFloat ? sgl_llama_mmq::XType::F32
+                                     : Xk.scalar_type() == torch::kHalf ? sgl_llama_mmq::XType::F16
+                                                                        : sgl_llama_mmq::XType::BF16;
+  torch::Tensor quant_X = torch::empty({sgl_llama_mmq::q8_buffer_bytes(M, K)}, X.options().dtype(torch::kUInt8));
+  sgl_llama_mmq::quantize_q8_1_mmq(Xk.data_ptr(), xtype, M, K, Xk.stride(0), type, quant_X.data_ptr(), stream);
+
+  // fp32 accumulation, rounded once to X's dtype when stored.
+  sgl_llama_mmq::mul_mat(
+      Wk.data_ptr(), row, K, Wk.stride(0), type, quant_X.data_ptr(), M, Y.data_ptr(), xtype, row, stream);
+  return Y;
+}
+#endif  // USE_MUSA
 
 torch::Tensor ggml_moe_a8(
     torch::Tensor X,  // input
