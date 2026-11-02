@@ -1,8 +1,11 @@
 """The ROCm mHC boundary, its gfx950 prefill regime and the norm hosting its sinkhorn match the unfused forms."""
 
+import math
 import unittest
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_sinkhorn, mhc_combine
 from sglang.srt.utils import is_hip
@@ -17,6 +20,8 @@ HC, H = 4, 5120
 MIX = (2 + HC) * HC
 ITERS, RMS_EPS, HC_EPS = 20, 1e-20, 1e-6
 _IS_HIP = is_hip()
+if _IS_HIP:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import _sinkhorn_div
 
 
 def _params(device):
@@ -218,6 +223,35 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
                 self.assertTrue(torch.equal(quant.scale, quant2.scale))
             else:
                 self.assertTrue(torch.equal(quant.x, quant2.x))
+
+
+@triton.jit
+def _sinkhorn_div_kernel(n_ptr, d_ptr, q_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(q_ptr + offs, _sinkhorn_div(tl.load(n_ptr + offs), tl.load(d_ptr + offs)))
+
+
+@unittest.skipUnless(_IS_HIP, "_sinkhorn_div is the ROCm sinkhorn's division")
+class TestSinkhornDivision(CustomTestCase):
+    def test_matches_division_on_sinkhorn_operands(self):
+        """`_sinkhorn_div` must round like '/': a reciprocal-multiply shortcut changes the bits."""
+        g = torch.Generator(device="cpu").manual_seed(0)
+        size = 1 << 20
+
+        def log_uniform(lo, hi):
+            u = torch.empty(size, dtype=torch.float64).uniform_(
+                math.log(lo), math.log(hi), generator=g
+            )
+            return u.exp().float()
+
+        # the operands the row divides after its first quotient
+        n, d = log_uniform(1e-12, 1.0), log_uniform(HC_EPS, HC + 1.0)
+        # fp64 division rounds correctly to fp32 (53 >= 2 * 24 + 2 bits)
+        want = (n.double() / d.double()).float()
+        got = torch.empty(size, dtype=torch.float32, device="cuda")
+        _sinkhorn_div_kernel[(size // 1024,)](n.cuda(), d.cuda(), got, BLOCK=1024)
+        mismatches = int((got.cpu() != want).sum())
+        self.assertEqual(mismatches, 0, f"{mismatches} of {size} quotients differ")
 
 
 def _prefill_available():
