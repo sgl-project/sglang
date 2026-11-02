@@ -239,10 +239,7 @@ class SGLDiffusionServerModel:
                         "default": 300,
                         "min": 1,
                         "max": 3600,
-                        "tooltip": "Seconds to wait for an image "
-                        "generate/edit request (e.g. a large job, or "
-                        "torch.compile warmup on the first request, can "
-                        "need more than 300s)",
+                        "tooltip": "Seconds to wait for an image request",
                     },
                 ),
             },
@@ -644,8 +641,7 @@ class SGLDiffusionGenerateVideo:
             video_path = resolve_video_path(
                 response.get("file_path"), response.get("url")
             )
-            # The server may have resolved a different size than requested
-            # (e.g. to match an image-to-video input's aspect ratio).
+            # the server may resolve a different size (e.g. I2V aspect ratio)
             resolved_size = response.get("size", "")
             if resolved_size:
                 width, height = (int(v) for v in resolved_size.split("x"))
@@ -744,13 +740,7 @@ class SGLDiffusionGenerateH3:
 
     @staticmethod
     def _image_material_uri(image: torch.Tensor) -> str:
-        """Embed the image inline as a base64 data URI.
-
-        A `file://` path only works when the SGLD server runs on this same
-        machine; the server's H3 material loader accepts `data:` URIs
-        directly (no upload endpoint needed), so this works locally and
-        remotely alike.
-        """
+        """Inline data: URI, so a remote server can read it (file:// cannot)."""
         path = get_image_path(image)
         try:
             with open(path, "rb") as fh:
@@ -780,14 +770,8 @@ class SGLDiffusionGenerateH3:
 
     @classmethod
     def _remote_material_uri(cls, value: str, kind: str, base_url: str) -> str:
-        """Remote URLs pass through. A local path only works when the SGLD
-        server is also on this machine: H3's server-side `/v1/videos`
-        endpoint has no multipart slot for the video/audio conditions this
-        node sends through `extra_fields.conditions`, unlike the image
-        conditions above (which sidestep that by embedding bytes inline).
-        Raise clearly instead of building a `file://` URI that will
-        silently fail against any server that isn't local.
-        """
+        """URLs pass through; a local path only works with a server on this machine,
+        since H3 conditions have no upload slot."""
         # file:// already names a server-side path
         if value.startswith(("http://", "https://", "file://")):
             return value
@@ -978,8 +962,7 @@ class SGLDiffusionServerSetLora:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.01,
-                        "tooltip": "LoRA merge strength; the server's own "
-                        "default is 1.0",
+                        "tooltip": "LoRA merge strength",
                     },
                 ),
             },
