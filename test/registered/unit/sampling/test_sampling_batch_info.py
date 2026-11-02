@@ -956,6 +956,49 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertFalse(info.is_all_spec_opt_out)
         self.assertEqual(info.spec_opt_out_mask.tolist(), [False, True])
 
+    def test_spec_opt_out_propagation_empty_reorder_and_merge(self):
+        def make(flags):
+            reqs = [self._make_req() for _ in flags]
+            for req, flag in zip(reqs, flags):
+                req.sampling_params.disable_speculative_decoding = flag
+            info = SamplingBatchInfo.from_schedule_batch(
+                MagicMock(reqs=reqs, device=DEVICE), VOCAB_SIZE
+            )
+            # Isolate mask bookkeeping from the scheduler-owned Req lifecycle.
+            info.penalizer_orchestrator = MagicMock(is_required=False)
+            return info
+
+        for left, right in (
+            ([False], [True]),
+            ([True], [False]),
+            ([True], [True]),
+            ([False], [False]),
+        ):
+            with self.subTest(left=left, right=right):
+                info, other = make(left), make(right)
+                # These bookkeeping operations must not read scalars from GPU.
+                with patch.object(
+                    torch.Tensor, "item", side_effect=AssertionError("device sync")
+                ):
+                    info.merge_batch(other)
+                    info.filter_batch([1, 0], torch.tensor([1, 0]))
+                expected = right + left
+                self.assertEqual(info.spec_opt_outs_host, expected)
+                self.assertEqual(info.has_spec_opt_out, any(expected))
+                self.assertEqual(info.is_all_spec_opt_out, all(expected))
+                if info.spec_opt_out_mask is not None:
+                    self.assertEqual(info.spec_opt_out_mask.tolist(), expected)
+                with patch.object(
+                    torch.Tensor, "item", side_effect=AssertionError("device sync")
+                ):
+                    info.filter_batch([], torch.tensor([], dtype=torch.long))
+                self.assertFalse(info.has_spec_opt_out)
+                self.assertFalse(info.is_all_spec_opt_out)
+                self.assertEqual(info.spec_opt_outs_host, [])
+                info.merge_batch(make([True]))
+                self.assertTrue(info.is_all_spec_opt_out)
+                self.assertEqual(info.spec_opt_out_mask.tolist(), [True])
+
 
 if __name__ == "__main__":
     unittest.main()

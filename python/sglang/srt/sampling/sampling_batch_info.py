@@ -113,6 +113,7 @@ class SamplingBatchInfo:
 
     # Per-request speculative decoding opt-out
     spec_opt_out_mask: Optional[torch.Tensor] = None
+    spec_opt_outs_host: Optional[List[bool]] = None
     has_spec_opt_out: bool = False
     is_all_spec_opt_out: bool = False
 
@@ -344,6 +345,7 @@ class SamplingBatchInfo:
             watermark_candidates_host=watermark_candidates_host,
             has_watermark_candidates=has_watermark_candidates,
             spec_opt_out_mask=spec_opt_out_mask,
+            spec_opt_outs_host=spec_opt_outs,
             has_spec_opt_out=has_spec_opt_out,
             is_all_spec_opt_out=is_all_spec_opt_out,
             sampling_support_logprobs_capture_indices=(
@@ -491,6 +493,13 @@ class SamplingBatchInfo:
 
         return observer_state
 
+    def _refresh_spec_opt_out_flags(self):
+        # Scheduler edits already have host row indices; never synchronize the
+        # device just to decide whether a batch contains opted-out requests.
+        flags = self.spec_opt_outs_host or []
+        self.has_spec_opt_out = any(flags)
+        self.is_all_spec_opt_out = bool(flags) and all(flags)
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
@@ -512,12 +521,9 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
-        if self.spec_opt_out_mask is not None:
-            self.has_spec_opt_out = bool(torch.any(self.spec_opt_out_mask).item())
-            self.is_all_spec_opt_out = bool(torch.all(self.spec_opt_out_mask).item())
-        else:
-            self.has_spec_opt_out = False
-            self.is_all_spec_opt_out = False
+        if self.spec_opt_outs_host is not None:
+            self.spec_opt_outs_host = [self.spec_opt_outs_host[i] for i in keep_indices]
+        self._refresh_spec_opt_out_flags()
 
         if self.watermark_candidates_host is not None:
             self.watermark_candidates_host = [
@@ -653,8 +659,10 @@ class SamplingBatchInfo:
                 else torch.zeros(other_len, dtype=torch.bool, device=self.device)
             )
             self.spec_opt_out_mask = torch.cat([self_mask, other_mask])
-            self.has_spec_opt_out = bool(torch.any(self.spec_opt_out_mask).item())
-            self.is_all_spec_opt_out = bool(torch.all(self.spec_opt_out_mask).item())
+        self.spec_opt_outs_host = (self.spec_opt_outs_host or [False] * self_len) + (
+            other.spec_opt_outs_host or [False] * other_len
+        )
+        self._refresh_spec_opt_out_flags()
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

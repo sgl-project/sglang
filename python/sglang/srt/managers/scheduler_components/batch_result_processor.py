@@ -896,9 +896,17 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
+        # Intentional one-token acceptance is not evidence of draft accuracy.
+        # Keep the total batch size for routing the controller's workload slot.
+        adaptive_acceptance = [
+            count
+            for req, count in zip(batch.reqs, result.num_correct_drafts_per_req_cpu)
+            if not req.sampling_params.disable_speculative_decoding
+        ]
+        if adaptive_acceptance:
+            self.model_worker.on_verify_complete_cpu(
+                adaptive_acceptance, batch_size=len(batch.reqs)
+            )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
         # the EAGLE overlap path already did this inside verify() via the grammar
