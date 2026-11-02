@@ -509,6 +509,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.config.client_server_address,
                 )
             else:
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    MooncakeTransferEngine,
+                )
+
                 try:
                     from sglang.srt.distributed.parallel_state import (
                         get_mooncake_transfer_engine,
@@ -523,8 +527,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
                 # Only reuse the shared MooncakeTransferEngine when its
                 # configuration matches the one used by MooncakeStore.
+                # A TENT engine has no classic engine object for the store to drive.
                 if (
-                    self._shared_mooncake_transfer_engine is not None
+                    isinstance(
+                        self._shared_mooncake_transfer_engine, MooncakeTransferEngine
+                    )
                     and device_name
                     == self._shared_mooncake_transfer_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
