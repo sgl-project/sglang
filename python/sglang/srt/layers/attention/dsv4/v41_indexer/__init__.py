@@ -108,7 +108,8 @@ def make_candidate_indexer(
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
         if get_device_sm() in (120, 121):
-            # SM12x has dense paged logits, but no sparse-table kernel.
+            # SM12x has the dense paged logits kernels; the pinned sgl-deep-gemm
+            # build carries no SM120 sparse-table kernel.
             return dense_blocks, dense_blocks
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
