@@ -302,12 +302,11 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        # Equal shards already have the collective shape. Avoid a zero fill
-        # and D2D staging copy before launching the attention KV collective.
-        if local_logical_len == physical_rank_len and x.is_contiguous():
+        # Rows past each rank's logical length are never selected below.
+        if x.shape[0] >= physical_rank_len and x.is_contiguous():
             padded_x = x[:physical_rank_len]
         else:
-            padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+            padded_x = x.new_empty((physical_rank_len, *x.shape[1:]))
             padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
@@ -332,10 +331,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             )
 
         flat_indices = torch.arange(total_tokens, device=x.device)
-        gather_indices = (
+        metadata.gather_index = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
-        return gathered.index_select(0, gather_indices)
+        return gathered.index_select(0, metadata.gather_index)
 
     def get_supported_attention_backend(self):
         return [CPAttentionBackendKind.DSA]

@@ -292,6 +292,12 @@ class UnifiedKvMetadata:
     pf_chunk_start: Optional[torch.Tensor] = None
     pf_cu_q: Optional[torch.Tensor] = None
     pf_final_pos: Optional[torch.Tensor] = None
+    # CP: this rank's query rows of pf_state_slot (pf_state_slot stays global).
+    pf_cp_state_slot: Optional[torch.Tensor] = None
+    # (compress_ratio, T) -> prefill index streams, built by the first layer
+    pf_indices: Dict[Tuple[int, int], Tuple[torch.Tensor, ...]] = field(
+        default_factory=dict
+    )
 
     # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
     # tokens); unused by plain decode, whose store reads req_pool_indices live.
@@ -301,6 +307,12 @@ class UnifiedKvMetadata:
     # precomputed once per step to drop the per-layer int add in the store path.
     c4_out_loc: Optional[torch.Tensor] = None
     c128_out_loc: Optional[torch.Tensor] = None
+
+    def apply_cp_reindex(self) -> None:
+        sl = slice(get_parallel().attn_cp_rank, None, get_parallel().attn_cp_size)
+        self.pf_chunk_start = self.pf_chunk_start[sl].contiguous()
+        self.pf_cu_q = self.pf_cu_q[sl].contiguous()
+        self.pf_cp_state_slot = self.pf_state_slot[sl].contiguous()
 
     def copy_(self, other: UnifiedKvMetadata) -> None:
         copy_metadata(
@@ -328,6 +340,7 @@ class UnifiedKvMetadata:
                 "pf_chunk_start",
                 "pf_cu_q",
                 "pf_final_pos",
+                "pf_cp_state_slot",
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
@@ -335,7 +348,8 @@ class UnifiedKvMetadata:
                 # target-verify path builds it outside the graph.
                 "swa_loc",
             ],
-            assign_fields=[],
+            # streams cached for other's forward, never the stale captured ones
+            assign_fields=["pf_indices"],
         )
 
     def refresh_for_breakable_cuda_graph_replay_(
@@ -367,10 +381,12 @@ class UnifiedKvMetadata:
                 "pf_chunk_start",
                 "pf_cu_q",
                 "pf_final_pos",
+                "pf_cp_state_slot",
                 "verify_store_state_slot",
                 "c4_out_loc",
                 "c128_out_loc",
             ],
+            assign_fields=["pf_indices"],
         )
 
 
@@ -1241,6 +1257,8 @@ class DeepseekV4HipRadixBackend(
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+            if core_attn_metadata.unified is not None:
+                core_attn_metadata.unified.apply_cp_reindex()
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
@@ -2942,46 +2960,51 @@ class DeepseekV4HipRadixBackend(
             )
 
         # prefill / extend
-        state_slot = core_attn_metadata.unified.pf_state_slot
-        chunk_start = core_attn_metadata.unified.pf_chunk_start
-        cu_q = core_attn_metadata.unified.pf_cu_q
-        final_pos = core_attn_metadata.unified.pf_final_pos
+        meta = core_attn_metadata.unified
+        state_slot = state_slot_full = meta.pf_state_slot
+        cu_q = meta.pf_cu_q
 
-        # Slice CP query metadata while keeping cache-write metadata global.
+        # CP: query metadata is this rank's rows; cache-write metadata stays global.
         _cp_active = is_cp_active(forward_batch)
-        state_slot_full = state_slot
-        final_pos_full = final_pos
         positions_full = positions
         if _cp_active:
-            _cp_size = get_parallel().attn_cp_size
-            # pf_* were built on the padded global layout before the reindex.
-            assert state_slot.shape[0] == _cp_size * T, (state_slot.shape, T)
-            _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
-            state_slot, chunk_start, cu_q, final_pos = (
-                v[_sl].contiguous() for v in (state_slot, chunk_start, cu_q, final_pos)
-            )
+            state_slot = meta.pf_cp_state_slot
+            assert state_slot.shape[0] == cu_q.shape[0] == T, (state_slot.shape, T)
             # Already CP-reindexed; padding rows carry the inert expansion position.
-            positions = core_attn_metadata.positions_casual.to(torch.int64)
+            positions = core_attn_metadata.positions_casual
             assert positions.shape[0] == T
             positions_full = forward_batch.positions.to(torch.int64)
 
-        kpre_i, kpre_p, kext_i, kext_p = runtime.build_prefill_indices(
-            compress_ratio=compress_ratio,
-            state_slot=state_slot,
-            positions=positions,
-            chunk_start=chunk_start,
-            cu_q=cu_q,
-            win=win,
-            ring_stride=ring_stride,
-            swa_pages=swa_pages,
-            c128_page_indices=c128_pi,
-            c4_sparse_page_indices=c4_pi,
-        )
-
-        if kpre_p.shape[0] < T + 1:
-            pad = T + 1 - kpre_p.shape[0]
-            kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
-            kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
+        # Layer-invariant except the C4 top-k tail, filled per layer below.
+        c4_len = None
+        if compress_ratio == 4:
+            c4_len = core_attn_metadata.c4_sparse_topk_lengths_raw[:T]
+        streams = meta.pf_indices.get((compress_ratio, T))
+        if streams is None:
+            streams = runtime.build_prefill_indices(
+                compress_ratio=compress_ratio,
+                state_slot=state_slot,
+                positions=positions,
+                chunk_start=meta.pf_chunk_start,
+                cu_q=cu_q,
+                win=win,
+                ring_stride=ring_stride,
+                swa_pages=swa_pages,
+                c128_page_indices=c128_pi,
+                c4_topk_lengths=c4_len,
+                c4_topk_width=0 if c4_len is None else c4_pi.shape[1],
+            )
+            meta.pf_indices[(compress_ratio, T)] = streams
+        kpre_i, kpre_p, kext_i, kext_p, kpre_swa_len = streams
+        if c4_len is not None:
+            runtime.fill_compress_tail(
+                indices=kpre_i,
+                indptr=kpre_p,
+                prefix_len=kpre_swa_len,
+                page_indices=c4_pi[:T],
+                valid_len=c4_len,
+                swa_pages=swa_pages,
+            )
         if q_rope is not None:
             assert k_rope is not None, (
                 "fp8 prefill needs the extend rope half beside the packed nope; "
@@ -3031,7 +3054,7 @@ class DeepseekV4HipRadixBackend(
                 unified_kv=unified,
                 win=win,
                 ring_stride=ring_stride,
-                final_pos=final_pos_full[:n_real],
+                final_pos=meta.pf_final_pos[:n_real],
                 kv_rope=None if k_rope is None else k_rope[:n_real],
                 unified_kv_rope=(
                     None if k_rope is None else pool.get_unified_kv_rope(layer_id)
