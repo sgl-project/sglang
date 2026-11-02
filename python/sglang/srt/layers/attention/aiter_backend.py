@@ -4226,6 +4226,14 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
+                    # aiter's gfx950 Gluon kernel needs Q and KV in one dtype; with
+                    # a bf16 Q and an FP8 cache this falls back to the Triton kernel,
+                    # which at page size 1 walks the KV one token per tile. Quantize
+                    # Q as forward_decode does.
+                    q_descale = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        q_unified, q_descale = self._quantize_q_fp8(q_unified)
+
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
@@ -4243,7 +4251,7 @@ class AiterAttnBackend(AttentionBackend):
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
-                        q_descale=None,
+                        q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
@@ -4345,6 +4353,11 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                # The asm kernel above takes bf16 Q; unified_attention wants Q in
+                # the KV dtype, as in target_verify.
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q, q_descale = self._quantize_q_fp8(q)
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -4363,7 +4376,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=de_window,
                     block_table=pt,
                     softcap=layer.logit_cap,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
