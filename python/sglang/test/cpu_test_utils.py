@@ -670,3 +670,23 @@ def unpack_and_dequant_gptq(qweight, qzeros, scales):
     unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
 
     return unpacked_qweight.T
+
+
+# Common server args shared by CPU nightly model tests.
+CPU_BASE_ARGS = [
+    "--device",
+    "cpu",
+    "--trust-remote-code",
+    "--disable-radix-cache",
+    "--disable-overlap-schedule",
+    "--mem-fraction-static",
+    "0.8",
+    "--enable-torch-compile",
+    "--torch-compile-max-bs",
+    "1",
+]
+
+# Server launch timeout for CPU nightly tests.
+# --enable-torch-compile triggers batch-capture on startup (~38s/batch × 24 batches).
+# Allow 40 minutes to cover compile + model load for the largest models.
+CPU_LAUNCH_TIMEOUT = 2400
