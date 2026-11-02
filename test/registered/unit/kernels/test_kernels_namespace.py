@@ -576,6 +576,11 @@ def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
         ("gemm.convrot_int8_fused_linear", (12, 0), True),
         ("gemm.convrot_int8_fused_linear", (12, 1), True),
         ("gemm.convrot_int8_fused_linear", (12, 2), False),
+        ("gemm.dsv3_fused_a_gemm_fp8", (9, 0), False),
+        ("gemm.dsv3_fused_a_gemm_fp8", (10, 0), True),
+        ("gemm.dsv3_fused_a_gemm_fp8", (10, 3), True),
+        ("gemm.dsv3_fused_a_gemm_fp8", (10, 7), True),
+        ("gemm.dsv3_fused_a_gemm_fp8", (12, 0), False),
     ],
 )
 def test_registered_architecture_boundaries(op, sm, expected):

@@ -238,6 +238,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.dsv3_fused_a_gemm_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm_fp8",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
