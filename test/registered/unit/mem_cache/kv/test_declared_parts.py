@@ -2488,7 +2488,6 @@ class TestDeclaredParts(CustomTestCase):
                 ),
                 fits,
             )
-        self.assertTrue(a.prealloc_fits_assumes_reclaim())
         self.assertIsNone(
             queue._reclaim_prealloc_capacity(token_demand(a, need, need), "resume")
         )

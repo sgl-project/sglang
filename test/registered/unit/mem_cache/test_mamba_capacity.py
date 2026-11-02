@@ -278,10 +278,8 @@ class TestMambaCapacity(unittest.TestCase):
         self.assertIsNone(req.kv.req_pool_idx)
 
         queue._prealloc_required_tokens = MagicMock(return_value=(1, 0))
-        queue._prealloc_reservation_fits = MagicMock(return_value=True)
-        queue.token_to_kv_pool_allocator = SimpleNamespace(
-            state=pool.state, prealloc_fits_assumes_reclaim=lambda: False
-        )
+        queue._admit_preallocation = MagicMock(return_value=True)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         with patch(
             "sglang.srt.disaggregation.decode.get_disagg",
             return_value=SimpleNamespace(

@@ -703,11 +703,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
 
-    def prealloc_fits_assumes_reclaim(self) -> bool:
-        """Whether decode-node preallocation reclaims the evictable entries its
-        admission credits before it takes: chains with a window do."""
-        return bool(self._windows)
-
     def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
         demand = demand.checked(self.window_pool_names())
         return self.admits(demand, empty_pool=True)
@@ -742,9 +737,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             return False
         evictable = dict(evictable)
-        if not self.prealloc_fits_assumes_reclaim():
-            # Nothing is reclaimed before the take: credit no eviction.
-            evictable = dict.fromkeys(evictable, 0)
         owner = self.full_attn_allocator.sub_pool_name
         full_tokens += max(
             0,
@@ -760,6 +752,29 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self.admits(
             KVDemand(full_tokens, windows, demand.state_slots), evictable=evictable
         )
+
+    def admit_preallocation(
+        self,
+        tree_cache,
+        admission: KVDemand,
+        take: KVDemand,
+        *,
+        evictable: Dict[str, int],
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Admit a decode-node preallocation on the admission rule, crediting
+        the entries the prefix cache could evict, then reclaim what that
+        credit counted on so ``take`` fits now: every admission that credits
+        eviction reclaims before the take."""
+        if not self.prealloc_fits(
+            admission,
+            evictable=evictable,
+            full_budget_tokens=full_budget_tokens,
+            swa_budget_tokens=swa_budget_tokens,
+        ):
+            return False
+        return self.reclaim_for_prealloc(tree_cache, take) is None
 
     def reclaim_for_load_back(self, tree_cache, demand: KVDemand) -> str | None:
         """Reclaim before a host load takes its rows; None means ready."""

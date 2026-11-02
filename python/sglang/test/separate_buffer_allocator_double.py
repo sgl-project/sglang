@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 # Bound on the double, so each reads the stubs the caller set on it.
 _SEPARATE_BUFFER_METHODS = {
     "window_pool_names": SWATokenToKVPoolAllocator.window_pool_names,
-    "prealloc_fits_assumes_reclaim": BaseTokenToKVPoolAllocator.prealloc_fits_assumes_reclaim,
+    "admit_preallocation": BaseTokenToKVPoolAllocator.admit_preallocation,
     "prealloc_ceiling_fits": BaseTokenToKVPoolAllocator.prealloc_ceiling_fits,
     "prealloc_fits": BaseTokenToKVPoolAllocator.prealloc_fits,
     "reclaim_for_prealloc": SWATokenToKVPoolAllocator.reclaim_for_prealloc,
