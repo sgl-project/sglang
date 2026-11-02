@@ -43,7 +43,7 @@ Invariants (mirroring the reference ``tree/`` package):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -89,6 +89,9 @@ class NodePlan:
     query_cu: torch.Tensor  # [n + 1] int32
     hidden_ids: torch.Tensor  # [n] int64
     token_index: torch.Tensor  # [n] int64
+    window_pages_cache: dict[tuple[int, int, int, int], tuple[int, ...]] = field(
+        default_factory=dict
+    )
 
 
 def build_node_plan(pre) -> NodePlan:
@@ -541,13 +544,28 @@ class NodeRecord:
 
 
 def _window_pages(plan: NodePlan, table: torch.Tensor, ratio: int, rows: int):
+    cache = getattr(plan, "window_pages_cache", None)
+    if cache is None:
+        cache = {}
+        plan.window_pages_cache = cache
+    cache_key = (
+        int(table.data_ptr()),
+        int(table.shape[1]),
+        int(ratio),
+        int(rows),
+    )
+    if cache_key in cache:
+        return cache[cache_key]
+
     if plan.req_ids.numel() == 0:
+        cache[cache_key] = ()
         return ()
     # NodePlan.req_ids is built as request-major contiguous rows, so the first
     # row of request r is r * max_q.  Keep the table on-device and only move
     # the (small) unique page set back to the host.
     depth_limit = int(plan.max_q)
     if depth_limit <= 0:
+        cache[cache_key] = ()
         return ()
     n_req = plan.req_ids.numel() // depth_limit
     device = plan.start.device
@@ -561,12 +579,16 @@ def _window_pages(plan: NodePlan, table: torch.Tensor, ratio: int, rows: int):
     valid = cols < table_width
     rows_idx = torch.arange(n_req, dtype=torch.long, device=device).unsqueeze(1)
     if table_width == 0:
+        cache[cache_key] = ()
         return ()
     page = table.long()[rows_idx, cols.clamp(max=table_width - 1)]
     pages = page[valid & (page > 0)]
     if pages.numel() == 0:
+        cache[cache_key] = ()
         return ()
-    return tuple(int(x) for x in torch.unique(pages).tolist())
+    result = tuple(int(x) for x in torch.unique(pages).tolist())
+    cache[cache_key] = result
+    return result
 
 
 def record_compressed_nodes(

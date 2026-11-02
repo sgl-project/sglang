@@ -683,6 +683,99 @@ class TestCompressorStateTableABI(unittest.TestCase):
         )
 
 
+class TestTreeCompressorStateCache(unittest.TestCase):
+    def _backend_and_inputs(self):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.forward_metadata = SimpleNamespace(
+            dsv4_explicit_state_block_tables={},
+            dsv4_full_state_page_tables={},
+            start_pos=torch.tensor([5, 9], dtype=torch.int32),
+            dsv4_max_input_capacity=4,
+            dsv4_live_prefix_max=9,
+            c4_page_table=torch.ones(2, 2, dtype=torch.int32),
+        )
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool._get_state_pool.return_value = SimpleNamespace(
+            state_cache_3d=torch.zeros(2, 2, 4),
+        )
+        backend.token_to_kv_pool.get_compress_buffer.return_value = torch.zeros(
+            4, 2, 2
+        )
+        backend.req_to_token = torch.zeros(2, 16, dtype=torch.int32)
+        backend._ensure_compressor_hadamard = MagicMock()
+        backend._ensure_fused_caches = MagicMock()
+
+        tree_plan = SimpleNamespace(
+            node_records=[],
+            tree_node_kv={},
+        )
+        forward_batch = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                tree_plan=tree_plan,
+                live_seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
+            ),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        compressor = SimpleNamespace(
+            ratio=4,
+            overlap=False,
+            layer_id=0,
+            is_in_indexer=False,
+            freqs_cis=None,
+            rotary_emb=None,
+        )
+        return backend, compressor, forward_batch
+
+    def test_tree_compress_reuses_full_table_and_cpu_max(self):
+        backend, compressor, forward_batch = self._backend_and_inputs()
+        sentinel = torch.zeros(2, 2, dtype=torch.int32)
+        rope = MagicMock()
+        rope.ensure_tables.return_value = (torch.zeros(1), torch.zeros(1))
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "is_npu_arch35",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "Dsv4NpuRoPE.for_freqs",
+                return_value=rope,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "_build_full_state_page_table",
+                return_value=sentinel,
+            ) as full_table,
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "_build_explicit_state_block_table"
+            ) as explicit_table,
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_tree_ops."
+                "get_node_plan",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_tree_ops."
+                "compress_nodes",
+                return_value=(torch.zeros(2, 2), None),
+            ),
+        ):
+            backend.forward_compress(
+                compressor, torch.zeros(2, 1), forward_batch
+            )
+            backend.forward_compress(
+                compressor, torch.zeros(2, 1), forward_batch
+            )
+
+        self.assertEqual(full_table.call_count, 1)
+        self.assertEqual(full_table.call_args.kwargs["max_prefix"], 9)
+        self.assertIs(full_table.return_value, sentinel)
+        explicit_table.assert_not_called()
+
+
 class TestArch35SparseAttentionDispatch(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"

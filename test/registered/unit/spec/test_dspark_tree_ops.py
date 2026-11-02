@@ -292,6 +292,40 @@ class RecordCompressedNodesTest(CustomTestCase):
         self.assertIs(record.original.shape[1], 4)
 
 
+class WindowPagesCacheTest(CustomTestCase):
+    def test_repeated_window_pages_reuses_cache(self):
+        plan = _make_plan()
+        table = torch.ones(2, 2, dtype=torch.int32)
+        with mock.patch.object(
+            tree_ops.torch, "unique", wraps=torch.unique
+        ) as unique:
+            first = tree_ops._window_pages(plan, table, ratio=4, rows=4)
+            second = tree_ops._window_pages(plan, table, ratio=4, rows=4)
+        self.assertEqual(first, second)
+        self.assertEqual(unique.call_count, 1)
+
+    def test_window_pages_cache_key_separates_table_and_ratio(self):
+        plan = _make_plan()
+        table_a = torch.ones(2, 2, dtype=torch.int32)
+        table_b = torch.full((2, 2), 2, dtype=torch.int32)
+        with mock.patch.object(
+            tree_ops.torch, "unique", wraps=torch.unique
+        ) as unique:
+            tree_ops._window_pages(plan, table_a, ratio=4, rows=4)
+            tree_ops._window_pages(plan, table_b, ratio=4, rows=4)
+            tree_ops._window_pages(plan, table_a, ratio=1, rows=4)
+        self.assertEqual(unique.call_count, 3)
+
+    def test_window_pages_cache_is_per_plan(self):
+        table = torch.ones(2, 2, dtype=torch.int32)
+        with mock.patch.object(
+            tree_ops.torch, "unique", wraps=torch.unique
+        ) as unique:
+            tree_ops._window_pages(_make_plan(), table, ratio=4, rows=4)
+            tree_ops._window_pages(_make_plan(), table, ratio=4, rows=4)
+        self.assertEqual(unique.call_count, 2)
+
+
 class CommitTest(CustomTestCase):
 
     def test_move_swa_kv_copies_rows(self):

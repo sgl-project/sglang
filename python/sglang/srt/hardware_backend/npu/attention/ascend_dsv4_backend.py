@@ -164,6 +164,7 @@ def _build_full_state_page_table(
     req_pool_indices: torch.Tensor,
     start_pos: torch.Tensor,
     max_input_capacity: int,
+    max_prefix: int | None = None,
 ) -> torch.Tensor:
     """Absolute state page table for the tree compressor/commit kernels.
 
@@ -176,8 +177,9 @@ def _build_full_state_page_table(
     rows = int(state_cache.shape[1])
     if rows <= 1:
         raise RuntimeError("tree state page table requires page_size > 1")
-    max_prefix = int(start_pos.max().item())
-    width = max(1, (max_prefix + int(max_input_capacity) + rows - 1) // rows)
+    if max_prefix is None:
+        max_prefix = int(start_pos.max().item())
+    width = max(1, (int(max_prefix) + int(max_input_capacity) + rows - 1) // rows)
     columns = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
     positions = columns.unsqueeze(0) * rows
     positions = positions.expand(req_pool_indices.numel(), -1)
@@ -295,6 +297,8 @@ class CompressorAscendBackendMixin:
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
+        fm.dsv4_full_state_page_tables = {}
+        fm.dsv4_live_prefix_max = None
         fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -545,12 +549,15 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
+        tree_plan = getattr(
+            getattr(forward_batch, "spec_info", None), "tree_plan", None
+        )
         if is_npu_arch35():
             # A5 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
             state_block_table = fm.dsv4_cycle_state_block_table
-        else:
+        elif tree_plan is None:
             table_cache = fm.dsv4_explicit_state_block_tables
             if ratio not in table_cache:
                 table_cache[ratio] = _build_explicit_state_block_table(
@@ -566,10 +573,11 @@ class CompressorAscendBackendMixin:
                     max_input_capacity=fm.dsv4_max_input_capacity,
                 )
             state_block_table = table_cache[ratio]
+        else:
+            # The tree path replaces the window table with an absolute state
+            # page table below.  Building the explicit table here is pure waste.
+            state_block_table = None
 
-        tree_plan = getattr(
-            getattr(forward_batch, "spec_info", None), "tree_plan", None
-        )
         rope = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
         )
@@ -588,15 +596,31 @@ class CompressorAscendBackendMixin:
         if tree_plan is not None and not is_npu_arch35():
             # compressor_tree and the ratio=1 node commit index the state
             # table by absolute position; replace the non-tree window table.
-            state_block_table = _build_full_state_page_table(
-                compress_ratio=ratio,
-                state_pool=state_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                start_pos=fm.start_pos,
-                max_input_capacity=fm.dsv4_max_input_capacity,
+            # Cache it per step: every layer with the same ratio and state-pool
+            # kind builds the identical table.  Keep the CPU-derived max prefix
+            # to avoid the per-layer device .item() sync.
+            full_tables = getattr(fm, "dsv4_full_state_page_tables", None)
+            if full_tables is None:
+                full_tables = {}
+                fm.dsv4_full_state_page_tables = full_tables
+            cache_key = (
+                int(ratio),
+                bool(getattr(compressor, "is_in_indexer", False)),
+                int(state_cache.shape[1]),
             )
+            state_block_table = full_tables.get(cache_key)
+            if state_block_table is None:
+                state_block_table = _build_full_state_page_table(
+                    compress_ratio=ratio,
+                    state_pool=state_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                    max_prefix=getattr(fm, "dsv4_live_prefix_max", None),
+                )
+                full_tables[cache_key] = state_block_table
 
         if tree_plan is not None and not bool(
             getattr(compressor, "is_in_indexer", False)
@@ -1639,6 +1663,8 @@ class DeepseekV4AscendAttnBackend(
             )
             for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
         }
+        metadata.dsv4_full_state_page_tables = {}
+        metadata.dsv4_live_prefix_max = None
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1941,6 +1967,14 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
+        live_cpu = getattr(ctx, "live_seq_lens_cpu", None)
+        fm.dsv4_live_prefix_max = (
+            int(live_cpu.max())
+            if isinstance(live_cpu, torch.Tensor)
+            and live_cpu.device.type == "cpu"
+            and live_cpu.numel() > 0
+            else None
+        )
         if self._is_eagle_algorithm:
             self._fill_verify_positions_cmp_padding_one_device(
                 ctx.forward_batch.positions,
@@ -2723,6 +2757,21 @@ class DeepseekV4AscendAttnBackend(
         valid = forward_batch.seq_lens[:bs] > 0
         fm.seqused = valid.to(torch.int32) * int(n_draft)
         fm.dsv4_max_input_capacity = max(1, n_draft)
+
+        live_cpu = getattr(
+            getattr(forward_batch, "spec_info", None),
+            "live_seq_lens_cpu",
+            None,
+        )
+        fm.dsv4_live_prefix_max = None
+        try:
+            if isinstance(live_cpu, torch.Tensor):
+                if live_cpu.device.type == "cpu" and live_cpu.numel() > 0:
+                    fm.dsv4_live_prefix_max = int(live_cpu.max())
+            elif live_cpu:
+                fm.dsv4_live_prefix_max = int(max(live_cpu))
+        except (TypeError, ValueError):
+            fm.dsv4_live_prefix_max = None
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:
