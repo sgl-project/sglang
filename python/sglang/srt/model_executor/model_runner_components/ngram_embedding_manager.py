@@ -7,12 +7,16 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, is_npu
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.ngram_embedding import update_token_table
+else:
+    from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher

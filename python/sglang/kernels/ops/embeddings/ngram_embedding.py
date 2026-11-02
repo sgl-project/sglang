@@ -30,14 +30,6 @@ def _jit_ngram_embedding_module() -> Module:
     )
 
 
-def _ngram_embedding_module(device_type: str):
-    if device_type == "npu":
-        from sglang.kernels.ops.embeddings import ngram_embedding_npu
-
-        return ngram_embedding_npu
-    return _jit_ngram_embedding_module()
-
-
 @debug_kernel_api
 def compute_n_gram_ids(
     ne_n: int,
@@ -70,7 +62,7 @@ def compute_n_gram_ids(
         n_gram_ids: output tensor for n-gram ids
         eos_token_id: tokens before an eos are excluded from the n-gram context
     """
-    module = _ngram_embedding_module(tokens.device.type)
+    module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids(
         ne_n,
         ne_k,
@@ -103,7 +95,7 @@ def compute_n_gram_ids_decode(
     """
     Compute n-gram IDs for decode, where each request contributes one token.
     """
-    module = _ngram_embedding_module(ne_token_table.device.type)
+    module = _jit_ngram_embedding_module()
     module.compute_n_gram_ids_decode(
         ne_n,
         ne_k,
@@ -138,7 +130,7 @@ def update_token_table(
         req_lens: request lengths
         ignore_tokens: tokens to be ignored (marked as negative in table)
     """
-    module = _ngram_embedding_module(tokens.device.type)
+    module = _jit_ngram_embedding_module()
     if ignore_tokens is None:
         # Create an empty tensor for ignore_tokens
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
@@ -164,7 +156,7 @@ def update_token_table_decode(
 
     This is the decode-only fast path for req_lens == 1 and no ignored tokens.
     """
-    module = _ngram_embedding_module(tokens.device.type)
+    module = _jit_ngram_embedding_module()
     module.update_token_table_decode(
         tokens,
         ne_token_table,
