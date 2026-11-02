@@ -513,10 +513,10 @@ class BeamAttention(nn.Module):
         self.apply_rope = config.layer_types[layer_id] == "sliding_attention"
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         # MergedColumnParallelLinear shards each projection independently, but
-        # does not replicate KV heads. Keep the existing quantized/replicated
-        # paths until their loading and backend contracts are validated.
+        # does not replicate KV heads.
         self.use_packed_projection = (
-            quant_config is None and config.num_key_value_heads >= self.tp_size
+            config.num_key_value_heads >= self.tp_size
+            and _packs_attention_projection(quant_config, prefix)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -528,6 +528,7 @@ class BeamAttention(nn.Module):
                     config.num_attention_heads * self.head_dim,
                 ],
                 bias=False,
+                quant_config=quant_config,
                 parallel_group="attn_tp",
                 prefix=add_prefix("qkv_gate_proj", prefix),
             )
@@ -1272,6 +1273,31 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
     return None
 
 
+def _packs_attention_projection(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    quant_scheme = get_beam_quantization(quant_config)
+    if quant_scheme == "bf16":
+        return True
+    # Unquantized shards of a quantized checkpoint (NVFP4 attention, FP8 ignores)
+    # stay split; packing changes their BF16 GEMM rounding at small M.
+    # TODO(ischencheng): pack them too after a B300 accuracy run.
+    # The packed name resolves through the Linear class target, which Beam's FP8
+    # checkpoint uses; configs that only name layers keep the split projections.
+    return (
+        quant_scheme == "fp8"
+        and "Linear" in quant_config.target_scheme_map
+        and not any(
+            should_ignore_layer(
+                add_prefix(proj, prefix),
+                ignore=quant_config.ignore,
+                fused_mapping=quant_config.packed_modules_mapping,
+            )
+            for proj in ("qkv_proj", "gate_proj")
+        )
+    )
+
+
 def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
     return {
         "bf16": ("auto", "triton"),
@@ -1283,6 +1309,7 @@ def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ..
 class BeamForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_gate_proj": ["q_proj", "k_proj", "v_proj", "gate_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
@@ -1397,7 +1424,7 @@ class BeamForCausalLM(nn.Module):
         )
         params = dict(self.named_parameters())
         # Select by the actual destination parameter so PP shards and the
-        # replicated-KV/quantized fallback retain their existing loaders.
+        # split-projection fallback retain their existing loaders.
         attention_shards = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 3}
         loaded = set()
         for name, weight in weights:
