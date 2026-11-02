@@ -15,7 +15,9 @@ use dynamo_renderer::{RenderedPrompt, RenderedSegment};
 use serde_json::{Map, Value, json};
 use tokenizers::{AddedVocabulary, Tokenizer};
 
-use super::pydantic_dump::{continues_final_message, function_dump, pydantic_bool};
+use super::pydantic_dump::{
+    accept_reasoning_alias, continues_final_message, function_dump, pydantic_bool,
+};
 use crate::py::python_json_compact;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -237,6 +239,9 @@ pub(crate) fn continued_message(request: &Value) -> Result<Option<Value>, String
 /// A message as `_process_messages` renders it: Pydantic lowercases the role,
 /// and a null content is "".
 fn normalize_message(message: &mut Value) {
+    if let Some(fields) = message.as_object_mut() {
+        accept_reasoning_alias(fields);
+    }
     if let Some(role) = message["role"].as_str() {
         message["role"] = role.to_lowercase().into();
     }
