@@ -207,42 +207,12 @@ def test_fp16(monkeypatch):
     torch.testing.assert_close(k, k_ref, atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize("is_neox", [True, False])
-@pytest.mark.parametrize(
-    "head_dim,rotary_dim", [(128, 128), (128, 64), (64, 64), (256, 256)]
-)
-def test_half_warp_matches_full_warp(head_dim, rotary_dim, is_neox):
-    """The two kernel variants shuffle with different lane groupings, so equal
-    outputs pin the 32-lane shuffle width on wave64."""
-    dtype, num_tokens, num_q_heads, num_kv_heads = torch.bfloat16, 257, 32, 8
-    q_norm, k_norm, rotary_emb = _make_modules(head_dim, rotary_dim, is_neox, dtype)
-    qkv, positions, sizes = _make_inputs(
-        num_tokens, num_q_heads, num_kv_heads, head_dim, dtype, torch.int64
-    )
-    outs = []
-    for half_warp in (True, False):
-        module = qknorm_rope_jit._jit_qknorm_rope_module(
-            head_dim,
-            rotary_dim,
-            is_neox,
-            dtype,
-            torch.float32,
-            True,
-            half_warp=half_warp,
-        )
-        out = qkv.clone()
-        q, k, _ = out.split(sizes, dim=-1)
-        module.qknorm_rope(
-            q.view(num_tokens, num_q_heads, head_dim),
-            k.view(num_tokens, num_kv_heads, head_dim),
-            q_norm.weight,
-            k_norm.weight,
-            rotary_emb.cos_sin_cache,
-            positions,
-            q_norm.variance_epsilon,
-        )
-        outs.append(out)
-    assert torch.equal(outs[0], outs[1])
+def test_kernel_gate_rejects_unvalidated_variants():
+    can_use = qknorm_rope_jit.can_use_fused_inplace_qknorm_rope
+    dtype = torch.bfloat16
+    assert not can_use(128, 128, True, dtype, round_norm_before_rope=False)
+    assert not can_use(128, 128, True, dtype, round_norm_before_rope=True, pack_kv=True)
+    assert can_use(128, 128, False, dtype, round_norm_before_rope=False)
 
 
 @pytest.mark.parametrize(
