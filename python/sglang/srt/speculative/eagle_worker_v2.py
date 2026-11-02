@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
@@ -1480,6 +1481,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                 )
 
+    @dumper.grouped_step
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

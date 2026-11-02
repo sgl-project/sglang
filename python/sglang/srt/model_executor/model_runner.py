@@ -197,6 +197,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
+    get_is_capture_mode,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 from sglang.srt.platforms import current_platform
@@ -1897,6 +1898,14 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            (
+                dumper.speculative_forward(
+                    is_draft=self.is_draft_worker,
+                    phase=forward_batch.forward_mode.name,
+                )
+                if dumper.in_grouped_step
+                else contextlib.nullcontext()
+            ),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
@@ -1939,7 +1948,7 @@ class ModelRunner:
         if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
 
-        if dumper.may_enable:
+        if dumper.may_enable and not get_is_capture_mode():
             dumper.step()
 
         if self.msprobe_debugger is not None:

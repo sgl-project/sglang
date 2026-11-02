@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
@@ -1132,6 +1133,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return 0
         return max(windows) + draft.draft_extend_num_front_tokens
 
+    @dumper.grouped_step
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
