@@ -21,6 +21,7 @@ import sys
 import unittest
 import unittest.mock
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import pytest
@@ -39,6 +40,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
 from sglang.srt.environ import envs
+from sglang.srt.utils.hf_transformers.tokenizer import _shim_fastokens_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -746,6 +748,53 @@ class TestPromptSegments(_EncodeCase):
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
         self.assertNotIn("hello world " * 30, encoder.cache)
+
+    def test_a_rendered_prompt_has_the_ids_of_a_full_encode(self):
+        for segments in _fuzz_segments():
+            text = "".join(segments)
+            # The second call reads the ids the first one cached.
+            for _ in range(2):
+                self.assertEqual(
+                    ppe.encode_rendered_prompt(self.tokenizer, text, {}),
+                    self.tokenizer.encode(text),
+                    repr(text[:200]),
+                )
+        no_plan = _tokenizer(_metaspace)
+        text = "<|user|>hello world<|assistant|>"
+        self.assertEqual(
+            ppe.encode_rendered_prompt(no_plan, text, {}), no_plan.encode(text)
+        )
+
+    def test_a_fastokens_backend_keeps_the_original_encode(self):
+        pytest.importorskip("fastokens")
+        tokenizer = _shim_fastokens_backend(_tokenizer())
+        text = "<|user|>hello world<|assistant|>"
+        self.assertEqual(
+            ppe.encode_rendered_prompt(tokenizer, text, {}), tokenizer.encode(text)
+        )
+
+    def test_concurrent_prompts_keep_their_ids_while_the_cache_evicts(self):
+        """Chat requests convert on executor threads and share this cache."""
+
+        def prompt(i):
+            turns = (f"<|user|>session {i % 8} turn {t} hello world " for t in range(6))
+            return "".join(turns) + f"<|assistant|>new text {i} the lazy dog"
+
+        prompts = [prompt(i) for i in range(1600)]
+        # Switch threads often, so that one thread can reach what another evicts.
+        self.addCleanup(sys.setswitchinterval, sys.getswitchinterval())
+        sys.setswitchinterval(1e-6)
+        with (
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 100),
+            ThreadPoolExecutor(16) as pool,
+        ):
+            ids = list(
+                pool.map(
+                    lambda text: ppe.encode_rendered_prompt(self.tokenizer, text, {}),
+                    prompts,
+                )
+            )
+        self.assertEqual(ids, [self.tokenizer.encode(text) for text in prompts])
 
 
 if __name__ == "__main__":

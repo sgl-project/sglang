@@ -160,13 +160,12 @@ def _build_plan(tokenizer):
     """Return (backend, specials_added, pattern, normalized_pattern, intra)
     or None."""
     try:
+        from tokenizers import Tokenizer
         from transformers import PreTrainedTokenizerBase
     except ImportError:
         return None
     backend = getattr(tokenizer, "_tokenizer", None)
-    if not getattr(tokenizer, "is_fast", False) or backend is None:
-        return None
-    if not hasattr(backend, "encode_batch") or not hasattr(backend, "to_str"):
+    if not getattr(tokenizer, "is_fast", False) or not isinstance(backend, Tokenizer):
         return None
     # Only the stock HF fast path: encode -> _encode_plus -> backend.encode_batch.
     if type(tokenizer).encode is not PreTrainedTokenizerBase.encode:
@@ -332,6 +331,10 @@ class _SegmentEncoder:
             t.content: i for i, t in added.items() if t.content and not t.normalized
         }
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
+        # A capturing group keeps the added tokens in the output of split().
+        self.split_added = (
+            re.compile(f"({self.pattern.pattern})").split if self.pattern else None
+        )
         self.cuts = {}
         self.lock = threading.Lock()
         self.cache = OrderedDict()
@@ -445,3 +448,18 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
     ):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments)
+
+
+def encode_rendered_prompt(tokenizer, text, encode_kwargs=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, text, encode_kwargs)`` for a
+    prompt that a chat template rendered to text. It cuts the prompt at its added
+    tokens, so the text between them comes from the ``encode_prompt_segments`` cache.
+    An added token that ``_cuts_at`` rejects rejoins the text around it."""
+    encoder = (
+        _segment_encoder_for(tokenizer)
+        if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
+        else None
+    )
+    if encoder is None or encoder.split_added is None:
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    return encode_prompt_segments(tokenizer, encoder.split_added(text), encode_kwargs)

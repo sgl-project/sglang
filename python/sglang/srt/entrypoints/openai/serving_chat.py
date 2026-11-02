@@ -53,8 +53,9 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    _segment_encoder_for,
     encode_prompt_segments,
-    parallel_prompt_encode,
+    encode_rendered_prompt,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -478,6 +479,8 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        # Concurrent first requests would each build the encoder.
+        _segment_encoder_for(self.tokenizer_manager.tokenizer)
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
@@ -2351,7 +2354,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
+                prompt_ids = encode_rendered_prompt(
                     self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
                 )
         decoded_prompt = (
