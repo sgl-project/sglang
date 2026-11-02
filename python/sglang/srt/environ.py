@@ -2047,6 +2047,35 @@ class Envs:
     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
     # _apply_wo_a_bf16_matmul.
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+    # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
+    # cco. Off by default: it reserves a symmetric window outside torch's
+    # allocator, so a run that enables it wants a lower --mem-fraction-static.
+    # It also substitutes the GEMM, so the output moves. Only where wo_a hands
+    # over an Fp8GridActivation -- the gfx950 native mxfp8 route -- do the two
+    # quantise identically and agree bit for bit. On --fp8-gemm-backend aiter,
+    # which the MI355X recipes pin, wo_b gets a plain bf16 tensor and each path
+    # rounds it itself: relative L2 7.5e-3 to 8.2e-3, measured at M=16384 TP4.
+    SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
+    # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
+    # mantissa width rather than a granularity that can be tuned away.
+    SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
+    # Which transport carries the fused wo_b's all-gather leg, "lsa" or "sdma".
+    # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
+    # second kernel. Only read when the fused path is on.
+    SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
+    # Seconds the fused wo_b's self-test may spend in its device phases. They end
+    # in cross-rank barriers with no timeout of their own, so a stack whose SDMA
+    # queues exist but never complete wedges every rank there; past this the path
+    # is turned off instead. A healthy self-test is well under a second -- the
+    # compile already happened in warmup -- so this is a loose upper bound.
+    SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S = EnvFloat(60.0)
+    # Debug: log the distribution of M the fused wo_b is offered. M is the token
+    # count of one forward, not of one request, so this is the only way to see
+    # what the scheduler actually batches.
+    SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
+    # Debug: run both the fused and the unfused wo_b and log their relative L2.
+    SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one

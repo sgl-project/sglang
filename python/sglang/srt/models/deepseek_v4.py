@@ -100,6 +100,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.mori_gemm_ar import fused_wo_b, prepare_fused_wo_b
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -3072,10 +3073,19 @@ class MQALayer(MqaAttentionBase):
             )
             and not should_skip_mlp_all_reduce()
         )
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=defer_all_reduce,
-        )
+        # the gfx950 wo_a fork already returned [T, G * R], so only the plain
+        # tensor needs flattening
+        o_in = o.flatten(1) if isinstance(o, torch.Tensor) else o
+        # Fusing *performs* the all-reduce, where a deferred one is skipped so
+        # the mHC post can fold it in -- a correctness constraint, not a gap.
+        # `defer_all_reduce` being false is not on its own a licence to fuse:
+        # it is also false when the layer reduces over another group or not at
+        # all. `fused_wo_b` checks that for itself against the layer.
+        fused_o = None if defer_all_reduce else fused_wo_b(self.wo_b, o_in)
+        if fused_o is not None:
+            o = fused_o
+        else:
+            o, _ = self.wo_b(o_in, skip_all_reduce=defer_all_reduce)
         if defer_all_reduce:
             return mhc.AttnOutput(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -5104,6 +5114,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        # The fused wo_b's weight copies and symmetric window are sized from
+        # configuration alone, so they are built here rather than on the first
+        # fused call, which allocated them after the memory profiler had sized
+        # the KV cache around their absence. Here rather than in
+        # `post_load_weights`, which runs *before* `process_weights_after_loading`
+        # and so before the mxfp8 layout this reads even exists.
+        #
+        # Only MQALayer routes wo_b through `fused_wo_b`. DSPARK's attention
+        # also has a `wo_b` and calls it directly, and the draft wrapper borrows
+        # this method, so a walk over every module with the attribute would
+        # prepare copies nothing reads.
+        prepare_fused_wo_b([m.wo_b for m in self.modules() if isinstance(m, MQALayer)])
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
