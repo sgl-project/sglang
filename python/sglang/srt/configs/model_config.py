@@ -38,14 +38,14 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 

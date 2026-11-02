@@ -1284,7 +1284,7 @@ def run_score_benchmark_multi(
 
     async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 

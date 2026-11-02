@@ -60,7 +60,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
