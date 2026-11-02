@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
@@ -35,6 +36,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.mem_cache_utils import finish_req
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 
 def session_radix_cache_test_values() -> tuple[bool, ...]:
@@ -86,9 +88,7 @@ class FakeFullComponent(TreeComponent):
 
 
 class PagedFullComponent(FullComponent):
-    """FULL component whose device values are not backed one-to-one by pool
-    rows: a value lists two entries per row, and the component can hand rows
-    of a node back to the allocator while the value stays on device."""
+    """FULL component whose device values are not backed one-to-one by pool rows."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -99,8 +99,7 @@ class PagedFullComponent(FullComponent):
 
 
 def component_with_cache(component_type, cache):
-    """A registry component instance bound to a (mock) cache and its tree_core."""
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
@@ -118,8 +117,10 @@ class DisabledUnifiedRadixCacheFixtures:
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=disable,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
             enable_kv_cache_events=True,
             eviction_policy="lru",
             eviction_policy_config={"not_an_lru_option": 1},
@@ -141,7 +142,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         cache.insert(params)
 
@@ -269,7 +270,7 @@ class UnifiedMambaLRUMatchRefreshFixtures:
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
 
@@ -291,7 +292,7 @@ class MambaCheckpointGridFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
             cache.insert(
                 InsertParams(
                     key=RadixKey(array("q", sequence)),
@@ -337,7 +338,7 @@ class UnifiedRadixCacheInt8MambaCheckpointFixtures:
             origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = array("q")
         req.kv.kv_committed_len = len(tokens)
         req.kv.kv_allocated_len = len(tokens)
@@ -368,7 +369,7 @@ class SWADraftHistoryFixtures:
             origin_input_ids=tokens,
             sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = tokens
         req.extend_end = len(tokens)
