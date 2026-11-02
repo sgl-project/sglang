@@ -213,6 +213,7 @@ def lower(case, settings, model):
     tokenizer_manager = SimpleNamespace(
         tokenizer=model.tokenizer,
         server_args=server_args,
+        served_model_name=server_args.served_model_name,
         model_path=model.path,
         model_config=SimpleNamespace(
             hf_config=model.hf_config,
@@ -266,12 +267,39 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
-def load_template_manager(path, tokenizer):
+def keep_volatile(new, old):
+    """`new`, with the `created` times and `call_` ids of `old`, its previous
+    recording, where they line up, so a rerun changes only what Python changed.
+    """
+    if isinstance(new, dict) and isinstance(old, dict):
+        kept = {}
+        for key, value in new.items():
+            previous = old.get(key)
+            volatile = key == "created" or (
+                key == "id"
+                and str(value).startswith("call_")
+                and str(previous).startswith("call_")
+            )
+            kept[key] = (
+                previous if volatile and key in old else keep_volatile(value, previous)
+            )
+        return kept
+    if isinstance(new, list) and isinstance(old, list):
+        return [keep_volatile(n, o) for n, o in zip(new, old)] + new[len(old) :]
+    return new
+
+
+def load_template_manager(path, tokenizer, hf_config):
     """The server's `TemplateManager` for a checkpoint with a Jinja template."""
     if not tokenizer.chat_template:
         return None
     manager = TemplateManager()
-    owner = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    # `load_chat_template` reads the config to pick a Python chat template.
+    owner = SimpleNamespace(
+        tokenizer=tokenizer,
+        processor=None,
+        model_config=SimpleNamespace(hf_config=hf_config),
+    )
     manager.load_chat_template(owner, None, path)
     return manager
 
@@ -284,11 +312,12 @@ def load_model(path):
     )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
     tokenizer = get_tokenizer(path, trust_remote_code=True)
+    hf_config = SimpleNamespace(**config, to_dict=lambda: config)
     return SimpleNamespace(
         path=path,
         tokenizer=tokenizer,
-        template_manager=load_template_manager(path, tokenizer),
-        hf_config=SimpleNamespace(**config, to_dict=lambda: config),
+        template_manager=load_template_manager(path, tokenizer, hf_config),
+        hf_config=hf_config,
         text_config=SimpleNamespace(**config.get("text_config", config)),
         sampling_defaults={
             k: generation[k] for k in keys if generation.get(k) is not None
@@ -336,9 +365,12 @@ def generate(path, model, engine_url):
         if case.get("unsupported"):
             continue
         sampling_defaults = fixture["sampling_defaults"][case["endpoint"]]
-        case.update(
-            run_case(case, settings, model, engine_url, defaults, sampling_defaults)
+        recorded = run_case(
+            case, settings, model, engine_url, defaults, sampling_defaults
         )
+        if "openai" in recorded:
+            recorded["openai"] = keep_volatile(recorded["openai"], case.get("openai"))
+        case.update(recorded)
         print(f"{path.name}: {case['name']}", file=sys.stderr)
     path.write_text(dump(fixture))
 

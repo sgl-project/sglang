@@ -22,9 +22,21 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_sail_runtime
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+_SAIL_GPU_ARCHS = (
+    "native",
+    "all",
+    "all-ppu",
+    "all-vm",
+    "ppu_10",
+    "ppu_15",
+    "vm_10",
+    "vm_15",
+)
 
 
 @cache_once
@@ -64,14 +76,57 @@ def rocm_home() -> str:
 
 @cache_once
 def device_compiler_path() -> str:
-    """The nvcc/hipcc that JIT builds actually invoke.
+    """The nvcc/hipcc/hgcc that JIT builds actually invoke.
 
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
     """
+    if is_sail_runtime():
+        return hgcc_path()
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
     return os.path.join(cuda_home(), "bin", "nvcc")
+
+
+@cache_once
+def hgcc_path() -> str:
+    """The hgcc compiler, from PATH or the PPU SDK install."""
+    searched = ["hgcc on PATH"]
+    on_path = shutil.which("hgcc")
+    if on_path is not None:
+        return on_path
+    for root in (
+        os.environ.get("PPU_SDK"),
+        os.environ.get("PPU_HOME"),
+        "/usr/local/PPU_SDK",
+    ):
+        if root is None:
+            continue
+        candidate = os.path.join(root, "bin", "hgcc")
+        searched.append(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError(
+        "JIT builds on SAIL require the hgcc compiler, which was not found. Searched: "
+        + ", ".join(searched)
+    )
+
+
+@cache_once
+def ppu_sdk_home() -> str:
+    """The PPU SDK root providing the hggc libraries to link against.
+
+    Two layers live in ``lib/`` and they are not interchangeable:
+    * ``libhggcrt1`` (SONAME ``libhggcrt.13.0.so``) is the *runtime*, the
+      counterpart of cudart.  It alone exports the ``hggc*`` Runtime-API
+      symbols and the ``__hggcRegister*`` entry points that hgcc's generated
+      fat-binary registration code calls from every translation unit with
+      device code.
+    * ``libhggc`` is the *driver*, the counterpart of libcuda.  It exports the
+      ``hg*`` Driver-API symbols (e.g. ``hgPointerGetAttribute``) and none of
+      the ``hggc*`` ones.
+    """
+    return os.environ.get("PPU_SDK") or "/usr/local/PPU_SDK"
 
 
 @cache_once
@@ -129,6 +184,14 @@ def target_flags() -> List[str]:
     the compiler driver to probe: the value is part of the cache key, so it has
     to be decided here and not rediscovered at build time.
     """
+    if is_sail_runtime():
+        arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+        if arch not in _SAIL_GPU_ARCHS:
+            raise ValueError(
+                f"Invalid SGLANG_SAIL_GPU_ARCH={arch!r}; expected one of "
+                f"{', '.join(_SAIL_GPU_ARCHS)}"
+            )
+        return [f"--gpu-architecture={arch}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
     arch = get_jit_cuda_arch()
@@ -170,6 +233,12 @@ def base_link_flags(*, with_device: bool) -> List[str]:
     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
     if not with_device:
         return flags
+    if is_sail_runtime():
+        return flags + [
+            f"-L{ppu_sdk_home()}/lib",
+            "-lhggcrt1",
+            "-lhggc",
+        ]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]

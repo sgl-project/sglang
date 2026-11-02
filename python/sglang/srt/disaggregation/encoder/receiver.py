@@ -787,9 +787,12 @@ class WaitingMMRequestStatus(IntEnum):
 
 def _select_mm_processor_prompt(recv_req, mm_processor):
     """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
-    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
-        return list(recv_req.input_ids)
-    return recv_req.input_text or recv_req.input_ids
+    # The scheduler holds input_ids as array("q"); processors accept str or
+    # list[int], not array.
+    input_ids = None if recv_req.input_ids is None else list(recv_req.input_ids)
+    if mm_processor.prefer_tokenized_input and input_ids is not None:
+        return input_ids
+    return recv_req.input_text or input_ids
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:

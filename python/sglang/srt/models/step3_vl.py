@@ -145,6 +145,7 @@ class Step3TextMoEMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
