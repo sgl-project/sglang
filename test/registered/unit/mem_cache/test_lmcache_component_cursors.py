@@ -12,14 +12,25 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchResult,
 )
+from sglang.srt.mem_cache.kv.plan import (
+    TREE_TOKEN,
+    TREE_WINDOW,
+    TreeSlot,
+    tree_slot_ids,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# The window LMCache keeps (the tree's one native window slot) and a further
-# window, each by its sub-pool name and its tree slot.
+# The window LMCache keeps (the tree's one window slot, as a one-window plan
+# numbers it) and a further window, each by its sub-pool name and tree slot.
 FIRST, SECOND = "window_4", "window_64"
+SLOTS = (
+    TreeSlot(component="FULL", family=TREE_TOKEN),
+    TreeSlot(component="WINDOW_4", family=TREE_WINDOW, window=4),
+)
+FIRST_WINDOW = tree_slot_ids(SLOTS)["WINDOW_4"]
 SECOND_WINDOW = ComponentType.of("WINDOW_64")
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -47,9 +58,10 @@ def cache_class():
 def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache = cache_class.__new__(cache_class)
     cache.is_swa_enabled = swa_enabled
-    cache.components = {ComponentType.SWA: SimpleNamespace(window_sub_pool=FIRST)}
+    cache._index_slots(SLOTS)
+    cache.components = {FIRST_WINDOW: SimpleNamespace(window_sub_pool=FIRST)}
     cache.__dict__["_window_slot_sub_pools"] = {
-        ComponentType.SWA: FIRST,
+        FIRST_WINDOW: FIRST,
         SECOND_WINDOW: SECOND,
     }
     cache.lmcache_connector = SimpleNamespace(aligned_swa_window_size=lambda: 4)
@@ -120,7 +132,7 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     insert_params = cache.insert.call_args.args[0]
     expected = {SECOND_WINDOW: 6}
     if swa_enabled:
-        expected[ComponentType.SWA] = 4
+        expected[FIRST_WINDOW] = 4
     assert insert_params.component_evicted_seqlens == expected
     req.kv.set_evicted_seqlen(SECOND, 99)
     assert insert_params.get_evicted_seqlen(SECOND_WINDOW) == 6
