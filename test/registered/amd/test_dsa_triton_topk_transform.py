@@ -1,7 +1,7 @@
 """The ROCm single-pass DSA top-k selector (triton_topk_transform.py) against a
 torch reference: an exact top-k (ties at the boundary may be broken either way),
 mapped through the page table, -1 padded; including rows whose candidate buffer
-overflows and must take the exact whole-row path."""
+underflows or overflows and must take the exact whole-row path."""
 
 import unittest
 
@@ -102,6 +102,18 @@ class TestTritonTopkTransform(unittest.TestCase):
         logits[0, free[torch.randperm(free.numel())[:5000]]] = 1.0
         logits[1] = torch.randn(width, device=self.dev)
         self._check(logits, torch.tensor([width, width]))
+
+    def test_candidate_underflow_takes_exact_path(self):
+        """A biased sample admits only 256 candidates for top-2048. The remaining
+        valid selections must come from the exact whole-row path, not padding."""
+        from sglang.kernels.ops.attention.dsa import triton_topk_transform as m
+
+        width = 1 << 17
+        probes = torch.arange(m._SMP_CH * m._SMP_NCH, device=self.dev)
+        positions = (probes // m._SMP_CH) * (width // m._SMP_NCH) + (probes % m._SMP_CH)
+        logits = torch.zeros(1, width, device=self.dev)
+        logits[0, positions[:256]] = 100.0
+        self._check(logits, torch.tensor([width]))
 
     def test_all_equal_row(self):
         logits = torch.full((3, 100_000), 0.5, device=self.dev)

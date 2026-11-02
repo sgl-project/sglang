@@ -323,12 +323,13 @@ def _topk_unfused(
 def _use_triton_topk(logits: torch.Tensor, topk: int) -> bool:
     """SGLANG_DSA_TOPK_TRITON (ROCm): the single-pass selector for decode-shaped
     PAGED rows; see kernels/ops/attention/dsa/triton_topk_transform.py."""
+    if not _is_hip or not envs.SGLANG_DSA_TOPK_TRITON.get():
+        return False
+
     from sglang.kernels.ops.attention.dsa.triton_topk_transform import MAX_ROWS
 
     return (
-        _is_hip
-        and envs.SGLANG_DSA_TOPK_TRITON.get()
-        and 0 < logits.shape[0] <= MAX_ROWS
+        0 < logits.shape[0] <= MAX_ROWS
         and logits.dtype == torch.float32
         and logits.stride(1) == 1
         and logits.shape[0] * logits.stride(0) * 4 < 2**31
