@@ -68,11 +68,12 @@ class BaseConv3d(nn.Conv3d):
         x = self._apply_temporal_padding(x)
         return x
 
-    def forward(self, x):
+    def forward(self, x, *, pre_padded=False):
         if sum(self.padding) == 0:
             return super().forward(x)
 
-        x = self._apply_padding(x)
+        if not pre_padded:
+            x = self._apply_padding(x)
         return F.conv3d(
             x,
             self.weight,
