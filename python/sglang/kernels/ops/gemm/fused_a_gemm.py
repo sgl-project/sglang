@@ -31,7 +31,7 @@ _AUTO_BACKEND = (
 # Mirrors the K asserts in each backend's _dsv3_fused_a_gemm_run.
 _K_ALIGNMENT = {
     FusedAGemmBackend.JIT: 256,
-    FusedAGemmBackend.CUTEDSL: 1024,
+    FusedAGemmBackend.CUTEDSL: 256,
 }
 
 _IS_CUDA = is_cuda()

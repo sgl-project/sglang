@@ -27,11 +27,11 @@ class _Linear(torch.nn.Linear):
 @pytest.mark.skipif(
     not is_sm120_supported(), reason="auto backend is CuTe DSL only on SM120"
 )
-@pytest.mark.parametrize("hd_in, expect_fused", [(3584, False), (7168, True)])
+@pytest.mark.parametrize("hd_in, expect_fused", [(3200, False), (3584, True)])
 @pytest.mark.parametrize("num_tokens", [1, 16])
 def test_eligibility_follows_cutedsl_k_alignment(num_tokens, hd_in, expect_fused):
-    """A K that is 256- but not 1024-aligned must take the unfused path on SM120
-    instead of asserting in the CuTe DSL kernel; 1024-aligned K stays fused."""
+    """On SM120 a 256-aligned K runs the fused CuTe DSL kernel and matches F.linear;
+    a K that is not 256-aligned takes the unfused path instead of asserting."""
     torch.manual_seed(num_tokens)
     layer = _Linear(hd_in, HD_OUT, bias=False, device="cuda", dtype=torch.bfloat16)
     x = torch.randn(num_tokens, hd_in, dtype=torch.bfloat16, device="cuda")
