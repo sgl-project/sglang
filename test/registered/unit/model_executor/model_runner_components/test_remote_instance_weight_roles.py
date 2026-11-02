@@ -43,7 +43,7 @@ def _start_bootstrap_server():
     raise TimeoutError(f"the bootstrap server on {url} did not start")
 
 
-def _publish(role, session_id, port, nixl_agent=None):
+def _publish(role, session_id, port, nixl_agent=None, mori_engine=None):
     model_config = SimpleNamespace(
         remote_instance_weight_loader_backend=None, engine_info_bootstrap_port=port
     )
@@ -68,11 +68,13 @@ def _publish(role, session_id, port, nixl_agent=None):
             get_model=lambda: torch.nn.Module(),
             gpu_id=3,
         )
-        if nixl_agent is None:
+        if mori_engine is not None:
+            transporter.mori_engine = mori_engine
+        elif nixl_agent is not None:
+            transporter.nixl_agent = nixl_agent
+        else:
             transporter.engine = object()
             transporter.session_id = session_id
-        else:
-            transporter.nixl_agent = nixl_agent
         transporter.parallelism_config = SimpleNamespace(
             to_dict=lambda: {"published_by": role}
         )
@@ -80,7 +82,9 @@ def _publish(role, session_id, port, nixl_agent=None):
 
 
 class TestTransports(CustomTestCase):
-    def _init_transports(self, *, loads_over_mooncake, seeds_via_nixl):
+    def _init_transports(
+        self, *, loads_over_mooncake, seeds_via_nixl, seeds_via_mori=False
+    ):
         built = []
         with (
             patch.object(
@@ -92,7 +96,8 @@ class TestTransports(CustomTestCase):
                 transporter_mod,
                 "get_model",
                 lambda: SimpleNamespace(
-                    remote_instance_weight_loader_start_seed_via_nixl=seeds_via_nixl
+                    remote_instance_weight_loader_start_seed_via_nixl=seeds_via_nixl,
+                    remote_instance_weight_loader_start_seed_via_mori=seeds_via_mori,
                 ),
             ),
             patch.object(
@@ -109,6 +114,11 @@ class TestTransports(CustomTestCase):
                 RemoteInstanceWeightTransporter,
                 "_init_nixl_agent",
                 lambda self: built.append("nixl"),
+            ),
+            patch.object(
+                RemoteInstanceWeightTransporter,
+                "_init_mori_engine",
+                lambda self: built.append("mori"),
             ),
         ):
             RemoteInstanceWeightTransporter(
@@ -127,6 +137,14 @@ class TestTransports(CustomTestCase):
         self.assertEqual(
             self._init_transports(loads_over_mooncake=False, seeds_via_nixl=True),
             ["nixl"],
+        )
+
+    def test_a_mori_seed_alone_starts_no_mooncake_engine(self):
+        self.assertEqual(
+            self._init_transports(
+                loads_over_mooncake=False, seeds_via_nixl=False, seeds_via_mori=True
+            ),
+            ["mori"],
         )
 
 
@@ -194,6 +212,52 @@ class TestPublicationRoles(CustomTestCase):
                 "transport": "nixl",
                 "agent_metadata": "a2V5cw==",
                 "gpu_id": 3,
+                "weights_info_dict": {"target.weight": [1, 4, 2]},
+            },
+        )
+
+    def test_a_mori_runner_publishes_its_engine_and_every_registered_weight_block(
+        self,
+    ):
+        """A MoRI write names the remote memory by the MemoryDesc of the block holding it, so each block's goes out."""
+        server, url = _start_bootstrap_server()
+        self.addCleanup(server.close)
+
+        class _Desc:
+            def __init__(self, blob):
+                self.blob = blob
+
+            def pack(self):
+                return self.blob
+
+        class _FakeMoriEngine:
+            def get_engine_desc(self):
+                return _Desc(b"engine")
+
+        def register_memory_region_mori(model, mori_engine, gpu_id):
+            self.assertEqual(gpu_id, 3)
+            return {"target.weight": (1, 4, 2)}, [
+                (1, 4096, _Desc(b"block-a")),
+                (8192, 4096, _Desc(b"block-b")),
+            ]
+
+        with patch.object(
+            transporter_mod, "register_memory_region_mori", register_memory_region_mori
+        ):
+            _publish("target", None, server.port, mori_engine=_FakeMoriEngine())
+
+        info = requests.get(
+            f"{url}/get_transfer_engine_info", params={"rank": 0}
+        ).json()["remote_instance_transfer_engine_info"]
+        self.assertEqual(
+            info,
+            {
+                "transport": "mori",
+                "engine_desc": "ZW5naW5l",
+                "memory_blocks": [
+                    [1, 4096, "YmxvY2stYQ=="],
+                    [8192, 4096, "YmxvY2stYg=="],
+                ],
                 "weights_info_dict": {"target.weight": [1, 4, 2]},
             },
         )
