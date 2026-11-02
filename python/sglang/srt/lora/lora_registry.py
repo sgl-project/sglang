@@ -79,9 +79,8 @@ class LoRARegistry:
             "Please file an issue if you see this error."
         )
 
-        # A read-write lock to ensure adapters loading / unloading operations are exclusive.
-        # Please note that the counter increment/decrement operations are not synchronized through this
-        # lock, as they are designed to be non-blocking and can be performed concurrently.
+        # Keep adapter registration, removal, and request acquisition exclusive.
+        # Releases hold a reader lock and can proceed concurrently.
         self._registry_lock = RWLock()
         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
@@ -124,10 +123,7 @@ class LoRARegistry:
         return lora_ref.lora_id
 
     async def acquire(self, lora_name: Union[str, List[str]]) -> Union[str, List[str]]:
-        """
-        Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters
-        by incrementing its counter.
-        """
+        """Resolve adapter names and acquire all request references atomically."""
 
         def _lookup(name: str) -> str:
             if name is None:
@@ -143,26 +139,40 @@ class LoRARegistry:
             return lora_ref.lora_id
 
         if isinstance(lora_name, str):
-            async with self._registry_lock.writer_lock:
-                lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
-            return lora_id
+            names = [lora_name]
         elif isinstance(lora_name, list):
-            async with self._registry_lock.writer_lock:
-                lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
-            return lora_ids
+            names = lora_name
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
+
+        acquired_counters = []
+        try:
+            # Unregister must not remove an adapter between lookup and increment.
+            async with self._registry_lock.writer_lock:
+                lora_ids = [_lookup(name) for name in names]
+                for lora_id in lora_ids:
+                    if lora_id is not None:
+                        counter = self._counters[lora_id]
+                        await counter.increment(notify_all=False)
+                        acquired_counters.append(counter)
+
+            return lora_ids[0] if isinstance(lora_name, str) else lora_ids
+        except BaseException:
+            if acquired_counters:
+
+                async def rollback():
+                    for counter in acquired_counters:
+                        await counter.decrement()
+
+                # A second cancellation must not interrupt reference cleanup.
+                cleanup = asyncio.create_task(rollback())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
+            raise
 
     async def release(self, lora_id: Union[str, List[str]]):
         """
