@@ -1,6 +1,6 @@
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0.
-"""Aiter MegaMoEV2 adapter for the SGLang MegaMoE hooks."""
+"""Aiter MegaMoEV2 (gfx95) and MegaMoEGfx1250 adapters for the SGLang MegaMoE hooks."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
+_is_gfx1250 = is_gfx1250_supported()
 
 
 def _import_aiter_megamoe():
@@ -145,6 +147,15 @@ def _ensure_mori_shmem() -> None:
 def build_mega_moe_experts_weights(layer) -> None:
     if getattr(layer, "_mega_moe_weights_built", False):
         return
+    if _is_gfx1250:
+        # MegaMoEGfx1250 fixes gate_mode=INTERLEAVE; other layouts run silently wrong.
+        if not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+            raise ValueError(
+                "gfx1250 aiter MegaMoE needs interleaved gate/up experts; "
+                "unset SGLANG_USE_AITER_MOE_GU_ITLV=0."
+            )
+        layer._mega_moe_weights_built = True
+        return
 
     backend = _import_aiter_megamoe()
 
@@ -226,6 +237,85 @@ def _get_or_build_mega_moe(
         )
         logger.info("Aiter MegaMoE: built capacity max_tok_per_rank=%d", capacity)
     return _MEGA_MOE_INSTANCE[(*shape_key, mtpr)]
+
+
+def _get_or_build_mega_moe_gfx1250(
+    layer, *, model_dim: int, experts: int, topk: int, swiglu_limit: float, mtpr: int
+):
+    from aiter import QuantType
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    from sglang.srt.layers.moe.moe_runner.aiter import _aiter_activation
+    from sglang.srt.layers.moe.token_dispatcher.moriep import _init_cco_communicator
+
+    rank, world = _ep_rank_world()
+    # Padded intermediate size of the stored [E, 2 * inter, model_dim // 2] w13.
+    inter_dim = layer.w13_weight.shape[1] // 2
+    activation = _aiter_activation(layer.moe_runner_config)
+    key = (
+        rank,
+        world,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        activation,
+        swiglu_limit,
+        layer.hidden_pad,
+        layer.intermediate_pad,
+        mtpr,
+    )
+    mega = _MEGA_MOE_INSTANCE.get(key)
+    if mega is None:
+        # Dispatch window plus fused-combine staging, doubled for headroom;
+        # this aiter has no required_vmm_bytes().
+        arena_bytes = 2 * (world + topk) * mtpr * model_dim * 2 + (1 << 28)
+        comm = _init_cco_communicator(
+            group=get_parallel().moe_ep_group,
+            instance_id=0,
+            per_rank_vmm_gb=-(-arena_bytes // (1 << 30)),
+        )
+        mega = MegaMoEGfx1250(
+            communicator=comm,
+            rank=rank,
+            world_size=world,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            max_tokens_per_rank=mtpr,
+            activation=activation,
+            gate_mode=GateMode.INTERLEAVE.value,
+            quant_type=QuantType.per_1x32,
+            hidden_pad=layer.hidden_pad,
+            intermediate_pad=layer.intermediate_pad,
+            swiglu_limit=swiglu_limit,
+            # The flydsl dispatch does not pack received rows from slot 0, so the
+            # receive bound below would cut live rows; mori packs them.
+            dispatch_backend="mori",
+            dispatch_wire="bf16",
+        )
+        comm.barrier()
+        _MEGA_MOE_INSTANCE[key] = mega
+    return mega
+
+
+def _recv_token_bound(num_tokens: int, ep_world: int, max_recv: int) -> int | None:
+    # Dispatch de-duplicates per destination rank, so a rank receives at most
+    # the group's token total; a python int keeps the GEMM grid graph-static.
+    # An idle rank still dispatches one dummy row with real expert ids.
+    # Without an MLP all-gather the list holds only the local count.
+    global_num_tokens = get_dp_global_num_tokens()
+    if (
+        not isinstance(global_num_tokens, (list, tuple))
+        or len(global_num_tokens) != ep_world
+        or not all(isinstance(n, int) for n in global_num_tokens)
+        or is_dsa_enable_prefill_cp()
+    ):
+        return None
+    bound = max(sum(max(n, 1) for n in global_num_tokens), num_tokens)
+    return bound if bound < max_recv else None
 
 
 def _swap_layer_weights(mega, layer) -> None:
@@ -312,7 +402,8 @@ def _run_mega_routed(
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
         num_token_non_padded, _ = moe.topk.routing_inputs()
-        if num_token_non_padded is not None:
+        # gfx1250 dispatch sends each id to its owner rank and has no sentinel.
+        if not _is_gfx1250 and num_token_non_padded is not None:
             _fill_padded_rows(
                 topk_ids,
                 num_token_non_padded,
@@ -325,15 +416,17 @@ def _run_mega_routed(
             if rank_sync
             else hidden_states.new_zeros((1, hidden_size))
         )
-        if rank_sync:
+        if rank_sync or _is_gfx1250:
             ep_rank, ep_world = _ep_rank_world()
             expert_base = ep_rank * (experts // ep_world)
             topk_ids = (
                 expert_base
                 + torch.arange(topk, device=hidden_states.device, dtype=torch.int32)
             ).unsqueeze(0)
-            topk_weights = hidden_states.new_full(
-                (1, topk), 1.0 / topk, dtype=torch.float32
+            topk_weights = (
+                hidden_states.new_full((1, topk), 1.0 / topk, dtype=torch.float32)
+                if rank_sync
+                else hidden_states.new_zeros((1, topk), dtype=torch.float32)
             )
         else:
             topk_ids = torch.full(
@@ -351,19 +444,44 @@ def _run_mega_routed(
     assert x_in.shape[0] <= selected_mtpr, (
         f"Aiter MegaMoE local tokens {x_in.shape[0]} exceed MTPR {selected_mtpr}"
     )
-    mega = _get_or_build_mega_moe(
-        moe.experts,
-        model_dim=hidden_size,
-        inter_dim=moe.config.moe_intermediate_size,
-        experts=experts,
-        topk=topk,
-        quant=envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4",
-        swiglu_limit=float(getattr(moe.config, "swiglu_limit", 0.0) or 0.0),
-        mtpr=selected_mtpr,
-    )
-    _swap_layer_weights(mega, moe.experts)
-
-    output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
+    swiglu_limit = float(getattr(moe.config, "swiglu_limit", 0.0) or 0.0)
+    if _is_gfx1250:
+        mega = _get_or_build_mega_moe_gfx1250(
+            moe.experts,
+            model_dim=hidden_size,
+            experts=experts,
+            topk=topk,
+            swiglu_limit=swiglu_limit,
+            mtpr=selected_mtpr,
+        )
+        _, ep_world = _ep_rank_world()
+        output = mega.forward(
+            x_in,
+            topk_weights,
+            topk_ids,
+            w1=moe.experts.w13_weight,
+            w2=moe.experts.w2_weight,
+            w1_scale=moe.experts.w13_weight_scale_inv,
+            w2_scale=moe.experts.w2_weight_scale_inv,
+            recv_token_bound=_recv_token_bound(
+                x_in.shape[0], ep_world, ep_world * selected_mtpr
+            ),
+        )[:num_tokens]
+    else:
+        mega = _get_or_build_mega_moe(
+            moe.experts,
+            model_dim=hidden_size,
+            inter_dim=moe.config.moe_intermediate_size,
+            experts=experts,
+            topk=topk,
+            quant=envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4",
+            swiglu_limit=swiglu_limit,
+            mtpr=selected_mtpr,
+        )
+        _swap_layer_weights(mega, moe.experts)
+        output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[
+            :num_tokens
+        ]
 
     if not moe.routed_scaling_factor_fused_in_topk:
         output.mul_(moe.routed_scaling_factor)
