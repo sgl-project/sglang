@@ -1,19 +1,34 @@
 ---
 name: ci-workflow-guide
-description: Guide to SGLang CI workflow orchestration — stage ordering, fail-fast, gating, partitioning, execution modes, and debugging CI failures. Use when modifying CI workflows, adding stages, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
+description: Guide to SGLang CI workflow orchestration — tiers and their workflows, stage ordering, fail-fast, gating, partitioning, execution modes, adding a runner to a tier, and debugging CI failures. Use when modifying CI workflows, adding stages or runners, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
 ---
 
 # SGLang CI Workflow Orchestration Guide
 
-This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and aborted on failure across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md).
+This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and aborted on failure across stages. For test authoring (templates, fixtures, registration, which tier a test belongs to), see the [write-sglang-test skill](../write-sglang-test/SKILL.md). To run the tests a change touches on a PR, see [rerun-test](../rerun-test/SKILL.md).
+
+The workflow files settle any disagreement with this guide. Counts that change with the test tree (shard counts, job counts, suite lists) are left out on purpose; read them from the files named below.
 
 ---
 
 ## Naming Conventions
 
-- **Suite**: `base-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `base-b-test-1-gpu-small`)
-- **Test group**: Directory-level registered test group under `test/registered/` (e.g., `hicache` maps to `test/registered/hicache/test_*.py`)
-- **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
+- **Suite**: `{stage}-test-{runner_config}`, generated from each test's `register_cuda_ci(stage=..., runner_config=...)` (e.g. `base-b-test-1-gpu-small`, `nightly-test-8-gpu-b200`)
+- **runner_config**: a runner-pool key (`1-gpu-small`, `4-gpu-h100`, `2-gpu-gb300`); `scripts/ci/runner_configs.yml` maps it to the physical runner label. Runner configs are independent of tiers: any tier can run any runner config.
+- **Test group**: directory-level group under `test/registered/` (e.g. `hicache` maps to `test/registered/hicache/test_*.py`)
+
+---
+
+## Tiers
+
+| Tier (stages) | Workflow | When it runs |
+|---------------|----------|--------------|
+| base (`base-a`, `base-b`, `base-c`) | `pr-test.yml` | Every PR with `run-ci`; on main twice daily (cron) |
+| extra (`extra-a`, `extra-b`) | `pr-test-extra.yml` | PRs with `run-ci` and `run-ci-nv-extra`; on main from `pr-test.yml`'s scheduled run (`call-pr-test-extra`) |
+| nightly (`nightly`) | `nightly-test-nvidia.yml` | Every two days, 14:00 UTC |
+| weekly (`weekly`) | `weekly-test-nvidia.yml` | Sunday 00:00 UTC |
+
+`pr-test-finish` (base) and `lint` are the required checks for merging. Which tier a test belongs to is in [write-sglang-test, Choosing a Tier](../write-sglang-test/SKILL.md#choosing-a-tier). `/rerun-test` runs any registered test on a PR, whatever its tier.
 
 ---
 
@@ -21,103 +36,39 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 | File | Role |
 |------|------|
-| `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
-| `.github/workflows/pr-test-extra.yml` | NVIDIA/shared Extra workflow, gated by BOTH `run-ci` and `run-ci-nv-extra` labels |
-| `scripts/ci/opt_in_ci_tiers.json` | CI selections: name → workflow files and an optional opt-in label |
+| `.github/workflows/pr-test.yml` | Base tiers: stage jobs, wait jobs, `pr-test-finish` |
+| `.github/workflows/pr-test-extra.yml` | Extra tier, gated by `run-ci` and `run-ci-nv-extra` |
+| `.github/workflows/nightly-test-nvidia.yml`, `weekly-test-nvidia.yml` | Scheduled tiers: one matrix row per runner config |
+| `.github/workflows/_pr-test-stage.yml`, `_pr-test-stage-cpu.yml` | Reusable stage: checkout, health check, install, `run_suite.py` per shard |
+| `.github/workflows/_pr-test-check-changes.yml` | Path filters, partitions, retry and continue-on-error flags |
+| `scripts/ci/utils/compute_partitions.py` | Shard count and `max_parallel` per suite |
+| `scripts/ci/runner_configs.yml` | `runner_config` -> runner label |
+| `test/run_suite.py` | Suite lists (`PER_COMMIT_SUITES`, `NIGHTLY_SUITES`, `OTHER_SUITES`); collects, filters, partitions, executes tests |
+| `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
+| `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
-| `.github/actions/check-maintenance/action.yml` | Maintenance mode check |
-| `.github/scripts/ci-labels.cjs` | Resolves the four CI control labels into dispatch axes |
-| `test/run_suite.py` | Suite runner: collects, filters, partitions, executes tests |
-| `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
-| `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
+| `.github/scripts/ci-labels.cjs` | Resolves the CI control labels into dispatch axes |
+| `scripts/ci/opt_in_ci_tiers.json` | Opt-in CI selections: name -> workflow files and an optional label |
 | `scripts/ci/utils/slash_command_handler.py` | Handles slash commands from PR comments |
 
 ---
 
 ## Architecture Overview
 
-```
- ┌──────────────┐
- │ build kernel │
- └──────┬───────┘
-        │
-        ├─ check-changes ──── detects which packages changed
-        │                      (main_package, sgl_kernel, jit_kernel, multimodal_gen)
-        │
-        ├─ call-gate ──────── pr-gate.yml (draft? label? rate limit?)
-        │
-        ├─────────────────────────────────────────────────────┐
-        │                                                     │
-        ▼                                                     │
- ┌─────────────────────────────────────┐                      │
- │          Base A (~3 min)            │                      │
- │         pre-flight check            │                      │
- │                                     │                      │
- │  ┌─────────────────────────────┐    │                      │
- │  │ base-a-test-1-gpu-small    │    │                      │
- │  │ (small GPUs)                │    │                      │
- │  └─────────────────────────────┘    │                      │
- │  ┌─────────────────────────────┐    │                      │
- │  │ base-a-test-cpu            │    │                      │
- │  │ (CPU)                       │    │                      │
- │  └─────────────────────────────┘    │                      │
- └──────┬──────────────────────────────┘                      │
-        │                                                     │
-        ▼                                                     ▼
- ┌─────────────────────────────────────┐          ┌──────────────────────────┐
- │          Base B (~30 min)           │          │      kernel test         │
- │            base tests               │          └──────────────────────────┘
- │                                     │          ┌──────────────────────────┐
- │  ┌─────────────────────────────┐    │          │   multimodal gen test    │
- │  │ base-b-test-1-gpu-small    │    │          └──────────────────────────┘
- │  │ (small GPUs, e.g. 5090)     │    │
- │  └─────────────────────────────┘    │
- │  ┌─────────────────────────────┐    │
- │  │ base-b-test-1-gpu-large    │    │
- │  │ (large GPUs, e.g. H100)     │    │
- │  └─────────────────────────────┘    │
- │  ┌─────────────────────────────┐    │
- │  │ base-b-test-2-gpu-large    │    │
- │  │ (large GPUs, e.g. H100)     │    │
- │  └─────────────────────────────┘    │
- └──────┬──────────────────────────────┘
-        │
-        ▼
- ┌─────────────────────────────────────┐
- │          Base C (~30 min)           │
- │          advanced tests             │
- │                                     │
- │  ┌─────────────────────────────┐    │
- │  │ base-c-test-4-gpu-h100     │    │
- │  │ (H100 GPUs)                 │    │
- │  └─────────────────────────────┘    │
- │  ┌─────────────────────────────┐    │
- │  │ base-c-test-8-gpu-h200     │    │
- │  │ (8 x H200 GPUs)             │    │
- │  └─────────────────────────────┘    │
- │  ┌─────────────────────────────┐    │
- │  │ base-c-test-4-gpu-b200     │    │
- │  │ (4 x B200 GPUs)             │    │
- │  └─────────────────────────────┘    │
- │  ┌─────────────────────────────┐    │
- │  │ Other advanced tests        │    │
- │  │ (DeepEP, PD Disagg, GB300)  │    │
- │  └─────────────────────────────┘    │
- └──────┬──────────────────────────────┘
-        │
-        ▼
- ┌─────────────────────────────────────┐
- │         pr-test-finish              │
- │  aggregates all results, fails if   │
- │  any job failed/cancelled           │
- └─────────────────────────────────────┘
-```
+`pr-test.yml` on a PR:
 
-**Every stage test job** includes a `check-pr-test-health` step after checkout — if any job in the run has already failed, the job fails fast (red X) with a root cause annotation.
+1. **`check-changes`** detects which packages changed (`main_package`, `sgl_kernel`, `jit_kernel`, `multimodal_gen`, ...) and computes the partitions; **`call-gate`** runs `pr-gate.yml` (draft, label, rate limit). Kernel and rust-ext builds start alongside.
+2. **Base A** (pre-flight): `base-a-test` (`1-gpu-small`, one shard) and `base-a-test-cpu`.
+3. **`wait-for-base-a`**, then **Base B**: the `base-b-test` matrix, one row per runner config.
+4. **`wait-for-base-b`**, then **Base C**: the `base-c-test` matrix and `base-c-test-aarch64` (GB300 rows).
+5. Kernel, JIT kernel, and multimodal-gen tests run as called workflows beside the stages.
+6. **`pr-test-finish`** aggregates every job and fails on any failure or cancellation.
 
-**Scheduled runs** skip `wait-for-base-*` jobs, running all stages in parallel. Fail-fast is also disabled.
+Each stage job is a matrix over `{ runner_config, run_timeout, timeout_per_file }` rows that calls `_pr-test-stage.yml`; that job runs `run_suite.py --suite {stage}-test-{runner_config}` once per shard. Extra, nightly, and weekly reuse the same reusable stage.
+
+Every stage job runs `check-pr-test-health` after checkout: if any job in the run has already failed, it fails fast with the root cause. Scheduled runs skip the `wait-for-base-*` jobs and the health check, and run all stages in parallel.
 
 ---
 
@@ -129,32 +80,30 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 |-------|-----------|-------------|----------------------|
 | **1. Test method → file** | `unittest -f` (failfast) | One test method fails → entire test file stops immediately | Yes |
 | **2. File → suite** | `run_unittest_files()` default | One test file fails → entire suite stops (`--continue-on-error` off) | Yes |
-| **3. Job → job (same stage)** | `check-pr-test-health` action | One job fails → other waiting jobs in same stage fail-fast (red X) | Yes |
-| **4. Stage → stage (cross-stage)** | `wait-for-base-*` + `needs` | Base A fails → base B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
+| **3. Job → job** | `check-pr-test-health` action | One job fails → jobs that have not started fail fast (red X) | Yes |
+| **4. Stage → stage** | `wait-for-base-*` + `needs` | Base A fails → base B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
 
 - **Layer 1**: `-f` flag appended to all `python3 -m pytest` / `unittest` invocations in `ci_utils.py`
 - **Layer 2**: `--continue-on-error` flag in `run_suite.py` — off for PRs, on for scheduled runs
-- **Layer 3**: `check-pr-test-health` auto-detects `schedule` event and skips; filters out cascade failures to show only root cause jobs
-- **Layer 4**: `wait-for-base-*` jobs are conditioned on `github.event_name == 'pull_request'` — skipped for scheduled runs
+- **Layer 3**: skipped when `SKIP_PR_TEST_HEALTH_CHECK` is set (scheduled, `run_all_tests`, `test_parallel_dispatch`); filters out cascade failures to show only root cause jobs
+- **Layer 4**: `wait-for-base-*` jobs run only on `pull_request` events without `test_parallel_dispatch`
+
+The control labels `bypass-fail-fast`, `parallel-stages`, `max-concurrency`, and `highest-priority` (all three) relax these limits for one PR; `.github/scripts/ci-labels.cjs` resolves them, and the [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels) describes each.
 
 ---
 
 ## Execution Modes
 
-| Aspect | PR (`pull_request`) | Scheduled (`cron`, every 6h) | Manual dispatch (`workflow_dispatch`) |
-|--------|---------------------|------------------------------|--------------------------------------|
-| **Stage ordering** | Sequential: A → B → C via `wait-for-base-*` | Parallel (all at once) | Single target stage only |
-| **Cross-job fail-fast** | Yes (`check-pr-test-health`) | Yes | Yes |
-| **continue-on-error** | No (stop at first failure within suite) | Yes (run all tests) | No |
+| Aspect | PR (`pull_request`) | Scheduled (cron, twice daily) | Manual dispatch (`workflow_dispatch`) |
+|--------|---------------------|-------------------------------|--------------------------------------|
+| **Stage ordering** | Sequential: A → B → C via `wait-for-base-*` | Parallel | Parallel (the wait jobs run only on PRs) |
+| **continue-on-error** | No (stop at first failure within suite) | Yes (run all tests) | With `force_continue_on_error` or `run_all_tests` |
 | **Retry** | Enabled | Enabled | Enabled |
-| **max_parallel** | 3 (default), 14 if `max-concurrency` label | 14 | 3 (default), 14 if `max-concurrency` |
-| **PR gate** | Yes (draft, label, rate limit) | Skipped | Skipped |
-| **Concurrency** | `cancel-in-progress: true` per PR | Queue (no cancel) | Isolated per stage+SHA |
+| **Shards at once** | `max_parallel` (about a third of the shards); all with `max-concurrency` | All | All with `run_all_tests`; otherwise as on a PR |
+| **PR gate** | Yes (draft, label, rate limit) | Skipped | Skipped with `test_parallel_dispatch` |
+| **Extra tier** | Only with `run-ci-nv-extra` | Called from the same run | Called with `run_all_tests` or `test_parallel_dispatch` |
 
-Four labels relax these limits for one PR: `bypass-fail-fast`, `parallel-stages`,
-`max-concurrency`, and `highest-priority` (all three). `.github/scripts/ci-labels.cjs`
-resolves them; the [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels)
-describes what each one does.
+A single test, class, or method on a PR runs through `/rerun-test`, not a stage dispatch.
 
 ---
 
@@ -162,64 +111,27 @@ describes what each one does.
 
 `wait-for-base-a` and `wait-for-base-b` are lightweight `ubuntu-latest` jobs that poll the GitHub Actions API.
 
-**How it works:**
 1. Calls `listJobsForWorkflowRun` to list all jobs in the current run
-2. Matches jobs by exact name or prefix (for matrix jobs, e.g., `base-b-test-1-gpu-small (3)`)
-3. If any matched job has `conclusion === 'failure'` → fail immediately (fail-fast)
-4. If all matched jobs are completed and count matches `expected_count` → success
-5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
-6. Timeout after `max-wait-minutes` of wall-clock time (240 min for base-a, 350 min for base-b). Keep budgets under the 6h hard cap on GitHub-hosted runners: a wait killed by the cap ends `cancelled`, not `timeout`, and `timeout-minutes` cannot raise it. The base-b wait sets `fail-on-timeout: 'false'`, so a timeout lets base-c start; `pr-test-finish` fails the run on any base-b failure regardless
+2. Matches jobs by name prefix (matrix shards are named like `base-b-test-1-gpu-small (3)`), so the stage jobs' `name:` is load-bearing
+3. If any matched job has `conclusion === 'failure'` → fail immediately
+4. If all matched jobs are completed and the count matches `expected_count` → success
+5. Otherwise → sleep and retry, up to `max-wait-minutes` (240 for base-a, 350 for base-b). Keep budgets under the 6h hard cap on GitHub-hosted runners: a wait killed by the cap ends `cancelled`, not `timeout`. The base-b wait sets `fail-on-timeout: 'false'`, so a timeout lets base-c start; `pr-test-finish` still fails the run on any base-b failure
 
-**Job specs example** (base-b):
-```json
-[
-  {"prefix": "base-b-test-1-gpu-small", "expected_count": 8},
-  {"prefix": "base-b-test-1-gpu-large", "expected_count": 14},
-  {"prefix": "base-b-test-2-gpu-large", "expected_count": 4},
-  {"prefix": "base-b-test-4-gpu-b200", "expected_count": 1}
-]
-```
-
-> **Critical**: `expected_count` must match the matrix size. If you add/remove matrix entries, update the wait job's spec accordingly.
-
-**PR only**: Condition `github.event_name == 'pull_request' && !inputs.target_stage` — scheduled runs and manual dispatches skip these entirely, allowing parallel execution.
+Each spec entry reads its `expected_count` from `check-changes.outputs.partitions['<suite>'].size`, so shard counts never need a hand edit. A new runner row in base-a or base-b still needs its own `{"prefix": ..., "expected_count": ...}` entry in the wait job.
 
 ---
 
 ## Cross-Job Fail-Fast (`check-pr-test-health` action)
 
-Composite action called after checkout in every stage test job (21 jobs total across `pr-test.yml`, `pr-test-multimodal-gen.yml`, `pr-test-sgl-kernel.yml`, `pr-test-jit-kernel.yml`).
+Composite action called after checkout in the reusable stage workflows and in the kernel and multimodal-gen workflows.
 
-**How it works:**
 1. Queries `listJobsForWorkflowRun` for the current workflow run
-2. Filters for **root cause failures only** — jobs with `conclusion === 'failure'` whose failing step is NOT `check-pr-test-health` (excludes cascade failures)
-3. If root cause failures found → calls `core.setFailed()` with the list of root cause job names
-4. If none → does nothing (step succeeds)
+2. Keeps **root cause failures only** — failed jobs whose failing step is not the health check itself (a job that failed fast is excluded)
+3. If any are found → `core.setFailed()` with their names; later steps skip through the default `if: success()`
+4. Otherwise the step succeeds
 
-**Cascade filtering**: When job A fails fast due to the health check, it also has `conclusion: failure`. Without filtering, job B would list both the original failure AND job A's fail-fast. The filter checks each failed job's `steps` array — if the failing step name contains `check-pr-test-health` or `Check PR test health`, it's excluded from the root cause list.
+It checks every job in the run, not only the current stage. Error message example:
 
-**Usage pattern:**
-```yaml
-steps:
-  - name: Checkout code
-    uses: actions/checkout@v4
-    ...
-
-  - uses: ./.github/actions/check-pr-test-health
-    id: pr-test-health
-
-  - name: Install dependencies        # skipped automatically if health check failed
-    ...                                # (default if: success() is false)
-
-  - name: Run test                     # also skipped
-    ...
-```
-
-**Visual effect**: Job shows **red X** (failure) with error annotation showing root cause job names. Subsequent steps are naturally skipped (default `if: success()` is false after a failed step). No per-step `if` guards needed.
-
-**No stage filtering**: Checks ALL jobs in the run, not just the current stage. Any failure anywhere triggers fail-fast.
-
-**Error message example:**
 ```
 Fail-fast: skipping — root cause job(s): base-b-test-1-gpu-small (0), base-b-test-1-gpu-small (1)
 ```
@@ -230,146 +142,65 @@ Fail-fast: skipping — root cause job(s): base-b-test-1-gpu-small (0), base-b-t
 
 Controlled by `run_unittest_files()` in `python/sglang/test/ci/ci_utils.py`.
 
-### Flags
-
 | Flag | PR default | Scheduled default | Effect |
 |------|------------|-------------------|--------|
 | `--continue-on-error` | Off | On | Off: stop at first failure. On: run all files, report all failures at end |
-| `--enable-retry` | On | On | Retry retriable failures (accuracy/perf assertions) |
+| `--enable-retry` | On | On | Retry retriable failures |
 | `--max-attempts` | 2 | 2 | Max attempts per file including initial run |
 
-### Retry Classification
+Retry classification: a failure matching `NON_RETRIABLE_PATTERNS` (import, syntax, type errors, OOM, segfault, ...) is not retried; one matching `RETRIABLE_PATTERNS` (accuracy and performance assertions) or `INFRA_RETRIABLE_PATTERNS` is. An unknown `AssertionError` is retried; other unknown failures are not. The lists are in `ci_utils.py`.
 
-When a test fails and retry is enabled, the output is classified:
-
-**Non-retriable** (checked first — real code errors):
-`SyntaxError`, `ImportError`, `ModuleNotFoundError`, `NameError`, `TypeError`, `AttributeError`, `RuntimeError`, `CUDA out of memory`, `OOM`, `Segmentation fault`, `core dumped`, `ConnectionRefusedError`, `FileNotFoundError`
-
-**Retriable** (accuracy/performance):
-`AssertionError` with comparison patterns (`not greater than`, `not less than`, `not equal to`), `accuracy`, `score`, `latency`, `throughput`, `timeout`
-
-**Default**: Unknown `AssertionError` → retriable. Other unknown failures → not retriable.
-
-### How `continue_on_error` is set
-
-In `pr-test.yml`'s `check-changes` job:
-- `schedule` runs or `run_all_tests` flag → `continue_on_error = 'true'`
-- PR runs → `continue_on_error = 'false'`
-
-Each test job propagates via:
-```yaml
-env:
-  CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-run: |
-  python3 run_suite.py --hw cuda --suite <name> $CONTINUE_ON_ERROR_FLAG
-```
+`check-changes` sets `continue_on_error` (true for scheduled runs and `run_all_tests`), and `_pr-test-stage.yml` passes it to `run_suite.py` as `--continue-on-error`.
 
 ---
 
 ## Test Partitioning
 
-Large suites are split across matrix jobs using the **LPT (Longest Processing Time) heuristic** in `ci_register.py:auto_partition()`:
+`scripts/ci/utils/compute_partitions.py` runs in `check-changes` and emits, per dispatched suite, `{size, arr, max_parallel}`:
 
-1. Sort tests by `est_time` descending, filename as tie-breaker (deterministic)
-2. Greedily assign each test to the partition with smallest cumulative time
-3. Result: roughly equal total time per partition
+- **Per-file time**: the live estimate from the `sglang-ci-stats` model (`model.json`), falling back to the file's `est_time`.
+- **Shard count**: enough shards that each fits `0.75 * run_timeout` of its stage row (0.75 is the inverse of LPT's 4/3 worst case). Lowering a row's `run_timeout` buys more shards, not shorter ones. `base-a-test-1-gpu-small` is pinned to one shard.
+- **`max_parallel`**: `size // 3` (at least 1) for GPU suites; all shards for CPU suites, scheduled runs, and `max-concurrency`.
 
-**Partition table** (CUDA per-commit suites):
+Within a suite, `ci_register.py:auto_partition()` assigns files to shards with the LPT heuristic: sort by time descending (filename as tie-breaker), then give each file to the shard with the least total time.
 
-| Suite | Partitions | Runner | max_parallel |
-|-------|-----------|--------|-------------|
-| `base-a-test-1-gpu-small` | 1 (no matrix) | `1-gpu-5090` | — |
-| `base-a-test-cpu` | 4 | `ubuntu-latest` | — |
-| `base-b-test-1-gpu-small` | 8 | `1-gpu-5090` | 8 |
-| `base-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
-| `base-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
-| `base-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `base-b-kernel-unit-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
-| `base-b-kernel-unit-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `base-b-kernel-unit-test-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
-| `base-b-kernel-benchmark-test-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
-| `base-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
-| `base-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
-| `base-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
-| `base-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
-| `base-c-test-4-gpu-b200` | 3 | `4-gpu-b200` | — |
-| `base-c-test-4-gpu-b200-small` | 3 | `4-gpu-b200-low-disk` | — |
-| `base-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
-| `base-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
-
-> **Suite names are generated**, not hand-written: each comes from a test's `register_*_ci(stage=..., runner_config=...)` as `{stage}-test-{runner_config}`, and `runner_config` maps to the `Runner` column via `scripts/ci/runner_configs.yml`.
->
-> **Note**: Kernel suites (`base-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `base-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
-
-**Workflow usage:**
-```yaml
-strategy:
-  matrix:
-    partition: [0, 1, 2, 3, 4, 5, 6, 7]
-steps:
-  - run: python3 run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
-           --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8
-```
+The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 ---
 
 ## check-changes Job
 
-Determines which test suites to run based on file changes.
+| Trigger | Method |
+|---------|--------|
+| `pull_request` | `dorny/paths-filter` on the PR diff |
+| `workflow_dispatch` / `workflow_call` with `run_all_tests` | Force all true |
+| `schedule` | Force all true |
 
-### Detection Methods
-
-| Trigger | Method | Details |
-|---------|--------|---------|
-| `pull_request` | `dorny/paths-filter` | Detects changes via GitHub diff |
-| `workflow_dispatch` (with `pr_head_sha`) | GitHub API | `repos/{repo}/compare/main...{sha}` |
-| `schedule` / `run_all_tests` | Force all true | Runs everything |
-
-### Output Flags
-
-| Output | Triggers |
-|--------|----------|
-| `main_package` | Base A/B/C test suites |
-| `sgl_kernel` | Kernel wheel builds + kernel test suites; also switches B200 jobs to kernel-build runner labels outside `target_stage` mode |
-| `jit_kernel` | JIT kernel test workflow |
-| `multimodal_gen` | Multimodal-gen test workflow |
-
-> **Note**: In `target_stage` mode, `sgl_kernel` is only active when `include_wheel_build=true`. Without that opt-in, kernel-change reruns fail validation instead of running a target stage without freshly built wheels. Outside `target_stage`, `sgl_kernel=true` switches B200 jobs from `4-gpu-b200` / `4-gpu-b200-low-disk` to `4-gpu-b200-kernel` / `4-gpu-b200-kernel-low-disk`.
+`main_package` gates the base stages; `sgl_kernel` builds the PR-local kernel wheel, runs the kernel suites, and switches B200 jobs to the kernel-build runner labels; `jit_kernel` and `multimodal_gen` gate their workflows. The full output list is in `_pr-test-check-changes.yml`.
 
 ---
 
 ## Concurrency Control
 
-```
-group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
-```
+`pr-test.yml` groups runs by `pr-test-{event_name}-{PR number or ref name}-{git_ref or 'all'}`:
 
-| Segment | Source | Purpose |
-|---------|--------|---------|
-| `event_name` | `github.event_name` | Prevents scheduled runs colliding with fork PRs named `main` |
-| `branch` | `github.head_ref \|\| github.ref_name` | Per-branch isolation |
-| `pr_sha` | `inputs.pr_head_sha \|\| 'current'` | Isolates manual dispatches from main runs |
-| `stage` | `inputs.target_stage \|\| 'all'` | Allows parallel stage dispatches |
+- `event_name` keeps scheduled runs apart from fork PRs whose branch is named `main`
+- a PR keys on its number, since `head_ref` has no owner and two forks with one branch name would cancel each other
 
-`cancel-in-progress: true` for `pull_request` events (new push cancels old run), `false` for `workflow_call`.
+`cancel-in-progress` is true except for `workflow_call`, so a new push cancels the old PR run.
 
 ---
 
-## How To: Add a New Stage Job
+## How To: Add a Runner to a Tier
 
-1. Define the job in `pr-test.yml` with `needs: [check-changes, call-gate, wait-for-base-X, ...]`
-2. Copy the `if:` condition pattern from an existing same-stage job (handles `target_stage`, `schedule`, `main_package`)
-3. Add `checkout` step
-4. Add `check-pr-test-health` step (after checkout) — if any prior job failed, `core.setFailed()` fires and all subsequent steps auto-skip via default `if: success()`
-5. Add `check-maintenance` step
-6. Add `download-artifact` step if `sgl_kernel` changed
-7. Add `install dependencies` step
-8. Add `run test` step with `$CONTINUE_ON_ERROR_FLAG`
-9. Add `upload-cuda-coredumps` step with `if: always()`
-10. Register the suite name in `PER_COMMIT_SUITES` in `test/run_suite.py`
-11. If using matrix, add `--auto-partition-id` and `--auto-partition-size` to the run command
-12. **Update `wait-for-base-X`** job spec with the new job name and `expected_count` (if matrix)
-13. **Add the job to `pr-test-finish.needs`** list
+Adding a test to a runner that its tier already runs needs no workflow edit: `stage=` and `runner_config=` on the registration are enough. When the tier lacks that runner, add one row; never move the test to another runner to fit a tier.
+
+1. Add `{ runner_config: <key>, run_timeout: ..., ... }` to the tier's matrix: the stage job in `pr-test.yml` (`base-a-test`, `base-b-test`, `base-c-test`, or `base-c-test-aarch64` for aarch64 runners), the `extra-test` matrix in `pr-test-extra.yml` (with its `stage` and, for GB300, `arch: aarch64`), or the matrix in `nightly-test-nvidia.yml` / `weekly-test-nvidia.yml`.
+2. Add the suite name `{stage}-test-{runner_config}` to `PER_COMMIT_SUITES` or `NIGHTLY_SUITES` in `test/run_suite.py`; `validate_all_suites` rejects a registration whose suite is not listed.
+3. For a base-a or base-b row, add its prefix to the `wait-for-base-*` spec.
+4. A new runner config (a new machine type) also needs its entry in `scripts/ci/runner_configs.yml`.
+
+A suite left with no tests makes its stage row fail (the partition lookup returns null): remove the row when moving the last test off a runner.
 
 ---
 
@@ -377,81 +208,28 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 
 | Symptom | Likely cause | What to check |
 |---------|-------------|---------------|
-| All stage-B/C jobs green but steps skipped | Earlier job failed, `check-pr-test-health` triggered | Find the actual failed job (red X) |
-| `wait-for-base-b` timeout | `expected_count` doesn't match matrix size | Verify job spec counts match `matrix:` array length |
-| `pr-test-finish` fails but all jobs green | A job was `cancelled` (counts as failure in finish) | Check concurrency cancellation, and whether a `wait-for-base-*` job hit the 6h hosted-runner cap |
-| Tests pass locally but fail in CI | Partition assignment, runner GPU type, or `est_time` inaccuracy | Check which partition the test lands in; verify runner label |
-| Flaky test retried and passed | Retriable failure (accuracy/perf) | Check `[CI Retry]` markers in job logs |
-| Flaky test NOT retried | Matched non-retriable pattern | Check if error matches `NON_RETRIABLE_PATTERNS` in `ci_utils.py` |
+| Stage B/C jobs red with "Fail-fast: skipping" | An earlier job failed, `check-pr-test-health` triggered | The root cause job named in the annotation |
+| `wait-for-base-b` waits until timeout | A stage job was renamed or a row lacks its spec entry | Job `name:` prefixes against the wait spec |
+| `pr-test-finish` fails but all jobs green | A job was `cancelled` (counts as failure in finish) | Concurrency cancellation, or a `wait-for-base-*` job hit the 6h hosted-runner cap |
+| Stage row fails before running tests | Its suite has no tests, so the partition is null | Registrations for `{stage}-test-{runner_config}` |
+| Tests pass locally but fail in CI | Shard assignment, runner GPU type, or a timeout from the estimate | Which shard the file landed in, the runner label, the file's live estimate |
+| Flaky test retried and passed | Retriable failure (accuracy/perf) | `[CI Retry]` markers in job logs |
+| Flaky test NOT retried | Matched a non-retriable pattern | `NON_RETRIABLE_PATTERNS` in `ci_utils.py` |
 
 ---
 
 ## Slash Commands
 
-| Command | Effect |
-|---------|--------|
-| `/tag-run-ci-label` | Adds `run-ci` label to PR |
-| `/tag-run-ci-label <tier> [<tier> ...]` | Also adds each tier's opt-in label (e.g. `run-ci-nv-extra`); retired `extra` is rejected, and other unrecognized suffixes are ignored |
-| `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
-| `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
-| `/tag-and-rerun-ci <tier> [<tier> ...]` | Adds `run-ci` and the tier labels + retries broadly; retired `extra` is rejected |
-| `/run-ci`, `/run-base-ci`, `/rerun-base-ci` | With no argument, aliases of `/tag-and-rerun-ci`, with the same broad retry scope and independent labeling/retry permissions. With one registered tier argument, equivalent to `/run-<tier>-ci`, including green runs and requiring both permissions. E.g. `/run-ci nv-extra` equals `/run-extra-ci nv`. |
-| `/run-ci nv`, `/run-base-ci nv`, `/run-nv-ci` | Adds `run-ci` and reruns NVIDIA base/shared checks only, including green runs. No extra or other-hardware workflows. Existing hardware labels are kept; future pushes follow the existing workflow gates. |
-| `/run-ci amd`, `/run-base-ci amd`, `/run-amd-ci` | Adds only `run-ci` and reruns existing AMD Base runs for the current commit, including green runs. Missing runs are skipped; paths and existing labels are preserved. No Extra selection or new `run-ci-amd` label; future pushes keep existing CI behavior. |
-| `/run-full-ci nv`, `/run-full-ci amd` | Combines the selected hardware's Base and Extra tiers: adds `run-ci` and its dedicated Extra label, then selects current-commit runs including green runs. Active runs are left alone; missing base runs are skipped and missing extra runs are reported. Requires both labeling and rerun permissions. Alias: `/rerun-full-ci <hardware>`. |
-| `/run-<tier>-ci` | Adds `run-ci` and any configured tier label + reruns **only** the listed workflows (green ones included). E.g. `/run-nv-extra-ci`. Alias: `/rerun-<tier>-ci`. |
-| `/run-extra-ci <hardware>`, `/rerun-extra-ci <hardware>` | Requires exactly one `nv` or `amd` argument; equivalent to `/run-<hardware>-extra-ci`. Bare Extra/Full commands and unknown or multiple hardware arguments are rejected without adding labels or rerunning workflows. |
-| `/run-extra-ci nv`, `/run-nv-extra-ci`, `/run-ci nv-extra` | Adds `run-ci` and `run-ci-nv-extra`, then reruns NVIDIA/shared Extra, including green runs. Includes the existing Xeon CPU Extra suite. |
-| `/run-extra-ci amd`, `/run-amd-extra-ci`, `/run-ci amd-extra` | Adds `run-ci` and `run-ci-amd-extra`, then reruns only AMD Extra, including green runs. Base CI behavior is unchanged; existing labels are kept. |
-| `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
-| `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
-| `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
+Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`. The commands, their permissions, and their limits are in the [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests).
 
-Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
+Base CI covers only the core default paths; tests in the extra, nightly, and weekly tiers do not run on a normal PR. To cover what a change touches, run those tests with `/rerun-test`; the [rerun-test](../rerun-test/SKILL.md) skill describes how to pick them.
 
-### Opt-in CI tiers (pr-test-extra and friends)
+### Opt-in CI tiers
 
-The registry contains `nv-extra`, selecting `pr-test-extra.yml` with
-`run-ci-nv-extra`, and `amd-extra`, selecting `pr-test-amd-extra.yml` with
-`run-ci-amd-extra`. NVIDIA/shared Extra includes its existing Xeon CPU coverage.
-The `nv` and `amd` entries select Base workflows; `mlu` selects `pr-test-mlu.yml`
-with `run-ci-mlu`. PPU is not registered; its workflow uses `run-ci` and
-`run-ci-ppu` labels plus PPU path filters.
+An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`: `nv-extra` selects `pr-test-extra.yml` (with its Xeon CPU coverage), and `amd-extra` selects `pr-test-amd-extra.yml`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for `/tag-run-ci-label <tier>`, `/tag-and-rerun-ci <tier>` and `/run-<tier>-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
 
-`/run-extra-ci <hardware>` and `/run-full-ci <hardware>` require exactly one
-`nv` or `amd` argument. Full combines the matching Base and Extra tiers. Missing,
-unknown, or multiple hardware arguments are rejected before labels or reruns.
-Regular Base CI triggers and path filters remain unchanged.
-
-The shared `extra` tier and `run-ci-extra` label are retired. Updated Extra gates
-accept only their dedicated label; the old label has no effect. Old
-`/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` commands are rejected
-with migration guidance. To intentionally opt into both hardware tiers, use
-`/tag-run-ci-label nv-extra amd-extra`, then rerun each with its dedicated command.
-Commands preserve existing labels and do not cancel queued or running workflows.
-
-For an existing PR, update the branch to include the registry, handler, and gate
-changes, then push to create fresh runs. Reruns keep the original workflow
-revision, so older runs retain the old shared-label behavior.
-
-Selections with `label: null`, such as `nv` and `amd`, add only `run-ci` and leave
-existing workflow gates intact. They select existing runs for the current commit, skipping workflows with no run.
-For `pull_request_target` reruns, selection also matches the PR source repository
-and branch.
-Future pushes follow the existing workflow gates.
-These selections retain existing event/path conditions, including any limitations
-of rerunning old labeled events. Use `/run-ci nv` to select NVIDIA or `/run-ci amd`
-to select AMD Base. Legacy `/tag-and-rerun-ci nv` and `/tag-and-rerun-ci amd`
-still retry broadly and add no extra opt-in label.
-
-An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for `/tag-run-ci-label <tier>`, `/tag-and-rerun-ci <tier>` and `/run-<tier>-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
-
-1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** NVIDIA/shared Extra requires `run-ci-nv-extra`; AMD Extra requires `run-ci-amd-extra`. Both also require `run-ci`. The gate live-fetches labels, so a missing opt-in fails the gate job (red run) and a rerun after labeling passes. Keep this decision out of event-payload expressions, which do not refresh on rerun.
+1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** The gate live-fetches labels, so a missing opt-in fails the gate job (red run) and a rerun after labeling passes. Keep this decision out of event-payload expressions, which do not refresh on rerun.
 2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).
-3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-<tier>-ci` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run, including Xeon Extra under NVIDIA/shared Extra.
+3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-<tier>-ci` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run.
 
-Tier names `base`, `cpu`, `extra`, `failed` and `full` are reserved: they collide with the
-base aliases, `/run-cpu-ci`, the hardware-specific Extra syntax, `/rerun-failed-ci`
-and `/run-full-ci`. Legacy labeling commands reject retired `extra` and keep
-ignoring other unknown suffixes; `/run-ci <tier>` aliases reject unknown or
-multiple arguments before adding labels or rerunning.
+Tier names `base`, `cpu`, `extra`, `failed` and `full` are reserved: they collide with the base aliases, `/run-cpu-ci`, the hardware-specific Extra syntax, `/rerun-failed-ci` and `/run-full-ci`.

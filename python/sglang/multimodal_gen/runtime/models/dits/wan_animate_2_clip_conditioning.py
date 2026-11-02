@@ -65,3 +65,7 @@ class WanAnimate2ReferenceKV(msgspec.Struct, frozen=True):
     # this is the full sequence with sharded heads, the layout forward_gen uses after its a2a.
     k: dict[int, torch.Tensor]
     v: dict[int, torch.Tensor]
+    # Per-(token, head) fp32 scales, set only when K/V are stored in FP8
+    # (SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV).
+    k_scale: dict[int, torch.Tensor] | None = None
+    v_scale: dict[int, torch.Tensor] | None = None

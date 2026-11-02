@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -40,7 +41,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -53,6 +54,7 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
     disaggregation_mode: DisaggregationMode
+    # Logical token page width; CP KV sharding uses CP size * physical page_size.
     page_size: int
     tree_cache: BasePrefixCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
@@ -64,6 +66,12 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    get_running_reqs: Callable = field(default=lambda: None)
+    # Under PP, the micro-batches' running batches and step batches.
+    get_pp_running_mbs: Callable = field(default=lambda: ())
+    get_pp_mbs: Callable = field(default=lambda: ())
+    # When False, extend step batches hold no running request.
+    prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -387,6 +395,12 @@ class SchedulerInvariantChecker:
         # the classed sharding allocator, whose free lists hold logical page
         # ids in the same unit).
         owner_pages = owner_locs // sub_allocs[0].page_size
+        if is_cp_sharded_padded():
+            cp_size = get_cp_strategy().cp_size
+            # Cache page zero reserves one page rather than one CP group.
+            owner_pages = torch.where(
+                owner_pages > 0, (owner_pages + cp_size - 1) // cp_size, owner_pages
+            )
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
             free = sub.get_all_free_pages()
@@ -467,6 +481,46 @@ class SchedulerInvariantChecker:
             messages.append(mamba_msg)
 
         return has_leak, messages
+
+    def maybe_check_running_reqs(
+        self,
+        running_batch: Optional[ScheduleBatch],
+        last_batch: Optional[ScheduleBatch],
+    ) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
+        the unfinished ones the batches hold, apart from the chunked request."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        step_batches = [last_batch, *self.get_pp_mbs()]
+        if not self.prefill_launch_starts_running():
+            step_batches = [
+                b
+                for b in step_batches
+                if b is not None and not b.forward_mode.is_extend()
+            ]
+        self.get_running_reqs().check(
+            [running_batch, *self.get_pp_running_mbs(), *step_batches],
+            chunked_req=self.get_chunked_req(),
+        )
+
+    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
+        the requests it was launched with."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        launched = batch.launched_reqs or ()
+        if len(batch.reqs) != len(launched) or any(
+            req is not launched_req for req, launched_req in zip(batch.reqs, launched)
+        ):
+            raise RuntimeError(
+                f"Step processed with requests {[req.rid for req in batch.reqs]}, "
+                f"launched with {[req.rid for req in launched]}"
+            )
+        uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
+        if uncounted:
+            raise RuntimeError(
+                f"Requests processed by a step they were not launched in: {uncounted}"
+            )
 
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():

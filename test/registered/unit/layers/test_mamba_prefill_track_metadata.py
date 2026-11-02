@@ -216,9 +216,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     lengths, [0, 3][: len(lengths)], [100, 200], mode
                 )
                 if mode == ForwardMode.TARGET_VERIFY:
-                    batch.spec_info = SimpleNamespace(
-                        ragged_verify_layout=None, draft_token_num=3
-                    )
+                    batch.spec_info = SimpleNamespace(draft_token_num=3)
                 with patch.object(
                     torch.Tensor,
                     "__int__",
@@ -462,7 +460,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
             )
         )
-        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
         with (
             patch.object(spec_utils, "get_exec", return_value=settings),
             patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),
