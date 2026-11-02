@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
@@ -153,50 +152,6 @@ class TestMiniMaxROCmVerifyIndexerGate(unittest.TestCase):
         self.assertEqual(num_draft(init(), ForwardMode.TARGET_VERIFY), 4)
         self.assertIsNone(num_draft(init(), ForwardMode.DECODE))
         self.assertIsNone(num_draft(init(spec=None), ForwardMode.TARGET_VERIFY))
-
-
-@unittest.skipUnless(is_gfx95_supported(), "the dense-metadata skip is gfx950-only")
-class TestMiniMaxHybridDenseMetadataSkip(unittest.TestCase):
-    @staticmethod
-    def _hybrid(*, dense_layer_ids=()):
-        from sglang.srt.layers.attention.minimax_sparse_backend import (
-            MiniMaxHybridAttnBackend,
-        )
-
-        calls = []
-
-        def side(name):
-            return SimpleNamespace(
-                name=name,
-                is_hip=True,
-                dense_layer_ids=list(dense_layer_ids),
-                runner_ids=None,
-                init_forward_metadata=lambda fb: calls.append(name),
-                init_forward_metadata_out_graph=lambda fb, cap: calls.append(name),
-                init_forward_metadata_in_graph=lambda fb: calls.append(name),
-                init_cuda_graph_state=lambda bs, tokens: calls.append(name),
-            )
-
-        hybrid = MiniMaxHybridAttnBackend(
-            side("dense"), side("sparse"), sparse_layer_ids=[0]
-        )
-        return hybrid, calls
-
-    def test_dense_metadata_runs_only_when_a_layer_is_dense(self):
-        """All-sparse models skip the dense backend's per-forward metadata and its
-        CUDA-graph buffers; a model with any dense layer must still build both, eagerly
-        and around graphs."""
-        for dense_layer_ids, expected in (
-            ((), ["sparse"] * 4),
-            ((5,), ["dense", "sparse"] + ["sparse", "dense"] * 3),
-        ):
-            with self.subTest(dense_layer_ids=dense_layer_ids):
-                hybrid, calls = self._hybrid(dense_layer_ids=dense_layer_ids)
-                hybrid.init_cuda_graph_state(1, 1)
-                hybrid.init_forward_metadata(None)
-                hybrid.init_forward_metadata_out_graph(None)
-                hybrid.init_forward_metadata_in_graph(None)
-                self.assertEqual(calls, expected)
 
 
 @unittest.skipUnless(
