@@ -730,10 +730,11 @@ class DeepseekMHAForwardMixin:
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
         elif (
             _is_cuda
-            and next_power_of_2(self.num_local_heads) == self.num_local_heads
             and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
             and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
         ):
+            # The Triton helper masks padded heads, including Kimi-K3's 12
+            # local heads at TP8; only the feature dimensions need powers of two.
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"
