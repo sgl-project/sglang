@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-# Two equal salt deltas exchange contributions in the retired additive hash.
+# Two equal salt deltas exchange contributions in the legacy diagnostic checksum.
 PAIRS = (
     (77110, 81718, 0x369AF600),
     (353907, 359029, 0x10F9A5A6),
@@ -64,7 +64,8 @@ class TestGpuTensorBlake3(CustomTestCase):
                     x = torch.from_numpy(a.view(np.uint8)).view(dtype).cuda()
                     y = torch.from_numpy(b.view(np.uint8)).view(dtype).cuda()
                     self.assertNotEqual(gpu_tensor_blake3(x), gpu_tensor_blake3(y))
-                    self.assertNotEqual(gpu_tensor_hash(x), gpu_tensor_hash(y))
+                    # Diagnostic checksums may collide; cache identities must not.
+                    self.assertEqual(gpu_tensor_hash(x), gpu_tensor_hash(y))
                     first = MultimodalDataItem(modality=Modality.IMAGE, feature=x)
                     second = MultimodalDataItem(modality=Modality.IMAGE, feature=y)
                     self.assertNotEqual(first.cache_key, second.cache_key)
