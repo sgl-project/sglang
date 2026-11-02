@@ -16,59 +16,23 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-import dataclasses
 from typing import TYPE_CHECKING, Dict, Hashable, Mapping, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand, EvictResult
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-@dataclasses.dataclass(frozen=True)
-class TokenDemand:
-    """What an allocation takes: tokens of the token pool, tokens of every
-    window pool the allocator keeps, by the window pool's name, and state
-    slots. A demand names every window: one it leaves out is an error, not a
-    window that takes nothing, so no window's share is ever guessed."""
-
-    full_tokens: int
-    window_tokens: Mapping[str, int] = dataclasses.field(default_factory=dict)
-    state_slots: int = 0
-
-    @classmethod
-    def same_tokens(
-        cls, allocator: BaseTokenToKVPoolAllocator, tokens: int, *, state_slots=0
-    ) -> TokenDemand:
-        """Every pool takes ``tokens``: the new tokens of an extend or decode
-        step, which every window keeps."""
-        return cls(
-            tokens,
-            {name: tokens for name in allocator.window_pool_names()},
-            state_slots,
-        )
-
-    def checked(self, window_pool_names) -> TokenDemand:
-        """This demand, once it names exactly the windows ``window_pool_names``
-        lists."""
-        names = set(window_pool_names)
-        if set(self.window_tokens) != names:
-            raise ValueError(
-                f"a demand must name every window pool: it names "
-                f"{sorted(self.window_tokens)}, the allocator keeps {sorted(names)}"
-            )
-        if self.full_tokens < 0 or self.state_slots < 0:
-            raise ValueError(f"negative demand {self}")
-        if any(t < 0 for t in self.window_tokens.values()):
-            raise ValueError(f"negative window demand {self}")
-        return self
-
-
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Whether every pool takes its rows from one shared memory, so the prefix
+    # cache reclaims an allocation's demand as one; else each pool is its own.
+    pools_share_memory = False
     # Ids handed out index a virtual space the allocator translates to physical
     # rows (a unified pool's chain), not the pool's rows themselves.
     hands_out_virtual_ids = False
@@ -180,10 +144,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def window_pool_names(self) -> Tuple[str, ...]:
         """The window pools this allocator keeps, by the names a
-        `TokenDemand` uses for them; none for a pool without windows."""
+        `KVDemand` uses for them; none for a pool without windows."""
         return ()
 
-    def prealloc_ceiling_fits(self, demand: TokenDemand) -> bool | None:
+    def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
         """Whether ``demand`` could EVER be preallocated, or None when this
         pool has no ceiling of its own and the caller's token capacity is the
         only bound.
@@ -192,9 +156,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def prealloc_fits(
         self,
-        tree_cache,
-        demand: TokenDemand,
+        demand: KVDemand,
         *,
+        evictable: Mapping[str, int],
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
     ) -> bool:
@@ -203,8 +167,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         The budgets are the scheduler's policy: what each side has left once
         decode headroom and retraction are reserved. Separate buffers make the
         two sides independent, so each is checked against its own budget and
-        ``tree_cache`` is never read -- what it could reclaim is already
-        inside that budget. ``state_slots`` live in a pool of their own here,
+        ``evictable`` (what the prefix cache could free per pool) is not
+        read -- what it could reclaim is already inside that budget. ``state_slots`` live in a pool of their own here,
         which the caller has already made room in. A pool that cuts both sides
         (and state slots) from one buffer overrides this to price them
         together, since a per-side budget cannot express a shared byte
@@ -233,13 +197,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         Return whether capacity was realized, or None if it still needs checking.
         """
-        from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
         from sglang.srt.mem_cache.common import _evict_until_allocatable
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         if self.available_size() < num_tokens:
-            tree_cache.evict_for_alloc(AllocDemand(num_tokens=num_tokens))
+            tree_cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(
@@ -263,16 +227,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
-    def window_available_size(self, component) -> int:
-        """What a take from the window pool of prefix-tree slot ``component``
-        can serve now; a pool keeping one window serves every window slot."""
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window pool ``sub_pool`` can serve now; a pool
+        keeping one window serves it under any name."""
         return self.swa_available_size()
 
-    def reclaim_for_demand(self, tree_cache, demand: AllocDemand) -> EvictResult | None:
-        """Evict until ``demand`` (what an allocation will take) can be served, when this allocator's pools share their memory;
-        None when each pool is its own, so the prefix tree evicts each pool's
-        shortfall."""
-        return None
+    def sub_pool_roles(self) -> Tuple[str, Tuple[str, ...], Optional[str]]:
+        """The token pool's name, every window pool's, and the state pool's
+        (None when state slots are not taken from this allocator's memory)."""
+        return ("kv", self.window_pool_names(), None)
 
     def debug_print(self) -> str:
         return ""

@@ -367,7 +367,7 @@ class TestPagedStepKeepsTheEpoch(unittest.TestCase):
                 self.assertEqual(owner._chain_capacity_epoch(), epoch)
             with (
                 patch.object(
-                    allocator, "_units_fit", wraps=allocator._units_fit
+                    allocator, "units_fit", wraps=allocator.units_fit
                 ) as joint,
                 patch.object(
                     owner, "_available_tokens", wraps=owner._available_tokens

@@ -8,12 +8,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import reset_context
@@ -169,7 +169,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 if allocation:
                     # The demand: two tokens past what the owner serves now.
                     demand = allocator.full_available_size() + 2
-                    result = cache.evict_for_alloc(AllocDemand(num_tokens=demand))
+                    result = cache.evict_for_alloc(KVDemand(full_tokens=demand))
                 else:
                     result = cache.evict(EvictParams(num_tokens=2))
                 # Allocation asks for a demand: a cascaded SWA free also
@@ -512,6 +512,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         script = r"""
 import queue, runpy, sys, threading
 from unittest.mock import patch
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.utils import rank_consensus_checker as checker
 module = runpy.run_path(sys.argv[1], run_name="rank_fixture")
 fixture = module["TestUnifiedJointAllocationEviction"]()
@@ -523,7 +524,7 @@ for _ in range(2):
         records = fixture.mark_prefixes(allocator, cache, 96)
         # The owner is short, so its cached entries are walked first, capped
         # at all of them; the walk stops at the first victim that suffices.
-        quota = allocator.admission_evictable(cache)[
+        quota = evictable_by_sub_pool(cache)[
             allocator.full_attn_allocator.sub_pool_name
         ]
         q = queue.Queue()

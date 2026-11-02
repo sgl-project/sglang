@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
@@ -173,16 +174,20 @@ class EvictParams:
     )
 
 
-@dataclasses.dataclass
-class AllocDemand:
-    """What an allocation is about to take from each component, in the same
-    units as `EvictParams`; the cache evicts whatever lets it be served."""
-
-    num_tokens: int = 0
-    mamba_num: int = 0
-    window_num_tokens: dict[ComponentType, int] = dataclasses.field(
-        default_factory=dict
-    )
+def evictable_by_sub_pool(tree_cache, allocator=None) -> dict[str, int]:
+    """What ``tree_cache`` could evict per sub-pool of ``allocator`` (by
+    default its own): tokens, or slots for the state sub-pool."""
+    if allocator is None:
+        allocator = tree_cache.token_to_kv_pool_allocator
+    owner, windows, state = allocator.sub_pool_roles()
+    evictable = {owner: tree_cache.full_evictable_size()}
+    for name in windows:
+        evictable[name] = tree_cache.window_evictable_size(name)
+    if state is not None:
+        evictable[state] = (
+            tree_cache.mamba_evictable_size() if tree_cache.supports_mamba() else 0
+        )
+    return evictable
 
 
 @dataclasses.dataclass
@@ -549,29 +554,28 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, demand: AllocDemand) -> EvictResult:
+    def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
         """Evict so that an allocation of ``demand`` can be served: here, the
         shortfall of each pool the allocator reads, evicted as counts. A
         cache without window slots keeps a single pool, which serves the
         demand's tokens and windows alike."""
         allocator = self.token_to_kv_pool_allocator
-        shortfall = EvictParams(mamba_num=demand.mamba_num)
-        if demand.num_tokens > 0:
+        shortfall = EvictParams(mamba_num=demand.state_slots)
+        if demand.full_tokens > 0:
             available = (
                 allocator.full_available_size()
                 if self.supports_swa()
                 else allocator.available_size()
             )
-            shortfall.num_tokens = max(0, demand.num_tokens - available)
-        windows = self.window_slots()
-        if windows:
-            for component, tokens in demand.window_num_tokens.items():
+            shortfall.num_tokens = max(0, demand.full_tokens - available)
+        if self.window_slots():
+            for name, tokens in demand.window_tokens.items():
                 if tokens > 0:
-                    short = max(0, tokens - self.window_available_size(component))
+                    short = max(0, tokens - self.window_available_size(name))
                     if short:
-                        shortfall.window_num_tokens[component] = short
-        elif demand.window_num_tokens:
-            tokens = max(demand.window_num_tokens.values())
+                        shortfall.window_num_tokens[self.window_slot_of(name)] = short
+        elif any(t > 0 for t in demand.window_tokens.values()):
+            tokens = max(demand.window_tokens.values())
             available = (
                 allocator.swa_available_size()
                 if self.supports_swa()
@@ -584,14 +588,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             return EvictResult()
         return self.evict(shortfall)
 
-    def window_available_size(self, component: ComponentType) -> int:
-        """What the pool of window slot ``component`` can serve now."""
-        return self.token_to_kv_pool_allocator.window_available_size(component)
+    def window_available_size(self, sub_pool: str) -> int:
+        """What window sub-pool ``sub_pool`` can serve now."""
+        return self.token_to_kv_pool_allocator.window_available_size(sub_pool)
 
-    def all_windows(self, tokens: int) -> dict[ComponentType, int]:
-        """``tokens`` for every window slot of this tree: the window part of a
-        demand whose windows all take the same tokens."""
-        return {component: tokens for component in self.window_slots()}
+    def window_slot_of(self, sub_pool: str) -> ComponentType:
+        """The tree slot keeping window sub-pool ``sub_pool``."""
+        raise KeyError(f"this cache keeps no window slot for {sub_pool!r}")
+
+    def window_sub_pool_of_slot(self, slot: ComponentType) -> str:
+        """The window sub-pool whose rows tree slot ``slot`` keeps."""
+        raise KeyError(f"this cache keeps no window slot {slot}")
+
+    def window_sub_pools(self) -> tuple[tuple[str, int], ...]:
+        """Each window sub-pool this cache keeps a slot for, with the history
+        it retains (what a request is charged at most in it)."""
+        return ()
+
+    def reclaim(self, units: dict[str, int]) -> bool:
+        """Evict cached entries until the allocator can take ``units`` (pages
+        per sub-pool, slots for state); return whether it can."""
+        raise NotImplementedError("This cache does not reclaim a joint demand")
 
     def evict_until(
         self, params: EvictParams, satisfied: Callable[[], bool]
@@ -653,8 +670,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
-    def window_evictable_size(self, component: ComponentType) -> int:
-        """Evictable tokens of one window slot."""
+    def window_evictable_size(self, sub_pool: str) -> int:
+        """Evictable tokens of one window sub-pool."""
         return 0
 
     def protected_size(self):
@@ -666,10 +683,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
-    def window_protected_size(self, component: ComponentType) -> int:
-        """Locked tokens of one window slot (`ComponentType.SWA` for a
-        cache that keeps its one window without slots)."""
-        return self.swa_protected_size() if component == ComponentType.SWA else 0
+    def window_protected_size(self, sub_pool: str) -> int:
+        """Locked tokens of one window sub-pool; a cache keeping its one window
+        without slots answers for it under any name."""
+        return self.swa_protected_size()
 
     def total_size(self):
         raise NotImplementedError()

@@ -20,7 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import index_slots
@@ -47,11 +47,11 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     FloatBand,
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.demand import estimate_window_tokens
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
@@ -733,14 +733,14 @@ class TestWindowChainAllocator(unittest.TestCase):
         extend_tokens = 32
         max_new_tokens = 0
         reservation_full_tokens = extend_tokens + max_new_tokens + page_size
-        reservation_swa_tokens = estimate_swa_kv_tokens(
+        reservation_swa_tokens = estimate_window_tokens(
             extend_tokens,
             max_new_tokens,
             sliding_window_size=16,
             page_size=page_size,
             allocation_limit=16,
         )
-        reservation_swa_with_tail = estimate_swa_kv_tokens(
+        reservation_swa_with_tail = estimate_window_tokens(
             extend_tokens,
             max_new_tokens,
             sliding_window_size=16,
@@ -3253,7 +3253,7 @@ class TestDcpWidening(unittest.TestCase):
                 if grouped_free:
                     allocator.free_group_begin()
 
-                result = cache.evict_for_alloc(AllocDemand(mamba_num=1))
+                result = cache.evict_for_alloc(KVDemand(state_slots=1))
 
                 self.assertEqual(walk["freed_leaves"], expected_leaves)
                 self.assertEqual(
@@ -3300,7 +3300,7 @@ class TestDcpWidening(unittest.TestCase):
             full.flush_for_allocation = MagicMock(wraps=original_flush)
             allocator.free_group_begin()
 
-            result = cache.evict_for_alloc(AllocDemand(mamba_num=4))
+            result = cache.evict_for_alloc(KVDemand(state_slots=4))
 
             self.assertGreater(walk["freed_leaves"], 1)
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])

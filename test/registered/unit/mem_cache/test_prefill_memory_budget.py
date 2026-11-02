@@ -74,7 +74,8 @@ def _cache():
     return SimpleNamespace(
         sliding_window_size=8,
         # The target's window slot retains its own window; a draft window more.
-        window_retain_size=lambda component: 8 if component.is_swa else 32,
+        window_retain_size=lambda name: 8 if name == "window" else 32,
+        window_sub_pool_of_slot=lambda slot: "window",
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         window_evictable_size=lambda component: 0,

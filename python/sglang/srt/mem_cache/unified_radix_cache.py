@@ -16,7 +16,6 @@ from typing import (
     Optional,
     Sequence,
     TypeVar,
-    Union,
 )
 
 import msgspec
@@ -34,7 +33,6 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     BasePrefixCache,
     CacheRequestHandle,
     DecLockRefParams,
@@ -48,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
+    evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
@@ -70,6 +69,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import (
     TREE_BLOCK,
@@ -723,22 +723,23 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._evict(params)
 
     @rank_consensus(same_params=True, same_results=True)
-    def evict_for_alloc(self, demand: AllocDemand) -> EvictResult:
+    def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
         """Evict so that an allocation of ``demand`` (what it will take, not
         what to evict) can be served.
 
-        Pools sharing their memory answer for the whole demand at once
-        (`reclaim_for_demand`). Pools of their own evict each component's
-        shortfall, and a walk stops once its pool can serve its demand: a
-        FULL leaf cascade can free a window's or a state's entries too.
+        Pools sharing their memory reclaim the whole demand at once
+        (`_reclaim`). Pools of their own evict each component's shortfall,
+        and a walk stops once its pool can serve its demand: a FULL leaf
+        cascade can free a window's or a state's entries too.
         """
         if self.disable:
             return EvictResult()
-        reclaimed = self.token_to_kv_pool_allocator.reclaim_for_demand(self, demand)
-        if reclaimed is not None:
-            return reclaimed
+        allocator = self.token_to_kv_pool_allocator
+        if allocator.pools_share_memory:
+            demand = demand.completed(allocator.window_pool_names())
+            return self._reclaim(allocator.page_demands(demand))
         demand_by_type = {
-            ct: n for ct, n in self._evict_request_by_type(demand).items() if n > 0
+            ct: n for ct, n in self._demand_by_type(demand).items() if n > 0
         }
         shortfall = {
             ct: n - self._pool_available(ct) for ct, n in demand_by_type.items()
@@ -757,6 +758,96 @@ class UnifiedRadixCache(BasePrefixCache):
             demand={ct: demand_by_type[ct] for ct in short},
         )
 
+    def _demand_by_type(self, demand: KVDemand) -> dict[ComponentType, int]:
+        """Per tree component, what an allocation's ``demand`` takes of it."""
+        request = {ct: 0 for ct in self.tree_components}
+        request[BASE_COMPONENT_TYPE] = demand.full_tokens
+        state = self.slot_id(TREE_STATE)
+        if state is not None:
+            request[state] = demand.state_slots
+        for name, tokens in demand.window_tokens.items():
+            request[self.window_slot_of(name)] = tokens
+        return request
+
+    def reclaim(self, units: dict[str, int]) -> bool:
+        self._reclaim(units)
+        return self.token_to_kv_pool_allocator.units_fit(
+            {n: d for n, d in units.items() if d > 0}
+        )
+
+    def _reclaim(self, units: dict[str, int]) -> EvictResult:
+        """Evict cached entries until the allocator can take ``units`` (pages
+        per sub-pool, slots for state), and report what was evicted.
+
+        A demand that fits now, rearranged if need be, evicts nothing; nor does
+        one that would not fit with every evictable entry gone, since eviction
+        would only lose cache: the caller refuses it or retracts. Otherwise
+        victims go one at a time in this cache's order, and every walk stops at
+        the first victim after which the allocator can take the demand, so the
+        order is a heuristic only: first the entries of each sub-pool whose
+        own demand does not fit now, whose freed pages it then takes in place;
+        then token entries by LRU, whose eviction frees their whole node; then
+        the state checkpoints left; then window entries. Admission credits the
+        same evictable entries, so an admitted demand is one this reclaim
+        makes room for."""
+        allocator = self.token_to_kv_pool_allocator
+        result = EvictResult()
+        demands = {n: d for n, d in units.items() if d > 0}
+        if allocator.units_fit(demands):
+            return result
+        if not allocator.admits_units(demands, self._reclaimable_units()):
+            return result
+        owner, windows, state = self._sub_pool_roles()
+        order = [
+            {n for n, d in demands.items() if not allocator.units_fit({n: d})},
+            {owner},
+            set() if state is None else {state},
+            set(windows),
+        ]
+        for names in order:
+            if allocator.fits_after_frees(demands):
+                break
+            reclaimable = self._reclaimable_units()
+            self._evict_units(
+                {n: reclaimable.get(n, 0) for n in names}, demands, result
+            )
+        return result
+
+    def _reclaimable_units(self) -> dict[str, int]:
+        """What this cache could free per sub-pool, in the allocator's units:
+        pages, slots for the state sub-pool."""
+        page = self.token_to_kv_pool_allocator.page_size
+        _, _, state = self._sub_pool_roles()
+        return {
+            name: n if name == state else n // page
+            for name, n in evictable_by_sub_pool(self).items()
+        }
+
+    def _evict_units(
+        self, units: dict[str, int], demands: dict[str, int], result: EvictResult
+    ) -> None:
+        """Evict ``units`` (pages, slots for state) per sub-pool, the walks
+        stopping once the allocator can take ``demands``; add what was
+        evicted to ``result``."""
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
+        owner, windows, state = self._sub_pool_roles()
+        params = EvictParams(
+            num_tokens=units.get(owner, 0) * page,
+            window_num_tokens={
+                self.window_slot_of(name): units[name] * page
+                for name in windows
+                if units.get(name, 0)
+            },
+            mamba_num=0 if state is None else units.get(state, 0),
+        )
+        if params.num_tokens or params.window_num_tokens or params.mamba_num:
+            result.add(
+                self.evict_until(
+                    params, satisfied=lambda: allocator.fits_after_frees(demands)
+                )
+            )
+
     @rank_consensus(same_params=["params"], same_results=True)
     def evict_until(
         self, params: EvictParams, satisfied: Callable[[], bool]
@@ -768,9 +859,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return EvictResult()
         return self._evict(params, satisfied=satisfied)
 
-    def _evict_request_by_type(
-        self, params: Union[EvictParams, AllocDemand]
-    ) -> dict[ComponentType, int]:
+    def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
         """Per tree component, what ``params`` asks of it."""
         windows = self.window_slots()
         unknown = set(params.window_num_tokens) - set(windows)
@@ -792,7 +881,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 return self.token_to_kv_pool_allocator.full_available_size()
             return self.token_to_kv_pool_allocator.available_size()
         if component_type in self.window_slots():
-            return self.window_available_size(component_type)
+            return self.window_available_size(
+                self.window_sub_pool_of_slot(component_type)
+            )
         if component_type == self.slot_id(TREE_STATE):
             return (
                 self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
@@ -1957,7 +2048,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         token_slot = self.slot_id(TREE_TOKEN)
         if self._pool_available(token_slot) < kv_tokens:
-            self.evict_for_alloc(AllocDemand(num_tokens=kv_tokens))
+            self.evict_for_alloc(KVDemand(full_tokens=kv_tokens))
             if self._pool_available(token_slot) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
@@ -3886,9 +3977,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return swa.sliding_window_size
 
-    def window_retain_size(self, component: ComponentType) -> int:
+    def window_retain_size(self, sub_pool: str) -> int:
         """Resolved retained history used by this window's readers and cache."""
-        return self.components[component].sliding_window_size
+        return self.components[self.window_slot_of(sub_pool)].sliding_window_size
 
     def swa_retain_floor(self, req, *, window=None) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:
@@ -3932,6 +4023,36 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def window_slots(self) -> tuple[ComponentType, ...]:
         return self._window_slots
+
+    def _window_sub_pools_by_slot(self) -> dict[ComponentType, str]:
+        """Each window slot's sub-pool, as the storage names it."""
+        names = self.__dict__.get("_window_slot_sub_pools")
+        if names is None:
+            storage = self.kv_storage()
+            names = {
+                slot: storage.tree_sub_pool(slot, family=TREE_WINDOW)
+                for slot in self._window_slots
+            }
+            self.__dict__["_window_slot_sub_pools"] = names
+        return names
+
+    def window_slot_of(self, sub_pool: str) -> ComponentType:
+        for slot, name in self._window_sub_pools_by_slot().items():
+            if name == sub_pool:
+                return slot
+        raise KeyError(f"no window slot keeps sub-pool {sub_pool!r}")
+
+    def window_sub_pool_of_slot(self, slot: ComponentType) -> str:
+        return self._window_sub_pools_by_slot()[slot]
+
+    def window_sub_pools(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (name, self.components[slot].sliding_window_size)
+            for slot, name in self._window_sub_pools_by_slot().items()
+        )
+
+    def _sub_pool_roles(self):
+        return self.token_to_kv_pool_allocator.sub_pool_roles()
 
     def window_lengths(self) -> tuple[tuple[ComponentType, int], ...]:
         return tuple(
@@ -3983,8 +4104,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
 
-    def window_evictable_size(self, component: ComponentType) -> int:
-        if component not in self.components:
+    def window_evictable_size(self, sub_pool: str) -> int:
+        try:
+            component = self.window_slot_of(sub_pool)
+        except KeyError:
             return 0
         return self.tree_core.component_evictable_size(component)
 
@@ -3994,8 +4117,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_protected_size(self) -> int:
         return self.tree_core.swa_protected_size()
 
-    def window_protected_size(self, component: ComponentType) -> int:
-        if component not in self.components:
+    def window_protected_size(self, sub_pool: str) -> int:
+        try:
+            component = self.window_slot_of(sub_pool)
+        except KeyError:
             return 0
         return self.tree_core.component_protected_size(component)
 
@@ -4026,7 +4151,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if ct == BASE_COMPONENT_TYPE:
                 continue
             if ct in self.window_slots():
-                available_size = self.window_available_size(ct)
+                available_size = self.window_available_size(
+                    self.window_sub_pool_of_slot(ct)
+                )
             elif ct.is_mamba:
                 available_size = (
                     self.token_to_kv_pool_allocator.state_slots.available_size()

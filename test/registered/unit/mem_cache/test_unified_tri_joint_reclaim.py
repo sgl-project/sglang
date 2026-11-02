@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
@@ -305,7 +306,7 @@ class TestTriJointReclaim(CustomTestCase):
                     a.admits(
                         400,
                         demand_windows(a, 400, 400),
-                        evictable=a.admission_evictable(c),
+                        evictable=evictable_by_sub_pool(c),
                     )
                 )
                 prefix = torch.tensor([0])
@@ -769,7 +770,7 @@ class TestTriJointReclaim(CustomTestCase):
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
-                query = a._units_fit
+                query = a.units_fit
                 checkpoints, results = [], []
 
                 def checked_query(demands):
@@ -797,7 +798,7 @@ class TestTriJointReclaim(CustomTestCase):
                 sa = a.swa_attn_allocator
 
                 with (
-                    patch.object(a, "_units_fit", side_effect=checked_query),
+                    patch.object(a, "units_fit", side_effect=checked_query),
                     patch.object(c, "evict_until", side_effect=checked_evict),
                     patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
                     patch.object(

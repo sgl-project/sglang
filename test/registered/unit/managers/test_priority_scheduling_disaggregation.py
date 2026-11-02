@@ -520,6 +520,12 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator.alloc.side_effect = iter(range(100))
 
         queue.token_to_kv_pool_allocator = MagicMock()
+
+        queue.token_to_kv_pool_allocator.sub_pool_roles.return_value = (
+            "full",
+            (),
+            None,
+        )
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000

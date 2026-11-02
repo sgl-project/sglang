@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     DecLockRefParams,
     IncLockRefResult,
     InsertResult,
@@ -18,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -500,7 +500,7 @@ class FullComponent(TreeComponent):
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
             if storage.available_units(sub_pool) < num_tokens:
-                self.cache.evict_for_alloc(AllocDemand(num_tokens=num_tokens))
+                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

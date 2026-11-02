@@ -28,7 +28,7 @@ import torch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
-from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import (
     ChainRoles,
     take_new_pages,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, plan
 from sglang.srt.mem_cache.kv.alloc.signals import wait_signals
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -482,7 +483,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                 cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
 
                 swa_live_before = allocator.swa_attn_allocator._live_pages()
-                result = cache.evict_for_alloc(AllocDemand(mamba_num=1))
+                result = cache.evict_for_alloc(KVDemand(state_slots=1))
 
                 self.assertEqual(walk["freed_leaves"], 1)
                 self.assertEqual(result.num_tokens_evicted, page_size)
@@ -1610,8 +1611,8 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         )
         self.assertFalse(
             allocator.prealloc_fits(
-                self._empty_tree(),
                 token_demand(allocator, full_demand, swa_demand),
+                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=full_demand,
                 swa_budget_tokens=swa_demand,
             )
@@ -1628,8 +1629,8 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         swa_budget = allocator.swa_available_size() - held
         self.assertTrue(
             allocator.prealloc_fits(
-                self._empty_tree(),
                 token_demand(allocator, page_size, page_size),
+                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=full_budget,
                 swa_budget_tokens=swa_budget,
             )
@@ -1637,8 +1638,8 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         # The request may not exceed its side's budget.
         self.assertFalse(
             allocator.prealloc_fits(
-                self._empty_tree(),
                 token_demand(allocator, page_size, page_size),
+                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=page_size - 1,
                 swa_budget_tokens=swa_budget,
             )
@@ -1647,8 +1648,8 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         # leaves no shared bytes for the request.
         self.assertFalse(
             allocator.prealloc_fits(
-                self._empty_tree(),
                 token_demand(allocator, page_size, page_size),
+                evictable=evictable_by_sub_pool(self._empty_tree(), allocator),
                 full_budget_tokens=page_size,
                 swa_budget_tokens=page_size,
             )

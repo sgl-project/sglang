@@ -65,17 +65,21 @@ def _get_allocator_type() -> str:
 
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     cache.evict_for_alloc(
-        AllocDemand(window_num_tokens=cache.all_windows(required_size))
+        KVDemand(
+            window_tokens=dict.fromkeys(
+                cache.token_to_kv_pool_allocator.window_pool_names(), required_size
+            )
+        )
     )
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-    cache.evict_for_alloc(AllocDemand(mamba_num=required_size))
+    cache.evict_for_alloc(KVDemand(state_slots=required_size))
 
 
 def _make_layer_mapper(
@@ -1539,12 +1543,12 @@ def _evict_for_host_load(
     component: ComponentType,
     required_size: int,
 ) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     if component == ComponentType.MAMBA:
-        demand = AllocDemand(mamba_num=required_size)
+        demand = KVDemand(state_slots=required_size)
     else:
-        demand = AllocDemand(window_num_tokens={component: required_size})
+        demand = KVDemand(window_tokens={sub_pool: required_size})
     cache.evict_for_alloc(demand)
 
 

@@ -94,12 +94,12 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, TokenDemand
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     BasePrefixCache,
     TreeLock,
+    evictable_by_sub_pool,
     window_sub_pool_of,
 )
 from sglang.srt.mem_cache.common import (
@@ -117,6 +117,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
@@ -535,14 +536,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_reservation_fits(
         self,
-        demand: TokenDemand,
+        demand: KVDemand,
         *,
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
     ) -> bool:
-        return self.token_to_kv_pool_allocator.prealloc_fits(
-            self.tree_cache,
+        allocator = self.token_to_kv_pool_allocator
+        return allocator.prealloc_fits(
             demand,
+            evictable=evictable_by_sub_pool(self.tree_cache, allocator),
             full_budget_tokens=full_allocatable_tokens,
             swa_budget_tokens=swa_allocatable_tokens,
         )
@@ -557,7 +559,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return state.pending_request_slots(self.req_to_token_pool, req)
 
     def _reclaim_prealloc_capacity(
-        self, demand: TokenDemand, req_id: str
+        self, demand: KVDemand, req_id: str
     ) -> Optional[str]:
         shortfall = self.token_to_kv_pool_allocator.reclaim_for_prealloc(
             self.tree_cache, demand
@@ -622,7 +624,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         reserved: bool,
         state_slots: int = 0,
         target_window_tokens: Optional[int] = None,
-    ) -> TokenDemand:
+    ) -> KVDemand:
         """A preallocation's demand naming every window, in whole pages. With
         tail preallocation each window takes the tail it keeps of the request
         (`_window_tails`), plus the decode reservation when ``reserved``;
@@ -645,7 +647,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             windows = dict.fromkeys(allocator.window_pool_names(), full_tokens)
         if target_window_tokens is not None and windows:
             windows[window_sub_pool_of(allocator)] = target_window_tokens
-        return TokenDemand(full_tokens, windows, state_slots)
+        return KVDemand(full_tokens, windows, state_slots)
 
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
@@ -2470,7 +2472,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             result = self.tree_cache.evict_for_alloc(
-                AllocDemand(num_tokens=required_alloc_tokens)
+                KVDemand(full_tokens=required_alloc_tokens)
             )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(

@@ -563,7 +563,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
 
         alloc.flush_deferred_full_frees()
         self.assertTrue(
-            alloc.reclaim(cache, alloc.page_demands(token_demand(alloc, before + 4, 0)))
+            cache.reclaim(alloc.page_demands(token_demand(alloc, before + 4, 0)))
         )
         self.assertEqual(alloc.full_available_size(), before + 8)
 

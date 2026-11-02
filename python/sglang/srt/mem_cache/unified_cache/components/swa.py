@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     DecLockRefParams,
     IncLockRefResult,
     InsertParams,
@@ -20,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -1242,7 +1242,7 @@ class SWAComponent(TreeComponent):
             storage, sub_pool = self.storage_and_sub_pool()
             if storage.available_units(sub_pool) < num_tokens:
                 self.cache.evict_for_alloc(
-                    AllocDemand(window_num_tokens={self.component_type: num_tokens})
+                    KVDemand(window_tokens={sub_pool: num_tokens})
                 )
             transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:

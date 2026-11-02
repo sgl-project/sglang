@@ -344,7 +344,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     self.assertTrue(bool(torch.all(resume.unit_ids > 0)), name)
                     self.assertEqual(len(resume.unit_ids), sent[name], name)
                     self.assertEqual(
-                        req.kv.get_evicted_seqlen(allocator.window_component(band)),
+                        req.kv.get_evicted_seqlen(storage.window_tree_component(name)),
                         seq_len - tail,
                         name,
                     )

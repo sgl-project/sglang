@@ -22,8 +22,9 @@ realizes the selected reservation before a host transfer pins device rows.
 from contextlib import nullcontext
 from typing import Dict, Mapping, Optional
 
-from sglang.srt.mem_cache.allocator.base import TokenDemand
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, estimate_window_tokens
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 
@@ -33,41 +34,6 @@ def _single_window_hit(
     """Host hit tokens of a pool keeping one window, whichever slot id the
     tree gives it."""
     return max((window_host_hit_lengths or {}).values(), default=0)
-
-
-def estimate_swa_kv_tokens(
-    extend_input_len: int,
-    max_new_tokens: int,
-    *,
-    sliding_window_size: Optional[int],
-    page_size: int,
-    allocation_limit: Optional[int] = None,
-    host_hit_length: int = 0,
-) -> int:
-    """Peak SWA reservation for one prefill/decode request."""
-    if sliding_window_size is None or sliding_window_size <= 0:
-        reserved = extend_input_len + max_new_tokens + page_size
-    else:
-        allocated = (
-            extend_input_len
-            if allocation_limit is None
-            else min(extend_input_len, allocation_limit)
-        )
-        allocated_tail = max(allocated - sliding_window_size, 0)
-        # With a roughly two-window SWA pool, a cached prefix can already lock
-        # one window. Charging another whole window for a short resume can then
-        # block admission forever on an idle pool. Reserve only its uncached
-        # tail plus decode headroom, capped at the window.
-        # Including the extension also keeps the reservation large enough for
-        # this pass's prefill allocation.
-        reserved = (
-            allocated_tail
-            + min(extend_input_len + max_new_tokens, sliding_window_size)
-            + page_size
-        )
-    if host_hit_length > 0:
-        reserved += -(-host_hit_length // page_size) * page_size
-    return reserved
 
 
 class PrefillBudget:
@@ -241,7 +207,7 @@ class SWAPrefillBudget(PrefillBudget):
     ):
         if self.req_ring:
             return self.allocator.swa_ring_cost_tokens
-        return estimate_swa_kv_tokens(
+        return estimate_window_tokens(
             extend_input_len,
             max_new_tokens,
             sliding_window_size=self.tree_cache.sliding_window_size,
@@ -389,14 +355,14 @@ class ChainPrefillBudget(PrefillBudget):
         )
         self.has_state_slots = allocator.mamba_allocator is not None
         self.pending_state_slots = 0
-        # (sub-pool, tree window slot, retained window) per window sub-pool.
+        # (sub-pool, retained window) per window sub-pool.
         self.windows = tuple(
-            (name, component, window)
-            for name, component, window, _ in allocator.admission_windows(tree_cache)
+            (name, tree_cache.window_retain_size(name))
+            for name in allocator.window_pool_names()
         )
         # A mixed decode token writes one row in every window too.
         self.window_offsets = {
-            name: num_mixed_decode_tokens for name, _, _ in self.windows
+            name: num_mixed_decode_tokens for name, _ in self.windows
         }
 
     def window_tokens(
@@ -409,24 +375,27 @@ class ChainPrefillBudget(PrefillBudget):
     ):
         """The tokens one request reserves in each window sub-pool; host hits
         are given per tree window slot."""
-        host_hit_lengths = host_hit_lengths or {}
+        hits = {
+            self.tree_cache.window_sub_pool_of_slot(slot): n
+            for slot, n in (host_hit_lengths or {}).items()
+        }
         return {
-            name: estimate_swa_kv_tokens(
+            name: estimate_window_tokens(
                 extend_input_len,
                 max_new_tokens,
                 sliding_window_size=window,
                 page_size=self.page_size,
                 allocation_limit=chunk_limit,
-                host_hit_length=host_hit_lengths.get(component, 0),
+                host_hit_length=hits.get(name, 0),
             )
-            for name, component, window in self.windows
+            for name, window in self.windows
         }
 
     def request_state_slots(self, req) -> int:
         return self.allocator.storage.pending_state_slots(req)
 
     def _no_window_tokens(self) -> Dict[str, int]:
-        return {name: 0 for name, _, _ in self.windows}
+        return {name: 0 for name, _ in self.windows}
 
     def _fits(self, full_tokens, window_tokens, state_slots=0, *, empty_pool=False):
         """Whether the pending work plus this demand is admitted (or this demand
@@ -437,13 +406,13 @@ class ChainPrefillBudget(PrefillBudget):
             {
                 name: window_tokens[name]
                 + (self.window_offsets[name] if pending else 0)
-                for name, _, _ in self.windows
+                for name, _ in self.windows
             },
             state_slots + (self.pending_state_slots if pending else 0),
             evictable=(
                 None
                 if empty_pool
-                else self.allocator.admission_evictable(self.tree_cache)
+                else evictable_by_sub_pool(self.tree_cache, self.allocator)
             ),
             empty_pool=empty_pool,
         )
@@ -633,7 +602,7 @@ class ChainPrefillBudget(PrefillBudget):
                 host_hit_lengths=dict(window_host_hit_lengths or {}),
             ).items()
         }
-        return TokenDemand(
+        return KVDemand(
             full_tokens,
             windows,
             state_slots + self.pending_state_slots if self.has_state_slots else 0,

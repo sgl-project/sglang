@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.prefill_budget import (
     ChainPrefillBudget,
     PrefillBudget,
     SWAPrefillBudget,
-    estimate_swa_kv_tokens,
+    estimate_window_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -1291,7 +1291,7 @@ class TestPrefillAdder(CustomTestCase):
                     rem_chunk_tokens=rem_chunk,
                 )
                 self.assertEqual(
-                    estimate_swa_kv_tokens(
+                    estimate_window_tokens(
                         extend,
                         max_new,
                         sliding_window_size=window,
@@ -1618,8 +1618,8 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
         allocator = self.mock_token_allocator
-        allocator.admission_windows.return_value = ()
-        allocator.admission_evictable.return_value = {}
+        allocator.window_pool_names.return_value = ()
+        allocator.sub_pool_roles.return_value = ("full", (), None)
         allocator.reclaim_for_load_back.return_value = None
         # A state slot takes free slot ids and 64 tokens' worth of shared bytes.
         allocator.admits.side_effect = lambda full, windows, state=0, **kwargs: (

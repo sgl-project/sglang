@@ -17,11 +17,12 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.base_prefix_cache import AllocDemand, BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel
@@ -261,7 +262,7 @@ def ensure_mamba_capacity(
     allocator = state.slots
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
     if allocator.schedulable_available_size() < needed and supports_mamba:
-        tree_cache.evict_for_alloc(AllocDemand(mamba_num=needed))
+        tree_cache.evict_for_alloc(KVDemand(state_slots=needed))
     return allocator.schedulable_available_size() >= needed
 
 

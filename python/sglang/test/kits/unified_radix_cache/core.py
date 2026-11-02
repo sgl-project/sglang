@@ -5,10 +5,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -200,9 +200,13 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 capacity["available"] = self._SHORTFALL
 
         params = (
-            AllocDemand(window_num_tokens={component_type: self._SHORTFALL})
+            KVDemand(
+                window_tokens={
+                    cache.window_sub_pool_of_slot(component_type): self._SHORTFALL
+                }
+            )
             if component_type is ComponentType.SWA
-            else AllocDemand(mamba_num=self._SHORTFALL)
+            else KVDemand(state_slots=self._SHORTFALL)
         )
         with (
             mock.patch.object(cache, "_pool_available", side_effect=available_size),

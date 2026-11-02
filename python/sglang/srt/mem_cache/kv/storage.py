@@ -720,8 +720,9 @@ class KVStorage:
 
     def window_tree_component(self, sub_pool: str):
         """The prefix-tree slot of a window sub-pool."""
-        allocator = self._allocator
-        return allocator.window_component(allocator.window_allocators[sub_pool])
+        return self._tree_slot_ids[
+            self._plan.sub_pool(sub_pool).external.tree_component
+        ]
 
     def storage_format_tag(self) -> Optional[str]:
         """The tag a persisted host copy of this storage's layout carries."""

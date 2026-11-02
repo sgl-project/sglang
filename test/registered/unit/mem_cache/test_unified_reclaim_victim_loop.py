@@ -7,11 +7,11 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
-    EvictParams,
     InsertParams,
     MatchPrefixParams,
+    evictable_by_sub_pool,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import first_plan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -85,7 +85,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                     allocator.free_swa(allocator.alloc(4))
                 owner = allocator.full_attn_allocator.sub_pool_name
                 demand = {owner: allocator.full_available_size() + 2}
-                self.assertFalse(allocator._units_fit(demand))
+                self.assertFalse(allocator.units_fit(demand))
                 walks = []
                 original = cache.evict_until
 
@@ -95,7 +95,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                     return result
 
                 with patch.object(cache, "evict_until", side_effect=walk):
-                    self.assertTrue(allocator.reclaim(cache, demand))
+                    self.assertTrue(cache.reclaim(demand))
                 first = walks[0][0]
                 self.assertGreater(first.num_tokens, 0)
                 self.assertEqual(
@@ -104,7 +104,7 @@ class TestReclaimVictimLoop(CustomTestCase):
                 )
                 self.assertEqual(len(walks), 1)
                 self.assertLess(walks[0][1].num_tokens_evicted, first.num_tokens)
-                self.assertTrue(allocator._units_fit(demand))
+                self.assertTrue(allocator.units_fit(demand))
                 self.assertIsNotNone(
                     allocator.realize(first_plan(allocator.pricing_snapshot(), demand))
                 )
@@ -137,11 +137,10 @@ class TestReclaimVictimLoop(CustomTestCase):
                     tokens,
                     demand_windows(allocator, tokens, tokens),
                     slots,
-                    evictable=allocator.admission_evictable(cache),
+                    evictable=evictable_by_sub_pool(cache),
                 )
                 before = _evictable(cache)
-                ready = allocator.reclaim(
-                    cache,
+                ready = cache.reclaim(
                     allocator.page_demands(
                         token_demand(allocator, tokens, tokens, state_slots=slots)
                     ),
@@ -175,33 +174,31 @@ class TestReclaimVictimLoop(CustomTestCase):
                 component = rng.choice(("owner", "window", "state"))
                 if component == "state":
                     need = rng.randint(1, 3)
-                    params = EvictParams(mamba_num=need)
+                    params = KVDemand(state_slots=need)
                     demand = {state: need}
                     admitted = allocator.admits(
                         0,
                         {window: 0},
                         need,
-                        evictable=allocator.admission_evictable(cache),
+                        evictable=evictable_by_sub_pool(cache),
                     )
                 else:
                     page = allocator.page_size
                     need = rng.randint(1, 48)
                     name = owner if component == "owner" else window
                     if component == "owner":
-                        params = AllocDemand(num_tokens=need)
+                        params = KVDemand(full_tokens=need)
                     else:
-                        params = AllocDemand(
-                            window_num_tokens={cache.window_slots()[0]: need}
-                        )
+                        params = KVDemand(window_tokens={window: need})
                     demand = {name: -(-need // page)}
                     admitted = allocator.admits(
                         need if component == "owner" else 0,
                         {window: 0 if component == "owner" else need},
-                        evictable=allocator.admission_evictable(cache),
+                        evictable=evictable_by_sub_pool(cache),
                     )
                 before = _evictable(cache)
                 cache.evict_for_alloc(params)
-                self.assertEqual(allocator._units_fit(demand), admitted)
+                self.assertEqual(allocator.units_fit(demand), admitted)
                 outcomes.add(admitted)
                 if not admitted:
                     self.assertEqual(_evictable(cache), before)
