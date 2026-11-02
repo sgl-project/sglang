@@ -264,7 +264,10 @@ mod tests {
                 Segment::Text(1..2),
                 Segment::Media {
                     item: 0,
-                    pattern: TokenPattern::Repeat { id: 5, n: u32::MAX as usize },
+                    pattern: TokenPattern::Repeat {
+                        id: 5,
+                        n: u32::MAX as usize,
+                    },
                 },
             ],
         };
@@ -275,7 +278,10 @@ mod tests {
         let over = TokenLayout {
             segments: vec![Segment::Media {
                 item: 0,
-                pattern: TokenPattern::Repeat { id: 5, n: u32::MAX as usize + 2 },
+                pattern: TokenPattern::Repeat {
+                    id: 5,
+                    n: u32::MAX as usize + 2,
+                },
             }],
         };
         let err = apply_layout(&[1], &over, 1).err().unwrap();
