@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use dynamo_tokenizers::{traits::Encoder as _, FastTikTokenTokenizer};
 use serde_json::{json, Value};
 use sgl_router::config::{TokenizerBackend, TokenizerConfig};
-use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter};
+use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter, stats::EncodeBackend};
 use sha2::{Digest, Sha256};
 
 #[path = "../../fixtures/kimi_k3.rs"]
@@ -72,7 +72,13 @@ fn kimi_tokens_match_sglang_on(backend: TokenizerBackend) {
         backend,
         l1_cache_mb: 0,
     };
-    let (tokenizer, _) = adapter::load_with(path, cfg).unwrap();
+    let (tokenizer, stats) = adapter::load_with(path, cfg).unwrap();
+    // `fast` must really encode on fastokens here, not fall back to tiktoken-rs.
+    let expected = match backend {
+        TokenizerBackend::Hf => EncodeBackend::Tiktoken,
+        TokenizerBackend::Fast => EncodeBackend::FastTiktoken,
+    };
+    assert_eq!(stats.backend(), expected, "{backend:?}");
     let formatter = ChatFormatter::load("served-alias", path).unwrap().unwrap();
     let cases: Vec<Value> =
         serde_json::from_str(include_str!("../../fixtures/kimi_k3/prompts.json")).unwrap();

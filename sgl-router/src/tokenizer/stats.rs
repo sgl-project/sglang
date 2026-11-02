@@ -23,6 +23,11 @@ pub enum EncodeBackend {
 }
 
 impl EncodeBackend {
+    /// Whether the tokenizer was loaded from a tiktoken `.model`, whichever engine encodes it.
+    pub fn is_tiktoken(self) -> bool {
+        matches!(self, Self::Tiktoken | Self::FastTiktoken)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Hf => "hf",
