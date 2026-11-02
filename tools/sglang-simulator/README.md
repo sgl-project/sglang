@@ -137,6 +137,25 @@ no estimator SDK installed, the SDK-dependent cases fail at server startup;
 it is not skipped. The CPU CI workflow runs the full suite in a single
 AISimulate environment with the real SDK installed.
 
+### macOS CPU simulation
+
+The CPU simulator has host compatibility hooks for macOS: it avoids Linux NUMA
+and native CPU thread initialization, and permits native kernel imports without
+loading those kernels. An attempted native kernel execution raises an error;
+these hooks do not provide real CPU or Metal inference. The runtime remains
+single-worker even when the predictor models a larger deployment.
+
+For Replay without AISimulate, pass `--max-total-tokens` explicitly. With the
+matching SGLang source and Python dependencies available, validate the local
+HTTP path from the repository root:
+
+```bash
+python -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py -k timestamp_trace
+```
+
+This smoke test uses the local Qwen3 test configuration and tokenizer. Passing
+it does not establish compatibility for every model or predictor on macOS.
+
 ## Serving mode
 
 Choose a fresh output directory and export it in the server terminal before
