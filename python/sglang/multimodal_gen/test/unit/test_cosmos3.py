@@ -1753,7 +1753,11 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertTrue(torch.allclose(out, torch.full((1,), 56.0)))
 
     def test_control_cfg_parallel_distribution(self):
-        """Round-robin branch distribution + all-reduce equals the serial blend."""
+        """Round-robin branch distribution + all-reduce equals the serial blend.
+
+        Every CFG rank must run the same number of forwards: FSDP shards span the
+        CFG ranks, so an uneven split desyncs the per-forward all-gathers.
+        """
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         seen = {}
 
@@ -1802,20 +1806,20 @@ class TestCosmos3Transfer(unittest.TestCase):
         # partial; summing them mimics the cross-rank reduction.
         with mock.patch(target, side_effect=lambda x: x):
             # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
-            # uncond), rank 1 runs only the control-dropped cond_nc.
+            # uncond), rank 1 runs cond_nc plus a discarded pad forward.
             r0 = run(0, 2)
             r1 = run(1, 2)
             self.assertEqual(seen[0], ["cond", "uncond"])
-            self.assertEqual(seen[1], ["cond_nc"])
+            self.assertEqual(seen[1], ["cond_nc", "uncond"])
             self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
 
             seen.clear()
-            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
+            # 4 ranks for 3 branches: rank 3 runs a pad forward and contributes zeros.
             parts = [run(r, 4) for r in range(4)]
             self.assertEqual(seen[0], ["cond"])
             self.assertEqual(seen[1], ["cond_nc"])
             self.assertEqual(seen[2], ["uncond"])
-            self.assertEqual(seen[3], [])
+            self.assertEqual(seen[3], ["cond"])
             self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
             self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
 
