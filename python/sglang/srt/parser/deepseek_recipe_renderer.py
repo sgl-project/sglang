@@ -157,14 +157,11 @@ class DeepSeekRecipe:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
-    # NOTE(@guapisolo): Miles (radixark/miles) calls these two methods directly;
-    # keep the signatures and behavior of `convert` and `encode_conversation` stable.
     def convert(
         self, body: dict[str, Any], *, effort_budget: Optional[int] = None
     ) -> Any:
-        """Recipe's `Conversation` for `body` (see `pre_normalize`); a request recipe
-        rejects raises ValueError. Pass the same `effort_budget` to
-        `encode_conversation`, which rewrites the effort line this renders."""
+        """Convert `body` to recipe's `Conversation`; invalid requests raise ValueError.
+        Pass the same `effort_budget` to `encode_conversation`."""
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
@@ -179,8 +176,7 @@ class DeepSeekRecipe:
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None
     ) -> list[int]:
-        """Prompt ids for a recipe `Conversation`, such as one `convert` returns or a
-        prefix of its messages."""
+        """Encode a recipe `Conversation`, including a prefix of its messages."""
         prompt_ids = self._encoding.encode(conversation)
         if effort_budget is not None and conversation.thinking_mode:
             prompt_ids = self._replace_effort_budget(prompt_ids, effort_budget)
