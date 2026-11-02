@@ -32,6 +32,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Tuple,
     cast,
 )
@@ -97,9 +98,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
+)
+from sglang.srt.model_loader.tensor_aliases import (
+    TensorAlias,
+    find_tensor_aliases,
+    rebase_tensor_aliases,
 )
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
@@ -2104,26 +2109,25 @@ class PreshardedModelLoader(DefaultModelLoader):
         return extras
 
     @staticmethod
-    def _rebind_parameter_aliases(model: nn.Module) -> None:
+    def _rebind_parameter_aliases(
+        model: nn.Module, aliases: Sequence[TensorAlias]
+    ) -> None:
+        """Refresh what a loader that copies tensors in directly leaves stale:
+        Gemma norms' derived weights, and the ``aliases`` that
+        find_tensor_aliases() recorded before any parameter was replaced.
+        Without that record nothing tells a stale alias from a valid one, so
+        it is required."""
         for _, module in model.named_modules():
             if isinstance(module, GemmaRMSNorm):
                 module.refresh_gemma_weight()
 
-            attn = getattr(module, "attn", None)
-            conv1d = getattr(module, "conv1d", None)
-            if attn is None:
-                continue
-            if hasattr(module, "A_log") and hasattr(attn, "A_log"):
-                attn.A_log = module.A_log
-            if hasattr(module, "dt_bias") and hasattr(attn, "dt_bias"):
-                attn.dt_bias = module.dt_bias
-            if conv1d is None:
-                continue
-            cweight = getattr(conv1d, "weight", None)
-            if cweight is not None and isinstance(attn, RadixLinearAttention):
-                attn.refresh_conv_weights(cweight)
-            if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
-                attn.bias = conv1d.bias
+        _, problems = rebase_tensor_aliases(model, aliases)
+        if problems:
+            # Serving with them would compute with the replaced tensors.
+            raise RuntimeError(
+                f"{len(problems)} tensor alias(es) still refer to tensors the "
+                f"presharded load replaced:\n  " + "\n  ".join(problems)
+            )
 
     def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
         rank, _ = self._world_rank_and_size()
@@ -2525,6 +2529,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+            # Post-processing below may replace parameters that a module also
+            # keeps a view of or a second reference to; record those first.
+            aliases = find_tensor_aliases(model)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
@@ -2587,7 +2594,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"checkpoint at {presharded_dir}."
                 )
 
-            self._rebind_parameter_aliases(model)
+            self._rebind_parameter_aliases(model, aliases)
 
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
