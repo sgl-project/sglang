@@ -20,16 +20,14 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, IndexKeyLayout
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host.dsa import (
-    DSAIndexerPoolHost,
-    make_dsa_indexer_pool_decl,
-)
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.runtime_context import get_context
@@ -277,8 +275,8 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -298,6 +296,9 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                # Round trips require retained files regardless of runner disk
+                # pressure. Cleaner behavior has its own dedicated test suite.
+                "l3_cleaner_enabled": False,
             },
         )
 
@@ -306,13 +307,9 @@ class TestNixlUnified(CustomTestCase):
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
             )
+            self.addCleanup(self.hicache.close)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def tearDown(self):
-        """Clean up test directories."""
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @staticmethod
     def _open_fds() -> int:
@@ -531,7 +528,9 @@ class TestNixlUnified(CustomTestCase):
             },
         )
         try:
-            return HiCacheNixl(storage_config=obj_config, file_path="")
+            hicache = HiCacheNixl(storage_config=obj_config, file_path="")
+            self.addCleanup(hicache.close)
+            return hicache
         except Exception as e:
             self.skipTest(f"NIXL OBJ backend unavailable: {e}")
 
@@ -580,9 +579,12 @@ class TestNixlUnified(CustomTestCase):
 
     def test_dsa_indexer_bounce_round_trip_preserves_every_byte(self):
         """Index pages must survive copy fallback when the main KV dtype is bf16."""
+        from sglang.srt.mem_cache.device_pool_info import (
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
         from sglang.srt.mem_cache.pool_host.dsa import (
             DSAIndexerPoolHost,
-            make_dsa_indexer_pool_decl,
         )
 
         pool = SimpleNamespace(
@@ -605,7 +607,20 @@ class TestNixlUnified(CustomTestCase):
             page_size=64, layout="page_first", size=256, page_num=4
         )
         host = DSAIndexerPoolHost(
-            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+            IndexKeyBufferInfo(
+                page_size=64,
+                compress_ratio=1,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                buffers=tuple(pool.index_k_with_scale_buffer),
+            ),
+            layer_mapping={0: 0, 1: 1},
+            target_device_layer_num=pool.layer_num,
+            num_host_pages=anchor.page_num,
+            transfer_page_size=anchor.page_size,
+            layout=anchor.layout,
+            buffer_device=pool.device,
+            dtype=pool.store_dtype,
+            pin_memory=False,
         )
         self.addCleanup(host.destroy)
         with mock.patch.object(
@@ -1023,8 +1038,19 @@ class TestNixlDirectIOPages(CustomTestCase):
             )
             self.addCleanup(kv.destroy)
             indexer = DSAIndexerPoolHost(
-                make_dsa_indexer_pool_decl(index_device),
-                kv,
+                IndexKeyBufferInfo(
+                    page_size=self.PAGE_TOKENS,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                    buffers=tuple(index_device.index_k_with_scale_buffer),
+                ),
+                layer_mapping={i: i for i in range(self.LAYERS)},
+                target_device_layer_num=self.LAYERS,
+                num_host_pages=kv.page_num,
+                transfer_page_size=kv.page_size,
+                layout=kv.layout,
+                buffer_device=index_device.device,
+                dtype=index_device.store_dtype,
                 pin_memory=False,
                 allocator_type=allocator_type,
             )

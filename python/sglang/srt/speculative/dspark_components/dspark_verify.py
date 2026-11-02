@@ -8,6 +8,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
     BlockwiseRejection,
     RejectionNoise,
@@ -18,7 +19,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     FinalizeAcceptLens,
     SelectMixedAccept,
     SoftmaxTemp,
-    _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
@@ -28,6 +28,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     ScatterCompactToStrided,
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
+)
+from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
+    accept_sampling_sharded,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
@@ -77,19 +80,11 @@ _is_npu = is_npu()
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
-# Targets whose greedy accept reads the split-vocab row argmax; it does not
-# reproduce torch.argmax's NaN choice, so it stays opt-in per target.
-_FUSED_ARGMAX_TARGETS = frozenset({"deepseek_v41", "minimax_m3_vl"})
-
 
 def target_model_type(target_worker) -> Optional[str]:
     return getattr(
         target_worker.model_runner.model_config.hf_text_config, "model_type", None
     )
-
-
-def target_uses_fused_argmax(target_worker) -> bool:
-    return target_model_type(target_worker) in _FUSED_ARGMAX_TARGETS
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -159,7 +154,6 @@ class TargetVerifyExecutor:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
         self._target_is_dsv41 = target_model_type(target_worker) == "deepseek_v41"
-        self._fused_argmax = target_uses_fused_argmax(target_worker)
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -208,7 +202,6 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
-            fused_argmax=self._fused_argmax,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
         )
@@ -584,7 +577,6 @@ class DsparkVerifyEpilogue:
         device,
         tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
-        fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
         fused_accept_tail: bool = False,
@@ -611,7 +603,6 @@ class DsparkVerifyEpilogue:
         self.sim_seed_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
-        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -837,7 +828,7 @@ class DsparkVerifyEpilogue:
         simulate_fold the bonus select runs in the tail."""
         bs = candidates.shape[0]
         # Under simulate_fold the tail does not read the argmax; it still runs as served.
-        target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+        target_predict = sampling_argmax(logits).view(-1)
         bonus_parts = None
         if self.simulate_fold:
             bonus_parts = (
@@ -1038,7 +1029,6 @@ class DsparkVerifyEpilogue:
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=self._fused_argmax,
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
@@ -1219,6 +1209,33 @@ def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.T
     )
 
 
+def _accepts_on_shards(
+    draft_block: DraftBlockResult, sampling_info, block_verification: bool
+) -> bool:
+    # The sharded accept is a Triton chain rule on temperature-only target
+    # probabilities; block verification and top-k/top-p need the whole vocab.
+    # A SimpleNamespace stand-in (unit tests) has no vocab_shard.
+    shard = getattr(draft_block, "vocab_shard", None)
+    return (
+        shard is not None
+        and not getattr(draft_block, "greedy_draft", False)
+        and not block_verification
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
+
+
+def _whole_vocab_logits(draft_block: DraftBlockResult, vocab_size: int) -> torch.Tensor:
+    logits = draft_block.corrected_logits
+    shard = getattr(draft_block, "vocab_shard", None)
+    if shard is None:
+        return logits
+    # Kept on the shards, but this batch needs the whole vocab.
+    bs, gamma_rows, width = logits.shape
+    whole = shard.gather(logits.reshape(bs * gamma_rows, width))[:, :vocab_size]
+    return whole.contiguous().view(bs, gamma_rows, vocab_size)
+
+
 _blockwise_rejection_noted = False
 
 
@@ -1252,9 +1269,10 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
         )
         draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
         return draft_probs
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    corrected_logits = _whole_vocab_logits(draft_block, vocab)
+    bs, gamma_rows, vocab = corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        logits=corrected_logits.reshape(bs * gamma_rows, vocab),
         temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
     ).view(bs, gamma_rows, vocab)
@@ -1272,7 +1290,6 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
-    fused_argmax: bool = False,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1285,9 +1302,24 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=fused_argmax,
         )
-    if _blockwise_rejection_applies(
+    if _accepts_on_shards(draft_block, sampling_info, block_verification):
+        # Block-wise rejection scans the whole draft vocab. This kernel is the
+        # same chain rule and reads the draft logits on the local shard.
+        shard = draft_block.vocab_shard
+        sampled = accept_sampling_sharded(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_logits=draft_block.corrected_logits,
+            temperatures=draft_block.temperatures,
+            vocab_start=shard.start,
+            width=shard.width,
+            gather_stacked=shard.gather.gather_stacked,
+            key=draft_block.noise.key,
+            offset=draft_block.noise.offset,
+            verify_lens=cutoff_verify_lens,
+        )
+    elif _blockwise_rejection_applies(
         sampling_info=sampling_info,
         rejection_noise=rejection_noise,
         block_verification=block_verification,
@@ -1325,7 +1357,6 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
-        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(

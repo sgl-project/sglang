@@ -182,6 +182,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -326,9 +330,17 @@ class ExecKernel(msgspec.Struct):
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'cutedsl_h16' enables experimental DeepSeek-V4 BF16 sparse "
+                "prefill for 16 TP-local query heads on SM90. Only ordinary "
+                "eager prefill uses H16; graph, speculative, TBO, CP and "
+                "bounded-replay paths retain the existing backend. "
+                "DeepSeek-V4.1 is not supported. Padded combined TOPK is limited "
+                "to 16384 (including the SWA window); the default 1M context "
+                "fits this limit. Sparse-prefill threshold and environment "
+                "selection remain unchanged."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8", "cutedsl_h16"],
         ),
     ] = "auto"
     dsa_triton_union: A[
@@ -799,7 +811,7 @@ class ExecComm(msgspec.Struct):
         Arg(
             help=(
                 "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "(EXTEND / MIXED) while keeping it for decode. "
                 "Only meaningful with --enable-aiter-allreduce-fusion."
             ),
             resolvable=True,
