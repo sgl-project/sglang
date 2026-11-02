@@ -1635,6 +1635,13 @@
                     ]
                   },
                   {
+                    "group": "Fibo",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Fibo/Fibo-2.0"
+                    ]
+                  },
+                  {
                     "group": "Krea",
                     "pages": [
                       "cookbook/diffusion/Krea/Krea-2"
