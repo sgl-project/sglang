@@ -428,7 +428,7 @@ def hicache_summary(bundle, chain: str, page_size: int, layout, backend) -> dict
         host = entry.host_pool
         entries.append(
             {
-                "name": entry.name.value,
+                "name": str(entry.name),
                 "host_cls": type(host).__name__,
                 "host_size": host.size,
                 "host_page_size": host.page_size,
