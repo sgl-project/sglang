@@ -1033,6 +1033,29 @@ def shard_range(
     )
 
 
+# Arbitrary; bounds the per-chunk temporaries.
+_MXFP4_EXPAND_CHUNK_ROWS = 1 << 20
+
+
+def _e2m1_nibble_to_e4m3_bits(nibble: torch.Tensor) -> torch.Tensor:
+    # E2M1 magnitude code m (0-7, values 0, 0.5, 1, ..., 6) in e4m3: 0x00, 0x30,
+    # then 4 * m + 48 for m >= 2.
+    magnitude = nibble & 0x7
+    bits = torch.where(magnitude >= 2, magnitude * 4 + 48, magnitude * 48)
+    return bits | ((nibble & 0x8) << 4)
+
+
+def _expand_mxfp4_rows_to_fp8(*, dst: torch.Tensor, packed: torch.Tensor) -> None:
+    # packed [rows, dim // 2] uint8 E2M1 pairs, even column in the low nibble;
+    # dst [rows, dim] e4m3. The per-32 e8m0 scales stay as stored.
+    out = dst.view(torch.uint8).view(dst.shape[0], packed.shape[1], 2)
+    for start in range(0, packed.shape[0], _MXFP4_EXPAND_CHUNK_ROWS):
+        chunk = packed[start : start + _MXFP4_EXPAND_CHUNK_ROWS].to(dst.device)
+        rows = slice(start, start + chunk.shape[0])
+        out[rows, :, 0] = _e2m1_nibble_to_e4m3_bits(chunk & 0xF)
+        out[rows, :, 1] = _e2m1_nibble_to_e4m3_bits(chunk >> 4)
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -1133,10 +1156,16 @@ class EngramEmbedding(nn.Module):
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+        dst = param.data[rows] if self._shared else param.data
+        src = loaded_weight[rows]
+        if src.dtype == torch.uint8 and dst.dtype == torch.float8_e4m3fn:
+            assert (src.shape[0], src.shape[1] * 2) == tuple(dst.shape), (
+                src.shape,
+                dst.shape,
+            )
+            _expand_mxfp4_rows_to_fp8(dst=dst, packed=src)
         else:
-            param.data.copy_(loaded_weight[rows])
+            dst.copy_(src)
         if self.host_table is not None:
             self.host_table.dirty = True
 
