@@ -97,15 +97,15 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
 
   static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0, "The elts per row must cleanly divide the total elt per warp");
 
-  const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
-  const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
+  const int64_t cta_base_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA;
+  const int64_t warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
   const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-  const int thread_row = warp_base_row + thread_row_in_warp;
+  const int64_t thread_row = warp_base_row + thread_row_in_warp;
   if (thread_row >= num_rows) {
     return;
   }
 
-  const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+  const T* thread_row_ptr = input + static_cast<int64_t>(thread_row) * ELTS_PER_ROW;
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
   const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
   const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
@@ -187,7 +187,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     }
 
     if (thread_group_idx == 0) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       output[idx] = max_val;
       indices[idx] = expert;
       row_sum_for_renormalize += max_val;
@@ -209,7 +209,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
       float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
 #pragma unroll
       for (int k_idx = 0; k_idx < k; ++k_idx) {
-        const int idx = k * thread_row + k_idx;
+        const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
         output[idx] = output[idx] * row_sum_for_renormalize_inv;
       }
     }
@@ -223,7 +223,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
     const bool row_padded = (num_token_non_padded != nullptr) && (thread_row >= *num_token_non_padded);
 #pragma unroll
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-      const int idx = k * thread_row + k_idx;
+      const int64_t idx = static_cast<int64_t>(k) * thread_row + k_idx;
       const int32_t id = row_padded ? -1 : indices[idx];
       packed_output[idx] = pack_routed(id, output[idx]);
     }

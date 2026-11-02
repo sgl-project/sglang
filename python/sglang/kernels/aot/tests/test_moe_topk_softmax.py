@@ -180,5 +180,39 @@ def test_topk_softmax_renormalize(num_tokens, num_experts, topk):
     )
 
 
+# num_tokens * num_experts > INT_MAX on the fused (512) and fallback (384) paths;
+# only rows around the 2^31-element boundary are checked, to bound memory.
+@pytest.mark.parametrize("num_experts", [512, 384])
+@pytest.mark.parametrize("topk", [1, 2])
+def test_topk_softmax_int32_overflow(num_experts, topk):
+    boundary_row = 2**31 // num_experts
+    num_tokens = boundary_row + 1024
+    numel = num_tokens * num_experts
+    needs_workspace = num_experts == 384
+    required = numel * (2 + (4 if needs_workspace else 0)) + (1 << 30)
+    if torch.cuda.mem_get_info()[0] < required:
+        pytest.skip("not enough GPU memory")
+
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.bfloat16, device="cuda"
+    )
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_softmax(topk_weights, topk_indices, gating_output)
+
+    rows = torch.cat(
+        [
+            torch.arange(0, 256),
+            torch.arange(boundary_row - 256, boundary_row + 256),
+            torch.arange(num_tokens - 256, num_tokens),
+        ]
+    ).cuda()
+    probs = torch.softmax(gating_output[rows].float(), dim=-1)
+    weights_ref, _ = probs.topk(topk, dim=-1)
+    torch.testing.assert_close(topk_weights[rows], weights_ref, rtol=1e-3, atol=1e-5)
+    gathered = torch.gather(probs, 1, topk_indices[rows].long())
+    torch.testing.assert_close(gathered, topk_weights[rows], rtol=1e-3, atol=1e-5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
