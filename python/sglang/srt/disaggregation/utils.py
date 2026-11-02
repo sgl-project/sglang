@@ -407,6 +407,10 @@ class CustomizedInfoError(ValueError):
     pass
 
 
+class DraftSeedMetadataError(ValueError):
+    """Invalid speculative seed that cannot be published to a decode peer."""
+
+
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
 
@@ -750,7 +754,7 @@ class MetadataBuffers:
         self.output_topk_index[idx].zero_()
         if req.output_topk_p is not None or req.output_topk_index is not None:
             if req.output_topk_p is None or req.output_topk_index is None:
-                raise ValueError(
+                raise DraftSeedMetadataError(
                     "PD draft seed requires both top-k probabilities and indices"
                 )
             if (
@@ -758,7 +762,9 @@ class MetadataBuffers:
                 or req.output_topk_index.shape != req.output_topk_p.shape
                 or not 0 < req.output_topk_p.shape[0] <= self.output_topk_p.shape[1]
             ):
-                raise ValueError("PD draft seed exceeds or mismatches metadata capacity")
+                raise DraftSeedMetadataError(
+                    "PD draft seed exceeds or mismatches metadata capacity"
+                )
             topk = req.output_topk_p.shape[0]
             self.output_topk_p[idx, :topk].copy_(req.output_topk_p)
             self.output_topk_index[idx, :topk].copy_(req.output_topk_index)

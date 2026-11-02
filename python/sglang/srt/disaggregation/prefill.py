@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     CustomizedInfoError,
     DisaggregationMode,
+    DraftSeedMetadataError,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1659,8 +1660,9 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             try:
                 self.disagg_metadata_buffers.set_buf(req)
-            except CustomizedInfoError as exc:
-                # customized_info may be unserializable or exceed the transfer buffer.
+            except (CustomizedInfoError, DraftSeedMetadataError) as exc:
+                # Invalid request metadata must not terminate the scheduler or
+                # send a partial final chunk. Other application errors propagate.
                 req.customized_info = None
                 prepare_abort(
                     req, str(exc), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
