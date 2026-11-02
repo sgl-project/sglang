@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     compute_row_log_normalizer,
@@ -87,7 +88,7 @@ def _run(proc, batch, fast, chunk_size):
     def get_logits_fn(states, lm_head, logits_metadata, **kwargs):
         return states
 
-    return proc.forward(
+    result, sampled = proc.forward(
         pruned_states=pruned_states,
         sample_indices=sample_indices,
         input_logprob_indices=input_logprob_indices,
@@ -96,6 +97,11 @@ def _run(proc, batch, fast, chunk_size):
         get_logits_fn=get_logits_fn,
         logits_metadata=metadata,
     )
+    # CUDA results hold pinned spans until the scheduler finalizes them.
+    output = LogitsProcessorOutput(next_token_logits=None)
+    result.write_input_to(output)
+    output.finalize_input_logprobs()
+    return result, sampled
 
 
 def _assert_nested_close(test, ref, got, label, rtol, atol):
