@@ -482,6 +482,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not transfer_queue.enable_staging
             and torch.cuda.is_available()
             and is_war_barrier_enabled()
+            # Pages of a pool that hands out virtual ids may move between the
+            # allocation and a deferred readback; publish such a pool inline.
+            and not token_to_kv_pool_allocator.hands_out_virtual_ids
         )
         self._pending_publish: List[_PendingPublish] = []
         # Assumes nothing else in-process draws priority -1 (true for srt on CUDA),
