@@ -1570,10 +1570,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         # it outright for FP8: _TRTLLM_ROUTED_FP8_ARCHS = (100, 103), "the outer
         # JIT module compiles for major 12 as well, but those cubins fail at
         # runtime on SM120/121". The launcher's own gate admits major 12, so the
-        # mismatch only surfaces mid-forward as "No valid config found for the
-        # given problem shape". The modelopt_fp4 arm below already reads the same
-        # limit. Checked after the device-free `allowed` handling so a request
-        # that does not end on a trtllm backend keeps its current answer.
+        # refusal lands at the first MoE call, in that runner's constructor
+        # (trtllm_batched_gemm_runner.cu): "the trtllm-gen batched GEMM cubin
+        # manifest contains no kernels runnable on sm120". The modelopt_fp4 arm
+        # below already reads the same limit. Checked after the device-free
+        # `allowed` handling so a request that does not end on a trtllm backend
+        # keeps its current answer.
         if moe_runner_backend in (
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
