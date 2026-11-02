@@ -22,16 +22,6 @@ def _first_attr(obj, names: tuple[str, ...], default=None):
     return default
 
 
-def _placeholder_str(token) -> Optional[str]:
-    """HF processors may expose placeholder tokens as tokenizers.AddedToken
-    (e.g. Blip2Processor.image_token); regex building needs the plain text."""
-    if token is None or isinstance(token, str):
-        return token
-    if isinstance(token, (list, tuple)):
-        return [_placeholder_str(t) for t in token]
-    return str(token)
-
-
 def _uses_mrope(hf_config) -> bool:
     text_config = getattr(hf_config, "text_config", hf_config)
     rope_scaling = getattr(text_config, "rope_scaling", None) or {}
@@ -56,9 +46,9 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token=_placeholder_str(getattr(_processor, "image_token", None)),
-            video_token=_placeholder_str(getattr(_processor, "video_token", None)),
-            audio_token=_placeholder_str(getattr(_processor, "audio_token", None)),
+            image_token=getattr(_processor, "image_token", None),
+            video_token=getattr(_processor, "video_token", None),
+            audio_token=getattr(_processor, "audio_token", None),
             image_token_id=_first_attr(
                 hf_config,
                 ("image_token_id", "image_token_index", "im_token_id"),
