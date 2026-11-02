@@ -38,7 +38,7 @@ _NUM_GROUPS = _HIDDEN // _GROUP_SIZE
 # Fusion trades the flat quant grid for one 224-thread CTA per token; that (and
 # the win itself, which is launch overhead) only makes sense at small decode
 # batches. Above the cap the callers run the unfused chain.
-_MAX_TOKENS = 64
+MAX_TOKENS = 64
 
 
 @cache_once
@@ -84,7 +84,7 @@ def covered(
     return (
         moe_route_radix.covered(scores, bias, topk)
         and x.dim() == 2
-        and 0 < x.shape[0] <= _MAX_TOKENS
+        and 0 < x.shape[0] <= MAX_TOKENS
         and x.shape[1] == _HIDDEN
         and x.dtype in (torch.bfloat16, torch.float32)
         and x.stride(1) == 1
@@ -101,11 +101,18 @@ def route_quant_fused(
     renormalize: bool,
     routed_scaling_factor: float,
     apply_scale: bool,
+    local_expert_offset: int = 0,
+    num_local_experts: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, packed [M, topk]
     int32, x_q [M, 3584] fp8_e4m3, x_s [M, 28] int32 row-major packed UE8M0)``.
     Caller must have checked covered(). Winners come out in expert-id-ascending
-    order (the standalone production dispatch's sorted=False)."""
+    order (the standalone production dispatch's sorted=False).
+
+    With ``num_local_experts > 0`` the packed ids are rank-local: experts
+    ``[local_expert_offset, local_expert_offset + num_local_experts)`` become
+    ``0..num_local_experts-1`` and any other expert in slot ``k`` becomes
+    ``num_local_experts + k``. ``ids`` keeps the global ids."""
     M = scores.shape[0]
     device = scores.device
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
@@ -126,5 +133,7 @@ def route_quant_fused(
         float(routed_scaling_factor),
         bool(renormalize),
         bool(apply_scale),
+        int(local_expert_offset),
+        int(num_local_experts),
     )
     return out_w, out_i, out_packed, out_q, out_s

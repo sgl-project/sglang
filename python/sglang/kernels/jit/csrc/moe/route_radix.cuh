@@ -112,6 +112,11 @@ struct RouteRadixParams {
   int renormalize;
   int apply_scale;
   int sorted;
+  // Rank-local ids for out_packed only (out_i keeps the global ids): this rank's
+  // experts become 0..num_local_experts-1, any other expert in output slot r
+  // becomes num_local_experts + r (unique per row). num_local_experts 0 disables.
+  int local_expert_offset = 0;
+  int num_local_experts = 0;
 };
 
 // Whole-CTA routing body, callable from other kernels (the fused
@@ -318,8 +323,15 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     if (params.out_packed != nullptr) {
       // (id << 16) | bf16(w) bits -- RN float->bf16 matches the triton pack.
       const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
+      int32_t packed_id = id;
+      if (params.num_local_experts > 0) {
+        const int32_t local_id = id - params.local_expert_offset;
+        packed_id = (local_id >= 0 && local_id < params.num_local_experts)
+                        ? local_id
+                        : params.num_local_experts + static_cast<int32_t>(rank);
+      }
       params.out_packed[bx * params.out_packed_stride + rank] =
-          static_cast<int32_t>((static_cast<uint32_t>(id) << 16) | bits);
+          static_cast<int32_t>((static_cast<uint32_t>(packed_id) << 16) | bits);
     }
   }
 }
