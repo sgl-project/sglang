@@ -1,19 +1,6 @@
 from typing import Optional
 
 import numpy as np
-from aiconfigurator.sdk import models
-from aiconfigurator.sdk.backends.factory import get_backend
-from aiconfigurator.sdk.common import (
-    CommQuantMode,
-    DatabaseMode,
-    FMHAQuantMode,
-    GEMMQuantMode,
-    KVCacheQuantMode,
-    MoEQuantMode,
-)
-from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
 from sglang_simulator.simulation.types import (
     SchedulerConfig,
 )
@@ -26,6 +13,30 @@ from sglang_simulator.time_predictor.base import (
     ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
+
+try:
+    from aiconfigurator.sdk import models
+    from aiconfigurator.sdk.backends.factory import get_backend
+    from aiconfigurator.sdk.common import (
+        CommQuantMode,
+        DatabaseMode,
+        FMHAQuantMode,
+        GEMMQuantMode,
+        KVCacheQuantMode,
+        MoEQuantMode,
+    )
+    from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
+    from aiconfigurator.sdk.inference_session import InferenceSession
+    from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+except ModuleNotFoundError as exc:
+    if exc.name != "aiconfigurator":
+        raise
+    raise ImportError(
+        "AIConfigurator prediction and automatic KV-cache memory estimation "
+        "require the optional 'aiconfigurator' dependency. Install it with "
+        "`pip install 'sglang-simulator[aic]'`. To use Replay or ML without it, "
+        "set --max-total-tokens explicitly."
+    ) from exc
 
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
