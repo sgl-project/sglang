@@ -1,9 +1,10 @@
-"""The scheduler's running-request owner and the hooks that keep it."""
+"""The scheduler's running-request owner, the launched-step count, and the
+hooks that keep them."""
 
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -72,9 +73,26 @@ class _Scheduler(Scheduler):
         raise _ForwardLaunched
 
 
-def _scheduler():
-    s = _Scheduler.__new__(_Scheduler)
+def _invariant_checker(s):
+    return SchedulerInvariantChecker(
+        disaggregation_mode=DisaggregationMode.NULL,
+        page_size=1,
+        tree_cache=None,
+        token_to_kv_pool_allocator=None,
+        req_to_token_pool=None,
+        pool_stats_observer=None,
+        get_last_batch=Mock(),
+        get_running_batch=Mock(),
+        scheduler_stage_metrics=None,
+        get_chunked_req=lambda: s.chunked_req,
+        get_running_reqs=lambda: s.running_reqs,
+    )
+
+
+def _scheduler(cls=_Scheduler):
+    s = cls.__new__(cls)
     s.running_reqs = RunningReqs()
+    s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
     s.dllm_config = None
     s.enable_hisparse = False
@@ -89,6 +107,17 @@ def _scheduler():
     s.profiler_manager = MagicMock()
     s.forward_sleep_time = None
     s.enable_staging = False
+    # process_batch_result, with the mode-specific processing mocked
+    s._deferred_responses = None
+    s.publish_load_snapshot = Mock()
+    s.load_publisher = MagicMock()
+    s.load_inquirer = MagicMock()
+    s.batch_result_processor = MagicMock()
+    s.tree_cache = MagicMock()
+    s._record_step_counters = Mock()
+    s.enable_fpm = False
+    s._maybe_clear_mm_inputs = Mock()
+    s.maybe_send_health_check_signal = Mock()
     return s
 
 
@@ -162,17 +191,17 @@ class TestRunningReqsHooks(CustomTestCase):
                 _launch(s, _batch([_req("p")], ForwardMode.EXTEND))
                 self.assertEqual(len(s.running_reqs), 0)
 
-    def test_converted_step_launched_after_its_result_rejoins_no_finished_row(self):
-        # DP attention converts this rank's decode step to extend while a peer
-        # prefills, so with SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP the loop
-        # processes the previous result between scheduling and launching it.
-        # A row that result finishes still rides the launched step.
-        s = Scheduler.__new__(Scheduler)
+    def test_ngram_grammar_step_launches_no_finished_row(self):
+        # A grammar row under NGRAM processes the previous result early; once it
+        # finishes, the loop overlaps again.
         done, kept = _req("done"), _req("kept")
+        done.grammar = MagicMock()
         for req in (done, kept):
             req.kv.kv_committed_len = 4
         running = _batch([done, kept], ForwardMode.DECODE)
-        running.spec_algorithm = SpeculativeAlgorithm.NONE
+        running.spec_algorithm = SpeculativeAlgorithm.NGRAM
+        running.has_grammar = True
+        s = Scheduler.__new__(Scheduler)
         s.running_batch = running
         s.last_batch = None
         s.running_reqs = RunningReqs()
@@ -181,19 +210,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.dllm_config = None
         s.enable_hisparse = False
         s.chunked_req = None
-        s.invariant_checker = SchedulerInvariantChecker(
-            disaggregation_mode=DisaggregationMode.NULL,
-            page_size=1,
-            tree_cache=None,
-            token_to_kv_pool_allocator=None,
-            req_to_token_pool=None,
-            pool_stats_observer=None,
-            get_last_batch=Mock(),
-            get_running_batch=Mock(),
-            scheduler_stage_metrics=None,
-            get_chunked_req=lambda: s.chunked_req,
-            get_running_reqs=lambda: s.running_reqs,
-        )
+        s.invariant_checker = _invariant_checker(s)
         # Event loop
         s.gracefully_exit = False
         s._engine_paused = False
@@ -203,27 +220,18 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_unified_memory = False
         s._apply_war_barrier = Mock()
         s.launch_batch_sample_if_needed = Mock()
-        # Scheduling: no admission; every step decodes and is converted to extend.
+        # Scheduling: no admission; every step decodes.
         s.scheduler_stage_metrics = None
         s.process_pending_chunked_abort = Mock()
         s._process_hicache_events = Mock()
-        s.require_mlp_sync = True
-        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.require_mlp_sync = False
+        s.spec_algorithm = SpeculativeAlgorithm.NGRAM
         s._should_defer_prefill = Mock(return_value=False)
         s.get_new_batch_prefill = lambda b: NextBatchPlan(None, b)
-
-        def decode(batch):
-            batch.forward_mode = ForwardMode.DECODE
-            return batch
-
-        def mlp_sync(batch, **_):
-            batch.is_extend_in_batch = True
-            return batch
-
-        s.update_running_batch = decode
+        s.update_running_batch = lambda b: b
         s.dp_attn_adapter = SimpleNamespace(
-            maybe_prepare_mlp_sync_batch=mlp_sync,
-            maybe_convert_decode_to_extend=lambda b: b.convert_decode_to_extend() or b,
+            maybe_prepare_mlp_sync_batch=lambda b, **_: b,
+            maybe_convert_decode_to_extend=lambda b: b,
         )
         s._arm_prefill_decode_interval = Mock()
         s.ngram_embedding_manager = SimpleNamespace(
@@ -240,34 +248,126 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_overlap = True
         s.future_map = Mock()
         s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
+        # Each launch's rows, and whether each has an earlier step unprocessed.
+        launched = []
 
         def run_batch(batch):
+            rids = [req.rid for req in batch.reqs]
             try:
                 Scheduler.run_batch(s, batch)
             except _ForwardLaunched:
+                launched.append((rids, [r.inflight_steps > 1 for r in batch.reqs]))
                 return SimpleNamespace()
 
-        s.run_batch = run_batch
-        # The first result finishes `done`.
-        processed = []
-
         def process_batch_result(batch, result):
-            if not processed:
-                _finish(done)
-            processed.append(batch)
-            s.running_reqs.leave_finished()
+            _finish(done)
+            s._on_step_processed(batch)
 
+        s.run_batch = run_batch
         s.process_batch_result = process_batch_result
 
         with (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(True),
             envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
             self.assertRaises(StopIteration),
         ):
             s.event_loop_overlap()
 
-        self.assertEqual(len(processed), 2)
-        self.assertEqual(list(s.running_reqs), [kept])
+        self.assertEqual(
+            launched,
+            [
+                (["done", "kept"], [False, False]),
+                (["kept"], [False]),
+                (["kept"], [True]),
+            ],
+        )
+
+    def test_resource_drain_precedes_admission_and_processes_each_step_once(self):
+        for token_budget, min_free_gb in ((64, 0), (0, 2)):
+            with self.subTest(token_budget=token_budget, min_free_gb=min_free_gb):
+                s = _scheduler(Scheduler)
+                done, kept, new = (_req(rid) for rid in ("done", "kept", "new"))
+                first = _batch([done, kept], ForwardMode.EXTEND)
+                first.extend_num_tokens = 16
+                first.spec_algorithm = SpeculativeAlgorithm.NONE
+                mixed = _batch([new, kept], ForwardMode.MIXED)
+                mixed.extend_num_tokens = 32
+                mixed.spec_algorithm = SpeculativeAlgorithm.NONE
+                s.running_batch = first
+                s.last_batch = None
+                s.waiting_queue = [new]
+                s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+                s.chunked_prefill_size = 64
+                s.dynamic_chunk_sizer = None
+                s.require_mlp_sync = False
+                s.device = "cpu"
+                s.tp_cpu_group = object()
+                s.gracefully_exit = False
+                s._engine_paused = False
+                s.increment_scheduler_iterations = Mock()
+                s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
+                s.is_generation = False
+                s.enable_unified_memory = False
+                s._apply_war_barrier = Mock()
+                events, launched, processed = [], [], []
+
+                def plan(*, running_batch, last_batch):
+                    events.append("plan")
+                    if last_batch is None:
+                        return NextBatchPlan(first, running_batch)
+                    if last_batch is first:
+                        # This is the admission boundary, before allocating the
+                        # next mixed step. A late pop would still see done here.
+                        self.assertTrue(done.finished())
+                        running_batch.filter_batch()
+                        self.assertEqual(running_batch.reqs, [kept])
+                        s.waiting_queue = []
+                        return NextBatchPlan(mixed, mixed)
+                    return NextBatchPlan(None, running_batch)
+
+                def launch(batch):
+                    events.append("run")
+                    self.assertTrue(all(not req.finished() for req in batch.reqs))
+                    s._on_step_launch(batch)
+                    launched.append([req.rid for req in batch.reqs])
+                    return SimpleNamespace()
+
+                def process(batch, result):
+                    events.append("process")
+                    processed.append([req.rid for req in batch.reqs])
+                    if len(processed) == 1:
+                        _finish(done)
+                    else:
+                        _finish(kept)
+                        _finish(new)
+                    s._on_step_processed(batch)
+
+                s.get_next_batch_to_run = plan
+                s.run_batch = launch
+                s.process_batch_result = process
+                with (
+                    envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+                    envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(token_budget),
+                    envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(min_free_gb),
+                    envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_available_gpu_memory",
+                        return_value=1,
+                    ),
+                    self.assertRaises(StopIteration),
+                ):
+                    s.event_loop_overlap()
+
+                self.assertEqual(
+                    events,
+                    ["plan", "run", "process", "plan", "run", "plan", "process"],
+                )
+                self.assertEqual(launched, [["done", "kept"], ["new", "kept"]])
+                self.assertEqual(processed, launched)
+                self.assertEqual(
+                    [r.inflight_steps for r in (done, kept, new)], [0, 0, 0]
+                )
+                self.assertEqual(len(s.running_reqs), 0)
+                self.assertEqual(len(s.result_queue), 0)
 
     def test_preemption_leaves_even_when_nothing_is_admitted(self):
         s = _scheduler()
@@ -330,6 +430,23 @@ class TestRunningReqsHooks(CustomTestCase):
         self.assertIsNone(new_batch)
         s._add_request_to_queue.assert_called_once_with(victim)
         self.assertEqual(list(s.running_reqs), [other])
+
+    def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
+        s = _scheduler()
+        a, b = _req("a"), _req("b")
+        first = _batch([a, b], ForwardMode.DECODE)
+        second = _batch([a], ForwardMode.DECODE)
+        _launch(s, first)
+        _launch(s, second)
+        self.assertEqual((a.inflight_steps, b.inflight_steps), (2, 1))
+
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            s.process_batch_result(first, MagicMock())
+            s.process_batch_result(second, MagicMock())
+            self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
+            with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
+                never_launched = _batch([_req("c")], ForwardMode.DECODE)
+                s.process_batch_result(never_launched, MagicMock())
 
 
 if __name__ == "__main__":

@@ -233,7 +233,16 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
-        host = get_serving().host
+        if get_exec().moe.is_ep_joiner:
+            # An elastic-EP joiner stays out: the serving ranks gathered at
+            # their own startup and never enter this collective again, so a
+            # joiner's gather cannot meet them (a scale joiner's returns at
+            # once with unset slots, a recover joiner's waits on them; see
+            # #47505). With no endpoints the joiner's listener fans nothing
+            # out, and the serving ranks' table is untouched.
+            return []
+        bind_host = get_serving().host
+        host = bind_host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another
             # node; advertise the address the interfaces answer on.
@@ -254,19 +263,40 @@ class RustServer:
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
+            address = NetworkAddress(host, port)
             config = {
                 "dp_rank": select_kv_publisher_dp_rank(
                     get_parallel().attn_dp_size,
                     get_parallel().attn_dp_rank,
                     get_parallel().dp_rank,
                 ),
-                "endpoint": NetworkAddress(host, port).to_url(),
+                "endpoint": address.to_url(),
             }
+            if bind_host == "0.0.0.0" and address.is_ipv6:
+                config["address_error"] = (
+                    f"DP rank {config['dp_rank']} listens on IPv4 at {bind_host} "
+                    f"but advertises {address.to_url()}; set --host to :: or "
+                    "SGLANG_HOST_IP to an IPv4 address"
+                )
         gathered = get_parallel().world_group.all_gather_object(config)
-        return sorted(
+        table = sorted(
             (entry for entry in gathered if entry is not None),
             key=lambda entry: entry["dp_rank"],
         )
+        # Validate the collective result so every rank fails together, including
+        # ranks that host no listener, instead of leaving peers in the gather.
+        errors = [entry["address_error"] for entry in table if "address_error" in entry]
+        if errors:
+            raise ValueError("SGLANG_RUST_SERVER: " + "; ".join(errors))
+        attn_dp_size = get_parallel().attn_dp_size
+        if attn_dp_size > 1:
+            ranks = [entry["dp_rank"] for entry in table]
+            if ranks != list(range(attn_dp_size)):
+                raise ValueError(
+                    "SGLANG_RUST_SERVER: expected one Rust listener for each of "
+                    f"{attn_dp_size} attention-DP ranks, gathered {ranks}"
+                )
+        return table
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:

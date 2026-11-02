@@ -389,6 +389,9 @@ class DecodeRequest:
     host_staged: bool = False
     # Queued for transfer but its destination not yet sent to any prefill rank.
     awaiting_publish: bool = False
+    # Overlap without the deferred publish: (ready event, send_metadata args,
+    # kwargs) until the forward in flight at allocation time is done.
+    pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1671,6 +1674,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            # Prefill is responsible for storing this prefix; no persistence ACK is required.
+            prefill_info = getattr(decode_req.kv_receiver, "prefill_info", None)
+            decode_req.req.linker_offload_skip_prefix_len = (
+                pre_alloc_fill_len(decode_req.req)
+                if prefill_info is not None and prefill_info.stores_to_linker
+                else 0
+            )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -2019,15 +2029,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
             )
-        decode_req.kv_receiver.send_metadata(
-            page_indices,
-            decode_req.metadata_buffer_index,
-            state_indices,
-            **metadata_kwargs,
-        )
+        args = (page_indices, decode_req.metadata_buffer_index, state_indices)
+        if (
+            self.scheduler.enable_overlap
+            and not self._defer_publish
+            and metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        ):
+            # A request that finished last step can still have its forward in
+            # flight, writing pages this request was just given. Prefill's RDMA
+            # into them follows no stream, so send once that forward is done.
+            # The deferred publish already waits on an allocation fenced behind
+            # that forward; this covers the inline publish (staging,
+            # HiSparse, no WAR barrier), where the destination is sent at once.
+            ready = self.scheduler.device_module.Event()
+            ready.record(stream=self.scheduler.forward_stream)
+            decode_req.pending_metadata = (ready, args, metadata_kwargs)
+        else:
+            decode_req.kv_receiver.send_metadata(*args, **metadata_kwargs)
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
+            and decode_req.pending_metadata is None
         ):
             self._submit_prefill_recompute(decode_req)
         self._num_published_destinations += 1
@@ -3065,6 +3087,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs, _ = self.pop_transferred_with_outcomes(rids_to_check)
         return transferred_reqs
 
+    def publish_pending_metadata(self, polls: Optional[List[int]] = None) -> None:
+        pending = []
+        ready = []
+        for i, decode_req in enumerate(self.queue):
+            metadata = decode_req.pending_metadata
+            if metadata is None:
+                continue
+            poll = polls[i] if polls is not None else decode_req.kv_receiver.poll()
+            pending.append(decode_req)
+            ready.append(int(poll != KVPoll.Failed and metadata[0].query()))
+        # Publish on every rank together so an abort cannot leave only some
+        # ranks waiting for acknowledgements from a published destination.
+        ready = all_reduce_flags(
+            flags=ready, group=self.gloo_group, op=dist.ReduceOp.MIN
+        )
+        for decode_req, publish in zip(pending, ready):
+            if publish:
+                _, args, kwargs = decode_req.pending_metadata
+                decode_req.pending_metadata = None
+                decode_req.kv_receiver.send_metadata(*args, **kwargs)
+                if (
+                    decode_req.is_rebootstrap
+                    and get_disagg().disaggregation_decode_allocation_policy == "early"
+                ):
+                    self.scheduler.disagg_decode_prealloc_queue._submit_prefill_recompute(
+                        decode_req
+                    )
+
     def pop_transferred_with_outcomes(
         self, rids_to_check: Optional[Dict[str, bool]] = None
     ) -> Tuple[List[Req], Dict[str, bool]]:
@@ -3145,9 +3195,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
                 )
-                # No prefill rank can write to a destination it was never sent.
+                # No prefill rank can write to a destination it was never sent,
+                # whether the publish was deferred or the send is still held.
                 deferrable = (
-                    deferred_release_enabled and not decode_req.awaiting_publish
+                    deferred_release_enabled
+                    and not decode_req.awaiting_publish
+                    and decode_req.pending_metadata is None
                 )
                 if deferrable and not decode_req.kv_receiver.abort_notified:
                     # A failure decode did not initiate (prefill fault, transport
@@ -3261,6 +3314,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
+
+        self.publish_pending_metadata(polls)
 
         if rids_to_check is not None:
             for rid, rid_failed in outcomes.items():
@@ -3280,6 +3336,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         required_acks = (
             0
             if self._is_host_destination(decode_req)
+            or decode_req.awaiting_publish
+            or decode_req.pending_metadata is not None
             or not decode_req.kv_receiver.abort_notified
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
@@ -3465,6 +3523,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
+            )
+            if process_last_batch_early:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -3475,13 +3540,6 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
-            # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -3494,7 +3552,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
@@ -3813,6 +3871,11 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
+        elif (
+            getattr(self.tree_cache, "linker", None) is not None
+            and self.tree_cache.linker.pending_offloads
+        ):
+            self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
@@ -3822,6 +3885,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
         # Before the retraction gate below, so a deferred publish never waits on it.
         self.disagg_decode_prealloc_queue.publish_pending_destinations()
+        self.disagg_decode_transfer_queue.publish_pending_metadata()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

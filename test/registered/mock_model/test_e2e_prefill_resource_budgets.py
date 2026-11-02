@@ -47,6 +47,7 @@ def _batch(tokens: int, *, prefill: bool = True):
         extend_num_tokens=tokens,
         forward_mode=ForwardMode.EXTEND if prefill else ForwardMode.DECODE,
         spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        grammar_needs_sync=lambda: False,
     )
 
 
@@ -69,11 +70,19 @@ def _consensus_worker(rank: int, port: int) -> None:
             scheduler.result_queue = []
             scheduler.device = "cuda"
             scheduler.tp_cpu_group = cpu_group
+            scheduler.chunked_prefill_size = 64
+            scheduler.waiting_queue = [object()]
+            scheduler.chunked_req = None
+            scheduler.dllm_config = None
+            scheduler.dynamic_chunk_sizer = None
+            scheduler.grammar_manager = SimpleNamespace(
+                has_waiting_grammars=lambda: False
+            )
 
             # The same ranks must still make progress on their device group
             # after every overlap decision, including asymmetric observations.
-            def check(expected, current, previous):
-                decision = scheduler.is_disable_overlap_for_batch(current, previous)
+            def check(expected, previous):
+                decision = scheduler.should_process_last_batch_early(previous)
                 witness = torch.tensor([int(decision)], device=f"cuda:{rank}")
                 dist.all_reduce(witness)
                 assert decision == expected, (rank, decision, expected)
@@ -82,7 +91,7 @@ def _consensus_worker(rank: int, port: int) -> None:
             total = torch.cuda.get_device_properties(rank).total_memory
             for local_gb in ((4.0, 1.0), (1.0, 4.0), (2.0, 4.0)):
                 with (
-                    envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False),
+                    envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
                     envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(0),
                     envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(2.0),
                     patch(
@@ -96,30 +105,35 @@ def _consensus_worker(rank: int, port: int) -> None:
                         ),
                     ),
                 ):
-                    check(min(local_gb) < 2.0, _batch(16), _batch(16))
+                    check(min(local_gb) < 2.0, _batch(16))
                     assert observation.call_count == 1
 
                     # A decode boundary must not enter the memory collective.
                     observation.reset_mock()
-                    check(False, _batch(1, prefill=False), _batch(16))
-                    check(False, _batch(16), None)
+                    check(False, _batch(1, prefill=False))
+                    check(False, None)
+                    scheduler.waiting_queue = []
+                    check(False, _batch(16))
+                    scheduler.waiting_queue = [object()]
                     observation.assert_not_called()
 
             with (
-                envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False),
+                envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
                 envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
                 patch(
                     "torch.cuda.mem_get_info",
                     side_effect=AssertionError("disabled memory budget must not probe"),
                 ),
             ):
-                for budget, current, previous, expected in (
-                    (0, 80, 80, False),
-                    (128, 64, 64, False),
-                    (128, 64, 65, True),
+                for budget, previous, expected in (
+                    (0, 80, False),
+                    (128, 64, False),
+                    (128, 65, True),
+                    (96, 32, False),
+                    (95, 32, True),
                 ):
                     with envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(budget):
-                        check(expected, _batch(current), _batch(previous))
+                        check(expected, _batch(previous))
     finally:
         dist.destroy_process_group(cpu_group)
         dist.destroy_process_group()
@@ -157,7 +171,7 @@ class _PrefillResourceTP:
             envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.override(True),
             envs.SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT.override(True),
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(True),
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False),
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
             envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(96),
             envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
             envs.SGLANG_FCFS_WARM_PREFILL_RESERVE_TOKENS.override(cls.RESERVE_TOKENS),
@@ -218,24 +232,32 @@ def _script_smaller_input_budget(t: ScriptedContext):
 
     hook = t._scheduler_hook
     original = hook.on_run_batch
-    original_decision = t.scheduler.is_disable_overlap_for_batch
+    original_decision = t.scheduler.should_process_last_batch_early
+    original_plan = t.scheduler.get_next_batch_to_run
     original_process = t.scheduler.process_batch_result
     batches = []
     decisions = []
     events = []
 
-    def decide(batch, last_batch):
-        disabled = original_decision(batch, last_batch)
-        if batch is not None and last_batch is not None:
-            consecutive = (
-                batch.forward_mode.is_extend() and last_batch.forward_mode.is_extend()
+    def decide(last_batch):
+        early = original_decision(last_batch)
+        if last_batch is not None:
+            prefill = last_batch.forward_mode.is_extend()
+            possible_prefill = bool(
+                t.scheduler.waiting_queue
+                or t.scheduler.chunked_req is not None
+                or t.scheduler.grammar_manager.has_waiting_grammars()
             )
-            tokens = (batch.extend_num_tokens or 0) + (
+            token_bound = (
                 last_batch.extend_num_tokens or 0
-            )
-            decisions.append((consecutive, tokens, bool(disabled)))
-            events.append(("decision", bool(disabled)))
-        return disabled
+            ) + t.scheduler.chunked_prefill_size
+            decisions.append((prefill, possible_prefill, token_bound, bool(early)))
+            events.append(("decision", bool(early)))
+        return early
+
+    def plan(*args, **kwargs):
+        events.append(("plan",))
+        return original_plan(*args, **kwargs)
 
     def process(batch, result):
         events.append(("process",))
@@ -263,7 +285,10 @@ def _script_smaller_input_budget(t: ScriptedContext):
 
     with (
         patch.object(hook, "on_run_batch", side_effect=capture),
-        patch.object(t.scheduler, "is_disable_overlap_for_batch", side_effect=decide),
+        patch.object(
+            t.scheduler, "should_process_last_batch_early", side_effect=decide
+        ),
+        patch.object(t.scheduler, "get_next_batch_to_run", side_effect=plan),
         patch.object(t.scheduler, "process_batch_result", side_effect=process),
     ):
         for _ in range(DEFAULT_MAX_STEPS):
@@ -285,18 +310,33 @@ def _script_smaller_input_budget(t: ScriptedContext):
         yield from run_until_finished(continuation)
         yield from run_until_finished(warm)
 
-    # The real loop must keep equality overlapped, drain above the token
-    # threshold, and preserve decode overlap. Observe the result/run order
-    # while calling the original scheduler methods on the original batches.
-    assert (True, 96, False) in decisions, decisions
+    # The real loop compares the previous prefill with the next step's fixed
+    # chunk upper bound before planning. Equality stays overlapped; a shorter
+    # actual next batch can drain conservatively. Decode overlap stays intact.
+    assert (True, True, 96, False) in decisions, decisions
     assert any(
-        extend and tokens > 96 and disabled for extend, tokens, disabled in decisions
+        prefill and possible and bound > 96 and early
+        for prefill, possible, bound, early in decisions
+    ), decisions
+    assert any(not prefill and not early for prefill, _, _, early in decisions), (
+        decisions
     )
-    assert any(not extend and not disabled for extend, _, disabled in decisions)
-    for index, event in enumerate(events):
-        if event[0] == "decision":
-            expected = ("process", "run") if event[1] else ("run", "process")
-            assert tuple(x[0] for x in events[index + 1 : index + 3]) == expected, (
+    decision_indices = [i for i, event in enumerate(events) if event[0] == "decision"]
+    for offset, index in enumerate(decision_indices):
+        end = (
+            decision_indices[offset + 1]
+            if offset + 1 < len(decision_indices)
+            else len(events)
+        )
+        step = tuple(event[0] for event in events[index + 1 : end])
+        assert step.count("plan") == 1 and step.count("process") == 1, events
+        if events[index][1]:
+            assert step[:2] == ("process", "plan"), events
+        else:
+            assert step[0] == "plan", events
+        if "run" in step:
+            assert step.index("plan") < step.index("run"), events
+            assert (step.index("process") < step.index("run")) == events[index][1], (
                 events
             )
 

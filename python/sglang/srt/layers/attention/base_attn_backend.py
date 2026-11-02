@@ -203,6 +203,11 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        """Allocate backend-owned stable buffers before prefill capture."""
+
     supports_draft_extend_metadata_staging: bool = False
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:

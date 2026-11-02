@@ -573,7 +573,7 @@ class TestNixlUnified(CustomTestCase):
         """Index pages must survive copy fallback when the main KV dtype is bf16."""
         from sglang.srt.mem_cache.device_pool_info import (
             IndexKeyBufferInfo,
-            IndexKeyFormat,
+            IndexKeyLayout,
         )
         from sglang.srt.mem_cache.pool_host.dsa import (
             DSAIndexerPoolHost,
@@ -602,7 +602,7 @@ class TestNixlUnified(CustomTestCase):
             IndexKeyBufferInfo(
                 page_size=64,
                 compress_ratio=1,
-                key_format=IndexKeyFormat.DSA_FP8,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
                 buffers=tuple(pool.index_k_with_scale_buffer),
             ),
             layer_mapping={0: 0, 1: 1},

@@ -193,8 +193,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1`</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable overlap schedule for consecutive prefill batches</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_OVERLAP_AFTER_PREFILL`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process a prefill step's result before scheduling the next step, for TTFT (formerly `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`, which still works with a deprecation warning)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
@@ -204,12 +204,12 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bound combined `extend_num_tokens` in consecutive overlapping prefill batches. Encoder SWA replay rows are excluded; this is not a bound on total forward work or GPU memory. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Before admission, bound the pending prefill's `extend_num_tokens` plus the next chunk's token limit, including mixed decode rows. Unknown bounds drain conservatively; a smaller actual batch can also drain. Encoder SWA replay rows are excluded. This is not a bound on total forward work or GPU memory. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PREFILL_OVERLAP_MIN_FREE_GB`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum TP group free GPU memory in GB for consecutive prefill overlap. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sample the TP group's minimum free GPU memory in GB before planning another possible prefill. This is not a post-admission memory floor. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
     </tr>
     <tr>
@@ -1264,7 +1264,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache file backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache <code>file</code> and <code>fast_file</code> backends.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>

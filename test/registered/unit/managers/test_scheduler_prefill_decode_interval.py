@@ -86,6 +86,13 @@ class TestPrefillOverlapBudgets(CustomTestCase):
         scheduler.result_queue = []
         scheduler.device = "cuda"
         scheduler.tp_cpu_group = object()
+        scheduler.chunked_prefill_size = 64
+        scheduler.max_prefill_tokens = 32
+        scheduler.chunked_req = None
+        scheduler.waiting_queue = [object()]
+        scheduler.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        scheduler.dllm_config = None
+        scheduler.dynamic_chunk_sizer = None
         return scheduler
 
     def _batch(self, tokens, *, prefill=True):
@@ -96,12 +103,13 @@ class TestPrefillOverlapBudgets(CustomTestCase):
             ),
             is_extend_in_batch=prefill,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            grammar_needs_sync=lambda: False,
         )
 
-    def test_combined_prefill_budget_and_disabled_default(self):
+    def test_next_chunk_bound_and_disabled_default(self):
         scheduler = self._scheduler()
         with (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False),
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
             envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
         ):
             for budget, tokens, expected in [
@@ -114,25 +122,69 @@ class TestPrefillOverlapBudgets(CustomTestCase):
                     envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(budget),
                 ):
                     self.assertEqual(
-                        scheduler.is_disable_overlap_for_batch(
-                            self._batch(tokens), self._batch(tokens)
-                        ),
+                        scheduler.should_process_last_batch_early(self._batch(tokens)),
                         expected,
                     )
             with envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(1):
                 self.assertFalse(
-                    scheduler.is_disable_overlap_for_batch(
-                        self._batch(80, prefill=False), self._batch(80)
+                    scheduler.should_process_last_batch_early(
+                        self._batch(80, prefill=False)
                     )
                 )
-                self.assertFalse(
-                    scheduler.is_disable_overlap_for_batch(self._batch(80), None)
+                self.assertFalse(scheduler.should_process_last_batch_early(None))
+
+    def test_no_candidate_continuation_and_waiting_grammar(self):
+        scheduler = self._scheduler()
+        scheduler.waiting_queue = []
+        with (
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+            envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(1),
+            envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
+        ):
+            self.assertFalse(scheduler.should_process_last_batch_early(self._batch(8)))
+            scheduler.chunked_req = object()
+            self.assertTrue(scheduler.should_process_last_batch_early(self._batch(8)))
+            scheduler.chunked_req = None
+            scheduler.grammar_manager.has_waiting_grammars = lambda: True
+            self.assertTrue(scheduler.should_process_last_batch_early(self._batch(8)))
+
+    def test_unknown_prefill_bound_drains_conservatively(self):
+        scheduler = self._scheduler()
+        with (
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+            envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(1024),
+            envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
+        ):
+            scheduler.chunked_prefill_size = None
+            self.assertTrue(scheduler.should_process_last_batch_early(self._batch(8)))
+            scheduler.chunked_prefill_size = 64
+            with patch.object(
+                scheduler, "get_prefill_adder_class", return_value=object
+            ):
+                self.assertTrue(
+                    scheduler.should_process_last_batch_early(self._batch(8))
                 )
+
+    def test_main_early_prefill_and_grammar_policy_is_preserved(self):
+        scheduler = self._scheduler()
+        scheduler.waiting_queue = []
+        with (
+            envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(0),
+            envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(0),
+        ):
+            with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True):
+                self.assertTrue(
+                    scheduler.should_process_last_batch_early(self._batch(8))
+                )
+            batch = self._batch(8, prefill=False)
+            batch.grammar_needs_sync = lambda: True
+            with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False):
+                self.assertTrue(scheduler.should_process_last_batch_early(batch))
 
     def test_free_memory_uses_tp_minimum_without_emptying_allocator(self):
         scheduler = self._scheduler()
         with (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(False),
+            envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
             envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(0),
             envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(2),
             get_device().override(gpu_id=0),
@@ -150,11 +202,18 @@ class TestPrefillOverlapBudgets(CustomTestCase):
                     side_effect=probe,
                 ):
                     self.assertEqual(
-                        scheduler.is_disable_overlap_for_batch(
-                            self._batch(8), self._batch(8)
-                        ),
+                        scheduler.should_process_last_batch_early(self._batch(8)),
                         expected,
                     )
+            with patch(
+                "sglang.srt.managers.scheduler.get_available_gpu_memory"
+            ) as probe:
+                self.assertFalse(
+                    scheduler.should_process_last_batch_early(
+                        self._batch(8, prefill=False)
+                    )
+                )
+                probe.assert_not_called()
 
     def test_attention_dp_is_rejected_before_resource_collectives(self):
         publish(

@@ -750,6 +750,7 @@ class TestAllocationIntegration(CustomTestCase):
                     queue._transfer_page_indices = Mock(return_value=[0])
                     queue.transfer_queue = SimpleNamespace(enable_staging=False)
                     queue._num_published_destinations = 0
+                    queue.scheduler = SimpleNamespace(enable_overlap=False)
                     events = Mock()
                     events.attach_mock(receiver.send_metadata, "metadata")
                     events.attach_mock(

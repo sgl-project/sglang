@@ -1056,16 +1056,27 @@ def apply_custom_logit_processor(
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
 
-        if token_offsets is not None:
-            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
-        selected = logits.index_select(0, indices)
         custom_params = [
             sampling_batch_info.custom_params[i]
             for i in rows
             for _ in range(num_tokens_in_batch)
         ]
-        result = entry.processor(selected, custom_params)
-        logits.index_copy_(0, indices, result.to(logits.dtype))
+        if len(rows) == batch_size:
+            # Rows are ascending and duplicate-free, so every row opted in and
+            # gather and scatter-back are the identity.
+            result = entry.processor(logits, custom_params)
+            if result is not logits:
+                # The gather path scatters the return value back implicitly, so
+                # a processor that builds a fresh tensor must still land here.
+                logits.copy_(result)
+        else:
+            if token_offsets is not None:
+                indices = (
+                    indices[:, None] * num_tokens_in_batch + token_offsets
+                ).flatten()
+            selected = logits.index_select(0, indices)
+            result = entry.processor(selected, custom_params)
+            logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
             f"Custom logit processor {entry.processor.__class__.__name__} is applied."

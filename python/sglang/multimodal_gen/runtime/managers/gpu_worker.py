@@ -269,6 +269,10 @@ class _FatalDistributedForward(SystemExit):
     """Escape request-level recovery when ranks can no longer run in lockstep."""
 
 
+class _FatalDeviceError(SystemExit):
+    """Escape request-level recovery when the device can no longer be trusted."""
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -894,6 +898,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 measure_server_warmup = False
                 raise _FatalDistributedForward(
                     "Multi-rank forward ran out of memory; restart the server."
+                ) from e
+            if _is_unrecoverable_device_error(e):
+                # The device can no longer be trusted and even empty_cache() may
+                # fail; exit so the HTTP backend monitor fails pending requests.
+                measure_server_warmup = False
+                logger.error(
+                    UNRECOVERABLE_DEVICE_ERROR_MSG.format(error=f"{error_context}: {e}")
+                )
+                raise _FatalDeviceError(
+                    "Unrecoverable device error; restart the server."
                 ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
@@ -1821,6 +1835,47 @@ def _oom_exceptions():
     return (torch.OutOfMemoryError,)
 
 
+UNRECOVERABLE_DEVICE_ERROR_MSG = """
+Unrecoverable device error in {error}
+The device or its memory allocator is in an unknown state, so this worker
+exits and the server stops accepting requests. Restart it.
+  - "CUDA driver error" or "!handles_.at(i) INTERNAL ASSERT FAILED" with
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: a non-OOM driver failure
+    while mapping memory leaves the allocator inconsistent
+    (https://github.com/pytorch/pytorch/issues/188008). It is most common on
+    WSL2/Windows near the memory limit; lower the resolution or memory use, or
+    run without expandable_segments.
+"""
+
+# Non-OOM device errors after which the CUDA context or the caching allocator
+# cannot be trusted, matched in the message because C10_CUDA_DRIVER_CHECK and
+# allocator asserts surface as plain RuntimeErrors.
+_UNRECOVERABLE_DEVICE_ERROR_MARKERS = (
+    "CUDA driver error:",
+    "CUDA error:",
+    "HIP error:",
+    "CUDACachingAllocator.cpp",
+)
+
+
+# An OOM stays recoverable: the allocator releases what it mapped, and the
+# cache is emptied after the request.
+def _is_unrecoverable_device_error(error: BaseException) -> bool:
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, _oom_exceptions()):
+            return False
+        message = str(error)
+        if "out of memory" not in message and (
+            isinstance(error, torch.AcceleratorError)
+            or any(marker in message for marker in _UNRECOVERABLE_DEVICE_ERROR_MARKERS)
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -1863,12 +1918,10 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except _FatalDistributedForward:
-        logger.exception(
-            "Worker %d cannot safely continue after a multi-rank OOM", rank
-        )
-        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
-        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+    except (_FatalDistributedForward, _FatalDeviceError) as e:
+        logger.exception("Worker %d cannot safely continue: %s", rank, e)
+        # CUDA/NCCL teardown can hang on a peer's collective and a broken
+        # allocator can fail in cleanup; the HTTP worker monitor rejects new work.
         os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)

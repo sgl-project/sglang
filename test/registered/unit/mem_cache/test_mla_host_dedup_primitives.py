@@ -114,13 +114,13 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         )
         from sglang.srt.mem_cache.device_pool_info import (
             IndexKeyBufferInfo,
-            IndexKeyFormat,
+            IndexKeyLayout,
         )
 
         info = IndexKeyBufferInfo(
             page_size=2,
             compress_ratio=1,
-            key_format=IndexKeyFormat.DSA_FP8,
+            key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
             buffers=tuple(torch.empty((4, 264), dtype=torch.uint8) for _ in range(2)),
         )
         indexer_host = DSAIndexerPoolHost(
