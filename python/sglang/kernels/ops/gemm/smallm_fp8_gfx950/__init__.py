@@ -1,7 +1,8 @@
 """gfx950 small-M W8A8 FP8 GEMM (per-token x per-channel, bf16 out) on aiter's (16, 16)-preshuffled weights.
 
 `smallm_fp8_gemm.hip` is built with hipcc at first use and launched like smallm_moe_gfx950. On by default for the
-Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below; SGLANG_ROCM_SMALLM_FP8_PROJ=0 turns it off.
+Qwen3.5-397B AttnFP8 TP4 and TP2 projection shapes below, and the MiniMax-M3.1 shared expert's gate_up that
+m31_router runs in its fused launch; SGLANG_ROCM_SMALLM_FP8_PROJ=0 turns it off.
 """
 
 import ctypes
@@ -33,6 +34,8 @@ SHAPES = {
     (10304, 4096): ((8, 1, 16, 4, 1), (16, 4, 8, 8, 1), (32, 4, 4, 16, 0)),
     (8704, 4096): ((4, 1, 16, 4, 1), (16, 4, 8, 8, 1)),
     (4096, 4096): ((8, 1, 8, 8, 0), (16, 1, 8, 8, 1), (40, 1, 4, 16, 0)),
+    # MiniMax-M3.1 TP4 shared expert gate_up, which m31_router fuses into its launch
+    (1536, 6144): ((8, 1, 12, 8, 1), (16, 1, 8, 12, 1)),
 }
 _mod = None
 _kernels = {}

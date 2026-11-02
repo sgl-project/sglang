@@ -16,11 +16,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import msgspec
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -78,11 +80,58 @@ def convert_time_to_realtime_ns(time_value: float) -> int:
     return int((time_value + global_diff_realtime_monotonic) * 1e9)
 
 
-def convert_time_cross_thread(
-    time_value: float, old_diff: float, new_diff: float
-) -> float:
-    # note: precision loss
-    return time_value + old_diff - new_diff
+def convert_realtime_to_time(realtime_value: float) -> float:
+    return realtime_value - global_diff_realtime_monotonic
+
+
+def compute_ttft_breakdown(
+    *,
+    received: Optional[float],
+    forward_entry: Optional[float],
+    prefill_finished: Optional[float],
+    queue_time: Optional[float],
+    prefetch_wait: Optional[float],
+    ttft: Optional[float],
+    num_retractions: Optional[int],
+) -> Dict[str, float]:
+    """Compute phase durations in seconds; omit unavailable or invalid phases.
+
+    Timestamps must share a clock. Prefill includes inter-chunk gaps, and
+    after_prefill is elapsed time until the first output, not a KV-transfer timer.
+    """
+
+    def measured(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    phases = {}
+    if measured(prefetch_wait) and prefetch_wait >= 0:
+        phases["storage_prefetch_wait"] = prefetch_wait
+        if measured(queue_time) and queue_time >= prefetch_wait:
+            phases["other_queue"] = queue_time - prefetch_wait
+    if (
+        measured(forward_entry)
+        and measured(prefill_finished)
+        and prefill_finished >= forward_entry
+    ):
+        phases["prefill_latency"] = prefill_finished - forward_entry
+    if (
+        num_retractions == 0
+        and "prefill_latency" in phases
+        and measured(received)
+        and measured(queue_time)
+        and queue_time >= 0
+        and measured(ttft)
+    ):
+        before_queue = forward_entry - received - queue_time
+        after_prefill = ttft - (prefill_finished - received)
+        if before_queue >= 0 and after_prefill >= 0:
+            phases["before_queue"] = before_queue
+            phases["after_prefill"] = after_prefill
+    return phases
 
 
 @dataclass
@@ -240,7 +289,6 @@ class ReqTimeStatsBase:
         default_factory=TraceNullContext
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL
-    diff_realtime_monotonic: float = 0.0
 
     @classmethod
     def new_from_obj(cls, obj: Optional[ReqTimeStatsBase], *args, **kwargs) -> Self:
@@ -340,7 +388,6 @@ class ReqTimeStatsBase:
             "disagg_mode": self.disagg_mode.value if self.disagg_mode else None,
             "enable_metrics": False,
             "trace_ctx": trace_ctx_state,
-            "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
 
     def __setstate__(self, state: object):
@@ -363,13 +410,6 @@ class ReqTimeStatsBase:
             else:
                 state["trace_ctx"] = TraceNullContext()
 
-        for key in state.keys():
-            if key.endswith("time") and state[key]:
-                state[key] = convert_time_cross_thread(
-                    state[key],
-                    state["diff_realtime_monotonic"],
-                    global_diff_realtime_monotonic,
-                )
         self.__dict__.update(state)
 
     def encode_json(self) -> Dict[str, Any]:
@@ -390,17 +430,6 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
-
-    def __getstate__(self) -> object:
-        state = {}
-        # send to DP controller or Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #    "created_time": self.created_time,
-        #    "api_server_dispatch_time": self.api_server_dispatch_time,
-        # }
-        state.update(super().__getstate__())
-        return state
 
     def set_created_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -504,8 +533,32 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
+    def get_ttft_breakdown(
+        self,
+        scheduler_time_stats: SchedulerOutputTimeStats,
+        num_retractions: Optional[int],
+    ) -> Dict[str, float]:
+        scheduler = scheduler_time_stats
+        return compute_ttft_breakdown(
+            received=(
+                convert_time_to_realtime(self.created_time)
+                if self.created_time > 0
+                else None
+            ),
+            forward_entry=scheduler.forward_entry_time,
+            prefill_finished=scheduler.prefill_finished_time,
+            queue_time=scheduler.queue_time,
+            prefetch_wait=scheduler.storage_prefetch_wait,
+            ttft=(
+                self.get_first_token_latency()
+                if self.first_token_time > self.created_time > 0
+                else None
+            ),
+            num_retractions=num_retractions,
+        )
+
     def convert_to_output_meta_info(
-        self, scheduler_time_stats=None, completion_tokens=0
+        self, scheduler_time_stats=None, completion_tokens=0, num_retractions=None
     ):
         meta_info = {}
         if self.created_time > 0.0:
@@ -530,6 +583,10 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         decode_throughput = self.get_decode_throughput(completion_tokens)
         if decode_throughput is not None:
             meta_info["decode_throughput"] = decode_throughput
+        if scheduler_time_stats is not None:
+            meta_info.update(
+                self.get_ttft_breakdown(scheduler_time_stats, num_retractions)
+            )
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
@@ -572,18 +629,6 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     dpc_dispatch_time: float = 0.0
     dpc_dispatch_finish_time: float = 0.0
 
-    def __getstate__(self) -> object:
-        state = {}
-        # send to Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #     "created_time": self.created_time,
-        #     "api_server_dispatch_time": self.api_server_dispatch_time,
-        #     "dpc_dispatch_time": self.dpc_dispatch_time,
-        # }
-        state.update(super().__getstate__())
-        return state
-
     def set_dp_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.dpc_dispatch_time = ts
@@ -606,6 +651,39 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
             )
+
+
+class SchedulerOutputTimeStats(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """The part of a request's scheduler time stats that the tokenizer puts in
+    meta_info. Timestamps are wall-clock; None means not stamped.
+
+    Fields are the meta_info keys, in meta_info order."""
+
+    # None while unmeasured or still waiting.
+    storage_prefetch_wait: Optional[float] = None
+    storage_staging_wait: Optional[float] = None
+    forward_entry_time: Optional[float] = None
+    prefill_finished_time: Optional[float] = None
+    queue_time: float = 0.0
+
+    def to_meta_info(self) -> Dict[str, float]:
+        return {
+            key: value
+            for key, value in msgspec.structs.asdict(self).items()
+            if value is not None
+        }
+
+
+def _stamped_realtime(time_value: float) -> Optional[float]:
+    return convert_time_to_realtime(time_value) if time_value > 0.0 else None
+
+
+def _finished_wait(
+    wait_s: Optional[float], timer: Optional[PollTimer]
+) -> Optional[float]:
+    return None if timer is not None and timer.running else wait_s
 
 
 @dataclass
@@ -662,47 +740,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_total_mb: float = 0.0
 
     # Seconds spent in the waiting queue over every entry (a retracted request
-    # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
+    # re-enters it).
     queue_duration_s: float = 0.0
 
     # Poll-observed waits; staging can include a re-prefetch and overlap prefetch.
-    # None means unmeasured (including stats received from an older scheduler).
+    # None means unmeasured.
     storage_prefetch_wait_s: Optional[float] = None
     storage_staging_wait_s: Optional[float] = None
     _storage_prefetch_wait: Optional[PollTimer] = None
     _storage_staging_wait: Optional[PollTimer] = None
 
-    has_timing_data: bool = False
-
-    def __getstate__(self) -> object:
-        # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
-            return {}
-
-        state = {
-            "has_timing_data": True,
-            "wait_queue_entry_time": self.wait_queue_entry_time,
-            "forward_entry_time": self.forward_entry_time,
-            "prefill_finished_time": self.prefill_finished_time,
-            # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
-            "queue_duration_s": self.queue_duration_s,
-            "storage_prefetch_wait_s": (
-                self.storage_prefetch_wait_s
-                if not (
-                    self._storage_prefetch_wait and self._storage_prefetch_wait.running
-                )
-                else None
+    def to_output_time_stats(self) -> Optional[SchedulerOutputTimeStats]:
+        if not self.enable_metrics:
+            return None
+        return SchedulerOutputTimeStats(
+            queue_time=self.get_queueing_time(),
+            forward_entry_time=_stamped_realtime(self.forward_entry_time),
+            prefill_finished_time=_stamped_realtime(self.prefill_finished_time),
+            storage_prefetch_wait=_finished_wait(
+                self.storage_prefetch_wait_s, self._storage_prefetch_wait
             ),
-            "storage_staging_wait_s": (
-                self.storage_staging_wait_s
-                if not (
-                    self._storage_staging_wait and self._storage_staging_wait.running
-                )
-                else None
+            storage_staging_wait=_finished_wait(
+                self.storage_staging_wait_s, self._storage_staging_wait
             ),
-            "diff_realtime_monotonic": global_diff_realtime_monotonic,
-        }
-        return state
+        )
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -1209,31 +1270,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
         else:
             return "Unknown Time Stats"
-
-    def convert_to_output_meta_info(self):
-        meta_data = {}
-        if self.storage_prefetch_wait_s is not None and not (
-            self._storage_prefetch_wait and self._storage_prefetch_wait.running
-        ):
-            meta_data["storage_prefetch_wait"] = self.storage_prefetch_wait_s
-        if self.storage_staging_wait_s is not None and not (
-            self._storage_staging_wait and self._storage_staging_wait.running
-        ):
-            meta_data["storage_staging_wait"] = self.storage_staging_wait_s
-        if self.forward_entry_time > 0.0:
-            meta_data["forward_entry_time"] = convert_time_to_realtime(
-                self.forward_entry_time
-            )
-        if self.prefill_finished_time > 0.0:
-            meta_data["prefill_finished_time"] = convert_time_to_realtime(
-                self.prefill_finished_time
-            )
-        meta_data.update(
-            {
-                "queue_time": self.get_queueing_time(),
-            }
-        )
-        return meta_data
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
