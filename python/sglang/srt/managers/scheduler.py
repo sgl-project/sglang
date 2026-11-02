@@ -774,6 +774,8 @@ class Scheduler(
 
         self.init_invariant_checker()
 
+        self.maybe_init_elastic_mem()
+
         self.init_load_publisher()
 
         self.init_load_inquirer()
@@ -2651,6 +2653,32 @@ class Scheduler(
             uocr_doc_hooks=self.uocr_doc_hooks,
         )
 
+    def maybe_init_elastic_mem(self) -> None:
+        """Let elastic hybrid-SWA pools evict from the tree cache and trade pages."""
+        self.elastic_mem_allocator = None
+        if not envs.SGLANG_ENABLE_ELASTIC_MEM_POOL.get():
+            return
+        from sglang.srt.mem_cache.elastic.elastic_allocator import (
+            ElasticSWATokenToKVPoolAllocator,
+        )
+
+        if not isinstance(
+            self.token_to_kv_pool_allocator, ElasticSWATokenToKVPoolAllocator
+        ):
+            logger.warning(
+                "SGLANG_ENABLE_ELASTIC_MEM_POOL is set but the KV allocator is "
+                f"{type(self.token_to_kv_pool_allocator).__name__}; "
+                "elastic memory only applies to hybrid-SWA models."
+            )
+            return
+        self.elastic_mem_allocator = self.token_to_kv_pool_allocator
+        self.elastic_mem_allocator.attach(
+            tree_cache=self.tree_cache,
+            max_req_len=self.max_req_len,
+            sliding_window_size=self.sliding_window_size,
+            chunked_prefill_size=self.chunked_prefill_size,
+        )
+
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
             disaggregation_mode=self.disaggregation_mode,
@@ -4276,6 +4304,8 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
+            if self.elastic_mem_allocator is not None:
+                self.elastic_mem_allocator.try_resize()
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 

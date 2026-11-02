@@ -411,6 +411,7 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    enable_elastic_mem: bool = field(init=False)
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -439,6 +440,7 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.draft_owns_its_depth and bool(
             self.layer_info.swa_attention_layer_ids
         )
+        self.enable_elastic_mem = envs.SGLANG_ENABLE_ELASTIC_MEM_POOL.get()
 
     def hybrid_swa_token_capacity(
         self,
@@ -2393,6 +2395,8 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
+        if self.enable_elastic_mem:
+            swa_pool_class = self._elastic_swa_pool_class()
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
@@ -2420,6 +2424,30 @@ class KVCacheConfigurator:
             **kwargs,
         )
         return token_to_kv_pool
+
+    def _elastic_swa_pool_class(self) -> type:
+        # Pages move between the full and SWA pools, so both must hold layers.
+        assert (
+            self.layer_info.full_attention_layer_ids
+            and self.layer_info.swa_attention_layer_ids
+        ), (
+            "SGLANG_ENABLE_ELASTIC_MEM_POOL needs both full-attention and SWA "
+            "layers on this rank; pure-SWA models are not supported"
+        )
+        from sglang.srt.mem_cache.elastic.elastic_memory_pool import (
+            ElasticMHATokenToKVPool,
+        )
+
+        return ElasticMHATokenToKVPool
+
+    def _hybrid_swa_allocator_cls(self) -> type:
+        if not self.enable_elastic_mem:
+            return SWATokenToKVPoolAllocator
+        from sglang.srt.mem_cache.elastic.elastic_allocator import (
+            ElasticSWATokenToKVPoolAllocator,
+        )
+
+        return ElasticSWATokenToKVPoolAllocator
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.configs.model_config import (
@@ -2768,7 +2796,7 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    token_to_kv_pool_allocator = self._hybrid_swa_allocator_cls()(
                         sizes.full_max_total_num_tokens,
                         sizes.swa_max_total_num_tokens,
                         page_size=get_schedule().page_size,

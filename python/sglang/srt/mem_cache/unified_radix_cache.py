@@ -4090,6 +4090,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
 
+    def component_evictable_device_indices(
+        self, component_type: ComponentType
+    ) -> torch.Tensor:
+        return self.tree_core.component_evictable_device_indices(component_type)
+
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
 

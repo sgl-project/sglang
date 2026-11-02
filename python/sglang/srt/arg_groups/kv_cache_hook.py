@@ -755,6 +755,45 @@ def draft_rows_refusal(
     )
 
 
+def handle_elastic_mem_pool(server_args: Any) -> None:
+    """Reject configs the elastic (kvcached) hybrid-SWA pools cannot serve."""
+    if not envs.SGLANG_ENABLE_ELASTIC_MEM_POOL.get():
+        return
+    cfg = resolving_view(server_args)
+    assert cfg.device == "cuda", (
+        f"SGLANG_ENABLE_ELASTIC_MEM_POOL supports cuda devices, got {cfg.device}"
+    )
+    # Elastic pools need the Python UnifiedTreeCore, which alone provides
+    # component_evictable_device_indices, even where the general tree default
+    # is Rust. Keep an explicit backend choice for the check below.
+    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
+    incompatible = [
+        ("--page-size > 1", cfg.page_size is not None and cfg.page_size != 1),
+        ("--enable-unified-memory", cfg.enable_unified_memory),
+        ("--enable-page-major-kv-layout", cfg.enable_page_major_kv_layout),
+        ("--enable-memory-saver", cfg.enable_memory_saver),
+        ("speculative decoding", cfg.speculative_algorithm is not None),
+        # Both register KV buffers by row count once; a resize changes the rows.
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+        ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+        # These dtypes use their own pool classes, which are not ETensor-backed.
+        (
+            f"--kv-cache-dtype {cfg.kv_cache_dtype}",
+            cfg.kv_cache_dtype in ("mxfp8", "nvfp4", "fp4_mx_block16"),
+        ),
+        ("SGLANG_USE_HND_KVCACHE", envs.SGLANG_USE_HND_KVCACHE.get()),
+        (
+            "a non-python SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND",
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() != "python",
+        ),
+    ]
+    for name, enabled in incompatible:
+        assert not enabled, (
+            f"SGLANG_ENABLE_ELASTIC_MEM_POOL is not compatible with {name}"
+        )
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).

@@ -3573,6 +3573,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def component_protected_size(self, component_type: ComponentType) -> int:
         return self.component_protected_size_.get(component_type, 0)
 
+    def component_evictable_device_indices(
+        self, component_type: ComponentType
+    ) -> torch.Tensor:
+        # Same predicate as the PART 4 size accounting in sanity_check.
+        values = []
+        for n in self._collect_all_nodes():
+            if n is self.root_node:
+                continue
+            cd = n.component_data[component_type]
+            if cd.value is not None and cd.lock_ref == 0:
+                values.append(cd.value)
+        if not values:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        return torch.cat(values)
+
     def full_evictable_size(self) -> int:
         return self.evictable_size()
 
