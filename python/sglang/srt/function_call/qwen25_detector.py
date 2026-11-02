@@ -39,6 +39,8 @@ class Qwen25Detector(BaseFormatDetector):
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
         self._validation_tail = ""
         self._validation_parts: list[str] | None = None
+        self._validation_in_string = False
+        self._validation_escaped = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Qwen 2.5 format tool call."""
@@ -77,6 +79,19 @@ class Qwen25Detector(BaseFormatDetector):
                 "model's tool-call format matches the selected JSON parser."
             ) from None
 
+    def _append_validation_text(self, text: str) -> None:
+        if not text:
+            return
+        assert self._validation_parts is not None
+        self._validation_parts.append(text)
+        for char in text:
+            if self._validation_escaped:
+                self._validation_escaped = False
+            elif char == "\\" and self._validation_in_string:
+                self._validation_escaped = True
+            elif char == '"':
+                self._validation_in_string = not self._validation_in_string
+
     def _validate_streaming_json(self, new_text: str) -> None:
         # Keep validation independent of the base parser's buffer: it may
         # consume a JSON object before a trailing syntax error or end tag arrives.
@@ -84,26 +99,38 @@ class Qwen25Detector(BaseFormatDetector):
         # quadratic string accumulation on long streaming arguments.
         text = self._validation_tail + new_text
         self._validation_tail = ""
-        while text:
+        start = 0
+        while start < len(text):
             marker = (
-                self.bot_token if self._validation_parts is None else self.eot_token
+                self.bot_token if self._validation_parts is None else self.eot_token[1:]
             )
-            index = text.find(marker)
+            index = text.find(marker, start)
             if index == -1:
-                keep = min(len(text), len(marker) - 1)
-                if self._validation_parts is not None and len(text) > keep:
-                    self._validation_parts.append(text[:-keep])
+                keep = min(len(text) - start, len(marker) - 1)
+                if self._validation_parts is not None and len(text) - keep > start:
+                    self._append_validation_text(text[start:-keep])
                 self._validation_tail = text[-keep:]
                 return
 
             if self._validation_parts is None:
                 self._validation_parts = []
+                self._validation_in_string = False
+                self._validation_escaped = False
             else:
-                self._validation_parts.append(text[:index])
-                payload = "".join(self._validation_parts)
-                self._validation_parts = None
-                self._parse_complete_json(payload)
-            text = text[index + len(marker) :]
+                self._append_validation_text(text[start:index])
+                # Both closing forms are supported by the streaming parser.
+                # A bare end tag inside a JSON string is argument text. A raw
+                # newline before it cannot occur in valid JSON string content,
+                # so still validate the standard end tag after malformed JSON.
+                if self._validation_in_string and not self._validation_parts[
+                    -1
+                ].endswith("\n"):
+                    self._append_validation_text(marker)
+                else:
+                    payload = "".join(self._validation_parts)
+                    self._validation_parts = None
+                    self._parse_complete_json(payload)
+            start = index + len(marker)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]

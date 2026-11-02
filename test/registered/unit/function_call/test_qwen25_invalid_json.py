@@ -51,15 +51,78 @@ class TestQwen25InvalidJSON(CustomTestCase):
                     self.assertNotIn(payload, str(cm.exception))
 
     def test_complete_invalid_block_streaming_at_every_split(self):
-        for payload in self.invalid_payloads:
-            wire = "I'll edit the file.\n<tool_call>\n" + payload + "\n</tool_call>"
-            for split in range(len(wire) + 1):
-                with self.subTest(payload=payload, split=split):
-                    parser = self.parser()
-                    with self.assertRaisesRegex(ValueError, "Invalid JSON"):
-                        parser.parse_stream_chunk(wire[:split])
-                        parser.parse_stream_chunk(wire[split:])
-                        parser.parse_stream_end()
+        for end_tag in ("\n</tool_call>", "</tool_call>"):
+            for payload in self.invalid_payloads:
+                wire = "I'll edit the file.\n<tool_call>\n" + payload + end_tag
+                for split in range(len(wire) + 1):
+                    with self.subTest(end_tag=end_tag, payload=payload, split=split):
+                        parser = self.parser()
+                        with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                            parser.parse_stream_chunk(wire[:split])
+                            parser.parse_stream_chunk(wire[split:])
+                            parser.parse_stream_end()
+
+    def test_streaming_calls_with_mixed_end_tags(self):
+        values = (
+            "first",
+            "literal </tool_call> inside JSON",
+            'escaped quote "</tool_call> and backslash \\',
+            'escaped newline\n</tool_call> and "quotes"',
+            r"backslash and quote \"</tool_call>",
+            r"two backslashes \\</tool_call>",
+            "many </tool_call> tags " * 8,
+        )
+        for first_end in ("</tool_call>", "\n</tool_call>"):
+            for second_end in ("</tool_call>", "\n</tool_call>"):
+                for value in values:
+                    for width in (1, 2, 7, 16, 1024):
+                        with self.subTest(
+                            first_end=first_end,
+                            second_end=second_end,
+                            value=value,
+                            width=width,
+                        ):
+                            parser = self.parser()
+                            calls = []
+                            for text, end_tag in (
+                                (value, first_end),
+                                ("second", second_end),
+                            ):
+                                for part in (
+                                    "<tool_call>\n",
+                                    '{"name":"edit",',
+                                    '"arguments":' + json.dumps({"text": text}) + "}",
+                                    end_tag,
+                                ):
+                                    for start in range(0, len(part), width):
+                                        calls.extend(
+                                            parser.parse_stream_chunk(
+                                                part[start : start + width]
+                                            )[1]
+                                        )
+                            calls.extend(parser.parse_stream_end()[1])
+                            self.assertEqual(
+                                [call.name for call in calls if call.name],
+                                ["edit", "edit"],
+                            )
+                            for index, text in enumerate((value, "second")):
+                                arguments = "".join(
+                                    call.parameters
+                                    for call in calls
+                                    if call.tool_index == index
+                                )
+                                self.assertEqual(json.loads(arguments), {"text": text})
+
+    def test_unclosed_json_string_before_standard_end_tag(self):
+        wire = (
+            '<tool_call>\n{"name":"edit","arguments":{"text":"unfinished\n</tool_call>'
+        )
+        for split in range(len(wire) + 1):
+            with self.subTest(split=split):
+                parser = self.parser()
+                with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                    parser.parse_stream_chunk(wire[:split])
+                    parser.parse_stream_chunk(wire[split:])
 
     def test_invalid_block_after_valid_call(self):
         valid = '<tool_call>\n{"name":"edit","arguments":{"text":"ok"}}\n</tool_call>'
