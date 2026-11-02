@@ -1,9 +1,11 @@
 """Unit tests for LLaDA2 model validation and routing metadata."""
 
+import json
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -343,13 +345,20 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
 
 
 class TestLLaDA2DllmBlockSizeValidation(CustomTestCase):
-    @staticmethod
-    def _server_args(algorithm_config=None):
+    def setUp(self):
+        from sglang.srt.dllm.config import _checkpoint_mask_id
+
+        _checkpoint_mask_id.cache_clear()
+        self.addCleanup(_checkpoint_mask_id.cache_clear)
+        self.tokenizer_path = self.enterContext(TemporaryDirectory())
+
+    def _server_args(self, algorithm_config=None):
         return SimpleNamespace(
             dllm_algorithm="LowConfidence",
             dllm_algorithm_config=algorithm_config,
             max_running_requests=1,
             model_path="unused",
+            tokenizer_path=self.tokenizer_path,
             revision=None,
             dllm_fdfo=False,
         )
@@ -357,12 +366,267 @@ class TestLLaDA2DllmBlockSizeValidation(CustomTestCase):
     @staticmethod
     def _model_config():
         return SimpleNamespace(
+            vocab_size=157184,
             hf_config=SimpleNamespace(
                 architectures=["LLaDA2MoeModelLM"],
                 block_size=32,
                 expert_capacity=48,
-            )
+            ),
         )
+
+    def _write_tokenizer(self, mask_token="<|mask|>"):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+
+        tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "<|mask|>": 1}, unk_token="[UNK]"))
+        tokenizer.save(f"{self.tokenizer_path}/tokenizer.json")
+        with open(f"{self.tokenizer_path}/tokenizer_config.json", "w") as f:
+            json.dump(
+                {
+                    "mask_token": mask_token,
+                    "tokenizer_class": "PreTrainedTokenizerFast",
+                },
+                f,
+            )
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_mask_metadata_matches_runtime_tokenizer(self, from_server_args):
+        from sglang.srt.dllm.config import _checkpoint_mask_id
+        from sglang.srt.utils.hf_transformers import get_tokenizer
+
+        from_server_args.return_value = self._model_config()
+        # Legacy maps override tokenizer_config; modern added-token metadata
+        # makes Transformers ignore that legacy map.
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                self._write_tokenizer()
+                with open(f"{self.tokenizer_path}/tokenizer_config.json", "w") as f:
+                    metadata = {
+                        "mask_token": "[UNK]",
+                        "tokenizer_class": "PreTrainedTokenizerFast",
+                    }
+                    if modern:
+                        metadata["added_tokens_decoder"] = {}
+                    json.dump(metadata, f)
+                with open(f"{self.tokenizer_path}/special_tokens_map.json", "w") as f:
+                    json.dump({"mask_token": "<|mask|>"}, f)
+                _checkpoint_mask_id.cache_clear()
+                config = DllmConfig.from_server_args(self._server_args())
+                runtime = get_tokenizer(self.tokenizer_path)
+                self.assertEqual(config.mask_id, runtime.mask_token_id)
+                self.assertEqual(config.mask_id, 0 if modern else 1)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_object_storage_tokenizer_sources(self, from_server_args):
+        from sglang.srt.dllm.config import _checkpoint_mask_id
+        from sglang.srt.utils.runai_utils import ObjectStorageModel
+
+        from_server_args.return_value = self._model_config()
+        for scheme in ("s3", "gs", "az"):
+            for has_mask in (False, True):
+                for separate_tokenizer in (False, True):
+                    with self.subTest(
+                        scheme=scheme,
+                        has_mask=has_mask,
+                        separate_tokenizer=separate_tokenizer,
+                    ):
+                        self._write_tokenizer("<|mask|>" if has_mask else None)
+                        _checkpoint_mask_id.cache_clear()
+                        args = self._server_args()
+                        args.model_path = f"{scheme}://bucket/model"
+                        args.tokenizer_path = (
+                            f"{scheme}://bucket/tokenizer"
+                            if separate_tokenizer
+                            else None
+                        )
+                        selected = args.tokenizer_path or args.model_path
+                        with patch.object(
+                            ObjectStorageModel,
+                            "get_path",
+                            return_value=self.tokenizer_path,
+                        ) as get_path:
+                            config = DllmConfig.from_server_args(args)
+                            get_path.assert_called_once_with(selected)
+                        self.assertEqual(config.mask_id, 1 if has_mask else 156895)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_remote_connector_tokenizer_source(self, from_server_args):
+        from sglang.srt.dllm.config import _checkpoint_mask_id
+
+        from_server_args.return_value = self._model_config()
+        for has_mask in (False, True):
+            with self.subTest(has_mask=has_mask):
+                self._write_tokenizer("<|mask|>" if has_mask else None)
+                _checkpoint_mask_id.cache_clear()
+                args = self._server_args()
+                args.model_path = "unused-model"
+                args.tokenizer_path = "redis://localhost/tokenizer"
+                connector = Mock()
+                connector.get_local_dir.return_value = self.tokenizer_path
+                with patch(
+                    "sglang.srt.utils.hf_transformers.tokenizer.create_remote_connector",
+                    return_value=connector,
+                ) as create_connector:
+                    config = DllmConfig.from_server_args(args)
+                    create_connector.assert_called_once_with(args.tokenizer_path)
+                connector.pull_files.assert_called_once_with(
+                    ignore_pattern=["*.pt", "*.safetensors", "*.bin"]
+                )
+                self.assertEqual(config.mask_id, 1 if has_mask else 156895)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_tokenizer_source_errors_are_not_missing_metadata(self, from_server_args):
+        from sglang.srt.utils.runai_utils import ObjectStorageModel
+
+        from_server_args.return_value = self._model_config()
+        args = self._server_args()
+        args.tokenizer_path = "s3://bucket/tokenizer"
+        with (
+            patch.object(
+                ObjectStorageModel,
+                "get_path",
+                side_effect=OSError("metadata unavailable"),
+            ),
+            self.assertRaisesRegex(OSError, "metadata unavailable"),
+        ):
+            DllmConfig.from_server_args(args)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_versioned_tokenizer_mask_matches_runtime(self, from_server_args):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+
+        from sglang.srt.dllm.config import _checkpoint_mask_id
+        from sglang.srt.utils.hf_transformers import get_tokenizer
+
+        from_server_args.return_value = self._model_config()
+        folder = Path(self.tokenizer_path)
+        for has_default in (False, True):
+            with self.subTest(has_default=has_default):
+                self._write_tokenizer()
+                (folder / "tokenizer.json").rename(folder / "tokenizer.5.0.0.json")
+                if has_default:
+                    Tokenizer(
+                        WordLevel(
+                            {"[UNK]": 0, "other": 1, "<|mask|>": 2},
+                            unk_token="[UNK]",
+                        )
+                    ).save(str(folder / "tokenizer.json"))
+                config_path = folder / "tokenizer_config.json"
+                metadata = json.loads(config_path.read_text())
+                metadata["fast_tokenizer_files"] = ["tokenizer.5.0.0.json"]
+                config_path.write_text(json.dumps(metadata))
+                _checkpoint_mask_id.cache_clear()
+                runtime = get_tokenizer(self.tokenizer_path)
+                self.assertEqual(runtime.mask_token_id, 1)
+                config = DllmConfig.from_server_args(self._server_args())
+                self.assertEqual(config.mask_id, runtime.mask_token_id)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_selected_tokenizer_must_contain_declared_mask(self, from_server_args):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+
+        from sglang.srt.utils.hf_transformers import get_tokenizer
+
+        from_server_args.return_value = self._model_config()
+        self._write_tokenizer()
+        folder = Path(self.tokenizer_path)
+        Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")).save(
+            str(folder / "tokenizer.5.0.0.json")
+        )
+        config_path = folder / "tokenizer_config.json"
+        metadata = json.loads(config_path.read_text())
+        metadata["fast_tokenizer_files"] = ["tokenizer.5.0.0.json"]
+        config_path.write_text(json.dumps(metadata))
+        # Loading invents ID 1 for the missing mask, which also happens to exist
+        # in the unselected tokenizer.json. That file must not validate it.
+        self.assertEqual(get_tokenizer(self.tokenizer_path).mask_token_id, 1)
+        with self.assertRaisesRegex(ValueError, "absent from its vocabulary"):
+            DllmConfig.from_server_args(self._server_args())
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_legacy_mask_map_without_config_declaration(self, from_server_args):
+        from_server_args.return_value = self._model_config()
+        self._write_tokenizer(None)
+        with open(f"{self.tokenizer_path}/special_tokens_map.json", "w") as f:
+            json.dump({"mask_token": {"content": "<|mask|>"}}, f)
+        self.assertEqual(DllmConfig.from_server_args(self._server_args()).mask_id, 1)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_declared_mask_token_replaces_architecture_default(self, from_server_args):
+        from_server_args.return_value = self._model_config()
+        self._write_tokenizer()
+        config = DllmConfig.from_server_args(self._server_args())
+        self.assertEqual(config.mask_id, 1)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_missing_mask_token_in_vocab_is_not_unknown_token(self, from_server_args):
+        from_server_args.return_value = self._model_config()
+        self._write_tokenizer("<|missing|>")
+        with self.assertRaisesRegex(ValueError, "absent from its vocabulary"):
+            DllmConfig.from_server_args(self._server_args())
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_mask_token_id_must_fit_model_vocab(self, from_server_args):
+        from_server_args.return_value = self._model_config()
+        from_server_args.return_value.vocab_size = 1
+        self._write_tokenizer()
+        with self.assertRaisesRegex(ValueError, "outside the model vocabulary"):
+            DllmConfig.from_server_args(self._server_args())
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_invalid_mask_token_declarations_are_rejected(self, from_server_args):
+        from_server_args.return_value = self._model_config()
+        for value in ("", 1, [], {"content": None}):
+            with self.subTest(value=value):
+                self._write_tokenizer(value)
+                with self.assertRaisesRegex(ValueError, "Invalid tokenizer mask_token"):
+                    DllmConfig.from_server_args(self._server_args())
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_tokenizer_revision_is_forwarded_and_result_cached(self, from_server_args):
+        from sglang.srt.dllm.config import cached_file
+
+        from_server_args.return_value = self._model_config()
+        self._write_tokenizer()
+        args = self._server_args()
+        args.revision = "test-revision"
+        with patch("sglang.srt.dllm.config.cached_file", wraps=cached_file) as resolve:
+            self.assertEqual(DllmConfig.from_server_args(args).mask_id, 1)
+            first_count = resolve.call_count
+            self.assertEqual(DllmConfig.from_server_args(args).mask_id, 1)
+            self.assertEqual(resolve.call_count, first_count)
+            for call in resolve.call_args_list:
+                self.assertEqual(call.args[0], self.tokenizer_path)
+                self.assertEqual(call.kwargs["revision"], "test-revision")
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_declared_mask_is_checked_against_edit_tokens(self, from_server_args):
+        model = self._model_config()
+        model.hf_config.delete_token_id = 1
+        model.hf_config.split_token_id = 2
+        from_server_args.return_value = model
+        self._write_tokenizer({"__type": "AddedToken", "content": "<|mask|>"})
+        args = self._server_args()
+        args.dllm_algorithm = "JointThresholdInDel"
+        with self.assertRaisesRegex(ValueError, "token IDs must be distinct"):
+            DllmConfig.from_server_args(args)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_conflicting_yaml_is_rejected_without_block_routing(self, from_server_args):
+        model = self._model_config()
+        model.hf_config.block_size = 64
+        model.hf_config.expert_capacity = None
+        from_server_args.return_value = model
+        with TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/dllm.yaml"
+            with open(config_path, "w") as f:
+                f.write("block_size: 16\n")
+            with self.assertRaisesRegex(
+                ValueError, r"checkpoint block_size \(64\), got 16"
+            ):
+                DllmConfig.from_server_args(self._server_args(config_path))
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_block_routing_accepts_matching_dllm_block_size(self, from_server_args):
@@ -373,8 +637,147 @@ class TestLLaDA2DllmBlockSizeValidation(CustomTestCase):
         self.assertEqual(config.block_size, 32)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_uses_checkpoint_block_size(self, from_server_args):
+        for expert_capacity in (None, 48):
+            with self.subTest(expert_capacity=expert_capacity):
+                model_config = self._model_config()
+                model_config.hf_config.block_size = 64
+                model_config.hf_config.expert_capacity = expert_capacity
+                from_server_args.return_value = model_config
+
+                config = DllmConfig.from_server_args(self._server_args())
+
+                self.assertEqual(config.block_size, 64)
+                self.assertEqual(config.mask_id, 156895)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_legacy_checkpoint_uses_default_block_size(self, from_server_args):
+        model_config = self._model_config()
+        del model_config.hf_config.block_size
+        del model_config.hf_config.expert_capacity
+        from_server_args.return_value = model_config
+
+        config = DllmConfig.from_server_args(self._server_args())
+
+        self.assertEqual(config.block_size, 32)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_yaml_overrides_legacy_default_without_block_routing(
+        self, from_server_args
+    ):
+        model_config = self._model_config()
+        del model_config.hf_config.block_size
+        model_config.hf_config.expert_capacity = None
+        from_server_args.return_value = model_config
+        with TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/dllm.yaml"
+            with open(config_path, "w") as config_file:
+                config_file.write("block_size: 16\n")
+
+            config = DllmConfig.from_server_args(self._server_args(config_path))
+
+        self.assertEqual(config.block_size, 16)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_yaml_without_block_size_keeps_checkpoint_default(self, from_server_args):
+        model_config = self._model_config()
+        model_config.hf_config.block_size = 64
+        from_server_args.return_value = model_config
+        with TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/dllm.yaml"
+            with open(config_path, "w") as config_file:
+                config_file.write("threshold: 0.8\n")
+
+            config = DllmConfig.from_server_args(self._server_args(config_path))
+
+        self.assertEqual(config.block_size, 64)
+        self.assertEqual(config.algorithm_config, {"threshold": 0.8})
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_block_routing_accepts_matching_yaml_override(self, from_server_args):
+        model_config = self._model_config()
+        model_config.hf_config.block_size = 64
+        from_server_args.return_value = model_config
+        with TemporaryDirectory() as tmpdir:
+            config_path = f"{tmpdir}/dllm.yaml"
+            with open(config_path, "w") as config_file:
+                config_file.write("block_size: 64\n")
+
+            config = DllmConfig.from_server_args(self._server_args(config_path))
+
+        self.assertEqual(config.block_size, 64)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_rejects_invalid_checkpoint_block_size(self, from_server_args):
+        for block_size in (0, -1, True, False, 1.5, "32", None):
+            with self.subTest(block_size=block_size):
+                model_config = self._model_config()
+                model_config.hf_config.block_size = block_size
+                model_config.hf_config.expert_capacity = None
+                from_server_args.return_value = model_config
+
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    DllmConfig.from_server_args(self._server_args())
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_rejects_invalid_yaml_block_size(self, from_server_args):
+        model_config = self._model_config()
+        model_config.hf_config.expert_capacity = None
+        from_server_args.return_value = model_config
+        for block_size in ("0", "-1", "true", "false", "1.5", "'32'", "null"):
+            with self.subTest(block_size=block_size), TemporaryDirectory() as tmpdir:
+                config_path = f"{tmpdir}/dllm.yaml"
+                with open(config_path, "w") as config_file:
+                    config_file.write(f"block_size: {block_size}\n")
+
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    DllmConfig.from_server_args(self._server_args(config_path))
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_checkpoint_block_size_does_not_change_sdar_default(self, from_server_args):
+        from_server_args.return_value = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["SDARForCausalLM"],
+                block_size=64,
+            )
+        )
+
+        config = DllmConfig.from_server_args(self._server_args())
+
+        self.assertEqual(config.block_size, 4)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_page_size_uses_checkpoint_block_size(self, from_server_args):
+        from sglang.srt.arg_groups.overrides import _dllm_page_size
+
+        model_config = self._model_config()
+        model_config.hf_config.block_size = 64
+        from_server_args.return_value = model_config
+        args = self._server_args()
+        args.disable_radix_cache = False
+        args.page_size = 128
+
+        self.assertEqual(_dllm_page_size(args), {"page_size": 64})
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
+    def test_page_size_rejects_zero_before_modulo(self, from_server_args):
+        from sglang.srt.arg_groups.overrides import _dllm_page_size
+
+        model_config = self._model_config()
+        model_config.hf_config.block_size = 0
+        model_config.hf_config.expert_capacity = None
+        from_server_args.return_value = model_config
+        args = self._server_args()
+        args.disable_radix_cache = False
+        args.page_size = 128
+
+        with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+            _dllm_page_size(args)
+
+    @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_block_routing_rejects_mismatched_dllm_block_size(self, from_server_args):
         from_server_args.return_value = self._model_config()
+        from_server_args.return_value.hf_config.block_size = 64
         with TemporaryDirectory() as tmpdir:
             config_path = f"{tmpdir}/dllm.yaml"
             with open(config_path, "w") as config_file:
@@ -382,7 +785,7 @@ class TestLLaDA2DllmBlockSizeValidation(CustomTestCase):
 
             with self.assertRaisesRegex(
                 ValueError,
-                r"requires the dLLM block size to match.*\(32\), got 16",
+                r"requires the dLLM block size to match.*\(64\), got 16",
             ):
                 DllmConfig.from_server_args(self._server_args(config_path))
 
