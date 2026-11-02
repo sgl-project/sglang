@@ -21,6 +21,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -53,11 +55,17 @@ class _RatioCache:
     def __init__(self, pool_size: int):
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.allocator = _BoundedMambaAllocator(pool_size)
-        self.req_to_token_pool = SimpleNamespace(mamba_allocator=self.allocator)
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=self.allocator, storage=None
+        )
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
         self.alloc_evict_params = []
+
+    def kv_storage(self):
+        # Static pools: the component's slot takes reach the bounded allocator.
+        return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
     def evict_for_alloc(self, params: EvictParams):
         self.alloc_evict_params.append(params)
@@ -108,7 +116,7 @@ class TestMambaRatioEnvGate(unittest.TestCase):
     ratio can never drift out of sync with whether the decode lock is skipped."""
 
     @staticmethod
-    def _ratio(*, extra_buffer, lazy, disable_overlap, skip):
+    def _ratio(*, extra_buffer, lazy, disable_overlap, skip, host_only=False):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
@@ -125,11 +133,15 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         )
         from sglang.srt import runtime_context as rc
 
-        with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
+        with (
+            envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(host_only),
+        ):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
                 mamba_radix_cache_strategy=strategy,
+                enable_hierarchical_cache=host_only,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
@@ -201,6 +213,58 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                         self.assertEqual(len(full.released), released + 1)
                     self.assertEqual(len(full.released), N)
 
+    def test_host_only_drops_gpu_prefix_floor(self):
+        """Host checkpoints keep no GPU donate or locked-prefix slot.
+
+        The pool is the live slot plus ping-pong slots extra-buffer still
+        writes: no_buffer 1, lazy 2, overlap 3.
+        """
+
+        def r(**kwargs):
+            return self._ratio(skip=False, host_only=True, **kwargs)
+
+        self.assertEqual(r(extra_buffer=False, lazy=False, disable_overlap=True), 1)
+        self.assertEqual(r(extra_buffer=True, lazy=True, disable_overlap=False), 2)
+        self.assertEqual(r(extra_buffer=True, lazy=False, disable_overlap=False), 3)
+
+    def _cleanup(self, *, host_only: bool, mamba_exist: bool):
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+
+        freed = []
+
+        class _Storage:
+            def quantizes_checkpoints(self, sub_pool):
+                return False
+
+            def tree_sub_pool(self, name):
+                return name
+
+            def release_state(self, sub_pool, req, keep=None):
+                freed.append(req)
+
+        component = object.__new__(MambaComponent)
+        component.host_only_checkpoint = host_only
+        component.cache = SimpleNamespace(
+            kv_storage=lambda: _Storage(),
+            enable_mamba_extra_buffer=False,
+        )
+        req = SimpleNamespace()
+        component.cleanup_after_caching_req(
+            req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=mamba_exist),
+            insert_params=InsertParams(),
+        )
+        return freed, req
+
+    def test_flag_off_keeps_a_donated_gpu_slot(self):
+        freed, _req = self._cleanup(host_only=False, mamba_exist=False)
+        self.assertEqual(freed, [])
+
+    def test_host_only_no_buffer_frees_the_request_slot(self):
+        freed, req = self._cleanup(host_only=True, mamba_exist=False)
+        self.assertEqual(freed, [req])
+
 
 class _RecordingComp:
     """Fake tree component: records the dec params it is asked to release with."""
@@ -235,10 +299,18 @@ class TestDecSwaLockSkip(unittest.TestCase):
         swa = _RecordingComp(ComponentType.SWA, 1)
         mamba = _RecordingComp(ComponentType.MAMBA, 0)
         node = SimpleNamespace(id=7)
+        slot_ids = {
+            TREE_TOKEN: ComponentType.FULL,
+            TREE_WINDOW: ComponentType.SWA,
+            TREE_STATE: ComponentType.MAMBA,
+        }
+        components_by_type = {ComponentType.SWA: swa}
         tree_core = SimpleNamespace(
             root_node=object(),
             components=(full, swa, mamba),
-            components_by_type={ComponentType.SWA: swa},
+            components_by_type=components_by_type,
+            slot_id=slot_ids.get,
+            component_of=lambda family: components_by_type.get(slot_ids.get(family)),
             node_by_id=lambda node_id: node,
             _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )

@@ -19,14 +19,14 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
-| DeepSeek-V3.2 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
+| DeepSeek-V3.2 | A3 Series Products | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
+| DeepSeek-V3.2 | A3 Series Products | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
+| DeepSeek-V3.2 | A3 Series Products | 32 | PD Disaggregation | 128k+1k | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
 
 ## Optimal Configuration
 
@@ -36,7 +36,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: DeepSeek-V3.2
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -232,7 +232,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-V3.2
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -427,7 +427,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-V3.2
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 

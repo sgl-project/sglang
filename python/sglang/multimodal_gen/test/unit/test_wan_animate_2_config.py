@@ -91,6 +91,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.denoising import (
     WanAnimate2DenoisingStage,
+    _clip_decoded_frames_to_uint8,
     get_sampling_sigmas,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
@@ -1989,3 +1990,12 @@ def test_before_denoising_stage_populates_the_standard_denoising_inputs(
         None, Req(sampling_params=Wan_Animate_2_14B_SamplingParam()), server_args
     )
     assert not bare.is_valid()
+
+
+def test_clip_decoded_frames_past_unit_range_saturate_instead_of_wrapping():
+    """``decode_raw`` does not clamp its output, so a VAE value a bit outside [-1, 1]
+    (e.g. -1.02) must saturate to 0/255, not wrap around to a bright/dark speckle."""
+    decoded = torch.tensor([-1.02, -1.0, 0.0, 1.0, 1.02]).reshape(1, 1, 1, 1, 5)
+    frames = _clip_decoded_frames_to_uint8(decoded)
+    assert frames.dtype == np.uint8
+    np.testing.assert_array_equal(frames.reshape(-1), [0, 0, 127, 255, 255])

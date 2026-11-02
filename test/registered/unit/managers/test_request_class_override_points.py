@@ -127,7 +127,7 @@ class TestRequestClassOverridePoints(CustomTestCase):
         manager.model_config = SimpleNamespace(vocab_size=VOCAB)
         manager.fake_bootstrap_room_counter = 0
         manager.rid_to_state = {
-            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats())
+            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats(), abort_sent=False)
         }
         obj = GenerateReqInput(input_ids=[1, 2], rid="r0", sampling_params={})
 

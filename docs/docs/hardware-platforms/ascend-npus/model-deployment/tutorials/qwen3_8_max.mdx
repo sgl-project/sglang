@@ -67,7 +67,7 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 We recommend deploying the W4A8 variant for reduced resource usage and higher throughput.
-The validated configuration in this tutorial deploys the W4A8 variant (approximately 1.33TB) on 4 Ascend A3 Series
+The validated configuration in this tutorial deploys the W4A8 variant (approximately 1.33TB) on 4 A3 Series
 nodes (`--tp-size 64`, 64 dies in total). The BF16 checkpoint alone weighs approximately 4.8TB and requires additional nodes.
 </Info>
 
@@ -130,7 +130,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 
 ### Multi-node online deployment
 
-Multi-node deployment distributes the model across multiple Ascend A3 Series nodes using tensor parallelism while keeping
+Multi-node deployment distributes the model across multiple A3 Series nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
 node can provide. The validated configuration deploys the W4A8 quantized checkpoint on 4 nodes with `--tp-size 64`
 (16 dies per node), DP attention (`--dp-size 4` + `--enable-dp-attention`), and DeepEP in `auto` mode.

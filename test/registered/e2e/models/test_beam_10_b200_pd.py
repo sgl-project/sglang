@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 
 # The 501B checkpoint needs two TP4 replicas; one full GSM8K pass covers both
 # NVLink PD transfer and the DFlash2 acceptance regression gate.
-register_cuda_ci(est_time=800, stage="nightly", runner_config="8-gpu-b200")
+register_cuda_ci(est_time=800, stage="weekly", runner_config="8-gpu-b200")
 
 MODEL_PATH = "reflection/Beam-1.0-501B-A23B-NVFP4"
 DRAFT_MODEL_PATH = "reflection/Beam-1.0-501B-A23B-DFlash2"
