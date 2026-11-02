@@ -108,6 +108,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             MultiLayerEagleDraftExtendCudaGraphRunner,
         )
 
+        if (
+            self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
+            is not None
+        ):
+            return "actual_seq_kvlen"
+
         # FIA V1 uses actual_seq_lengths_kv; FIA V2 uses actual_seq_kvlen.
         # Check specialized runners before their common decode base class.
         runner_update_attrs = (

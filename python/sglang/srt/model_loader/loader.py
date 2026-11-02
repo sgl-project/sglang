@@ -218,6 +218,15 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            server_args = get_server_args()
+            requested_dtype = (
+                server_args.speculative_draft_kv_cache_dtype
+                if model_config.is_draft_model
+                and server_args.speculative_draft_kv_cache_dtype is not None
+                else server_args.kv_cache_dtype
+            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
