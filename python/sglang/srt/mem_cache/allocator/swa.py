@@ -177,9 +177,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def window_pool_names(self):
-        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
-        return (window_sub_pool_of(self),)
+        return (BaseSWAKVPool.WINDOW_SUB_POOL,)
 
     def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         """Free room for a decode-node preallocation; None means it is ready.

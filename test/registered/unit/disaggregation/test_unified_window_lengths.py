@@ -266,7 +266,9 @@ class TestUnifiedWindowLengths(CustomTestCase):
             self.assertEqual(router.sub_pool(name).window, window)
             self.assertEqual(router.layer(i + 1).route.window, window)
         self.assertIsNone(router.layer(0).route.window)
-        self.assertEqual(storage.primary_window_name(), f"window_{_TARGET_WINDOW}")
+        self.assertEqual(
+            storage.allocator.target_window_pool(), f"window_{_TARGET_WINDOW}"
+        )
         self.assertEqual(primary_window(_WINDOWS), _TARGET_WINDOW)
         self.assertEqual(primary_window((8, None, 4)), None)
         for name in (storage.owner, *storage.retained_window_lengths()):

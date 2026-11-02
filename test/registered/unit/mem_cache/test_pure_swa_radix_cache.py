@@ -42,6 +42,9 @@ class _FakeAllocator:
     def window_pool_names(self):
         return ("swa",)
 
+    def target_window_pool(self):
+        return "swa"
+
     def get_kvcache(self):
         return SimpleNamespace(request_window=None)
 

@@ -494,7 +494,10 @@ class ChainPrefillBudget(PrefillBudget):
         )
 
     def request_state_slots(self, req) -> int:
-        return self.allocator.storage.pending_state_slots(req)
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        # A chain is unified memory: its storage is the pool's own.
+        return kv_storage_of(None, self.allocator).pending_state_slots(req)
 
     def _others_hold_memory(self, req) -> bool:
         """Whether memory is held by anything but ``req`` that gives it back

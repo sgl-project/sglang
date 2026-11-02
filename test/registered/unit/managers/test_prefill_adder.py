@@ -1641,9 +1641,10 @@ class TestPrefillAdder(CustomTestCase):
         allocator.pools_share_memory = True
         allocator.prealloc_shortfall.return_value = None
         # A state slot takes free slot ids and 64 tokens' worth of shared bytes.
-        allocator.admits.side_effect = lambda full, windows, state=0, **kwargs: (
-            state <= allocator.mamba_allocator.schedulable_available_size()
-            and full + state * 64 <= allocator.available_size()
+        allocator.admits.side_effect = lambda demand, **kwargs: (
+            demand.state_slots <= allocator.mamba_allocator.schedulable_available_size()
+            and demand.full_tokens + demand.state_slots * 64
+            <= allocator.available_size()
         )
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             ChainPrefillBudget(allocator, tree_cache, **kwargs)

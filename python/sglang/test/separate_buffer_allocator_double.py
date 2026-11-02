@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 # Bound on the double, so each reads the stubs the caller set on it.
 _SEPARATE_BUFFER_METHODS = {
     "window_pool_names": SWATokenToKVPoolAllocator.window_pool_names,
+    "target_window_pool": BaseTokenToKVPoolAllocator.target_window_pool,
     "admit_preallocation": BaseTokenToKVPoolAllocator.admit_preallocation,
     "prealloc_ceiling_fits": BaseTokenToKVPoolAllocator.prealloc_ceiling_fits,
     "prealloc_fits": BaseTokenToKVPoolAllocator.prealloc_fits,
@@ -43,6 +44,8 @@ def bind_separate_buffer_capacity(allocator) -> None:
         # A static pool has no unified storage: its one window goes by the
         # static window pool's name.
         allocator.storage = None
+    # Its sides own their buffers: nothing is shared with the owner.
+    allocator.pools_share_memory = False
     for name, impl in _SEPARATE_BUFFER_METHODS.items():
         setattr(
             allocator,

@@ -140,6 +140,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         `KVDemand` uses for them; none for a pool without windows."""
         return ()
 
+    def target_window_pool(self) -> Optional[str]:
+        """The window pool a reader that sizes one window by reads (the
+        scheduler's window budget, a running request's retention): the target
+        model's own window, or None without windows. A reduction for those
+        readers only; every per-window question names its window."""
+        names = self.window_pool_names()
+        return names[0] if names else None
+
     def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
         """Whether ``demand`` could EVER be preallocated, or None when this
         pool has no ceiling of its own and the caller's token capacity is the

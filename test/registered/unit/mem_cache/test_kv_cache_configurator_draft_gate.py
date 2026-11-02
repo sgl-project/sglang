@@ -160,6 +160,7 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
         storage=None,
         window_retention=None,
         window_pool_names=lambda: ("swa",),
+        target_window_pool=lambda: "swa",
         get_kvcache=lambda: SimpleNamespace(request_window=None),
     )
     kv_storage_of(None, allocator).bind_window_retention(
