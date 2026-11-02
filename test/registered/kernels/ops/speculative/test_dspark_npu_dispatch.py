@@ -102,7 +102,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         logits[2, 10] = float("inf")
         expected_top1 = logits.cpu().argmax(-1)
         with mock.patch.object(sample, "row_argmax", wraps=sample.row_argmax) as kernel:
-            actual = _row_argmax(logits, fused=True)
+            actual = _row_argmax(logits)
         kernel.assert_called_once_with(logits)
         self.assertTrue(torch.equal(actual.cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
@@ -115,11 +115,13 @@ class TestDSparkNpuDispatch(CustomTestCase):
         lengths = (candidates[:, 1:] == predict[:, :-1]).int().cumprod(1).sum(1)
         bonus = predict[torch.arange(rows), lengths]
         npu_candidates = candidates.npu()
-        integrated = AcceptGreedy.execute(
-            candidates=npu_candidates,
-            target_logits=logits,
-            verify_num_draft_tokens=block,
-        )
+        with mock.patch.object(sample, "row_argmax", wraps=sample.row_argmax) as kernel:
+            integrated = AcceptGreedy.execute(
+                candidates=npu_candidates,
+                target_logits=logits,
+                verify_num_draft_tokens=block,
+            )
+        kernel.assert_called_once_with(logits)
         self.assertEqual(integrated[0].dtype, torch.int32)
         self.assertEqual(integrated[1].dtype, torch.int64)
         self.assertTrue(torch.equal(integrated[0].cpu(), lengths.int()))
@@ -133,7 +135,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
             torch.randn(3, 64, device="npu")[:, ::2],
         ):
             with mock.patch.object(sample, "row_argmax") as kernel:
-                actual = _row_argmax(logits, fused=True)
+                actual = _row_argmax(logits)
             kernel.assert_not_called()
             self.assertTrue(torch.equal(actual.cpu(), logits.cpu().argmax(-1)))
 
