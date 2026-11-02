@@ -1041,8 +1041,9 @@ class TestTRTLLMMLA(CustomTestCase):
         backend.init_forward_metadata_out_graph(capture_fb, in_capture=True)
 
         # Verify capture metadata
-        self.assertIn(batch_size, backend.decode_cuda_graph_metadata)
-        capture_metadata = backend.decode_cuda_graph_metadata[batch_size]
+        key = (batch_size, ForwardMode.DECODE)
+        self.assertIn(key, backend.decode_cuda_graph_metadata)
+        capture_metadata = backend.decode_cuda_graph_metadata[key]
 
         self.assertIsNotNone(capture_metadata.block_kv_indices)
 

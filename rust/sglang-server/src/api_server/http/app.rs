@@ -1,6 +1,6 @@
 //! Router assembly and the shared handler state: every endpoint module
 //! registers its routes here, and [`serve`] runs the assembled app on the
-//! pre-bound listener until shutdown.
+//! pre-bound listener until a drain ends or the runtime shuts down.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,9 +8,9 @@ use std::time::Duration;
 use axum::Router;
 
 use super::generate_hook::GenerateHook;
-use super::{hicache, info, loads, metrics, native_api, openai};
+use super::{hicache, info, loads, metrics, native_api, openai, pre_generate};
 use crate::HttpLayer;
-use crate::api_server::core::FLUSH_INTERVAL;
+use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::api_server::log;
@@ -73,12 +73,14 @@ pub async fn serve(
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
-    // aborted with the api runtime.
+    // aborted with the api runtime. A graceful drain
+    // (`CoreHandle::begin_drain`) instead returns once its requests finished.
     shutdown: flume::Receiver<()>,
     hicache_manager: Arc<HiCacheManager>,
     tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    let drain = core.clone();
     // Legacy conversation templates add stop strings `lower_chat` never sees;
     // they stay on the typed handler.
     let openai_chat = chat_formatter
@@ -126,12 +128,13 @@ pub async fn serve(
     // a configured `api_key` does NOT protect these routes.
     //
     // No body limit, matching the Python server.
+    let core = state.core.clone();
     let mut app = router
         .with_state(state)
         .merge(hicache::routes(hicache_manager))
         .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
-        app = http_layer(app);
+        app = pre_generate::apply(app, &http_layer, core);
     }
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
@@ -158,18 +161,43 @@ pub async fn serve(
         }
     };
     // `with_connect_info` exposes the peer address to the access-log middleware.
+    // Once a drain ends, stop accepting, let the requests still on open
+    // connections finish (the last bytes of the drained responses, or one
+    // that raced the close), close idle keep-alive connections, and return.
+    let graceful = drain.clone();
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
+    )
+    .with_graceful_shutdown(async move {
+        if graceful.drain_ended().await == DrainEnd::Drained {
+            tracing::info!("drain: no request left in flight; closing the HTTP listener");
+        }
+    });
     tokio::select! {
         r = serve => {
             if let Err(e) = r {
                 tracing::error!(error = %e, "axum serve exited");
             }
         }
+        // Dropping `serve` closes the listener without waiting; the requests
+        // still in flight end with the api runtime.
+        () = drain.drain_close_deadline() => {
+            if drain.drain_force_reason().is_none() {
+                tracing::warn!(
+                    "drain: connections still open past the graceful-close timeout after \
+                     the requests drained; closing them"
+                );
+            }
+        }
         _ = shutdown.recv_async() => {
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
+    }
+    if let Some(reason) = drain.drain_force_reason() {
+        // TODO(crash-dump): dump the in-flight requests here, as Python's
+        // `dump_requests_before_crash` does on the health-check path, once
+        // the Rust server supports `--crash-dump-folder`.
+        tracing::error!("{reason}");
     }
 }
