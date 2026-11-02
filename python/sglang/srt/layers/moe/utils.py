@@ -125,6 +125,11 @@ class MoeA2ABackend(Enum):
 
         return mori_tbo_child_dispatch_cap()
 
+    def tbo_uses_micro_batch_rows(self) -> bool:
+        # Whether TBO gathers every rank's first-micro-batch rows: MORI EPv2 bounds
+        # each micro-batch's MoE receive by its own per-rank rows.
+        return self.is_mori_epv2()
+
 
 @dataclass
 class AscendOpsConfig:

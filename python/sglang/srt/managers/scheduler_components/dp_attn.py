@@ -667,9 +667,9 @@ def prepare_mlp_sync_batch_raw(
             )
         )
         if mlp_sync_info.tbo_split_seq_index is not None:
-            mlp_sync_info.global_tbo_split_num_tokens = mlp_sync_info.tp0_info_cpu[
-                :, 11
-            ].tolist()
+            mlp_sync_info.global_tbo_split_num_tokens = (
+                tbo_preparer.compute_split_num_tokens(mlp_sync_info.tp0_info_cpu[:, 11])
+            )
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)

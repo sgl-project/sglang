@@ -431,13 +431,15 @@ class TboDPAttentionPreparer:
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
+        self._uses_micro_batch_rows = get_moe_a2a_backend().tbo_uses_micro_batch_rows()
 
         # Short-circuit when TBO is off: prepare_mlp_sync_batch_raw invokes
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
         # Rows of this rank's first micro-batch, gathered so each micro-batch's
-        # dispatch can be bounded by its own per-rank rows.
+        # dispatch can be bounded by its own per-rank rows; 0 when the MoE a2a
+        # backend neither uses them nor caps micro-batch B.
         self.local_tbo_split_num_tokens = 0
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
@@ -473,14 +475,18 @@ class TboDPAttentionPreparer:
                 and not tbo_splits_extend_in_low_latency
                 and (resolved_deepep_mode.is_low_latency())
             )
-            if local_can_run_tbo and not local_batch.forward_mode.is_prebuilt():
+            child_cap = get_moe_a2a_backend().tbo_child_dispatch_cap()
+            if (
+                local_can_run_tbo
+                and (self._uses_micro_batch_rows or child_cap is not None)
+                and not local_batch.forward_mode.is_prebuilt()
+            ):
                 self.local_tbo_split_num_tokens = compute_split_token_index(
                     split_seq_index=self.local_tbo_split_seq_index,
                     forward_mode=local_batch.forward_mode,
                     extend_seq_lens=local_batch.extend_lens,
                     token_num_per_seq=token_num_per_seq,
                 )
-                child_cap = get_moe_a2a_backend().tbo_child_dispatch_cap()
                 if (
                     child_cap is not None
                     and num_tokens - self.local_tbo_split_num_tokens > child_cap
@@ -514,6 +520,16 @@ class TboDPAttentionPreparer:
         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
         global_forward_mode = global_forward_mode if can_run_tbo else None
         return tbo_split_seq_index, global_forward_mode
+
+    def compute_split_num_tokens(
+        self, gathered_split_num_tokens: torch.Tensor
+    ) -> Optional[List[int]]:
+        """Every rank's first-micro-batch rows, or None when the MoE a2a backend
+        does not use them; the gathered zeros would bound the first micro-batch at
+        0 rows, while None makes both micro-batches fall back to the parent's."""
+        if not self._uses_micro_batch_rows:
+            return None
+        return gathered_split_num_tokens.tolist()
 
     @staticmethod
     def _compute_local_forward_mode(local_batch):

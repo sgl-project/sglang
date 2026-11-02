@@ -134,7 +134,7 @@ class TestTboChildDispatchCap(CustomTestCase):
                 first = int(m * 0.48) + 1
                 self.assertLessEqual(_micro_batch_b_rows([first, m - first]), cap)
 
-    def _local_can_run_tbo(self, extend_lens, child_cap):
+    def _local_can_run_tbo(self, extend_lens, child_cap, uses_rows=True):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             spec_info=None,
@@ -145,6 +145,7 @@ class TestTboChildDispatchCap(CustomTestCase):
         backend = Mock(
             is_none=Mock(return_value=False),
             tbo_child_dispatch_cap=Mock(return_value=child_cap),
+            tbo_uses_micro_batch_rows=Mock(return_value=uses_rows),
         )
         preparer = TboDPAttentionPreparer()
         with (
@@ -172,6 +173,25 @@ class TestTboChildDispatchCap(CustomTestCase):
     def test_unbounded_backend_keeps_the_split(self):
         _, can_run, _ = self._local_can_run_tbo([4000, 5000], None)
         self.assertTrue(can_run)
+
+    def test_split_rows_reach_only_backends_that_use_them(self):
+        """A backend that does not bound micro-batches by their own rows gets None,
+        not the gathered zeros, which would bound the first micro-batch at 0 rows."""
+        gathered = torch.tensor([4500, 4096])
+        for uses_rows, local_rows, split_rows in (
+            # [4000, 5000] splits into two 4500-row micro-batches.
+            (True, 4500, [4500, 4096]),
+            (False, 0, None),
+        ):
+            with self.subTest(uses_rows=uses_rows):
+                preparer, can_run, _ = self._local_can_run_tbo(
+                    [4000, 5000], None, uses_rows=uses_rows
+                )
+                self.assertTrue(can_run)
+                self.assertEqual(preparer.local_tbo_split_num_tokens, local_rows)
+                self.assertEqual(
+                    preparer.compute_split_num_tokens(gathered), split_rows
+                )
 
 
 if __name__ == "__main__":
