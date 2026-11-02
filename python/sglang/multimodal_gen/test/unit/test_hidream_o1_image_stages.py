@@ -26,9 +26,6 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGBranch, CFGP
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines.hidream_o1_image import (
-    HIDREAM_O1_FLOW_SHIFT,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image import (
     HIDREAM_O1_MROPE_FIX_POINT,
     HIDREAM_O1_NOISE_SCALE,
@@ -42,6 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 
 PATCH_SIZE = 32
 CPU = torch.device("cpu")
+
+# Flow shift the reference implementation trains and samples with; a named
+# constant because the tests pin the UniPC contract against it.
+HIDREAM_O1_FLOW_SHIFT = 3.0
 
 
 class TestHiDreamO1PositionIds(unittest.TestCase):

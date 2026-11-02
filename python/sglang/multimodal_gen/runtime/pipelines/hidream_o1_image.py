@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HiDream-O1-Image text-to-image pipeline.
+"""HiDream-O1-Image pipeline — one class, one loader, one stage set.
 
-The checkpoint is a plain Qwen3-VL directory with no ``model_index.json``, so
-the pipeline loads its single component itself instead of going through the
-diffusers component loaders.
+All three checkpoints run through the same three-stage set (before-denoising
+with prompt enhancement, TI2I conditioning and initial noise; the clean-image
+denoising loop with CFG, co-batching, deterministic reroll and cache-dit; a
+pure-unpatchify decoding stage); the variant resolved from the served model
+path only selects the recipe — fixed 28-step flash / flow-match editing for
+the Dev checkpoints in fp32 weights, 50-step FlowUniPC with CFG 5.0 for the
+full checkpoint in bf16 — via the variant-aware configs.
 """
 
 import json
 import os
 
 import torch
-
+from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
+    HiDreamO1ImageDitConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
     HiDreamO1ImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
+    _VARIANT_DEFAULTS,
     HiDreamO1ImageSamplingParams,
+    _resolve_variant,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -25,9 +33,6 @@ from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.hidream_o1_image import (
     HiDreamO1ImageTransformer,
     is_hidream_o1_image_weight,
-)
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
-    FlowUniPCMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -40,18 +45,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HiDreamO1ImageDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from transformers import AutoProcessor
+from transformers import PreTrainedTokenizerBase
 
 logger = init_logger(__name__)
-
-# Flow shift the reference implementation trains and samples with.
-HIDREAM_O1_FLOW_SHIFT = 3.0
-# Modules the stages read back through get_module; a caller-supplied dict has to
-# cover all of them before load_modules can skip building them.
-_HIDREAM_O1_MODULES = frozenset({"transformer", "processor", "tokenizer", "scheduler"})
-
 
 class HiDreamO1ImagePipeline(ComposedPipelineBase):
     pipeline_name = "HiDreamO1ImagePipeline"
@@ -82,43 +82,79 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, torch.nn.Module]:
-        model_dir = maybe_download_model(self.model_path, revision=server_args.revision)
-        with open(os.path.join(model_dir, "config.json")) as config_file:
+        model_path = maybe_download_model(
+            self.model_path, revision=server_args.revision
+        )
+        with open(os.path.join(model_path, "config.json")) as config_file:
             hf_config = json.load(config_file)
 
-        # Read even when the modules are handed in: create_pipeline_stages and
-        # the stages both need these, and neither is recoverable from a module.
-        self._vision_start_token_id = hf_config["vision_start_token_id"]
         dit_config = server_args.pipeline_config.dit_config
-        dit_config.update_model_arch(hf_config["text_config"])
-
-        # The pixel head is not numerically stable in fp16, so this is a hard
-        # rejection rather than a cast.
-        param_dtype = resolve_precision(
-            server_args, "dit", precision_attr="dit_precision"
-        )
-        if param_dtype != torch.bfloat16:
-            raise ValueError(
-                f"HiDream-O1-Image is only released in bfloat16; got {param_dtype}. "
-                "Drop --dit-precision / --component-precisions overrides."
-            )
-
-        if loaded_modules is not None and _HIDREAM_O1_MODULES <= set(loaded_modules):
+        if loaded_modules is not None and {
+            "model",
+            "tokenizer",
+            "processor",
+        } <= set(loaded_modules):
             self._validate_tms_token(loaded_modules["tokenizer"], dit_config)
             return loaded_modules
+        variant = _resolve_variant(model_path)
+        w_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
+        # The vision tower is built for every variant: the stage serves TI2I
+        # editing for all of them, and the checkpoint ships model.visual.*.
+        model = self._load_transformer(
+            server_args, model_path, dit_config, hf_config, w_dtype
+        )
+
+        if variant != "full":
+            # Dev variants keep fp32 weights + bf16 autocast per variant policy;
+            # the dtype reaches the loader as param_dtype, so this is just the
+            # eval switch (the loader may leave the model on CPU for residency).
+            model = model.eval()
+
+        processor = AutoProcessor.from_pretrained(model_path)
+
+        tokenizer = (
+            processor
+            if isinstance(processor, PreTrainedTokenizerBase)
+            else processor.tokenizer
+        )
+        self._validate_tms_token(tokenizer, dit_config)
+
+        # No scheduler is built here: the scheduler depends on the request
+        # (task type, number of reference images), so the before-denoising
+        # stage only resolves the scheduler *name* and the denoising stage
+        # builds the scheduler per request.
+        return {
+            "model": model,
+            "processor": processor,
+            "tokenizer": tokenizer,
+        }
+
+    @staticmethod
+    def _load_transformer(
+        server_args: ServerArgs,
+        model_path: str,
+        dit_config: HiDreamO1ImageDitConfig,
+        hf_config: dict,
+        param_dtype: torch.dtype,
+    ) -> HiDreamO1ImageTransformer:
         safetensors_list = _list_safetensors_files(
-            model_dir,
+            model_path,
             index_file="model.safetensors.index.json",
             key_filter=is_hidream_o1_image_weight,
         )
         if not safetensors_list:
-            raise ValueError(f"No safetensors files found in {model_dir}")
+            raise ValueError(f"No safetensors files found in {model_path}")
 
         local_torch_device = get_local_torch_device()
         transformer = maybe_load_fsdp_model(
             model_cls=HiDreamO1ImageTransformer,
-            init_params={"config": dit_config, "hf_config": hf_config},
+            init_params={
+                "config": dit_config,
+                "hf_config": hf_config,
+                # TI2I editing is a capability of every variant.
+                "with_vision_tower": True,
+            },
             weight_dir_list=safetensors_list,
             device=local_torch_device,
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
@@ -135,60 +171,48 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
             checkpoint_key_filter=is_hidream_o1_image_weight,
             weight_load_plan=WeightLoadPlan(checkpoint_load_device=local_torch_device),
         )
-        server_args.model_paths["transformer"] = model_dir
-
-        from transformers import AutoProcessor, PreTrainedTokenizerBase
-
-        processor = AutoProcessor.from_pretrained(model_dir)
-        tokenizer = (
-            processor
-            if isinstance(processor, PreTrainedTokenizerBase)
-            else processor.tokenizer
+        server_args.model_paths["transformer"] = model_path
+        logger.info(
+            "HiDream %s transformer loaded to %s",
+            _resolve_variant(model_path),
+            local_torch_device,
         )
-        self._validate_tms_token(tokenizer, dit_config)
 
-        return {
-            "transformer": transformer,
-            "processor": processor,
-            "tokenizer": tokenizer,
-            "scheduler": FlowUniPCMultistepScheduler(
-                num_train_timesteps=1000,
-                shift=HIDREAM_O1_FLOW_SHIFT,
-                prediction_type="flow_prediction",
-                # The denoising stage's x_pred -> velocity conversion is only
-                # inverted by the x0 branch of convert_model_output.
-                predict_x0=True,
-                use_dynamic_shifting=False,
-            ),
-        }
+        # The TI2I two-pass loop drives decoder submodules directly, bypassing
+        # FSDP2's per-layer unshard hooks; under FSDP inference the model must
+        # take its dense 4D-mask branch instead (see _fsdp_wrapped).
+        from torch.distributed.fsdp import FSDPModule
+
+        transformer._fsdp_wrapped = isinstance(
+            transformer, FSDPModule
+        ) or any(isinstance(m, FSDPModule) for m in transformer.modules())
+        if transformer._fsdp_wrapped:
+            logger.info(
+                "FSDP inference wrapping detected: TI2I requests take the "
+                "dense attention branch."
+            )
+        return transformer
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        # 1. Resolution defaults plus the per-output seeds the noise is drawn from.
+        arch_config = server_args.pipeline_config.dit_config.arch_config
+        processor = self.get_module("processor")
         self.add_stage(InputValidationStage())
-
-        # 2. Prompt tokens, mrope positions, hybrid attention mask, patchified
-        #    noise and the timestep schedule.
         self.add_stage(
             HiDreamO1ImageBeforeDenoisingStage(
                 tokenizer=self.get_module("tokenizer"),
-                processor=self.get_module("processor"),
-                scheduler=self.get_module("scheduler"),
-                vision_start_token_id=self._vision_start_token_id,
-                tms_token_id=server_args.pipeline_config.dit_config.arch_config.tms_token_id,
-            )
+                processor=processor,
+                vision_start_token_id=arch_config.vision_start_token_id,
+                tms_token_id=arch_config.tms_token_id,
+            ),
+            "HiDreamO1ImageBeforeDenoisingStage",
         )
-
-        # 3. Denoising loop, converting the predicted clean image to a velocity.
         self.add_stage(
             HiDreamO1ImageDenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-                pipeline=self,
-            )
+                model=self.get_module("model"),
+            ),
+            "HiDreamO1ImageDenoisingStage",
         )
-
-        # 4. Unpatchify; there is no VAE to decode through.
-        self.add_stage(HiDreamO1ImageDecodingStage())
+        self.add_stage(HiDreamO1ImageDecodingStage(), "HiDreamO1ImageDecodingStage")
 
 
 EntryClass = HiDreamO1ImagePipeline

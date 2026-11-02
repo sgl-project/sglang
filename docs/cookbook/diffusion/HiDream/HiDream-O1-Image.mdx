@@ -10,7 +10,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Deployment } from '/src/snippets/_deployment.jsx';
 import { config } from '/src/snippets/configs/HiDream/hidream-o1-image.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "pixel-space", "8B UiT"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "image-editing", "pixel-space", "8B UiT"]} />
 
 ## 1. Quick start
 
@@ -23,11 +23,15 @@ then choose a recipe below. TP 1 and TP 2 on a single H200 are the verified shap
 
 [HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) is an 8B pixel-level Unified Transformer (UiT). Unlike the usual latent-diffusion layout, it has neither a VAE nor a separate text encoder: one Qwen3-VL backbone embeds the prompt and predicts clean 32x32 RGB patches directly, and the flow-matching head reads its timestep from a dedicated token in the prompt. It loads through SGLang's native `HiDreamO1ImagePipeline`.
 
-Choose it for text-to-image at its trained 2K-class resolutions, including legible in-image text. The checkpoint ships a stock `qwen3_vl` config with no `model_index.json`, so the pipeline loads the transformer itself; the tradeoff is a narrower feature surface: bf16 only, one prompt per request, no sequence parallelism, and monolithic serving only.
+Choose it for generation at its trained 2K-class resolutions, including legible in-image text. The checkpoint ships a stock `qwen3_vl` config with no `model_index.json`, so the pipeline loads the model itself. All three checkpoints run the same generation stage, so the full model also supports TI2I editing, `--pe-server-url` prompt enhancement, multi-prompt batching, and cache-dit — the remaining per-variant surface is the recipe (bf16 vs fp32 weights, CFG vs distilled) and sequence parallelism, which is unsupported for the family.
 
 | Model | Hugging Face model ID | Notes |
 | --- | --- | --- |
-| HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | Text-to-image, bf16 only |
+| HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | Reference recipe; T2I + TI2I; bf16 |
+| HiDream-O1-Image-Dev | `HiDream-ai/HiDream-O1-Image-Dev` | Distilled; fixed 28 steps; TI2I editing |
+| HiDream-O1-Image-Dev-2604 | `HiDream-ai/HiDream-O1-Image-Dev-2604` | Same recipe as Dev (earlier snapshot) |
+
+All three checkpoints load through SGLang's native `HiDreamO1ImagePipeline`; the two Dev checkpoints trade quality for speed. They are guidance-distilled (`guidance_scale` 0.0, no CFG branch, one forward pass per step) and always run the official fixed 28-step schedule — a requested `--num-inference-steps` is ignored with a warning. Weights are held in fp32 and forwarded under bf16 autocast. A request that carries a reference image resolves to TI2I editing automatically, and multiple prompts and outputs are batched inside the generation stage (dynamic batching). Unlike the full checkpoint, Dev text-to-image requests snap to the closest trained resolution by aspect ratio.
 
 ## 3. Generate an image
 
@@ -62,14 +66,47 @@ with open("hidream_o1.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### Edit an image (TI2I)
+
+Requests that carry a reference image run TI2I editing on every checkpoint (the official repo recommends the full model for editing). One-shot from the CLI:
+
+```bash Command
+sglang generate \
+  --model-path HiDream-ai/HiDream-O1-Image-Dev \
+  --prompt "Turn the sign into glowing neon lettering" \
+  --image-path reference.png \
+  --save-output
+```
+
+Or through the OpenAI-compatible edits endpoint:
+
+```python Python
+with open("reference.png", "rb") as f:
+    response = client.images.edit(
+        model="HiDream-ai/HiDream-O1-Image-Dev",
+        prompt="Turn the sign into glowing neon lettering",
+        image=f,
+    )
+```
+
+Editing behavior:
+
+- A single reference defines the target size: it is resized to 2048 on its long side (patch-aligned) and its aspect is kept, unless the request sets both `width` and `height` explicitly.
+- Up to 8 references are supported. `--layout-bboxes` adds a layout image describing where each reference belongs in the output.
+- Editing runs the `flow_match` scheduler by default (the official editing default); pass `--scheduler-name` to override. The trajectory is deterministic, and a bad initial draw is re-rolled automatically.
+- Prompt enhancement (`--pe-server-url`) applies to text-to-image only and is skipped for editing requests.
+
 ## 4. Configuration tips
 
-- The model is released in bfloat16 only; `--dit-precision` / `--component-precisions` overrides are rejected rather than silently downcast.
-- The trained resolutions are 2048x2048, 2304x1728, 2560x1440, 2496x1664, 3104x1312, 2304x1792 and their transposes. Nothing snaps: an off-grid size is warned about in the server log and then rendered exactly as requested, and because pixel patches carry no scale invariance the quality degrades badly.
-- Sequence parallelism is unsupported: the prompt span is causal while the image span is bidirectional, which needs a dense `[B, 1, S, S]` mask that cannot be sharded along the sequence. Use `--tp-size` for multi-GPU instead. `--cfg-parallel-size 2` is accepted at the default `--guidance-scale 5.0`, since it splits the two CFG branches across GPUs, but it has not been verified end to end.
+- The per-variant weight dtype is fixed by the recipe (bf16 for the full checkpoint, fp32 for the Dev checkpoints, forwarded under bf16 autocast); `--dit-precision` / `--component-precisions` do not apply.
+- The trained resolutions are 2048x2048, 2304x1728, 2560x1440, 2496x1664, 3104x1312, 2304x1792 and their transposes. Requests snap to the closest trained resolution by aspect ratio (a single-reference TI2I request keeps the reference aspect instead), because pixel patches carry no scale invariance and off-grid sizes degrade quality badly.
+- Sequence parallelism is unsupported; use `--tp-size` for multi-GPU instead.
 - Encoder/denoiser/decoder disaggregation does not apply — one component does all three, so the pipeline only runs in the monolithic role.
 - The defaults are the reference `full` recipe: 50 steps, `--guidance-scale 5.0`, shift 3.0 (fixed). Classifier-free guidance costs a second forward pass per step, so `--guidance-scale 1.0` halves the step cost at some quality loss.
-- Noise is drawn on the host, so a given `--seed` reproduces the same image on any accelerator.
+- Each output keeps its own private RNG stream, so a given `--seed` reproduces the same image for the same checkpoint on the same device class.
+- Dev checkpoints ignore `--num-inference-steps` (the fixed 28-step official schedule) and run guidance-free: `--guidance-scale` defaults to 0.0 and there is no CFG branch, so a step costs one forward pass.
+- Dev text-to-image requests snap to the closest trained resolution by aspect ratio (the size list above); TI2I inherits the reference aspect instead.
+- Cache-DiT acceleration is available on every variant: start the server with `SGLANG_CACHE_DIT_ENABLED=true`. The stage applies a tighter residual-diffusion threshold tuned for HiDream unless `SGLANG_CACHE_DIT_RDT` is set explicitly (the shipped 0.05 default is fidelity-safe but inert; ~0.4 was verified acceptable with a large speedup on the full checkpoint); the other `SGLANG_CACHE_DIT_*` knobs apply as usual.
 
 ## 5. Run in ComfyUI
 

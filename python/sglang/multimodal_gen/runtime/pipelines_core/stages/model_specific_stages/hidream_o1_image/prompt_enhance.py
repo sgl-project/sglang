@@ -14,7 +14,6 @@ import re
 from typing import Any
 
 import requests
-
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -192,3 +191,10 @@ def enhance_prompt(prompt: str, base_url: str) -> str:
 
     logger.info("Prompt enhanced: %r -> %r", prompt, refined)
     return refined
+
+
+def prepare_prompt(prompt: str, *, pe_server_url: str | None) -> str:
+    """Path 1: rewrite via the PE server; path 2: use the raw prompt."""
+    if pe_server_url:
+        return enhance_prompt(prompt=prompt, base_url=pe_server_url)
+    return prompt
