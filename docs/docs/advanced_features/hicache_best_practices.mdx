@@ -81,9 +81,9 @@ Guidelines:
 
 ### KV cache sharding with Mooncake
 
-On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCache host offload and Mooncake storage. Configure your model and parallelism for KV sharding first: plain TP for MLA, or prefill attention CP for GQA. Use the Python UnifiedTreeCore (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`). Configure Mooncake as described in [Deployment with Mooncake](/docs/advanced_features/hicache_best_practices#deployment-with-mooncake), then add these flags to your prefill server:
+On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCache host offload and Mooncake storage. Configure your model and parallelism for KV sharding first: plain TP for MLA, or prefill attention CP for GQA. KV sharding requires the Python UnifiedTreeCore: leave `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND` unset so that sharding selects it, or set it to `python`. Set up Mooncake as described in [Deployment with Mooncake](#deployment-with-mooncake), but use `--hicache-io-backend kernel` and `--hicache-mem-layout page_first` instead of that example's I/O flags. Then add these flags to your prefill server:
 
-```bash
+```bash Command
 --enable-kv-cache-sharding \
 --enable-hierarchical-cache \
 --hicache-host-memory-mode cache \
@@ -92,14 +92,16 @@ On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCach
 --hicache-storage-backend mooncake
 ```
 
-Each rank reads and writes only the pages it owns, using local host rows. Storage keys identify the attention head partition and page format, so a later request can read a page even if its owner changes. Sharded writers use a separate namespace from unsharded writers. To share pages, use the same model, attention-TP size, page size, KV dtype, host layout, and layer partition.
+Each rank reads and writes only the pages it owns, using local host rows. Storage keys identify the attention head partition and page format, so a later request can read a page even if its owner changes. To share pages, use the same model, attention-TP size, page size, KV dtype, host layout, and layer partition.
+
+Sharded writers use a separate namespace from unsharded writers. Decode workers never shard KV, so a KV-sharded prefill does not reuse pages written by decode-side offload (`--disaggregation-decode-enable-offload-kvcache`) or by unsharded prefill instances.
 
 The following restrictions also apply to runtime storage attachment:
 
 - Use `cache` host memory mode. `buffer_only` mode is unsupported with KV-sharded storage.
-- Only the `mooncake` and `file` storage backends are supported. With `file`, all shard ranks must use a shared directory; file eviction through `max_size` or `min_free_space` is unsupported.
+- Only the `mooncake` and `file` storage backends are supported. With `file`, all shard ranks must use a shared directory, and file eviction is unsupported: leave `max_size` and `min_free_space` unset in `--hicache-storage-backend-extra-config`, and leave `SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE` and `SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE` unset.
 - Omit `tp_lcm_size`; heterogeneous head splitting is unsupported with KV sharding.
-- Only the primary KV host pool is supported. Existing KV-sharding restrictions, including unsupported DSA, speculative decoding, and DCP configurations, still apply.
+- DSA models, including GLM DSA with NextN MTP, are not yet supported with KV-sharded storage: sharded storage I/O covers only the KV host pool, not the indexer pool.
 
 ### Prefetch Policies
 

@@ -63,6 +63,7 @@ import unittest.mock
 from array import array
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
+from queue import Queue
 from types import SimpleNamespace
 
 import numpy as np
@@ -127,13 +128,14 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     _multicast_gather_supported,
     _symmetric_scratch_layout,
 )
-from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel, get_spec
@@ -2084,6 +2086,16 @@ def _host_pool(shard_rank, device_pages=32):
     )
 
 
+@contextmanager
+def _file_eviction_env(*, max_size, min_free_space="0"):
+    """Pin the HiCacheFile eviction env vars a CI host may export."""
+    with (
+        envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.override(max_size),
+        envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.override(min_free_space),
+    ):
+        yield
+
+
 def _page_classes(indices):
     return (indices[::PS] // PS % N).tolist()
 
@@ -2245,6 +2257,7 @@ class _FakeStore:
         self.missing = set(missing)
         self.raise_on_rank = raise_on_rank
         self.reads = {r: [] for r in range(N)}
+        self.read_rows = {r: [] for r in range(N)}
         self.writes = {r: [] for r in range(N)}
 
     def controller(self, rank, pool):
@@ -2260,7 +2273,7 @@ class _FakeStore:
             if rank == self.raise_on_rank:
                 raise IOError("short read")
             self.reads[rank].append(list(keys))
-            assert int(rows.max()) < pool.size, "logical rows reached a backend"
+            self.read_rows[rank].append(rows)
             hits = 0
             for key in keys:
                 if key in self.missing:
@@ -2269,7 +2282,6 @@ class _FakeStore:
             return hits
 
         def put(keys, rows, extra_info=None):
-            assert int(rows.max()) < pool.size, "logical rows reached a backend"
             self.writes[rank].extend(keys)
             return True
 
@@ -2323,9 +2335,15 @@ class TestShardedStorageIO(CustomTestCase):
         op, mins = self._prefetch(store, num_pages=10)
         self.assertEqual(mins[-1], 10 * PS)
         owners = _page_classes(op.host_indices)
+        placement = PageInterleavePlacement(_make_spec())
         for r in range(N):
             read = [k for batch in store.reads[r] for k in batch]
             self.assertEqual(read, [k for k, o in zip(op.hash_value, owners) if o == r])
+            # Backends address this rank's host buffer, never logical slots.
+            owned = op.host_indices[placement.owner_of(op.host_indices) == r]
+            self.assertTrue(
+                torch.equal(torch.cat(store.read_rows[r]), placement.local_index(owned))
+            )
 
     def test_min_of_rank_prefixes_is_the_landed_prefix(self):
         for miss, num_pages in ((6, 10), (2, 10), (9, 10), (0, 3)):
@@ -2334,9 +2352,9 @@ class TestShardedStorageIO(CustomTestCase):
                 _, mins = self._prefetch(store, num_pages=num_pages)
                 self.assertEqual(mins[-1], miss * PS)
 
-    def test_a_raising_rank_reports_a_short_prefix_instead_of_hanging(self):
-        """Only owners call the backend: an exception on one rank must still
-        produce its acks, or the others block in the ack collective."""
+    def test_a_raising_rank_keeps_the_prefix_before_its_first_owned_page(self):
+        """A backend exception on one rank caps the landed prefix at that
+        rank's first owned page, not at the start of the batch."""
         store = _FakeStore(raise_on_rank=2)
         op, mins = self._prefetch(store, num_pages=10)
         first_owned = _page_classes(op.host_indices).index(2)
@@ -2412,9 +2430,15 @@ class TestShardedStorageIO(CustomTestCase):
                 pool=pools[rank], page_get=get, page_set=put
             )
 
+        def owned(pool, host):
+            # Derived from the placement, not from owned_storage_pages.
+            mask = pool.placement.owner_of(host) == pool.shard_rank
+            positions = torch.nonzero(mask[::PS]).squeeze(1).tolist()
+            return positions, pool.placement.local_index(host[mask])
+
         for rank, pool in enumerate(pools):
             host = pool.alloc(page_count * PS, start_owner=3)
-            positions, rows = pool.owned_storage_pages(host)
+            positions, rows = owned(pool, host)
             buffers[rank][rows] = values[positions].flatten().float()
             self.assertTrue(io(rank)[1](keys, host))
             pool.free(host)
@@ -2424,7 +2448,7 @@ class TestShardedStorageIO(CustomTestCase):
         for rank, pool in enumerate(pools):
             host = pool.alloc(page_count * PS, start_owner=1)
             self.assertEqual(io(rank)[0](None, keys, host), page_count)
-            positions, rows = pool.owned_storage_pages(host)
+            positions, rows = owned(pool, host)
             torch.testing.assert_close(
                 buffers[rank][rows], values[positions].flatten().float()
             )
@@ -2559,14 +2583,29 @@ class TestShardedStorageKeys(CustomTestCase):
                     )
                 self.assertTrue(os.path.exists(page))
 
-    def test_split_heads_are_refused_at_attach(self):
-        """Launch sees no parsed extra config; attach rejects tp_lcm_size."""
-        check_kv_shard_storage(storage_backend="file", host_memory_mode="cache")
-        with self.assertRaisesRegex(ValueError, "tp_lcm_size"):
+    def test_file_eviction_is_refused_from_the_extra_config_or_env(self):
+        """Eviction also comes from SGLANG_HICACHE_FILE_BACKEND_*; refuse it for
+        the file backend, and leave an unread @file config to attach."""
+
+        def check(storage_backend="file", extra_config=None):
             check_kv_shard_storage(
-                storage_backend="mooncake",
+                storage_backend=storage_backend,
                 host_memory_mode="cache",
-                extra_config={"tp_lcm_size": 8},
+                extra_config={} if extra_config is None else extra_config,
+            )
+
+        with _file_eviction_env(max_size="0"):
+            check()
+            with self.assertRaisesRegex(ValueError, "HiCacheFile eviction"):
+                check(extra_config={"max_size": "1G"})
+        with _file_eviction_env(max_size="1G"):
+            with self.assertRaisesRegex(ValueError, "HiCacheFile eviction"):
+                check()
+            check(extra_config={"max_size": 0})
+            check(storage_backend="mooncake")
+            # Launch cannot read an @file config; attach checks it instead.
+            check_kv_shard_storage(
+                storage_backend="file", host_memory_mode="cache", extra_config=None
             )
 
     def test_runtime_attach_rejects_unsupported_sidecars_before_backend_creation(self):
@@ -2577,8 +2616,8 @@ class TestShardedStorageKeys(CustomTestCase):
             storage_host_pool=pool,
             mem_pool_host=SimpleNamespace(
                 entries=[
-                    SimpleNamespace(host_pool=pool),
-                    SimpleNamespace(host_pool=object()),
+                    SimpleNamespace(name=PoolName.KV, host_pool=pool),
+                    SimpleNamespace(name=PoolName.INDEXER, host_pool=object()),
                 ]
             ),
             _stop_storage_threads=unittest.mock.Mock(),
@@ -2590,10 +2629,197 @@ class TestShardedStorageKeys(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=1),
             ),
-            self.assertRaisesRegex(ValueError, "only the KV host pool"),
+            unittest.mock.patch.object(
+                cache_controller_module,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="legacy"),
+            ),
+            self.assertRaisesRegex(
+                ValueError, r"only the KV host pool, not \['indexer'\]"
+            ),
         ):
             HiCacheController.attach_storage_backend(controller, "mooncake")
         controller._generate_storage_config.assert_not_called()
+
+
+class TestShardedFileStorage(CustomTestCase):
+    """The real HybridCacheController attach and page IO on every simulated
+    shard rank, over one shared HiCacheFile directory."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, _file_eviction_env(max_size="0"))
+
+    def _controller(self, rank, host_memory_mode="cache"):
+        pool = _host_pool(rank)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.is_kv_sharded = True
+        controller.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller.storage_host_pool = pool
+        controller.mem_pool_device = object.__new__(MLATokenToKVPool)
+        controller.mem_pool_device.dtype = torch.bfloat16
+        controller.page_size = PS
+        controller.host_memory_mode = host_memory_mode
+        controller.enable_storage = False
+        controller.enable_storage_metrics = False
+        controller.storage_stop_event = threading.Event()
+        controller.prefetch_thread = controller.prefetch_io_aux_thread = None
+        controller.prefetch_sync_thread = controller.backup_thread = None
+        controller._storage_worker_failures = {}
+        controller.tp_group = controller.pp_group = None
+        controller.attn_cp_group = controller.attn_tp_group = None
+        controller.pp_prefetch_command_group = None
+        controller.pp_prefetch_command_thread = None
+
+        def start_inline_storage():
+            # Page IO runs inline on the test thread; it only needs the ack queue.
+            controller.prefetch_sync_queue = Queue()
+
+        controller._start_storage_threads = start_inline_storage
+        return controller
+
+    def _attach(self, controller, rank, storage_backend="file", extra_config=None):
+        # Plain-TP MLA: the shard group is the attention-TP group.
+        parallel = SimpleNamespace(
+            tp_rank=rank,
+            tp_size=N,
+            pp_rank=0,
+            pp_size=1,
+            attn_tp_rank=rank,
+            attn_tp_size=N,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+        )
+        with (
+            unittest.mock.patch.object(
+                cache_controller_module, "get_parallel", return_value=parallel
+            ),
+            unittest.mock.patch.object(
+                cache_controller_module, "is_dp_attention_enabled", return_value=False
+            ),
+            unittest.mock.patch.object(
+                cache_controller_module,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_storage_key_scheme="legacy"),
+            ),
+        ):
+            controller.attach_storage_backend(
+                storage_backend=storage_backend,
+                prefetch_threshold=PS,
+                model_name="model",
+                storage_backend_extra_config=dict(extra_config or {}),
+                host_pools=controller.mem_pool_host.entries,
+            )
+
+    def test_a_chain_written_in_one_rotation_reads_back_in_another(self):
+        """Owners write their pages through local host rows under names free of
+        the owner rank; a chain with other owners reads every page back."""
+        controllers = [self._controller(rank) for rank in range(N)]
+        pools = [controller.storage_host_pool for controller in controllers]
+        keys = [f"page-{i}" for i in range(9)]
+        pages = [
+            torch.full_like(pools[0].get_dummy_flat_data_page(), i + 1)
+            for i in range(len(keys))
+        ]
+        placement = PageInterleavePlacement(_make_spec())
+
+        def owned_pages(rank, host):
+            for position in range(len(keys)):
+                start = host[position * PS : position * PS + 1]
+                if int(placement.owner_of(start)) == rank:
+                    yield position, int(placement.local_index(start))
+
+        with (
+            tempfile.TemporaryDirectory() as path,
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(path),
+        ):
+            for rank, controller in enumerate(controllers):
+                self._attach(controller, rank)
+            # Mirrored allocators; burned slots push logical ids past every
+            # rank's host rows, so a logical index cannot pass for a local row.
+            for pool in pools:
+                pool.alloc(80 * PS, start_owner=0)
+            host = [pool.alloc(9 * PS, start_owner=3) for pool in pools]
+            self.assertGreater(int(host[0].min()), pools[0].size)
+            for rank, pool in enumerate(pools):
+                for position, row in owned_pages(rank, host[rank]):
+                    pool.set_from_flat_data_page(row, pages[position])
+            for rank, (controller, slots) in enumerate(zip(controllers, host)):
+                operation = SimpleNamespace(
+                    id=rank,
+                    hash_value=keys,
+                    host_indices=slots,
+                    prefix_keys=None,
+                    completed_tokens=0,
+                    pool_transfers=None,
+                )
+                controller._page_backup(operation)
+                self.assertEqual(operation.completed_tokens, len(keys) * PS)
+            self.assertEqual(len(os.listdir(path)), len(keys))
+
+            for pool, slots in zip(pools, host):
+                pool.free(slots)
+                pool.kv_buffer.zero_()
+            reload = [pool.alloc(9 * PS, start_owner=1) for pool in pools]
+            self.assertTrue(
+                all(
+                    int(placement.owner_of(reload[0][p * PS : p * PS + 1]))
+                    != int(placement.owner_of(host[0][p * PS : p * PS + 1]))
+                    for p in range(len(keys))
+                )
+            )
+            streams = []
+            for controller, slots in zip(controllers, reload):
+                controller._page_transfer(
+                    SimpleNamespace(
+                        request_id="r",
+                        hash_value=keys,
+                        host_indices=slots,
+                        prefix_keys=None,
+                        pool_transfers=None,
+                        is_terminated=lambda: False,
+                    )
+                )
+                acks = controller.prefetch_sync_queue
+                streams.append(
+                    [acks.get_nowait().completed_tokens for _ in range(acks.qsize())]
+                )
+
+        self.assertEqual([min(acks) for acks in zip(*streams)][-1], len(keys) * PS)
+        for rank, pool in enumerate(pools):
+            for position, row in owned_pages(rank, reload[rank]):
+                self.assertTrue(torch.equal(pool.get_data_page(row), pages[position]))
+
+    def test_attach_refuses_unsupported_storage_before_creating_a_backend(self):
+        """A runtime attach skips the launch gate, so attach itself must refuse
+        what sharded storage cannot serve, before any backend exists."""
+        for storage_backend, mode, extra_config in (
+            ("hf3fs", "cache", None),
+            ("file", "buffer_only", None),
+            ("mooncake", "cache", {"tp_lcm_size": 8}),
+            ("file", "cache", {"min_free_space": "1G"}),
+        ):
+            with self.subTest(storage_backend=storage_backend, mode=mode):
+                controller = self._controller(0, host_memory_mode=mode)
+                with (
+                    unittest.mock.patch.object(
+                        StorageBackendFactory, "create_backend"
+                    ) as create_backend,
+                    self.assertRaises(ValueError),
+                ):
+                    self._attach(controller, 0, storage_backend, extra_config)
+                create_backend.assert_not_called()
+                self.assertFalse(controller.enable_storage)
 
 
 class TestShardedStorageFormat(CustomTestCase):
@@ -2665,6 +2891,7 @@ class TestShardedStorageFormat(CustomTestCase):
                 page_size=PS,
                 enable_storage_metrics=False,
                 get_attn_cp_rank_and_size=lambda: (cp_rank, 2),
+                _build_unified_plan=lambda *_: None,
             )
             parallel = SimpleNamespace(
                 tp_rank=2 * cp_rank + 1,
