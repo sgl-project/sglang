@@ -783,7 +783,9 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
-            self.rid = expand_base_rid(self.rid, num)
+            # Unpadded on purpose: clients and the Rust server rebuild `<rid>_<i>`.
+            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            self.rid = new_rids
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
             # as the rid would be expanded for parallel sampling in tokenizer_manager

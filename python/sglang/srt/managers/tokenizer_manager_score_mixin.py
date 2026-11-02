@@ -14,6 +14,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
+from sglang.srt.utils.rid_utils import expand_base_rid
 
 logger = logging.getLogger(__name__)
 
@@ -1183,6 +1184,10 @@ class TokenizerManagerScoreMixin:
 
         # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
+        sub_rids = None
+        if rid is not None:
+            prompts = text_prompts if text_prompts is not None else input_ids
+            sub_rids = expand_base_rid(rid, len(prompts))
         if is_generation:
             # packed MIS requests gather the union, then select per item
             request_labels = (
@@ -1210,7 +1215,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
-                rid=rid,
+                rid=sub_rids,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1220,7 +1225,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
-                rid=rid,
+                rid=sub_rids,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
