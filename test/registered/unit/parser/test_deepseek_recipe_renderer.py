@@ -200,7 +200,7 @@ class TestDeepSeekRecipe(CustomTestCase):
         """Miles (radixark/miles) tokenizes sessions turn by turn with these calls: a
         history cut after pending tool calls renders through `convert` and
         `encode_conversation` as a prefix of the full prompt, then the generation
-        header, with the effort budget applied as in `encode`."""
+        header, preserving the effort budget and response schema."""
         recipe = renderer.load_deepseek_recipe()
         call = {
             "id": "call_1",
@@ -216,6 +216,19 @@ class TestDeepSeekRecipe(CustomTestCase):
                 ],
                 "tools": [{"type": "function", "function": {"name": "get_weather"}}],
                 "thinking": thinking,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "weather",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
             }
             with self.subTest(thinking=thinking):
                 conversation = self.deepseek_recipe.convert(body, effort_budget=30)
@@ -231,6 +244,8 @@ class TestDeepSeekRecipe(CustomTestCase):
                     tools=conversation.tools,
                     tool_choice=conversation.tool_choice,
                     reasoning_effort=conversation.reasoning_effort,
+                    response_schema=conversation.response_schema,
+                    response_regex=conversation.response_regex,
                 )
                 prefix = self.deepseek_recipe.encode_conversation(
                     history, effort_budget=30
