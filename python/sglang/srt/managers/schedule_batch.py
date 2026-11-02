@@ -2430,6 +2430,11 @@ class Req(ReqDllmMixin):
         self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
 
     def __repr__(self):
+        if envs.SGLANG_REDACT_REQUEST_DATA.get():
+            return (
+                f"Req(rid={self.rid}, input_len={len(self.origin_input_ids)}, "
+                f"output_len={len(self.output_ids)})"
+            )
         return (
             f"Req(rid={self.rid}, "
             f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
