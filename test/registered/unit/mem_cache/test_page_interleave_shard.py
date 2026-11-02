@@ -943,6 +943,77 @@ class TestClassedAllocator(CustomTestCase):
         self.assertIsNone(out)
         self.assertEqual(alloc.class_free_page_counts(), counts_before)
 
+    def test_batch_alloc_matches_sequential_requests(self):
+        """The batched commit pops each class once for the whole batch; it
+        must hand out exactly the pages a request-by-request commit would,
+        with staged (need_sort) or reordered (no sort) free lists."""
+        prefix_lens = [2 * PS, 0, 0, 5 * PS, 0]
+        seq_lens = [7 * PS - 3, 3 * PS + 1, 1, 6 * PS, 9 * PS - 5]
+        bases = [1, None, None, 3, None]
+        last_locs = [
+            (5 * N + 2) * PS + PS - 1,
+            -1,
+            -1,
+            (7 * N + 3) * PS + PS - 1,
+            -1,
+        ]
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                batched, sequential = (
+                    _make_allocator(pages_per_rank=16, need_sort=need_sort)
+                    for _ in range(2)
+                )
+                for alloc in (batched, sequential):
+                    # Free part of an allocation so the classes hold staged
+                    # pages (need_sort) or reordered heads (no sort).
+                    warm = _alloc_extend(alloc, 0, 12 * PS, rotation_base=2)
+                    alloc.free(warm[3 * PS : 9 * PS])
+
+                batch_bases = list(bases)
+                out = _alloc_extend_batch(
+                    batched, prefix_lens, seq_lens, batch_bases, last_locs
+                )
+                expected = torch.cat(
+                    [
+                        _alloc_extend(sequential, p, s, b, loc)
+                        for p, s, b, loc in zip(
+                            prefix_lens, seq_lens, batch_bases, last_locs
+                        )
+                    ]
+                )
+                self.assertTrue(torch.equal(out, expected))
+                self.assertEqual(
+                    batched.class_free_page_counts(),
+                    sequential.class_free_page_counts(),
+                )
+
+    def test_grouped_free_segments_release_each_page_once(self):
+        """free() and free_segment() calls in one group are released together:
+        each page returns to its owner class exactly once, staged until the
+        next merge under need_sort."""
+        alloc = _make_allocator(need_sort=True)
+        total = alloc.class_free_page_counts()
+        out = _alloc_extend(alloc, 0, 6 * PS + 5, rotation_base=1)
+
+        alloc.free_group_begin()
+        alloc.free_segment(out[: 2 * PS], start_pos=0)
+        alloc.free_segment(out[2 * PS : 5 * PS], start_pos=2 * PS)
+        alloc.free(out[5 * PS :])
+        # Grouped segment ids must not alias the caller's row.
+        out[: 5 * PS].zero_()
+        alloc.free_group_end()
+
+        self.assertEqual(alloc.class_free_page_counts(), total)
+        free_pages = alloc.get_all_free_pages()
+        self.assertEqual(len(torch.unique(free_pages)), free_pages.numel())
+        alloc.debug_check_classes()
+
+    def test_free_segment_rejects_unaligned_start(self):
+        alloc = _make_allocator()
+        out = _alloc_extend(alloc, 0, 2 * PS, rotation_base=0)
+        with self.assertRaises(AssertionError):
+            alloc.free_segment(out[1:], start_pos=1)
+
 
 class TestEvictUntilAllocatable(CustomTestCase):
     """The evict-then-allocate contract under min-class accounting: one

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -106,29 +107,36 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             + r
             for r in range(self.shard_size)
         ]
-        self.class_release_pages: List[torch.Tensor] = [
-            torch.empty((0,), dtype=torch.int64, device=self.device)
-            for _ in range(self.shard_size)
+        # need_sort only: freed pages per class, staged unsorted until an
+        # alloc runs short (merge_and_sort_free), with host-side counts.
+        self.class_staged_pages: List[List[torch.Tensor]] = [
+            [] for _ in range(self.shard_size)
         ]
+        self.class_num_staged_pages: List[int] = [0] * self.shard_size
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group = None
-        # free_segment() routes back to free(), so this stays empty; the paged
-        # base's free_group_end() reads it unconditionally.
+        # Grouped free_segment() page ids, released at free_group_end().
         self.free_page_ids_group = []
         # Neutralize the base single-list attributes: every consumer of this
         # allocator must go through the classed API (or fail loud on None),
         # never a stale flat free list.
         self.free_pages = None
         self.release_pages = None
+        self.staged_pages = None
+        self.num_staged_pages = 0
+        # Reusable pinned host buffer for the alloc_extend plan; the event
+        # guards reuse until the previous H2D copy has completed.
+        self._plan_host: Optional[torch.Tensor] = None
+        self._plan_copied = None
 
     # ---- classed accounting ---------------------------------------------------
 
     def class_free_page_counts(self) -> List[int]:
-        """Free pages per class (free + release) — the per-class watermarks
+        """Free pages per class (free + staged) — the per-class watermarks
         exported at the scheduler invariant-checker seam."""
         return [
-            len(free) + len(release)
-            for free, release in zip(self.class_free_pages, self.class_release_pages)
+            len(free) + staged
+            for free, staged in zip(self.class_free_pages, self.class_num_staged_pages)
         ]
 
     def available_size(self) -> int:
@@ -154,14 +162,13 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
 
     def merge_and_sort_free(self):
         for r in range(self.shard_size):
-            if len(self.class_release_pages[r]) > 0:
+            if self.class_staged_pages[r]:
                 merged = torch.cat(
-                    (self.class_free_pages[r], self.class_release_pages[r])
+                    (self.class_free_pages[r], *self.class_staged_pages[r])
                 )
                 self.class_free_pages[r], _ = torch.sort(merged)
-                self.class_release_pages[r] = torch.empty(
-                    (0,), dtype=torch.int64, device=self.device
-                )
+                self.class_staged_pages[r] = []
+                self.class_num_staged_pages[r] = 0
 
     # ---- alloc / free -----------------------------------------------------------
 
@@ -211,7 +218,11 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         per-request reserve) makes that unreachable outside true OOM.
         """
         ps, shard_size = self.page_size, self.shard_size
-        bs = len(prefix_lens_cpu)
+        # Host lengths as Python ints: per-element tensor indexing costs a
+        # dispatch per read, several reads per request.
+        prefix_list = _host_int_list(prefix_lens_cpu)
+        seq_list = _host_int_list(seq_lens_cpu)
+        bs = len(prefix_list)
         assert rotation_bases is not None and len(rotation_bases) == bs, (
             "sharded alloc_extend needs one rotation base slot per request "
             "(alloc_paged_token_slots_extend derives them from req.last_node)"
@@ -224,8 +235,8 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         start_classes: List[int] = []
         new_pages_list: List[int] = []
         for i in range(bs):
-            prefix_len = int(prefix_lens_cpu[i])
-            seq_len = int(seq_lens_cpu[i])
+            prefix_len = prefix_list[i]
+            seq_len = seq_list[i]
             assert prefix_len % ps == 0, (
                 f"sharded extends start page-aligned (the radix-tree match "
                 f"quantum and the chunk flooring guarantee it), got "
@@ -257,13 +268,11 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
                     f"{i}): owner of the last prefix page is {actual}, host "
                     f"phase says {expected}"
                 )
-        assert extend_num_tokens == sum(
-            int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i]) for i in range(bs)
-        )
+        assert extend_num_tokens == sum(seq_list) - sum(prefix_list)
         if min(sim_counts) < 0:
             return None
         # Under need_sort the pops slice class_free_pages only; merge the
-        # release lists in whenever any class's free list alone is shorter
+        # staged pages in whenever any class's free list alone is shorter
         # than its total need (= total count - simulated remainder).
         needs = [
             total - remaining
@@ -274,37 +283,75 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         ):
             self.merge_and_sort_free()
 
-        # Pass 2: commit the pops, one position-ordered page vector per
-        # request, concatenated in batch order (= out_cache_loc order).
-        out_parts = []
+        # Pass 2: commit the pops with a batch-size-independent number of
+        # device ops. Each class pops its whole-batch need once, and a host
+        # plan maps every output row to a (popped page, in-page offset) pair.
+        # Request i's position-page j draws class c = (start_i + j) % N and
+        # takes that class's (j // N)-th pop for the request, after the pops
+        # of earlier requests in the batch.
+        per_req_counts = [
+            self._class_counts(start_classes[i], new_pages_list[i], shard_size)
+            for i in range(bs)
+        ]
+        totals = [sum(cnt[c] for cnt in per_req_counts) for c in range(shard_size)]
+        class_base = np.zeros(shard_size, dtype=np.int64)
+        np.cumsum(totals[:-1], out=class_base[1:])
+        popped = []
+        for c in range(shard_size):
+            if totals[c]:
+                popped.append(self.class_free_pages[c][: totals[c]])
+                self.class_free_pages[c] = self.class_free_pages[c][totals[c] :]
+
+        plan = self._plan_buffer(extend_num_tokens)
+        slot, offset = plan.numpy()
+        consumed = np.zeros(shard_size, dtype=np.int64)
+        row = 0
         for i in range(bs):
-            new_pages = new_pages_list[i]
-            start_class = start_classes[i]
-            counts = self._class_counts(start_class, new_pages, shard_size)
-            # Interleave the class pops into one position-ordered page
-            # vector: position-page j draws class (start_class + j) % N, so
-            # class c fills plan slots (c - start_class) % N, +N, +2N, ...
-            pages = torch.empty((new_pages,), dtype=torch.int64, device=self.device)
-            for c in range(shard_size):
-                if counts[c] == 0:
-                    continue
-                pages[
-                    torch.arange(
-                        (c - start_class) % shard_size,
-                        new_pages,
-                        shard_size,
-                        device=self.device,
-                    )
-                ] = self.class_free_pages[c][: counts[c]]
-                self.class_free_pages[c] = self.class_free_pages[c][counts[c] :]
-            extend_len = int(seq_lens_cpu[i]) - int(prefix_lens_cpu[i])
-            offsets = torch.arange(extend_len, dtype=torch.int64, device=self.device)
-            out_parts.append(pages[offsets // ps] * ps + offsets % ps)
-        out_indices = torch.cat(out_parts) if len(out_parts) > 1 else out_parts[0]
+            extend_len = seq_list[i] - prefix_list[i]
+            j = np.arange(new_pages_list[i])
+            cls = (start_classes[i] + j) % shard_size
+            page_slot = class_base[cls] + consumed[cls] + j // shard_size
+            consumed += per_req_counts[i]
+            t = np.arange(extend_len)
+            slot[row : row + extend_len] = page_slot[t // ps]
+            offset[row : row + extend_len] = t % ps
+            row += extend_len
+
+        if plan.is_pinned():
+            # A pinned source keeps the copy ordered on the current stream
+            # without a host sync; the event guards the buffer's reuse.
+            plan = plan.to(self.device, non_blocking=True)
+            self._plan_copied.record()
+        else:
+            plan = plan.to(self.device)
+        pool = torch.cat(popped) if len(popped) > 1 else popped[0]
+        out_indices = pool[plan[0]] * ps + plan[1]
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
         return out_indices
+
+    def _plan_buffer(self, num_tokens: int) -> torch.Tensor:
+        """A contiguous (2, num_tokens) int64 host buffer for the plan.
+
+        On CUDA it views a reused pinned buffer instead of pinning a fresh copy
+        per call. The buffer is reused only once its previous copy completed;
+        otherwise this call takes a new one rather than wait on a stream that
+        may be queued behind a forward.
+        """
+        if torch.device(self.device).type != "cuda":
+            return torch.empty((2, num_tokens), dtype=torch.int64)
+        host = self._plan_host
+        if (
+            host is None
+            or host.numel() < 2 * num_tokens
+            or not self._plan_copied.query()
+        ):
+            capacity = max(2 * num_tokens, 0 if host is None else host.numel())
+            host = torch.empty((capacity,), dtype=torch.int64, pin_memory=True)
+            self._plan_host = host
+            self._plan_copied = torch.cuda.Event()
+        return host[: 2 * num_tokens].view(2, num_tokens)
 
     def alloc_cyclic(self, start_class: int, need_size: int) -> Optional[torch.Tensor]:
         """One chain's whole pages at a fixed rotation: owners cycle from
@@ -344,31 +391,72 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
 
         # The tree quantum is the physical page, so every free covers whole
         # pages (any partial in-page coverage means the rest of that page
-        # belongs to the same free). Split by owner class; a freed page is
-        # immediately reusable — nothing strands.
-        pages = torch.unique(free_index.long() // self.page_size)
+        # belongs to the same free).
+        self._free_pages(torch.unique(free_index.long() // self.page_size))
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape free of ``kv_row[start_pos : start_pos + n]``.
+
+        A page's tokens sit consecutively in the row and the start is
+        page-aligned, so ``free_index[::ps]`` hits each page once: no
+        ``torch.unique``. Contract (base): a page is freed by only one call
+        per group.
+        """
+        if free_index.numel() == 0:
+            return
+        ps = self.page_size
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        # Integer division copies, so a group holds no req_to_token view.
+        page_ids = free_index[::ps].long() // ps
+        if self.debug_mode:
+            assert torch.equal(
+                torch.sort(page_ids.cpu())[0],
+                torch.unique(free_index.cpu().long() // ps),
+            )
+        if self.free_group is not None:
+            self.free_page_ids_group.append(page_ids)
+            return
+        self._free_pages(page_ids)
+
+    def free_group_end(self):
+        pending, self.free_group = self.free_group, None
+        page_ids, self.free_page_ids_group = self.free_page_ids_group, []
+        if pending:
+            merged = torch.cat(pending) if len(pending) > 1 else pending[0]
+            page_ids.append(torch.unique(merged.long() // self.page_size))
+        if page_ids:
+            # Like the paged base: free() ids are deduped, segment ids are
+            # stride samples, and the segment contract frees a page once per
+            # group, so the union is distinct. One release covers the group.
+            self._free_pages(torch.cat(page_ids) if len(page_ids) > 1 else page_ids[0])
+
+    def _free_pages(self, pages: torch.Tensor) -> None:
+        """Return distinct logical pages to their owner classes.
+
+        A freed page is immediately reusable — nothing strands.
+        """
         owners = pages % self.shard_size
-        for r in range(self.shard_size):
-            freed = pages[owners == r]
-            if freed.numel() == 0:
+        # One host sync for all classes (boolean-mask selection syncs once per
+        # class). The stable sort keeps each class in input order, as the
+        # masks did.
+        counts = (
+            torch.zeros(self.shard_size, dtype=torch.int64, device=pages.device)
+            .scatter_add_(0, owners, torch.ones_like(owners))
+            .tolist()
+        )
+        grouped = torch.split(pages[torch.argsort(owners, stable=True)], counts)
+        for r, freed in enumerate(grouped):
+            if counts[r] == 0:
                 continue
             if self.need_sort:
-                self.class_release_pages[r] = torch.cat(
-                    (freed, self.class_release_pages[r])
-                )
+                # Stage the split view; merge_and_sort_free concatenates.
+                self.class_staged_pages[r].append(freed)
+                self.class_num_staged_pages[r] += counts[r]
             else:
                 self.class_free_pages[r] = torch.cat((freed, self.class_free_pages[r]))
 
         if self.debug_mode:
             self.debug_check_classes()
-
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        # Back to the base contract (plain free): the paged override derives
-        # page representatives by striding and hands them to _release_page_ids,
-        # which writes the stock free_pages list this allocator does not use.
-        # start_pos buys nothing here — free() keys pages by owner class, which
-        # needs the page ids anyway.
-        self.free(free_index)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
         raise NotImplementedError(
@@ -389,22 +477,29 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         )
 
     def get_all_free_pages(self) -> torch.Tensor:
-        """All free logical page ids across classes (free + release) — for
+        """All free logical page ids across classes (free + staged) — for
         the scheduler invariant checker's use-after-free / double-free sweep
         (page unit = the physical page = self.page_size). The paged base
         reads the flat lists this allocator neutralizes, so the classed
         census is the override."""
-        return torch.cat(self.class_free_pages + self.class_release_pages)
+        staged = [
+            pages for class_pages in self.class_staged_pages for pages in class_pages
+        ]
+        return torch.cat(self.class_free_pages + staged)
 
     def debug_check_classes(self):
         for r in range(self.shard_size):
-            merged = torch.cat((self.class_free_pages[r], self.class_release_pages[r]))
+            merged = torch.cat((self.class_free_pages[r], *self.class_staged_pages[r]))
             assert bool((merged % self.shard_size == r).all()), (
                 f"page of another owner leaked into class {r}"
             )
             assert len(torch.unique(merged)) == len(merged), (
                 f"double free: duplicate pages in class {r}"
             )
+
+
+def _host_int_list(values) -> List[int]:
+    return values.tolist() if isinstance(values, torch.Tensor) else list(values)
 
 
 def page_interleave_shard_size(allocator: BaseTokenToKVPoolAllocator) -> int:
