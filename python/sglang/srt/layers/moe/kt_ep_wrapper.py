@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,

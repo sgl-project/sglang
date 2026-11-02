@@ -31,8 +31,10 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.config import CacheConfig

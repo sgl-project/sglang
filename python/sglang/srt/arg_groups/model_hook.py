@@ -8,6 +8,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -18,16 +26,10 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
-    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
     validate_declarations,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook

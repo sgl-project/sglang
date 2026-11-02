@@ -9,10 +9,10 @@ import logging
 import os
 from typing import Any, Optional
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _gguf_quantization,
     declare_resolution,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.utils.common import find_local_repo_dir, is_remote_url

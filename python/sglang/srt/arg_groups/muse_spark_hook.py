@@ -5,11 +5,8 @@ import logging
 import os
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType, parse_connector_type
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform

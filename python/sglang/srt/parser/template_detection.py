@@ -29,8 +29,9 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.muse_spark_hook import muse_spark_chat_template_default
-from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 
 logger = logging.getLogger(__name__)
 

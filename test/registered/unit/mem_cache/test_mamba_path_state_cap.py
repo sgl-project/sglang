@@ -17,8 +17,11 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,

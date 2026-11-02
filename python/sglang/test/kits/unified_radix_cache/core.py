@@ -17,11 +17,11 @@ from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_radix_cache import (
-    COMPONENT_REGISTRY,
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,

@@ -1322,7 +1322,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         slot; overwrite it with the learned vector. VocabParallelEmbedding-aware:
         each rank only updates the row if the token falls within its shard.
         """
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         draft_model_path = resolving_view(self.server_args).speculative_draft_model_path
         if draft_model_path is None:

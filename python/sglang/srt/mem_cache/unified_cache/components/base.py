@@ -38,12 +38,12 @@ if TYPE_CHECKING:
         ComponentAction,
     )
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+        UnifiedTreeCore,
         UnifiedTreeNode,
     )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 _NUM_COMPONENT_TYPES = len(ComponentType)

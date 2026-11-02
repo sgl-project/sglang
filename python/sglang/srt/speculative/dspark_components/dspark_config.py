@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,

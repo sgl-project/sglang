@@ -64,11 +64,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolution_result,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import bootstrap

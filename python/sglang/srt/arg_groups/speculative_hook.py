@@ -6,14 +6,16 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
-from sglang.srt.arg_groups.overrides import (
-    _speculative_moe_runner_default,
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    record_foreign_defaults,
     resolved_view,
     resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
+    _speculative_moe_runner_default,
+    declare_resolution,
+    record_foreign_defaults,
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
