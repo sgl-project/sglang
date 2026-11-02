@@ -202,6 +202,34 @@ def set_default_server_args(args: "ServerArgs"):
             )
 
 
+def _patch_npu_seed_trace_rules():
+    """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
+    from torch._dynamo import trace_rules
+    from torch._dynamo.variables import (
+        SkipFunctionVariable,
+        TorchInGraphFunctionVariable,
+    )
+    from torch_npu.dynamo.trace_rule import (
+        torch_non_c_binding_in_graph_functions_npu as npu_rules,
+    )
+
+    changed = False
+    for name in ("manual_seed", "manual_seed_all"):
+        npu_name = f"torch.npu.random.{name}"
+        if (
+            trace_rules.manual_torch_name_rule_map.get(f"torch.cuda.{name}")
+            is SkipFunctionVariable
+            and npu_rules.get(npu_name) is TorchInGraphFunctionVariable
+            and getattr(torch.cuda, name) is getattr(torch.npu.random, name)
+        ):
+            # transfer_to_npu aliases these functions. Patch the source dict
+            # so this also works when torch_npu registers its rules lazily.
+            npu_rules[npu_name] = SkipFunctionVariable
+            changed = True
+    if changed:
+        trace_rules.clear_lru_cache()
+
+
 @_call_once
 def init_npu_backend():
     """
@@ -233,6 +261,8 @@ def init_npu_backend():
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        _patch_npu_seed_trace_rules()
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
