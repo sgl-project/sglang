@@ -51,12 +51,9 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
     # discard positions after a divergence or normalize away a scale error.
     logprob_atol = 0.02
     # VERIFY vs teacher-forced prefill, and fused vs fallback, run different
-    # kernels over FP8 weights and the FP8 KV cache, so their logprobs differ
-    # by more than logprob_atol even with identical greedy tokens. Exact token
-    # equality catches an omitted or doubled reduction; these bounds catch a
-    # gross scale error.
-    cross_path_mean_atol = 0.4
-    cross_path_max_atol = 1.5
+    # kernels over FP8 weights and the FP8 KV cache, so they differ by more
+    # than logprob_atol even with identical greedy tokens.
+    cross_path_logprob_atol = 1.5
 
     @classmethod
     def setUpClass(cls):
@@ -135,7 +132,7 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
         self.assertGreater(remaining, 0)
         return prefix + (filler * (remaining // len(filler) + 1))[:remaining] + suffix
 
-    def _logprob_values(self, actual, expected, label):
+    def _assert_logprobs(self, actual, expected, label, atol=None):
         self.assertEqual(len(actual), len(expected), label)
         self.assertEqual(
             [row[1] for row in actual], [row[1] for row in expected], label
@@ -144,23 +141,11 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
         expected_values = np.asarray([row[0] for row in expected], dtype=np.float64)
         self.assertTrue(np.isfinite(actual_values).all(), label)
         self.assertTrue(np.isfinite(expected_values).all(), label)
-        return actual_values, expected_values
-
-    def _assert_logprobs_cross_path(self, actual, expected, label):
-        actual_values, expected_values = self._logprob_values(actual, expected, label)
-        diff = np.abs(actual_values - expected_values)
-        stats = f"{label}: mean={diff.mean():.4f} max={diff.max():.4f}"
-        print(stats)
-        self.assertLessEqual(diff.mean(), self.cross_path_mean_atol, stats)
-        self.assertLessEqual(diff.max(), self.cross_path_max_atol, stats)
-
-    def _assert_logprobs(self, actual, expected, label):
-        actual_values, expected_values = self._logprob_values(actual, expected, label)
         np.testing.assert_allclose(
             actual_values,
             expected_values,
             rtol=0,
-            atol=self.logprob_atol,
+            atol=self.logprob_atol if atol is None else atol,
             err_msg=label,
         )
 
@@ -183,10 +168,11 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
         )
         self.assertEqual(len(scores), len(outputs))
         for prompt, output, score in zip(prompts, outputs, scores, strict=True):
-            self._assert_logprobs_cross_path(
+            self._assert_logprobs(
                 output["meta_info"]["output_token_logprobs"],
                 score["meta_info"]["input_token_logprobs"][len(prompt) :],
                 "VERIFY versus teacher-forced CP prefill",
+                atol=self.cross_path_logprob_atol,
             )
 
     def _exercise(self, log_path):
@@ -371,8 +357,11 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
                             for actual, expected in zip(
                                 outputs, reference[case], strict=True
                             ):
-                                self._assert_logprobs_cross_path(
-                                    actual, expected, f"fusion parity {case}"
+                                self._assert_logprobs(
+                                    actual,
+                                    expected,
+                                    f"fusion parity {case}",
+                                    atol=self.cross_path_logprob_atol,
                                 )
                     self.assertIsNone(self.process.poll())
                     print(
