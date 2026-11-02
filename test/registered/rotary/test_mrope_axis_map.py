@@ -107,16 +107,23 @@ class TestMRopeAxisMap(CustomTestCase):
         self.assertIsNone(ernie.axis_map)
 
     def test_npu_dispatch_preserves_multimodal_positions(self):
+        # The fused CANN op does only 1-D plain RoPE; 3-axis positions that
+        # reach it lose the height and width axes.
         rope = build_mrope([11, 11, 10], 64, interleaved=True)
         rope.head_size = 256
         positions = torch.tensor([[0, 1], [2, 3], [4, 5]])
         query, key = torch.randn(2, 3072), torch.randn(2, 512)
-        expected = rope.forward_native(positions, query, key)
-        with patch.object(mrope, "torch_npu", create=True) as npu:
+        with (
+            patch.object(mrope, "torch_npu", create=True) as npu,
+            patch.object(mrope, "triton_mrope_fused") as fused,
+        ):
             npu.npu_mrope.return_value = (query, key)
-            actual = rope.forward_npu(positions, query, key)
+            rope.forward_npu(positions, query, key)
             npu.npu_mrope.assert_not_called()
-            torch.testing.assert_close(actual, expected)
+            # The kernel reads all three axes, so the 3-D tensor must arrive
+            # intact rather than collapsed to positions[0].
+            self.assertIs(fused.call_args.args[3], positions)
+
             text_positions = positions[0]
             rope.forward_npu(text_positions, query, key)
             npu.npu_mrope.assert_called_once_with(
@@ -128,6 +135,7 @@ class TestMRopeAxisMap(CustomTestCase):
                 mrope_section=[0, 0, 0],
                 rotary_mode="half",
             )
+            self.assertEqual(fused.call_count, 1)
 
     def test_qwen35_npu_prefill_and_decode_dispatch(self):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
