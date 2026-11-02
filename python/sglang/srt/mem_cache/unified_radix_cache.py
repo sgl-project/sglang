@@ -776,10 +776,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return EvictResult()
         return super().evict_for_alloc(demand)
 
-    def reclaim_jointly(self, demand: KVDemand) -> EvictResult:
+    def reclaim_jointly(
+        self, demand: KVDemand, *, windows_first: bool = False
+    ) -> EvictResult:
         allocator = self.token_to_kv_pool_allocator
         demand = demand.completed(allocator.window_pool_names())
-        return self._reclaim(allocator.page_demands(demand))
+        return self._reclaim(
+            allocator.page_demands(demand), windows_first=windows_first
+        )
 
     def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
         demand_by_type = {
@@ -821,7 +825,9 @@ class UnifiedRadixCache(BasePrefixCache):
             {n: d for n, d in units.items() if d > 0}
         )
 
-    def _reclaim(self, units: dict[str, int]) -> EvictResult:
+    def _reclaim(
+        self, units: dict[str, int], *, windows_first: bool = False
+    ) -> EvictResult:
         """Evict cached entries until the allocator can take ``units`` (pages
         per sub-pool, slots for state), and report what was evicted.
 
@@ -833,9 +839,15 @@ class UnifiedRadixCache(BasePrefixCache):
         order is a heuristic only: first the entries of each sub-pool whose
         own demand does not fit now, whose freed pages it then takes in place;
         then token entries by LRU, whose eviction frees their whole node; then
-        the state checkpoints left; then window entries. Admission credits the
-        same evictable entries, so an admitted demand is one this reclaim
-        makes room for."""
+        the state checkpoints left; then window entries. With
+        ``windows_first`` (`capacity.windows_reclaimed_first`) token entries
+        go last, after window entries and state checkpoints, even when the
+        token sub-pool's own demand does not fit now: FULL prefixes are kept
+        while other entries' bytes can serve the demand. Under the joint_lru
+        policy, with compaction able to run, the order is instead the tree's
+        joint LRU of token leaves and window entries, by access time.
+        Admission credits the same evictable entries, so an admitted demand is
+        one this reclaim makes room for."""
         allocator = self.token_to_kv_pool_allocator
         result = EvictResult()
         demands = {n: d for n, d in units.items() if d > 0}
@@ -846,12 +858,22 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return result
         owner, windows, state = self._sub_pool_roles()
-        order = [
-            {n for n, d in demands.items() if not allocator.units_fit({n: d})},
-            {owner},
-            set() if state is None else {state},
-            set(windows),
-        ]
+        if self.evicts_by_joint_lru and allocator.compaction_can_run():
+            # joint_lru: one walk over token and window entries by access
+            # time, every victim's bytes serving either side, stopping at the
+            # first victim after which the demand fits.
+            reclaimable = self._reclaimable_units()
+            self._evict_units(
+                {n: reclaimable.get(n, 0) for n in (owner, *windows)}, demands, result
+            )
+            return result
+        short = {n for n, d in demands.items() if not allocator.units_fit({n: d})}
+        spent_first, kept = ({owner}, set(windows))
+        if windows_first:
+            # FULL prefixes go last, even for a token demand short now.
+            spent_first, kept = kept, spent_first
+            short -= kept
+        order = [short, spent_first, set() if state is None else {state}, kept]
         for names in order:
             if allocator.fits_after_frees(demands):
                 break

@@ -7,7 +7,9 @@ together is the pool's reclaim discipline, chosen in one place
 
 - a pool whose sub-pools share one memory answers by counts and geometry
   alone and never calls the cache; the discipline drives "evict, then check"
-  for it and the cache reclaims a demand as one (`_SharedMemory`);
+  for it and the cache reclaims a demand as one (`_SharedMemory`), window
+  entries first where a cached FULL prefix is worth more than its windows
+  (`windows_reclaimed_first`);
 - pools of their own keep their own hooks, which reclaim from the cache they
   are handed, and the cache evicts each pool's shortfall (`_OwnPools`).
 
@@ -23,6 +25,23 @@ from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictResult
+
+
+def windows_reclaimed_first() -> bool:
+    """Whether reclaim over one shared memory evicts window entries before
+    token entries. By default token entries go first: a FULL prefix is
+    spent to keep the sliding windows that let it be reused. With a HiCache
+    storage backend attached, or on the decode side of a PD pair, the FULL
+    prefix is the one worth keeping, so window entries go first. (A
+    hierarchical cache without a storage backend keeps the default.) Read on
+    every reclaim: a storage backend can attach and a PD role can change
+    while the server runs."""
+    from sglang.srt.runtime_context import get_disagg, get_memory
+
+    memory = get_memory()
+    return (
+        memory.enable_hierarchical_cache and memory.hicache_storage_backend is not None
+    ) or get_disagg().disaggregation_mode == "decode"
 
 
 def _shares_prefixes(tree_cache: Optional[BasePrefixCache]) -> bool:
@@ -72,7 +91,7 @@ class _SharedMemory:
     the allocator answers by counts and geometry."""
 
     def evict_for_alloc(self, cache: BasePrefixCache, demand: KVDemand) -> EvictResult:
-        return cache.reclaim_jointly(demand)
+        return cache.reclaim_jointly(demand, windows_first=windows_reclaimed_first())
 
     def windows_share_owner_memory(self, allocator) -> bool:
         return bool(allocator.window_pool_names())

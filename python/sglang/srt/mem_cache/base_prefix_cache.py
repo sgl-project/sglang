@@ -592,9 +592,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         return evict_for_alloc(self, demand)
 
-    def reclaim_jointly(self, demand: KVDemand) -> EvictResult:
+    def reclaim_jointly(
+        self, demand: KVDemand, *, windows_first: bool = False
+    ) -> EvictResult:
         """Evict until the allocator can take all of ``demand`` at once, its
-        pools sharing one memory. A cache that does not reclaim so evicts each
+        pools sharing one memory, window entries before token entries when
+        ``windows_first``. A cache that does not reclaim so evicts each
         pool's shortfall instead."""
         return self.evict_pool_shortfalls(demand)
 

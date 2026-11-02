@@ -1,5 +1,6 @@
 """Real shared-pool allocation after allocation-driven cache eviction."""
 
+import contextlib
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -12,11 +13,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.capacity import windows_reclaimed_first
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_disagg, get_memory, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows, token_demand
@@ -181,6 +183,53 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                     allocator.full_attn_allocator.available_size(), before + 2
                 )
                 self.check_prefixes(allocator, cache, records, range(expected, 96))
+
+    def test_storage_or_decode_reclaim_keeps_full_prefixes(self):
+        """By default allocation reclaim spends a FULL prefix to keep its
+        window: token entries go first. With a HiCache storage backend
+        attached, or on the decode side of a PD pair, the FULL prefix is the
+        one worth keeping, so window entries go first and token entries last,
+        even for a token demand short now; a hierarchical cache alone keeps
+        the default. Pins the order per configuration, so a predicate that
+        degrades to one branch is caught."""
+        cases = (
+            ({}, None, False),
+            ({"enable_hierarchical_cache": True}, None, False),
+            (
+                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
+                None,
+                True,
+            ),
+            ({}, "decode", True),
+        )
+        for memory, role, windows_first in cases:
+            with self.subTest(memory=memory, role=role):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(get_memory().override(**memory))
+                    if role is not None:
+                        stack.enter_context(
+                            get_disagg().override(disaggregation_mode=role)
+                        )
+                    self.assertEqual(windows_reclaimed_first(), windows_first)
+                    allocator, cache = self.build_cache()
+                    owner = allocator.full_attn_allocator.sub_pool_name
+                    (window,) = allocator.window_pool_names()
+                    walks = []
+                    evict_units = cache._evict_units
+
+                    def record(units, demands, result):
+                        if any(units.values()):
+                            walks.append({n for n, u in units.items() if u})
+                        return evict_units(units, demands, result)
+
+                    stack.enter_context(
+                        patch.object(cache, "_evict_units", side_effect=record)
+                    )
+                    # Two FULL tokens past what the owner serves now.
+                    demand = KVDemand(allocator.full_available_size() + 2, {window: 0})
+                    cache.evict_for_alloc(demand)
+                    self.assertTrue(allocator.ensure_capacity(demand))
+                    self.assertEqual(walks[0], {window} if windows_first else {owner})
 
     def test_schedule_batch_decode_uses_allocator_contract(self):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
