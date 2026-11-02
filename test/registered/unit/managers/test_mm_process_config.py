@@ -278,6 +278,49 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_io_worker_num, 6)
 
 
+class TestMultimodalProcessorExecutorMemory(CustomTestCase):
+    def _run(self, function):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        executor = MultimodalProcessorExecutor(lambda: object(), max_workers=1)
+        try:
+            return executor._executor.submit(executor._run, function, (), {}).result()
+        finally:
+            executor.shutdown()
+
+    @patch("torch.cuda.is_available", return_value=True)
+    @patch("torch.cuda.empty_cache")
+    def test_cache_released_after_each_call(self, empty_cache, _):
+        self.assertEqual(self._run(lambda processor: 7), 7)
+        empty_cache.assert_called_once()
+
+    @patch("torch.cuda.is_available", return_value=True)
+    @patch("torch.cuda.empty_cache")
+    def test_oom_retried_once_after_releasing_cache(self, empty_cache, _):
+        calls = []
+
+        def function(processor):
+            calls.append(empty_cache.call_count)
+            if len(calls) == 1:
+                raise torch.OutOfMemoryError("oom")
+            return "ok"
+
+        self.assertEqual(self._run(function), "ok")
+        self.assertEqual(calls, [0, 1])
+
+    @patch("torch.cuda.is_available", return_value=True)
+    @patch("torch.cuda.empty_cache")
+    def test_second_oom_propagates(self, empty_cache, _):
+        def function(processor):
+            raise torch.OutOfMemoryError("oom")
+
+        with self.assertRaises(torch.OutOfMemoryError):
+            self._run(function)
+        self.assertEqual(empty_cache.call_count, 2)
+
+
 class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     def _server_args(self, mm_feature_transport):
         override = get_context().override_server_args(
