@@ -17,7 +17,7 @@ GPU-backed metrics tests.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
