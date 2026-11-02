@@ -68,6 +68,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -162,6 +163,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
+    from sglang.srt.sampling.custom_logit_processor import PageGuardState
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -636,6 +639,10 @@ class MultimodalProcessorOutput(
 
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
+
+    # A ClassVar, so it never goes on the wire. A processor's subclass sets it to
+    # have wrap_shm_features also move large model_specific_data tensors to SHM.
+    shm_model_specific_data: ClassVar[bool] = False
 
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
@@ -1282,6 +1289,10 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
+        self.page_guard_state: Optional[PageGuardState] = None
+        # Unlimited-OCR v2 split-document window state; None for other requests.
+        self.uocr_doc: Optional[UocrReqState] = None
         self.return_hidden_states = return_hidden_states
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
@@ -1382,6 +1393,10 @@ class Req(ReqDllmMixin):
         # it is chunked, and decrement whenever chunked request is
         # processed.
         self.inflight_middle_chunks = 0
+
+        # The launched steps carrying this request whose results are not
+        # processed yet.
+        self.inflight_steps = 0
 
         # For retraction
         self.is_retracted = False
@@ -1517,6 +1532,8 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
+        self.linker_offload_skip_prefix_len = 0
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -2638,6 +2655,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
+    # The requests this batch was launched with; the in-flight counts are kept
+    # over these.
+    launched_reqs: Optional[Tuple[Req, ...]] = None
+
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
@@ -2856,13 +2877,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_empty(self):
         return len(self.reqs) == 0
 
+    def add_inflight_step(self) -> None:
+        self.launched_reqs = tuple(self.reqs)
+        for req in self.launched_reqs:
+            req.inflight_steps += 1
+
+    def drop_inflight_step(self) -> None:
+        for req in self.launched_reqs:
+            req.inflight_steps -= 1
+
     def is_dllm(self):
         return self.dllm_config is not None
 
     def grammar_needs_sync(self) -> bool:
-        """Whether grammar forces this batch onto the synchronous path, i.e. the
-        previous batch's result is resolved before this forward."""
-        return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
+        """Whether a spec algorithm that cannot advance the grammar FSM inside
+        verify() needs this batch's result processed before the next schedule."""
+        return (
+            self.has_grammar
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.supports_grammar_overlap()
+        )
 
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
@@ -4136,6 +4170,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            launched_reqs=self.launched_reqs,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -115,6 +116,9 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    uses_joint_lru,
+)
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -141,6 +145,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
@@ -208,6 +213,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Unlimited-OCR v2 split-document KV reuse; None for every other model.
+    uocr_doc_reuse: Optional[DocReuse] = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -250,6 +258,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self._index_slots(params.tree_slots)
         # Whether a slot keeps the trailing window of a prefix.
         self.is_swa_enabled = TREE_WINDOW in families
+        # Whether eviction may walk Full and SWA jointly by access time.
+        self.evicts_by_joint_lru = uses_joint_lru(params, self.tree_components)
+        if self.evicts_by_joint_lru and params.enable_session_radix_cache:
+            raise ValueError(
+                "--radix-eviction-policy joint_lru does not support "
+                "--enable-session-radix-cache"
+            )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
         # Whether the mamba extra (ping-pong) buffer is enabled.
@@ -302,6 +317,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 "rotation bases; "
                 f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
                 "does not."
+            )
+        if self.evicts_by_joint_lru and not self.tree_core.supports_joint_eviction:
+            # Fail at construction rather than at the first joint eviction,
+            # under memory pressure.
+            raise ValueError(
+                "--radix-eviction-policy joint_lru requires a tree core with the "
+                "joint Full/SWA eviction walk; "
+                f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                "has none."
             )
 
         # Session ref tracking (--enable-session-radix-cache).
@@ -670,6 +694,19 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def _linker_offload_skip_prefix(self, req: Req, token_ids):
+        # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
+        # Convert the request's raw-token skip boundary to page-aligned radix-key units.
+        if self.linker is None:
+            return nullcontext()
+        skip_key = RadixKey(
+            token_ids[: req.linker_offload_skip_prefix_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        return self.linker.skip_offload_prefix(len(skip_key))
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
@@ -849,13 +886,24 @@ class UnifiedRadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
-        request_by_type = self._evict_request_by_type(params)
-        self._evict_components(
-            request_by_type,
-            tracker,
-            available_size_targets=available_size_targets,
-            allocation_reclaim_satisfied=allocation_reclaim_satisfied,
-        )
+        if (
+            available_size_targets is None
+            and self.evicts_by_joint_lru
+            and self.token_to_kv_pool_allocator.compaction_can_run()
+        ):
+            self._evict_by_joint_lru(
+                params,
+                tracker,
+                allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+            )
+        else:
+            request_by_type = self._evict_request_by_type(params)
+            self._evict_components(
+                request_by_type,
+                tracker,
+                available_size_targets=available_size_targets,
+                allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+            )
 
         if (
             self.cache_controller is not None
@@ -1063,33 +1111,79 @@ class UnifiedRadixCache(BasePrefixCache):
                         if not made_progress:
                             break
                     else:
-                        backup_kv = self._evict_device_leaf(node_id, tracker)
-                    if node_id is not None and backup_kv is not None:
-                        # Deferred demote: run the D->H backup, demote only on success.
-                        written = self._execute_and_commit_kv_backup(
-                            backup_kv, write_back=True
-                        )
-                        if written > 0:
-                            self.writing_check(write_back=True)
-                            self._demote(node_id, tracker)
-                        elif self._drop_subtree_no_host(node_id, tracker):
-                            logger.warning(
-                                "write_back: KV subtree dropped without backup "
-                                "due to host memory pressure, root node %d",
-                                node_id,
-                            )
-                        else:
-                            logger.warning(
-                                "write_back: backup failed under host memory "
-                                "pressure but subtree drop declined (node "
-                                "locked); root node %d stays device-resident "
-                                "until host space frees",
-                                node_id,
-                            )
+                        self._evict_leaf_with_backup(node_id, tracker)
                     if target_reached(ct):
                         break
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _evict_by_joint_lru(
+        self,
+        params: EvictParams,
+        tracker: dict[ComponentType, int],
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Evict the oldest Full leaves and SWA entries until the freed bytes,
+        cascades included, reach the requested quotas' bytes, or until
+        ``allocation_reclaim_satisfied`` holds. Compaction can run, so bytes
+        freed on either side serve the other side's allocation."""
+        allocator = self.token_to_kv_pool_allocator
+
+        def satisfied() -> bool:
+            return (
+                allocation_reclaim_satisfied is not None
+                and allocation_reclaim_satisfied()
+            )
+
+        target = allocator.shared_bytes(params.num_tokens, params.swa_num_tokens)
+        if target <= 0 or satisfied():
+            return
+        self.tree_core.start_joint_eviction()
+        try:
+            while (
+                allocator.shared_bytes(
+                    tracker[BASE_COMPONENT_TYPE], tracker[ComponentType.SWA]
+                )
+                < target
+                and not satisfied()
+            ):
+                victim = self.tree_core.next_joint_eviction_victim()
+                if victim is None:
+                    break
+                component_type, node_id = victim
+                if component_type == BASE_COMPONENT_TYPE:
+                    self._evict_leaf_with_backup(node_id, tracker)
+                else:
+                    # Joint walks strip SWA without collapsing leaves.
+                    leaf_id, _ = self._evict_device_next_node(component_type, tracker)
+                    assert leaf_id is None
+        finally:
+            self.tree_core.end_joint_eviction()
+
+    def _evict_leaf_with_backup(
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> None:
+        backup_kv = self._evict_device_leaf(node_id, tracker)
+        if backup_kv is None:
+            return
+        written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        if written > 0:
+            self.writing_check(write_back=True)
+            self._demote(node_id, tracker)
+        elif self._drop_subtree_no_host(node_id, tracker):
+            logger.warning(
+                "write_back: KV subtree dropped without backup "
+                "due to host memory pressure, root node %d",
+                node_id,
+            )
+        else:
+            logger.warning(
+                "write_back: backup failed under host memory pressure but "
+                "subtree drop declined (node locked); root node %d stays "
+                "device-resident until host space frees",
+                node_id,
+            )
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
@@ -1286,7 +1380,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if reuse_existing_mamba:
             insert_params.allow_missing_mamba = True
         try:
-            result = self.insert(insert_params)
+            with self._linker_offload_skip_prefix(req, token_ids):
+                result = self.insert(insert_params)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False
@@ -3975,6 +4070,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
+    def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
+        """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""
+        self.uocr_doc_reuse = doc_reuse
+        self.session.uocr_doc_reuse = doc_reuse
+
     def evictable_size(self) -> int:
         return self.tree_core.evictable_size()
 
@@ -4130,6 +4230,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return node_handle
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        if self.uocr_doc_reuse is not None:
+            # A reused window's prefix was copied into fresh slots on no tree
+            # path; the match only reported its length.
+            indices = self.uocr_doc_reuse.prefix_device_indices(req)
+            if indices is not None:
+                return indices
         root = self.root_node_handle(req.extra_key)
         path = self.tree_core.collect_full_device_indices(req.last_node, root)
         if self.linker is not None:

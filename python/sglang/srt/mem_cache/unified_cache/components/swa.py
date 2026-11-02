@@ -91,6 +91,8 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # The running device-eviction walk's leaf-collapse mode.
+        self._evict_device_collapse_leaves = True
 
     component_type = ComponentType.SWA
     pool_name = PoolName.SWA
@@ -263,6 +265,7 @@ class SWAComponent(TreeComponent):
                 # MATCH_END / INSERT_END instead.
                 return
             case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                joint_lru = self.tree_core.joint_lru
                 self.tree_core.lru_lists[
                     self.component_type
                 ].reset_node_and_window_ancestors_mru(
@@ -270,7 +273,14 @@ class SWAComponent(TreeComponent):
                     root_node,
                     self.sliding_window_size + self.tree_core.page_size,
                     self.node_has_component_data,
+                    on_refresh=(
+                        joint_lru.window_stamper()
+                        if joint_lru is not None
+                        and self.component_type == ComponentType.SWA
+                        else None
+                    ),
                 )
+
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
@@ -662,6 +672,17 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def evict_device_start(
+        self, request_cnt: int, *, collapse_leaves: bool = True
+    ) -> None:
+        """Begin a device-eviction walk. Without ``collapse_leaves``, evicting an
+        entry on a device leaf strips this component only, leaving Full."""
+        super().evict_device_start(request_cnt)
+        self._evict_device_collapse_leaves = collapse_leaves
+
+    def collapses_leaves(self) -> bool:
+        return self._evict_device_collapse_leaves
+
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
@@ -707,8 +728,10 @@ class SWAComponent(TreeComponent):
 
         x = self._evict_device_cursor
         assert x.component_data[ct].value is not None
-        if x in self.tree_core.evictable_device_leaves and (
-            not enabled or self._can_evict_leaf_atomically(x)
+        if (
+            self._evict_device_collapse_leaves
+            and x in self.tree_core.evictable_device_leaves
+            and (not enabled or self._can_evict_leaf_atomically(x))
         ):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
@@ -768,6 +791,7 @@ class SWAComponent(TreeComponent):
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
+        self._evict_device_collapse_leaves = True
 
     def acquire_component_lock(
         self,

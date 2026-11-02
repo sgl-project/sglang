@@ -728,7 +728,7 @@ class TestRustServerExtension(CustomTestCase):
             return [
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
                 None,
-                obj,
+                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
                 None,
             ]
 
@@ -737,7 +737,7 @@ class TestRustServerExtension(CustomTestCase):
                 server_module,
                 "get_exec",
                 return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                    moe=SimpleNamespace(is_ep_joiner=False, is_ep_scale_joiner=False)
                 ),
             ),
             patch.object(
@@ -772,9 +772,7 @@ class TestRustServerExtension(CustomTestCase):
             gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
         )
         self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
-        self.assertEqual(
-            others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
-        )
+        self.assertEqual(others_only, table)
         self.assertEqual(
             table,
             [
@@ -782,6 +780,167 @@ class TestRustServerExtension(CustomTestCase):
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
             ],
         )
+
+    def test_gather_server_endpoints_requires_every_attention_dp_rank_once(self):
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_size=2,
+            world_group=SimpleNamespace(all_gather_object=Mock()),
+        )
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
+            ),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="10.0.0.1", port=30000),
+            ),
+        ):
+            for ranks in ([], [0], [0, 0], [0, 2], [0, 1, 2]):
+                parallel.world_group.all_gather_object.return_value = [
+                    {"dp_rank": rank, "endpoint": f"http://10.0.0.{i + 1}:30000"}
+                    for i, rank in enumerate(ranks)
+                ]
+                with (
+                    self.subTest(ranks=ranks),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "expected one Rust listener for each of 2 attention-DP ranks",
+                    ),
+                ):
+                    RustServer.gather_server_endpoints(hosts_listener=False)
+
+    def test_gather_server_endpoints_checks_bind_family_on_every_rank(self):
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=Mock()),
+        )
+        serving = SimpleNamespace(host="0.0.0.0", port=30000)
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
+            ),
+            patch.object(server_module, "get_serving", return_value=serving),
+            patch.object(RustServer, "_port_offset", return_value=0),
+            patch.object(server_module, "get_local_ip_auto") as advertised,
+        ):
+            for bind, host in (
+                ("0.0.0.0", "10.0.0.1"),
+                ("::", "2001:db8::1"),
+                ("0.0.0.0", "2001:db8::1"),
+            ):
+                serving.host = bind
+                advertised.return_value = host
+                gathered = []
+
+                def gather(entry):
+                    if entry is not None:
+                        gathered.append(entry)
+                    return gathered
+
+                parallel.world_group.all_gather_object.side_effect = gather
+                for hosts_listener in (True, False):
+                    with self.subTest(bind=bind, host=host, listener=hosts_listener):
+                        if bind == "0.0.0.0" and ":" in host:
+                            with self.assertRaisesRegex(
+                                ValueError, "DP rank 0.*IPv4.*2001:db8::1"
+                            ):
+                                RustServer.gather_server_endpoints(hosts_listener)
+                            self.assertEqual(len(gathered), 1)
+                        else:
+                            self.assertEqual(
+                                RustServer.gather_server_endpoints(hosts_listener),
+                                [
+                                    {
+                                        "dp_rank": 0,
+                                        "endpoint": server_module.NetworkAddress(
+                                            host, 30000
+                                        ).to_url(),
+                                    }
+                                ],
+                            )
+
+    def test_gather_server_endpoints_skips_the_collective_on_an_ep_joiner(self):
+        """The serving ranks gathered at their own startup and never enter
+        this collective again, so an elastic-EP joiner (scale or recover)
+        returns an empty table without entering it and fans nothing out. A
+        serving rank under elastic EP gathers as any rank does."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [
+                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+            ]
+
+        parallel = SimpleNamespace(
+            nnodes=1,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        for is_ep_joiner, is_ep_scale_joiner in (
+            (True, True),
+            (True, False),
+            (False, False),
+        ):
+            with (
+                self.subTest(joiner=is_ep_joiner, scale=is_ep_scale_joiner),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(
+                            elastic_ep_backend="mooncake",
+                            is_ep_joiner=is_ep_joiner,
+                            is_ep_scale_joiner=is_ep_scale_joiner,
+                        )
+                    ),
+                ),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_serving",
+                    return_value=SimpleNamespace(host="10.0.0.1", port=30000),
+                ),
+            ):
+                gathered.clear()
+                tables = [
+                    RustServer.gather_server_endpoints(hosts_listener=hosts_listener)
+                    for hosts_listener in (True, False)
+                ]
+                if is_ep_joiner:
+                    self.assertEqual(tables, [[], []])
+                    self.assertEqual(gathered, [], "a joiner never enters the gather")
+                else:
+                    self.assertEqual(
+                        gathered,
+                        [{"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}, None],
+                    )
+                    expected = [
+                        {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                        {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+                    ]
+                    self.assertEqual(tables, [expected, expected])
 
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
@@ -796,10 +955,18 @@ class TestRustServerExtension(CustomTestCase):
         ):
             parallel = SimpleNamespace(
                 nnodes=2,
+                attn_dp_size=1,
                 dist_init_addr=dist_init_addr,
                 world_group=SimpleNamespace(all_gather_object=all_gather_object),
             )
             with (
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,

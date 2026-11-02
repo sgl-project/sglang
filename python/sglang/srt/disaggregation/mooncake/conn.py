@@ -189,51 +189,49 @@ class KVArgsRegisterInfo:
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_aux_item_lens=(
-                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
-                if len(msg) > 20
-                else None
+                list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])) if msg[6] else None
             ),
-            dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
-            dst_tp_rank=int(msg[7].decode("ascii")),
-            dst_attn_tp_size=int(msg[8].decode("ascii")),
-            dst_kv_item_len=int(msg[9].decode("ascii")),
+            dst_state_data_ptrs=unpack_int_lists(msg[7], "Q"),
+            dst_tp_rank=int(msg[8].decode("ascii")),
+            dst_attn_tp_size=int(msg[9].decode("ascii")),
+            dst_kv_item_len=int(msg[10].decode("ascii")),
             dst_state_item_lens=(
-                unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
-            ),
-            dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            dst_kv_layer_ids=(
-                list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
-                if len(msg) > 12 and msg[12] != b""
-                else []
+            dst_state_dim_per_tensor=(
+                unpack_int_lists(msg[12], "I") if len(msg) > 12 else []
             ),
-            dst_state_layer_ids=(
-                unpack_int_lists(msg[13], "I")
+            dst_kv_layer_ids=(
+                list(struct.unpack(f"{len(msg[13]) // 4}I", msg[13]))
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
+            dst_state_layer_ids=(
+                unpack_int_lists(msg[14], "I")
+                if len(msg) > 14 and msg[14] != b""
+                else []
+            ),
             staging_base_ptr=(
-                struct.unpack("Q", msg[14])[0]
-                if len(msg) > 14 and len(msg[14]) == 8
+                struct.unpack("Q", msg[15])[0]
+                if len(msg) > 15 and len(msg[15]) == 8
                 else 0
             ),
             staging_total_size=(
-                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 0
             ),
             dst_dcp_size=(
-                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
+                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 1
             ),
             dst_dcp_rank=(
-                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+                int(msg[18].decode("ascii")) if len(msg) > 18 and msg[18] != b"" else 0
             ),
             dst_kv_item_lens=(
-                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
-                if len(msg) > 19 and msg[19]
+                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
+                if len(msg) > 20 and msg[20]
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
 
 
@@ -3281,13 +3279,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        message = [
+        return [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
             session_id.encode("ascii"),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
+            # Always sent, empty unless customized-info transfer is enabled.
+            (
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+                if self.customized_info_enabled
+                else b""
+            ),
             packed_state_data_ptrs,
             dst_tp_rank,
             dst_attn_tp_size,
@@ -3306,13 +3312,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
         ]
-        if self.customized_info_enabled:
-            message.append(
-                struct.pack(
-                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
-                )
-            )
-        return message
 
     def build_receiver_metadata_message(
         self,

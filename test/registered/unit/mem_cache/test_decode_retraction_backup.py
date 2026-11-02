@@ -389,6 +389,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 enable_decode_hicache=False,
                 enable_lora=False,
                 enable_priority_scheduling=False,
+                enable_overlap=False,
                 metrics_reporter=SimpleNamespace(
                     current_scheduler_metrics_enabled=False
                 ),

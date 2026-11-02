@@ -100,8 +100,6 @@ PER_COMMIT_SUITES = {
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
-        "base-c-test-8-gpu-h20",
-        "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
         "base-c-test-8-gpu-b300",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
@@ -114,6 +112,8 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-h200",
         "extra-b-test-8-gpu-h20",
         "extra-b-test-8-gpu-b300",
+        "extra-b-test-2-gpu-gb300",
+        "extra-b-test-4-gpu-gb300",
     ],
     HWBackend.NPU: [
         "base-a-test-npu",
@@ -151,6 +151,7 @@ NIGHTLY_SUITES = {
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
+        "nightly-test-1-gpu-small",
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -158,6 +159,7 @@ NIGHTLY_SUITES = {
         "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
+        "nightly-test-8-gpu-b300",
     ],
     HWBackend.AMD: [
         "nightly-amd",

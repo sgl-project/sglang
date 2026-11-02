@@ -838,6 +838,16 @@ class HiCacheFile(HiCacheStorage):
             if storage_config.is_mla_model
             else self.tp_config_suffix
         )
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file.
+            dcp_suffix = (
+                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
+            self.config_suffix += dcp_suffix
+            self.tp_config_suffix += dcp_suffix
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -851,17 +861,6 @@ class HiCacheFile(HiCacheStorage):
         self._init_config_suffix(storage_config)
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-
-        # TODO: Include KV dtype and stored layout in keys for both DCP and
-        # non-DCP caches; raw file payloads do not describe their format.
-        if storage_config.dcp_size > 1:
-            # Equivalent MLA shards in different DCP groups share a file.
-            dcp_suffix = (
-                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
-                f"_page{storage_config.logical_page_size}"
-            )
-            self.config_suffix += dcp_suffix
-            self.tp_config_suffix += dcp_suffix
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)

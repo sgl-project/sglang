@@ -38,6 +38,7 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
@@ -141,6 +142,44 @@ def _build_forward_token_modalities(
         dtype=torch.int8,
         pin_memory=is_pin_memory_available(device),
     ).to(device, non_blocking=True)
+
+
+# write_host_ints passes every value as a kernel argument; one launch carries at
+# most this many, so its arguments stay far below the kernel parameter limit.
+_HOST_INTS_PER_LAUNCH = 256
+
+
+def _host_ints_to_device(values: List[int], dtype: torch.dtype, device) -> torch.Tensor:
+    """A 1-D ``dtype`` CUDA tensor holding ``values``, written by kernels that take
+    the values as arguments. Unlike a pinned host-to-device copy, the write never
+    queues on a copy engine behind bulk host-to-device transfers.
+
+    The kernel writes a buffer padded to a power of two (or to whole launches past
+    one launch), so a varying length compiles a bounded set of kernels; the
+    result is the buffer's leading ``len(values)`` elements.
+    """
+    n = len(values)
+    if n == 0:
+        return torch.empty(0, dtype=dtype, device=device)
+    if n <= _HOST_INTS_PER_LAUNCH:
+        size = 1 << (n - 1).bit_length()
+    else:
+        size = -(-n // _HOST_INTS_PER_LAUNCH) * _HOST_INTS_PER_LAUNCH
+    padded = list(values) + [0] * (size - n)
+    out = torch.empty(size, dtype=dtype, device=device)
+    for start in range(0, size, _HOST_INTS_PER_LAUNCH):
+        stop = min(start + _HOST_INTS_PER_LAUNCH, size)
+        write_host_ints((out[start:stop],), (padded[start:stop],))
+    return out[:n]
+
+
+def _kernel_writes_metadata(device) -> bool:
+    """Whether kernels write the forward's small metadata instead of pinned
+    host-to-device copies: SGLANG_ENABLE_MLP_SYNC_METADATA_FILL, on CUDA."""
+    return (
+        envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
+        and torch.device(device).type == "cuda"
+    )
 
 
 def _maybe_build_forward_token_modalities(
@@ -585,6 +624,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # Unlimited-OCR v2: the decode CUDA graph loads input_ids and positions itself.
+    uocr_graph_io_deferred: bool = False
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -931,16 +973,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
-        pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        if _kernel_writes_metadata(device):
+            # One kernel writes both: a pinned host-to-device copy would queue on
+            # the copy engine behind bulk transfers (such as host KV restores)
+            # and hold up this forward.
+            self.global_num_tokens_gpu = torch.empty(
+                len(global_num_tokens), dtype=torch.int64, device=device
+            )
+            self.global_num_tokens_for_logprob_gpu = torch.empty(
+                len(global_num_tokens_for_logprob), dtype=torch.int64, device=device
+            )
+            write_host_ints(
+                (self.global_num_tokens_gpu, self.global_num_tokens_for_logprob_gpu),
+                (global_num_tokens, global_num_tokens_for_logprob),
+            )
+        else:
+            pin_memory = is_pin_memory_available(device)
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
+            ).to(device, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
@@ -958,6 +1015,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         pp_loras: Optional[set[Optional[str]]] = None,
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
+        uocr_graph_io_deferred: bool = False,
     ):
         # init_new must not mutate ScheduleBatch; use explicit forward overrides.
         # Speculative forwards share iteration_ids and select their write_cols;
@@ -1080,6 +1138,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            uocr_graph_io_deferred=uocr_graph_io_deferred,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1216,19 +1275,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            if ret.positions is None:
+            if ret.positions is None and not ret.uocr_graph_io_deferred:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                pin_memory = is_pin_memory_available(device)
-                ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
-                ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                if _kernel_writes_metadata(device):
+                    # Written by kernels: a pinned host-to-device copy would queue
+                    # on the copy engine behind bulk transfers (such as host KV
+                    # load-backs) and hold up this forward.
+                    ret.extend_seq_lens = _host_ints_to_device(
+                        extend_seq_lens, torch.int32, device
+                    )
+                    ret.extend_prefix_lens = _host_ints_to_device(
+                        extend_prefix_lens, torch.int32, device
+                    )
+                else:
+                    pin_memory = is_pin_memory_available(device)
+                    ret.extend_seq_lens = torch.tensor(
+                        extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
+                    ret.extend_prefix_lens = torch.tensor(
+                        extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
@@ -1368,11 +1438,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             num_tokens = 0
         if enable_num_token_non_padded():
-            self.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
+            if _kernel_writes_metadata(device):
+                # A kernel writes the 0-dim count; see _host_ints_to_device.
+                self.global_num_token_non_padded = _host_ints_to_device(
+                    [num_tokens], torch.int32, device
+                ).squeeze(0)
+            else:
+                self.global_num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
         self.global_num_token_non_padded_cpu = num_tokens
 
     def set_local_num_token_non_padded(self, *, sharded: bool) -> None:
@@ -1940,12 +2016,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        global_num_tokens_pinned = torch.tensor(
-            global_num_tokens, pin_memory=self.use_pin_memory
-        )
-        self.global_num_tokens_gpu.copy_(
-            global_num_tokens_pinned, non_blocking=self.use_pin_memory
-        )
+        if _kernel_writes_metadata(self.global_num_tokens_gpu.device):
+            # One kernel writes the padded counts in place: a pinned host-to-device
+            # copy would queue on the copy engine behind bulk transfers and hold up
+            # this forward.
+            write_host_ints((self.global_num_tokens_gpu,), (global_num_tokens,))
+        else:
+            global_num_tokens_pinned = torch.tensor(
+                global_num_tokens, pin_memory=self.use_pin_memory
+            )
+            self.global_num_tokens_gpu.copy_(
+                global_num_tokens_pinned, non_blocking=self.use_pin_memory
+            )
         # Exchanged here, not in the model forward: every rank reaches this point
         # after reshaping its batch and before it picks a prefill graph or eager.
         if (
