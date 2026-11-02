@@ -74,9 +74,13 @@ def make_runner(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
         ),
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(temporal=SimpleNamespace(dtype=state_dtype))
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=SimpleNamespace(dtype=state_dtype)
+                    )
+                )
             )
         ),
     )
@@ -95,9 +99,7 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
             extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
-        backend.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(mamba_cache=cache)
-        )
+        backend.state_pool = SimpleNamespace(mamba_cache=cache)
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
