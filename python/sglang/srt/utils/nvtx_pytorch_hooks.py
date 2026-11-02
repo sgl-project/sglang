@@ -284,7 +284,8 @@ class PytHooks(object):
                 continue
 
             module.register_forward_pre_hook(self.module_fwd_pre_hook)
-            module.register_forward_hook(self.module_fwd_hook)
+            # Keep the range balanced when forward exits through an exception.
+            module.register_forward_hook(self.module_fwd_hook, always_call=True)
             if module not in self.module_to_name_map:
                 self.module_to_name_map[module] = name
             else:
