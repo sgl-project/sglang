@@ -344,6 +344,11 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # gathered together, so scale the per-rank forward bound by num_dp_ranks.
         max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+    # Clamped SwiGLU (e.g. DeepSeek-V4): the kernel clamps gate from above and up
+    # to [-limit, limit] after dequantization, so the limit is in model units.
+    swiglu_kwargs = {}
+    if layer.moe_runner_config.swiglu_limit is not None:
+        swiglu_kwargs["swiglu_limit"] = float(layer.moe_runner_config.swiglu_limit)
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
     # _dummy_run which runs under inference_mode(); inference tensors cannot
@@ -366,6 +371,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            **swiglu_kwargs,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (

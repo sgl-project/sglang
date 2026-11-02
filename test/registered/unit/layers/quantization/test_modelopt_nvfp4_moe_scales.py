@@ -255,6 +255,88 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                     self.assertFalse(hasattr(layer, "gemm1_clamp_limit"))
                     torch.testing.assert_close(layer.gemm1_beta, torch.tensor([25.0]))
 
+    def test_cutedsl_wrapper_gets_swiglu_limit(self):
+        """DeepSeek-V4's clamp (swiglu_limit=10) must reach the CuteDSL kernel; the
+        limit is in dequantized units, so it is passed through unchanged."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+            ensure_cutedsl_wrapper,
+        )
+
+        num_experts = 4
+        for swiglu_limit in (10.0, None):
+            layer = SimpleNamespace(
+                _cutedsl_wrapper=None,
+                moe_runner_config=MoeRunnerConfig(
+                    activation="silu",
+                    is_gated=True,
+                    params_dtype=torch.bfloat16,
+                    swiglu_limit=swiglu_limit,
+                ),
+                quant_config=SimpleNamespace(use_per_token_activation=False),
+                dispatcher=SimpleNamespace(max_num_tokens=256),
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                moe_ep_rank=0,
+                top_k=2,
+                hidden_size=128,
+                intermediate_size_per_partition=64,
+                w13_weight=torch.zeros(num_experts, 128, 64, dtype=torch.uint8),
+                g1_alphas=torch.ones(num_experts),
+                g2_alphas=torch.ones(num_experts),
+                w13_weight_scale_2=torch.ones(num_experts),
+                w2_weight_scale_2=torch.ones(num_experts),
+                w13_input_scale_quant=torch.tensor(1.0),
+                w2_input_scale_quant=torch.tensor(1.0),
+            )
+            with (
+                self.subTest(swiglu_limit=swiglu_limit),
+                # autospec checks the kwargs against FlashInfer's real signature.
+                mock.patch(
+                    "flashinfer.CuteDslMoEWrapper", autospec=True
+                ) as wrapper_cls,
+            ):
+                ensure_cutedsl_wrapper(layer)
+                swiglu_kwargs = {
+                    k: v
+                    for k, v in wrapper_cls.call_args.kwargs.items()
+                    if k.startswith("swiglu")
+                }
+                # alpha / beta keep FlashInfer's plain-SiLU defaults.
+                expected = {} if swiglu_limit is None else {"swiglu_limit": 10.0}
+                self.assertEqual(swiglu_kwargs, expected)
+
+    def test_cutedsl_deepep_rejects_swiglu_limit(self):
+        """The DeepEP (masked) CuteDSL path cannot clamp, so it must refuse to start
+        instead of serving an unclamped SwiGLU."""
+        for a2a, swiglu_limit, rejected in (
+            (MoeA2ABackend.DEEPEP, 10.0, True),
+            (MoeA2ABackend.DEEPEP, None, False),
+            (MoeA2ABackend.NONE, 10.0, False),
+        ):
+            with (
+                self.subTest(a2a=a2a, swiglu_limit=swiglu_limit),
+                get_flags().moe.override(
+                    runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL,
+                    a2a_backend=a2a,
+                ),
+                mock.patch.object(
+                    modelopt_quant,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_blackwell=True),
+                ),
+            ):
+                method = ModelOptNvFp4FusedMoEMethod(
+                    SimpleNamespace(use_per_token_activation=False)
+                )
+                config = MoeRunnerConfig(
+                    activation="silu", is_gated=True, swiglu_limit=swiglu_limit
+                )
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "swiglu_limit=10.0"):
+                        method.create_moe_runner(SimpleNamespace(), config)
+                else:
+                    method.create_moe_runner(SimpleNamespace(), config)
+
 
 class TestGemm1Alphas(CustomTestCase):
     """w13 gate/up global-scale split feeding g1_alphas / g1_alphas_up."""

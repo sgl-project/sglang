@@ -3136,6 +3136,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
+            # The masked (DeepEP) path's SiLU-and-mul quantize kernel has no clamp.
+            if (
+                self._is_cutedsl_v1_deepep
+                and moe_runner_config.swiglu_limit is not None
+            ):
+                raise ValueError(
+                    "flashinfer_cutedsl with --moe-a2a-backend deepep does not apply "
+                    f"swiglu_limit={moe_runner_config.swiglu_limit}. Use "
+                    "--moe-a2a-backend none or flashinfer with flashinfer_cutedsl, "
+                    "or another --moe-runner-backend."
+                )
             layer._cutedsl_wrapper = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
