@@ -9,7 +9,7 @@
    "1": {
     "index": 0,
     "storage": "window_8",
-    "sub_pool": "swa"
+    "sub_pool": "window_8"
    }
   },
   "window_kind": "swa",

@@ -197,11 +197,11 @@ class RunnerIds:
             if is_unified_target:
                 self._spaces = alloc_spaces
             else:
+                router = token_to_kv_pool.layer_router
                 self._spaces = {IdSpaceKind.FULL: alloc_spaces[IdSpaceKind.FULL]}
-                for sub_pool in token_to_kv_pool.layer_router.sub_pools():
-                    view = token_to_kv_pool.layer_router.view(sub_pool.name)
+                for sub_pool in router.sub_pools():
                     self._spaces[sub_pool.name] = alloc_spaces[
-                        token_to_kv_pool.layer_router.storage_name(sub_pool.name)
+                        router.storage_name(sub_pool.name)
                     ]
             if self.is_fused_draft:
                 from sglang.srt.mem_cache.kv.alloc.id_space import ReplicatedTokenIds
@@ -233,6 +233,24 @@ class RunnerIds:
                         replicated = ReplicatedTokenIds(band.ids, view.token_replicas)
                         self._spaces[name] = replicated.space(self._spaces[name].key)
                         self.defer_read_translate = False
+            if not is_unified_target:
+                # The window sub-pools this runner's layers read: a backend
+                # bound to it must serve them all, as for the target.
+                self.window_sub_pools = tuple(
+                    sorted(
+                        p.name
+                        for p in token_to_kv_pool.layer_router.sub_pools()
+                        if p.window is not None
+                    )
+                )
+                # The window sub-pool this runner's pool names by role: its id
+                # space answers for the role too, as the target's does.
+                window = token_to_kv_pool.layer_router.sub_pool(
+                    IdSpaceKind.SLIDING_WINDOW
+                )
+                if window is not None and window.name != IdSpaceKind.SLIDING_WINDOW:
+                    self._spaces[IdSpaceKind.SLIDING_WINDOW] = self._spaces[window.name]
+                    self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = window.name
             self._full_v2p_table = self._spaces[IdSpaceKind.FULL].table
         else:
             self._capture_page_size = page_size
