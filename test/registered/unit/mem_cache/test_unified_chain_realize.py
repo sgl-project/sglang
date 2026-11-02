@@ -20,6 +20,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.kv.alloc import band as band_module
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
 from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
@@ -401,7 +402,7 @@ class TestChainRealize(CustomTestCase):
                     token_demand(allocator, tokens, tokens)
                 )
                 admitted = allocator.admits(
-                    tokens, demand_windows(allocator, tokens, tokens)
+                    KVDemand(tokens, demand_windows(allocator, tokens, tokens))
                 )
                 taken = allocator.alloc(tokens)
             else:

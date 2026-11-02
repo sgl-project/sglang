@@ -106,7 +106,8 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 # Not even an empty pool holds it, so reclaim must keep every prefix.
                 self.assertFalse(
                     allocator.admits(
-                        101, demand_windows(allocator, 101, 101), empty_pool=True
+                        KVDemand(101, demand_windows(allocator, 101, 101)),
+                        empty_pool=True,
                     )
                 )
                 for _ in range(3):
@@ -286,7 +287,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertLess(demand * sa.entry_bytes_per_page, fa._current_gap_bytes())
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
         self.assertFalse(
-            allocator.admits(0, demand_windows(allocator, 0, demand), empty_pool=True)
+            allocator.admits(
+                KVDemand(0, demand_windows(allocator, 0, demand)), empty_pool=True
+            )
         )
         self.assertFalse(allocator.ensure_capacity(token_demand(allocator, 0, demand)))
         self.assertEqual(cache.full_evictable_size(), 0)

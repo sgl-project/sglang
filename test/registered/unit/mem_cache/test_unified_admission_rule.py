@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 from test_unified_chain_realize import _allocator, _live_pages
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import token_demand
@@ -95,9 +96,11 @@ class TestAdmissionIsATake(CustomTestCase):
                 rng.choice((0, 1, 2)) if allocator.mamba_allocator is not None else 0
             )
             if not allocator.admits(
-                tokens,
-                {w.sub_pool_name: tokens for w in allocator._windows},
-                state_slots,
+                KVDemand(
+                    tokens,
+                    {w.sub_pool_name: tokens for w in allocator._windows},
+                    state_slots,
+                ),
                 evictable=self._credit(allocator, cached, cached_slots),
             ):
                 refused += 1

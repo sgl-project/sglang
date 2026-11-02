@@ -838,7 +838,9 @@ class UnifiedRadixCache(BasePrefixCache):
         demands = {n: d for n, d in units.items() if d > 0}
         if allocator.units_fit(demands):
             return result
-        if not allocator.admits_units(demands, self._reclaimable_units()):
+        if not allocator.admits(
+            self._units_demand(demands), evictable=evictable_by_sub_pool(self)
+        ):
             return result
         owner, windows, state = self._sub_pool_roles()
         order = [
@@ -855,6 +857,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 {n: reclaimable.get(n, 0) for n in names}, demands, result
             )
         return result
+
+    def _units_demand(self, units: dict[str, int]) -> KVDemand:
+        """A demand in the allocator's units (pages, slots for state) as the
+        tokens and slots admission prices."""
+        page = self.token_to_kv_pool_allocator.page_size
+        owner, windows, state = self._sub_pool_roles()
+        return KVDemand(
+            units.get(owner, 0) * page,
+            {name: units.get(name, 0) * page for name in windows},
+            0 if state is None else units.get(state, 0),
+        )
 
     def _reclaimable_units(self) -> dict[str, int]:
         """What this cache could free per sub-pool, in the allocator's units:

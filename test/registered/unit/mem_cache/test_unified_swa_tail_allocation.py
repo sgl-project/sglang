@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -63,7 +64,9 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         seq_len = allocator.available_size() + page_size
                         self.assertFalse(
                             allocator.admits(
-                                seq_len, demand_windows(allocator, seq_len, seq_len)
+                                KVDemand(
+                                    seq_len, demand_windows(allocator, seq_len, seq_len)
+                                )
                             )
                         )
                     prefix_capacity = -(-prefix_len // page_size) * page_size

@@ -7,6 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     DerivedPartDecl,
@@ -728,7 +729,7 @@ class TestDeclaredParts(CustomTestCase):
                 a = storage.allocator
                 self.assertIsNone(a.full_attn_allocator.max_live_tokens)
                 self.assertGreaterEqual(a.size_full, 1500)
-                self.assertTrue(a.admits(1500, demand_windows(a, 1500, 20)))
+                self.assertTrue(a.admits(KVDemand(1500, demand_windows(a, 1500, 20))))
                 chunks = []
                 for i in range(375):
                     if i >= 5:
@@ -1362,8 +1363,7 @@ class TestDeclaredParts(CustomTestCase):
                 if not state:
                     self.assertTrue(
                         a.admits(
-                            4,
-                            demand_windows(a, 4, 4),
+                            KVDemand(4, demand_windows(a, 4, 4)),
                             evictable={
                                 a.full_attn_allocator.sub_pool_name: cache.full_evictable_size(),
                                 a.swa_attn_allocator.sub_pool_name: cache.swa_evictable_size(),
@@ -1371,7 +1371,7 @@ class TestDeclaredParts(CustomTestCase):
                         )
                     )
                 self.assertFalse(
-                    a.admits(20, demand_windows(a, 20, 4), empty_pool=True)
+                    a.admits(KVDemand(20, demand_windows(a, 20, 4)), empty_pool=True)
                 )
                 self.assertFalse(a.ensure_capacity(token_demand(a, 1, 1)))
                 self.assertTrue(a.evict_to_free_tokens(cache, 4))
@@ -1771,7 +1771,7 @@ class TestDeclaredParts(CustomTestCase):
                 self.assertIsNotNone(first)
                 self.assertEqual(alloc.available_size(), 16 * dcp)
                 self.assertFalse(
-                    alloc.admits(20 * dcp, demand_windows(alloc, 20 * dcp, 0))
+                    alloc.admits(KVDemand(20 * dcp, demand_windows(alloc, 20 * dcp, 0)))
                 )
                 second = alloc.alloc(16 * dcp)
                 self.assertIsNotNone(second)
@@ -2027,8 +2027,8 @@ class TestDeclaredParts(CustomTestCase):
                 tree_core_backend="python",
             )
         )
-        self.assertTrue(a.admits(400, demand_windows(a, 400, 16)))
-        self.assertFalse(a.admits(400, demand_windows(a, 400, 400)))
+        self.assertTrue(a.admits(KVDemand(400, demand_windows(a, 400, 16))))
+        self.assertFalse(a.admits(KVDemand(400, demand_windows(a, 400, 400))))
         full_budget = a.full_available_size()
         swa_budget = a.conserve_swa_available_size()
         self.assertTrue(
@@ -2042,7 +2042,9 @@ class TestDeclaredParts(CustomTestCase):
         # Pending requests and decode headroom are deducted from these budgets.
         # They must still be charged to the joint byte demand, not just compared
         # with this request's individual token counts.
-        self.assertFalse(a.admits(full_budget, demand_windows(a, full_budget, 16)))
+        self.assertFalse(
+            a.admits(KVDemand(full_budget, demand_windows(a, full_budget, 16)))
+        )
         for full_reserved, swa_reserved, fits in (
             (4, 4, True),
             (full_budget - 400, 0, False),
@@ -2448,10 +2450,12 @@ class TestDeclaredParts(CustomTestCase):
         storage, _, _ = _build(fused_draft=placement)
         a = storage.allocator
         empty_demands = [
-            n for n in range(8, 128, 4) if a.admits(n, demand_windows(a, n, n))
+            n
+            for n in range(8, 128, 4)
+            if a.admits(KVDemand(n, demand_windows(a, n, n)))
         ]
         ids = []
-        while a.admits(4, demand_windows(a, 4, 4)):
+        while a.admits(KVDemand(4, demand_windows(a, 4, 4))):
             allocation = a.alloc(4)
             self.assertIsNotNone(allocation)
             ids.append(allocation)
@@ -2634,10 +2638,10 @@ class TestDeclaredParts(CustomTestCase):
         )
         # The evicted end holes are credited before any flush: the planned
         # take compacts the ends.
-        self.assertTrue(a.admits(8, demand_windows(a, 8, 8)))
+        self.assertTrue(a.admits(KVDemand(8, demand_windows(a, 8, 8))))
         for band in (a.full_attn_allocator, a.swa_attn_allocator):
             band.flush_for_allocation()
-        self.assertTrue(a.admits(8, demand_windows(a, 8, 8)))
+        self.assertTrue(a.admits(KVDemand(8, demand_windows(a, 8, 8))))
         fresh = a.alloc(8)
         self.assertIsNotNone(fresh)
         a.free(fresh)

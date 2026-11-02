@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     FLUSH_ENDS,
     NO_MOVE,
@@ -236,7 +237,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Require one token pair beyond free space, so the unlocked state
         # checkpoints must make room while every token binding stays locked.
         demand = a.available_size() + 1
-        self.assertFalse(a.admits(demand, demand_windows(a, demand, demand)))
+        self.assertFalse(a.admits(KVDemand(demand, demand_windows(a, demand, demand))))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
@@ -304,8 +305,7 @@ class TestTriJointReclaim(CustomTestCase):
                 # No layout holds 400 tokens even with every cached entry evicted.
                 self.assertFalse(
                     a.admits(
-                        400,
-                        demand_windows(a, 400, 400),
+                        KVDemand(400, demand_windows(a, 400, 400)),
                         evictable=evictable_by_sub_pool(c),
                     )
                 )

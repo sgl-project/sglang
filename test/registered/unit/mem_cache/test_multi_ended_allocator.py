@@ -673,7 +673,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
         allocator.free_swa(indices)
 
-        self.assertTrue(allocator.admits(0, demand_windows(allocator, 0, 8)))
+        self.assertTrue(allocator.admits(KVDemand(0, demand_windows(allocator, 0, 8))))
         self.assertTrue(allocator.ensure_capacity(token_demand(allocator, 0, 8)))
         allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
         self.assertTrue(
@@ -721,18 +721,22 @@ class TestWindowChainAllocator(unittest.TestCase):
         )
         self.assertTrue(
             allocator.admits(
-                full_pages * page_size,
-                demand_windows(
-                    allocator, full_pages * page_size, swa_pages * page_size
+                KVDemand(
+                    full_pages * page_size,
+                    demand_windows(
+                        allocator, full_pages * page_size, swa_pages * page_size
+                    ),
                 ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
             allocator.admits(
-                full_pages * page_size + 1,
-                demand_windows(
-                    allocator, full_pages * page_size + 1, swa_pages * page_size
+                KVDemand(
+                    full_pages * page_size + 1,
+                    demand_windows(
+                        allocator, full_pages * page_size + 1, swa_pages * page_size
+                    ),
                 ),
                 empty_pool=True,
             )
@@ -773,18 +777,22 @@ class TestWindowChainAllocator(unittest.TestCase):
         )
         self.assertTrue(
             allocator.admits(
-                reservation_full_tokens,
-                demand_windows(
-                    allocator, reservation_full_tokens, reservation_swa_tokens
+                KVDemand(
+                    reservation_full_tokens,
+                    demand_windows(
+                        allocator, reservation_full_tokens, reservation_swa_tokens
+                    ),
                 ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
             allocator.admits(
-                reservation_full_tokens,
-                demand_windows(
-                    allocator, reservation_full_tokens, reservation_swa_with_tail
+                KVDemand(
+                    reservation_full_tokens,
+                    demand_windows(
+                        allocator, reservation_full_tokens, reservation_swa_with_tail
+                    ),
                 ),
                 empty_pool=True,
             )
@@ -3440,11 +3448,11 @@ class TestDcpWidening(unittest.TestCase):
                     with self._dcp(dcp_size):
                         a = self._build_composite(page_size=page_size)
                         admitted = 0
-                        while a.admits(0, {}, admitted + 1):
+                        while a.admits(KVDemand(0, {}, admitted + 1)):
                             admitted += 1
                         self.assertGreater(admitted, 0)
                         self.assertIsNotNone(a.alloc_state_slots(admitted))
-                        self.assertFalse(a.admits(0, {}, 1))
+                        self.assertFalse(a.admits(KVDemand(0, {}, 1)))
 
     def test_allocation_flush_public_wrapper_is_urgent(self):
         with self._dcp(1):

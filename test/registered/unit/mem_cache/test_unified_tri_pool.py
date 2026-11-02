@@ -196,12 +196,14 @@ class TestUnifiedTriPool(_PoolTestCase):
                     length = allocator.available_size() + 4
                     self.assertFalse(
                         allocator.admits(
-                            length, demand_windows(allocator, length, length)
+                            KVDemand(length, demand_windows(allocator, length, length))
                         )
                     )
                     self.assertTrue(
                         allocator.admits(
-                            length, demand_windows(allocator, length, tail_len)
+                            KVDemand(
+                                length, demand_windows(allocator, length, tail_len)
+                            )
                         )
                     )
                     prefix = torch.tensor([0], dtype=torch.int64)

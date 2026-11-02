@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
@@ -289,24 +290,28 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 self.assertFalse(budget.check_prefill(**request)[0])
                 self.assertTrue(
                     allocator.admits(
-                        admitted * reserved_tokens,
-                        demand_windows(
-                            allocator,
+                        KVDemand(
                             admitted * reserved_tokens,
-                            admitted * reserved_tokens,
+                            demand_windows(
+                                allocator,
+                                admitted * reserved_tokens,
+                                admitted * reserved_tokens,
+                            ),
+                            slots,
                         ),
-                        slots,
                     )
                 )
                 self.assertFalse(
                     allocator.admits(
-                        (admitted + 1) * reserved_tokens,
-                        demand_windows(
-                            allocator,
+                        KVDemand(
                             (admitted + 1) * reserved_tokens,
-                            (admitted + 1) * reserved_tokens,
+                            demand_windows(
+                                allocator,
+                                (admitted + 1) * reserved_tokens,
+                                (admitted + 1) * reserved_tokens,
+                            ),
+                            slots + slots_per_request,
                         ),
-                        slots + slots_per_request,
                     )
                 )
                 self.assertTrue(
@@ -356,7 +361,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 chunk_limit=None,
                 state_slots=2,
             )
-            self.assertEqual(fit.call_args.args[2], 3)
+            self.assertEqual(fit.call_args.args[0].state_slots, 3)
             budget.fit_chunk(
                 _NO_ROW_REQ,
                 extend_input_len=8,
@@ -364,7 +369,9 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 chunk_limit=8,
                 state_slots=2,
             )
-            self.assertTrue(all(call.args[2] == 3 for call in fit.call_args_list))
+            self.assertTrue(
+                all(call.args[0].state_slots == 3 for call in fit.call_args_list)
+            )
         with unittest.mock.patch.object(
             allocator, "reclaim_for_load_back", return_value=None
         ) as reclaim:
@@ -546,8 +553,10 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 req.prefix_len = len(allocator.alloc(page_size))
                 self.assertTrue(
                     allocator.admits(
-                        page_size + 2,
-                        demand_windows(allocator, page_size + 2, page_size + 2),
+                        KVDemand(
+                            page_size + 2,
+                            demand_windows(allocator, page_size + 2, page_size + 2),
+                        ),
                     )
                 )
 
@@ -564,8 +573,10 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                 self.assertEqual(req.prefix_len, 0)
                 self.assertTrue(
                     allocator.admits(
-                        2 * page_size + 2,
-                        demand_windows(allocator, 2 * page_size + 2, 2 * page_size),
+                        KVDemand(
+                            2 * page_size + 2,
+                            demand_windows(allocator, 2 * page_size + 2, 2 * page_size),
+                        ),
                     )
                 )
 
