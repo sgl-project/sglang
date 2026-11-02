@@ -140,6 +140,8 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
+    if x.device.type == "cpu":
+        return _linear_bf16_fp32_cublas(x, y)
     if hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
         if output is not None:

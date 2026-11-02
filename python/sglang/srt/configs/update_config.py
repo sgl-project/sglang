@@ -241,7 +241,24 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.get_total_num_kv_heads(),
         )
 
-    if (
+    from sglang.srt.configs.model_config import is_deepseek_v4
+    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+    if is_deepseek_v4(model_config.hf_config):
+        text_config = model_config.hf_text_config
+        original_groups = text_config.o_groups
+        heads_per_group = model_config.num_attention_heads // original_groups
+        padded_groups = pad_vocab_size(original_groups, tp_size)
+        padded_heads = padded_groups * heads_per_group
+        for config in [
+            model_config,
+            model_config.hf_config,
+            model_config.hf_text_config,
+        ]:
+            update_config(config, "original_o_groups", original_groups)
+            update_config(config, "o_groups", padded_groups)
+            update_config(config, "num_attention_heads", padded_heads)
+    elif (
         model_config.num_attention_heads % tp_size != 0
         or model_config.get_total_num_kv_heads() % tp_size != 0
     ):
@@ -263,8 +280,6 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
         total_kv_heads = model_config.get_total_num_kv_heads()
-        from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
-
         head_dim = resolve_head_dim(
             model_config, model_config.num_attention_heads, True
         )

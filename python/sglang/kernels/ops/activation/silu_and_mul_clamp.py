@@ -59,6 +59,9 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
+    if input.device.type == "cpu":
+        torch.ops.sgl_kernel.silu_and_mul_clamp_cpu(input, output, swiglu_limit)
+        return
     if _is_xpu:
         from sgl_kernel import silu_and_mul_clamp
 

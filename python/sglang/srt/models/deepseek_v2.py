@@ -548,7 +548,7 @@ class MoEGate(nn.Module):
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
-        if _is_cpu and _is_cpu_amx_available:
+        if _is_cpu and _is_cpu_amx_available and self.weight.dtype != torch.float32:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
             num_experts=config.n_routed_experts,
@@ -566,9 +566,6 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
-        if self.weight.dtype == torch.float32:
-            return F.linear(hidden_states.float(), self.weight)
-
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -576,6 +573,9 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
+
+        if self.weight.dtype == torch.float32:
+            return F.linear(hidden_states.float(), self.weight)
 
         if get_exec().deterministic.enable_deterministic_inference:
             if _is_cuda or _is_hip:
