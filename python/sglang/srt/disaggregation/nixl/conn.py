@@ -460,6 +460,38 @@ class KVArgsRegisterInfo:
         )
 
 
+class _BootstrapMessageError(ValueError):
+    """Malformed metadata rejected before the bootstrap state is changed."""
+
+
+def _parse_bootstrap_metadata(
+    msg: List[bytes],
+) -> KVArgsRegisterInfo | TransferInfo:
+    """Parse GUARD metadata without registering a peer or updating a room.
+
+    Staging and ABORT messages have their own handlers and are not parsed here.
+    Only errors from decoding the wire representation are recoverable; failures
+    while applying the parsed metadata must still terminate the bootstrap loop.
+    """
+    if not msg or msg[0] != GUARD:
+        raise _BootstrapMessageError("missing NIXL metadata guard")
+    frames = msg[1:]
+    if not frames:
+        raise _BootstrapMessageError("missing NIXL metadata frames")
+    is_registration = frames[0] == b"None"
+    # Later fields are optional for compatibility with older decode peers.
+    min_frames = 13 if is_registration else 7
+    if len(frames) < min_frames:
+        raise _BootstrapMessageError("incomplete NIXL metadata frames")
+    try:
+        if is_registration:
+            return KVArgsRegisterInfo.from_zmq(frames)
+        return TransferInfo.from_zmq(frames)
+    except (ValueError, struct.error) as exc:
+        # Do not include peer-provided frame contents in the warning.
+        raise _BootstrapMessageError("invalid NIXL metadata encoding") from exc
+
+
 def expand_page_indices_for_slice(
     page_indices: npt.NDArray[np.int32],
     num_ptr_pairs: int,
@@ -3389,14 +3421,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
 
+                tag = waiting_req_bytes[0] if waiting_req_bytes else None
                 # Staging: decode reports consumption watermark back to prefill
-                if waiting_req_bytes[0] == b"WATERMARK":
+                if tag == b"WATERMARK":
                     if self.enable_staging:
                         handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
 
                 # Staging: decode replies with allocated staging offset
-                if waiting_req_bytes[0] == b"STAGING_RSP":
+                if tag == b"STAGING_RSP":
                     if self.enable_staging:
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
@@ -3404,28 +3437,28 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
-                assert waiting_req_bytes[0] == GUARD, (
-                    f"First message should be {GUARD}. Foreign traffic?"
-                )
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                try:
+                    metadata = _parse_bootstrap_metadata(waiting_req_bytes)
+                except _BootstrapMessageError as exc:
+                    logger.warning(
+                        "Ignoring malformed NIXL bootstrap metadata (%d frames): %s",
+                        len(waiting_req_bytes),
+                        exc,
                     )
+                    continue
+
+                # The parse-only boundary ends here. Registration, engine and
+                # state-application errors are deliberately not recoverable.
+                agent_name = metadata.agent_name
+                if isinstance(metadata, KVArgsRegisterInfo):
+                    self._add_remote_peer(metadata)
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
-                room = int(room)
+                room = metadata.room
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
+                self.transfer_infos[room][agent_name] = metadata
+                required_dst_info_num = metadata.required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
