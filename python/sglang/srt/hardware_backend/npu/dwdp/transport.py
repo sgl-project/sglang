@@ -1,7 +1,7 @@
 """Immutable expert shards shared through ACL, copied on a caller's NPU stream.
 
-Only the resident shards use shareable physical allocations. Compute buffers
-are ordinary local NPU tensors; no remote pointer is passed to a MoE kernel.
+Resident shards use shareable physical allocations. Local pool pages back the
+remote regions of composite compute views; kernels never read remote memory.
 """
 
 from __future__ import annotations
@@ -81,6 +81,8 @@ class _Allocation:
     size: int
     pointer: int = 0
     mapped: bool = False
+    data_offset: int = 0
+    nbytes: int = 0
 
 
 class NpuWeightTransport:
@@ -116,34 +118,80 @@ class NpuWeightTransport:
         _check(ret, "device_get_bare_tgid")
         return socket.gethostname(), self.device.index, pid
 
-    def _map(self, allocation: _Allocation) -> None:
-        ptr, ret = self.rt.reserve_mem_address(allocation.size, 0, 0, 0)
-        _check(ret, "reserve_mem_address")
-        allocation.pointer = ptr
-        _check(
-            self.rt.map_mem(ptr, allocation.size, 0, allocation.handle, 0), "map_mem"
-        )
-        allocation.mapped = True
-
-    def publish(self, key, tensor, peer_pids: list[int]) -> None:
-        """The caller supplies a ready, contiguous ND tensor at setup time."""
-        nbytes = tensor.numel() * tensor.element_size()
-        size = (nbytes + self.granularity - 1) // self.granularity * self.granularity
+    def allocate(self, size: int) -> _Allocation:
         handle, ret = self.rt.malloc_physical(size, self._prop, 0)
         _check(ret, "malloc_physical")
         allocation = _Allocation(handle, size)
         self._allocations.append(allocation)
+        return allocation
+
+    def reserve(self, size: int) -> int:
+        ptr, ret = self.rt.reserve_mem_address(size, 0, 0, 1)
+        _check(ret, "reserve_mem_address")
+        return ptr
+
+    def map(self, pointer: int, size: int, handle: int) -> None:
+        _check(self.rt.map_mem(pointer, size, 0, handle, 0), "map_mem")
+
+    def unmap(self, pointer: int) -> None:
+        _check(self.rt.unmap_mem(pointer), "unmap expert shard")
+
+    def release_address(self, pointer: int) -> None:
+        _check(self.rt.release_mem_address(pointer), "release expert address")
+
+    def _map(self, allocation: _Allocation) -> None:
+        ptr = self.reserve(allocation.size)
+        allocation.pointer = ptr
+        self.map(ptr, allocation.size, allocation.handle)
+        allocation.mapped = True
+
+    def publish(self, key, tensor, peer_pids: list[int], data_offset=0) -> None:
+        """The caller supplies a ready, contiguous ND tensor at setup time."""
+        nbytes = tensor.numel() * tensor.element_size()
+        size = (
+            (data_offset + nbytes + self.granularity - 1)
+            // self.granularity
+            * self.granularity
+        )
+        allocation = self.allocate(size)
+        allocation.data_offset, allocation.nbytes = data_offset, nbytes
         self._map(allocation)
         _check(
-            self.rt.memcpy(allocation.pointer, size, tensor.data_ptr(), nbytes, 3),
+            self.rt.memcpy(
+                allocation.pointer + data_offset,
+                size - data_offset,
+                tensor.data_ptr(),
+                nbytes,
+                3,
+            ),
             "copy resident expert shard",
         )
-        self._exports[key] = self._fabric.export_handle(handle, peer_pids)
+        self._exports[key] = self._fabric.export_handle(allocation.handle, peer_pids)
         self._local[key] = allocation
+
+    def local_allocation(self, key) -> _Allocation:
+        return self._local[key]
+
+    def local_tensor(self, key, tensor):
+        from .buffer import tensor_from_pointer
+
+        allocation = self._local[key]
+        return tensor_from_pointer(
+            allocation.pointer + allocation.data_offset,
+            allocation.nbytes,
+            shape=tuple(tensor.shape),
+            dtype=tensor.dtype,
+            device=self.device,
+        )
 
     def export_metadata(self) -> dict:
         return {
-            key: (self._exports[key], allocation.size)
+            key: (
+                self._exports[key],
+                allocation.size,
+                allocation.data_offset,
+                allocation.nbytes,
+            )
             for key, allocation in self._local.items()
         }
 
@@ -164,18 +212,22 @@ class NpuWeightTransport:
                     self.rt.device_enable_peer_access(peer_device, 0),
                     "device_enable_peer_access",
                 )
-            for (layer, name), (share, size) in shards.items():
+            for (layer, name), (share, size, offset, nbytes) in shards.items():
                 allocation = _Allocation(self._fabric.import_handle(share), size)
                 self._imports.append(allocation)
                 self._map(allocation)
-                self._peer_shards[peer, layer, name] = (allocation.pointer, size)
+                self._peer_shards[peer, layer, name] = (
+                    allocation.pointer + offset,
+                    nbytes,
+                )
 
     def copy_shard(
         self, rank: int, peer: int, key, destination: int, nbytes: int, stream
     ):
         if peer == rank:
             allocation = self._local[key]
-            source, capacity = allocation.pointer, allocation.size
+            source = allocation.pointer + allocation.data_offset
+            capacity = allocation.nbytes
         else:
             source, capacity = self._peer_shards[peer, *key]
         if not 0 < nbytes <= capacity:

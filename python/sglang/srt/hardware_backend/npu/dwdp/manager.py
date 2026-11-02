@@ -1,4 +1,4 @@
-"""NPU DWDP with resident expert shards and two complete ND compute slots.
+"""NPU DWDP with resident expert shards and two remote-only VMM page slots.
 
 All ranks keep their own tokens. Peer shards are immutable for the manager's
 lifetime; only local stream events coordinate slot readers and writers.
@@ -31,45 +31,6 @@ class _WeightSpec:
     @property
     def nbytes(self) -> int:
         return math.prod(self.shape) * self.element_size
-
-
-class NpuWeightBuffer:
-    """Full-expert ND views backed by exactly two ordinary local byte buffers."""
-
-    def __init__(self, specs: dict, device):
-        self.layer_indices = sorted(specs)
-        self._slots = {li: i % 2 for i, li in enumerate(self.layer_indices)}
-        sizes = [0, 0]
-        offsets = {}
-        for li in self.layer_indices:
-            offset = 0
-            for name, spec in specs[li].items():
-                offset = (offset + 511) // 512 * 512
-                offsets[li, name] = offset
-                offset += spec.nbytes
-            sizes[self._slots[li]] = max(sizes[self._slots[li]], offset)
-        self.buffers = [
-            torch.empty(size, dtype=torch.uint8, device=device) for size in sizes
-        ]
-        self._tensors = {
-            (li, name): self.buffers[self._slots[li]][
-                offsets[li, name] : offsets[li, name] + spec.nbytes
-            ]
-            .view(spec.dtype)
-            .view(spec.shape)
-            for li, weights in specs.items()
-            for name, spec in weights.items()
-        }
-
-    def buffer_index_for_layer(self, layer: int) -> int:
-        return self._slots[layer]
-
-    def get_full_tensor(self, layer: int, name: str) -> torch.Tensor:
-        return self._tensors[layer, name]
-
-    def release(self) -> None:
-        self._tensors.clear()
-        self.buffers.clear()
 
 
 class NpuDwdpManager:
@@ -234,13 +195,10 @@ class NpuDwdpManager:
             peer_pids = [
                 pid for r, (_, _, pid) in enumerate(identities) if r != self.dwdp_rank
             ]
-            self._weight_buffer = self._setup_stage(
-                "compute buffer allocation",
-                lambda: NpuWeightBuffer(self._specs, self.device),
-            )
             self._setup_stage(
                 "weight publication", lambda: self._publish_weights(peer_pids)
             )
+            self._setup_stage("composite buffer mapping", self._bind_weights)
             metadata = self._group.all_gather_object(self._transport.export_metadata())
             self._imports_started = True
             self._setup_stage(
@@ -261,7 +219,7 @@ class NpuDwdpManager:
             self._setup_complete = True
             torch.npu.empty_cache()
             logger.info(
-                "NPU DWDP ready: %d ranks, %d MoE layers, native ACL prefetch, two full ND slots",
+                "NPU DWDP ready: %d ranks, %d MoE layers, native ACL prefetch, two remote-only VMM slots",
                 self.dwdp_size,
                 len(self._moe_layers),
             )
@@ -278,10 +236,22 @@ class NpuDwdpManager:
                 # require a separate, format-aware implementation.
                 data = torch.ops.npu.npu_format_cast(weight.data, 2).contiguous()
                 torch.npu.current_stream(self.device).synchronize()
-                self._transport.publish((li, name), data, peer_pids)
+                shard_bytes = data.numel() * data.element_size()
+                offset = self.dwdp_rank * shard_bytes % self._transport.granularity
+                self._transport.publish((li, name), data, peer_pids, offset)
+                # Drop loader storage one weight at a time. This temporary
+                # view aliases the resident shard until full views are bound.
                 experts.replace_expert_tensor(
-                    name, self._weight_buffer.get_full_tensor(li, name)
+                    name, self._transport.local_tensor((li, name), data)
                 )
+
+    def _bind_weights(self):
+        from sglang.srt.hardware_backend.npu.dwdp.buffer import NpuWeightBuffer
+
+        self._weight_buffer = NpuWeightBuffer(
+            self._specs, self._transport, self.dwdp_size, self.dwdp_rank
+        )
+        for li, experts in self._moe_layers:
             experts.bind_full_expert_weights(
                 {
                     name: self._weight_buffer.get_full_tensor(li, name)
@@ -311,6 +281,8 @@ class NpuDwdpManager:
                 full = self._weight_buffer.get_full_tensor(layer, name)
                 shard_bytes = spec.nbytes // self.dwdp_size
                 for peer in range(self.dwdp_size):
+                    if peer == self.dwdp_rank:
+                        continue
                     self._transport.copy_shard(
                         self.dwdp_rank,
                         peer,
@@ -350,6 +322,9 @@ class NpuDwdpManager:
         if self._transport is None:
             return
         torch.npu.synchronize(self.device)
+        if self._weight_buffer is not None:
+            self._weight_buffer.release()
+            self._weight_buffer = None
         self._transport.close_imports()
         # Every consumer must drop imported mappings before any owner releases
         # immutable source weights. This is teardown, never a forward barrier.
@@ -357,7 +332,4 @@ class NpuDwdpManager:
             self._group.barrier()
         self._transport.close()
         self._transport = None
-        if self._weight_buffer is not None:
-            self._weight_buffer.release()
-            self._weight_buffer = None
         self._setup_complete = False

@@ -7,7 +7,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_npu
 
 # Import only the selected backend. The CUDA manager owns CUDA VMM resources;
-# the NPU manager uses ordinary ND compute buffers and native ACL stream copies.
+# the NPU manager owns ACL VMM views and native stream-ordered peer copies.
 if is_npu():
     from sglang.srt.hardware_backend.npu.dwdp.manager import (
         NpuDwdpManager as DwdpManager,
