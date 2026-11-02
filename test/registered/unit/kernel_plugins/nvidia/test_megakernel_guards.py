@@ -11,6 +11,12 @@ from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,6 +56,25 @@ class TestMegakernelGuards(CustomTestCase):
 
         self.assertTrue(tp_reasons("_fakes:SPEC"))
         self.assertEqual(tp_reasons("_fakes:ANY_TP"), [])
+
+    def test_only_a_spec_that_covers_prefill_is_held_to_the_prefill_graphs(self):
+        hf_config = SimpleNamespace(architectures=[ARCH], model_type="fake")
+
+        def prefill_reasons(path, backend):
+            registry._REGISTRY.clear()
+            registry.register(architecture=ARCH, path=path)
+            graphs = with_phase(
+                default_cuda_graph_config(), Phase.PREFILL, backend=backend
+            )
+            _, reasons = megakernel_disable_reasons(
+                cfg=server_args(cuda_graph_config=graphs), hf_config=hf_config, isa=ISA
+            )
+            return [r for r in reasons if "prefill CUDA graphs" in r]
+
+        self.assertTrue(prefill_reasons("_fakes:PREFILL", Backend.DISABLED))
+        self.assertEqual(prefill_reasons("_fakes:PREFILL", Backend.BREAKABLE), [])
+        # a decode-only spec is not asked about prefill graphs at all
+        self.assertEqual(prefill_reasons("_fakes:SPEC", Backend.DISABLED), [])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import torch.distributed as dist
+
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
@@ -42,12 +44,17 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
+    HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    _host_memory_budget,
+    host_memory_budget_scope,
     prepare_page_unified_write_back_staging,
+    ranks_per_host,
 )
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
@@ -352,7 +359,65 @@ def validate_decode_radix_cache(
         )
 
 
-def build_kv_cache(
+def _snapshot_host_budget() -> tuple[int, int, int]:
+    """(per-rank budget, node free bytes after the reserve, local ranks).
+
+    The same rule a single pool applies in host_memory_budget_bytes, sampled once.
+    """
+    free = (
+        available_host_memory_bytes(allow_cgroup_fallback=True)
+        - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    )
+    ranks = ranks_per_host()
+    return max(free, 0) // ranks, free, ranks
+
+
+def _host_rank_barrier() -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    dist.barrier(group=get_parallel().world_group.cpu_group)
+
+
+def build_kv_cache(*, enable_hierarchical_cache: bool, **kwargs) -> KVCacheBuildResult:
+    """Build the KV cache, booking every HiCache host pool against one snapshot.
+
+    Without the snapshot each host pool re-samples the machine's free memory as it
+    is built and divides it by the local rank count. Ranks build concurrently, so a
+    rank that samples after its peers have pinned theirs sees a fraction of what is
+    actually its share, and a large --hicache-size then fails on some ranks and not
+    others with "Not enough host memory available" -- a boot that either dies or,
+    worse, succeeds with pools of different sizes on different ranks.
+
+    The snapshot is taken between two barriers of the node's ranks, so every rank
+    sees the same free memory and divides it exactly as a single pool would. Pool
+    sizes are unchanged; only the admission check they are measured against is.
+    """
+    if not enable_hierarchical_cache:
+        return _build_kv_cache(
+            enable_hierarchical_cache=enable_hierarchical_cache, **kwargs
+        )
+    _host_rank_barrier()  # no rank has pinned yet
+    budget, free, ranks = _snapshot_host_budget()
+    _host_rank_barrier()  # every rank now holds the same snapshot
+    with host_memory_budget_scope(budget):
+        result = _build_kv_cache(
+            enable_hierarchical_cache=enable_hierarchical_cache, **kwargs
+        )
+        left = _host_memory_budget.get()
+    claimed = budget - (budget if left is None else left)
+    logger.info(
+        "HiCache host budget: %.2f GB per rank (node free %.2f GB after the "
+        "%.0f GiB reserve, %d local ranks), claimed %.2f GB",
+        budget / 1e9,
+        free / 1e9,
+        HICACHE_HOST_MEMORY_RESERVE_BYTES / 2**30,
+        ranks,
+        claimed / 1e9,
+    )
+    return result
+
+
+def _build_kv_cache(
     *,
     server_args: ServerArgs,
     model_config: ModelConfig,

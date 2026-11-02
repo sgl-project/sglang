@@ -14,7 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
+from sglang.srt.arg_groups.layernorm_sp_hook import (
+    validate_layernorm_sp,
+    validate_layernorm_sp_min_tokens,
+)
 from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
@@ -25,6 +28,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -47,9 +51,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
+def _initialize(*, enable=True, arch="Qwen3ForCausalLM", min_tokens=0):
     publish(
-        ServerArgs(model_path="dummy", enable_layernorm_sp=enable), role="tokenizer"
+        ServerArgs(
+            model_path="dummy",
+            enable_layernorm_sp=enable,
+            layernorm_sp_min_tokens=min_tokens,
+        ),
+        role="tokenizer",
     )
     layernorm_sp.initialize_layernorm_sp(
         model_config=SimpleNamespace(
@@ -73,12 +82,41 @@ class TestLayerNormSPGating(CustomTestCase):
         self.assertFalse(layernorm_sp.layernorm_sp_enabled())
 
     def test_runs_sp_only_on_extend(self):
-        with get_flags().sp.override(enabled=True):
-            self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
-            # SP is prefill-only; decode must never engage it.
-            self.assertFalse(layernorm_sp.runs_sp(ForwardMode.DECODE))
+        _initialize()
+        self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1))
+        # SP is prefill-only; decode must never engage it.
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.DECODE, 1))
         # A disabled model never activates, even on EXTEND.
-        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND))
+        _initialize(enable=False)
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1))
+
+    def test_runs_sp_above_the_min_tokens_only(self):
+        _initialize(min_tokens=1280)
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 512))
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1280))
+        self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1281))
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.DECODE, 8192))
+        # the threshold only narrows an enabled model
+        _initialize(enable=False, min_tokens=1280)
+        self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 8192))
+
+    def test_exit_gather_takes_the_entry_decision(self):
+        """Regression: with --layernorm-sp-min-tokens, a pass at or below the
+        threshold enters replicated, so the exit gather must not gather it."""
+        hidden = torch.ones(1280, 4)
+        _initialize(min_tokens=1280)
+        with patch.object(
+            layernorm_sp, "sp_exit_gather", side_effect=lambda h, num_tokens: h
+        ) as gather:
+            for rows, gathered in ((1280, False), (1281, True)):
+                gather.reset_mock()
+                layernorm_sp.maybe_exit_gather(
+                    hidden_states=hidden,
+                    hidden_states_before_norm=None,
+                    input_ids=torch.zeros(rows, dtype=torch.long),
+                    forward_mode=ForwardMode.EXTEND,
+                )
+                self.assertEqual(gather.called, gathered)
 
     def test_runs_sp_ignores_the_active_flag(self):
         """Regression: the exit gather must not key off ``sp_active``.
@@ -89,9 +127,9 @@ class TestLayerNormSPGating(CustomTestCase):
         starts consulting the flag, a replayed prefill skips the gather and feeds
         sequence-sharded hidden states to the LM head.
         """
-        with get_flags().sp.override(enabled=True):
-            get_forward().set("sp_active", False)
-            self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
+        _initialize()
+        get_forward().set("sp_active", False)
+        self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1))
         reset_context()
 
 
@@ -158,6 +196,20 @@ class TestLayerNormSPValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "pipeline"):
             validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
+    def test_min_tokens_must_be_a_captured_prefill_bucket(self):
+        graphs = dict(prefill_backend=Backend.FULL, prefill_bs=[512, 1280, 2048])
+        for ok in (0, 512, 1280, 2048, 4096):
+            validate_layernorm_sp_min_tokens(min_tokens=ok, **graphs)  # must not raise
+        with self.assertRaisesRegex(ValueError, "captured"):
+            validate_layernorm_sp_min_tokens(min_tokens=1000, **graphs)
+        with self.assertRaisesRegex(ValueError, ">= 0"):
+            validate_layernorm_sp_min_tokens(min_tokens=-1, **graphs)
+
+    def test_min_tokens_is_free_without_prefill_graphs(self):
+        validate_layernorm_sp_min_tokens(
+            min_tokens=1000, prefill_backend=Backend.DISABLED, prefill_bs=[512, 1280]
+        )  # must not raise
+
 
 class _Norm:
     def __call__(self, x, residual=None, post_residual_addition=None):
@@ -171,6 +223,11 @@ class TestSpRegionSteps(CustomTestCase):
     """The communicator opens the SP region at the model's first layer on a
     prefill forward and, inside it, keeps every boundary on this rank's sequence
     shard: add + norm, no move, no collective."""
+
+    def setUp(self):
+        # runs_sp reads --layernorm-sp-min-tokens from the published config
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
 
     def test_sp_flag_remains_visible_to_traced_linears(self):
         from sglang.srt.runtime_context import ForwardFlags

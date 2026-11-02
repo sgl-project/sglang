@@ -12,12 +12,28 @@ from msgspec.structs import replace
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ANY_TP, ARCH, DRAFT, ISA, SPEC, Lm, batch, server_args  # noqa: E402
+from _fakes import (  # noqa: E402
+    ANY_TP,
+    ARCH,
+    DRAFT,
+    ISA,
+    PREFILL,
+    SPEC,
+    Lm,
+    batch,
+    server_args,
+)
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -33,6 +49,7 @@ def install(
     gathered=None,
     tokens=2,
     hooks=None,
+    prefill_hooks=None,
     is_draft=False,
 ):
     """install_megakernel on an Lm as rank 0 of the published server; gathered maps
@@ -57,6 +74,7 @@ def install(
             model=lm,
             hf_config=SimpleNamespace(architectures=list(archs)),
             capture_tail_hooks=hooks,
+            prefill_capture_tail_hooks=prefill_hooks,
             is_draft=is_draft,
         )
     return lm
@@ -226,6 +244,55 @@ class TestMegakernelRuntime(CustomTestCase):
         capture([2, 8], capture_bs=[2, 8])
         with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
             capture([8, 16], capture_bs=[8, 16])
+
+    def test_a_spec_covering_prefill_is_checked_on_the_prefill_graph_buckets(self):
+        """A prefill graph is keyed by its token bucket, not by its batch size, and
+        only a spec that declares prefill graph backends is held to them."""
+
+        def publish_prefill_graphs(backend, **phase):
+            # explicit: the default prefill backend is breakable on CUDA only
+            graphs = with_phase(
+                default_cuda_graph_config(), Phase.PREFILL, backend=backend, **phase
+            )
+            publish(
+                server_args(enable_nvidia_megakernel=True, cuda_graph_config=graphs),
+                role="test",
+            )
+
+        publish_prefill_graphs(Backend.DISABLED)
+        with self.assertRaisesRegex(ValueError, "prefill CUDA graphs 'disabled'"):
+            self._install_spec(PREFILL)
+        publish_prefill_graphs(Backend.BREAKABLE, bs=[8, 2])
+        hooks, prefill_hooks = [], []
+        lm = self._install_spec(SPEC, hooks=hooks, prefill_hooks=prefill_hooks)
+        self.assertEqual((lm.context.prefill_widths, len(prefill_hooks)), ((), 0))
+
+        def capture(buckets):
+            hooks, prefill_hooks = [], []
+            lm = self._install_spec(
+                PREFILL, tokens=1, hooks=hooks, prefill_hooks=prefill_hooks
+            )
+            self.assertEqual(lm.context.prefill_widths, (2, 8))
+            self.assertEqual((len(hooks), len(prefill_hooks)), (1, 1))
+            runner = SimpleNamespace(capture_num_tokens=buckets)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                for rows in buckets:
+                    # one request per bucket: only the token count tells them apart
+                    fb = SimpleNamespace(batch_size=1, input_ids=torch.zeros(rows))
+                    lm(fb.input_ids, None, fb)
+                    prefill_hooks[0](runner, None, fb, rows)
+
+        with self.assertLogs(binding.logger, "INFO") as logs:
+            capture([2, 8])
+        self.assertIn(
+            "prefill graphs of token counts [2] (1 of 2)", "".join(logs.output)
+        )
+        with self.assertRaisesRegex(
+            ValueError, "none of the 2 captured prefill graphs"
+        ):
+            capture([8, 16])
 
 
 if __name__ == "__main__":

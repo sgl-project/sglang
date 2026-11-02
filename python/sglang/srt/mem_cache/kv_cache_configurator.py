@@ -1750,10 +1750,20 @@ class KVCacheConfigurator:
                 )
         else:
             if self.is_hybrid_swa:
+                quant_method = self._build_mha_quant_method(
+                    num_layers=self.layer_info.num_effective_layers
+                )
+                if quant_method is not None and is_float4_e2m1fn_x2(
+                    self.kv_cache_dtype
+                ):
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
+                    )
                 token_to_kv_pool = self._build_hybrid_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
+                    quant_method=quant_method,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 reject_out_of_tree_path(
@@ -2375,6 +2385,7 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
         mha_pool_class: type,
+        quant_method=None,
     ) -> KVCache:
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -2406,7 +2417,7 @@ class KVCacheConfigurator:
             size_swa=size_swa,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            post_capture_active=self.post_capture_kv_active,
+            post_capture_active=self.post_capture_kv_active and quant_method is None,
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
@@ -2417,6 +2428,7 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            quant_method=quant_method,
             **kwargs,
         )
         return token_to_kv_pool

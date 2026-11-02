@@ -73,8 +73,16 @@ def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
-    """Whether this forward runs SP: an enabled model, prefill only.
+def runs_sp(forward_mode, num_tokens: int) -> bool:
+    """Whether this forward runs SP: an enabled model, prefill only, and more
+    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass).
+
+    ``num_tokens`` is the pass's token count, before the entry scatter. Every
+    caller passes it, so the entry scatter, the layer-boundary entry and the
+    exit gathers take the same decision for one pass. In a captured prefill
+    graph the entry decides on the bucket size while the exit gather outside
+    the graph sees the real count; they agree because the threshold is a
+    captured bucket (checked at resolution, ``handle_layernorm_sp``).
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
@@ -82,7 +90,9 @@ def runs_sp(forward_mode) -> bool:
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    return num_tokens > get_parallel().layernorm_sp_min_tokens
 
 
 class _SPForwardState:
@@ -156,7 +166,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
