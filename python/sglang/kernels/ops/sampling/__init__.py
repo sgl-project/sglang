@@ -23,6 +23,7 @@ register_kernel(
         target="sglang.kernels.cake_kernels.sampling:softmax",
         capabilities=frozenset(
             {
+                CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0)),
                 CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
             }
         ),

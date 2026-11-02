@@ -4,6 +4,7 @@ import unittest
 import weakref
 from array import array
 from pathlib import Path
+from unittest.mock import patch
 
 import msgspec
 import numpy as np
@@ -29,8 +30,13 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal.kimi_k3_image_processing import KimiK3DeferredPreprocessing
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.cuda_vmm_transport_utils import (
+    CudaVmmPackedTensorTransportProxy,
+    _CudaVmmPackedTensorLayout,
+    _CudaVmmPackedTransportOwner,
+)
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -153,9 +159,12 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         )
 
     def _round_trip(self, req):
-        req.wrap_pickle_fields()
-        decoded = msgpack_decode(msgpack_encode(req))
-        decoded.unwrap_pickle_fields()
+        with patch.object(io_struct, "_USE_PICKLE_IPC", False):
+            req.wrap_pickle_fields()
+            # The DP controller re-sends the decoded request before it is unwrapped.
+            forwarded = msgpack_decode(msgpack_encode(req))
+            decoded = msgpack_decode(msgpack_encode(forwarded))
+            decoded.unwrap_pickle_fields()
         return decoded
 
     def _round_trip_mm_inputs(self, mm_inputs):
@@ -211,9 +220,9 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
             item.model_specific_data["patch_counts"],
             np.array([2], dtype=np.int32),
         )
-        self.assertEqual(item.model_specific_data["count"], 2)
-        self.assertIs(item.model_specific_data["enabled"], True)
-        self.assertEqual(item.model_specific_data["size"], [336, 336])
+        self.assertEqual(item.model_specific_data["count"], np.int64(2))
+        self.assertIsInstance(item.model_specific_data["enabled"], np.bool_)
+        self.assertEqual(item.model_specific_data["size"], (336, 336))
         self.assertTrue(
             torch.equal(
                 decoded.mm_inputs.mrope_positions,
@@ -305,94 +314,62 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertEqual(item.model_specific_data["image_grid_thw"].device.type, "cuda")
         self.assertEqual(decoded.mm_inputs.mrope_positions.device.type, "cuda")
 
-    def test_cuda_ipc_proxy_state_round_trip_preserves_tuple_types(self):
-        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
-        proxy.proxy_state = {
-            "ipc_extra": {
-                "shape": torch.Size([2, 3]),
-                "stride": (3, 1),
-                "dtype": torch.float16,
-                "nested": [(1, 2), torch.Size([4])],
-            },
-            "tensor_data": None,
-        }
-        proxy.reconstruct_tensor = None
-        proxy.sync_data_meta = {
-            "handle": "dummy",
-            "shape": torch.Size([1]),
-            "dtype": np.dtype("float32"),
-        }
-        proxy.sync_buffer = None
+    def test_packed_proxies_keep_one_owner(self):
+        # Reconstructing one packed child copies and acknowledges the shared
+        # chunk; a per-proxy owner copy would read it again after the release.
+        owner = _CudaVmmPackedTransportOwner(
+            fabric_handle=None,
+            posix_socket_path="\0sgl_mm_vmm_test",
+            allocation_size=1 << 21,
+            data_offset=1024,
+            data_nbytes=512,
+            control_offset=768,
+            consumer_count=2,
+        )
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=CudaVmmPackedTensorTransportProxy(
+                        owner=owner,
+                        layout=_CudaVmmPackedTensorLayout(
+                            relative_offset=offset,
+                            data_nbytes=8,
+                            shape=torch.Size([2]),
+                            dtype=torch.int32,
+                        ),
+                    ),
+                )
+                for offset in (0, 256)
+            ]
+        )
 
+        first, second = self._round_trip_mm_inputs(mm_inputs).mm_items
+
+        self.assertIs(type(first.feature), CudaVmmPackedTensorTransportProxy)
+        self.assertIs(first.feature._packed_owner, second.feature._packed_owner)
+
+    def test_object_fields_round_trip_like_pickle(self):
         mm_inputs = self._make_mm_inputs()
-        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
-        decoded = self._round_trip(
-            TokenizedGenerateReqInput(
-                input_text="",
-                input_ids=array("q", [1, 2]),
-                input_embeds=None,
-                mm_inputs=mm_inputs,
-                token_type_ids=[0, 0],
-                sampling_params=SamplingParams(),
-                return_logprob=False,
-                logprob_start_len=0,
-                top_logprobs_num=0,
-                token_ids_logprob=None,
-                stream=False,
-            )
+        item = mm_inputs.mm_items[0]
+        item.feature = (torch.ones(2), torch.zeros(3))
+        config = KimiK3DeferredPreprocessing(
+            backend="gpu",
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.25, 0.25, 0.25],
+            transparent_bg_config=None,
+            resize_config={"num_tokens": 4},
+        )
+        item.model_specific_data.update(
+            {"kimi_k3_deferred_preprocessing": config, "dtype": torch.bfloat16}
         )
 
-        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
-        ipc_extra = decoded_proxy.proxy_state["ipc_extra"]
-        self.assertIsInstance(ipc_extra["shape"], torch.Size)
-        self.assertEqual(ipc_extra["shape"], torch.Size([2, 3]))
-        self.assertIsInstance(ipc_extra["stride"], tuple)
-        self.assertEqual(ipc_extra["stride"], (3, 1))
-        self.assertIsInstance(ipc_extra["nested"][0], tuple)
-        self.assertIsInstance(ipc_extra["nested"][1], torch.Size)
-        self.assertIsInstance(decoded_proxy.sync_data_meta["shape"], torch.Size)
-        self.assertIsInstance(decoded_proxy.sync_data_meta["dtype"], np.dtype)
-        self.assertFalse(decoded_proxy._consumer_acknowledged)
+        decoded_item = self._round_trip_mm_inputs(mm_inputs).mm_items[0]
 
-    def test_cuda_ipc_proxy_tensor_fallback_round_trip(self):
-        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
-        proxy.proxy_state = {
-            "ipc_extra": None,
-            "tensor_data": torch.tensor([1.0, 2.0], device="cpu"),
-        }
-        proxy.reconstruct_tensor = None
-        proxy.sync_data_meta = {
-            "handle": "dummy",
-            "shape": (1,),
-            "dtype": np.dtype("uint8"),
-        }
-        proxy.sync_buffer = None
-
-        mm_inputs = self._make_mm_inputs()
-        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
-        decoded = self._round_trip(
-            TokenizedGenerateReqInput(
-                input_text="",
-                input_ids=array("q", [1, 2]),
-                input_embeds=None,
-                mm_inputs=mm_inputs,
-                token_type_ids=[0, 0],
-                sampling_params=SamplingParams(),
-                return_logprob=False,
-                logprob_start_len=0,
-                top_logprobs_num=0,
-                token_ids_logprob=None,
-                stream=False,
-            )
-        )
-
-        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
-        self.assertTrue(
-            torch.equal(
-                decoded_proxy.proxy_state["tensor_data"],
-                torch.tensor([1.0, 2.0], device="cpu"),
-            )
-        )
+        self.assertEqual(decoded_item.kimi_k3_deferred_preprocessing, config)
+        self.assertIs(decoded_item.dtype, torch.bfloat16)
+        self.assertIsInstance(decoded_item.feature, tuple)
+        self.assertTrue(torch.equal(decoded_item.feature[1], torch.zeros(3)))
 
     def test_evs_model_specific_data_round_trip(self):
         mm_inputs = self._make_mm_inputs()
@@ -421,7 +398,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         )
 
         decoded_item = decoded.mm_inputs.mm_items[0]
-        self.assertEqual(decoded_item.thw_grids, [[2, 3, 4]])
+        self.assertEqual(decoded_item.thw_grids, [(2, 3, 4)])
         self.assertEqual(decoded_item.pre_chunked_input_ids, [1, 2, 3])
 
     def test_torch_tensor_ext_wire_format(self):

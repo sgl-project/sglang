@@ -1,7 +1,6 @@
 ---
 title: PaddleOCR-VL
 description: "Deploy PaddleOCR-VL 1.6 / 1.5 / 0.9B with SGLang — Baidu's 0.9B NaViT + ERNIE-4.5 document-parsing VLM for OCR, tables, formulas and charts in 109 languages, on a single H100, H200 or B200."
-tag: NEW
 ---
 
 ## Deployment

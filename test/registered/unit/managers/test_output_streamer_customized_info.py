@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
+from sglang.api.v1.api_types import GenerateMetaInfo
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -16,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.incremental_detokenize import DetokenizeState
 from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
     RequestOutputStats,
@@ -33,6 +35,11 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
+    hide_forced_text,
+    req_state,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -110,6 +117,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def finished(self):
         return self._finished
@@ -800,7 +808,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         req.cached_tokens_host = 2
         req.cached_tokens_storage = 3
         streamer._stream_output_generation([req], False)
-        return rust_server.push_generation.call_args.args[2:]
+        return rust_server.push_generation.call_args.args[2:4]
 
     def test_rust_frames_split_cached_tokens_by_tier(self):
         """A cache with a host or storage tier, or a PD decode server, sends
@@ -823,6 +831,103 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
             ([(1, 2, 3)], None),
         )
         self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
+
+
+class TestOutputStreamerRustRequestStats(unittest.TestCase):
+    def _stats_sent(self, *, metrics, speculative):
+        """The `request_stats` one Rust egress frame carries for a running
+        request and a finished one, which was retracted twice, waited on a
+        storage prefetch (none on staging) and, with speculative decoding,
+        verified 3 times."""
+        for target, value in (
+            ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
+            (
+                "get_observability",
+                SimpleNamespace(
+                    enable_request_time_stats_logging=False, enable_metrics=metrics
+                ),
+            ),
+            ("get_spec", SimpleNamespace(speculative_num_draft_tokens=4)),
+            ("get_parallel", SimpleNamespace(dp_rank=0, attn_tp_rank=0)),
+        ):
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.output_streamer.{target}",
+                return_value=value,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=None,
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=False, enable_lmcache=False
+            ),
+            is_generation=True,
+            spec_algorithm=(
+                SpeculativeAlgorithm.EAGLE if speculative else SpeculativeAlgorithm.NONE
+            ),
+            disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
+            enable_hicache_storage=lambda: False,
+            rust_server=rust_server,
+        )
+        running = _FakeReq("running", [1])
+        running.stream = True
+        done = _FakeReq("done", [1, 2, 3, 4, 5, 6, 7], finished=True)
+        done.stream = True
+        done.retraction_count = 2
+        for req in (running, done):
+            req.time_stats = SchedulerReqTimeStats(
+                enable_metrics=True,
+                forward_entry_time=100.25,
+                prefill_finished_time=100.75,
+                queue_duration_s=0.125,
+                storage_prefetch_wait_s=0.5,
+            )
+            req.spec_verify_ct = 3
+            req.spec_num_correct_drafts = 4
+            req.spec_num_cap_tokens = 5
+            req.spec_num_block_accept_tokens = 6
+            req.spec_correct_drafts_histogram = [1, 1, 1]
+            req.spec_cap_lens_histogram = []
+        streamer._stream_output_generation([running, done], False)
+        return rust_server.push_generation.call_args.args[4]
+
+    def test_rust_frames_carry_finished_requests_stats(self):
+        """A finished request's frame carries the `meta_info` keys Python's
+        TokenizerManager derives from scheduler state, in its order: the
+        retraction count, the scheduler's timings with metrics on (realtime
+        stamps), and the speculative stats with speculative decoding; a
+        running request's carries none. None of the keys is one the api.v1
+        schema writes."""
+        with patch(
+            "sglang.srt.observability.req_time_stats.global_diff_realtime_monotonic",
+            1_760_000_000.0,
+        ):
+            stats = self._stats_sent(metrics=True, speculative=True)
+        expected = {
+            "num_retractions": 2,
+            "storage_prefetch_wait": 0.5,
+            "forward_entry_time": 1_760_000_100.25,
+            "prefill_finished_time": 1_760_000_100.75,
+            "queue_time": 0.125,
+            "spec_accept_rate": 4 / 9,
+            "spec_accept_length": 7 / 3,
+            "spec_num_correct_drafts": 4,
+            "spec_num_proposed_drafts": 9,
+            "spec_verify_ct": 3,
+            "spec_cap_length": 5 / 3,
+            "spec_correct_drafts_histogram": [1, 1, 1],
+        }
+        self.assertEqual(list(stats), [1])
+        self.assertEqual(list(stats[1].items()), list(expected.items()))
+        self.assertFalse(set(stats[1]) & set(GenerateMetaInfo.__struct_fields__))
+
+        self.assertEqual(
+            self._stats_sent(metrics=False, speculative=False),
+            {1: {"num_retractions": 2}},
+        )
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):
@@ -1033,6 +1138,31 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         req.reset_for_retract()
         self.assertIsNone(output())
 
+    def test_skipped_output_prefix_becomes_detokenizer_context(self):
+        outputs = []
+        streamer = _streamer(outputs)
+        streamer.uocr_doc_hooks = object.__new__(UocrDocHooks)
+        req = self._req()
+        req.output_ids.extend(array("q", [900, 901]))
+        req_state(req).forced_len = 2
+        hide_forced_text(req)
+        req.output_ids.append(800)
+        streamer.stream_output([req], False)
+        [payload] = outputs
+        [header] = payload.detokenize_headers
+        self.assertEqual(list(header.prompt_tail_ids), [2, 3, 4, 5, 6, 900, 901])
+        self.assertEqual(list(row_output_ids(payload, 0)), [800])
+        self.assertEqual(payload.completion_tokens, [1])
+        state = DetokenizeState.from_header(header=header, vocab_size=1000)
+        state.append_row(
+            rid=req.rid,
+            output_ids=list(row_output_ids(payload, 0)),
+            completion_tokens=payload.completion_tokens[0],
+            is_beam=False,
+            vocab_size=1000,
+        )
+        self.assertEqual(state.decode_ids[state.read_offset :], [800])
+
     def test_release_follows_a_sent_header_only(self):
         outputs = []
         streamer = _streamer(outputs)
@@ -1090,6 +1220,55 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         )
 
         self.assertEqual(payload.http_worker_ipcs, [])
+
+
+class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
+    def test_payload_carries_prefill_spans_for_finished_requests(self):
+        """Prefill spans computed before the KV release ride out with the finished request."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20], finished=True)
+        finished_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4),
+            WeightVersionSpan(version="v1", start=4, end=6),
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.prefill_weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v0", start=0, end=4),
+                    WeightVersionSpan(version="v1", start=4, end=6),
+                ],
+            ],
+        )
+
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
+    def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
+        """With tracking disabled every request contributes None, so nothing goes on the wire."""
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=_FakeReq("r0", [10], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+        self.assertIsNotNone(payload.weight_versions)
 
 
 if __name__ == "__main__":
