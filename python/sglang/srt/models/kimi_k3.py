@@ -38,7 +38,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateList,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.communication import (
+    k3_ar_fusion,
+    k3_sp_collective,
+    mori_gemm_ar_bf16,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -2506,7 +2510,15 @@ def _stage_facts(
             ),
         )
     return (
-        declare_attn(**attn_ops),
+        # A fused o_proj GEMM + all-reduce leaves the sum complete; the
+        # declared sum then passes its output through. An SP-MoE layer's sum
+        # is a reduce-scatter instead, which the FFN read's fusion takes.
+        declare_attn(
+            **attn_ops,
+            sum_impl=(
+                None if is_moe and _shards_moe_rows() else mori_gemm_ar_bf16.sum_impl()
+            ),
+        ),
         declare_ffn(
             **ffn_ops,
             sparse=is_moe,
@@ -2666,6 +2678,15 @@ class KimiK3DecoderLayer(nn.Module):
         if self._sp_moe and k3_sp_collective.enabled():
             return (
                 ReadoutFusion(SumGroup.ATTN_TP, _k3_reduce_scatter_add, scatters=True),
+            )
+        if self._sp_moe and mori_gemm_ar_bf16.enabled():
+            # o_proj's GEMM already reduce-scattered over mori (ROCm).
+            return (
+                ReadoutFusion(
+                    SumGroup.ATTN_TP,
+                    mori_gemm_ar_bf16.reduce_scatter_add,
+                    scatters=True,
+                ),
             )
         return ()
 
@@ -3454,6 +3475,14 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+        # Opt-in fused o_proj GEMM + attention-TP all-reduce (ROCm, mori);
+        # allocates its window before the memory profiler runs.
+        mori_gemm_ar_bf16.prepare(
+            (layer.self_attn, layer._sp_moe)
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+        )
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
