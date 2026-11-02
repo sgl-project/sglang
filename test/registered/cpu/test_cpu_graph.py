@@ -50,6 +50,8 @@ class TestCPUGraph(CustomTestCase):
         bind = get_tp_cpu_bind(tp_size)
         if bind is None:
             tp_size = len(get_cpu_ids_by_node())
+        else:
+            tp_size = len(bind.split("|"))
         process = popen_launch_server(
             model,
             base_url,
