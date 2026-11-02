@@ -18,12 +18,33 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.stage_domain import EPLBStageDomain
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.utils.common import LazyValue
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def get_routed_experts_weights_of_layer(model: nn.Module):
+    """Resolve the EPLB weight map across model wrappers and lazy variants."""
+
+    private_value = vars(model).get("_routed_experts_weights_of_layer")
+    if private_value is not None:
+        return (
+            private_value.materialize()
+            if isinstance(private_value, LazyValue)
+            else private_value
+        )
+
+    public_value = model.routed_experts_weights_of_layer
+    return (
+        public_value.materialize()
+        if isinstance(public_value, LazyValue)
+        else public_value
+    )
 
 
 class EPLBManager:
@@ -41,6 +62,7 @@ class EPLBManager:
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
         self._model_config = model_config
+        self._stage_domain = EPLBStageDomain.from_runtime()
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
         self._get_expert_backup_client = get_expert_backup_client
@@ -162,6 +184,7 @@ class EPLBManager:
                     if is_post_scale_rebalance
                     else get_parallel().tp_rank
                 ),
+                stage_domain=(None if is_post_scale_rebalance else self._stage_domain),
                 use_flat_topology=is_post_scale_rebalance,
                 expert_backup_client=self._get_expert_backup_client(),
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
@@ -191,6 +214,7 @@ class EPLBManager:
             return ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                stage_domain=self._stage_domain,
             )
 
         current_metadata = get_global_expert_location_metadata()
@@ -239,7 +263,7 @@ class EPLBManager:
 
     def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
         all_layer_ids = sorted(
-            list(self._get_model().routed_experts_weights_of_layer.keys())
+            list(get_routed_experts_weights_of_layer(self._get_model()).keys())
         )
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
@@ -302,18 +326,21 @@ def update_expert_location_with_recovery(
     new_expert_location_metadata: ExpertLocationMetadata,
     update_layer_ids: List[int],
     tp_rank: int,
+    stage_domain: EPLBStageDomain | None = None,
     use_flat_topology: bool = False,
     expert_backup_client,
     update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
 ):
+    routed_experts_weights_of_layer = get_routed_experts_weights_of_layer(model)
     p2p_missing_logical_experts = expert_location_updater.update(
-        model.routed_experts_weights_of_layer,
+        routed_experts_weights_of_layer,
         new_expert_location_metadata,
         update_layer_ids=update_layer_ids,
         nnodes=get_parallel().nnodes,
         rank=tp_rank,
+        stage_domain=stage_domain,
         use_flat_topology=use_flat_topology,
     )
 
