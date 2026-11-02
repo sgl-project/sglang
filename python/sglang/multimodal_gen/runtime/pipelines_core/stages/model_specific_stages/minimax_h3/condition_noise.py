@@ -34,12 +34,12 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     """Apply the imgvid-condition RF noise recipe to packed clean rows.
 
     ``condition_shapes`` contains ``(latent_t, latent_h, latent_w)`` in packed
-    visual-condition order. A new CPU generator with the same row seed is
-    created for every condition. Under the dependent-noise policy, each draw
-    uses the target temporal length plus the template's imgvid-condition frame
-    count, then slices the prefix matching the current condition. A supplied
-    generator instead draws each condition in external [B,F,C,H,W] order from
-    one continuous request-local stream, as used by Pika's release.
+    visual-condition order. Without a supplied generator, each condition uses
+    a new CPU generator with the same row seed. Under the dependent-noise
+    policy, each draw uses the target temporal length plus the template's
+    imgvid-condition frame count, then slices the matching condition prefix.
+    A supplied generator draws each condition in [B,F,C,H,W] order, advancing
+    the same stream across conditions.
     """
 
     noise_aug = float(noise_aug)
