@@ -137,10 +137,6 @@ class AscendRunnerCore(MoeRunnerCore):
     runner_backend = MoeRunnerBackend.ASCEND
 
     def __init__(self, config: MoeRunnerConfig):
-        from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
-            _NPUBlockFp8MoEKernel,
-        )
-
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
@@ -160,12 +156,12 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluMxfp8Quant(config.swiglu_limit)
-        elif (
-            isinstance(kernel, _NPUBlockFp8MoEKernel)
-            and config.swiglu_limit is not None
-            and config.swiglu_limit > 0
-        ):
+        elif config.swiglu_limit is not None and config.swiglu_limit > 0:
+            # Clamp gate/up before SiLU for every weight format. INT8 kernels
+            # requantize this floating output in w2.apply when its scale is None.
             self.activation = NPUSwigluWithLimit(config.swiglu_limit)
+            if getattr(config, "use_tp_all_gather_activation", False):
+                self.activation = AllGatherActivationWrapper(self.activation, dim=-1)
         elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             # DeepEP / Ascend Ops path: the dispatcher hands over tokens grouped
             # by expert, so use a unified kernel that decides quantisation.
