@@ -3479,6 +3479,155 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * self.kv_lora_rank)
 
+    def _forward_mixed_mla(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """MLA attention for a mixed (prefill rows + decode tails) batch.
+
+        Reuses the split-attention structure of ``forward_extend``'s prefix
+        branch: the in-batch rows form the causal chunk, each row's history
+        forms a cross-attention prefix, and both partial outputs are merged by
+        their LSEs. ``mix_mask`` replaces ``fia_mask`` for the causal part so a
+        prefill row cannot attend to the decode tail rows.
+
+        ``q``/``k`` arrive already expanded by the MLA attention module
+        (``qk_head_dim = qk_nope_head_dim + qk_rope_head_dim``), and that same
+        module already wrote the KV cache, so ``save_kv_cache`` is False and no
+        cache write happens here.
+        """
+        num_token_padding = q.shape[0]
+        num_real = forward_batch.global_num_token_non_padded_cpu
+        if num_real is not None and num_real < num_token_padding:
+            q, k, v = [data[:num_real] for data in [q, k, v]]
+
+        q_nope, q_rope_cur = q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope_cur, k_rope_cur = k.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        query_lens = self.forward_metadata.extend_seq_lens_cpu_int
+        cu_query_lens = query_lens.cumsum(0).tolist()
+        q_nope, q_rope_cur = q_nope.contiguous(), q_rope_cur.contiguous()
+        k_nope_cur, k_rope_cur = k_nope_cur.contiguous(), k_rope_cur.contiguous()
+
+        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            query=q_nope,
+            key=k_nope_cur,
+            value=v.contiguous(),
+            query_rope=q_rope_cur,
+            key_rope=k_rope_cur,
+            num_query_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            actual_seq_qlen=cu_query_lens,
+            actual_seq_kvlen=cu_query_lens,
+            atten_mask=self.mix_mask,
+            sparse_mode=3,
+            next_tokens=0,
+            softmax_scale=layer.scaling,
+            return_softmax_lse=True,
+        )
+
+        prefix_lens = self.forward_metadata.prefix_lens
+        if prefix_lens is not None and int(prefix_lens.sum().item()) > 0:
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            kv_cached = gather_mla_cache_pages(
+                k_buffer,
+                self.forward_metadata.flatten_prefix_block_tables,
+                is_nz=is_fia_nz(),
+            )
+            k_rope_cached = gather_mla_cache_pages(
+                v_buffer,
+                self.forward_metadata.flatten_prefix_block_tables,
+                is_nz=is_fia_nz(),
+            ).flatten(0, 1)
+
+            assert layer.kv_b_proj is not None
+            kv_p = layer.kv_b_proj(kv_cached)[0].view(
+                -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+            )
+            k_nope_all, v_all = kv_p.split(
+                [self.qk_nope_head_dim, layer.v_head_dim], dim=-1
+            )
+            k_rope_all = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+
+            # The gathered cache is page-aligned, so a row's real prefix can be
+            # shorter than the pages it occupies. Walk each row with its true
+            # length (BSND, one row at a time) instead of trusting a per-row
+            # cumulative token count that the TND layout would have to align.
+            page = self.page_size
+            q_start = 0
+            page_start = 0
+            merged_output = attn_output
+            for row, (row_len, prefix_len) in enumerate(
+                zip(query_lens.tolist(), prefix_lens.tolist())
+            ):
+                padded_prefix = ((int(prefix_len) + page - 1) // page) * page
+                if prefix_len == 0:
+                    page_start += padded_prefix
+                    q_start += row_len
+                    continue
+                k_pre = k_nope_all[page_start : page_start + int(prefix_len)]
+                v_pre = v_all[page_start : page_start + int(prefix_len)]
+                k_rope_pre = k_rope_all[page_start : page_start + int(prefix_len)]
+                prefix_output, prefix_lse = (
+                    torch_npu.npu_fused_infer_attention_score_v2(
+                        query=q_nope[q_start : q_start + row_len],
+                        key=k_pre.contiguous(),
+                        value=v_pre.contiguous(),
+                        query_rope=q_rope_cur[q_start : q_start + row_len],
+                        key_rope=k_rope_pre.contiguous(),
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        actual_seq_qlen=[row_len],
+                        actual_seq_kvlen=[int(prefix_len)],
+                        sparse_mode=0,
+                        softmax_scale=layer.scaling,
+                        return_softmax_lse=True,
+                    )
+                )
+                cur_out = attn_output[q_start : q_start + row_len]
+                cur_lse = attn_lse[q_start : q_start + row_len]
+                merged, _ = torch_npu.npu_attention_update(
+                    (cur_lse.reshape(-1), prefix_lse.reshape(-1)),
+                    (
+                        cur_out.float().reshape(-1, layer.v_head_dim),
+                        prefix_output.float().reshape(-1, layer.v_head_dim),
+                    ),
+                    0,
+                )
+                merged_output[q_start : q_start + row_len] = merged.to(q.dtype).reshape(
+                    -1, layer.tp_q_head_num, layer.v_head_dim
+                )
+                q_start += row_len
+                page_start += padded_prefix
+            attn_output = merged_output
+
+        attn_output = attn_output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+        if num_real is not None and num_real < num_token_padding:
+            attn_output = torch.cat(
+                [
+                    attn_output,
+                    attn_output.new_zeros(
+                        num_token_padding - attn_output.shape[0],
+                        *attn_output.shape[1:],
+                    ),
+                ],
+                dim=0,
+            )
+        return attn_output
+
     def forward_mixed(
         self,
         q: torch.Tensor,
@@ -3491,16 +3640,23 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if (
-            topk_indices is not None
-            or self.use_mla
-            or (not self.use_fia and layer.qk_head_dim > 128)
-        ):
+        if topk_indices is not None or (not self.use_fia and layer.qk_head_dim > 128):
             raise NotImplementedError(
                 "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
                 "1. When using the MLA backend on Ascend NPU devices, "
                 "2. When using the deepseekv3.2 model on Ascend NPU devices, "
                 "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
+            )
+        if self.use_mla:
+            return self._forward_mixed_mla(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
             )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
