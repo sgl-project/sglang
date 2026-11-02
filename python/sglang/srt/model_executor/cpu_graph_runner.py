@@ -1044,6 +1044,7 @@ class CPUGraphRunner:
     disable_padding: bool = False
     max_bs: int = 0
     model_is_mrope: bool = False
+    is_generation: bool = True
     capture_num_tokens: list = []
     prefill_graphs: dict = {}
     prefill_graphs_bs1: dict = {}
@@ -1783,10 +1784,13 @@ class CPUGraphRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         with cpu_graph_patch_boundary_classes():
             if forward_batch.forward_mode.is_extend():
-                return self._execute_prefill_graph(forward_batch, pp_proxy_tensors)
+                return self._execute_prefill_graph(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors, **kwargs
+                )
 
             assert pp_proxy_tensors is None, (
                 "PPProxyTensors is not supported in CPUGraphRunner yet."
@@ -2020,7 +2024,9 @@ class CPUGraphRunner:
                 return layer_model
         return model
 
-    def _run_prefill_once(self, compiled_fn: Callable, forward_batch: ForwardBatch):
+    def _run_prefill_once(
+        self, compiled_fn: Callable, forward_batch: ForwardBatch, **kwargs
+    ):
         # Metadata prep happens *outside* the compiled callable, exactly like
         # decode already does above -- CPU never needs a separate "capture-time"
         # metadata initializer the way CUDA graphs do (see class docstring).
@@ -2050,11 +2056,13 @@ class CPUGraphRunner:
                                 forward_batch.input_ids,
                                 forward_batch.positions,
                                 forward_batch,
+                                **kwargs,
                             )
                     return compiled_fn(
                         forward_batch.input_ids,
                         forward_batch.positions,
                         forward_batch,
+                        **kwargs,
                     )
             finally:
                 forward_batch.global_num_token_non_padded_cpu = (
@@ -2070,6 +2078,7 @@ class CPUGraphRunner:
         mark_request_axis_dynamic: bool = True,
         save_dynamic_template: bool = True,
     ) -> None:
+        warmup_kwargs = {} if self.is_generation else {"get_embedding": True}
         for bs in warmup_bs_values or self.prefill_warmup_bs_values:
             if bs > num_tokens:
                 continue
@@ -2084,7 +2093,7 @@ class CPUGraphRunner:
             # exercises the already-compiled artifact (mirrors
             # capture_one_batch_size above).
             for _ in range(2):
-                self._run_prefill_once(compiled_fn, fb)
+                self._run_prefill_once(compiled_fn, fb, **warmup_kwargs)
 
     def _compile_prefill_bucket(self, num_tokens: int) -> Callable:
         with patch_model(
@@ -2357,6 +2366,7 @@ class CPUGraphRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         assert pp_proxy_tensors is None, (
             "PPProxyTensors is not supported in CPUGraphRunner's prefill path yet."
@@ -2417,7 +2427,7 @@ class CPUGraphRunner:
         if self.enable_torch_compile and using_dynamic_fallback:
             self._mark_dynamic_token_axis(forward_batch)
 
-        output = self._run_prefill_once(compiled_fn, forward_batch)
+        output = self._run_prefill_once(compiled_fn, forward_batch, **kwargs)
         if isinstance(output, LogitsProcessorOutput):
             if output.hidden_states is not None:
                 output.hidden_states = output.hidden_states[:raw_num_tokens]

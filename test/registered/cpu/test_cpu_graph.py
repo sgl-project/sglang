@@ -1032,6 +1032,33 @@ class TestCPUGraph(CustomTestCase):
         forward_batch2.return_hidden_states_before_norm = True
         self.assertFalse(runner._can_run_prefill_graph(forward_batch2))
 
+    def test_prefill_graph_forwards_extend_kwargs(self):
+        runner = _make_cpu_graph_runner()
+        runner._prefill_uses_eager_logits_tail = False
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+        )
+        received_kwargs = []
+
+        def compiled_fn(input_ids, positions, fb, **kwargs):
+            del input_ids, positions, fb
+            received_kwargs.append(kwargs)
+            return LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4))
+
+        runner.prefill_graphs = {6: compiled_fn}
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2)
+
+        with patch.object(
+            cpu_graph_runner_module,
+            "get_parallel",
+            return_value=SimpleNamespace(
+                tp_group=SimpleNamespace(barrier=lambda: None)
+            ),
+        ):
+            runner.execute(forward_batch, get_embedding=True)
+
+        self.assertEqual(received_kwargs, [{"get_embedding": True}])
+
     def test_mamba_cache_install_and_reset_uses_layer_router_state_part(self):
         from sglang.srt.mem_cache.kv.router import STATE_PART
         from sglang.srt.model_executor.cpu_graph_runner import (
