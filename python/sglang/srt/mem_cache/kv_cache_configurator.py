@@ -28,9 +28,11 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
+    get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_unlimited_ocr_v2,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -76,6 +78,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    UnlimitedOCRV2KVPool,
     get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.page_interleave import (
@@ -774,7 +777,7 @@ class KVCacheConfigurator:
         draft_owns_state = False
         if req_to_token_pool is None:
             req_to_token_pool = self._build_req_to_token_pool(
-                max_num_reqs=sizes.max_running_requests
+                max_num_reqs=self._req_pool_rows(sizes.max_running_requests)
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -1420,6 +1423,12 @@ class KVCacheConfigurator:
                 "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
+    def _req_pool_rows(self, max_running_requests: int) -> int:
+        """Request rows; v2 doc split keeps one more per request for a retained window."""
+        if is_unlimited_ocr_v2(self.model_config.hf_config) and get_mm().uocr_doc_split:
+            return 2 * max_running_requests
+        return max_running_requests
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
@@ -1751,6 +1760,10 @@ class KVCacheConfigurator:
                     current_platform, subsystem="the MiniMax sparse-index KV pool"
                 )
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
+            elif is_unlimited_ocr_v2(self.model_config.hf_config):
+                token_to_kv_pool = self._build_unlimited_ocr_v2_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.mambaish_config:
@@ -2460,6 +2473,30 @@ class KVCacheConfigurator:
             **hisparse_kwargs,
         )
         return token_to_kv_pool
+
+    def _build_unlimited_ocr_v2_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        """Build main K/V plus single-head index K for DASH routing."""
+        sparse_cfg = get_unlimited_ocr_v2_sparse_config(self.model_config.hf_config)
+        num_layers = int(self.model_config.num_hidden_layers)
+        sparse_layer_ids = list(range(num_layers))
+        return UnlimitedOCRV2KVPool(
+            size=max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            index_dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            idx_head_dim=int(sparse_cfg["sparse_index_dim"]),
+            dense_layer_ids=[],
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=sparse_layer_ids,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+        )
 
     def _build_hybrid_linear_kv_pool(
         self,
