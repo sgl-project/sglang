@@ -171,6 +171,18 @@ class SRTPlatform(DeviceMixin):
         """
         return None
 
+    def get_token_allocator_cls(self) -> Optional[type]:
+        """Return the page_size == 1 allocator class, or None for the in-tree
+        ``TokenToKVPoolAllocator``.
+
+        The page_size == 1 sites build a token allocator instead of the paged
+        one, so ``get_paged_allocator_cls`` does not reach them. The class is
+        constructed as ``cls(size, dtype, device, kvcache, need_sort)``
+        (positionally or by those keyword names), like the in-tree class.
+        Honored by the KV cache configurator and ``SWATokenToKVPoolAllocator``.
+        """
+        return None
+
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
 
