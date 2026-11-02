@@ -129,7 +129,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG = {
 }
 
 
-class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
+class TestNPUDeepSeekV4ProW4A816PIn128kOut1kPrefix90RadixCache(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
     """Test NPU performance for DeepSeek-V4-Pro W4A8 16p mix in128k out1k prefix90"""
