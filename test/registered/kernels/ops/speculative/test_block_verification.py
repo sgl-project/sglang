@@ -139,6 +139,53 @@ def test_matches_reference(steps, vocab, block):
     assert (final_coins <= upper + 1e-6).all()
 
 
+@pytest.mark.parametrize("vocab,token", [(129, 126), (65569, 32766)])
+def test_final_draw_when_cutoff_rounds_to_residual_total(vocab, token):
+    target = torch.zeros(1, 2, vocab, device=DEVICE)
+    # The common prefix sums to 1 - 2**-126; the two rows differ only in the tail.
+    target[:, :, :126] = target.new_tensor([2.0**-k for k in range(1, 127)])
+    target[:, :, token] = 2.0**-126
+    draft = target[:, :1].clone()
+    draft[:, :, token + 1] = draft[:, :, token]
+    draft[:, :, token] = 0
+    lengths, output = _verify(
+        target,
+        draft,
+        torch.full((1, 2), token + 1, device=DEVICE),
+        target.new_full((1, 2), 0.9),
+        target.new_tensor([1 - 2**-24]),
+        block=False,
+    )
+    assert lengths.item() == 0
+    assert output[0, 0].item() == token
+
+
+@pytest.mark.parametrize("vocab", [17, 129])
+def test_final_draw_stays_in_residual_support_for_coins_near_one(vocab):
+    torch.manual_seed(42)
+    batch = 102400
+    target = torch.randn(batch, 2, vocab, device=DEVICE).softmax(-1)
+    draft = torch.randn(batch, 1, vocab, device=DEVICE).softmax(-1)
+    # Reject the only draft, so the final token comes from max(p - q, 0).
+    candidates = torch.zeros(batch, 2, dtype=torch.long, device=DEVICE)
+    candidates[:, 1] = (draft[:, 0] - target[:, 0]).argmax(-1)
+    # FP32 rounding can lift the cutoff to the cumsum for these largest coins.
+    final_coins = 1 - (torch.arange(batch, device=DEVICE) % 16 + 1) * 2.0**-24
+    lengths, output = _verify(
+        target,
+        draft,
+        candidates,
+        target.new_full((batch, 2), 1 - 2**-24),
+        final_coins,
+        block=False,
+    )
+    assert (lengths == 0).all()
+    tokens = output[:, 0].long()
+    assert ((tokens >= 0) & (tokens < vocab)).all()
+    rows = torch.arange(batch, device=DEVICE)
+    assert (target[rows, 0, tokens] > draft[rows, 0, tokens]).all()
+
+
 def test_accepts_longer_prefix_after_rejection():
     target = torch.tensor([[[1 / 3, 2 / 3]] * 3], device=DEVICE)
     draft = torch.tensor([[[2 / 3, 1 / 3]] * 2], device=DEVICE)

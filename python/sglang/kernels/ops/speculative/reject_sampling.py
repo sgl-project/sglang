@@ -197,9 +197,12 @@ def speculative_sampling_classic_kernel(
 
             norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # Pass 2: CDF. FP32 rounding can move the cumsum across target_u at a zero-weight
+    # lane or at a lane past VOCAB_SIZE, so only positive-weight lanes can match. If
+    # target_u reaches the cumsum total, no lane matches and the last positive-weight
+    # token is used. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
+    # rejection) has no such token, so final_token falls back to VOCAB_SIZE - 1.
+    # This case is numerically near-impossible.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
@@ -226,13 +229,22 @@ def speculative_sampling_classic_kernel(
             block_cumsum = tl.cumsum(val, axis=0)
             total_cumsum = cum_sum + block_cumsum
 
-            candidates_mask = total_cumsum > target_u
-            has_match = tl.max(candidates_mask, axis=0)
+            # One reduction finds both results. A match ranks above every other lane
+            # and an earlier match ranks higher. Other positive lanes rank by token.
+            positive = val > 0.0
+            ranks = tl.where(positive, v_offsets, -1)
+            ranks = tl.where(
+                positive & (total_cumsum > target_u),
+                2 * VOCAB_SIZE - 1 - v_offsets,
+                ranks,
+            )
+            best_rank = tl.max(ranks, axis=0)
 
-            if has_match:
-                match_idx = tl.argmax(candidates_mask.to(tl.int32), axis=0)
-                final_token = v_start + match_idx
+            if best_rank >= VOCAB_SIZE:
+                final_token = 2 * VOCAB_SIZE - 1 - best_rank
                 found = 1
+            elif best_rank >= 0:
+                final_token = best_rank
 
             cum_sum += tl.sum(val)
 
