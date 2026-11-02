@@ -1622,7 +1622,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
-                reserved_restore_tokens += prefix_match.restore_token_count
+                if not self.scheduler.enable_unified_cache_external_linker:
+                    reserved_restore_tokens += prefix_match.restore_token_count
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
@@ -2275,9 +2276,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # awareness, a retracted request should re-match the tree here
         # instead of re-allocating from scratch. See resume_retracted_reqs.
         delta_len = fill_len - total_prefix_len
-        required_alloc_tokens = self._required_alloc_tokens(
-            fill_len=fill_len, prefix_len=prefix_len
-        )
+        if self.scheduler.enable_unified_cache_external_linker:
+            # Linker prefetch already owns device slots for the restoring prefix.
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=total_prefix_len
+            )
+        else:
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=prefix_len
+            )
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (

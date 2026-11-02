@@ -32,6 +32,7 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    max_prefix_len: Optional[int] = None
 
     @property
     def l1_prefix_len(self) -> int:
@@ -105,6 +106,7 @@ class DecodeHiCachePreallocMixin:
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
+            max_prefix_len=max_prefix_len,
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
@@ -121,6 +123,15 @@ class DecodeHiCachePreallocMixin:
         Clears the L3 span unless the prefetch was taken, so prefill is never
         promised tokens nothing will load.
         """
+        if (
+            prefix_match is not None
+            and self.scheduler.enable_unified_cache_external_linker
+        ):
+            prefix_match.l3_storage_hit_length = (
+                self.tree_cache.linker.prefetch(req, prefix_match.max_prefix_len) or 0
+            )
+            prefix_match.prefetch_registered = prefix_match.l3_storage_hit_length > 0
+            return
         if (
             prefix_match is None
             or prefix_match.l3_storage_hit_length <= 0
@@ -165,7 +176,10 @@ class DecodeHiCachePreallocMixin:
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
-        if not self.scheduler.enable_decode_hicache:
+        if (
+            not self.scheduler.enable_decode_hicache
+            or self.scheduler.enable_unified_cache_external_linker
+        ):
             return 0
         return sum(
             dr.prefix_match.restore_token_count
@@ -298,7 +312,10 @@ class DecodeHiCacheTransferMixin:
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
         # Phase B: queue new load_back ops if the next slot is free on every rank.
-        if not self.tree_cache.has_free_load_back_slot():
+        if (
+            not self.scheduler.enable_unified_cache_external_linker
+            and not self.tree_cache.has_free_load_back_slot()
+        ):
             return
         queued = [
             dr
@@ -312,6 +329,12 @@ class DecodeHiCacheTransferMixin:
             )
         ]
         if not queued:
+            return
+
+        if self.scheduler.enable_unified_cache_external_linker:
+            # Prefetch publishes device KV only after every rank finishes the read.
+            for dr in queued:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
             return
 
         counter = self.tree_cache.cache_controller.layer_done_counter
