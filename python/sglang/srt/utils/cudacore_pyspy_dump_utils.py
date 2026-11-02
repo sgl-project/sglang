@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import stat
 import subprocess
 import time
 from errno import ENXIO
@@ -48,6 +49,18 @@ def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
         return Path(proc.cwd()) / path
     except (psutil.Error, OSError):
         return Path.cwd() / path
+
+
+def _get_cuda_coredump_pipe_candidates(proc: psutil.Process) -> List[Path]:
+    pipe_path = _resolve_cuda_coredump_pipe_path(proc)
+    if os.environ.get("CUDA_COREDUMP_PIPE") is not None:
+        return [pipe_path]
+
+    # Some CUDA driver builds create the default FIFO without the documented
+    # ".cuda." component. Keep the documented name first, then try the observed
+    # driver name in the same working directory.
+    driver_default_path = pipe_path.with_name(f"corepipe_{platform.node()}_{proc.pid}")
+    return [pipe_path, driver_default_path]
 
 
 def _is_sglang_scheduler_process(proc: psutil.Process) -> bool:
@@ -109,36 +122,60 @@ def trigger_cuda_user_coredump(scheduler_only=False):
         procs = [psutil.Process()]
 
     for proc in procs:
-        pipe_path = _resolve_cuda_coredump_pipe_path(proc)
-        try:
-            fd = os.open(pipe_path, os.O_WRONLY | os.O_NONBLOCK)
+        pipe_paths = _get_cuda_coredump_pipe_candidates(proc)
+        for index, pipe_path in enumerate(pipe_paths):
             try:
-                os.write(fd, b"1")
-            finally:
-                os.close(fd)
-            logger.error(
-                "Triggered CUDA user coredump for PID %s via %s",
-                proc.pid,
-                pipe_path,
-            )
-        except FileNotFoundError:
-            logger.error(
-                "CUDA coredump pipe not found for PID %s: %s. Ensure "
-                "CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 was set before this "
-                "process initialized CUDA.",
-                proc.pid,
-                pipe_path,
-            )
-        except OSError as e:
-            if e.errno == ENXIO:
+                flags = os.O_WRONLY | os.O_NONBLOCK
+                if index > 0:
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(pipe_path, flags)
+                if index > 0:
+                    try:
+                        is_fifo = stat.S_ISFIFO(os.fstat(fd).st_mode)
+                    except OSError:
+                        os.close(fd)
+                        raise
+                    if not is_fifo:
+                        os.close(fd)
+                        logger.error(
+                            "CUDA coredump fallback path is not a FIFO for PID %s: %s",
+                            proc.pid,
+                            pipe_path,
+                        )
+                        break
+                try:
+                    os.write(fd, b"1")
+                finally:
+                    os.close(fd)
+            except FileNotFoundError:
+                if index + 1 < len(pipe_paths):
+                    continue
                 logger.error(
-                    "CUDA coredump pipe has no reader for PID %s: %s",
+                    "CUDA coredump pipe not found for PID %s: tried %s. Ensure "
+                    "CUDA_ENABLE_USER_TRIGGERED_COREDUMP=1 was set before this "
+                    "process initialized CUDA.",
                     proc.pid,
-                    pipe_path,
+                    ", ".join(str(path) for path in pipe_paths),
                 )
+                break
+            except OSError as e:
+                if e.errno == ENXIO:
+                    logger.error(
+                        "CUDA coredump pipe has no reader for PID %s: %s",
+                        proc.pid,
+                        pipe_path,
+                    )
+                else:
+                    logger.exception(
+                        "Failed to trigger CUDA user coredump for PID %s via %s",
+                        proc.pid,
+                        pipe_path,
+                    )
+                break
             else:
-                logger.exception(
-                    "Failed to trigger CUDA user coredump for PID %s via %s",
+                logger.error(
+                    "Triggered CUDA user coredump for PID %s via %s",
                     proc.pid,
                     pipe_path,
                 )
+                break
