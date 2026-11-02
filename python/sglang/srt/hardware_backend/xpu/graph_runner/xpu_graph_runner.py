@@ -15,17 +15,13 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import register_xpu_device_properties_for_dynamo
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -136,27 +132,3 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert not self.require_gathered_buffer, (
             "XPUGraphRunner does not support gathered buffer yet."
         )
-
-    def _init_profile_context_and_memory_record(self):
-        profile_context = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
-            record_shapes=True,
-        )
-        torch.xpu.memory._record_memory_history()
-        return profile_context
-
-    def _post_process_after_profile(self, prof_context):
-        torch.xpu.memory._dump_snapshot("xpu_graph_runner_memory_usage.pickle")
-        torch.xpu.memory._record_memory_history(enabled=None)
-        log_message = (
-            "Sorted by XPU Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="self_xpu_time_total"
-            )
-            + "\n\nSorted by CPU Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="self_cpu_time_total"
-            )
-            + "\n\nMemory Usage is saved to xpu_graph_runner_memory_usage.pickle\n"
-        )
-        logger.info(log_message)
