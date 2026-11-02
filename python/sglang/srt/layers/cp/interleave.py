@@ -375,7 +375,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support dense K/V materialization"

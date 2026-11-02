@@ -32,7 +32,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -2005,9 +2005,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                         attn.attn,
                         KVWriteLoc(
                             cache_loc_2d,
-                            swa_loc=swa_cache_loc.view_as(cache_loc_2d)
-                            if swa_cache_loc is not None
-                            else None,
+                            window_locs=layer_window_locs(
+                                self.draft_model_runner.token_to_kv_pool,
+                                attn.attn.layer_id,
+                                swa_cache_loc.view_as(cache_loc_2d)
+                                if swa_cache_loc is not None
+                                else None,
+                            ),
                             physical=True,
                         ),
                         commit_lens,
@@ -2078,7 +2082,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 attn.attn.layer_id
             ).store(
                 attn.attn,
-                KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
+                KVWriteLoc(
+                    ctx_cache_loc,
+                    window_locs=layer_window_locs(
+                        self.draft_model_runner.token_to_kv_pool,
+                        attn.attn.layer_id,
+                        ctx_swa_cache_loc,
+                    ),
+                    physical=True,
+                ),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -2110,9 +2122,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn,
                     KVWriteLoc(
                         ctx_cache_loc_2d,
-                        swa_loc=ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
-                        if ctx_swa_cache_loc is not None
-                        else None,
+                        window_locs=layer_window_locs(
+                            token_to_kv_pool,
+                            attn.layer_id,
+                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                            if ctx_swa_cache_loc is not None
+                            else None,
+                        ),
                         physical=True,
                     ),
                     commit_lens,
@@ -2124,7 +2140,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.layer_router.layer(attn.layer_id).store(
                     attn,
-                    KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
+                    KVWriteLoc(
+                        ctx_cache_loc,
+                        window_locs=layer_window_locs(
+                            token_to_kv_pool, attn.layer_id, ctx_swa_cache_loc
+                        ),
+                        physical=True,
+                    ),
                     cache_k,
                     cache_v,
                     attn.k_scale,

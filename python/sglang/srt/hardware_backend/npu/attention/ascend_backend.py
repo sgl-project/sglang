@@ -36,7 +36,7 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -267,7 +267,7 @@ class AscendAttnMaskBuilder:
 
 
 def _cp_allgather_and_save_kv_npu(
-    forward_batch, layer, k, v, cp_size, token_to_kv_pool, swa_loc=None
+    forward_batch, layer, k, v, cp_size, token_to_kv_pool, window_locs=None
 ):
     """NPU-compatible CP KV all-gather with merged K/V communication.
 
@@ -280,8 +280,9 @@ def _cp_allgather_and_save_kv_npu(
     Equivalent to cp_allgather_and_save_kv_cache() in cp_utils.py, but uses
     a single all-gather for both K and V.
 
-    swa_loc is the pre-translated full->SWA write target for hybrid SWA pools
-    (None for non-SWA pools); set_kv_buffer never translates internally.
+    window_locs holds the pre-translated window write targets, by sub-pool, for
+    hybrid SWA pools (None for non-SWA pools); set_kv_buffer never translates
+    internally.
     """
     cache_loc = (
         forward_batch.out_cache_loc
@@ -295,7 +296,7 @@ def _cp_allgather_and_save_kv_npu(
     if cp_strategy is None or cp_strategy.cp_size <= 1:
         token_to_kv_pool.set_kv_buffer(
             layer,
-            KVWriteLoc(cache_loc, swa_loc),
+            KVWriteLoc(cache_loc, window_locs=window_locs),
             k,
             v,
         )
@@ -306,7 +307,7 @@ def _cp_allgather_and_save_kv_npu(
         layer,
         k,
         v,
-        swa_loc=swa_loc,
+        window_locs=window_locs,
     )
 
 
@@ -1704,7 +1705,9 @@ class AscendAttnBackend(AttentionBackend):
                         v,
                         self.attn_cp_size,
                         self.token_to_kv_pool,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     )
                 else:
                     # support cross attention
@@ -1713,13 +1716,15 @@ class AscendAttnBackend(AttentionBackend):
                         if not layer.is_cross_attention
                         else forward_batch.encoder_out_cache_loc
                     )
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
+                    window_locs = (
+                        window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        )
                         if not layer.is_cross_attention
                         else None
                     )
                     self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                        layer, KVWriteLoc(cache_loc, window_locs=window_locs), k, v
                     )
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -2402,7 +2407,9 @@ class AscendAttnBackend(AttentionBackend):
                 layer,
                 KVWriteLoc(
                     forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    ),
                 ),
                 k,
                 v,
@@ -2473,7 +2480,9 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -2833,7 +2842,9 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -3152,13 +3163,15 @@ class AscendAttnBackend(AttentionBackend):
                 # swa_out_cache_loc is the full->SWA write target, derived from
                 # out_cache_loc; it must not be applied to cross-attention writes
                 # (which target encoder_out_cache_loc) and is None for non-SWA pools.
-                swa_loc = (
-                    self.forward_metadata.swa_out_cache_loc
+                window_locs = (
+                    window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    )
                     if not layer.is_cross_attention
                     else None
                 )
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                    layer, KVWriteLoc(cache_loc, window_locs=window_locs), k, v
                 )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)

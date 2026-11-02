@@ -26,7 +26,11 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    ReqToTokenPool,
+    window_write_locs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel, reset_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -423,7 +427,9 @@ def _static_rig(window, *, deterministic=False):
 def _draft_write_loc(batch, runner_ids):
     """The write loc a backend bundles for a fused draft's layers."""
     window = runner_ids.write_ids(batch, runner_ids.window_kv_kind)
-    return KVWriteLoc.for_batch(batch, swa_loc=window)
+    return KVWriteLoc.for_batch(
+        batch, window_locs=window_write_locs(runner_ids, window)
+    )
 
 
 def _fused_draft():
