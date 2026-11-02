@@ -801,9 +801,9 @@ const cfg = {
         "--port {{PORT}}",
       ],
     },
-    // AgentX at 48 and 64 sessions on MI355X (InferenceX#4694): GSM8K 96.59 at 64. Registered
-    // pageable host pools fault at the first HiCache write, so HSA_USERPTR_FOR_PAGED_MEM=0
-    // allocates them with hipHostMalloc (#42553); 180 GB per rank fits two servers per host.
+    // AgentX at 48 and 64 sessions on MI355X: GSM8K 96.59 at 64. Registered pageable host
+    // pools fault at the first HiCache write, so HSA_USERPTR_FOR_PAGED_MEM=0 allocates them
+    // with hipHostMalloc (#42553); 180 GB per rank fits two servers per host.
     {
       match: { hw: "mi355x", variant: "flash", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
