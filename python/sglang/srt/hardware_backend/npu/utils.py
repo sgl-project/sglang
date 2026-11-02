@@ -8,11 +8,12 @@ import torch
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
@@ -105,6 +106,24 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             page_size=128,
         )
+
+    if model_config_of(cfg).hf_config.architectures[0] in (
+        "JetNemotronForCausalLM",
+        "JetVLMForConditionalGeneration",
+    ):
+        # Keep graph capture off until Jet's padded-batch state updates and
+        # checkpoint writes have a validated graph-replay path.
+        graph_config = with_phase(
+            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+        )
+        declare_resolution(
+            args,
+            "jet_nemotron_npu_graphs",
+            cuda_graph_config=with_phase(
+                graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        logger.warning("Jet on NPU uses eager execution.")
 
     # NPU memory settings
     npu_mem = get_npu_memory_capacity()
