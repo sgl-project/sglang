@@ -1864,9 +1864,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # --tool-call-constraint none: an auto request is sampled without any
         # parser-derived grammar and parsed afterwards; required and named
         # tool choices still constrain.
-        auto_unconstrained = getattr(self, "tool_call_constraint", "auto") == "none" and (
-            request.tool_choice is None or request.tool_choice == "auto"
-        )
+        auto_unconstrained = getattr(
+            self, "tool_call_constraint", "auto"
+        ) == "none" and (request.tool_choice is None or request.tool_choice == "auto")
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
