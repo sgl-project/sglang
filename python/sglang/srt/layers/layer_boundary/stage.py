@@ -33,6 +33,7 @@ from sglang.srt.layers.layer_boundary.contracts import (
 )
 from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.ops import sum_output
+from sglang.srt.layers.layer_boundary.prepare import reads_quantized
 from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -88,6 +89,11 @@ class StageBoundary:
         if steps is None:
             steps = self.plan.path_for(forward_batch)
         return steps.entry
+
+    def reads_quantized(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch's read may take a non-empty ``quant_format``: it
+        is the entry's last step, on the rows the stage computes."""
+        return reads_quantized(self.entry(forward_batch))
 
     def _prepare(
         self,
@@ -170,9 +176,12 @@ class StageBoundary:
                 forward's residual stream. Do not unwrap or modify a partial sum.
             forward_batch: Batch owning the stream and selecting the prepared path.
             cache: FFN-only NPU weight cache prefetched on the FFN input path.
-            **call: Attention-only read/adapter options: quant_format,
-                post_residual_addition, capture_gathered and capture. FFN
-                stages do not accept these options. capture is a callback on
+            **call: Read/adapter options: quant_format (attention, or an FFN
+                declared with a quantizing read; non-empty only where
+                reads_quantized holds for the batch, and only a request: a
+                fusion that completes the sum with the read returns the bf16
+                input, so the consumer must take either), and the attention-only
+                post_residual_addition, capture_gathered and capture. capture is a callback on
                 the producer's rows; capture_gathered is a collector on the
                 attention's compute-input rows. A capture callback is
                 called as capture(value, owned=bool): owned=True means
