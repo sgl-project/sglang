@@ -251,10 +251,11 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
+        _sampling_lm_head=quant_head,
         device="cpu",
         _selector_sampling_enabled=True,
         _target_worker=SimpleNamespace(
-            model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
+            model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=None))
         ),
     )
 
@@ -264,7 +265,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is quant_head
 
     # A packed head without an applicable quant method must stay eager.
-    worker._target_worker.model_runner.model.lm_head = SimpleNamespace(
+    worker._sampling_lm_head = SimpleNamespace(
         weight=torch.empty(8, 2, dtype=torch.int8)
     )
     worker.draft_model.lm_head = None

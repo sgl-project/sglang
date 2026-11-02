@@ -37,7 +37,10 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -833,10 +836,13 @@ class DFlashDecoderLayer(nn.Module):
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
+    Bolt E4B example: nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16-DFlash-NVFP4.
+
     The checkpoint provides:
       - transformer weights for `layers.*`
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
+      - optional `lm_head.*` when `has_own_lm_head` is enabled
     """
 
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
@@ -875,7 +881,23 @@ class DFlashDraftModel(nn.Module):
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
-        self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
+        self.quantizable = (
+            self.supports_quantization
+            or self.is_nemotron_35_draft
+            or (draft_config.has_own_lm_head and quant_config is not None)
+        )
+        self.own_lm_head = None
+        if draft_config.has_own_lm_head:
+            if draft_config.selector_rank or draft_config.is_domino:
+                raise ValueError(
+                    "An independent DFLASH head cannot be combined with selector or Domino drafts."
+                )
+            self.own_lm_head = ParallelLMHead(
+                config.vocab_size,
+                hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.lm_head" if prefix else "lm_head",
+            )
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -1085,6 +1107,10 @@ class DFlashDraftModel(nn.Module):
         }
 
         def resolve_param_name(name: str) -> Optional[str]:
+            unprefixed_name = name.removeprefix("model.")
+            if unprefixed_name.startswith("lm_head."):
+                if self.own_lm_head is not None:
+                    name = unprefixed_name.replace("lm_head.", "own_lm_head.", 1)
             if name in params_dict:
                 return name
             if name.startswith("model."):
@@ -1128,7 +1154,7 @@ class DFlashDraftModel(nn.Module):
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight"):
-                    if self.is_nemotron_35_draft:
+                    if self.is_nemotron_35_draft or self.own_lm_head is not None:
                         expected_shape = (
                             int(self.config.hidden_size),
                             int(self.num_context_features * self.config.hidden_size),
@@ -1165,6 +1191,16 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
+
+        if self.own_lm_head is not None:
+            required_head = {
+                name for name in params_dict if name.startswith("own_lm_head.")
+            }
+            missing = required_head - loaded_params
+            if missing:
+                raise ValueError(
+                    f"DFLASH checkpoint is missing head weights: {sorted(missing)}"
+                )
 
         if self.projector_type == "domino":
             required = {
