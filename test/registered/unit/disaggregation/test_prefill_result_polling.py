@@ -1256,6 +1256,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
         self.scheduler_stage_metrics = None
         self.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        self.invariant_checker = Mock()
         self.forward_ct = 0
         self._sched_idled = False
         self.processed_tokens_counter = 0
