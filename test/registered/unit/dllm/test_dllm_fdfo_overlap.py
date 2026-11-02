@@ -94,12 +94,17 @@ class TestDllmResultSnapshot(CustomTestCase):
         config = SimpleNamespace(
             first_done_first_out_mode=True, requires_separate_context_encoding=False
         )
-        batch = ScheduleBatch(reqs=[object()], dllm_config=config)
+        req = SimpleNamespace(inflight_steps=0)
+        batch = ScheduleBatch(reqs=[req], dllm_config=config)
+        batch.add_inflight_step()
         snapshot = batch.copy()
+        self.assertIs(snapshot.launched_reqs, batch.launched_reqs)
         self.assertTrue(snapshot.is_dllm())
         self.assertIs(snapshot.dllm_config, config)
         batch.reqs.clear()
         self.assertEqual(snapshot.batch_size(), 1)
+        snapshot.drop_inflight_step()
+        self.assertEqual(req.inflight_steps, 0)
 
 
 class TestFdfoLowConfidenceOverlap(CustomTestCase):

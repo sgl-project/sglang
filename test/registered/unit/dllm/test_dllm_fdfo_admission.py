@@ -41,7 +41,7 @@ class TestDllmFdfoAdmission(CustomTestCase):
                     _get_dllm_remain_tokens=lambda req: 32,
                     can_run_list=[],
                     _update_prefill_budget=lambda *args, **kwargs: None,
-                    _mamba_gap_budget_for_req=lambda req: 0,
+                    _state_slot_reserve_for_req=lambda req: 0,
                 )
                 result = PrefillAdder.add_dllm_staging_req(adder, req)
                 self.assertEqual(result, AddReqResult.CONTINUE)
@@ -80,7 +80,7 @@ class TestDllmFdfoAdmission(CustomTestCase):
             _update_prefill_budget=lambda *args, **kwargs: budget.__setitem__(
                 0, budget[0] - args[1]
             ),
-            _mamba_gap_budget_for_req=lambda req: 0,
+            _state_slot_reserve_for_req=lambda req: 0,
         )
         for _ in range(2):
             result = PrefillAdder.add_dllm_staging_req(adder, req)

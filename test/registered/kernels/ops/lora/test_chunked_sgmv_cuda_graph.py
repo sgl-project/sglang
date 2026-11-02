@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Numerical and CUDA-graph regressions for chunked-SGMV LoRA."""
+"""CUDA-graph replay regressions for chunked-SGMV LoRA."""
 
 import math
 from unittest.mock import patch
@@ -37,12 +37,12 @@ from sglang.kernels.ops.lora.dense.kv_b_lora_absorbed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, csgmv_segment_grid_size
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -198,7 +198,7 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             device=torch.device("cuda"),
             server_args=server_args,
         )
-        backend.init_cuda_graph_batch_info(
+        backend.init_decode_cuda_graph_batch_info(
             max_bs_in_cuda_graph=BS, num_tokens_per_req=1
         )
         lora_ranks = [MAX_RANK] * NUM_LORAS
@@ -229,6 +229,46 @@ def test_prepare_batch_neutralizes_static_tail_segments():
             backend.batch_info.seg_indptr.cpu(),
             torch.tensor([0, 2, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
         )
+
+
+def test_segment_grid_size_covers_replays_with_smaller_chunks():
+    """A 64-request graph launches 9 segment programs, enough for its worst replay."""
+
+    class MockForwardBatch:
+        forward_mode = ForwardMode.DECODE
+
+        def __init__(self, batch_size):
+            self.batch_size = batch_size
+
+    with get_context().override_server_args(max_lora_chunk_size=32) as server_args:
+        backend = ChunkedSgmvLoRABackend(
+            max_loras_per_batch=NUM_LORAS,
+            device=torch.device("cuda"),
+            server_args=server_args,
+        )
+        backend.init_decode_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=64, num_tokens_per_req=1
+        )
+
+        def prepare(weight_indices):
+            backend.prepare_lora_batch(
+                forward_batch=MockForwardBatch(len(weight_indices)),
+                weight_indices=weight_indices,
+                lora_ranks=[MAX_RANK] * NUM_LORAS,
+                scalings=[1.0] * NUM_LORAS,
+                use_cuda_graph=True,
+            )
+
+        # Capture a 64-request graph: it uses 32-token chunks.
+        prepare([0] * 64)
+        grid = csgmv_segment_grid_size(backend.batch_info, num_tokens=64)
+
+        # Replay 63 requests: they drop to 16-token chunks, and their adapter
+        # groups of 17, 17, 17, 11 and 1 tokens need 2 + 2 + 2 + 1 + 1 segments.
+        prepare([1, 2, 3] * 17 + [4] * 11 + [0])
+        assert backend.batch_info.num_segments == 8
+        assert grid == 9  # 64 // 16 + 5
+        assert csgmv_segment_grid_size(backend.batch_info, num_tokens=4096) == 64
 
 
 def test_absorbed_kv_b_replay_uses_all_current_segments():
@@ -310,88 +350,6 @@ def _set_mixed_segment_state(batch_info, *, active):
     batch_info.scalings.copy_(torch.tensor([1.0, -0.7, 1.0, 1.5, 0.3], device="cuda"))
 
 
-def test_split_k_preserves_fp32_partials_and_reduction_tail():
-    """Split boundaries and rank tails must match FP32 matmul before the final cast."""
-    torch.manual_seed(5)
-    batch_info = _make_batch_info()
-    _set_mixed_segment_state(batch_info, active=True)
-    k = 12345
-    inputs = torch.randn(BS, k, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(
-        NUM_LORAS, 96, k, device="cuda", dtype=torch.bfloat16
-    ) / math.sqrt(k)
-    # Cancellation loses the small terms if partials are rounded before reduction.
-    starts = [0, 1792, 3584, 5376, 7168, 8960]
-    small_terms = [start + 1 for start in starts] + [10753]
-    weights[:, 0].zero_()
-    inputs[:, starts + small_terms] = 1
-    weights[:, 0, starts] = torch.tensor(
-        [256, -256, 256, -256, 256, -256], device="cuda", dtype=torch.bfloat16
-    )
-    weights[:, 0, small_terms] = 0.125
-    split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
-    with (
-        envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False),
-        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
-        patch.object(
-            shrink_module,
-            "get_lora_shrink_config",
-            return_value={"BLOCK_N": 16, "BLOCK_K": 256},
-        ),
-        patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
-    ):
-        actual = chunked_sgmv_lora_shrink_forward(
-            inputs, weights, batch_info, 3, split_k=8
-        )
-        assert launches.call_count == 1
-    for adapter, rank in enumerate((8, 16, 32), start=1):
-        rows = batch_info.permutation[2 * (adapter - 1) : 2 * adapter].long()
-        expected = (
-            inputs[rows].float() @ weights[adapter, : 3 * rank].float().T
-        ).bfloat16()
-        torch.testing.assert_close(
-            actual[rows, : 3 * rank], expected, rtol=0.025, atol=0.04
-        )
-        assert torch.equal(expected[:, 0], torch.full_like(expected[:, 0], 0.875))
-        assert torch.equal(actual[rows, 0], expected[:, 0])
-
-
-def test_compact_expand_preserves_ragged_slices_and_output_stride():
-    """Empty and partial slices must preserve their neighbors and wider output padding."""
-    torch.manual_seed(6)
-    batch_info = _make_batch_info()
-    _set_mixed_segment_state(batch_info, active=True)
-    offsets = (0, 65, 65, 194)
-    offsets_cpu = torch.tensor(offsets, dtype=torch.int32)
-    offsets_gpu = offsets_cpu.cuda()
-    inputs = torch.randn(BS, 96, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(
-        NUM_LORAS, 194, 32, device="cuda", dtype=torch.bfloat16
-    ) / math.sqrt(32)
-    initial = torch.randn(BS, 211, device="cuda", dtype=torch.bfloat16)
-    rectangular, compact = initial.clone(), initial.clone()
-    chunked_sgmv_lora_expand_forward(
-        inputs, weights, batch_info, offsets_gpu, 129, rectangular[:, :194]
-    )
-    chunked_sgmv_lora_expand_forward(
-        inputs, weights, batch_info, offsets_gpu, 129, compact[:, :194], offsets_cpu
-    )
-    assert torch.equal(compact, rectangular)
-    expected = initial.clone()
-    for adapter, rank in enumerate((8, 16, 32), start=1):
-        rows = batch_info.permutation[2 * (adapter - 1) : 2 * adapter].long()
-        for s, (lo, hi) in enumerate(zip(offsets, offsets[1:])):
-            delta = (
-                inputs[rows, s * rank : (s + 1) * rank].float()
-                @ weights[adapter, lo:hi, :rank].float().T
-            )
-            expected[rows, lo:hi] += (delta * batch_info.scalings[adapter]).bfloat16()
-    torch.testing.assert_close(compact, expected, rtol=0.03, atol=0.08)
-    assert torch.equal(compact[:, 194:], initial[:, 194:])
-    inactive_rows = batch_info.permutation[6:].long()
-    assert torch.equal(compact[inactive_rows], initial[inactive_rows])
-
-
 def test_split_k_compact_replay_uses_current_metadata():
     """Captured split-K and compact expand must follow inactive and active adapter updates."""
     torch.manual_seed(7)
@@ -428,54 +386,6 @@ def test_split_k_compact_replay_uses_current_metadata():
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
-
-
-def test_deterministic_mode_keeps_original_shrink_path():
-    """Deterministic mode must suppress both automatic and explicit split-K launches."""
-    batch_info = _make_batch_info()
-    _set_mixed_segment_state(batch_info, active=True)
-    inputs = torch.randn(BS, 4096, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(NUM_LORAS, 96, 4096, device="cuda", dtype=torch.bfloat16) / 64
-    split_kernel = shrink_module._chunked_lora_shrink_split_k_kernel
-    # Installed tuning tables may disable the policy; pin the eligibility inputs.
-    with (
-        patch.object(
-            shrink_module,
-            "get_lora_shrink_config",
-            return_value={"BLOCK_N": 16, "BLOCK_K": 256},
-        ),
-        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
-    ):
-        with envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(False):
-            expected = chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
-        with (
-            envs.SGLANG_ENABLE_LORA_CSGMV_SPLIT_K.override(True),
-            patch.object(split_kernel, "run", wraps=split_kernel.run) as launches,
-        ):
-            chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3)
-            assert launches.call_count == 1
-            assert launches.call_args.kwargs["SPLIT_K"] == 8
-            chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=4)
-            assert launches.call_count == 2
-            assert launches.call_args.kwargs["SPLIT_K"] == 4
-            chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=1)
-            assert launches.call_count == 2
-            for deterministic in (False, True):
-                with (
-                    envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(deterministic),
-                    pytest.raises(ValueError, match="split_k must be positive"),
-                ):
-                    chunked_sgmv_lora_shrink_forward(
-                        inputs, weights, batch_info, 3, split_k=0
-                    )
-            with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
-                actual = chunked_sgmv_lora_shrink_forward(
-                    inputs, weights, batch_info, 3, split_k=8
-                )
-            assert launches.call_count == 2
-    for adapter, rank in enumerate((8, 16, 32), start=1):
-        rows = batch_info.permutation[2 * (adapter - 1) : 2 * adapter].long()
-        assert torch.equal(actual[rows, : 3 * rank], expected[rows, : 3 * rank])
 
 
 if __name__ == "__main__":

@@ -750,10 +750,11 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     key_filter=model.should_materialize_checkpoint_weight,
                 )
             else:
+                # copy into the allocated parameters without a second GPU weight tensor
                 checkpoint_weights = self._get_all_weights(
                     model,
                     model_path,
-                    to_cpu=component_starts_on_cpu,
+                    to_cpu=True,
                 )
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)

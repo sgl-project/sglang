@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict
 from urllib.parse import urlparse
@@ -29,8 +30,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=160, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=790, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -74,11 +75,20 @@ class HiCacheStorageBaseMixin:
         return DEFAULT_MODEL_NAME_FOR_TEST
 
     @classmethod
+    def _get_storage_backend(cls):
+        return "file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {}
+
+    @classmethod
     def _get_base_server_args(cls):
         """Get base server arguments - can be extended in subclasses"""
         extra_config = {
             "hicache_storage_pass_prefix_keys": True,
         }
+        extra_config.update(cls._get_storage_backend_extra_config())
         return {
             "--enable-hierarchical-cache": True,
             "--mem-fraction-static": 0.6,
@@ -86,7 +96,7 @@ class HiCacheStorageBaseMixin:
             "--page-size": 64,
             "--enable-cache-report": True,
             "--hicache-storage-prefetch-policy": "wait_complete",
-            "--hicache-storage-backend": "file",
+            "--hicache-storage-backend": cls._get_storage_backend(),
             "--hicache-storage-backend-extra-config": json.dumps(extra_config),
         }
 
@@ -236,6 +246,114 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
             "--tp-size": 2,
         }
         return server_args, {}
+
+
+class TestHiCacheStorageFastFilePageFirstDirectIO(
+    HiCacheStorageBaseMixin, CustomTestCase
+):
+    """Page first direct tests for the fast_file storage backend (direct I/O path)."""
+
+    @classmethod
+    def _get_storage_backend(cls):
+        return "fast_file"
+
+    @classmethod
+    def _get_storage_backend_extra_config(cls):
+        return {"file_storage_path": cls.temp_dir, "read_workers": 2}
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {
+            "--hicache-mem-layout": "page_first_direct",
+            "--hicache-io-backend": "direct",
+            "--tp-size": 2,
+        }
+        return server_args, {}
+
+    def test_generation_is_identical_after_storage_reload(self):
+        """Pages read back through vectored I/O must be byte-identical to the
+        pages written, so deterministic generation cannot change after an L3
+        reload."""
+        prompt = self.gen_prompt(768)
+        initial = self.send_request(prompt, max_tokens=128)
+
+        self.trigger_offloading_and_flush()
+
+        cached = self.send_request(prompt, max_tokens=128)
+        self.assertEqual(initial["text"], cached["text"])
+        self.assertGreater(
+            self.get_cached_tokens(cached),
+            700,
+            "Expected the deterministic comparison to reload from L3 storage",
+        )
+
+
+class TestHiCacheStorageRandomDelay(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random storage delays must change only latency, never hit semantics;
+    the rank consensus checker (enabled by the mixin) fails the server if the
+    skewed storage IO timing causes cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY": "0.1",
+        }
+        return server_args, env_vars
+
+    def test_delayed_storage_hits_concurrent_requests(self):
+        base_prompt = self.gen_prompt(768)
+        self.send_request(base_prompt, max_tokens=8)
+        self.trigger_offloading_and_flush()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: self.send_request(base_prompt, max_tokens=8), range(4)
+                )
+            )
+
+        for response in responses:
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+            self.assertGreater(
+                self.get_cached_tokens(response),
+                700,
+                "Delayed storage IO must not turn a stored prefix into a miss",
+            )
+
+
+class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random backend failures must degrade to plain cache misses: every
+    request still completes, and the server stays healthy; the rank
+    consensus checker (enabled by the mixin) fails the server if per-rank
+    failure draws cause cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE": "0.05",
+        }
+        return server_args, env_vars
+
+    # The inherited test requires a storage hit, but an injected failure turns
+    # the prefetch into a miss; test_random_failures_degrade_to_cache_misses
+    # covers this configuration instead.
+    test_basic_backup_and_prefetch = None
+
+    def test_random_failures_degrade_to_cache_misses(self):
+        base_prompt = self.gen_prompt(768)
+        for _ in range(10):
+            self.send_request(base_prompt, max_tokens=8)
+            self.trigger_offloading_and_flush()
+
+            response = self.send_request(base_prompt, max_tokens=8)
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):

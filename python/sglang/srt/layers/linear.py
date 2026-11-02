@@ -265,6 +265,9 @@ class LinearBase(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
         self.quant_config = quant_config
+        # A model sets this before weights load to ask for the DeepGEMM-packed
+        # MXFP8 input path; Fp8LinearMethod keeps it True only once prepared.
+        self.deepgemm_mxfp8_input = False
         if quant_config is None:
             from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
@@ -1776,7 +1779,10 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+                get_parallel().tp_group,
+                # Replicated modules have no TP group and produce complete
+                # local outputs; they do not need a collective memory window.
+                disabled=self.tp_group is None or not is_allocation_symmetric(),
             )
         with symm_ctx:
             if output_tensor is None:

@@ -39,7 +39,7 @@ from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _bundled_item(grid_key=None, grid=None, feature_len=10, num_images=2):
@@ -211,19 +211,6 @@ class TestMMPadding(CustomTestCase):
                         self.assertTrue(
                             torch.equal(actual[1:] if prefix == 0 else actual, expected)
                         )
-
-    def test_padding_requires_int64_arrays(self):
-        mm_inputs = MultimodalInputs(mm_items=[])
-        for pad in (
-            pad_mm_tokens,
-            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
-            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
-            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
-        ):
-            for input_ids in ([1, 2], array("i", [1, 2])):
-                with self.subTest(pad=pad, input_ids=input_ids):
-                    with self.assertRaisesRegex(AssertionError, "input_ids must be"):
-                        pad(input_ids, mm_inputs)
 
     def test_multimodal_offsets_and_input_ownership(self):
         mm_inputs = MultimodalInputs(

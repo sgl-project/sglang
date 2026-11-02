@@ -18,19 +18,18 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.interim import _FloatChainPolicy
+from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
@@ -43,7 +42,7 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         if pool_tokens is not None
         else dict(total_bytes=total_bytes)
     )
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -327,12 +326,24 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(budget.remaining_swa, 64)
 
     def test_tri_pool_keeps_fixed_admission_and_clipping(self):
-        allocator = self._allocator(UnifiedMambaSWATokenToKVPoolAllocator)
+        allocator = self._allocator(ChainAllocator)
+        # A full + window + state chain's capacity policy, sized like the rest.
+        allocator._policy = object.__new__(_FloatChainPolicy)
+        allocator._policy._size_full = 128
+        allocator._policy._size_swa = 64
         allocator.can_reserve = MagicMock(
             side_effect=AssertionError("two-pool reservation")
         )
-        budget = allocator.create_prefill_budget(_cache())
-        self.assertIs(type(budget), SWAPrefillBudget)
+        allocator.full_attn_allocator = SimpleNamespace(entry_bytes=64)
+        allocator.swa_attn_allocator = SimpleNamespace(entry_bytes=64)
+        allocator.mamba_allocator = SimpleNamespace(
+            entry_bytes_per_page=256, schedulable_available_size=lambda: 8
+        )
+        cache = _cache()
+        cache.supports_mamba = lambda: False
+        budget = allocator.create_prefill_budget(cache)
+        self.assertIs(type(budget), ChainPrefillBudget)
+        self.assertEqual(budget.rules.window, "split")
         self.assertTrue(budget.has_capacity())
         self.assertEqual(
             allocator.max_new_tokens_for_memory(
@@ -359,7 +370,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         setup_allocator_context()
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
-        states = bundle.req_to_token_pool.mamba_allocator.alloc(8)
+        states = allocator.state_slots.alloc(8)
         slots = allocator.alloc(96)
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)

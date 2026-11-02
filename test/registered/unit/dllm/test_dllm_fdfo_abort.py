@@ -52,6 +52,9 @@ class TestFdfoAbort(CustomTestCase):
             req.kv = ReqKvInfo(req_pool_idx=1, kv_allocated_len=4, kv_committed_len=4)
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_continuous_input_polling = False
+        scheduler.deferred_responses = SimpleNamespace(abort=Mock())
+        scheduler.uocr_runtime = None
+        scheduler.rust_server = None
         scheduler.chunked_req = None
         scheduler.mm_receiver = None
         scheduler.waiting_queue = []
@@ -85,7 +88,9 @@ class TestFdfoAbort(CustomTestCase):
         scheduler.metrics_reporter = SimpleNamespace(
             num_generated_tokens=0, report_prefill_stats=Mock()
         )
-        scheduler.output_streamer = SimpleNamespace(stream_output=Mock())
+        scheduler.output_streamer = SimpleNamespace(
+            stream_output=Mock(), release_detokenize_state=Mock()
+        )
         return scheduler, req
 
     def test_abort_invalidates_future_before_slot_release(self):

@@ -17,7 +17,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -433,6 +432,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
+        model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(model_runner=model_runner)
     else:
@@ -510,6 +510,15 @@ def capture_prefill_graph(
     # init_lm_head so graphs capture the final embedding weights.
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
+
+    if model_runner.is_draft_worker and get_parallel().enable_prefill_cp:
+        from sglang.srt.layers.cp.base import is_interleave
+
+        if is_interleave():
+            # EagleWorkerV2 requests capture again with force_for_draft_worker=True
+            # after init_lm_head, bypassing the guard above. The interleave adapter
+            # supports only target prefill; draft CP must stay eager on that call too.
+            return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
@@ -763,7 +772,6 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             model_runner._decode_cuda_graph_runner_cls,
             {
                 "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )

@@ -21,9 +21,9 @@ GPU and computed there by the model's own fused-MoE kernel. This differs from `-
 and CPU expert offload, which move the computation to the CPU.
 
 **Results are unchanged.** Routing is untouched (E-wide), and the paged layer produces the same
-output as the unpaged one: bit-identical for unquantized and block-FP8 experts (with
+output as the unpaged one: bit-identical for unquantized, FP8 and INT8 experts (with
 `--enable-deterministic-inference`), and within the Marlin kernel's own run-to-run noise for
-GPTQ. See [Correctness](#correctness).
+the other quantized formats. See [Correctness](#correctness).
 
 ## Usage
 
@@ -47,9 +47,22 @@ breaks.
 
 ## Supported Configurations and Limitations
 
-- **Quantization:** unquantized (bf16/fp16), block-quantized FP8 (e.g. `weight_block_size`
-  `[128, 128]`) on the triton MoE runner, and GPTQ int4/int8 on the Marlin runner. Other
-  quantization methods are rejected at startup.
+- **Quantization:**
+
+  | Experts | MoE runner | Notes |
+  |---|---|---|
+  | unquantized (bf16/fp16) | triton | |
+  | block-quantized FP8 (e.g. `weight_block_size` `[128, 128]`) | triton | |
+  | compressed-tensors FP8, per-channel or block, dynamic activations (e.g. `FP8-dynamic` checkpoints) | triton | per-tensor FP8 is not supported |
+  | W8A8 FP8 (`--quantization w8a8_fp8`), W8A8 INT8 (`--quantization w8a8_int8`) | triton | |
+  | block-quantized INT8 | triton | |
+  | GPTQ int4/int8, AWQ int4 | Marlin | |
+  | compressed-tensors W4A16/W8A16 | Marlin | |
+  | compressed-tensors NVFP4 | Marlin | weight-only: nvfp4a16, or w4a4 before Blackwell |
+  | MXFP4 (e.g. gpt-oss) | Marlin | pass `--moe-runner-backend marlin` |
+  | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
+
+  Other quantization methods and MoE runners are rejected at startup.
 - **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
   (use `--disable-shared-experts-fusion`), `--enable-fused-moe-sum-all-reduce` and
   `--load-format dummy` are rejected at startup.
@@ -60,7 +73,7 @@ breaks.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
   the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
   half of system RAM.
-- **Startup:** for GPTQ, the Marlin repack runs over the host store K experts at a time at load.
+- **Startup:** on the Marlin runner, the repack runs over the host store K experts at a time at load.
 
 ## How It Works
 
@@ -73,9 +86,9 @@ view of the host store, so checkpoint weights are written by SGLang's native per
 (sharding, gate/up placement, scale layout) and the host rows have exactly the layout the GPU
 slots would have.
 
-After loading, the wrapped method's post-load step runs as it would without paging. For methods
-that repack their experts (GPTQ's Marlin repack), it runs over the host store K experts at a
-time, so the host store holds every expert in the repacked layout.
+After loading, the wrapped method's post-load step runs as it would without paging. On the
+Marlin runner, whose methods repack their experts into Marlin's layout, it runs over the host
+store K experts at a time, so the host store holds every expert in the repacked layout.
 
 ### A step: waves, page-in, merge
 
@@ -132,7 +145,11 @@ lower K or use `--kv-cache-dtype fp8`.
 Prompt and greedy decode logprobs are compared with the unpaged server under
 `--enable-deterministic-inference --attention-backend triton`, eager and with decode captured:
 
-- **unquantized and block-FP8 experts (triton runner):** bit-identical;
-- **GPTQ (Marlin runner):** Marlin's reduction depends on the batch shape, so a paged step (which
-  runs the kernel on a different number of experts) differs from the unpaged one within Marlin's
-  own batch-to-batch noise.
+- **triton runner (unquantized, FP8, INT8):** bit-identical;
+- **Marlin runner (GPTQ, AWQ, compressed-tensors, MXFP4, NVFP4):** Marlin's reduction depends on
+  the batch shape, so a paged step (which runs the kernel on a different number of experts)
+  differs from the unpaged one within Marlin's own batch-to-batch noise. On SM90 and newer the
+  Marlin MoE kernel also reduces with atomic adds and is not reproducible from run to run (two
+  identical unpaged NVFP4 servers differ by up to about 1 nat). Accuracy is unchanged: on GSM8K
+  (200 questions), gpt-oss-20b MXFP4 scores 0.96–0.97 paged (16 of 32 experts resident) and
+  0.975 unpaged.

@@ -6,7 +6,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -19,27 +19,33 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=355, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     """One server covering both worker pools: multi-tokenizer and
-    multi-detokenizer (the flags are orthogonal)."""
+    multi-detokenizer (the flags are orthogonal), with DP attention, so the
+    worker pools also see idle DP ranks."""
 
-    mmlu_score_threshold = 0.64
+    mmlu_score_threshold = 0.72
     mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--trust-remote-code",
+                "--tp",
+                2,
+                "--attn-dp-size",
+                2,
                 "--tokenizer-worker-num",
                 8,
                 "--detokenizer-worker-num",
@@ -80,7 +86,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             # relax for mi300x
             self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
-            self.assertLess(res["median_itl_ms"], 10)
+            self.assertLess(res["median_itl_ms"], 11)
 
     def test_batch_input_ids_routing(self):
         # Regression guard for sgl-project/sglang#29878 (introduced by #29214).

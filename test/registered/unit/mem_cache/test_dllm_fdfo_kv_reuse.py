@@ -27,10 +27,13 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
+    state = None  # no recurrent state
+    storage = None  # static pools
+
     def __init__(self, base=1000, page_size=1):
         self.base = base
         self.page_size = page_size
@@ -74,9 +77,10 @@ class _FakeAllocator:
 
 
 class _FakeTreeCache:
-    def __init__(self, allocator):
+    def __init__(self, allocator, req_to_token_pool=None):
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
+        self.req_to_token_pool = req_to_token_pool
 
     def supports_prefix_sharing(self):
         return False
@@ -91,11 +95,10 @@ class _FakeTreeCache:
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
+        dllm_block_done=False,
         tree_prefix=torch.tensor(prefix, dtype=torch.int32),
         prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
-        dllm_block_done=False,
-        inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
@@ -225,6 +228,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         return scheduler, req, batch, result, allocator
 
     def _schedule_staging(self, scheduler, req, adder, *, previously_staged=True):
+        scheduler.invariant_checker = SimpleNamespace(maybe_check_running_reqs=Mock())
         scheduler.process_pending_chunked_abort = lambda: None
         scheduler._process_hicache_events = lambda: None
         scheduler.enable_fpm = False
@@ -271,7 +275,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
             _update_prefill_budget=lambda *args, **kwargs: budget.__setitem__(
                 0, budget[0] - args[1]
             ),
-            _mamba_gap_budget_for_req=lambda req: 0,
+            _state_slot_reserve_for_req=lambda req: 0,
         )
         adder.add_dllm_staging_req = lambda item: PrefillAdder.add_dllm_staging_req(
             adder, item
