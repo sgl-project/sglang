@@ -4291,6 +4291,10 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        # Pools owned beside full_kv_pool, which describes the full KV itself.
+        return ()
+
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
