@@ -18,12 +18,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestQLoraProjectionDispatch(unittest.TestCase):
-    def test_kernel_availability_selects_fused_or_fallback(self):
+    def test_arch_selects_fused_or_fallback(self):
         q_lora = object()
         q_norm = SimpleNamespace(weight=object(), variance_epsilon=1e-6)
         wq_b = Mock(return_value=("q", None))
 
-        with patch.object(deepseek_v4, "_fused_rms_fp8_group_quant", None):
+        with patch.object(deepseek_v4, "_is_gfx95_supported", False):
             self.assertIsNone(
                 deepseek_v4._fused_q_lora_projection(q_lora, q_norm, wq_b)
             )
@@ -36,6 +36,7 @@ class TestQLoraProjectionDispatch(unittest.TestCase):
             return "quant", "normalized", None, None
 
         with (
+            patch.object(deepseek_v4, "_is_gfx95_supported", True),
             patch.object(deepseek_v4, "_fused_rms_fp8_group_quant", fused),
             patch.object(deepseek_v4, "_use_aiter_bpreshuffle_gfx95", False),
         ):

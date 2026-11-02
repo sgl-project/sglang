@@ -12,6 +12,9 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.utils import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
@@ -24,7 +27,10 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_quant
         and quant_method.weight_block_size == [128, 128]
-        and mlp.down_proj.weight_scale_inv.dtype != torch.float8_e8m0fnu
+        and not (
+            _is_gfx1250_supported
+            and mlp.down_proj.weight_scale_inv.dtype == torch.float8_e8m0fnu
+        )
     )
     # gfx950 32-block native or aiter route: the activation lands on the fp8 grid, so down_proj
     # skips its fake-quant

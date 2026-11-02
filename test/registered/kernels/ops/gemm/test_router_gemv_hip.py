@@ -31,6 +31,7 @@ class TestAiterBf16Fp32Dispatch(unittest.TestCase):
         tgemm.mm.return_value = expected
 
         with (
+            mock.patch.object(bf16_fp32, "_is_gfx1250_supported", True),
             mock.patch.object(envs.SGLANG_USE_AITER, "get", return_value=True),
             mock.patch.object(bf16_fp32, "_get_aiter_tgemm", return_value=tgemm),
             mock.patch.object(bf16_fp32, "_linear_bf16_fp32_cublas") as fallback,
@@ -40,7 +41,6 @@ class TestAiterBf16Fp32Dispatch(unittest.TestCase):
         self.assertIs(output, expected)
         tgemm.mm.assert_called_once_with(x, weight, None, otype=torch.float32)
         fallback.assert_not_called()
-        self.assertFalse(hasattr(bf16_fp32, "is_gfx1250_supported"))
 
     def test_disabled_or_unavailable_aiter_falls_back(self):
         x = object()
@@ -48,6 +48,7 @@ class TestAiterBf16Fp32Dispatch(unittest.TestCase):
         for enabled in (False, True):
             with (
                 self.subTest(enabled=enabled),
+                mock.patch.object(bf16_fp32, "_is_gfx1250_supported", True),
                 mock.patch.object(envs.SGLANG_USE_AITER, "get", return_value=enabled),
                 mock.patch.object(
                     bf16_fp32, "_get_aiter_tgemm", return_value=None
@@ -62,6 +63,21 @@ class TestAiterBf16Fp32Dispatch(unittest.TestCase):
                 else:
                     get_tgemm.assert_not_called()
                 fallback.assert_called_once_with(x, weight)
+
+    def test_non_gfx1250_keeps_fallback(self):
+        x = object()
+        weight = object()
+        with (
+            mock.patch.object(bf16_fp32, "_is_gfx1250_supported", False),
+            mock.patch.object(envs.SGLANG_USE_AITER, "get", return_value=True),
+            mock.patch.object(bf16_fp32, "_get_aiter_tgemm") as get_tgemm,
+            mock.patch.object(
+                bf16_fp32, "_linear_bf16_fp32_cublas", return_value="ref"
+            ) as fallback,
+        ):
+            self.assertEqual(linear_bf16_fp32(x, weight), "ref")
+        get_tgemm.assert_not_called()
+        fallback.assert_called_once_with(x, weight)
 
 
 @unittest.skipUnless(is_hip(), "ROCm only")
