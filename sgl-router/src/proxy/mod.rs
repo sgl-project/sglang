@@ -139,6 +139,11 @@ fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
         // Under SGLang's default 5 s keep-alive, so idle connections close here first.
         .pool_idle_timeout(Duration::from_secs(3))
         .connect_timeout(Duration::from_secs(5));
+    // reqwest sets TCP_USER_TIMEOUT to 30 s by default, so a forwarded request is aborted
+    // with ETIMEDOUT when the engine reads none of its body for 30 s, e.g. while its HTTP
+    // process is busy with a burst of long prompts. request_timeout bounds requests instead.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(None);
     match protocol {
         WireProtocol::Http1 => builder,
         WireProtocol::H2c => builder.http2_prior_knowledge(),

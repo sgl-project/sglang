@@ -221,3 +221,97 @@ async fn streaming_request_times_out_waiting_for_headers() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 }
+
+/// A worker that accepts the connection but reads none of the request for `stall`, then
+/// reads the whole request and answers 200. Returns its URL.
+#[cfg(target_os = "linux")]
+async fn spawn_slow_reading_worker(stall: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(stall).await;
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 1 << 16];
+        let header_end = loop {
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(
+                n > 0,
+                "router closed the connection before sending the request"
+            );
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let content_length: usize = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .expect("request must carry content-length")
+            .trim()
+            .parse()
+            .unwrap();
+        while buf.len() < header_end + content_length {
+            let n = sock.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "router closed the connection mid-body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+    });
+    url
+}
+
+/// An engine whose HTTP process reads nothing for longer than 30 s (busy with a burst of
+/// long prompts) must still get the request once it reads: the forwarding client must not
+/// abort its unacknowledged send on TCP_USER_TIMEOUT, which reqwest sets to 30 s by default.
+/// Takes about 40 s; run with `cargo test --test proxy -- --ignored reads_nothing`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "takes about 40 s"]
+async fn request_survives_worker_that_reads_nothing_for_over_30s() {
+    let url = spawn_slow_reading_worker(Duration::from_secs(40)).await;
+    let mut cfg = config(&url);
+    cfg.model.disable_input_ids_forwarding = true;
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url,
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        ..Default::default()
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(120)).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let app = build_router(ctx);
+
+    // Far more than the socket buffers hold while the worker reads nothing, so the
+    // router's send stalls on a zero window.
+    let prompt = "a".repeat(16 << 20);
+    let req = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(90), app.oneshot(req))
+        .await
+        .expect("router must answer once the worker reads")
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "x-router-error-code: {:?}",
+        res.headers().get("x-router-error-code")
+    );
+}

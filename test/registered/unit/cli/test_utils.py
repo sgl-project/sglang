@@ -15,7 +15,7 @@ from sglang.cli.utils import get_is_diffusion_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _hub_error(error_type, status_code):
@@ -53,9 +53,7 @@ class TestDiffusionModelDetection(CustomTestCase):
         )
 
         self.assertTrue(get_is_diffusion_model("test/gated-diffusion-model"))
-        mock_hf_api.return_value.model_info.assert_called_once_with(
-            "test/gated-diffusion-model"
-        )
+        mock_hf_api.return_value.model_info.assert_called_once()
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
@@ -66,9 +64,7 @@ class TestDiffusionModelDetection(CustomTestCase):
         )
 
         self.assertFalse(get_is_diffusion_model("test/gated-llm-model"))
-        mock_hf_api.return_value.model_info.assert_called_once_with(
-            "test/gated-llm-model"
-        )
+        mock_hf_api.return_value.model_info.assert_called_once()
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")

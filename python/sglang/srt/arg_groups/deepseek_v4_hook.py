@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+    cols_per_rank,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     context_parallel_attn_dp_size,
@@ -17,13 +26,29 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _attention_is_tensor_parallel(cfg) -> bool:
+    # validate_deepseek_v4_cp sets attn_cp_size to the whole TP group after this runs.
+    if cfg.enable_prefill_cp:
+        return False
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    return attn_tp_size > 1
 
 
 def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
@@ -36,10 +61,85 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
-        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
+        # MegaAttention pads each rank to a 64-head tile under attention TP.
+        or (cfg.disaggregation_mode == "null" and _attention_is_tensor_parallel(cfg))
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
     return "flashmla_mega"
+
+
+_DEPRECATED_ENGRAM_ENVS = (
+    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE",
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT",
+    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS",
+)
+
+
+def _engram_config_from_env(cfg) -> EngramConfig:
+    if (
+        envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
+        and cfg.tp_size > 1
+        and get_platform().is_cuda
+    ):
+        return EngramConfig(lookup=EngramLookup.PEER_READ)
+    if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        shared = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
+        return EngramConfig(
+            placement=EngramPlacement.CPU,
+            replication=EngramReplication.PER_NODE
+            if shared
+            else EngramReplication.NONE,
+        )
+    return EngramConfig()
+
+
+def _resolve_engram_config(server_args: ServerArgs) -> None:
+    """Validate --engram-config and declare it. A `lookup` of `auto` stays as is:
+    the layers resolve it at model construction (`resolve_engram_config`), once the
+    parallel layout and the GPUs are known."""
+    cfg = resolving_view(server_args)
+    raw = cfg.engram_config
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if raw is not None:
+            raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
+        return
+    legacy = [n for n in _DEPRECATED_ENGRAM_ENVS if getattr(envs, n).is_set()]
+    if raw is None:
+        config = _engram_config_from_env(cfg)
+        if legacy:
+            logger.warning(
+                "%s deprecated; use --engram-config '%s' instead.",
+                ", ".join(legacy),
+                json.dumps(dataclasses.asdict(config)),
+            )
+    else:
+        if legacy:
+            logger.warning("--engram-config is set; ignoring %s.", ", ".join(legacy))
+        config = EngramConfig.from_dict(raw)
+    if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
+        raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
+        cfg.attn_dp_size <= 1 or not get_platform().is_cuda
+    ):
+        raise ValueError(
+            f"--engram-config: lookup {config.lookup!r} applies to DP attention on CUDA."
+        )
+    if config.lookup == EngramLookup.ALL_TO_ALL:
+        text_config = model_config_of(server_args).hf_text_config
+        columns = text_config.engram_n_heads * (text_config.engram_max_ngram_size - 1)
+        if cols_per_rank(columns, cfg.tp_size) is None:
+            raise ValueError(
+                f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
+                f"columns to divide over --tp-size {cfg.tp_size}."
+            )
+    # One mapping per TP group, which its ranks open through /proc.
+    if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
+        raise ValueError(
+            "--engram-config: replication 'per_node' needs the TP group on one node."
+        )
+    declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
+    logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -63,6 +163,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    _resolve_engram_config(server_args)
 
     if cfg.dsv4_attn_backend == "auto":
         declare_resolution(
@@ -208,7 +309,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
-    supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
+    supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
@@ -348,7 +449,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -356,8 +457,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."

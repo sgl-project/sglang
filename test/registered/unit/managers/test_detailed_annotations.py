@@ -15,14 +15,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
 from sglang.srt.utils.profile_utils import build_step_span_name
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _CpuMirror:
