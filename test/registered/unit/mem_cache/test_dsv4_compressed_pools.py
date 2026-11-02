@@ -132,6 +132,7 @@ class TestDSV4CompressedPools(CustomTestCase):
 
         pool = DeepSeekV4IndexerPool.__new__(DeepSeekV4IndexerPool)
         pool.index_k_with_scale_buffer = None
+        pool.fp4_natural_layout = False
         pool.index_k_payload_buffer = [
             torch.empty((3, 1, 4, 64, 16), dtype=torch.uint8) for _ in range(2)
         ]

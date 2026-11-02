@@ -698,8 +698,17 @@ class DeepSeekV4IndexerPool(KVCache):
                     layout="index_fused",
                 )
             )
-        # Payload and scale are both allocated per pool page, in either layout.
-        page_slots = self.index_page_size
+        if self.fp4_natural_layout:
+            # Payload and scale are both allocated per pool page.
+            page_slots = self.index_page_size
+        else:
+            page_slots = self.index_k_payload_buffer[0].shape[3]
+            scale_slots = self.index_k_scale_buffer[0].shape[3]
+            if scale_slots != page_slots:
+                raise ValueError(
+                    "FP4 indexer payload and scale must agree on slots per page: "
+                    f"payload={page_slots}, scale={scale_slots}"
+                )
         rows = self.contiguous_page_row_buffers()
         key_layers = len(self.index_k_payload_buffer)
         return DSV4IndexerBufferInfo(

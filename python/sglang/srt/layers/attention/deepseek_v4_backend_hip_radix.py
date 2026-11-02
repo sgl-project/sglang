@@ -1913,13 +1913,15 @@ class DeepseekV4HipRadixBackend(
             return
 
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            fp4_natural_layout,
             prepare_fp4_prefill_workspace,
         )
 
         indexer_metadata = metadata.indexer_metadata
         cu_seq_q = None
         if (
-            forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            fp4_natural_layout()
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and forward_batch.extend_num_tokens == indexer_metadata.page_table.shape[0]
         ):
             cu_seq_q = F.pad(
