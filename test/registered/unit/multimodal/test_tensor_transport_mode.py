@@ -27,6 +27,22 @@ class TestTensorTransportMode(CustomTestCase):
                 ):
                     self.assertEqual(determine_tensor_transport_mode(), expected)
 
+    def test_multi_node_pipeline_keeps_first_stage_local(self):
+        # Only the first pipeline stage reads tokenizer output; it stays on
+        # node 0 as long as each TP group fits on one node.
+        cases = (
+            (dict(nnodes=8, pp_size=8), "cuda_ipc"),
+            (dict(nnodes=2, pp_size=8), "cuda_ipc"),
+            (dict(nnodes=4, pp_size=2), "default"),
+            (dict(nnodes=2, pp_size=2, dp_size=2), "default"),
+            (dict(nnodes=8, pp_size=8, use_ray=True), "default"),
+        )
+
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                with get_context().override_server_args(**overrides):
+                    self.assertEqual(determine_tensor_transport_mode(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

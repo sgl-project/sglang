@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
 # Load the quantization package first so `base_config`, `moe_methods`, and
 # `linear_method_npu` initialize in dependency order. Importing `fp4_moe_methods`
@@ -29,6 +29,19 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+
+def _make_fp4_method(**kwargs):
+    """Build the real method with the Ascend MX-quant op stubbed out.
+
+    Constructing it also builds the W13/W2 kernels, whose
+    ``HiddenStatesDynamicQuant`` resolves ``torch.ops.npu.npu_dynamic_mx_quant``
+    at init time; that op only exists on an NPU host. These tests cover the
+    checkpoint-loading, runner-delegation and dispatcher wiring above it, never
+    the kernel itself.
+    """
+    with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
+        return NPUW4A8MXFP4FusedMoEMethod(**kwargs)
 
 
 class TestFP4MethodGate(unittest.TestCase):
@@ -57,6 +70,12 @@ class TestFP4MethodGate(unittest.TestCase):
             patch(
                 "sglang.srt.layers.quantization.fp8.is_npu_arch35",
                 return_value=True,
+            ),
+            # The arches only pick the class; building the real W13/W2 kernels
+            # would grab torch.ops.npu.npu_dynamic_mx_quant, which exists only
+            # on an NPU host.
+            patch(
+                "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.NPUW4A8MXFP4MoEMethod"
             ),
         ):
             method = config.get_quant_method(layer, "model.layers.0.experts")
@@ -150,7 +169,7 @@ class TestMxfp4ScaleWeightLoader(unittest.TestCase):
             loaded.append(loaded_weight.clone())
 
         layer = torch.nn.Module()
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        method = _make_fp4_method(prefix="test")
         method.create_weights(
             layer,
             num_experts=1,
@@ -686,7 +705,7 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
 
 class TestRunnerDelegation(unittest.TestCase):
     def test_apply_delegates_with_dsv4_scale_names(self):
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        method = _make_fp4_method(prefix="test")
         expected = object()
         method.runner = MagicMock()
         method.runner.run.return_value = expected
@@ -708,7 +727,7 @@ class TestRunnerDelegation(unittest.TestCase):
         self.assertIs(quant_info.w2_weight_scale, layer.w2_weight_scale_inv)
 
     def test_create_runner_installs_internal_kernels_before_runner(self):
-        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        method = _make_fp4_method(prefix="test")
         layer = SimpleNamespace()
         config = SimpleNamespace(layer=None)
         backend = MagicMock()
@@ -732,7 +751,7 @@ class TestRunnerDelegation(unittest.TestCase):
 class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
     @staticmethod
     def _method():
-        return NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        return _make_fp4_method(prefix="test")
 
     def test_raises_when_w13_scales_never_loaded(self):
         # An all-zero scale is the signature of a checkpoint whose scale names

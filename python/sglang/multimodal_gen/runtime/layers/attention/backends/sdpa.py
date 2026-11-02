@@ -17,8 +17,14 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -336,17 +342,25 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if query.shape[2] != key.shape[2]:
+        # sm_10x keeps GQA on cuDNN; CudnnSDPAImpl passes enable_gqa.
+        if query.shape[2] != key.shape[2] and (
+            not self._is_sm100 or query.shape[2] % key.shape[2]
+        ):
             return False
         if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
             return False
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
-            # shorter than one 128-row tile while the other is not drops cuDNN to
-            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
-            # 24.9 vs 12.1 us)
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
+            # FA4's faster sub-tile kernel pays off in captured segments, but
+            # its host dispatch loses to cuDNN in eager (including BCG breaks).
+            # Keep exact requests on the reference route: cuDNN and FA4 differ
+            # in rounding. The BCG scope includes warmup, priming FA4 for capture.
+            if not is_in_breakable_cuda_graph():
+                context = get_forward_context_or_none()
+                if context is not None and context.quality in ("lossless", "high"):
+                    return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
