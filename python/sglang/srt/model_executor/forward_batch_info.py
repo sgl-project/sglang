@@ -70,7 +70,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import async_h2d, ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1696,7 +1696,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             deltas_list = [0] * batch_size
             for i, mm in enumerate(mm_inputs):
                 deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
-            deltas = torch.tensor(
+            deltas = async_h2d(
                 deltas_list, dtype=torch.int64, device=model_runner.device
             )
             positions_1d = (deltas - 1) + seq_lens_int64
