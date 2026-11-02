@@ -84,7 +84,9 @@ class EngineScoreMixin:
             temperature: Positive calibration temperature, applied before candidate/class
                 softmax. Requires apply_softmax=True when different from 1.
             return_token_logprobs: Include uncalibrated full-vocabulary logprobs for
-                each item's candidates. Only supported for CausalLM, not raw logits.
+                each item's candidates, shaped like ``scores`` (nested per item
+                when score_extraction_token_id is set). Only supported for
+                CausalLM, not raw logits.
             stacked_query_item_embed_overrides: Alternative to query_/item_embed_overrides:
                 one already-stacked [N, hidden] tensor per output sequence, used without
                 a restack. See score_request.
