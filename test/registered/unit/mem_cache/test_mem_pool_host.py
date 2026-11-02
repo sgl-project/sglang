@@ -1072,6 +1072,29 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
                 transfer_page_size=512,
             )
 
+    @staticmethod
+    def _anchor(stub):
+        return MLATokenToKVPoolHost(
+            MLAHostAllocation(
+                dtype=stub.store_dtype,
+                kv_lora_rank=stub.kv_lora_rank,
+                qk_rope_head_dim=stub.qk_rope_head_dim,
+                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
+                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
+                * stub.store_dtype.itemsize
+                * stub.layer_num,
+            ),
+            device_capacity_tokens=stub.size,
+            start_layer=stub.start_layer,
+            end_layer=stub.end_layer,
+            target_layer_num=stub.layer_num,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+        )
+
     def test_host_bytes_match_observed_allocation(self):
         info = self._stub().get_device_pool_infos()[1].buffer_info
         self.assertEqual(info.page_bytes, 8448)
@@ -1097,29 +1120,18 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         self.assertEqual(config.device_to_host_layer, {})
         self.assertEqual(config.buffer_info.buffers, ())
 
+    def test_mirror_preserves_anchor_geometry(self):
+        stub = self._stub()
+        anchor = self._anchor(stub)
+        mirror = _make_indexer_host(stub, anchor, pin_memory=False, is_dummy=True)
+        self.assertEqual(mirror.layout, anchor.layout)
+        self.assertEqual(mirror.indexer_page_stride_size, 8448)
+        self.assertEqual(mirror.get_size_per_token(), 132 * 5)
+
     def test_compact_layers_preserve_host_geometry_and_draft_offsets(self):
         stub = self._stub()
         stub.skip_topk_layers = [False, True, True, False, True]
-        anchor = MLATokenToKVPoolHost(
-            MLAHostAllocation(
-                dtype=stub.store_dtype,
-                kv_lora_rank=stub.kv_lora_rank,
-                qk_rope_head_dim=stub.qk_rope_head_dim,
-                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
-                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
-                * stub.store_dtype.itemsize
-                * stub.layer_num,
-            ),
-            device_capacity_tokens=stub.size,
-            start_layer=stub.start_layer,
-            end_layer=stub.end_layer,
-            target_layer_num=stub.layer_num,
-            host_to_device_ratio=2,
-            host_size=0,
-            page_size=64,
-            layout="page_first",
-            pin_memory=False,
-        )
+        anchor = self._anchor(stub)
         host = _make_indexer_host(stub, anchor, pin_memory=False, is_dummy=True)
         self.assertEqual(host.layer_num, 2)
         self.assertEqual(host.size, anchor.size)
@@ -1172,33 +1184,15 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
 
         stub = self._stub()
         stub.layer_num = stub.end_layer = 72
+        stub.model_layer_ids = tuple(range(72))
+        stub.index_key_cache.buffer = [
+            torch.empty((2, 64 * 132), dtype=torch.uint8) for _ in range(72)
+        ]
         stub.skip_topk_layers = [p == "S" for p in config["index_topk_pattern"]]
-        decl = make_dsa_indexer_pool_decl(stub)
-        anchor = MLATokenToKVPoolHost(
-            MLAHostAllocation(
-                dtype=stub.store_dtype,
-                kv_lora_rank=stub.kv_lora_rank,
-                qk_rope_head_dim=stub.qk_rope_head_dim,
-                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
-                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
-                * stub.store_dtype.itemsize
-                * stub.layer_num,
-            ),
-            device_capacity_tokens=stub.size,
-            start_layer=stub.start_layer,
-            end_layer=stub.end_layer,
-            target_layer_num=stub.layer_num,
-            host_to_device_ratio=2,
-            host_size=0,
-            page_size=64,
-            layout="page_first",
-            pin_memory=False,
-        )
-        mirror = DSAIndexerPoolHost(
-            decl=decl, anchor_host=anchor, pin_memory=False, is_dummy=True
-        )
+        anchor = self._anchor(stub)
+        mirror = _make_indexer_host(stub, anchor, pin_memory=False, is_dummy=True)
 
-        owned = set(decl.owned_device_layers)
+        owned = set(mirror._owned_device_layer_ids(stub))
         self.assertEqual(len(owned), 44)
         self.assertLessEqual(set(consumers), owned)
         self.assertEqual(mirror.layer_num, 44)
