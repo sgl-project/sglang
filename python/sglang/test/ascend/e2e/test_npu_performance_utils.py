@@ -1068,13 +1068,28 @@ def assert_metrics(self, metrics):
                 f"min_hit_rate_pcts; supported tiers: {sorted(hit_rate_keys)}"
             )
         for tier, threshold in min_hit_rate_pcts.items():
-            self.assertIsNotNone(
-                metrics.get(hit_rate_keys[tier]),
-                f"{tier} hit rate not found in bench_serving output while "
-                f"min_hit_rate_pcts['{tier}'] is set (did the case set "
-                "cache_report=True and the server run with "
-                "--enable-cache-report?)",
-            )
+            if metrics.get(hit_rate_keys[tier]) is None:
+                if metrics.get("cache_hit_rate_pct") is not None:
+                    # The overall rate was parsed, so cache_report and the
+                    # server's --enable-cache-report both took effect; the
+                    # tier line alone is missing, e.g. L1 capacity sufficed
+                    # and the tier was never engaged.
+                    hint = (
+                        "cache_report worked but this tier has no line; "
+                        "possibly L1 capacity sufficed and the tier was "
+                        "never engaged - inspect the server-side Cache "
+                        "Hit Details output"
+                    )
+                else:
+                    hint = (
+                        "did the case set cache_report=True and the server "
+                        "run with --enable-cache-report?"
+                    )
+                self.assertIsNotNone(
+                    metrics.get(hit_rate_keys[tier]),
+                    f"{tier} hit rate not found in bench_serving output "
+                    f"while min_hit_rate_pcts['{tier}'] is set; {hint}",
+                )
             dump_metric(
                 f"{tier}_hit_rate",
                 float(metrics[hit_rate_keys[tier]]),
