@@ -182,6 +182,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -799,7 +803,7 @@ class ExecComm(msgspec.Struct):
         Arg(
             help=(
                 "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "(EXTEND / MIXED) while keeping it for decode. "
                 "Only meaningful with --enable-aiter-allreduce-fusion."
             ),
             resolvable=True,

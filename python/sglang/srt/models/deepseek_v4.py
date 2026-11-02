@@ -1066,7 +1066,9 @@ class MqaAttentionBase(nn.Module):
         )
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
-        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(
+            quant_config, wo_a_keeps_quant_config
+        )
         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
@@ -4665,6 +4667,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
@@ -5260,7 +5263,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
@@ -5313,7 +5316,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 if (
-                    self.wo_a_fp8
+                    (self.wo_a_fp8 or self.use_npu_arch35_mxfp8_wo_a)
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
@@ -5332,6 +5335,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
+                    if _is_npu:
+                        name = name.replace("weight_packed", "weight")
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
                     skip_group = None
@@ -5408,8 +5413,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name not in name:
                             continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
                         if ("mlp.experts." in name) and name not in params_dict:
                             continue
                         name = name.replace(weight_name, param_name)
@@ -5434,8 +5437,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
-                            if _is_npu:
-                                name = name.replace("weight_packed", "weight")
                             resolved_name = name.replace(weight_name, param_name)
                             if resolved_name not in params_dict:
                                 skip_unmaterialized_expert_param = True

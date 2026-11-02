@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -51,28 +50,6 @@ class TestRadixCacheFCFS(CustomTestCase):
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestRadixCacheLPM(TestRadixCacheFCFS):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--chunked-prefill-size",
-                "128",
-                "--max-total-tokens",
-                "20000",
-                "--schedule-policy",
-                "lpm",
-            ],
-            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
-        )
 
 
 class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):

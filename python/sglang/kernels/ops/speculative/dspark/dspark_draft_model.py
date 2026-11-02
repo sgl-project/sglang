@@ -363,6 +363,8 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
     """Whether _build_stacked_wkv_weight can handle these weights; unsupported
     quant schemes fall back to the per-linear torch path in execute()."""
+    if _is_npu:
+        return False
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         return True
     return all(_dequant_supported(linear) for linear in wkv_linears)

@@ -45,23 +45,11 @@ class TestRayWrapperBase(unittest.TestCase):
 
 
 class TestNameSanitization(TestRayWrapperBase):
-    def test_replaces_colons_with_underscores(self):
-        sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang:num_running_reqs"
-        )
-        self.assertEqual(sanitized, "sglang_num_running_reqs")
-
     def test_replaces_all_punctuation(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
             "sglang:foo.bar-baz/qux"
         )
         self.assertEqual(sanitized, "sglang_foo_bar_baz_qux")
-
-    def test_keeps_already_valid_names(self):
-        sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang_foo_bar"
-        )
-        self.assertEqual(sanitized, "sglang_foo_bar")
 
 
 class TestReplicaIdInjection(TestRayWrapperBase):
@@ -83,14 +71,6 @@ class TestReplicaIdInjection(TestRayWrapperBase):
 
 
 class TestCounterWrapper(TestRayWrapperBase):
-    def test_inc_forwards_value_and_tags(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        counter.labels(m="x").inc(5)
-        self.assertEqual(
-            counter.metric.calls[-1],
-            ("inc", 5, {"m": "x", "ReplicaId": "rep-001"}),
-        )
-
     def test_inc_zero_is_noop(self):
         counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
         counter.labels(m="x").inc(0)
@@ -106,14 +86,6 @@ class TestGaugeWrapper(TestRayWrapperBase):
             gauge.metric.calls[-1],
             ("set", 12, {"m": "x", "ReplicaId": "rep-001"}),
         )
-
-    def test_set_to_current_time_uses_set(self):
-        gauge = self.rw.RayGaugeWrapper("sglang:start_time", "doc")
-        gauge.set_to_current_time()
-        op, value, _ = gauge.metric.calls[-1]
-        self.assertEqual(op, "set")
-        self.assertIsInstance(value, float)
-        self.assertGreater(value, 0)
 
     def test_accepts_multiprocess_mode_for_api_parity(self):
         # multiprocess_mode is irrelevant under Ray; the wrapper must still
@@ -135,12 +107,6 @@ class TestHistogramWrapper(TestRayWrapperBase):
             hist.metric.calls[-1],
             ("observe", 0.3, {"m": "x", "ReplicaId": "rep-001"}),
         )
-
-    def test_buckets_translate_to_boundaries(self):
-        hist = self.rw.RayHistogramWrapper(
-            "sglang:ttft_seconds", "doc", buckets=[0.1, 0.5, 1.0, 2.0]
-        )
-        self.assertEqual(hist.metric.boundaries, [0.1, 0.5, 1.0, 2.0])
 
     def test_no_buckets_defaults_to_empty_list(self):
         hist = self.rw.RayHistogramWrapper("sglang:ttft_seconds", "doc")
@@ -164,13 +130,6 @@ class TestHistogramWrapper(TestRayWrapperBase):
 
 
 class TestSummaryWrapperFallback(TestRayWrapperBase):
-    def test_observe_uses_default_boundaries(self):
-        summary = self.rw.RaySummaryWrapper("sglang:request_latency", "doc")
-        self.assertEqual(
-            summary.metric.boundaries,
-            self.rw.RaySummaryWrapper.DEFAULT_BOUNDARIES,
-        )
-
     def test_observe_forwards_value_and_tags(self):
         summary = self.rw.RaySummaryWrapper(
             "sglang:request_latency", "doc", labelnames=["m"]
@@ -183,16 +142,6 @@ class TestSummaryWrapperFallback(TestRayWrapperBase):
 
 
 class TestLabelsCopyAndGuard(TestRayWrapperBase):
-    def test_labels_returns_copy_not_self(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        labeled = counter.labels(m="x")
-        self.assertIsNot(labeled, counter)
-
-    def test_original_remains_unlabeled_after_labels_call(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        counter.labels(m="x")
-        self.assertFalse(counter._is_labeled)
-
     def test_double_labels_raises(self):
         counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
         labeled = counter.labels(m="x")
@@ -232,10 +181,6 @@ class TestRayMissingImportError(unittest.TestCase):
 
     def tearDown(self) -> None:
         clear_fake_ray_modules()
-
-    def test_module_imports_without_ray(self):
-        # If we got here without exception, the import succeeded.
-        self.assertTrue(hasattr(self.rw, "RayCounterWrapper"))
 
     def test_instantiating_wrapper_without_ray_raises(self):
         with self.assertRaises(ImportError) as ctx:

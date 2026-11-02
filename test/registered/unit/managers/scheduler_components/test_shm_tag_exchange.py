@@ -85,7 +85,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     )
     try:
         with (
-            envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True),
+            envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True),
             _sleep_on_idle(False),
             _shm_names(),
         ):
@@ -113,7 +113,7 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
     )
     group = torch.distributed.group.WORLD
     try:
-        with envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True):
+        with envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True):
             # --sleep-on-idle keeps the gloo path: the other ranks would spin
             with _sleep_on_idle(True):
                 assert shm_tag_exchange.get_shm_exchange(group, "idle") is None

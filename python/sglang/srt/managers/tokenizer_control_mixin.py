@@ -63,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -1061,6 +1062,14 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    def release_uocr_doc(self: TokenizerManager, doc_id: str) -> None:
+        """Tell the scheduler to free a split document's retained window.
+
+        Sync because it is also called from a `finally` while the handler is
+        being cancelled.
+        """
+        self._dispatch_to_scheduler(ReleaseUocrDocReqInput(doc_id=doc_id))
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

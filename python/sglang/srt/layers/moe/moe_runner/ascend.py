@@ -145,7 +145,8 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if _uses_fused_gmm1(kernel, config):
+        # W13 decides fusion; W2 determines the separate activation's format.
+        if _uses_fused_gmm1(config.layer.w13_kernel, config):
             # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
