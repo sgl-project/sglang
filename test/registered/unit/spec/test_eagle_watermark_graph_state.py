@@ -93,7 +93,7 @@ def _stub_capture_hardware(*, patches, backend):
         patch.object(
             eagle_draft_cuda_graph_runner,
             "resolve_decode_backend",
-            return_value=Mock(),
+            return_value=Mock(cache_loc_dtype=torch.int64),
         )
     )
     patches.enter_context(
