@@ -1,9 +1,11 @@
 import os
 import unittest
 from multiprocessing import shared_memory
+from unittest import mock
 
 from sglang.srt.utils.stale_shm_cleanup import (
     _creator_pid,
+    cleanup_stale_shm,
     make_shm_name,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -64,6 +66,19 @@ class TestCleanupStaleShm(unittest.TestCase):
             f.write(b"\0" * 4096)
         self.addCleanup(self._unlink_quiet, path)
         return path
+
+    def test_shared_host_keeps_pidless_segments(self):
+        """With several runners in one container, a job start must not unlink
+        pid-less segments that may belong to another runner's live job."""
+        path = self._make_raw_file(f"cuda.shm.test_{os.getpid()}")
+        env = {"SGLANG_IS_IN_CI": "true", "SGLANG_CI_SHARED_HOST": "true"}
+        with mock.patch.dict(os.environ, env):
+            cleanup_stale_shm()
+        self.assertTrue(os.path.exists(path))
+
+        with mock.patch.dict(os.environ, {**env, "SGLANG_CI_SHARED_HOST": "false"}):
+            cleanup_stale_shm()
+        self.assertFalse(os.path.exists(path))
 
 
 if __name__ == "__main__":

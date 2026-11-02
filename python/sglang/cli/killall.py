@@ -207,8 +207,10 @@ def _find_sglang_pids_by_name():
 
     Safe in shared-GPU containers: without --pid=host, /proc only exposes
     processes in our own PID namespace, so this cannot kill other containers.
+    Runners sharing one PID namespace are told apart by RUNNER_NAME.
     """
     my_pid = os.getpid()
+    my_runner = os.environ.get("RUNNER_NAME")
     pids = set()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -217,9 +219,27 @@ def _find_sglang_pids_by_name():
         if pid <= 1 or pid == my_pid:
             continue
         cmdline = _read_proc_cmdline(pid)
-        if cmdline and _SGLANG_PROCESS_PATTERNS.search(cmdline):
+        if (
+            cmdline
+            and _SGLANG_PROCESS_PATTERNS.search(cmdline)
+            and not _owned_by_other_runner(pid=pid, my_runner=my_runner)
+        ):
             pids.add(pid)
     return pids
+
+
+def _owned_by_other_runner(pid, my_runner):
+    """True if pid inherited a RUNNER_NAME from a different GitHub Actions runner."""
+    if not my_runner:
+        return False
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, PermissionError):
+        return False
+    for entry in environ.split(b"\x00"):
+        if entry.startswith(b"RUNNER_NAME="):
+            return entry[len(b"RUNNER_NAME=") :].decode(errors="replace") != my_runner
+    return False
 
 
 def _check_pid_namespace(pid):

@@ -8,8 +8,11 @@ if ! command -v zstd >/dev/null 2>&1; then
     if [ "$(id -u)" = "0" ]; then SUDO=""
     elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
     else SUDO=""; fi
-    ${SUDO} apt-get update || true
-    ${SUDO} apt-get install -y --no-install-recommends zstd || true
+    # Host lock shared with ci_install_dependency.sh, for runners sharing one host.
+    HOST_LOCK=(flock --timeout 1800 /tmp/sglang-ci-host.lock)
+    command -v flock >/dev/null 2>&1 || HOST_LOCK=()
+    ${SUDO} "${HOST_LOCK[@]}" apt-get update || true
+    ${SUDO} "${HOST_LOCK[@]}" apt-get install -y --no-install-recommends zstd || true
 fi
 command -v zstd >/dev/null 2>&1 \
     || echo "::warning::zstd unavailable on ${RUNNER_NAME:-this runner}; actions/cache entries here will not match the ones saved with it"
