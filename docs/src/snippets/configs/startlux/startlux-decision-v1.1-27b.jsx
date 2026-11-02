@@ -45,7 +45,7 @@ export const config = {
 
   tips: [
     "The checkpoint reads its prompt causally, so the radix cache and chunked prefill are safe; use `--disable-radix-cache` when comparing probabilities against the checkpoint's own server.",
-    "`none_probability` is the share of the read-out that went to an extra \\"None of the above\\" option. Pass `none_check: false` to read the listed options only.",
+    '`none_probability` is the share of the read-out that went to an extra "None of the above" option. Pass `none_check: false` to read the listed options only.',
     "`allow_none: true` lets `choice` be null when that extra option wins.",
     "A choice list over 25 options needs the checkpoint's own grouping rounds, which this route does not run; it refuses the request instead.",
     "AutoThink's thought loop (`think_mode`, `gate`, `mix`) is refused rather than ignored: this route reads one answer and generates nothing.",
