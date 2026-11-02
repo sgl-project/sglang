@@ -67,6 +67,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
+    prewarm_dsv4_aicpu,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
@@ -721,6 +722,51 @@ class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
+
+    def test_prewarm_initializes_all_metadata_before_synchronizing(self):
+        for is_arch35, metadata_op_name in (
+            (False, "npu_sparse_attn_sharedkv_metadata"),
+            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
+        ):
+            events = []
+            with (
+                self.subTest(is_arch35=is_arch35),
+                patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
+                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
+                patch("torch.npu", MagicMock(), create=True) as npu,
+            ):
+                backend = DeepseekV4AscendAttnBackend.__new__(
+                    DeepseekV4AscendAttnBackend
+                )
+                # No forward request or KV buffers exist during startup.
+                backend.forward_metadata = None
+                backend._is_dspark_draft_worker = False
+                backend._dsv4_sliding_window_size = 128
+                backend._dsv4_q_head_num = 64
+                backend._dsv4_kv_head_num = 1
+                backend._dsv4_head_dim = 512
+                backend._dsv4_has_c4 = True
+                backend._dsv4_has_c128 = True
+                backend._dsv4_index_topk = 512
+                backend._dsv4_index_n_heads = 16
+                backend._dsv4_index_head_dim = 128
+
+                metadata_op = getattr(custom_ops, metadata_op_name)
+                metadata_op.side_effect = lambda **kw: events.append(kw["cmp_ratio"])
+                custom_ops.npu_quant_lightning_indexer_metadata.side_effect = (
+                    lambda **kw: events.append("indexer")
+                )
+                npu.synchronize.side_effect = lambda device: events.append("sync")
+
+                prewarm_dsv4_aicpu(backend, "cpu")
+
+                self.assertEqual(events, [1, 4, "indexer", 128, "sync"])
+                npu.synchronize.assert_called_once_with("cpu")
+                for call in metadata_op.call_args_list:
+                    self.assertEqual(call.kwargs["batch_size"], 1)
+                    self.assertEqual(call.kwargs["cu_seqlens_q"].tolist(), [0, 1])
+                    self.assertEqual(call.kwargs["seqused_kv"].tolist(), [1])
+                self.assertIsNone(backend.forward_metadata)
 
     def test_device_metadata_receives_sequence_lengths(self):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)

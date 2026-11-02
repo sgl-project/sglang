@@ -91,9 +91,6 @@ def prewarm_dsv4_aicpu(attn_backend, device) -> None:
         bs=1,
         actual_seq_lengths_q_pa=torch.arange(2, dtype=torch.int32, device=device),
         actual_seq_lengths_kv=torch.ones(1, dtype=torch.int32, device=device),
-        block_tables=None,
-        max_seqlen_q=1,
-        is_nextn=False,
     )
     torch.npu.synchronize(device)
 
