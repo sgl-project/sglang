@@ -85,10 +85,12 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             name="routed_experts",
         )
         cap.device_topk_size = self.TOPK_SIZE + 1
+        cap.local_cache = None
         cap.gather_buffer = torch.empty((8, self.TOPK_SIZE + 1), dtype=torch.int32)
         return cap
 
     def _capture(self, cap, ids, backend):
+        cap._gathers_per_layer = MoeA2ABackend(backend).is_deepep()
         with (
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
@@ -157,7 +159,7 @@ class TestOutputRankHostCache(CustomTestCase):
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    def _capturer(self, attn_tp_rank, backend="none"):
+    def _capturer(self, attn_tp_rank, backend="none", dp_attention=False):
         parallel = SimpleNamespace(
             num_dp_ranks=1,
             pp_rank=0,
@@ -178,7 +180,9 @@ class TestOutputRankHostCache(CustomTestCase):
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
             ),
-            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.object(
+                re_mod, "is_dp_attention_enabled", return_value=dp_attention
+            ),
             mock.patch.dict(
                 base_mod.ALLOC_MEMORY_FUNCS,
                 {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
@@ -239,8 +243,8 @@ class TestOutputRankHostCache(CustomTestCase):
             self._read(other_rank)
 
     def test_scattered_other_rank_only_joins_the_all_gather(self):
-        """Under DeepEP every rank must join each layer's all-gather, or the
-        output rank hangs; the other ranks still keep no rows."""
+        """Under DeepEP without DP attention every rank must join each layer's
+        all-gather, or the output rank hangs; the other ranks still keep no rows."""
         other_rank = self._capturer(attn_tp_rank=1, backend="deepep")
         self.assertIsNone(other_rank.device_cache)
         gathered_shapes = []
@@ -263,6 +267,169 @@ class TestOutputRankHostCache(CustomTestCase):
                     topk_indices=torch.zeros((3, self.K), dtype=torch.int32),
                 )
         self.assertEqual(gathered_shapes, [(6, self.K)] * self.NUM_LAYERS)
+
+
+class TestForwardEndGather(CustomTestCase):
+    """DeepEP with DP attention: each attention-TP rank keeps its own tokens'
+    ids, and one all-gather per forward rebuilds the per-layer all-gather's rows."""
+
+    NUM_LAYERS = 3
+    K = 2
+    LOCAL_ROWS = 3
+    OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5, 9])
+
+    def _parallel(self, attn_tp_rank, pp_rank=0):
+        return SimpleNamespace(
+            num_dp_ranks=1,
+            pp_rank=pp_rank,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=2,
+            attn_cp_rank=0,
+        )
+
+    def _capturer(self, parallel):
+        hf_text_config = SimpleNamespace(
+            num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
+        )
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(
+                re_mod,
+                "get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=8),
+            ),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
+            ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.dict(
+                base_mod.ALLOC_MEMORY_FUNCS,
+                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
+            ),
+        ):
+            return re_mod.RoutedExpertsCapturer(
+                SimpleNamespace(hf_text_config=hf_text_config),
+                num_tokens=16,
+                max_running_requests=4,
+                num_fused_shared_experts=0,
+                device="cpu",
+            )
+
+    def _capture_layers(self, cap, parallel, local_topk):
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
+            ),
+            mock.patch.object(
+                re_mod,
+                "attn_tp_all_gather_into_tensor",
+                side_effect=AssertionError("no per-layer all-gather"),
+            ),
+        ):
+            for layer_id in range(self.NUM_LAYERS):
+                cap.capture(layer_id=layer_id, topk_indices=local_topk[:, layer_id])
+
+    def _forward_end(
+        self, cap, parallel, can_run_graph, local_dp_buffer_len, all_gather
+    ):
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(
+                re_mod, "get_local_dp_buffer_len", return_value=local_dp_buffer_len
+            ),
+            mock.patch.object(
+                re_mod, "attn_tp_all_gather_into_tensor", side_effect=all_gather
+            ),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
+            ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+        ):
+            return cap.on_forward_end(
+                SimpleNamespace(
+                    out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
+                ),
+                can_run_graph=can_run_graph,
+                cuda_graph_batch=None,
+            )
+
+    def test_one_all_gather_rebuilds_the_per_layer_rows(self):
+        shares = [
+            torch.randint(
+                0, 64, (self.LOCAL_ROWS, self.NUM_LAYERS, self.K), dtype=torch.int32
+            )
+            for _ in range(2)
+        ]
+        sent = {}
+
+        def all_gather(rank):
+            # The last rank to join sees every share, like the real collective.
+            def _all_gather(output, input_):
+                sent[rank] = input_.clone()
+                if len(sent) == 2:
+                    output.copy_(torch.cat([sent[0], sent[1]], dim=0))
+
+            return _all_gather
+
+        output_parallel = self._parallel(0)
+        peer_parallel = self._parallel(1)
+        output_rank = self._capturer(output_parallel)
+        peer = self._capturer(peer_parallel)
+        self.assertIsNone(peer.device_cache)
+        self.assertIsNotNone(peer.local_cache)
+        self.assertIsNotNone(peer.all_gather_scratch)
+        self.assertIsNone(output_rank.all_gather_scratch)
+
+        self._capture_layers(peer, peer_parallel, shares[1])
+        self._capture_layers(output_rank, output_parallel, shares[0])
+        self.assertIsNone(
+            self._forward_end(peer, peer_parallel, False, 6, all_gather(1))
+        )
+        self.assertIsNone(
+            self._forward_end(output_rank, output_parallel, False, 6, all_gather(0))
+        )
+
+        # What the per-layer all-gather wrote: rank 0's rows, then rank 1's.
+        expected = torch.cat(shares, dim=0)
+        pool = SimpleNamespace(req_to_token=self.OUT_CACHE_LOC.unsqueeze(0))
+        self.assertTrue(
+            torch.equal(
+                output_rank.get_topk(
+                    req_pool_idx=0, seqlen=7, req_to_token_pool=pool, start_len=0
+                ),
+                expected,
+            )
+        )
+
+    def test_graph_replay_gathers_the_local_dp_buffer_share(self):
+        """Graph replay runs no Python capture(), so the row count comes from
+        the local DP buffer the runner set for the replayed batch."""
+        gathered_rows = []
+        parallel = self._parallel(1)
+        peer = self._capturer(parallel)
+        self._forward_end(
+            peer,
+            parallel,
+            can_run_graph=True,
+            local_dp_buffer_len=8,
+            all_gather=lambda output, input_: gathered_rows.append(
+                (output.shape[0], input_.shape[0])
+            ),
+        )
+        self.assertEqual(gathered_rows, [(8, 4)])
+
+    def test_later_pipeline_stages_send_nothing(self):
+        parallel = self._parallel(1, pp_rank=1)
+        cap = self._capturer(parallel)
+        self.assertIsNone(cap.local_cache)
+        self.assertIsNone(cap.device_cache)
+        self.assertIsNone(cap.all_gather_scratch)
+        self._capture_layers(
+            cap,
+            parallel,
+            torch.zeros((self.LOCAL_ROWS, self.NUM_LAYERS, self.K), dtype=torch.int32),
+        )
 
 
 if __name__ == "__main__":

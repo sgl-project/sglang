@@ -59,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    set_local_dp_buffer_len,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -1686,6 +1687,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         self._set_dp_real_num_tokens(raw_num_token)
+        # The graph replays at its padded size, not the batch's; publish it as
+        # run_once did at capture for readers after replay (routed-experts
+        # capture all-gathers each rank's share of this many tokens).
+        set_local_dp_buffer_len(padded_num_tokens)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
