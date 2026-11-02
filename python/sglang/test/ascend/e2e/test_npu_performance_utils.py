@@ -1070,15 +1070,15 @@ def assert_metrics(self, metrics):
         for tier, threshold in min_hit_rate_pcts.items():
             if metrics.get(hit_rate_keys[tier]) is None:
                 if metrics.get("cache_hit_rate_pct") is not None:
-                    # The overall rate was parsed, so cache_report and the
-                    # server's --enable-cache-report both took effect; the
-                    # tier line alone is missing, e.g. L1 capacity sufficed
-                    # and the tier was never engaged.
+                    # The overall rate was parsed, so the cache report
+                    # itself worked; only the tier line is missing.
                     hint = (
                         "cache_report worked but this tier has no line; "
-                        "possibly L1 capacity sufficed and the tier was "
-                        "never engaged - inspect the server-side Cache "
-                        "Hit Details output"
+                        "the tier may never have been engaged (e.g. L1 "
+                        "capacity sufficed so L2 saw no traffic, or the "
+                        "workload had no prefix reuse), or radix cache "
+                        "is disabled on the server - inspect the "
+                        "server-side Cache Hit Details output"
                     )
                 else:
                     hint = (
