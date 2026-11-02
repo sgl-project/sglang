@@ -60,6 +60,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_attn_tp_input_scattered=False,
                     moe_dp_size=1,
                     cp_strategy=None,
+                    cp_kv_layout=None,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -141,6 +142,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             enable_prefill_cp=prefill,
                             cp_size=cp_size,
                             cp_strategy=cfg.cp_strategy,
+                            cp_kv_layout=None,
                         )
 
 
@@ -217,6 +219,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
+                    "speculative_draft_model_quantization",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -1651,7 +1654,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
             _nemotron_h_overrides(server_args, hf_config)
 
-    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+    def test_nemotron_h_w4a16_moe_explicit_runner(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
         )
@@ -1664,10 +1667,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 }
             }
         )
-        server_args.moe_runner_backend = "flashinfer_trtllm"
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}, None),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}, None),
+            ("marlin", "none", False, {}, None),
+            ("marlin", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", False, None, "moe-runner-backend=marlin"),
+            ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
+            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+        ]
+        for runner, a2a, w4a16_enabled, expected, error in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16_enabled=w4a16_enabled),
+                override_platform(is_sm100=True),
+                override_platform(is_blackwell=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                server_args.moe_runner_backend = runner
+                server_args.moe_a2a_backend = a2a
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _nemotron_h_overrides(server_args, hf_config)
+                else:
+                    self.assertEqual(
+                        _nemotron_h_overrides(server_args, hf_config),
+                        {
+                            "quantization": "modelopt_mixed",
+                            "attention_backend": "trtllm_mha",
+                            **expected,
+                        },
+                    )
 
-        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
-            _nemotron_h_overrides(server_args, hf_config)
+    def test_nemotron_h_w4a16_cutedsl_rejects_non_sm100(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_cutedsl"
+        for is_blackwell in (False, True):
+            with (
+                self.subTest(is_blackwell=is_blackwell),
+                override_platform(is_sm100=False, is_blackwell=is_blackwell),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+                self.assertRaisesRegex(ValueError, "SM100-family GPUs"),
+            ):
+                _nemotron_h_overrides(server_args, hf_config)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
@@ -1918,6 +1973,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
+
+    def test_deterministic_incompatible_phase_backend_raises(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        # A per-phase backend overrides --attention-backend for its phase, so a
+        # non-deterministic one must be refused even when the main backend is fine.
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            with self.subTest(field=field):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        **{field: "aiter"},
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    _deterministic_attention_backend(view)
+
+    def test_deterministic_compatible_phase_backends_are_accepted(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                attention_backend="triton",
+                prefill_attention_backend="triton",
+                decode_attention_backend="fa3",
+            )
+        )
+        self.assertEqual(_deterministic_attention_backend(view), {})
 
     def test_deterministic_ascend_is_left_alone(self):
         from sglang.srt.arg_groups.overrides import (
@@ -3549,10 +3640,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+        # page_size 1 is accepted: the flat page table runs the non-paged varlen
+        # kernel.
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
+                )
+            ),
+            {},
+        )
+        # an unsupported page still snaps to 128
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    page_size=32,  # non-MLA accepts only 1, 64, 128
                 )
             ),
             {"page_size": 128},
@@ -3566,6 +3669,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {},
+        )
+        # MLA does not inherit MHA's page_size 1: mla_decode has no page_size 1 path.
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    _model_config=SimpleNamespace(attention_arch=AttentionArch.MLA),
+                    page_size=1,
+                )
+            ),
+            {"page_size": 128},
         )
 
     def test_monolith_attention_families_at_callable_level(self):
@@ -4157,6 +4271,42 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
+    """The deterministic fallback must not hand XPU a CUDA-only backend.
+
+    fa3 asserts on the device's SM version, so an XPU server that only asked
+    for --enable-deterministic-inference dies at launch rather than falling
+    back. The explicit-backend case guards the other direction: the platform
+    branch must not override a backend the user named.
+    """
+
+    @staticmethod
+    def _view(attention_backend):
+        return SimpleNamespace(
+            enable_deterministic_inference=True,
+            attention_backend=attention_backend,
+            model_path="Qwen/Qwen3-4B",
+        )
+
+    def test_xpu_fallback_is_an_xpu_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view(None)
+            )
+        self.assertEqual(updates, {"attention_backend": "intel_xpu"})
+
+    def test_xpu_keeps_explicit_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view("triton")
+            )
+        self.assertEqual(updates, {})
 
 
 if __name__ == "__main__":
