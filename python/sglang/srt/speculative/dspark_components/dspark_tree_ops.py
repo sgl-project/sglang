@@ -155,7 +155,7 @@ def _load_compressor_ops():
             "package (compressor_tree / compressor_tree_project); it is "
             "unavailable in this process."
         ) from exc
-    return compressor_tree, compressor_tree_project
+    return compressor_tree_project, compressor_tree
 
 
 def _load_indexer_op():

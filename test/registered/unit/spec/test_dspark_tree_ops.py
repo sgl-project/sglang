@@ -6,6 +6,7 @@ here: their absence is exactly what the no-fallback tests exercise.
 """
 
 import sys
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,7 +68,7 @@ FORBIDDEN_TOKENS = (
 
 
 def _module_source() -> str:
-    return Path(tree_ops.__file__).read_text()
+    return Path(tree_ops.__file__).read_text(encoding="utf-8")
 
 
 def _make_plan(device: str = "cpu") -> tree_ops.NodePlan:
@@ -138,6 +139,25 @@ class PublicSurfaceTest(CustomTestCase):
             self.assertIn(
                 f"from sgl_kernel_npu.tree import {op}", src, f"missing {op!r}"
             )
+
+    def test_compressor_loader_returns_project_then_tree(self) -> None:
+        fake_tree = types.ModuleType("sgl_kernel_npu.tree")
+        fake_tree.compressor_tree = object()
+        fake_tree.compressor_tree_project = object()
+        fake_package = types.ModuleType("sgl_kernel_npu")
+        fake_package.tree = fake_tree
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "sgl_kernel_npu": fake_package,
+                "sgl_kernel_npu.tree": fake_tree,
+            },
+        ):
+            project, tree = tree_ops._load_compressor_ops()
+
+        self.assertIs(project, fake_tree.compressor_tree_project)
+        self.assertIs(tree, fake_tree.compressor_tree)
 
 
 class NodePlanTest(CustomTestCase):
