@@ -2014,21 +2014,27 @@ class KimiK3DeltaAttention(nn.Module):
         w = layer.conv_weights
         if _is_npu:
             return
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        from sglang.kernels.ops.attention import kda_fused_decode
+
+        heads = self.local_num_heads
+        seg = heads * 128
         if (
-            w is None
+            heads not in kda_fused_decode.SUPPORTED_HEADS
+            or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
             or layer.dt_bias.dtype != torch.float32
         ):
             rank0_log(
-                "K3 fused KDA decode disabled: unexpected conv/A_log/dt_bias "
+                f"K3 fused KDA decode disabled: {heads} local heads "
+                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
                 f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
@@ -2048,7 +2054,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [heads]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
