@@ -1024,9 +1024,7 @@ def cp_verify_merge(
 # no peer can still be reading call n's slots.
 CP_PARITIES = 2
 CP_MAX_ROWS = 4096
-# About 2.5 minutes of 150 ns polls: far past any lag between healthy ranks, which run the
-# same launches in step, and under the scheduler watchdog's 300 s, so a peer that died or
-# took another path ends in a device error naming the exchange rather than a silent hang.
+# ~2.5 min of polls, under the scheduler watchdog's 300 s: a dead peer traps, not hangs
 CP_MAX_SPINS = 1 << 30
 
 
@@ -1124,16 +1122,14 @@ def _cp_merge_ipc_kernel(
         word = tl.load(ptrs, cache_modifier=".cv", volatile=True)
         spins += 1
         if spins >= MAX_SPINS:
-            if r == 0:
-                tl.device_print(
-                    "indexer CP exchange: a peer's candidates never came; row, tag",
-                    r,
-                    tag,
-                )
+            tl.device_print(
+                "indexer CP exchange: a peer's candidates never came; row, tag",
+                r,
+                tag,
+            )
             tl.inline_asm_elementwise(
                 "s_trap 2", "=r", [], dtype=tl.int32, is_pure=False, pack=1
             )
-            spins = 0
     # back to the native key order: ordered score, then the lower block id
     blk_field = word & 0xFFFFFF
     blk = 0xFFFFFF - blk_field

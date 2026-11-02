@@ -118,6 +118,13 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         logger.warning("MiniMax indexer CP disabled: %s", reason)
         return None
     cp = MiniMaxIndexerCP(parallel.attn_tp_group)
+    # only the NVFP4 index cache reads the exchange; it is a collective on every rank
+    if backend.kv_is_nvfp4 and envs.SGLANG_MINIMAX_M3_INDEXER_CP_IPC.get():
+        from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
+            CpExchange,
+        )
+
+        cp.exchange = CpExchange(cp.group, cp.group.device)
     cp.warmup()
     logger.info(
         "MiniMax indexer CP enabled: TP4, decode-only, replicated index cache, "
@@ -136,18 +143,7 @@ class MiniMaxIndexerCP:
         self.exchange = None
 
     def warmup(self):
-        """Initialize both runtime and PyNCCL gather paths before graph capture.
-
-        Also allocates the IPC candidate exchange, a collective on every rank.
-        """
-        from sglang.srt.environ import envs
-
-        if envs.SGLANG_MINIMAX_M3_INDEXER_CP_IPC.get():
-            from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
-                CpExchange,
-            )
-
-            self.exchange = CpExchange(self.group, self.group.device)
+        """Initialize both runtime and PyNCCL gather paths before graph capture."""
         probe = torch.zeros((1, 128), dtype=torch.bfloat16, device=self.group.device)
         output = torch.empty((4, 128), dtype=probe.dtype, device=probe.device)
         self.group.all_gather_into_tensor(output, probe)

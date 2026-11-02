@@ -59,7 +59,7 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
     def test_dspark_enables_cp_only_under_static_verify(self):
         """DSpark must enable CP under static verify only: ragged verify trims rows per
         request, which the CP tile would mis-score."""
-        for mode, expected in (("static", True), ("ragged", False)):
+        for mode, expected in (("static", True), ("compact", False)):
             with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
                 reason = unsupported_reason(
                     **{

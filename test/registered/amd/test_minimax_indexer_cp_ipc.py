@@ -179,14 +179,7 @@ class TestMiniMaxIndexerCPExchange(CustomTestCase):
     def test_exchange_matches_the_native_selector_on_four_ranks(self):
         if torch.cuda.device_count() < WORLD:
             self.skipTest(f"needs {WORLD} GPUs")
-        context = multiprocessing.get_context("spawn")
-        port = get_open_port()
-        procs = [
-            context.Process(target=_run_exchange, args=(rank, port))
-            for rank in range(WORLD)
-        ]
-        for proc in procs:
-            proc.start()
+        procs = _spawn(_run_exchange, get_open_port())
         # a buffer that serves a stale line spins the merge forever instead of failing
         for proc in procs:
             proc.join(timeout=600)
