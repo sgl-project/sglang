@@ -1,12 +1,20 @@
 """Unit tests for the Nano Nemotron VL processor."""
 
 import asyncio
+import tempfile
 import unittest
 from array import array
+from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import av
+import numpy as np
 import torch
+
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
@@ -15,8 +23,8 @@ from sglang.srt.multimodal.processors.nano_nemotron_vl import (
     NanoNemotronVLImageProcessor,
     _create_visual_items,
 )
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -218,6 +226,29 @@ class TestNanoNemotronVLProcessor(CustomTestCase):
         self.assertEqual(video.thw_grids, [(2, 2, 2)])
         self.assertEqual(video.pre_chunked_input_ids, input_ids)
         self.assertEqual(video.frames_per_video, [3])
+
+    def test_video_timestamps_preserve_frame_rate_precision(self):
+        fps = Fraction(24000, 1001)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/video.avi"
+            with av.open(path, "w") as container:
+                stream = container.add_stream("ffv1", rate=fps)
+                stream.width = stream.height = 16
+                stream.pix_fmt = "bgr0"
+                for index in range(120):
+                    # Lossless pixels identify each sampled frame independently.
+                    pixels = np.full((16, 16, 3), index, dtype=np.uint8)
+                    frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode():
+                    container.mux(packet)
+
+            with VideoDecoderWrapper(path) as video:
+                frames, timestamps = NanoNemotronVLImageProcessor.parse_video(video)
+
+        expected_timestamps = frames[:, 0, 0, 0].astype(float) / float(fps)
+        np.testing.assert_allclose(timestamps, expected_timestamps, rtol=0, atol=1e-9)
 
 
 if __name__ == "__main__":
