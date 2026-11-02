@@ -49,7 +49,7 @@ export const config = {
     "default|bf16":  "Qwen/Qwen3.8-2.4T-A95B",
     // Separate repo, not a revision of the BF16 one.
     "default|fp8":   "Qwen/Qwen3.8-2.4T-A95B-FP8",
-    "default|nvfp4": "RadixArk/Qwen3.8-2.4T-A95B-NVFP4",
+    "default|nvfp4": "nvidia/Qwen3.8-2.4T-A95B-NVFP4",
     "default|mxfp4": "Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4",
   },
 

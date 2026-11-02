@@ -94,7 +94,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`. Raising `presence_penalty` toward 2 curbs runaway repetition at some risk of language mixing. For agentic work Qwen suggests allowing 262,144 tokens of reasoning and 131,072 for the final response.
 
-**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-2.4T-A95B-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell](https://huggingface.co/nvidia/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-2.4T-A95B-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
 
 ## 2. Configuration Tips
 
@@ -102,7 +102,7 @@ Four cells are marked **Not Verified** — **GB300 BF16** and the three GB300 **
 
 **Weight size decides the topology.** At 2.4T parameters BF16 is ≈4.8TB, FP8 ≈2.4TB, NVFP4 ≈1.2TB. FP8 fits no single node here — not even B300, whose 8 × 288GB = 2.30TB misses by a hair — so every FP8 recipe is multi-node. Single-node means FP4: NVFP4 on B300, MXFP4 on MI355X/MI350X. B200 NVFP4 would fit one node but pipelines two, because ~25GB per GPU after weights is too little to serve against. BF16 does not fit 16 GPUs either, so its one recipe is TP32 across 8 GB300 nodes — the only platform where a flat TP32 stays on rack-scale NVLink.
 
-**Two distinct FP4 checkpoints.** [NVFP4](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) is Blackwell-only; [MXFP4](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4) is MI350X/MI355X-only and hybrid (MXFP4 experts, FP8 attention/dense). MI300X is CDNA3 with no hardware MX matmul, so it serves FP8. Leave `--moe-runner-backend` unset on both and the runner resolves from the checkpoint's own `quant_method` — except the NVFP4 wide-EP tier, which pairs `flashinfer_trtllm_routed` with `--moe-a2a-backend flashinfer` by hand because auto cannot resolve that combination.
+**Two distinct FP4 checkpoints.** [NVFP4](https://huggingface.co/nvidia/Qwen3.8-2.4T-A95B-NVFP4) is Blackwell-only; [MXFP4](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4) is MI350X/MI355X-only and hybrid (MXFP4 experts, FP8 attention/dense). MI300X is CDNA3 with no hardware MX matmul, so it serves FP8. Leave `--moe-runner-backend` unset on both and the runner resolves from the checkpoint's own `quant_method` — except the NVFP4 wide-EP tier, which pairs `flashinfer_trtllm_routed` with `--moe-a2a-backend flashinfer` by hand because auto cannot resolve that combination.
 
 ### GDN state is the scarce resource, not KV
 
