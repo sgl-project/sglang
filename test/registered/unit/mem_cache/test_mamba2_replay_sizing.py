@@ -272,6 +272,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
             (NemotronHConfig(), True),
             (NemotronHPuzzleConfig(block_configs=[], mtp_block_configs=[{}]), False),
         ):
+            config.n_groups = 8  # Checkpoint configs set n_groups; defaults do not.
             with get_parallel().override(attn_tp_size=1):
                 params = config.mamba2_cache_params
             for enabled in (False, True):

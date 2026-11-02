@@ -134,6 +134,7 @@ class TestMamba2SpecReplay(CustomTestCase):
                     _translate_mamba_indices=lambda x: x,
                     forward_metadata=metadata,
                     accept_lens_pool=None,
+                    state_pool=pool,
                     req_to_token_pool=SimpleNamespace(
                         mamba_pool=pool,
                         get_speculative_mamba2_params_all_layers=pool.get_speculative_mamba2_params_all_layers,
