@@ -46,8 +46,6 @@ def resolve_sparse_kv_budget(
     copy_sfa: bool = False,
     copy_sfa_query_heads: int = 128,
     mtp_full_visible: bool = False,
-    fused_copy_sfa_metadata: bool = False,
-    fused_pre_metadata: bool = False,
     graph_batch_capacity: int = 0,
     device_tail_tokens: int = 0,
 ) -> SparseKVBudget:
@@ -129,11 +127,10 @@ def resolve_sparse_kv_budget(
             + num_layers * (request_rows + 1) * 4
             + 128 * 4
         )
+    if experimental:
+        adapter_bytes += batch_rows * (6 * 4 + 2)
     if native and copy_sfa:
-        if fused_copy_sfa_metadata:
-            adapter_bytes += (request_rows + 1 + batch_rows) * 4
-        if fused_pre_metadata:
-            adapter_bytes += batch_rows * (6 * 4 + 2)
+        adapter_bytes += (request_rows + 1 + batch_rows) * 4
     mtp_output_bytes = 0
     if mtp_full_visible:
         # Q4 source/slot rows, route counts, query scales and Q endpoints.

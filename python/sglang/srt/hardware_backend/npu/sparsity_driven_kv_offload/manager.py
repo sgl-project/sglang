@@ -670,79 +670,31 @@ class SparseKVCacheManager:
         valid = plan.valid_rows & plan.sparse_rows
         route_valid = valid[:, None].expand(batch, 4).reshape(rows)
         adapter = self.lim_adapter
-        if adapter.fused_copy_metadata:
-            adapter._fused_copy_sfa_metadata(
-                source_ids=plan.source_ids,
-                topk_misses=plan.topk_misses,
-                miss_counts=plan.miss_counts,
-                valid_rows=plan.valid_rows,
-                sparse_rows=plan.sparse_rows,
-                request_slots=plan.request_slots,
-                next_prefix=plan.prefix_lens,
-                last_prefix=adapter._metadata_prefix_scratch,
-                actual_seq_lengths_kv=self.planner_actual_seq_lengths_kv[:batch],
-                num_cache_tokens=self.planner_num_cache_tokens[:batch],
-                hbm_block_table=self.planner_hbm_block_table[:batch],
-                dram_block_table=self.planner_dram_block_table[:batch],
-                capacity=self.cache_capacity,
-                host_context_len=self.max_context_len,
-                request_rows=self.size,
-                query_width=4,
-                tail_tokens=self.tail_tokens,
-                tail_seq_lens=plan.seq_lens if self.separate_mtp_tail else None,
-                host_block_table=(
-                    adapter.block_table[:batch]
-                    if getattr(self, "host_kv_is_paged", False)
-                    else None
-                ),
-            )
-        else:
-            plan.topk_misses.masked_fill_(~route_valid, 0)
-            plan.miss_counts.masked_fill_(~valid, 0)
-            # These lengths suppress padding; full-visible attention appends no tail.
-            self.planner_actual_seq_lengths_kv[:batch].copy_(
-                valid.to(torch.int32)
-                * (
-                    self.cache_capacity + plan.seq_lens - plan.prefix_lens
-                    if self.separate_mtp_tail
-                    else self.cache_capacity + 3
-                )
-            )
-            self.planner_num_cache_tokens[:batch].copy_(
-                valid.to(torch.int32) * self.cache_capacity
-            )
-            for pages, offsets, output in (
-                (
-                    self.device_kv_stride // 128,
-                    self.hbm_page_offsets,
-                    self.planner_hbm_block_table,
-                ),
-                (
-                    self.max_context_len // 128,
-                    self.dram_page_offsets,
-                    self.planner_dram_block_table,
-                ),
-            ):
-                fill_request_block_table(
-                    plan.request_slots, valid, offsets, pages, output[:batch]
-                )
-            if self.separate_mtp_tail:
-                cp = self.cache_capacity // 128
-                p = self.device_kv_stride // 128
-                self.planner_hbm_block_table[:batch, cp:].copy_(
-                    plan.request_slots[:, None] * p
-                    + cp
-                    + (
-                        plan.prefix_lens[:, None] // 128
-                        + self.hbm_page_offsets[None, cp:]
-                        - cp
-                    )
-                    % 2
-                )
-            if getattr(self, "host_kv_is_paged", False):
-                self.fill_host_block_table(
-                    plan.request_slots, valid, self.planner_dram_block_table[:batch]
-                )
+        adapter._fused_copy_sfa_metadata(
+            source_ids=plan.source_ids,
+            topk_misses=plan.topk_misses,
+            miss_counts=plan.miss_counts,
+            valid_rows=plan.valid_rows,
+            sparse_rows=plan.sparse_rows,
+            request_slots=plan.request_slots,
+            next_prefix=plan.prefix_lens,
+            last_prefix=adapter._metadata_prefix_scratch,
+            actual_seq_lengths_kv=self.planner_actual_seq_lengths_kv[:batch],
+            num_cache_tokens=self.planner_num_cache_tokens[:batch],
+            hbm_block_table=self.planner_hbm_block_table[:batch],
+            dram_block_table=self.planner_dram_block_table[:batch],
+            capacity=self.cache_capacity,
+            host_context_len=self.max_context_len,
+            request_rows=self.size,
+            query_width=4,
+            tail_tokens=self.tail_tokens,
+            tail_seq_lens=plan.seq_lens if self.separate_mtp_tail else None,
+            host_block_table=(
+                adapter.block_table[:batch]
+                if getattr(self, "host_kv_is_paged", False)
+                else None
+            ),
+        )
         padded_heads = self.mtp_attn_out.shape[1]
         if query_nope.shape[1] < padded_heads:
             padding = padded_heads - query_nope.shape[1]

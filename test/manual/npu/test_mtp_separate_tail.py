@@ -44,14 +44,11 @@ class _IndexPool(MLATokenToKVPool):
         return self.key
 
 
-@pytest.mark.parametrize("fused_metadata", [False, True])
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("async_checks", [False, True])
 @pytest.mark.parametrize("heads", [4, 8])
 @pytest.mark.parametrize("capacity", [11392, 12288, 16384, 16768])
-def test_separate_tail_manager_lifecycle(
-    fused_metadata, graph, async_checks, heads, capacity
-):
+def test_separate_tail_manager_lifecycle(graph, async_checks, heads, capacity):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
@@ -94,7 +91,6 @@ def test_separate_tail_manager_lifecycle(
         copy_sfa_query_heads=heads,
         mtp_full_visible=True,
         device_tail_tokens=256,
-        fused_copy_sfa_metadata=fused_metadata,
     )
     inputs = SimpleNamespace(
         batch_size=batch,
@@ -143,12 +139,6 @@ def test_separate_tail_manager_lifecycle(
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
             stack.enter_context(
                 envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.override(True)
-            )
-            stack.enter_context(
-                envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.override(fused_metadata)
-            )
-            stack.enter_context(
-                envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.override(fused_metadata)
             )
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
@@ -292,7 +282,7 @@ def test_separate_tail_manager_lifecycle(
                     "FRAMEWORK_MTP_METRICS "
                     + json.dumps(
                         {
-                            "metadata_fused": fused_metadata,
+                            "metadata_fused": True,
                             "graph": graph,
                             "async_checks": async_checks,
                             "heads": heads,
@@ -356,7 +346,7 @@ def test_separate_tail_manager_lifecycle(
                     "FRAMEWORK_MTP_METRICS "
                     + json.dumps(
                         {
-                            "metadata_fused": fused_metadata,
+                            "metadata_fused": True,
                             "graph": graph,
                             "async_checks": async_checks,
                             "heads": heads,

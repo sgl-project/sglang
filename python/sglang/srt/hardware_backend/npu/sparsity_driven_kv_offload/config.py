@@ -213,8 +213,6 @@ def get_sparse_kv_budget(
             or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
         ),
         device_tail_tokens=256 if envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() else 0,
-        fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
-        fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
         graph_batch_capacity=sparse_batch_capacity(
             request_rows,
             max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),

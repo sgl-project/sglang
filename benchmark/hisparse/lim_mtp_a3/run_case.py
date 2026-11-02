@@ -40,14 +40,12 @@ ACTIVE_CASES = {
         "batch_size": 5,
         "offload": 0,
         "copy_sfa": 0,
-        "metadata_fusion": 0,
     },
     "offload_64k_b16_copysfa": {
         "input_tokens": 64000,
         "batch_size": 16,
         "offload": 1,
         "copy_sfa": 1,
-        "metadata_fusion": 1,
     },
 }
 
@@ -59,8 +57,6 @@ SAFE_ENV_KEYS = (
     "MTP",
     "GRAPH",
     "OUTPUT_TOKENS",
-    "METADATA_FUSION",
-    "PRE_METADATA_FUSION",
     "SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE",
     "SGLANG_ENABLE_ASYNC_ASSERT",
     "SGLANG_SOURCE_ROOT",
@@ -91,8 +87,6 @@ SAFE_ENV_KEYS = (
     "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD",
     "SGLANG_NPU_ENABLE_COPY_SFA",
     "SGLANG_NPU_SPARSE_KV_CACHE_SIZE",
-    "SGLANG_NPU_FUSED_LIM_PRE_METADATA",
-    "SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA",
     "DEEPEP_HYBRID_DEPLOYMENT",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS",
@@ -252,10 +246,6 @@ def predicted_launcher_env_snapshot(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": str(case["offload"]),
             "SGLANG_NPU_ENABLE_COPY_SFA": str(case["copy_sfa"]),
             "SGLANG_NPU_SPARSE_KV_CACHE_SIZE": "12288",
-            "SGLANG_NPU_FUSED_LIM_PRE_METADATA": "0",
-            "SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA": (
-                str(case["metadata_fusion"]) if mtp else "0"
-            ),
             "SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE": str(
                 int(bool(mtp and case["offload"]))
             ),
@@ -424,8 +414,6 @@ def launch_env(
         MTP="1" if mtp else "0",
         GRAPH="1",
         OUTPUT_TOKENS=str(FORMAL_OUTPUT_TOKENS),
-        METADATA_FUSION=str(case["metadata_fusion"] if mtp else 0),
-        PRE_METADATA_FUSION="0",
         SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE=(
             "1" if mtp and case["offload"] else "0"
         ),
@@ -709,8 +697,6 @@ def plan_commands(args: argparse.Namespace, case_id: str, port: int) -> dict[str
         {
             "CASE_ID": case_id,
             "MTP": "1",
-            "METADATA_FUSION": str(case["metadata_fusion"]),
-            "PRE_METADATA_FUSION": "0",
         }
     )
     launch_previews = {}

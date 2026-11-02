@@ -2,7 +2,7 @@
 
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -20,7 +20,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
     LIMDecodeAdapter,
-    prepare_lim_rows,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     mtp_compact_topk,
@@ -195,7 +194,7 @@ class TestLIMState(CustomTestCase):
                         torch.tensor(requests), torch.tensor(lengths), 4, 8
                     )
 
-    def test_copy_sfa_shares_native_miss_stride_and_masks_interior_padding(self):
+    def test_copy_sfa_uses_fused_metadata_and_shares_native_miss_stride(self):
         for capacity in (2048, 4096, 8192):
             with self.subTest(capacity=capacity):
                 self._check_copy_sfa_metadata(capacity)
@@ -224,7 +223,11 @@ class TestLIMState(CustomTestCase):
         )
         adapter = LIMDecodeAdapter.__new__(LIMDecodeAdapter)
         adapter.top_k, adapter.capacity = top_k, capacity
-        adapter.fused_copy_metadata = False
+        adapter._fused_copy_sfa_metadata = Mock()
+        adapter.rows = 5
+        adapter._metadata_next_scratch = ints(batch)
+        adapter._metadata_prefix_scratch = ints(6)
+        manager.tail_tokens = 0
         sources = torch.arange(batch * 32768, dtype=torch.int32).view(batch, 32768)
         plan = SimpleNamespace(
             source_ids=torch.arange(top_k, dtype=torch.int32).expand(batch, -1).clone(),
@@ -244,9 +247,6 @@ class TestLIMState(CustomTestCase):
         self.assertTrue(all(t.is_contiguous() for t in metadata))
         torch.testing.assert_close(metadata[3][0], sources[0])
         torch.testing.assert_close(metadata[3][2], sources[2])
-        self.assertEqual(metadata[5].tolist(), [capacity, 0, 7])
-        self.assertEqual(metadata[7].tolist(), [capacity, 0, capacity])
-        self.assertEqual(metadata[8].tolist(), [capacity, 0, capacity])
         for actual, native in zip(
             metadata[:6],
             (
@@ -259,27 +259,17 @@ class TestLIMState(CustomTestCase):
             ),
         ):
             self.assertEqual(actual.data_ptr(), native.data_ptr())
-        self.assertEqual(metadata[2][1].item(), 0)
+        adapter._fused_copy_sfa_metadata.assert_called_once()
+        kwargs = adapter._fused_copy_sfa_metadata.call_args.kwargs
+        self.assertIs(kwargs["source_ids"], plan.source_ids)
+        self.assertIs(kwargs["valid_rows"], plan.valid_rows)
+        self.assertIs(kwargs["sparse_rows"], plan.sparse_rows)
+        self.assertEqual(kwargs["capacity"], capacity)
+        self.assertEqual(kwargs["host_context_len"], context_len)
+        self.assertIsNone(kwargs["host_block_table"])
         self.assertEqual(
-            metadata[9][:, 0].tolist(), [3 * capacity // 128, 0, capacity // 128]
+            kwargs["actual_seq_lengths_kv"].data_ptr(), metadata[7].data_ptr()
         )
-        self.assertEqual(
-            metadata[10][:, 0].tolist(), [3 * context_len // 128, 0, context_len // 128]
-        )
-
-    def test_full_visible_large_cache_stays_cold_below_capacity(self):
-        for capacity in (4096, 8192):
-            with self.subTest(capacity=capacity):
-                result = prepare_lim_rows(
-                    torch.tensor([2048, capacity - 1, capacity, capacity + 1]),
-                    torch.tensor([1, 2, 3, 4]),
-                    torch.full((6,), -1, dtype=torch.int32),
-                    capacity,
-                    5,
-                    full_visible=True,
-                )
-                self.assertEqual(result[3].tolist(), [False, False, True, True])
-                self.assertEqual(result[5].tolist(), [-3, -3, -2, -2])
 
     def test_padded_graph_scratch_keeps_request_bounds_and_avoids_tail_workspace(self):
         self._check_padded_graph_scratch(3, 16, 2048)
@@ -305,9 +295,20 @@ class TestLIMState(CustomTestCase):
             start_layer=0,
             paged_kv_cache=SimpleNamespace(get_index_k_buffer=lambda _: key),
         )
-        with patch(
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim.load_fused_lim_operator",
-            return_value=None,
+        pre_module = ModuleType("pre_metadata")
+        pre_module.fused_prepare_lim_metadata = Mock()
+        copy_module = ModuleType("copy_metadata")
+        copy_module.fused_lim_copy_sfa_metadata = Mock()
+        module_prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+        with (
+            patch(module_prefix + "lim.load_fused_lim_operator", return_value=None),
+            patch.dict(
+                "sys.modules",
+                {
+                    module_prefix + "npu_lim_input_metadata": pre_module,
+                    module_prefix + "npu_lim_copy_sfa_metadata": copy_module,
+                },
+            ),
         ):
             adapter = LIMDecodeAdapter(manager)
         adapter.is_native = False
@@ -326,6 +327,14 @@ class TestLIMState(CustomTestCase):
         def reference_indexer(**_kwargs):
             return torch.arange(top_k, dtype=torch.int32).expand(batch, 1, -1)
 
+        # The device kernel owns row arithmetic; CPU tests verify that its
+        # preallocated outputs are used by the adapter and charged to the budget.
+        adapter._pre_safe_slots.copy_(torch.tensor([1, 2] + [rows] * (batch - 2)))
+        adapter._pre_lengths.copy_(torch.tensor([2049, 2177] + [0] * (batch - 2)))
+        adapter._pre_prefixes.copy_(adapter._pre_lengths)
+        adapter._pre_valid.copy_(torch.tensor([True, True] + [False] * (batch - 2)))
+        adapter._pre_sparse.zero_()
+        adapter._pre_next_prefix.fill_(-1)
         plan = adapter.select(
             manager,
             query=torch.empty((batch, 32, 128), dtype=torch.bfloat16),
@@ -336,6 +345,10 @@ class TestLIMState(CustomTestCase):
             layer_id=0,
             reference_indexer=reference_indexer,
         )
+        pre_module.fused_prepare_lim_metadata.assert_called_once()
+        kwargs = pre_module.fused_prepare_lim_metadata.call_args.kwargs
+        self.assertIs(kwargs["request_slots"], req_ids)
+        self.assertEqual(kwargs["safe_slots"].data_ptr(), plan.request_slots.data_ptr())
         self.assertEqual(plan.request_slots.tolist(), [1, 2] + [rows] * (batch - 2))
         self.assertTrue(torch.all(plan.source_ids[2:] == -1))
         budget = resolve_sparse_kv_budget(
@@ -405,10 +418,6 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             mtp.copy_sfa_bytes - baseline.copy_sfa_bytes, 8 * 4 * 32 * 512 * 2
         )
-        fused = resolve_sparse_kv_budget(
-            **options, mtp_full_visible=True, fused_copy_sfa_metadata=True
-        )
-        self.assertEqual(fused.adapter_bytes - mtp.adapter_bytes, (4 + 1 + 8) * 4)
         with self.assertRaisesRegex(ValueError, "capacity"):
             resolve_sparse_kv_budget(
                 **{**options, "cache_tokens": 4096}, mtp_full_visible=True
@@ -417,47 +426,6 @@ class TestLIMState(CustomTestCase):
             resolve_sparse_kv_budget(
                 **{**options, "copy_sfa": False}, mtp_full_visible=True
             )
-
-    def test_full_visible_q1_transition_padding_and_reuse(self):
-        previous = torch.tensor([-1, -1, 2048, 3000, -1], dtype=torch.int32)
-        result = prepare_lim_rows(
-            torch.tensor([2048, 2049, 2177, 0]),
-            torch.tensor([1, 2, 3, 0]),
-            previous,
-            2048,
-            4,
-            full_visible=True,
-        )
-        self.assertEqual(result[2].tolist(), [2048, 2049, 2177, 0])
-        self.assertEqual(result[5].tolist(), [-2, -1, -2, -3])
-        self.assertEqual(result[0].tolist(), [1, 2, 3, 4])
-
-    def test_page_boundary_and_cold_to_warm(self):
-        previous = torch.full((5,), -1, dtype=torch.int32)
-        slots = torch.tensor([1, 2, 3])
-        lengths = torch.tensor([2048, 2049, 2176])
-        result = prepare_lim_rows(lengths, slots, previous, 2048, 4)
-        self.assertEqual(result[2].tolist(), [1920, 2048, 2048])
-        self.assertEqual(result[5].tolist(), [-3, -2, -2])
-        previous[result[0].long()] = result[6]
-        result = prepare_lim_rows(lengths + 1, slots, previous, 2048, 4)
-        self.assertEqual(result[2].tolist(), [2048, 2048, 2176])
-        self.assertEqual(result[5].tolist(), [-2, -1, -1])
-
-    def test_padding_reset_and_rollback(self):
-        previous = torch.tensor([-1, 8192, -1, -1, -1], dtype=torch.int32)
-        slots = torch.tensor([1, 0, -1, 99])
-        result = prepare_lim_rows(
-            torch.tensor([4097, 100, 0, 9000]), slots, previous, 4096, 4
-        )
-        self.assertEqual(result[0].tolist(), [1, 4, 4, 4])
-        self.assertEqual(result[1].tolist(), [4097, 0, 0, 0])
-        self.assertEqual(result[5].tolist(), [-2, -3, -3, -3])
-        previous[1] = -1  # request pool slot was freed/reused
-        result = prepare_lim_rows(
-            torch.tensor([8193]), torch.tensor([1]), previous, 4096, 4
-        )
-        self.assertEqual(result[5].tolist(), [-2])
 
     def test_copy_sfa_budget_includes_planner_and_page_aligned_host_rows(self):
         budget = resolve_sparse_kv_budget(

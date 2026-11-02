@@ -240,11 +240,7 @@ def forward_sparsity_driven_kv_offload(
             result = sparse_kv_manager.copy_sfa_mtp_verify(
                 layer, query_nope, query_rope, layer.tp_q_head_num, layer.scaling, plan
             )
-            sparse_kv_manager.last_decode_path = (
-                "mtp_verify_lim_copy_sfa_fused_metadata"
-                if sparse_kv_manager.lim_adapter.fused_copy_metadata
-                else "mtp_verify_lim_copy_sfa"
-            )
+            sparse_kv_manager.last_decode_path = "mtp_verify_lim_copy_sfa"
             forward_batch.sparse_kv_decode_path = sparse_kv_manager.last_decode_path
             return torch.nn.functional.pad(result, (0, 0, 0, q_nope.shape[0] - rows))
         return _forward_sparse_mtp(
