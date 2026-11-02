@@ -65,10 +65,10 @@ class TestSWAPoolVHeadDim(unittest.TestCase):
         and `TritonAttnBackend.__init__` reads `get_value_buffer(start_layer)`;
         with start_layer fixed at 0 that raised KeyError at startup."""
         pool = _swa_pool(swa_attention_layer_ids=(2,), full_attention_layer_ids=(3,))
-        self.assertEqual(pool.start_layer, 2)
         self.assertEqual(
             pool.get_value_buffer(pool.start_layer).shape[-1], _SWA_V_HEAD_DIM
         )
+        self.assertEqual(pool.start_layer, 2)
 
 
 if __name__ == "__main__":
