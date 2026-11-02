@@ -195,7 +195,7 @@ def record_network_transfer(
 def _state_rows(storage, state_types: Sequence, state_indices: Optional[Sequence]):
     """Each state entry's ``(sub_pool, slots)`` a transfer addresses. A
     generator: a storage whose rows never move records nothing and never asks."""
-    from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
+    from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 
     if state_indices is None:
         return

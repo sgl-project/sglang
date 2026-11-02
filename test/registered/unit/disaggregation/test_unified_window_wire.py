@@ -31,9 +31,13 @@ from sglang.srt.disaggregation.utils import (
     state_wire,
 )
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
-from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
+from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    MHAGeometry,
+    WindowLayers,
+    kv_layer_decls,
+)
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
-from sglang.srt.mem_cache.kv.router import KV_PART
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

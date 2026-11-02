@@ -564,7 +564,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
         """
-        from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.kv.advance import coalesce_ranges
 
         allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]

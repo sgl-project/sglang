@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
