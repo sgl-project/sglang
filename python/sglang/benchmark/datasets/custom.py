@@ -80,14 +80,21 @@ def sample_custom_requests(
                 except json.JSONDecodeError:
                     continue  # skip lines with JSON errors
 
-    # Filter out the conversations with less than 2 turns.
+    # Skip malformed records and conversations with fewer than 2 turns.
     processed_dataset = []
     for data in dataset:
+        if not isinstance(data, dict):
+            continue
         convs = data.get("conversations", data.get("conversation", []))
-        if len(convs) >= 2:
-            user_turn = convs[0].get("content", convs[0].get("value", ""))
-            assist_turn = convs[1].get("content", convs[1].get("value", ""))
-            processed_dataset.append((user_turn, assist_turn))
+        if not isinstance(convs, list) or len(convs) < 2:
+            continue
+        if not isinstance(convs[0], dict) or not isinstance(convs[1], dict):
+            continue
+        user_turn = convs[0].get("content", convs[0].get("value", ""))
+        assist_turn = convs[1].get("content", convs[1].get("value", ""))
+        if not isinstance(user_turn, str) or not isinstance(assist_turn, str):
+            continue
+        processed_dataset.append((user_turn, assist_turn))
     dataset = processed_dataset
     random.shuffle(dataset)
 
