@@ -28,8 +28,10 @@ import signal
 import sys
 import threading
 import zlib
+from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing import shared_memory
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 import msgspec
@@ -555,6 +557,26 @@ def _send_output_to_tokenizer_workers(
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
+    @contextmanager
+    def _timed_processing(self: DetokenizerManager):
+        """Time one message's dispatch and send for the processing histogram.
+
+        The histogram is created by DetokenizerManager when metrics are
+        enabled. The receive wait happens before this context is entered, so
+        it is excluded. When metrics are disabled this is a no-op and the
+        clock is never read. A message whose handling raises still records
+        an observation.
+        """
+        histogram = getattr(self, "processing_seconds", None)
+        if histogram is None:
+            yield
+        else:
+            start = perf_counter()
+            try:
+                yield
+            finally:
+                histogram.observe(perf_counter() - start)
+
     def maybe_clear_socket_mapping(self: DetokenizerManager):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
@@ -567,23 +589,24 @@ class MultiHttpWorkerDetokenizerMixin:
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
-            output = self._request_dispatcher(recv_obj)
-            if output is not None:
-                # Fan out the output back to the originating tokenizer worker(s).
-                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-                # forward either batched or single requests, so handle both shapes.
-                if isinstance(recv_obj, BaseBatchReq):
-                    _send_output_to_tokenizer_workers(
-                        output, output.http_worker_ipcs, self.socket_mapping
-                    )
-                elif isinstance(recv_obj, BaseReq):
-                    self.socket_mapping.send_output(
-                        recv_obj.http_worker_ipc, output, is_tokenizer=True
-                    )
-                else:
-                    raise ValueError(
-                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                    )
+            with self._timed_processing():
+                output = self._request_dispatcher(recv_obj)
+                if output is not None:
+                    # Fan out the output back to the originating tokenizer worker(s).
+                    # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                    # forward either batched or single requests, so handle both shapes.
+                    if isinstance(recv_obj, BaseBatchReq):
+                        _send_output_to_tokenizer_workers(
+                            output, output.http_worker_ipcs, self.socket_mapping
+                        )
+                    elif isinstance(recv_obj, BaseReq):
+                        self.socket_mapping.send_output(
+                            recv_obj.http_worker_ipc, output, is_tokenizer=True
+                        )
+                    else:
+                        raise ValueError(
+                            f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                        )
             self.soft_watchdog.feed()
 
 

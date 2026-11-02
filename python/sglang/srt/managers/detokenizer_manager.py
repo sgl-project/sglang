@@ -141,8 +141,32 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
+        self.processing_seconds = None
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+            # Import after the launcher configures PROMETHEUS_MULTIPROC_DIR.
+            from prometheus_client import Histogram
+
+            self.processing_seconds = Histogram(
+                "sglang:detokenizer_processing_seconds",
+                "Time spent handling one received message in the detokenizer, "
+                "including sends.",
+                buckets=(
+                    0.00001,
+                    0.00005,
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1.0,
+                    5.0,
+                    10.0,
+                ),
+            )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -160,9 +184,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
-            output = self._request_dispatcher(recv_obj)
-            if output is not None:
-                sock_send(self.send_to_tokenizer, output)
+            with self._timed_processing():
+                output = self._request_dispatcher(recv_obj)
+                if output is not None:
+                    sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(
