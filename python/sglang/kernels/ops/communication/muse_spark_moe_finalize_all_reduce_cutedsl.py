@@ -34,6 +34,8 @@ import math
 
 import torch
 
+from sglang.kernels.arch import current_arch
+
 try:
     import cuda.bindings.driver as cuda
     import cutlass
@@ -506,10 +508,10 @@ if HAS_CUTEDSL:
 
     @functools.lru_cache(maxsize=16)
     def _get_sm_version(device=None) -> int:
-        if not torch.cuda.is_available():
+        cuda_arch = current_arch().cuda
+        if cuda_arch is None:
             return 80
-        props = torch.cuda.get_device_properties(device)
-        return props.major * 10 + props.minor
+        return cuda_arch.sm_version
 
     # =================================================================
     # PTX Wrappers
