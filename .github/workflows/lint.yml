@@ -57,8 +57,19 @@ jobs:
           workspaces: rust
           shared-key: "rust-workspace-lint"
 
+      # On pull requests, lint only the files changed by the PR (base..head)
+      # instead of the whole tree, which keeps feedback fast. `push` events have
+      # no diff range, so they fall back to checking all files.
       - name: Run pre-commit checks
-        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SKIP=no-commit-to-branch pre-commit run \
+              --from-ref "${{ github.event.pull_request.base.sha }}" \
+              --to-ref "${{ github.event.pull_request.head.sha }}" \
+              --show-diff-on-failure
+          else
+            SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+          fi
 
       - name: Run lychee docs checks (offline references)
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
