@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -16,10 +18,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    resolve_sequence_shard,
+)
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
+    LingBotVideoSparseMoeBlock,
+    MoeExpertParallelInfo,
+    resolve_moe_expert_parallel,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -32,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
     make_joint_position_ids,
+    pack_expert_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -111,7 +120,7 @@ def test_router_bias_shifts_selection_but_not_gate_weights():
     assert abs(picked[3] - float(raw[1])) < 1e-5
 
 
-def _sdpa(q, k, v, attn_mask=None, attn_mask_meta=None):
+def _sdpa(q, k, v, attn_mask=None, attn_mask_meta=None, **_sp_kwargs):
     q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     if attn_mask is not None and attn_mask.dim() == 2:
         attn_mask = attn_mask[:, None, None, :]
@@ -173,7 +182,7 @@ def test_attention_forwards_2d_mask_and_varlen_metadata(monkeypatch):
     hidden = num_heads * head_dim
     captured = {}
 
-    def capture_attention(q, k, v, attn_mask=None, attn_mask_meta=None):
+    def capture_attention(q, k, v, attn_mask=None, attn_mask_meta=None, **_sp_kwargs):
         captured["mask"] = attn_mask
         captured["meta"] = attn_mask_meta
         return _sdpa(q, k, v, attn_mask=attn_mask)
@@ -335,11 +344,16 @@ def test_grouped_experts_store_packed_w13_weight():
 
 
 def test_preprocess_packs_w1_w3_into_w13_weight():
-    pack = LingBotVideoTransformer3DModel.preprocess_loaded_state_dict
-    E, I, H = 2, 3, 4
-    w1 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H)
-    w2 = torch.arange(E * H * I, dtype=torch.float32).reshape(E, H, I)
-    w3 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H) + 100.0
+    E, M, H = 2, 3, 4
+    ep_info = MoeExpertParallelInfo(
+        ep_size=1,
+        ep_rank=0,
+        num_local_experts=E,
+        local_expert_start=0,
+    )
+    w1 = torch.arange(E * M * H, dtype=torch.float32).reshape(E, M, H)
+    w2 = torch.arange(E * H * M, dtype=torch.float32).reshape(E, H, M)
+    w3 = torch.arange(E * M * H, dtype=torch.float32).reshape(E, M, H) + 100.0
     # block 0: w1 before w3; block 1: w3 before w1 (order-independence).
     src = [
         ("blocks.0.ffn.experts.w1", w1),
@@ -350,7 +364,7 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
         ("blocks.1.ffn.experts.w2", w2.clone()),
         ("blocks.1.ffn.experts.w1", w1.clone()),
     ]
-    out = dict(pack(None, iter(src)))
+    out = dict(pack_expert_weights(iter(src), ep_info=ep_info))
     assert set(out.keys()) == {
         "blocks.0.ffn.experts.w13_weight",
         "blocks.0.ffn.experts.w2",
@@ -394,3 +408,178 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         torch.testing.assert_close(
             vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
         )
+
+
+def _ep_info(ep_size: int, ep_rank: int, num_experts: int) -> MoeExpertParallelInfo:
+    num_local = num_experts // ep_size
+    return MoeExpertParallelInfo(
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        num_local_experts=num_local,
+        local_expert_start=ep_rank * num_local,
+    )
+
+
+def _make_moe_block(**overrides):
+    kwargs = dict(
+        hidden_size=8,
+        intermediate_size=4,
+        num_experts=8,
+        top_k=2,
+        score_func="sigmoid",
+        norm_topk_prob=True,
+        n_group=None,
+        topk_group=None,
+        routed_scaling_factor=1.0,
+        n_shared_experts=1,
+    )
+    kwargs.update(overrides)
+    return LingBotVideoSparseMoeBlock(**kwargs)
+
+
+def test_expert_parallel_shards_tile_the_dense_checkpoint():
+    num_experts, intermediate_size, hidden_size, ep_size = 8, 3, 4, 4
+    w1 = torch.arange(
+        num_experts * intermediate_size * hidden_size, dtype=torch.float32
+    ).reshape(num_experts, intermediate_size, hidden_size)
+    w2 = torch.arange(
+        num_experts * hidden_size * intermediate_size, dtype=torch.float32
+    ).reshape(num_experts, hidden_size, intermediate_size)
+    w3 = w1 + 100.0
+    router = torch.randn(num_experts, hidden_size)
+    shared = torch.randn(intermediate_size, hidden_size)
+    src = [
+        ("blocks.0.ffn.experts.w1", w1),
+        ("blocks.0.ffn.experts.w2", w2),
+        ("blocks.0.ffn.experts.w3", w3),
+        ("blocks.0.ffn.router.weight", router),
+        ("blocks.0.ffn.shared_experts.up_proj.weight", shared),
+    ]
+
+    shards = [
+        dict(
+            pack_expert_weights(iter(src), ep_info=_ep_info(ep_size, rank, num_experts))
+        )
+        for rank in range(ep_size)
+    ]
+
+    for shard in shards:
+        assert (
+            shard["blocks.0.ffn.experts.w13_weight"].shape[0] == num_experts // ep_size
+        )
+        assert shard["blocks.0.ffn.experts.w2"].shape[0] == num_experts // ep_size
+        for key in (
+            "blocks.0.ffn.experts.w13_weight",
+            "blocks.0.ffn.experts.w2",
+        ):
+            tensor = shard[key]
+            assert tensor.untyped_storage().nbytes() == (
+                tensor.numel() * tensor.element_size()
+            )
+        torch.testing.assert_close(shard["blocks.0.ffn.router.weight"], router)
+        torch.testing.assert_close(
+            shard["blocks.0.ffn.shared_experts.up_proj.weight"], shared
+        )
+
+    for key, dense in (
+        ("blocks.0.ffn.experts.w13_weight", torch.cat((w1, w3), dim=1)),
+        ("blocks.0.ffn.experts.w2", w2),
+    ):
+        torch.testing.assert_close(torch.cat([s[key] for s in shards]), dense)
+
+
+@pytest.mark.parametrize("ep_rank", [0, 3])
+def test_moe_block_with_expert_parallel_owns_only_its_shard(ep_rank):
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.moe.create_moe_token_dispatcher",
+        return_value=object(),
+    ):
+        block = _make_moe_block(ep_info=_ep_info(4, ep_rank, 8))
+
+    assert block.ep_info.enabled
+    assert block.num_local_experts == 2
+    assert block.ep_info.local_expert_start == ep_rank * 2
+    assert block.experts.w13_weight.shape[0] == 2
+    assert block.experts.w2.shape[0] == 2
+    assert block.router.weight.shape[0] == 8
+
+
+def test_resolve_ep_disabled_ignores_sp():
+    info = resolve_moe_expert_parallel(8, ep_size=1)
+    assert not info.enabled
+    assert info.ep_size == 1
+    assert info.ep_rank == 0
+    assert info.num_local_experts == 8
+
+
+def test_resolve_ep_uses_sp_rank_for_larger_degree():
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.layers.moe.get_sp_world_size",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.moe.get_sp_parallel_rank",
+            return_value=3,
+        ),
+    ):
+        info = resolve_moe_expert_parallel(8, ep_size=4)
+
+    assert info.enabled
+    assert info.ep_size == 4
+    assert info.ep_rank == 3
+    assert info.num_local_experts == 2
+    assert info.local_expert_start == 6
+
+
+def test_resolve_ep_requires_matching_sp_world_size():
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.moe.get_sp_world_size",
+        return_value=4,
+    ):
+        with pytest.raises(RuntimeError, match="SP world size"):
+            resolve_moe_expert_parallel(8, ep_size=2)
+
+
+def test_lingbot_uses_model_level_sequence_sharding():
+    config = LingBotVideoMoEPipelineConfig()
+    assert resolve_sequence_shard(config, None)
+
+    latents = torch.zeros(1, 16, 21, 4, 4)
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe.get_sp_world_size",
+        return_value=2,
+    ):
+        sharded, did_shard = config.shard_latents_for_sp(
+            SimpleNamespace(enable_sequence_shard=True), latents
+        )
+        with pytest.raises(ValueError, match="model-level sequence sharding"):
+            config.shard_latents_for_sp(
+                SimpleNamespace(enable_sequence_shard=False), latents
+            )
+
+    assert not did_shard
+    assert sharded is latents
+
+
+def test_lingbot_sp_rejects_dynamic_batching():
+    config = LingBotVideoMoEPipelineConfig()
+    with pytest.raises(ValueError, match="dynamic batching"):
+        config.validate_server_args(
+            SimpleNamespace(ep_size=1, sp_degree=2, batching_max_size=2)
+        )
+
+
+def test_expert_parallel_model_rejects_full_weight_updates():
+    model = SimpleNamespace(ep_info=_ep_info(2, 0, 8))
+    with pytest.raises(ValueError, match="expert parallelism"):
+        LingBotVideoTransformer3DModel.validate_weight_update_source(
+            model, weights_path=None
+        )
+
+
+def test_dense_model_accepts_full_weight_updates():
+    model = SimpleNamespace(ep_info=resolve_moe_expert_parallel(8, ep_size=1))
+    LingBotVideoTransformer3DModel.validate_weight_update_source(
+        model, weights_path="/weights"
+    )

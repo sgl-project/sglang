@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 
 
 def _qwen3vl_postprocess_text(
@@ -58,7 +59,31 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         self.vae_config.load_decoder = True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(dit_layerwise_offload_modes=("memory",))
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            supports_expert_parallel=True,
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        num_experts = self.dit_config.arch_config.num_experts
+        if server_args.ep_size > 1 and num_experts % server_args.ep_size != 0:
+            raise ValueError(
+                f"num_experts ({num_experts}) must be divisible by "
+                f"ep_size ({server_args.ep_size})"
+            )
+        if server_args.sp_degree > 1 and server_args.batching_max_size > 1:
+            raise ValueError(
+                "LingBot-Video MoE sequence parallelism does not support "
+                "dynamic batching"
+            )
+
+    def shard_latents_for_sp(self, batch, latents):
+        if get_sp_world_size() > 1 and not batch.enable_sequence_shard:
+            raise ValueError(
+                "LingBot-Video MoE requires model-level sequence sharding when "
+                "sp_degree is greater than 1"
+            )
+        return latents, False
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[0]

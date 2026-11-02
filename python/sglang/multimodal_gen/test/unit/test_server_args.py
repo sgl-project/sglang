@@ -26,6 +26,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
+    LingBotVideoMoEPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
@@ -99,6 +102,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.server_args import server_args as server_args_module
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+from sglang.test.test_utils import CustomTestCase
 
 
 def _from_dict_without_model_resolution(
@@ -2020,6 +2024,38 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
+    def test_ep_size_makes_auto_cfg_back_off(self):
+        args = self._from_dict_with_pipeline_config(
+            LingBotVideoMoEPipelineConfig(),
+            kwargs={
+                "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+                "num_gpus": 2,
+                "ep_size": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertEqual(args.cfg_parallel_degree, 1)
+        self.assertEqual(args.ep_size, 2)
+
+    def test_ep_preserves_the_sp2_default_exchange(self):
+        args = self._from_dict_with_pipeline_config(
+            LingBotVideoMoEPipelineConfig(),
+            kwargs={
+                "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+                "num_gpus": 2,
+                "ep_size": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.kv_gather_degree, 2)
+        self.assertTrue(args.sp_split_auto)
+
     def test_cache_dit_rejects_explicit_fsdp(self):
         with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
             with self.assertRaisesRegex(ValueError, "FSDP inference"):
@@ -3901,6 +3937,115 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.denoiser_ring, 2)
         self.assertEqual(args.encoder_tp, 1)
         self.assertEqual(args.decoder_sp, 8)
+
+
+class TestExpertParallelMesh(CustomTestCase):
+    def _args(self, **kwargs):
+        return _from_dict_without_model_resolution(
+            {"model_path": "/fake", "performance_mode": "manual", **kwargs},
+            pipeline_config=LingBotVideoMoEPipelineConfig(),
+        )
+
+    def test_ep_accepts_valid_topologies(self):
+        cases = {
+            "shares the SP axis": dict(num_gpus=2, ep_size=2),
+            "composes with TP": dict(num_gpus=4, tp_size=2, ep_size=2),
+            "larger degree": dict(num_gpus=8, tp_size=2, ep_size=4),
+            "ring": dict(num_gpus=2, ep_size=2, ulysses_degree=1, ring_degree=2),
+            "kv_gather": dict(num_gpus=2, ep_size=2, kv_gather_degree=2),
+            "multi-node": dict(
+                num_gpus=2, nnodes=2, ep_size=2, dist_init_addr="127.0.0.1:29500"
+            ),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                args = self._args(**kwargs)
+                self.assertEqual(args.ep_size, kwargs["ep_size"])
+                self.assertEqual(args.sp_degree, args.ep_size)
+
+        with self.subTest("ROCm"):
+            args = self._args(num_gpus=2, ep_size=2)
+            with (
+                patch.object(current_platform, "is_cuda", return_value=False),
+                patch.object(current_platform, "is_rocm", return_value=True),
+            ):
+                args._validate_expert_parallel()
+
+    def test_ep_rejects_invalid_configs(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        cases = (
+            ("non-positive ep_size", dict(num_gpus=4, ep_size=0), "ep_size"),
+            (
+                "indivisible experts",
+                dict(num_gpus=3, ep_size=3, ulysses_degree=1, ring_degree=3),
+                r"num_experts \(128\) must be divisible by ep_size \(3\)",
+            ),
+            (
+                "ep_size != sp_degree",
+                dict(num_gpus=4, ep_size=2, ulysses_degree=4),
+                "sp_degree == ep_size",
+            ),
+            (
+                "unassigned GPU ranks",
+                dict(num_gpus=4, ep_size=2, sp_degree=2, ulysses_degree=2),
+                "physical parallel-axis product",
+            ),
+            (
+                "disaggregated mode",
+                dict(num_gpus=2, ep_size=2, disagg_mode=True),
+                "monolithic diffusion serving",
+            ),
+            (
+                "disaggregated role",
+                dict(num_gpus=2, ep_size=2, disagg_role=RoleType.DENOISER),
+                "monolithic diffusion serving",
+            ),
+            (
+                "torch.compile",
+                dict(num_gpus=2, ep_size=2, enable_torch_compile=True),
+                "does not support torch.compile",
+            ),
+            (
+                "FSDP inference",
+                dict(num_gpus=2, ep_size=2, use_fsdp_inference=True),
+                "FSDP inference",
+            ),
+        )
+        for name, kwargs, pattern in cases:
+            with self.subTest(name), self.assertRaisesRegex(ValueError, pattern):
+                self._args(**kwargs)
+
+        with (
+            self.subTest("pipeline without EP support"),
+            self.assertRaisesRegex(
+                ValueError,
+                "QwenImagePipelineConfig does not support expert parallelism",
+            ),
+        ):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/fake",
+                    "performance_mode": "manual",
+                    "num_gpus": 2,
+                    "ep_size": 2,
+                },
+                pipeline_config=QwenImagePipelineConfig(),
+            )
+
+        with self.subTest("unsupported platform"):
+            args = self._args(num_gpus=2, ep_size=2)
+            with (
+                patch.object(current_platform, "is_cuda", return_value=False),
+                patch.object(current_platform, "is_rocm", return_value=False),
+                self.assertRaisesRegex(ValueError, "requires CUDA or ROCm"),
+            ):
+                args._validate_expert_parallel()
+
+    def test_ep_disabled_leaves_sp_budget_untouched(self):
+        args = self._args(num_gpus=4, tp_size=2)
+        self.assertEqual(args.ep_size, 1)
+        self.assertEqual(args.sp_degree, 2)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):
