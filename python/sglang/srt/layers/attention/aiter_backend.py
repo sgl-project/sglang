@@ -6,11 +6,12 @@ from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 end to end attention solution with aiter kernels
 """
 
+import functools
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
@@ -24,6 +25,9 @@ from sglang.kernels.ops.attention.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
     spec_kv_index_token_blocks,
+)
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -149,6 +153,27 @@ _MLA_REDUCE_V1_HEADS = {
     512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
 }
 
+# Instances newer than the pinned AITER (ROCm/aiter#7087 adds nh12_hd128);
+# fold them into the table above once docker/rocm.Dockerfile pins an AITER with them.
+_MLA_REDUCE_V1_OPTIONAL_HEADS = {128: frozenset({12})}
+
+
+@functools.lru_cache(maxsize=None)
+def _aiter_has_mla_reduce_v1_instance(num_head: int, head_dim: int) -> bool:
+    # mla_reduce_v1 aborts the process on a shape it has no instance for,
+    # so probe the source it is built from: one reduce_instances/nh<H>_hd<D>.cu per shape.
+    try:
+        from aiter.jit.core import AITER_CSRC_DIR
+    except ImportError:
+        return False
+    return os.path.isfile(
+        os.path.join(
+            AITER_CSRC_DIR,
+            "kernels/mla/reduce_instances",
+            f"nh{num_head}_hd{head_dim}.cu",
+        )
+    )
+
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
@@ -179,6 +204,9 @@ class MlaPrefillPsMetadata:
     is_causal: bool
     need_lse: bool
     num_partial_tiles: int
+    # Query rows of the requests with keys in a prefix chunk (a slice when adjacent),
+    # set when the metadata covers only those; the other rows leave with LSE -inf.
+    active_q_rows: Optional[Union[slice, torch.Tensor]] = None
 
 
 def _kv_cache_is_vectorized_5d(pool) -> bool:
@@ -246,7 +274,7 @@ class ForwardMetadata:
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
-    chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
+    chunked_prefix_ps_metadatas: Optional[list[MlaPrefillPsMetadata]] = None
     # cprr
     global_kv_indptr: Optional[torch.Tensor] = None
     use_asm_cprr_verify: bool = False
@@ -297,6 +325,14 @@ _AITER_PARTITION_SIZE_ROCM = 256
 # Query rows one asm-prefill work tile covers. The scheduler, the partial
 # buffers and mla_reduce_v1 must all agree on it.
 _PREFILL_TILE_Q = 256
+
+
+def _zero_pad_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Append zero heads to x [tokens, heads, dim] up to num_heads."""
+    out = x.new_empty((x.shape[0], num_heads, *x.shape[2:]))
+    out[:, : x.shape[1]].copy_(x)
+    out[:, x.shape[1] :].zero_()
+    return out
 
 
 _DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
@@ -465,7 +501,7 @@ class AiterAttnBackend(AttentionBackend):
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
         # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
-        # else is tiled up to one it does carry, or falls back to
+        # else is zero-padded up to one it does carry, or falls back to
         # flash_attn_varlen_func when the table has nothing to reach.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
@@ -740,7 +776,11 @@ class AiterAttnBackend(AttentionBackend):
         mla prefill, return None if it is invalid so we will fall it back to
         aiter fa implementation.
         """
-        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
+        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset()) | {
+            h
+            for h in _MLA_REDUCE_V1_OPTIONAL_HEADS.get(v_head_dim, ())
+            if _aiter_has_mla_reduce_v1_instance(num_head=h, head_dim=v_head_dim)
+        }
         if num_head in supported:
             return num_head
         if num_head != num_kv_head:
@@ -1928,13 +1968,12 @@ class AiterAttnBackend(AttentionBackend):
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
         # mla_reduce_v1 dispatches on the head count, so a model it has no
-        # instantiation for runs on the next one up, with the query heads tiled
-        # to fill and the extra output columns sliced back off.
+        # instantiation for runs on the next one up, with zero heads sliced back off.
         head_pad = self.fp8_prefill_num_head - nhead
         if head_pad:
-            q = self.pad_heads(q, self.fp8_prefill_num_head)
-            k = self.pad_heads(k, self.fp8_prefill_num_head)
-            v = self.pad_heads(v, self.fp8_prefill_num_head)
+            q = _zero_pad_heads(q, num_heads=self.fp8_prefill_num_head)
+            k = _zero_pad_heads(k, num_heads=self.fp8_prefill_num_head)
+            v = _zero_pad_heads(v, num_heads=self.fp8_prefill_num_head)
             nhead = self.fp8_prefill_num_head
 
         if q.dtype != fp8_dtype:
@@ -3494,13 +3533,16 @@ class AiterAttnBackend(AttentionBackend):
                 )
             )
 
-        metadatas: list[Optional[MlaPrefillPsMetadata]] = []
+        metadatas: list[MlaPrefillPsMetadata] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
-            # An empty kv range has no PS metadata shape.
-            # _forward_extend_prefix_chunk falls back to varlen there.
             if forward_batch.prefix_chunk_has_zero_kv[i]:
-                metadatas.append(None)
+                metadatas.append(
+                    self._build_active_prefix_chunk_ps_metadata(
+                        chunk_lens_cpu=chunk_lens_cpu,
+                        extend_lens_cpu=extend_lens_cpu,
+                    )
+                )
                 continue
             chunk_indptr_cpu = torch.zeros(len(chunk_lens_cpu) + 1, dtype=torch.int32)
             chunk_indptr_cpu[1:] = torch.cumsum(chunk_lens_cpu, dim=0)
@@ -3519,6 +3561,45 @@ class AiterAttnBackend(AttentionBackend):
                 )
             )
         self.forward_metadata.chunked_prefix_ps_metadatas = metadatas
+
+    def _build_active_prefix_chunk_ps_metadata(
+        self,
+        *,
+        chunk_lens_cpu: torch.Tensor,
+        extend_lens_cpu: torch.Tensor,
+    ) -> MlaPrefillPsMetadata:
+        # The PS scheduler rejects a request without keys;
+        # the chunk's k/v hold the others' keys in order, so the identity page table holds.
+        active = chunk_lens_cpu > 0
+        q_lens_cpu = extend_lens_cpu[active]
+        kv_lens_cpu = chunk_lens_cpu[active]
+        qo_indptr_cpu = torch.zeros(len(q_lens_cpu) + 1, dtype=torch.int32)
+        qo_indptr_cpu[1:] = torch.cumsum(q_lens_cpu, dim=0)
+        kv_indptr_cpu = torch.zeros(len(kv_lens_cpu) + 1, dtype=torch.int32)
+        kv_indptr_cpu[1:] = torch.cumsum(kv_lens_cpu, dim=0)
+
+        row_ends = torch.cumsum(extend_lens_cpu, dim=0)
+        row_starts = row_ends - extend_lens_cpu
+        reqs = torch.nonzero(active).flatten().tolist()
+        if reqs[-1] - reqs[0] + 1 == len(reqs):
+            rows = slice(int(row_starts[reqs[0]]), int(row_ends[reqs[-1]]))
+        else:
+            rows = torch.cat(
+                [torch.arange(int(row_starts[b]), int(row_ends[b])) for b in reqs]
+            ).to(self.device)
+
+        ps = self._build_prefill_ps_metadata(
+            qo_indptr=qo_indptr_cpu.to(self.device),
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_indptr=kv_indptr_cpu.to(self.device),
+            kv_indptr_cpu=kv_indptr_cpu,
+            kv_lens_cpu=kv_lens_cpu,
+            num_kv_tokens=int(kv_indptr_cpu[-1]),
+            max_q_len=int(q_lens_cpu.max()),
+            is_causal=False,
+            need_lse=True,
+        )
+        return replace(ps, active_q_rows=rows)
 
     def _build_prefill_ps_metadata(
         self,
@@ -3597,6 +3678,24 @@ class AiterAttnBackend(AttentionBackend):
             num_partial_tiles=num_partial_tiles,
         )
 
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # With PS metadata every chunk runs the asm fp8 kernel at unit K/V scale,
+        # so one pass writes both in fp8; without it they stay bf16 for varlen.
+        if self.forward_metadata.chunked_prefix_ps_metadatas is not None:
+            return mla_kv_pack_quantize_fp8(
+                k_nope, k_pe, v, fp8_dtype=fp8_dtype, enable_pdl=False
+            )
+        nope_dim = k_nope.shape[-1]
+        k = k_nope.new_empty((*k_nope.shape[:-1], nope_dim + k_pe.shape[-1]))
+        k[..., :nope_dim] = k_nope
+        k[..., nope_dim:] = k_pe
+        return k, v
+
     def _forward_extend_prefix_chunk(
         self,
         q: torch.Tensor,
@@ -3607,8 +3706,19 @@ class AiterAttnBackend(AttentionBackend):
     ):
         idx = forward_batch.prefix_chunk_idx
         ps_metadatas = self.forward_metadata.chunked_prefix_ps_metadatas
-        if ps_metadatas is not None and ps_metadatas[idx] is not None:
-            return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps_metadatas[idx])
+        if ps_metadatas is not None:
+            ps = ps_metadatas[idx]
+            rows = ps.active_q_rows
+            if rows is None:
+                return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps)
+            out_rows, lse_rows = self._mla_fp8_prefill_attn_ps(q[rows], k, v, layer, ps)
+            # merge_state weights a -inf LSE row by zero,
+            # so its output only has to be finite.
+            output = out_rows.new_zeros((q.shape[0], *out_rows.shape[1:]))
+            lse = lse_rows.new_full((q.shape[0], lse_rows.shape[1]), float("-inf"))
+            output[rows] = out_rows
+            lse[rows] = lse_rows
+            return output, lse
 
         output, lse = flash_attn_varlen_func(
             q,
