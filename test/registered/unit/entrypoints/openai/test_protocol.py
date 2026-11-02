@@ -65,6 +65,35 @@ class TestCompletionRequest(unittest.TestCase):
             CompletionRequest(model="test-model")  # missing prompt
 
 
+class TestPromptCacheOptions(unittest.TestCase):
+    """prompt_cache_options.ttl is parsed into seconds and validated."""
+
+    def test_ttl_units(self):
+        for ttl, seconds in (("90s", 90), ("5m", 300), ("1h", 3600)):
+            with self.subTest(ttl=ttl):
+                request = ChatCompletionRequest(
+                    model="test",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    prompt_cache_options={"ttl": ttl},
+                )
+                self.assertEqual(request.prompt_cache_options.ttl_seconds(), seconds)
+
+    def test_absent_ttl(self):
+        request = CompletionRequest(model="test", prompt="Hi")
+        self.assertIsNone(request.prompt_cache_options)
+        request = CompletionRequest(
+            model="test", prompt="Hi", prompt_cache_options={"mode": "implicit"}
+        )
+        self.assertIsNone(request.prompt_cache_options.ttl_seconds())
+
+    def test_malformed_ttl_rejected(self):
+        for ttl in ("5", "0m", "5x", "-1h", "1.5h"):
+            with self.subTest(ttl=ttl), self.assertRaises(ValidationError):
+                CompletionRequest(
+                    model="test", prompt="Hi", prompt_cache_options={"ttl": ttl}
+                )
+
+
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
