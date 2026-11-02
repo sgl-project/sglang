@@ -1349,6 +1349,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _resolve_swa_cap_tokens(self) -> Optional[int]:
         """SWA slots to reserve in cap mode, None to keep ratio sizing. Cap mode
         budgets from the request cap plus radix headroom, not full_tokens."""
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.swa_ring import (
+                resolve_npu_swa_ring_size,
+            )
+
+            ring = resolve_npu_swa_ring_size(self.sliding_window_size, self.page_size)
+            if ring is not None:
+                # Request-owned rings have fixed capacity. The model's default
+                # SWA ratio applies only to paged allocation.
+                return (
+                    self._get_num_req_slots(
+                        self.requested_max_running_requests_per_worker
+                    )
+                    * ring
+                )
         if self.operator_swa_ratio is not None:
             return None
         if self._unified:

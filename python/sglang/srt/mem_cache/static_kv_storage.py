@@ -981,7 +981,11 @@ def _static_state_entries(
             target_geometry = (
                 token_to_kv_pool.page_size,
                 token_to_kv_pool.sliding_window,
-                request_window.capacity if request_window is not None else None,
+                (
+                    request_window.capacity
+                    if request_window is not None
+                    else token_to_kv_pool.swa_req_ring_size
+                ),
             )
             draft_geometry = (
                 draft_token_to_kv_pool.page_size,
