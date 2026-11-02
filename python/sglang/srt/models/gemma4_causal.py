@@ -195,7 +195,7 @@ class Gemma4Router(nn.Module):
             self.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
         self._scale_fused = False
@@ -737,7 +737,8 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self._next_stream(
             hidden_states, residual, per_layer_input, forward_batch
         )
-        return self.ffn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states
 
     def _next_stream(
         self,
