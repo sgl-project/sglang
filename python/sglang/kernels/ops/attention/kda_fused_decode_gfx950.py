@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.environ import envs
@@ -30,8 +31,8 @@ def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
     """Whether the kernel runs on ``device`` over a ``state_dtype`` pool."""
     if not is_hip() or not enabled() or not torch.cuda.is_available():
         return False
-    arch = torch.cuda.get_device_properties(device).gcnArchName
-    if arch.split(":", 1)[0] != "gfx950":
+    hip = current_arch().hip
+    if hip is None or hip.gcn_arch != "gfx950":
         return False
     if state_dtype != torch.float32:
         print_warning_once(
