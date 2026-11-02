@@ -647,8 +647,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved=False,
             state_slots=state_slots,
         )
-        return allocator.admit_preallocation(
+        from sglang.srt.mem_cache.capacity import admit_preallocation
+
+        return admit_preallocation(
             self.tree_cache,
+            allocator,
             admission,
             take,
             evictable=evictable_by_sub_pool(self.tree_cache, allocator),
@@ -668,8 +671,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _reclaim_prealloc_capacity(
         self, demand: KVDemand, req_id: str
     ) -> Optional[str]:
-        shortfall = self.token_to_kv_pool_allocator.reclaim_for_prealloc(
-            self.tree_cache, demand
+        from sglang.srt.mem_cache.capacity import reclaim_for_prealloc
+
+        shortfall = reclaim_for_prealloc(
+            self.tree_cache, self.token_to_kv_pool_allocator, demand
         )
         return None if shortfall is None else f"{shortfall}, req={req_id}"
 

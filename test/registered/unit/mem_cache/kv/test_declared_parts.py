@@ -7,6 +7,12 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import (
+    check_decode_capacity,
+    create_prefill_budget,
+    evict_to_free_tokens,
+    reclaim_for_prealloc,
+)
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
@@ -1146,7 +1152,7 @@ class TestDeclaredParts(CustomTestCase):
                     nodes.append(
                         cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
                     )
-                budget = a.create_prefill_budget(cache)
+                budget = create_prefill_budget(a, cache)
                 self.assertTrue(budget.state_slots_fit(1))
                 # The longer draft retains this whole prompt. Its bytes plus
                 # FULL 248 require a state donor, while the prompt remains below
@@ -1188,8 +1194,9 @@ class TestDeclaredParts(CustomTestCase):
                         cache.dec_lock_ref(node, receipt.to_dec_params())
                 self.assertTrue(budget.check_prefill(**demand)[0])
                 self.assertIsNone(
-                    a.reclaim_for_prealloc(
+                    reclaim_for_prealloc(
                         cache,
+                        a,
                         token_demand(
                             a, 248, 20, windows={"draft_swa": 244}, state_slots=1
                         ),
@@ -1296,7 +1303,7 @@ class TestDeclaredParts(CustomTestCase):
                         return result
 
                     with patch.object(cache, "evict_until", side_effect=walk):
-                        self.assertTrue(a.evict_to_free_tokens(cache, demand))
+                        self.assertTrue(evict_to_free_tokens(cache, a, demand))
                     self.assertIsNotNone(a.alloc(demand))
                     # Every token entry is locked, so the tokens are funded
                     # from state checkpoints alone, and no more of them than
@@ -1374,7 +1381,7 @@ class TestDeclaredParts(CustomTestCase):
                     a.admits(KVDemand(20, demand_windows(a, 20, 4)), empty_pool=True)
                 )
                 self.assertFalse(a.ensure_capacity(token_demand(a, 1, 1)))
-                self.assertTrue(a.evict_to_free_tokens(cache, 4))
+                self.assertTrue(evict_to_free_tokens(cache, a, 4))
                 self.assertLessEqual(a.full_attn_allocator.allocated_count(), 12)
                 self.assertIsNotNone(a.alloc(4))
                 self.assertEqual(storage.accounting_violations(), [])
@@ -2061,7 +2068,7 @@ class TestDeclaredParts(CustomTestCase):
                     ),
                     fits,
                 )
-        self.assertIsNone(a.reclaim_for_prealloc(cache, token_demand(a, 400, 16)))
+        self.assertIsNone(reclaim_for_prealloc(cache, a, token_demand(a, 400, 16)))
         self.assertTrue(a.ensure_capacity(token_demand(a, 400, 16)))
 
     def test_multiwindow_reclaim_uses_one_window_as_joint_byte_donor(self):
@@ -2146,7 +2153,9 @@ class TestDeclaredParts(CustomTestCase):
 
                     with patch.object(cache, "evict_until", side_effect=walk):
                         self.assertTrue(
-                            a.check_decode_capacity(num_tokens=4, tree_cache=cache)
+                            check_decode_capacity(
+                                allocator=a, num_tokens=4, tree_cache=cache
+                            )
                         )
                     # FULL/target cost 32 bytes per token; draft costs 64 or 128.
                     # A four-token request therefore needs 16 or 24 target
@@ -2259,7 +2268,7 @@ class TestDeclaredParts(CustomTestCase):
                         tree_core_backend="python",
                     )
                 )
-                budget = a.create_prefill_budget(cache)
+                budget = create_prefill_budget(a, cache)
                 # The draft reads beyond its retained window during speculation.
                 retained = dict(budget.windows)
                 self.assertEqual(retained["draft_swa"], 12)
@@ -2341,7 +2350,7 @@ class TestDeclaredParts(CustomTestCase):
             supports_prefix_sharing=lambda: True,
             evict_for_alloc=lambda *args, **kwargs: EvictResult(),
         )
-        budget = a.create_prefill_budget(cache)
+        budget = create_prefill_budget(a, cache)
         from sglang.srt.mem_cache.kv.alloc.pricing import feasible
 
         def fits_restore(tokens):
@@ -2402,7 +2411,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
             (False, None),
         )
-        budget = a.create_prefill_budget(cache)
+        budget = create_prefill_budget(a, cache)
         self.assertTrue(
             budget.prepare_load_back(
                 **prepare, window_host_hit_lengths={DRAFT_WINDOW: restore}
@@ -2476,7 +2485,7 @@ class TestDeclaredParts(CustomTestCase):
         need = next(
             n for n in empty_demands if not a.ensure_capacity(token_demand(a, n, n))
         )
-        budget = a.create_prefill_budget(cache)
+        budget = create_prefill_budget(a, cache)
         before = a.pricing_snapshot()
         self.assertTrue(
             budget._fits(
@@ -2622,7 +2631,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
             (80, 8, 4),
         )
-        budget = a.create_prefill_budget(cache)
+        budget = create_prefill_budget(a, cache)
         hold_band(a.full_attn_allocator)
         hold_band(a.swa_attn_allocator)
         self.assertFalse(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))

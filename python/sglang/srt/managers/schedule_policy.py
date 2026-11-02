@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -661,8 +662,10 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
-        self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
-            tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        self.memory_budget = create_prefill_budget(
+            token_to_kv_pool_allocator,
+            tree_cache,
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
 
         self.req_states = None

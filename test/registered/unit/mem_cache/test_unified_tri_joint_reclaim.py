@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.capacity import check_decode_capacity, evict_to_free_tokens
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import (
@@ -409,7 +410,7 @@ class TestTriJointReclaim(CustomTestCase):
                     a.free_group_begin()
                 self.assertGreaterEqual(a.available_size(), page_size)
                 before = snapshot(a)
-                self.assertTrue(a.evict_to_free_tokens(c, page_size))
+                self.assertTrue(evict_to_free_tokens(c, a, page_size))
                 self.assertEqual(snapshot(a), before)
                 got = a.alloc(page_size)
                 self.assertIsNotNone(got)
@@ -493,7 +494,8 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertTrue(evict_from_tree_cache(c, demand))
                 else:
                     self.assertTrue(
-                        a.check_decode_capacity(
+                        check_decode_capacity(
+                            allocator=a,
                             num_tokens=demand,
                             tree_cache=c,
                             requests=[],
@@ -597,8 +599,8 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     elif recovery == "decode":
                         self.assertTrue(
-                            allocator.check_decode_capacity(
-                                num_tokens=6, tree_cache=cache
+                            check_decode_capacity(
+                                allocator=allocator, num_tokens=6, tree_cache=cache
                             )
                         )
                     else:

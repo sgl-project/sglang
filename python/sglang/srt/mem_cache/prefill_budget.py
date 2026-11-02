@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import reclaim_for_load_back
 from sglang.srt.mem_cache.kv.alloc.demand import (
     KVDemand,
     estimate_window_tokens,
@@ -844,8 +845,8 @@ class ChainPrefillBudget(PrefillBudget):
 
     def prepare_load_back(self, **kwargs) -> bool:
         return (
-            self.allocator.reclaim_for_load_back(
-                self.tree_cache, self._load_back_demand(**kwargs)
+            reclaim_for_load_back(
+                self.tree_cache, self.allocator, self._load_back_demand(**kwargs)
             )
             is None
         )

@@ -292,7 +292,9 @@ class BuilderAdapter:
 
     def evict(self, n: int) -> bool:
         self._sync_hold()
-        return bool(self.allocator.evict_to_free_tokens(self.tree, n))
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return bool(evict_to_free_tokens(self.tree, self.allocator, n))
 
     def _member(self, name: str):
         return next(m for m in self.members() if m.sub_pool_name == name)
