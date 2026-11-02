@@ -124,7 +124,8 @@ class CompressorBackendMixin:
                 bf16_store=bf16_store,
             )
             return
-        kv_score_input = kv_score_input.float()
+        if _is_gfx1250_supported:
+            kv_score_input = kv_score_input.float()
 
         # Step 1: compress_forward
         compress_out = None
@@ -188,7 +189,7 @@ class CompressorBackendMixin:
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
-        if _use_online_compress(compressor.ratio):
+        if _is_gfx1250_supported and _use_online_compress(compressor.ratio):
             kv_score_input = kv_score_input.float()
 
         state_pool = compressor.get_state_pool(self)
