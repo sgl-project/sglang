@@ -1,4 +1,5 @@
-"""Per-expert MoE LoRA against independent FP32 and staged-BF16 references."""
+"""Per-expert MoE LoRA against independent FP32 and staged-BF16 references,
+over BF16 and [128, 128]-block FP8 base weights."""
 
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from sglang.srt.lora.moe.plan import (
     SelectedPlan,
     resolve_plans,
 )
-from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
+from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo, MoeLoraFp8QuantInfo
 from sglang.srt.lora.moe.runner import (
     MoeLoraBatch,
     MoeLoraRunner,
@@ -27,7 +28,11 @@ from sglang.srt.lora.moe.runner import (
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# SM100 runs its own plan rows (per-row B and split-K in decode) and base GEMMs.
+# The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
+# its four GPUs are allocation granularity, not multi-GPU coverage.
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _bind_test_menu(runner, plan, launch_config):
@@ -74,15 +79,17 @@ def _resolve_execution(
     *,
     hidden_size=_HIDDEN,
     physical_rank=_PHYSICAL_RANK,
+    experts=_EXPERTS,
+    quant_family="bf16",
 ):
     selected = resolve_plans(
-        quant_family="bf16",
+        quant_family=quant_family,
         architecture=architecture,
         is_shared_outer=False,
         physical_rank=physical_rank,
         activation=ActivationFn.SILU,
         hidden_size=hidden_size,
-        num_local_experts=_EXPERTS,
+        num_local_experts=experts,
     )[mode]
     launch_config = selected.tiles.config_for(num_tokens)
     if architecture == "sm100" and mode is Phase.DECODE:
@@ -101,6 +108,7 @@ def _make_cpu_tensors(
     hidden_size=_HIDDEN,
     intermediate_size=_INTERMEDIATE,
     physical_rank=_PHYSICAL_RANK,
+    experts=_EXPERTS,
 ) -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(0x5A17 + num_tokens)
     # Keep each projection's variance comparable as fan-in and rank grow.
@@ -112,32 +120,32 @@ def _make_cpu_tensors(
             (num_tokens, hidden_size), generator=generator, scale=0.20
         ),
         "w13_weight": _rand_bf16(
-            (_EXPERTS, 2 * intermediate_size, hidden_size),
+            (experts, 2 * intermediate_size, hidden_size),
             generator=generator,
             scale=0.08 * hidden_scale,
         ),
         "w2_weight": _rand_bf16(
-            (_EXPERTS, hidden_size, intermediate_size),
+            (experts, hidden_size, intermediate_size),
             generator=generator,
             scale=0.08 * intermediate_scale,
         ),
         "gate_up_lora_a": _rand_bf16(
-            (_SLOTS, _EXPERTS, 2 * physical_rank, hidden_size),
+            (_SLOTS, experts, 2 * physical_rank, hidden_size),
             generator=generator,
             scale=0.15 * hidden_scale,
         ),
         "gate_up_lora_b": _rand_bf16(
-            (_SLOTS, _EXPERTS, 2 * intermediate_size, physical_rank),
+            (_SLOTS, experts, 2 * intermediate_size, physical_rank),
             generator=generator,
             scale=0.15 * rank_scale,
         ),
         "down_lora_a": _rand_bf16(
-            (_SLOTS, _EXPERTS, physical_rank, intermediate_size),
+            (_SLOTS, experts, physical_rank, intermediate_size),
             generator=generator,
             scale=0.15 * intermediate_scale,
         ),
         "down_lora_b": _rand_bf16(
-            (_SLOTS, _EXPERTS, hidden_size, physical_rank),
+            (_SLOTS, experts, hidden_size, physical_rank),
             generator=generator,
             scale=0.15 * rank_scale,
         ),
@@ -150,7 +158,7 @@ def _make_cpu_tensors(
     tensors["topk_weights"] = torch.tensor([[0.65, 0.35]], dtype=torch.float32).repeat(
         num_tokens, 1
     )
-    tensors["router_logits"] = torch.zeros((num_tokens, _EXPERTS), dtype=torch.float32)
+    tensors["router_logits"] = torch.zeros((num_tokens, experts), dtype=torch.float32)
     tensors["adapter_enabled"] = torch.tensor([1, 0], dtype=torch.int32)
     return tensors
 
@@ -172,16 +180,37 @@ def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     raise AssertionError(f"unknown traffic pattern {traffic}")
 
 
+def _fp8_blocks(weight: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """[128, 128]-block FP8 checkpoint: (codes, FP32 scales, dequantized FP32)."""
+    experts, rows, cols = weight.shape
+    blocks = weight.float().view(experts, rows // 128, 128, cols // 128, 128)
+    scales = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-6) / 448
+    expanded = scales.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
+    codes = (weight.float() / expanded).to(torch.float8_e4m3fn)
+    return codes, scales, codes.float() * expanded
+
+
+def _fp8_groups(values: torch.Tensor) -> torch.Tensor:
+    """Round-trip a base-GEMM input through FP8 with one FP32 scale per 128."""
+    groups = values.reshape(-1, 128)
+    scales = groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-10) / 448
+    codes = (groups / scales).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return (codes.float() * scales).view_as(values)
+
+
 def _reference(
     tensors: dict[str, torch.Tensor],
     token_lora_mapping: torch.Tensor,
     *,
     plan: MoePlan | None = None,
+    fp8_base: bool = False,
 ) -> torch.Tensor:
     """FP32 matvecs, optionally rounded at the selected plan's BF16 buffers.
 
     No production routing or kernels, nor a backend-dependent BF16 matmul.
     The default retains the full-FP32 oracle for the original small fixtures.
+    An FP8 base also quantizes both base-GEMM inputs (the BF16 hidden row and
+    the BF16 activation); LoRA reads them unquantized.
     """
 
     if plan is not None:
@@ -189,6 +218,9 @@ def _reference(
 
     def boundary(value):
         return value.to(torch.bfloat16).float() if plan is not None else value
+
+    def base_input(value):
+        return _fp8_groups(value) if fp8_base else value
 
     hidden_states = tensors["hidden_states"].float()
     w13_weight = tensors["w13_weight"].float()
@@ -210,7 +242,7 @@ def _reference(
         slot_is_active = slot >= 0 and bool(adapter_enabled[slot])
         for topk_idx in range(_TOP_K):
             expert = int(topk_ids[token_idx, topk_idx])
-            gate_up = boundary(torch.mv(w13_weight[expert], hidden))
+            gate_up = boundary(torch.mv(w13_weight[expert], base_input(hidden)))
             gate = gate_up[:intermediate_size]
             up = gate_up[intermediate_size:]
 
@@ -228,7 +260,7 @@ def _reference(
                 up = up + up_delta
 
             activation = boundary(F.silu(gate) * up)
-            pair_output = boundary(torch.mv(w2_weight[expert], activation))
+            pair_output = boundary(torch.mv(w2_weight[expert], base_input(activation)))
             if slot_is_active:
                 down_rank = boundary(torch.mv(down_lora_a[slot, expert], activation))
                 down_delta = torch.mv(down_lora_b[slot, expert], down_rank)
@@ -415,6 +447,135 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
         rtol=0.06,
         msg=f"{choice.name}: mutated-routing replay",
     )
+
+
+_FP8_EXPERTS = 4
+# GB300 matched the staged reference bit for bit. A CPU sensitivity check
+# that adds 2^-14 |W||x| noise to both base GEMMs used at most a quarter of
+# this gate; it is not a model of Hopper rounding or a bound.
+_FP8_ATOL = 6e-3
+_FP8_RTOL = 3e-2
+
+
+def _check_fp8(actual, cpu, mapping, plan, label):
+    reference = _reference(cpu, mapping, plan=plan, fp8_base=True)
+    # Dropping LoRA or swapping the two adapters must miss the gate on every
+    # adapter row by more than the absolute tolerance.
+    rows = mapping >= 0
+    for wrong in (torch.full_like(mapping, -1), torch.where(rows, 1 - mapping, -1)):
+        wrong_output = _reference(cpu, wrong, plan=plan, fp8_base=True)
+        excess = (reference - wrong_output).abs() - (
+            _FP8_ATOL + _FP8_RTOL * reference.abs()
+        )
+        assert excess[rows].amax(dim=1).min().item() > _FP8_ATOL, label
+    torch.testing.assert_close(
+        actual.detach().float().cpu(),
+        reference,
+        atol=_FP8_ATOL,
+        rtol=_FP8_RTOL,
+        msg=label,
+    )
+
+
+def test_fp8_base_pipeline_matches_reference_under_graph_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Block-FP8 base weights with both adapters and base rows in one batch:
+    eager, replayed, and replayed again after inputs, routes and adapters change."""
+    device = torch.device("cuda")
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] not in (9, 10):
+        pytest.skip(f"MoE LoRA does not support SM{capability[0]}{capability[1]}")
+    monkeypatch.setattr(
+        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
+    )
+
+    num_tokens = 6
+    cpu = _make_cpu_tensors(num_tokens, experts=_FP8_EXPERTS)
+    cpu["adapter_enabled"] = torch.tensor([1, 1], dtype=torch.int32)
+    # The provider reads the checkpoint bytes; the reference their dequantization.
+    w13_codes, w13_scales, cpu["w13_weight"] = _fp8_blocks(cpu["w13_weight"])
+    w2_codes, w2_scales, cpu["w2_weight"] = _fp8_blocks(cpu["w2_weight"])
+    gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
+
+    choice, launch_config = _resolve_execution(
+        architecture_for_capability(capability[0]),
+        Phase.DECODE,
+        num_tokens,
+        experts=_FP8_EXPERTS,
+        quant_family="fp8",
+    )
+    provider = select_provider_cls(choice.base_gemm_rows, "fp8")(
+        MoeLoraFp8QuantInfo(
+            w13_weight=w13_codes.to(device),
+            w13_scale=w13_scales.to(device),
+            w2_weight=w2_codes.to(device),
+            w2_scale=w2_scales.to(device),
+            block_shape=(128, 128),
+            num_local_experts=_FP8_EXPERTS,
+            intermediate_size=_INTERMEDIATE,
+            hidden_size=_HIDDEN,
+        )
+    )
+    runner = MoeLoraRunner(
+        providers={"test": provider},
+        top_k=_TOP_K,
+        routed_scaling_factor=_ROUTED_SCALING,
+        activation=ActivationFn.SILU,
+    )
+    runner.validate_plan(choice.plan, base_gemm_rows="test")
+    _bind_test_menu(runner, choice.plan, launch_config)
+
+    dispatch = StandardDispatchOutput(
+        hidden_states=gpu["hidden_states"],
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=gpu["topk_weights"],
+            topk_ids=gpu["topk_ids"],
+            router_logits=gpu["router_logits"],
+        ),
+    )
+    mapping = torch.tensor([0, -1, 1, 1, -1, 0], dtype=torch.int32)
+    batch = MoeLoraBatch(
+        gate_up_lora_a=gpu["gate_up_lora_a"],
+        gate_up_lora_b=gpu["gate_up_lora_b"],
+        down_lora_a=gpu["down_lora_a"],
+        down_lora_b=gpu["down_lora_b"],
+        token_lora_mapping=mapping.to(device),
+    )
+    actual = runner.run(dispatch, batch).hidden_states
+    _check_fp8(actual, cpu, mapping, choice.plan, f"{choice.name}: eager")
+
+    batch.use_cuda_graph = True
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):  # JIT + workspace graph-buffer retention before capture
+            runner.run(dispatch, batch)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = runner.run(dispatch, batch).hidden_states
+    graph.replay()
+    torch.cuda.synchronize(device)
+    _check_fp8(output, cpu, mapping, choice.plan, f"{choice.name}: replay")
+
+    # New rows and weights, routes onto the experts the capture left empty,
+    # and every row on a different adapter or the base.
+    cpu["hidden_states"] = _rand_bf16(
+        (num_tokens, _HIDDEN), generator=torch.Generator().manual_seed(7), scale=0.3
+    )
+    cpu["topk_ids"] = torch.tensor(
+        [[3, 2], [2, 3], [3, 1], [1, 3], [2, 0], [3, 2]], dtype=torch.int32
+    )
+    cpu["topk_weights"] = torch.tensor([[0.8, 0.2]]).repeat(num_tokens, 1)
+    for name in ("hidden_states", "topk_ids", "topk_weights"):
+        gpu[name].copy_(cpu[name])
+    mapping = torch.tensor([1, 0, -1, 0, 1, -1], dtype=torch.int32)
+    batch.token_lora_mapping.copy_(mapping)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    _check_fp8(output, cpu, mapping, choice.plan, f"{choice.name}: changed replay")
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -73,6 +74,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
+    get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -101,8 +103,9 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
 
+_is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -383,7 +386,11 @@ def _prepare_ple_batch(
                     tokens,
                     tokens.new_full((), ngram_eos_token_id),
                 )
-        history = get_req_to_token_pool().get_ngram_context(state_indices)
+        # Read once, before the layer loop: wait for the layer whose host
+        # load-back restores the context.
+        router = get_token_to_kv_pool().layer_router
+        router.wait_for_part(NGRAM_PART)
+        history = router.part_view(NGRAM_PART).get_context(state_indices)
         if history.shape[1] != ngram_size - 1:
             raise RuntimeError(
                 "Qwen4 PLE N-gram cache has the wrong context width: "
@@ -414,6 +421,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         return
 
     pool = get_req_to_token_pool()
+    ngram = get_token_to_kv_pool().layer_router.part_view(NGRAM_PART)
     context = batch.ngram_context
     context_len = context.shape[1] - batch.row_width
     if batch.mode.is_target_verify():
@@ -427,7 +435,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
             batch.lengths.ne(0),
             pool.size,
         )
-        pool.set_ngram_intermediate_context(
+        ngram.set_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
@@ -441,23 +449,23 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         # Decode advances every two-token history by exactly one column.  Slicing
         # preserves the int64 values while avoiding arange + gather launches.
         next_context = context[:, batch.row_width :]
-        pool.set_ngram_context(batch.state_indices, next_context)
+        ngram.set_context(batch.state_indices, next_context)
         track = _ple_track_targets(forward_batch, batch)
         if track is not None:
             track_indices, _ = track
-            pool.set_ngram_context(track_indices, next_context)
+            ngram.set_context(track_indices, next_context)
         return
 
     context_cols = torch.arange(context_len, device=context.device, dtype=torch.long)
     next_context = context.gather(
         1, batch.lengths.unsqueeze(1) + context_cols.unsqueeze(0)
     )
-    pool.set_ngram_context(batch.state_indices, next_context)
+    ngram.set_context(batch.state_indices, next_context)
 
     track = _ple_track_targets(forward_batch, batch)
     if track is not None:
         track_indices, track_offsets = track
-        pool.set_ngram_context(
+        ngram.set_context(
             track_indices,
             context.gather(1, track_offsets.unsqueeze(1) + context_cols.unsqueeze(0)),
         )
@@ -1110,7 +1118,7 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1128,8 +1136,10 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x
-        pool = get_req_to_token_pool()
-        conv_state = pool.short_conv_layer_cache(self.layer_id)
+        short_conv = get_token_to_kv_pool().layer_router.read(
+            self.layer_id, SHORT_CONV_PART
+        )
+        conv_state = short_conv.view.layer_cache(short_conv.view_layer_id)
 
         if batch.use_decode_fast_path:
             # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
@@ -1183,7 +1193,9 @@ class Qwen4ExpPLELayer(nn.Module):
         ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
-            intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
+            intermediate_cache = short_conv.view.layer_intermediate_cache(
+                short_conv.view_layer_id
+            )
             if intermediate_cache is not None:
                 if self.short_conv_state_len:
                     intermediate_state = (
@@ -1317,9 +1329,9 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(torch.get_device_module().current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with torch.get_device_module().stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
@@ -1329,7 +1341,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        torch.get_device_module().current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
@@ -1404,17 +1416,19 @@ class Qwen4ExpPLELayer(nn.Module):
                 fused_qwen4_verify_conv,
             )
 
-            pool = get_req_to_token_pool()
+            short_conv = get_token_to_kv_pool().layer_router.read(
+                self.layer_id, SHORT_CONV_PART
+            )
             conv_args = (
                 gated_value_normed,
                 gated_value,
                 self.conv1d.weight,
-                pool.short_conv_layer_cache(self.layer_id),
+                short_conv.view.layer_cache(short_conv.view_layer_id),
                 batch.state_indices,
                 batch.valid_tokens,
                 batch.row_width,
                 self.short_conv_dilation,
-                pool.short_conv_layer_intermediate_cache(self.layer_id),
+                short_conv.view.layer_intermediate_cache(short_conv.view_layer_id),
             )
             if can_fuse_qwen4_verify_conv(*conv_args):
                 output = fused_qwen4_verify_conv(*conv_args)
@@ -1527,6 +1541,16 @@ def _build_qwen4_exp_stages(config, layer_id, residual, *, linear_attention=Fals
     return append_stages((attn, None), (ffn, None))
 
 
+def _prepare_decode_moe_comm(mlp):
+    # qwen4_decode pulls in CUDA-only communication kernels (tvm_ffi), so
+    # only import it where its Blackwell decode path can be enabled.
+    if not (_is_cuda and isinstance(mlp, Qwen2MoeSparseMoeBlock)):
+        return None
+    from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
+
+    return prepare_qwen4_decode_comm(mlp)
+
+
 class Qwen4ExpLayerExtensionMixin:
     stage_facts = staticmethod(_qwen4_exp_stage_facts)
 
@@ -1600,13 +1624,7 @@ class Qwen4ExpLayerExtensionMixin:
             linear_attention=linear_attention,
         )
 
-        from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
-
-        self._decode_moe_comm = (
-            prepare_qwen4_decode_comm(self.mlp)
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-            else None
-        )
+        self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
     def hc_norms(self, normalized_input, next_norm):

@@ -11,13 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -40,7 +33,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -429,17 +422,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         # Boot guard: every backend a draft forward reaches must carry its
-        # runner's translator or the index builders emit virtual ids.
-        translator = self.draft_runner.kv_index_translator
+        # runner's runner_ids or the index builders emit virtual ids.
+        runner_ids = self.draft_runner.runner_ids
         # DCP read production (e.g. a gathered draft prefill) needs it too,
         # but only ROCm shards the draft; CUDA keys on is_translating as before.
-        if translator.is_translating or (_is_hip and translator.needs_read_translate):
+        if runner_ids.is_translating or (_is_hip and runner_ids.needs_read_translate):
             backends = [self.draft_extend_attn_backend]
             if self.draft_attn_backend is not None:
-                if translator.is_translating:
+                if runner_ids.is_translating:
                     backends.append(self.draft_attn_backend)
                 backends += self.draft_attn_backend.attn_backends
-            translator.bind_and_verify_backends(backends)
+            runner_ids.bind_and_verify_backends(backends)
 
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
@@ -503,7 +496,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2DraftCudaGraphRunner = {
             "xpu": EAGLEDraftCudaGraphRunner,
-            "npu": EAGLEDraftNpuGraphRunner,
+            "npu": EAGLEDraftCudaGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
@@ -555,7 +548,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2ExtendCudaGraphRunner = {
             "xpu": EAGLEDraftExtendCudaGraphRunner,
-            "npu": EAGLEDraftExtendNpuGraphRunner,
+            "npu": EAGLEDraftExtendCudaGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
@@ -676,7 +669,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -684,7 +677,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
-            target_translator=self.target_worker.model_runner.kv_index_translator,
+            target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
         if (
@@ -753,10 +746,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
-        if kv_loc_plan is not None:
+        if iteration_ids is not None:
             # Verify and draft extend write the window the draft planned.
-            verify_input.kv_loc_plan = kv_loc_plan
-            verify_input.prepared_out_cache_loc = kv_loc_plan.write_virtual
+            verify_input.iteration_ids = iteration_ids
+            verify_input.prepared_out_cache_loc = iteration_ids.write_virtual
         if with_topology:
             # PP+spec relays the tree so every stage rebuilds the same verify
             # input; the mask build needs the topology this one was built from.
@@ -989,7 +982,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
-        kv_loc_plan: Optional[KVLocPlan] = None,
+        iteration_ids: Optional[IterationIds] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -998,7 +991,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
-            kv_loc_plan: The target prefill's plan; the draft writes the same
+            iteration_ids: The target prefill's plan; the draft writes the same
                 slots.
         """
         if self.megakernel is not None:
@@ -1053,7 +1046,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=False,
-            kv_loc_plan=kv_loc_plan,
+            iteration_ids=iteration_ids,
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
@@ -1139,7 +1132,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         batch_result: GenerationBatchResult,
         *,
-        kv_loc_plan: Optional[KVLocPlan] = None,
+        iteration_ids: Optional[IterationIds] = None,
     ):
         if self.megakernel is not None:
             self.megakernel.note_draft_extend()
@@ -1199,7 +1192,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
-                kv_loc_plan=kv_loc_plan,
+                iteration_ids=iteration_ids,
             )
 
         if self.plan_stream:
@@ -1575,7 +1568,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(
-                        batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
+                        batch, batch_output, iteration_ids=verify_input.iteration_ids
                     )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
@@ -1635,9 +1628,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=target_capture_mode,
-            return_kv_loc_plan=self._draft_worker is not None,
+            return_iteration_ids=self._draft_worker is not None,
         )
-        kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
+        iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
 
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
         # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1674,7 +1667,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
                 batch_output.logits_output.mm_input_embeds,
-                kv_loc_plan=kv_loc_plan,
+                iteration_ids=iteration_ids,
             )
             return batch_output
 
@@ -1886,9 +1879,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
                 # Same runner class as the startup target verify graph on OOT.
                 TargetGraphRunnerCls = _select_spec_graph_runner_cls(
-                    builtin_runner_cls=lambda: (
-                        NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
-                    ),
+                    builtin_runner_cls=lambda: DecodeCudaGraphRunner,
                     oot_runner_cls=current_platform.get_graph_runner_cls,
                 )
             if TargetGraphRunnerCls is not None:
@@ -2056,7 +2047,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
-        # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
+        # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(

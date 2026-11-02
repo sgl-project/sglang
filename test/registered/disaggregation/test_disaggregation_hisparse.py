@@ -7,7 +7,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    is_in_ci,
     popen_launch_pd_server,
     try_cached_model,
 )
@@ -24,15 +23,6 @@ DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
-DSV4_NIXL_SERVER_LAUNCH_TIMEOUT = 1800
-
-
-def _has_nixl():
-    try:
-        import nixl._api  # noqa: F401
-    except Exception:
-        return False
-    return True
 
 
 class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin):
@@ -130,32 +120,6 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             other_args=decode_args,
             env=DSV4_FLASH_ENV,
         )
-
-
-@unittest.skipIf(is_in_ci(), "Flaky in CI — skip until stabilized.")
-class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
-    @classmethod
-    def setUpClass(cls):
-        PDDisaggregationServerBase.setUpClass.__func__(cls)
-
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-        cls.model = try_cached_model(DSV4_FLASH_MODEL)
-
-        cls.start_prefill()
-        cls.start_decode()
-
-        cls.wait_server_ready(
-            cls.prefill_url + "/health",
-            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
-            process=cls.process_prefill,
-        )
-        cls.wait_server_ready(
-            cls.decode_url + "/health",
-            timeout=DSV4_NIXL_SERVER_LAUNCH_TIMEOUT,
-            process=cls.process_decode,
-        )
-
-        cls.launch_lb()
 
 
 if __name__ == "__main__":

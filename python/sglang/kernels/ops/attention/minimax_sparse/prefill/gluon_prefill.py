@@ -9,35 +9,51 @@ context is gathered into persistent SHUFFLE 5D scratch pages:
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize``. Each request occupies a contiguous,
+with ``x = 16 // dtype.itemsize``, in q's dtype: a bf16/fp16 pool as is, an fp8 pool
+widened and an NVFP4 pool dequantized (both exact), except that an fp8 pool stays fp8 for
+the per-query decode kernel, which widens it per tile. Each request occupies a contiguous,
 position-ordered page range rounded up to whole sparse blocks.
 """
 
 from __future__ import annotations
 
+import functools
 from itertools import accumulate
-from typing import Optional
+from types import ModuleType
+from typing import Optional, Union
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
+from sglang.kernels.ops.attention.minimax_sparse.prefill.nvfp4_prefill import (
+    gather_nvfp4_to_shuffle,
+)
 from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
 )
+from sglang.srt.utils.common import async_h2d
+
+try:
+    from . import gluon_prefill_pair_gfx950
+except ImportError:  # Gluon without the CDNA4 buffer/MFMA ops
+    gluon_prefill_pair_gfx950 = None
 
 SPARSE_BLOCK_SIZE = 128
 # The Gluon PS kernel takes kv_block_size 16 or 64; 64 halves the block-table width.
 GLUON_PAGE_SIZE = 64
 PAGES_PER_BLOCK = SPARSE_BLOCK_SIZE // GLUON_PAGE_SIZE
 HEAD_DIM = 128
+# aiter's fp8 on gfx950, the only arch that dispatches here (gfx942 would be e4m3fnuz).
+_FP8_KV_DTYPE = torch.float8_e4m3fn
 # Scratch grows in 1024-page steps (16 KiB/page/buffer -> 16 MiB granularity).
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# 512 MiB per buffer at bf16 (~2.1M context tokens per forward); past it the caller
-# falls back to the Triton kernel, which reads the pool in place.
+# 512 MiB per buffer at bf16 (~2.1M context tokens per forward); past it an NVFP4 batch
+# runs in request groups, others fall back to Triton (reads the pool in place).
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
@@ -101,20 +117,21 @@ def _gather_nhd_to_shuffle_kernel(
         + (off_t[:, None] % X)
     )
     # Unmasked: tiles are zero past seq_len, so no previous layer's data survives.
-    tl.store(k_out_ptr + page_base + k_off, k_tile)
-    tl.store(v_out_ptr + page_base + v_off, v_tile)
+    tl.store(k_out_ptr + page_base + k_off, k_tile.to(k_out_ptr.dtype.element_ty))
+    tl.store(v_out_ptr + page_base + v_off, v_tile.to(v_out_ptr.dtype.element_ty))
 
 
-# Grow-only (device, dtype) -> (k_flat, v_flat); layers run in sequence and share it.
+# Grow-only device -> (k_bytes, v_bytes) at bf16 width, viewed as each forward's scratch
+# dtype (fp8 or bf16); layers and forwards run in stream order and share it.
 _SCRATCH: dict = {}
 
 
 def _get_scratch(
     device: torch.device, dtype: torch.dtype, total_pages: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = (device, dtype)
-    entry = _SCRATCH.get(key)
-    needed = total_pages * _PAGE_ELEMS
+    assert dtype.itemsize <= 2
+    entry = _SCRATCH.get(device)
+    needed = total_pages * _PAGE_ELEMS * 2
     if entry is None or entry[0].numel() < needed:
         cap_pages = (
             (total_pages + _SCRATCH_GROW_PAGES - 1) // _SCRATCH_GROW_PAGES
@@ -123,49 +140,74 @@ def _get_scratch(
         # the caller falls back to the scratch-free Triton kernel.
         try:
             entry = (
-                torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
-                torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
+                torch.empty(
+                    cap_pages * _PAGE_ELEMS * 2, dtype=torch.uint8, device=device
+                ),
+                torch.empty(
+                    cap_pages * _PAGE_ELEMS * 2, dtype=torch.uint8, device=device
+                ),
             )
         except torch.cuda.OutOfMemoryError as exc:
             raise GluonPrefillUnavailableError(
                 f"gluon prefill scratch of {cap_pages} pages "
-                f"({cap_pages * _PAGE_ELEMS * dtype.itemsize * 2 >> 20} MiB) "
+                f"({cap_pages * _PAGE_ELEMS * 4 >> 20} MiB) "
                 "does not fit; lower --mem-fraction-static"
             ) from exc
-        _SCRATCH[key] = entry
-    return entry
+        _SCRATCH[device] = entry
+    return entry[0].view(dtype), entry[1].view(dtype)
 
 
 def _gather_context_to_shuffle(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     page_req: torch.Tensor,
     page_pos: torch.Tensor,
     total_pages: int,
+    scratch_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather this batch's context tokens (NHD pool slots) into SHUFFLE 5D pages."""
-    x = 16 // k_cache.dtype.itemsize  # 8 for bf16/fp16
-    k_flat, v_flat = _get_scratch(k_cache.device, k_cache.dtype, total_pages)
-    _gather_nhd_to_shuffle_kernel[(total_pages,)](
-        k_cache,
-        v_cache,
-        k_flat,
-        v_flat,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        page_req,
-        page_pos,
-        k_cache.stride(0),
-        v_cache.stride(0),
-        req_to_token.stride(0),
-        HEAD_DIM_C=HEAD_DIM,
-        PAGE=GLUON_PAGE_SIZE,
-        X=x,
-    )
+    """Gather this batch's context tokens (NHD pool slots) into SHUFFLE 5D pages.
+
+    The pages are ``scratch_dtype``: the pool's, or the compute dtype an fp8 or NVFP4
+    pool widens to exactly.
+    """
+    x = 16 // scratch_dtype.itemsize  # 8 for bf16/fp16, 16 for fp8
+    k_flat, v_flat = _get_scratch(k_cache.device, scratch_dtype, total_pages)
+    if isinstance(k_cache, Nvfp4Cache):
+        gather_nvfp4_to_shuffle(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_out=k_flat,
+            v_out=v_flat,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            page_req=page_req,
+            page_pos=page_pos,
+            total_pages=total_pages,
+            page=GLUON_PAGE_SIZE,
+            x=x,
+        )
+    else:
+        _gather_nhd_to_shuffle_kernel[(total_pages,)](
+            k_cache,
+            v_cache,
+            k_flat,
+            v_flat,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_req,
+            page_pos,
+            k_cache.stride(0),
+            v_cache.stride(0),
+            req_to_token.stride(0),
+            HEAD_DIM_C=HEAD_DIM,
+            PAGE=GLUON_PAGE_SIZE,
+            X=x,
+        )
     k5 = k_flat[: total_pages * _PAGE_ELEMS].view(
         total_pages, 1, HEAD_DIM // x, GLUON_PAGE_SIZE, x
     )
@@ -245,6 +287,13 @@ _META_CACHE: Optional[tuple] = None
 _BT_OUT_CACHE: Optional[tuple] = None
 
 
+def _scratch_pages_per_req(seq_lens_cpu: torch.Tensor) -> list[int]:
+    return [
+        ((kv_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
+        for kv_len in seq_lens_cpu.tolist()
+    ]
+
+
 def _build_gluon_prefill_meta(
     cu_seqlens: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -272,17 +321,14 @@ def _build_gluon_prefill_meta(
 
     # Host-side page layout: each request's context span rounds up to whole
     # sparse blocks so every emitted page id stays inside its own span.
-    pages_per_req = [
-        ((kv_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE) * PAGES_PER_BLOCK
-        for kv_len in seq_lens_cpu.tolist()
-    ]
+    pages_per_req = _scratch_pages_per_req(seq_lens_cpu)
     total_pages = sum(pages_per_req)
-    page_start = torch.tensor(
+    page_start = async_h2d(
         list(accumulate(pages_per_req, initial=0))[:-1],
         dtype=torch.int32,
         device=device,
     )
-    repeats = torch.tensor(pages_per_req, dtype=torch.int64, device=device)
+    repeats = async_h2d(pages_per_req, dtype=torch.int64, device=device)
     page_req = torch.repeat_interleave(
         torch.arange(len(pages_per_req), dtype=torch.int32, device=device),
         repeats,
@@ -353,10 +399,20 @@ def _unit_or_none(scale) -> bool:
     return scale is None or scale == 1.0
 
 
+@functools.lru_cache(maxsize=None)
+def _scale_tensor(value: float, device: torch.device) -> torch.Tensor:
+    return torch.full((1,), value, dtype=torch.float32, device=device)
+
+
+def _kv_scale_tensor(scale: Optional[float], device: torch.device) -> torch.Tensor:
+    # The kernel takes per-tensor KV scales only as [1] fp32 tensors.
+    return _scale_tensor(1.0 if scale is None else float(scale), device)
+
+
 def can_use_gluon_prefill(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     sink: Optional[torch.Tensor],
     block_size_k: int,
     seq_lens_cpu: Optional[torch.Tensor],
@@ -373,8 +429,19 @@ def can_use_gluon_prefill(
         or block_size_k != SPARSE_BLOCK_SIZE
     ):
         return False
-    # The gather requires a contiguous, single-head NHD pool. Calibrated and
-    # unsupported cache formats stay on the Triton path.
+    if isinstance(k_cache, Nvfp4Cache):
+        return (
+            q.dim() == 3
+            and q.shape[-1] == HEAD_DIM
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and k_cache.num_heads == 1
+            and _unit_or_none(q_scale)
+            and _unit_or_none(k_scale)
+            and _unit_or_none(v_scale)
+        )
+    # The gather requires a contiguous, single-head NHD pool; an fp8 pool's
+    # per-tensor k/v scales pass through to the kernel.
+    fp8_kv = k_cache.dtype == _FP8_KV_DTYPE and v_cache.dtype == k_cache.dtype
     return (
         q.dim() == 3
         and q.shape[-1] == HEAD_DIM
@@ -385,21 +452,33 @@ def can_use_gluon_prefill(
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k_cache.dtype == q.dtype
-        and v_cache.dtype == q.dtype
+        and (fp8_kv or (k_cache.dtype == q.dtype and v_cache.dtype == q.dtype))
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
-        and _unit_or_none(k_scale)
-        and _unit_or_none(v_scale)
+        and (fp8_kv or (_unit_or_none(k_scale) and _unit_or_none(v_scale)))
+    )
+
+
+def _pair_prefill_module(
+    q: torch.Tensor, k_cache: Union[torch.Tensor, Nvfp4Cache]
+) -> Optional[ModuleType]:
+    """The two-queries-per-program kernel module when it serves this forward, else None."""
+    if gluon_prefill_pair_gfx950 is None:
+        return None
+    fp8_pool = not isinstance(k_cache, Nvfp4Cache) and k_cache.dtype == _FP8_KV_DTYPE
+    return (
+        gluon_prefill_pair_gfx950
+        if gluon_prefill_pair_gfx950.can_use_pair_prefill(q, fp8_pool)
+        else None
     )
 
 
 @torch.no_grad()
-def gluon_sparse_prefill(
+def _gluon_sparse_prefill_group(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
     topk_idx: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -409,8 +488,11 @@ def gluon_sparse_prefill(
     seq_lens_cpu: torch.Tensor,
     block_size_k: int,
     sm_scale: Optional[float] = None,
-) -> torch.Tensor:
-    """Run Gluon sparse prefill over the NHD KV pool via the SHUFFLE scratch.
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    out_quant: str = "",
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """``gluon_sparse_prefill`` over one request group, its whole context in the scratch.
 
     Raises GluonPrefillUnavailableError when the scratch cannot hold the context.
     """
@@ -441,6 +523,17 @@ def gluon_sparse_prefill(
             f"> cap {_MAX_SCRATCH_PAGES}"
         )
 
+    nvfp4 = isinstance(k_cache, Nvfp4Cache)
+    # fp8 KV needs scale tensors: without them the kernel has no dequant mode.
+    if nvfp4 or k_cache.dtype == q.dtype:
+        key_scale = value_scale = None
+    else:
+        key_scale = _kv_scale_tensor(k_scale, q.device)
+        value_scale = _kv_scale_tensor(v_scale, q.device)
+
+    # The pair kernel reads bf16 scratch; the decode kernel widens an fp8 one per tile.
+    pair = _pair_prefill_module(q, k_cache)
+    scratch_dtype = q.dtype if pair is not None or nvfp4 else k_cache.dtype
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
     k_cache, v_cache = _gather_context_to_shuffle(
         k_cache,
@@ -451,7 +544,23 @@ def gluon_sparse_prefill(
         page_req,
         page_pos,
         total_pages,
+        scratch_dtype,
     )
+
+    if pair is not None:
+        return pair.pair_sparse_prefill(
+            q,
+            k_cache,
+            v_cache,
+            topk_idx,
+            req_id,
+            abs_pos,
+            page_start,
+            sm_scale,
+            1.0 if k_scale is None else float(k_scale),
+            1.0 if v_scale is None else float(v_scale),
+            out_quant=out_quant,
+        )
 
     sparse_bt, sparse_ctx = _build_gluon_sparse_bt_prefill(
         topk_idx, req_id, abs_pos, page_start, block_size_k
@@ -480,8 +589,8 @@ def gluon_sparse_prefill(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
@@ -489,4 +598,81 @@ def gluon_sparse_prefill(
         sliding_window=0,
         ps=True,
     )
+    return out
+
+
+def gluon_sparse_prefill(
+    q: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
+    topk_idx: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    block_size_k: int,
+    sm_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    out_quant: str = "",
+    q_lens_cpu: Optional[list[int]] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Run Gluon sparse prefill via the SHUFFLE scratch.
+
+    Raises GluonPrefillUnavailableError when the scratch cannot hold the context; an
+    NVFP4 cache past the cap runs consecutive request groups of ``q_lens_cpu`` query rows
+    instead, raising only for one oversized request. ``out_quant`` may return O
+    quantized for the o_proj, from a single group only.
+    """
+    run_group = functools.partial(
+        _gluon_sparse_prefill_group,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        req_to_token=req_to_token,
+        block_size_k=block_size_k,
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    pages = _scratch_pages_per_req(seq_lens_cpu)
+    # Only NVFP4 splits an oversized batch: it has no Triton fallback.
+    if (
+        sum(pages) <= _MAX_SCRATCH_PAGES
+        or q_lens_cpu is None
+        or not isinstance(k_cache, Nvfp4Cache)
+    ):
+        return run_group(
+            q=q,
+            topk_idx=topk_idx,
+            req_pool_indices=req_pool_indices,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_quant=out_quant,
+        )
+    out = torch.empty_like(q)
+    start = row = 0
+    while start < len(pages):
+        end, group_pages = start, 0
+        while end < len(pages) and group_pages + pages[end] <= _MAX_SCRATCH_PAGES:
+            group_pages += pages[end]
+            end += 1
+        if end == start:
+            raise GluonPrefillUnavailableError(
+                f"one request spans {pages[start]} scratch pages > cap {_MAX_SCRATCH_PAGES}"
+            )
+        rows = sum(q_lens_cpu[start:end])
+        out[row : row + rows] = run_group(
+            q=q[row : row + rows],
+            topk_idx=topk_idx[:, row : row + rows],
+            req_pool_indices=req_pool_indices[start:end],
+            cu_seqlens=cu_seqlens[start : end + 1] - cu_seqlens[start],
+            seq_lens=seq_lens[start:end],
+            prefix_lens=prefix_lens[start:end],
+            seq_lens_cpu=seq_lens_cpu[start:end],
+        )
+        start, row = end, row + rows
     return out

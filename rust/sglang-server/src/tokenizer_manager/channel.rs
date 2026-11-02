@@ -34,6 +34,10 @@ pub struct ToSchedulerRx {
     /// [`wait`]: ToSchedulerRx::wait
     /// [`drain`]: ToSchedulerRx::drain
     stash: Mutex<Option<SchedulerRequest>>,
+    /// Wakes a parked [`wait`](ToSchedulerRx::wait) without a request (see
+    /// [`ToSchedulerRx::waker`]).
+    wake_tx: flume::Sender<()>,
+    wake_rx: flume::Receiver<()>,
 }
 
 impl ToSchedulerTx {
@@ -93,19 +97,26 @@ impl ToSchedulerRx {
         if self.stash.lock().unwrap().is_some() {
             return true;
         }
-        let selected = flume::Selector::new()
-            .recv(&self.priority_rx, |result| result.ok())
-            .recv(&self.rx, |result| result.ok())
-            .wait_timeout(timeout)
-            .ok()
-            .flatten();
-        match selected {
-            Some(m) => {
+        let stash = |r: Result<SchedulerRequest, flume::RecvError>| match r {
+            Ok(m) => {
                 *self.stash.lock().unwrap() = Some(m);
                 true
             }
-            None => false, // Timeout or disconnected
-        }
+            Err(_) => false, // Disconnected
+        };
+        let woken = flume::Selector::new()
+            .recv(&self.priority_rx, stash)
+            .recv(&self.rx, stash)
+            .recv(&self.wake_rx, |r| r.is_ok())
+            .wait_timeout(timeout);
+        woken.unwrap_or(false) // Timeout
+    }
+
+    /// A handle that ends a parked [`wait`](Self::wait) at once (returning
+    /// `true`), for a state change the scheduler must act on without a request:
+    /// the listeners closing at the end of a drain.
+    pub fn waker(&self) -> flume::Sender<()> {
+        self.wake_tx.clone()
     }
 }
 
@@ -150,12 +161,15 @@ impl FromSchedulerRx {
 pub fn to_scheduler(cap: usize) -> (ToSchedulerTx, ToSchedulerRx) {
     let (tx, rx) = flume::bounded(cap);
     let (priority_tx, priority_rx) = flume::unbounded();
+    let (wake_tx, wake_rx) = flume::unbounded();
     (
         ToSchedulerTx { tx, priority_tx },
         ToSchedulerRx {
             rx,
             priority_rx,
             stash: Mutex::new(None),
+            wake_tx,
+            wake_rx,
         },
     )
 }
@@ -229,6 +243,21 @@ mod tests {
         });
         assert!(rx.wait(Duration::from_secs(5)));
         assert_eq!(rx.drain(1)[0].header, Bytes::from_static(b"abort"));
+    }
+
+    /// The waker ends a parked `wait` without a message to drain.
+    #[test]
+    fn waker_ends_a_parked_wait() {
+        let (_tx, rx) = to_scheduler(8);
+        let waker = rx.waker();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = waker.send(());
+        });
+        let started = std::time::Instant::now();
+        assert!(rx.wait(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(rx.drain(16).is_empty());
     }
 
     /// A full from_scheduler channel parks the producer until the consumer drains — the

@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -72,10 +73,9 @@ def make_metadata_backend():
     backend = object.__new__(MambaAttnBackendBase)
     backend.device = "cpu"
     backend.topk = 1
-    backend.req_to_token_pool = SimpleNamespace(
-        get_mamba_indices=lambda rows: rows,
-        translate_mamba_indices=lambda slots: slots,
-    )
+    backend.req_to_token_pool = SimpleNamespace(get_mamba_indices=lambda rows: rows)
+    backend.state_pool = None
+    backend._state_ids = IdSpace(key=("mamba", None))
     return backend
 
 
@@ -216,9 +216,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     lengths, [0, 3][: len(lengths)], [100, 200], mode
                 )
                 if mode == ForwardMode.TARGET_VERIFY:
-                    batch.spec_info = SimpleNamespace(
-                        ragged_verify_layout=None, draft_token_num=3
-                    )
+                    batch.spec_info = SimpleNamespace(draft_token_num=3)
                 with patch.object(
                     torch.Tensor,
                     "__int__",
@@ -269,7 +267,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
             # A pass-through runner: its plan hands the batch its ids untouched.
-            kv_index_translator=SimpleNamespace(
+            runner_ids=SimpleNamespace(
                 own_plan=lambda batch: SimpleNamespace(
                     bind=lambda batch, reader, cols=None: None
                 )
@@ -462,7 +460,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
             )
         )
-        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
         with (
             patch.object(spec_utils, "get_exec", return_value=settings),
             patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),

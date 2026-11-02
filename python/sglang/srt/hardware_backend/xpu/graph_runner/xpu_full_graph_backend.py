@@ -10,10 +10,12 @@ Mirrors FullCudaGraphBackend with XPU-specific differences:
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -31,6 +33,9 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 class FullXPUGraphBackend(BaseCudaGraphBackend):
     """One torch.xpu.XPUGraph per shape for Intel XPU devices."""
 
@@ -44,6 +49,30 @@ class FullXPUGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.xpu.Stream] = None
+
+    def capture_profile_context(self, options):
+        profile_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
+            record_shapes=True,
+        )
+        torch.xpu.memory._record_memory_history()
+        return profile_context
+
+    def finish_capture_profile(self, options, prof_context):
+        torch.xpu.memory._dump_snapshot("xpu_graph_runner_memory_usage.pickle")
+        torch.xpu.memory._record_memory_history(enabled=None)
+        log_message = (
+            "Sorted by XPU Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="self_xpu_time_total"
+            )
+            + "\n\nSorted by CPU Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="self_cpu_time_total"
+            )
+            + "\n\nMemory Usage is saved to xpu_graph_runner_memory_usage.pickle\n"
+        )
+        logger.info(log_message)
 
     @contextmanager
     def capture_session(self, stream: torch.xpu.Stream):

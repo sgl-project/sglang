@@ -970,6 +970,128 @@ def _topk_index_merge_kernel(
     )
 
 
+def decode_topk_uses_jit(num_score_blocks: int, topk: int) -> bool:
+    return (
+        envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
+        and num_score_blocks <= _JIT_TOPK_MAX_NUM_BLOCKS
+        and topk <= 32
+    )
+
+
+def select_decode_topk(
+    *,
+    score: torch.Tensor,  # [num_q_heads, batch_size, max_seqblock]
+    seq_lens: torch.Tensor,
+    block_size: int,
+    topk: int,
+    use_jit_topk: bool,
+    out: Optional[torch.Tensor] = None,  # [num_q_heads, batch_size, topk] int32
+) -> torch.Tensor:
+    num_q_heads, batch_size, _ = score.shape
+    if out is None:
+        topk_idx = torch.empty(
+            (num_q_heads, batch_size, topk),
+            device=score.device,
+            dtype=torch.int32,
+        )
+    else:
+        assert out.shape == (num_q_heads, batch_size, topk)
+        assert out.dtype == torch.int32
+        topk_idx = out
+    if use_jit_topk:
+        # Single-stage JIT radix-select: one kernel, no intermediate buffers.
+        # Equivalent output to the 2-stage path (set of block ids, front-packed,
+        # -1 padded); ~2-16x faster for long context. See
+        # sglang/kernels/ops/attention/minimax_decode_topk.py.
+        if is_xpu():
+            from sgl_kernel import minimax_decode_topk
+        else:
+            from sglang.kernels.ops.attention.minimax_decode_topk import (
+                minimax_decode_topk,
+            )
+
+        minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
+    else:
+        # 2-stage split-K Triton fallback.
+        # Choose NUM_TOPK_CHUNKS to add parallelism over the seqblock dim.
+        # Same constraints as flash_decode: must be deterministic from values
+        # constant within a cuda graph (BS, num_q_heads), pow2, capped so the
+        # merge kernel's BLOCK_SIZE_K = pow2(NUM_TOPK_CHUNKS * pow2(topk))
+        # stays reasonable. With topk=32 and cap 16, merge sorts 512 items.
+        TOPK_TARGET_GRID = 64
+        MAX_NUM_TOPK_CHUNKS = 16
+        topk_target = max(
+            1,
+            min(
+                MAX_NUM_TOPK_CHUNKS,
+                TOPK_TARGET_GRID // max(1, batch_size * num_q_heads),
+            ),
+        )
+        NUM_TOPK_CHUNKS = 1 << (topk_target.bit_length() - 1)
+        BLOCK_SIZE_T = triton.next_power_of_2(topk)
+        max_seqblock = score.shape[2]
+        chunk_blocks = (max_seqblock + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
+        topk_score_partial = torch.empty(
+            NUM_TOPK_CHUNKS,
+            num_q_heads,
+            batch_size,
+            BLOCK_SIZE_T,
+            dtype=torch.float32,
+            device=score.device,
+        )
+        topk_idx_partial = torch.empty(
+            NUM_TOPK_CHUNKS,
+            num_q_heads,
+            batch_size,
+            BLOCK_SIZE_T,
+            dtype=torch.int32,
+            device=score.device,
+        )
+        grid = (batch_size, num_q_heads, NUM_TOPK_CHUNKS)
+        _topk_index_partial_kernel[grid](
+            score,
+            topk_score_partial,
+            topk_idx_partial,
+            seq_lens,
+            block_size,
+            topk,
+            chunk_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            topk_score_partial.stride(0),
+            topk_score_partial.stride(1),
+            topk_score_partial.stride(2),
+            topk_score_partial.stride(3),
+            topk_idx_partial.stride(0),
+            topk_idx_partial.stride(1),
+            topk_idx_partial.stride(2),
+            topk_idx_partial.stride(3),
+        )
+        grid = (batch_size, num_q_heads)
+        _topk_index_merge_kernel[grid](
+            topk_score_partial,
+            topk_idx_partial,
+            topk_idx,
+            seq_lens,
+            block_size,
+            topk,
+            topk_score_partial.stride(0),
+            topk_score_partial.stride(1),
+            topk_score_partial.stride(2),
+            topk_score_partial.stride(3),
+            topk_idx_partial.stride(0),
+            topk_idx_partial.stride(1),
+            topk_idx_partial.stride(2),
+            topk_idx_partial.stride(3),
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
+        )
+    return topk_idx
+
+
 @torch.no_grad()
 def flash_decode_with_topk_idx(
     q: torch.Tensor,  # [batch_size, num_heads, head_dim]
@@ -1048,11 +1170,7 @@ def flash_decode_with_topk_idx(
         dtype=torch.float32,
         device=q.device,
     )
-    use_jit_topk = (
-        envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= _JIT_TOPK_MAX_NUM_BLOCKS
-        and topk <= 32
-    )
+    use_jit_topk = decode_topk_uses_jit(score.shape[2], topk)
     # If the live context has <= topk sparse blocks, the downstream dense
     # page-table/JIT top-k kernels select every block from seq_lens directly
     # without reading score. Keep this gate in sync with the consumers below:
@@ -1222,107 +1340,13 @@ def flash_decode_with_topk_idx(
     else:
         _skip_block_topk = False
 
-    # get topk index
     if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
-
-    if _skip_block_topk:
-        pass
-    elif use_jit_topk:
-        # Single-stage JIT radix-select: one kernel, no intermediate buffers.
-        # Equivalent output to the 2-stage path (set of block ids, front-packed,
-        # -1 padded); ~2-16x faster for long context. See
-        # sglang/kernels/ops/attention/minimax_decode_topk.py.
-        if is_xpu():
-            from sgl_kernel import minimax_decode_topk
-        else:
-            from sglang.kernels.ops.attention.minimax_decode_topk import (
-                minimax_decode_topk,
-            )
-
-        minimax_decode_topk(score, seq_lens, block_size, topk, out=topk_idx)
-    else:
-        # 2-stage split-K Triton fallback.
-        # Choose NUM_TOPK_CHUNKS to add parallelism over the seqblock dim.
-        # Same constraints as flash_decode: must be deterministic from values
-        # constant within a cuda graph (BS, num_q_heads), pow2, capped so the
-        # merge kernel's BLOCK_SIZE_K = pow2(NUM_TOPK_CHUNKS * pow2(topk))
-        # stays reasonable. With topk=32 and cap 16, merge sorts 512 items.
-        TOPK_TARGET_GRID = 64
-        MAX_NUM_TOPK_CHUNKS = 16
-        topk_target = max(
-            1,
-            min(
-                MAX_NUM_TOPK_CHUNKS,
-                TOPK_TARGET_GRID // max(1, batch_size * num_q_heads),
-            ),
-        )
-        NUM_TOPK_CHUNKS = 1 << (topk_target.bit_length() - 1)
-        BLOCK_SIZE_T = triton.next_power_of_2(topk)
-        max_seqblock = score.shape[2]
-        chunk_blocks = (max_seqblock + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
-        topk_score_partial = torch.empty(
-            NUM_TOPK_CHUNKS,
-            num_q_heads,
-            batch_size,
-            BLOCK_SIZE_T,
-            dtype=torch.float32,
-            device=score.device,
-        )
-        topk_idx_partial = torch.empty(
-            NUM_TOPK_CHUNKS,
-            num_q_heads,
-            batch_size,
-            BLOCK_SIZE_T,
-            dtype=torch.int32,
-            device=score.device,
-        )
-        # stream 0 (default): topk partial → topk merge
-        grid = (batch_size, num_q_heads, NUM_TOPK_CHUNKS)
-        _topk_index_partial_kernel[grid](
-            score,
-            topk_score_partial,
-            topk_idx_partial,
-            seq_lens,
-            block_size,
-            topk,
-            chunk_blocks,
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            topk_score_partial.stride(0),
-            topk_score_partial.stride(1),
-            topk_score_partial.stride(2),
-            topk_score_partial.stride(3),
-            topk_idx_partial.stride(0),
-            topk_idx_partial.stride(1),
-            topk_idx_partial.stride(2),
-            topk_idx_partial.stride(3),
-        )
-        grid = (batch_size, num_q_heads)
-        _topk_index_merge_kernel[grid](
-            topk_score_partial,
-            topk_idx_partial,
-            topk_idx,
-            seq_lens,
-            block_size,
-            topk,
-            topk_score_partial.stride(0),
-            topk_score_partial.stride(1),
-            topk_score_partial.stride(2),
-            topk_score_partial.stride(3),
-            topk_idx_partial.stride(0),
-            topk_idx_partial.stride(1),
-            topk_idx_partial.stride(2),
-            topk_idx_partial.stride(3),
-            topk_idx.stride(0),
-            topk_idx.stride(1),
-            topk_idx.stride(2),
-            NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
+        topk_idx = select_decode_topk(
+            score=score,
+            seq_lens=seq_lens,
+            block_size=block_size,
+            topk=topk,
+            use_jit_topk=use_jit_topk,
         )
     if disable_index_value:
         return None, topk_idx, real_seq_lens

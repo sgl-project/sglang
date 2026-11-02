@@ -1,9 +1,13 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# SM100 runs exercise the native Cake path for eligible shapes.
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+# backend-specific: ROCm uses the temperature_softmax kernel for per-row scaling.
 register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import unittest
+from itertools import product
 
 import torch
 
@@ -19,8 +23,11 @@ class TestTemperatureSoftmax(CustomTestCase):
             0.5, 1.5, rows, dtype=torch.float32, device="cuda"
         ).unsqueeze(1)
 
-    def assert_matches_torch(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        expected = torch.softmax(logits / temperatures, dim=-1)
+    def assert_matches_torch(
+        self, logits: torch.Tensor, temperatures: torch.Tensor | None
+    ):
+        scaled_logits = logits if temperatures is None else logits / temperatures
+        expected = torch.softmax(scaled_logits, dim=-1)
         actual = softmax(logits, temperatures=temperatures)
 
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-7)
@@ -32,6 +39,10 @@ class TestTemperatureSoftmax(CustomTestCase):
             (1, 0),
             (1, 1024),
             (1, 32000),
+            (1, 131072),
+            (4, 154880),
+            (64, 131072),
+            (1, 262144),
             (7, 65537),
             (32, 128257),
             (33, 4096),
@@ -45,6 +56,7 @@ class TestTemperatureSoftmax(CustomTestCase):
                     device="cuda",
                     generator=generator,
                 )
+                self.assert_matches_torch(logits, None)
                 self.assert_matches_torch(logits, self.temperatures(rows))
 
     def test_noncontiguous_logits_fall_back(self):
@@ -52,13 +64,13 @@ class TestTemperatureSoftmax(CustomTestCase):
         self.assert_matches_torch(logits, self.temperatures(logits.shape[0]))
 
     def test_sparse_grammar_mask_with_fully_masked_splits(self):
-        vocab_size = 65537
-        allowed = torch.tensor(
-            [0, vocab_size // 2, vocab_size - 1], device="cuda", dtype=torch.long
-        )
-
-        for rows in (1, 3, 16, 32, 384):
-            with self.subTest(rows=rows):
+        for vocab_size, rows in product((65537, 131072), (1, 3, 16, 32, 384)):
+            with self.subTest(vocab_size=vocab_size, rows=rows):
+                allowed = torch.tensor(
+                    [0, vocab_size // 2, vocab_size - 1],
+                    device="cuda",
+                    dtype=torch.long,
+                )
                 logits = torch.full(
                     (rows, vocab_size),
                     -float("inf"),
