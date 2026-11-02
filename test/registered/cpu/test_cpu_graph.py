@@ -1048,14 +1048,7 @@ class TestCPUGraph(CustomTestCase):
         runner.prefill_graphs = {6: compiled_fn}
         forward_batch = _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2)
 
-        with patch.object(
-            cpu_graph_runner_module,
-            "get_parallel",
-            return_value=SimpleNamespace(
-                tp_group=SimpleNamespace(barrier=lambda: None)
-            ),
-        ):
-            runner.execute(forward_batch, get_embedding=True)
+        runner.execute(forward_batch, get_embedding=True)
 
         self.assertEqual(received_kwargs, [{"get_embedding": True}])
 

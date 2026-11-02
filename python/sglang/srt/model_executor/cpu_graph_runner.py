@@ -2045,7 +2045,6 @@ class CPUGraphRunner:
                 if self.enable_torch_compile and forward_batch.batch_size >= 2:
                     self._mark_dynamic_prefill_metadata()
                 with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
-                    get_parallel().tp_group.barrier()
                     if self._prefill_uses_eager_logits_tail:
                         # The outer model retains its normal forward contract; the
                         # dispatcher redirects only its inner LM call for this graph.
@@ -2093,6 +2092,7 @@ class CPUGraphRunner:
             # exercises the already-compiled artifact (mirrors
             # capture_one_batch_size above).
             for _ in range(2):
+                get_parallel().tp_group.barrier()
                 self._run_prefill_once(compiled_fn, fb, **warmup_kwargs)
 
     def _compile_prefill_bucket(self, num_tokens: int) -> Callable:
