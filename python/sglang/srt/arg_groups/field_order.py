@@ -556,5 +556,8 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
+    "uocr_doc_split",
+    "uocr_doc_page_window",
+    "uocr_max_page_tokens",
 )
 # fmt: on

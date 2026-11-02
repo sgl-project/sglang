@@ -136,6 +136,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -174,7 +175,10 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
-from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    supports_sampling_mask,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_secrets,
@@ -1191,6 +1195,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Multimodal inputs are not supported when --language-model-only "
                 "is set; the encoder is not loaded. Restart without the flag."
             )
+
+        # Reject audio early when audio_config is explicitly None (audio
+        # tower disabled, e.g. gemma-4-31B-it); otherwise the audio items
+        # reach the scheduler and get_audio_feature() kills it. Models that
+        # cannot process audio (no audio token, e.g. GLM-5.3-Flash) or
+        # define their audio config differently (e.g. Phi-4 MM) are not
+        # affected.
+        hf_config = self.model_config.hf_config
+        declares_audio = getattr(
+            getattr(self.mm_processor, "mm_tokens", None), "audio_token", None
+        )
+        if (
+            has_valid_data(obj.audio_data)
+            and declares_audio
+            and hasattr(hf_config, "audio_config")
+            and hf_config.audio_config is None
+        ):
+            raise ValueError(
+                f"Audio inputs are not supported by {self.served_model_name}"
+            )
+
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -1451,6 +1476,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 obj.custom_logit_processor
                 and not get_exec().features.enable_custom_logit_processor
+                and obj.custom_logit_processor != UOCR_PAGE_GUARD_PROCESSOR
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
