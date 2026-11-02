@@ -7,6 +7,7 @@ from typing import (
     TYPE_CHECKING,
     Callable,
     Deque,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -14,7 +15,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -61,17 +62,14 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
-    get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # it still owns its KV row.
+    # The lists that hold the live requests, by name (`Scheduler.request_lists`).
+    get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
     get_chunked_req: Callable = field(default=lambda: None)
     get_running_reqs: Callable = field(default=lambda: None)
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
     get_pp_mbs: Callable = field(default=lambda: ())
-    # When False, extend step batches hold no running request.
-    prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -267,16 +265,7 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            reqs.append(chunked_req)
+        reqs = [req for reqs in self.get_request_lists().values() for req in reqs]
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
@@ -482,26 +471,46 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
+    def maybe_check_request_lists(self) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, no request is in two lists."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        owners: Dict[Req, str] = {}
+        for name, reqs in self.get_request_lists().items():
+            for req in reqs:
+                if req in owners:
+                    raise RuntimeError(
+                        f"Request {req.rid} is in both {owners[req]} and {name}"
+                    )
+                owners[req] = name
+
     def maybe_check_running_reqs(
         self,
         running_batch: Optional[ScheduleBatch],
         last_batch: Optional[ScheduleBatch],
     ) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the batches hold, apart from the chunked request."""
+        the unfinished ones the running batches and the steps decode, apart from
+        the chunked request. A launched prefill joins running at its merge."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        step_batches = [last_batch, *self.get_pp_mbs()]
-        if not self.prefill_launch_starts_running():
-            step_batches = [
-                b
-                for b in step_batches
-                if b is not None and not b.forward_mode.is_extend()
-            ]
-        self.get_running_reqs().check(
-            [running_batch, *self.get_pp_running_mbs(), *step_batches],
-            chunked_req=self.get_chunked_req(),
-        )
+        held = [
+            req
+            for b in (running_batch, *self.get_pp_running_mbs())
+            if b is not None
+            for req in b.reqs
+        ]
+        # An extend step decodes only the rows a mixed step took from a running
+        # batch; its other rows are launched prefills.
+        held += [
+            req
+            for b in (last_batch, *self.get_pp_mbs())
+            if b is not None
+            for req in (
+                (b.decoding_reqs or ()) if b.forward_mode.is_extend() else b.reqs
+            )
+        ]
+        self.get_running_reqs().check(held, chunked_req=self.get_chunked_req())
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
