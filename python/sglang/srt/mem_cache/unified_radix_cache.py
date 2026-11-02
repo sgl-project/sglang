@@ -111,12 +111,12 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (  # noqa: F401
+    NodeId,
     uses_joint_lru,
 )
 from sglang.srt.observability.metrics_collector import (

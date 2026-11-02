@@ -246,7 +246,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
-            from sglang.srt.eplb.expert_location_dispatch import (
+            from sglang.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
 

@@ -13,9 +13,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
