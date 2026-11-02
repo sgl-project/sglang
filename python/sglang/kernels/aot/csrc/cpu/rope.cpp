@@ -392,7 +392,11 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
   int64_t head_size = query.size(2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, num_heads, head_size}, input_dtype);
+  CHECK_DIM(3, key);
+  CHECK_EQ(key.size(0), num_tokens);
+  CHECK_EQ(key.size(2), head_size);
+  CHECK_EQ(key.scalar_type(), input_dtype);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
   CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
   CHECK_EQ(cos.scalar_type(), sin.scalar_type());
