@@ -15,6 +15,32 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestNemotronHConfig(CustomTestCase):
+    def test_transformers_v5_layer_names_match_legacy_layout(self):
+        """A config.json written by transformers >= 5 parses to the legacy layer layout."""
+        legacy = NemotronHConfig(
+            layers_block_type=["mamba", "moe", "attention", "mlp"],
+            num_nextn_predict_layers=1,
+            mtp_layers_block_type=["attention", "moe"],
+        )
+        v5 = NemotronHConfig(
+            layers_block_type=["linear_attention", "moe", "full_attention", "mlp"],
+            num_nextn_predict_layers=1,
+            mtp_layers_block_type=["full_attention", "moe"],
+        )
+
+        self.assertEqual(v5.hybrid_override_pattern, legacy.hybrid_override_pattern)
+        self.assertEqual(
+            v5.mtp_hybrid_override_pattern, legacy.mtp_hybrid_override_pattern
+        )
+        self.assertEqual(v5.mamba_layer_ids, [0])
+        self.assertEqual(v5.full_attention_layer_ids, [2])
+
+    def test_unknown_layer_names_are_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "invalid types"):
+            NemotronHConfig(layers_block_type=["mamba", "sliding_attention"])
+
+
 class TestNemotronHOmniConfig(CustomTestCase):
     def test_uses_checkpoint_model_type(self):
         config = NemotronH_Omni_Reasoning_V3_Config(
@@ -26,29 +52,36 @@ class TestNemotronHOmniConfig(CustomTestCase):
         self.assertEqual(config.model_type, "nemotron_h_omni")
 
     def test_normalizes_current_nemotron_h_layer_names(self):
+        """Every VL wrapper accepts the transformers >= 5 layer names in llm_config."""
         llm_config = {
             "layers_block_type": ["linear_attention", "moe", "full_attention"],
             "num_nextn_predict_layers": 1,
             "mtp_layers_block_type": ["full_attention", "moe"],
         }
 
-        config = NemotronH_Omni_Reasoning_V3_Config(
-            vision_config={"args": {"model": "radio"}},
-            llm_config=llm_config,
-        )
+        for config_class in (
+            NemotronH_Nano_VL_V2_Config,
+            NemotronH_Nano_Omni_Reasoning_V3_Config,
+            NemotronH_Omni_Reasoning_V3_Config,
+        ):
+            with self.subTest(config_class=config_class.__name__):
+                config = config_class(
+                    vision_config={"args": {"model": "radio"}},
+                    llm_config=llm_config,
+                )
 
-        self.assertEqual(
-            config.llm_config.layers_block_type,
-            ["mamba", "moe", "attention"],
-        )
-        self.assertEqual(
-            config.llm_config.mtp_layers_block_type,
-            ["attention", "moe"],
-        )
-        self.assertEqual(
-            llm_config["layers_block_type"],
-            ["linear_attention", "moe", "full_attention"],
-        )
+                self.assertEqual(
+                    config.llm_config.layers_block_type,
+                    ["mamba", "moe", "attention"],
+                )
+                self.assertEqual(
+                    config.llm_config.mtp_layers_block_type,
+                    ["attention", "moe"],
+                )
+                self.assertEqual(
+                    llm_config["layers_block_type"],
+                    ["linear_attention", "moe", "full_attention"],
+                )
 
     def test_text_config_resolves_to_the_language_model_config(self):
         """get_text_config() returns llm_config, which LoRAManager sizes from."""
