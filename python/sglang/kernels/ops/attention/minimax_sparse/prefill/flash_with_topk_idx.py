@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
 
+from ..common.nvfp4 import Nvfp4Cache
 from ..common.tile_ptr import tile_ptrs_2d
 from ..common.utils import (
     _bitonic_merge,
@@ -605,10 +606,43 @@ def _index_block_score_only_kernel(
         tl.store(s_ptrs, score, mask=q_store_mask)
 
 
+def _use_fused_index_topk(
+    q: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    *,
+    disable_index_value: bool,
+    score_type: str,
+    sink: Optional[torch.Tensor],
+    q_scale: Optional[float],
+    k_scale: float,
+    topk: int,
+    local_blocks: int,
+    page_size: int,
+    block_size_q: int,
+    block_size_k: int,
+) -> bool:
+    # Scale-free max scores: a positive sm_scale cannot change which blocks win.
+    if not (
+        is_gfx95_supported()
+        and disable_index_value
+        and score_type == "max"
+        and sink is None
+        and q_scale in (None, 1.0)
+        and k_scale == 1.0
+        and block_size_q == 1
+    ):
+        return False
+    try:
+        from .index_topk_gfx950 import can_fuse_index_topk
+    except ImportError:  # Gluon without the CDNA4 MFMA op
+        return False
+    return can_fuse_index_topk(q, k_cache, topk, local_blocks, page_size, block_size_k)
+
+
 @torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
-    k_cache: torch.Tensor,  # paged
+    k_cache: Union[torch.Tensor, Nvfp4Cache],  # paged
     v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
     sink: Optional[torch.Tensor],
     req_to_token: torch.Tensor,
@@ -640,16 +674,28 @@ def flash_prefill_with_topk_index(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check (v_cache is None under disable_index_value)
-    is_fp8 = check_sparse_kv_fp8(
-        q, k_cache, None if disable_index_value else v_cache, label="prefill indexer"
-    )
+    is_nvfp4 = isinstance(k_cache, Nvfp4Cache)
+    if is_nvfp4:
+        assert disable_index_value and score_type == "max" and sink is None, (
+            "the NVFP4 index-K cache serves only the score-only max indexer "
+            "(no index V, no sink)"
+        )
+        is_fp8 = False
+        max_slots, num_kv_heads = 0, k_cache.num_heads
+    else:
+        # dtype check (v_cache is None under disable_index_value)
+        is_fp8 = check_sparse_kv_fp8(
+            q,
+            k_cache,
+            None if disable_index_value else v_cache,
+            label="prefill indexer",
+        )
+        max_slots, num_kv_heads, _ = k_cache.shape
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
     if disable_index_value:
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
@@ -675,6 +721,40 @@ def flash_prefill_with_topk_index(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
+    if _use_fused_index_topk(
+        q,
+        k_cache,
+        disable_index_value=disable_index_value,
+        score_type=score_type,
+        sink=sink,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        topk=topk,
+        local_blocks=local_blocks,
+        page_size=page_size,
+        block_size_q=block_size_q,
+        block_size_k=block_size_k,
+    ):
+        from .index_topk_gfx950 import fused_index_topk
+
+        return None, fused_index_topk(
+            q,
+            k_cache,
+            req_to_token,
+            slot_ids,
+            cu_seqlens,
+            prefix_lens,
+            max_seqlen_q,
+            max_seqlen_k,
+            topk,
+            init_blocks,
+            local_blocks,
+            block_size_k,
+        )
+    if is_nvfp4:
+        raise NotImplementedError(
+            "an NVFP4 index K is scored only by the fused gfx950 index top-k"
+        )
     if disable_index_value:
         o = None
     else:

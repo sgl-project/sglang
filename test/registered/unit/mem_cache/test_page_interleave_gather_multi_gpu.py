@@ -81,7 +81,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
 
 _GATHER_WORLD = 2
 _GATHER_LAYER_NUM = 4

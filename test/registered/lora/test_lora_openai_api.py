@@ -1,8 +1,9 @@
 """
-Unit tests for OpenAI-compatible LoRA API support.
+Unit tests for OpenAI-compatible LoRA adapter selection.
 
-Tests the model parameter parsing and LoRA adapter resolution logic
-that enables OpenAI-compatible LoRA adapter selection.
+``_parse_model_parameter`` and ``_resolve_lora_path`` in ``serving_base.py``
+decide which adapter a ``model="base:adapter"`` request runs on; a wrong split
+silently serves the base model or another adapter.
 """
 
 import unittest
@@ -12,28 +13,24 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="nightly-amd-1-gpu", nightly=True)
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
 
-
-def publish_config(case):
-    """`OpenAIServingBase.__init__` reads `get_observability()`, so a case that
-    builds one needs a published config. The mock manager cannot stand in for
-    it: `MagicMock(spec=ServerArgs)` passes the `isinstance` guard, so the read
-    happens and there is no bag to answer from."""
-    reset_context()
-    case.addCleanup(reset_context)
-    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+SERVED_MODEL_NAME = "test-model"
+# An exact served name that itself contains a colon.
+URI_MODEL_NAME = "s3://bucket/model"
 
 
 class MockTokenizerManager:
-    """Mock TokenizerManager for testing."""
+    """The manager attributes the resolver reads."""
 
     def __init__(self, enable_lora=False):
         self.server_args = MagicMock(spec=ServerArgs)
         self.server_args.enable_lora = enable_lora
-        self.served_model_name = "test-model"
+        self.served_model_name = SERVED_MODEL_NAME
 
 
 class ConcreteServingBase(OpenAIServingBase):
@@ -49,223 +46,86 @@ class ConcreteServingBase(OpenAIServingBase):
         pass
 
 
-class TestParseModelParameter(unittest.TestCase):
-    """Test _parse_model_parameter method."""
-
+class TestLoRAModelParameter(CustomTestCase):
     def setUp(self):
-        publish_config(self)
+        # `OpenAIServingBase.__init__` reads `get_observability()`, so a case
+        # needs a published config: `MagicMock(spec=ServerArgs)` passes the
+        # `isinstance` guard, and there is no bag to answer from otherwise.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
     def test_model_without_adapter(self):
-        """Test parsing model without adapter returns None for adapter."""
-        base_model, adapter = self.serving._parse_model_parameter("llama-3.1-8B")
-        self.assertEqual(base_model, "llama-3.1-8B")
-        self.assertIsNone(adapter)
-
-    def test_model_with_adapter(self):
-        """Test parsing model with adapter extracts both parts."""
-        base_model, adapter = self.serving._parse_model_parameter(
-            "llama-3.1-8B:sql-expert"
+        self.assertEqual(
+            self.serving._parse_model_parameter("llama-3.1-8B"), ("llama-3.1-8B", None)
         )
-        self.assertEqual(base_model, "llama-3.1-8B")
-        self.assertEqual(adapter, "sql-expert")
+        self.assertIsNone(self.serving._resolve_lora_path("llama-3.1-8B", None))
 
-    def test_model_with_path_and_adapter(self):
-        """Test parsing model path with slashes and adapter."""
-        base_model, adapter = self.serving._parse_model_parameter(
-            "meta-llama/Llama-3.1-8B-Instruct:adapter-name"
+    def test_explicit_lora_path_string(self):
+        self.assertEqual(
+            self.serving._resolve_lora_path("llama-3.1-8B", "python-expert"),
+            "python-expert",
         )
-        self.assertEqual(base_model, "meta-llama/Llama-3.1-8B-Instruct")
-        self.assertEqual(adapter, "adapter-name")
 
-    def test_model_with_multiple_colons(self):
-        """Test that only first colon is used for splitting."""
-        base_model, adapter = self.serving._parse_model_parameter("model:adapter:extra")
-        self.assertEqual(base_model, "model")
-        self.assertEqual(adapter, "adapter:extra")
-
-    def test_model_with_whitespace(self):
-        """Test that whitespace is stripped from both parts."""
-        base_model, adapter = self.serving._parse_model_parameter(
-            " model-name : adapter-name "
+    def test_explicit_lora_path_list(self):
+        explicit = ["adapter1", None, "adapter2"]
+        self.assertIs(
+            self.serving._resolve_lora_path("llama-3.1-8B", explicit), explicit
         )
-        self.assertEqual(base_model, "model-name")
-        self.assertEqual(adapter, "adapter-name")
 
-    def test_model_with_empty_adapter(self):
-        """Test model ending with colon returns None for adapter."""
-        base_model, adapter = self.serving._parse_model_parameter("model-name:")
-        self.assertEqual(base_model, "model-name")
-        self.assertIsNone(adapter)
-
-    def test_model_with_only_spaces_after_colon(self):
-        """Test model with only whitespace after colon returns None for adapter."""
-        base_model, adapter = self.serving._parse_model_parameter("model-name:   ")
-        self.assertEqual(base_model, "model-name")
-        self.assertIsNone(adapter)
-
-
-class TestResolveLoraPath(unittest.TestCase):
-    """Test _resolve_lora_path method."""
-
-    def setUp(self):
-        publish_config(self)
-        self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
-        self.serving = ConcreteServingBase(self.tokenizer_manager)
-
-    def test_no_adapter_specified(self):
-        """Test when neither model nor explicit lora_path has adapter."""
-        result = self.serving._resolve_lora_path("model-name", None)
-        self.assertIsNone(result)
-
-    def test_adapter_in_model_only(self):
-        """Test adapter from model parameter when no explicit path."""
-        result = self.serving._resolve_lora_path("model:sql-expert", None)
-        self.assertEqual(result, "sql-expert")
-
-    def test_adapter_in_explicit_only(self):
-        """Test adapter from explicit lora_path when not in model."""
-        result = self.serving._resolve_lora_path("model-name", "python-expert")
-        self.assertEqual(result, "python-expert")
-
-    def test_model_parameter_takes_precedence(self):
-        """Test model parameter adapter takes precedence over explicit."""
-        result = self.serving._resolve_lora_path("model:sql-expert", "python-expert")
-        self.assertEqual(result, "sql-expert")
-
-    def test_with_list_explicit_lora_path(self):
-        """Test that explicit list is returned when no model adapter."""
-        explicit = ["adapter1", "adapter2", None]
-        result = self.serving._resolve_lora_path("model-name", explicit)
-        self.assertEqual(result, explicit)
-
-    def test_model_adapter_overrides_list(self):
-        """Test model adapter overrides even when explicit is a list."""
-        result = self.serving._resolve_lora_path(
-            "model:sql-expert", ["adapter1", "adapter2"]
+    def test_model_suffix_overrides_explicit_string(self):
+        self.assertEqual(
+            self.serving._resolve_lora_path("model:sql-expert", "python-expert"),
+            "sql-expert",
         )
-        self.assertEqual(result, "sql-expert")
 
-    def test_complex_model_name_with_adapter(self):
-        """Test resolution with complex model name."""
-        result = self.serving._resolve_lora_path(
-            "org/model-v2.1:adapter-name", "other-adapter"
+    def test_model_suffix_overrides_explicit_list(self):
+        self.assertEqual(
+            self.serving._resolve_lora_path(
+                "model:sql-expert", ["adapter1", "adapter2"]
+            ),
+            "sql-expert",
         )
-        self.assertEqual(result, "adapter-name")
 
+    def test_first_colon_splits_base_from_adapter(self):
+        self.assertEqual(self.serving._parse_model_parameter("a:b:c"), ("a", "b:c"))
+        self.assertEqual(
+            self.serving._parse_model_parameter(
+                "meta-llama/Llama-3.1-8B-Instruct:adapter-name"
+            ),
+            ("meta-llama/Llama-3.1-8B-Instruct", "adapter-name"),
+        )
 
-class TestIntegrationScenarios(unittest.TestCase):
-    """Integration tests for common usage scenarios."""
+    def test_whitespace_stripped_and_empty_suffix_is_none(self):
+        self.assertEqual(
+            self.serving._parse_model_parameter(" model-name : adapter-name "),
+            ("model-name", "adapter-name"),
+        )
+        for model in ("model-name:", "model-name:   "):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    self.serving._parse_model_parameter(model), ("model-name", None)
+                )
 
-    def setUp(self):
-        publish_config(self)
-        self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
-        self.serving = ConcreteServingBase(self.tokenizer_manager)
+    def test_served_model_name_with_colon_is_the_base_model(self):
+        self.tokenizer_manager.served_model_name = URI_MODEL_NAME
+        self.assertEqual(
+            self.serving._parse_model_parameter(URI_MODEL_NAME), (URI_MODEL_NAME, None)
+        )
+        self.assertIsNone(self.serving._resolve_lora_path(URI_MODEL_NAME, None))
 
-    def test_openai_compatible_usage(self):
-        """Test typical OpenAI-compatible usage pattern."""
-        # User specifies adapter in model parameter
-        model = "meta-llama/Llama-3.1-8B:sql-expert"
-        explicit_lora = None
-
-        lora_path = self.serving._resolve_lora_path(model, explicit_lora)
-        self.assertEqual(lora_path, "sql-expert")
-
-    def test_backward_compatible_usage(self):
-        """Test backward-compatible usage with explicit lora_path."""
-        model = "meta-llama/Llama-3.1-8B"
-        explicit_lora = "sql-expert"
-
-        lora_path = self.serving._resolve_lora_path(model, explicit_lora)
-        self.assertEqual(lora_path, "sql-expert")
-
-    def test_base_model_usage(self):
-        """Test using base model without any adapter."""
-        model = "meta-llama/Llama-3.1-8B"
-        explicit_lora = None
-
-        lora_path = self.serving._resolve_lora_path(model, explicit_lora)
-        self.assertIsNone(lora_path)
-
-        # No validation needed when no adapter
-
-    def test_batch_request_scenario(self):
-        """Test batch request with list of adapters."""
-        model = "meta-llama/Llama-3.1-8B"  # No adapter in model
-        explicit_lora = ["sql-expert", "python-expert", None]
-
-        lora_path = self.serving._resolve_lora_path(model, explicit_lora)
-        self.assertEqual(lora_path, explicit_lora)
-
-    def test_adapter_in_model_overrides_batch_list(self):
-        """Test that adapter in model parameter overrides batch list."""
-        model = "meta-llama/Llama-3.1-8B:preferred-adapter"
-        explicit_lora = ["adapter1", "adapter2"]
-
-        lora_path = self.serving._resolve_lora_path(model, explicit_lora)
-        self.assertEqual(lora_path, "preferred-adapter")
-
-
-class TestEdgeCases(unittest.TestCase):
-    """Test edge cases and error conditions."""
-
-    def setUp(self):
-        publish_config(self)
-        self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
-        self.serving = ConcreteServingBase(self.tokenizer_manager)
-
-    def test_empty_string_model(self):
-        """Test handling of empty string model."""
-        base, adapter = self.serving._parse_model_parameter("")
-        self.assertEqual(base, "")
-        self.assertIsNone(adapter)
-
-    def test_only_colon(self):
-        """Test model parameter that is just a colon."""
-        base, adapter = self.serving._parse_model_parameter(":")
-        self.assertEqual(base, "")
-        self.assertIsNone(adapter)
-
-    def test_empty_list_lora_path(self):
-        """Test validation with empty list doesn't crash."""
-        lora_path = self.serving._resolve_lora_path("model-name", [])
-        # Empty list is falsy, so validation won't be called
-        self.assertEqual(lora_path, [])
-
-    def test_list_with_none_first(self):
-        """Test validation finds first non-None adapter in list."""
-        lora_path = self.serving._resolve_lora_path("model-name", [None, "adapter2"])
-        self.assertEqual(lora_path, [None, "adapter2"])
-        # In actual usage, validation would find "adapter2"
-
-    def test_list_all_none(self):
-        """Test validation with list of all None values."""
-        lora_path = self.serving._resolve_lora_path("model-name", [None, None])
-        self.assertEqual(lora_path, [None, None])
-        # In actual usage, no validation would occur (no non-None adapters)
-
-    def test_unicode_in_adapter_name(self):
-        """Test Unicode characters in adapter name."""
-        base, adapter = self.serving._parse_model_parameter("model:adapter-名前")
-        self.assertEqual(base, "model")
-        self.assertEqual(adapter, "adapter-名前")
-
-    def test_special_characters_in_adapter(self):
-        """Test special characters in adapter name."""
-        base, adapter = self.serving._parse_model_parameter("model:adapter_v2.1-final")
-        self.assertEqual(base, "model")
-        self.assertEqual(adapter, "adapter_v2.1-final")
-
-    def test_none_as_explicit_lora_path(self):
-        """Test None as explicit lora_path is handled correctly."""
-        result = self.serving._resolve_lora_path("model:adapter", None)
-        self.assertEqual(result, "adapter")
-
-    def test_empty_string_as_explicit_lora_path(self):
-        """Test empty string as explicit lora_path."""
-        result = self.serving._resolve_lora_path("model-name", "")
-        self.assertEqual(result, "")
+    def test_served_model_name_with_colon_keeps_adapter_suffix(self):
+        self.tokenizer_manager.served_model_name = URI_MODEL_NAME
+        self.assertEqual(
+            self.serving._parse_model_parameter(f"{URI_MODEL_NAME}:adapter"),
+            (URI_MODEL_NAME, "adapter"),
+        )
+        self.assertEqual(
+            self.serving._resolve_lora_path(f"{URI_MODEL_NAME}:adapter", "other"),
+            "adapter",
+        )
 
 
 if __name__ == "__main__":

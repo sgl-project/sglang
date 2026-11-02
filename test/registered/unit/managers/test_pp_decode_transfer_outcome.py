@@ -90,6 +90,7 @@ def _decode_req(rid, poll):
         metadata_buffer_index=1,
         hicache_restore_status=None,
         host_staged=False,
+        pending_metadata=None,
     )
 
 

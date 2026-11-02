@@ -71,7 +71,13 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
-from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
+from sglang.srt.utils.msgpack_utils import (
+    dec_hook,
+    enc_hook,
+    ext_hook,
+    pickle_unfaithful_values,
+    unpickle_values,
+)
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
@@ -1183,9 +1189,17 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
+        self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
+        self.positional_embed_overrides = wrap_object_fields_as_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
+        self.mm_inputs = unwrap_object_fields_from_pickle(self.mm_inputs)
+        self.positional_embed_overrides = unwrap_object_fields_from_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1264,6 +1278,9 @@ class EmbeddingReqInput:
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # "float" (default / None) returns list[float]; "tensor" returns the raw
+    # torch.Tensor at the engine's native compute dtype.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1458,6 +1475,7 @@ class EmbeddingReqInput:
                 priority=self.priority,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                encoding_format=self.encoding_format,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1490,6 +1508,7 @@ class EmbeddingReqInput:
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
                 dimensions=self.dimensions,
+                encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 external_trace_header=self.external_trace_header,
@@ -1534,6 +1553,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Encoding format for the returned embedding. See EmbeddingReqInput.
+    encoding_format: Optional[str] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
@@ -1549,9 +1570,17 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
+        self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
+        self.positional_embed_overrides = wrap_object_fields_as_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
+        self.mm_inputs = unwrap_object_fields_from_pickle(self.mm_inputs)
+        self.positional_embed_overrides = unwrap_object_fields_from_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1577,7 +1606,10 @@ TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
-OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
+# A row is one vector for return_hidden_states="last", else a list of chunks.
+OutputHiddenStates = Optional[
+    List[Optional[List[Optional[Union[float, HiddenStateChunk]]]]]
+]
 CachedTokensDetails = Dict[str, Union[int, str]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
@@ -1705,6 +1737,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1801,6 +1834,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1851,6 +1885,9 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
+    # Tensor-format embeddings use a separate typed field because msgspec does not
+    # allow a custom type such as torch.Tensor in a union with other value types.
+    tensor_embeddings: Optional[List[Optional[torch.Tensor]]] = None
     # Each request is output once, so every row carries its stats.
     request_stats: List[RequestOutputStats]
     # Placeholder token info
@@ -2241,6 +2278,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     skip_tensor_list: Optional[List[str]] = None
     # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
+    names: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
@@ -2309,6 +2347,7 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    prefill_weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -2455,6 +2494,12 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+
+
+class ReleaseUocrDocReqInput(BaseReq, kw_only=True):
+    """Free the KV a split document retained for its next window."""
+
+    doc_id: str
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):
@@ -2690,6 +2735,24 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         # objects (native-MM `mm_inputs`) without a pickle hop.
         return obj
     return pickle.loads(obj.data)
+
+
+def wrap_object_fields_as_pickle(
+    obj: Optional[Union[MultimodalProcessorOutput, PositionalEmbeds]],
+):
+    """Pickle the object-typed values in obj that msgpack would not round-trip."""
+    if obj is None or _USE_PICKLE_IPC:
+        return obj
+    return obj.map_object_fields(pickle_unfaithful_values)
+
+
+def unwrap_object_fields_from_pickle(
+    obj: Optional[Union[MultimodalProcessorOutput, PositionalEmbeds]],
+):
+    """Inverse of wrap_object_fields_as_pickle."""
+    if obj is None or _USE_PICKLE_IPC:
+        return obj
+    return obj.map_object_fields(unpickle_values)
 
 
 _struct_types = tuple(

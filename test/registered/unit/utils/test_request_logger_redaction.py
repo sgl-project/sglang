@@ -1,5 +1,6 @@
 """Watermark secrets stay redacted in request logs, and the redaction walk is
-bounded by max_length instead of the prompt length."""
+bounded by max_length instead of the prompt length. With watermarking off, only
+requests that carry a watermark field are redacted."""
 
 import dataclasses
 import json
@@ -13,8 +14,11 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.runtime_context import create_context, use_context
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import request_logger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,6 +39,22 @@ def _request(num_ids: int) -> GenerateReqInput:
         sampling_params={"max_new_tokens": 8, "watermark": {"key": SECRET}},
         rid="rid-0",
     )
+
+
+def _log_all_entry_points(req, chat_req, log_requests_format: str) -> str:
+    """Logs req as received and finished and chat_req as an OpenAI request."""
+    logger = request_logger.RequestLogger(
+        log_requests=True,
+        log_requests_level=3,
+        log_requests_format=log_requests_format,
+        log_requests_target=None,
+    )
+    target = mock.Mock()
+    logger.targets = [target]
+    logger.log_received_request(req)
+    logger.log_finished_request(req, {"meta_info": {"e2e_latency": 0.1}})
+    logger.log_openai_received_request(chat_req)
+    return "\n".join(call.args[0] for call in target.info.call_args_list)
 
 
 class _LongestWalkSpy:
@@ -78,6 +98,64 @@ class TestRequestLogRedaction(CustomTestCase):
         json_out = repr(request_logger._transform_data_for_logging(req))
         self.assertNotIn(SECRET, text_out)
         self.assertNotIn(SECRET, json_out)
+
+    def test_watermarking_off_checks_only_watermark_fields(self):
+        # The received-request log runs before validation rejects a key sent to
+        # a server without --enable-watermark, so the key must still be redacted.
+        watermark_off = create_context(ServerArgs(model_path="dummy"), role="test")
+        self.assertFalse(watermark_off.config_bag("exec").features.enable_watermark)
+        messages = [{"role": "user", "content": "hi"}]
+        key = {"key": SECRET}
+        with_key = [
+            GenerateReqInput(input_ids=[1, 2], watermark=key),
+            GenerateReqInput(input_ids=[1, 2], sampling_params={"watermark": key}),
+            GenerateReqInput(input_ids=[[1], [2]], watermark=[None, key]),
+            GenerateReqInput(
+                input_ids=[[1], [2]], sampling_params=[{}, {"watermark": key}]
+            ),
+            EmbeddingReqInput(input_ids=[1, 2], sampling_params={"watermark": key}),
+        ]
+        without_key = [
+            GenerateReqInput(input_ids=[1, 2], sampling_params={"max_new_tokens": 1}),
+            GenerateReqInput(input_ids=[[1], [2]]),
+            EmbeddingReqInput(input_ids=[1, 2]),
+        ]
+        for req in with_key + without_key:
+            req.normalize_batch_and_arguments()
+        chat_with_key = ChatCompletionRequest(
+            model="m", messages=messages, watermark=key
+        )
+        chat_without_key = ChatCompletionRequest(model="m", messages=messages)
+
+        with use_context(watermark_off):
+            for log_requests_format in ("text", "json"):
+                for req in with_key:
+                    out = _log_all_entry_points(req, chat_with_key, log_requests_format)
+                    self.assertNotIn(SECRET, out, req)
+                    self.assertEqual(out.count("<redacted>"), 3, req)
+
+                # Requests without a watermark field are logged as is, with no
+                # redaction copy or walk.
+                with mock.patch.object(
+                    request_logger, "redact_watermark_secrets"
+                ) as redact:
+                    for req in without_key:
+                        _log_all_entry_points(
+                            req, chat_without_key, log_requests_format
+                        )
+                redact.assert_not_called()
+
+                # An OpenAI request with a watermark config redacts only that
+                # config, not the dict holding its prompt.
+                with mock.patch.object(
+                    request_logger,
+                    "redact_watermark_secrets",
+                    wraps=request_logger.redact_watermark_secrets,
+                ) as redact:
+                    _log_all_entry_points(
+                        without_key[0], chat_with_key, log_requests_format
+                    )
+                self.assertEqual([c.args[0] for c in redact.call_args_list], [key])
 
     def test_struct_under_ordinary_field_is_redacted(self):
         payload = {"rid": "r1", "extra": ExtraOptions()}
