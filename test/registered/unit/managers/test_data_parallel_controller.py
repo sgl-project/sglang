@@ -37,7 +37,7 @@ from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 # Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which

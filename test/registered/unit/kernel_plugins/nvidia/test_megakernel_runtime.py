@@ -19,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fakes import ANY_TP, ARCH, DRAFT, ISA, SPEC, Lm, batch, server_args  # noqa: E402
 
-register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 
 
 class OtherBinding:

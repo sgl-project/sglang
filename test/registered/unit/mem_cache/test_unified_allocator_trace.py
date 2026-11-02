@@ -19,7 +19,7 @@ from sglang.test.unified_allocator_trace import (
     replay_run,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _MANUAL = Path(__file__).resolve().parents[3] / "manual" / "mem_cache"
 

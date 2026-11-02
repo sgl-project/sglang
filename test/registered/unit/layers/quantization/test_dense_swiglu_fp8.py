@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 
 @unittest.skipUnless(get_device_sm() in (100, 103), "Dense block-FP8 fusion on SM100")

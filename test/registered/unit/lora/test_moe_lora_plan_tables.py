@@ -11,7 +11,7 @@ from sglang.srt.lora.moe import plan as ep
 from sglang.srt.lora.moe.plan import ActivationFn
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)

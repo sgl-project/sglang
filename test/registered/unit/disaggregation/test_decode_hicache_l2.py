@@ -40,7 +40,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 # The TP case spawns two gloo workers that each re-import torch and sglang.
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=39, suite="base-a-test-cpu")
 
 
 class _Event:

@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _fakes import ARCH, ISA, server_args  # noqa: E402
 
-register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=11, stage="base-a", runner_config="cpu")
 
 
 class TestMegakernelGuards(CustomTestCase):

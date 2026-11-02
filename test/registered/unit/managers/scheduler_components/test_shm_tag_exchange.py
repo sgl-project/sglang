@@ -25,7 +25,7 @@ from sglang.srt.utils import stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 # Arbitrary, with both 32-bit halves non-zero: the shm row carries the digest folded.
 _DIGEST = (7 << 32) | 5

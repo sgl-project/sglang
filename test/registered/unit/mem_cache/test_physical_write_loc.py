@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=39, suite="base-a-test-cpu")
 
 # `set_kv_buffer` dispatches on the platform, so the pools that get written live
 # on the platform's device; the mark itself is device-free.

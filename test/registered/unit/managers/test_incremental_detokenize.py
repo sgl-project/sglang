@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 SPECIAL = 100
 

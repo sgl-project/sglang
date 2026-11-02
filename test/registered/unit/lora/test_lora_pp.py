@@ -36,7 +36,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.runtime_context import get_context, get_parallel
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _req(lora_id, finished=False):

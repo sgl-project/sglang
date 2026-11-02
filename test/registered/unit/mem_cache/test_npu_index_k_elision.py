@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 INDEX_HEAD_DIM = 128
 # GLM-5.2-like: only some layers own an Indexer, the rest reuse top-k.
