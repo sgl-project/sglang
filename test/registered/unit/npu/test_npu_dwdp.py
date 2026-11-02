@@ -29,6 +29,8 @@ class TestNpuDwdpValidation(unittest.TestCase):
             ("attn_dcp_size", 2, "DCP1"),
             ("lora_paths", ["adapter"], "LoRA"),
             ("cpu_offload_gb", 1, "CPU offload"),
+            ("offload_group_size", 1, "CPU offload"),
+            ("enable_pd_role_switch", True, "PD role switching"),
         ):
             with self.subTest(field=field):
                 manager = NpuDwdpManager.__new__(NpuDwdpManager)
@@ -45,8 +47,9 @@ class TestNpuDwdpValidation(unittest.TestCase):
                     enable_lora=None,
                     lora_paths=None,
                     cpu_offload_gb=0,
+                    offload_group_size=0,
                     enable_memory_saver=False,
-                    enable_pdmux=False,
+                    enable_pd_role_switch=False,
                 )
                 target = (
                     manager._parallel

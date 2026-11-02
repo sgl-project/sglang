@@ -134,11 +134,12 @@ class NpuDwdpManager:
             self._server_args.enable_lora
             or (self._server_args.enable_lora is None and self._server_args.lora_paths)
             or self._server_args.cpu_offload_gb > 0
+            or self._server_args.offload_group_size > 0
             or self._server_args.enable_memory_saver
-            or self._server_args.enable_pdmux
+            or self._server_args.enable_pd_role_switch
         ):
             raise ValueError(
-                "NPU DWDP does not support LoRA, CPU offload, memory saver or PDMux"
+                "NPU DWDP does not support LoRA, CPU offload, memory saver or PD role switching"
             )
         layers = self._collect_moe_layers(model)
         if not layers:
