@@ -10,7 +10,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-a", runner_config="1-gpu-small-mi30x")
 
 
 class _EngineDesc:

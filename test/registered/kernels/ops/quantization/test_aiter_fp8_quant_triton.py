@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (  # noqa: E
 )
 from sglang.test.ci.ci_register import register_amd_ci  # noqa: E402
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 def _gate_up(num_tokens: int) -> torch.Tensor:

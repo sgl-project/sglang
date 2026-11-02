@@ -39,7 +39,7 @@ import torch
 from sglang.srt.utils.device import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 @unittest.skipUnless(is_hip(), "wo_a batched_gemm_bf16 routing requires ROCm")

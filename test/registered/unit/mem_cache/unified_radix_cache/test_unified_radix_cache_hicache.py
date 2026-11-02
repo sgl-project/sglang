@@ -47,7 +47,7 @@ from sglang.test.kits.unified_radix_cache.hicache import (
 )
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=12, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 
 class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):

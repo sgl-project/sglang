@@ -30,7 +30,7 @@ _is_hip = is_hip()
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 # the mi35x suite rather than the default AMD one: the ROCm case below is gfx95-only, and
 # everything else in here skips on HIP, so the mi300 registration only ever produced skips
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 HEAD_DIM = 128
 ROPE_DIM = 64

@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: the hook resolves get_device() and the matching distributed
 # backend, so only an AMD run exercises the HIP device and dump path.
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 TEST_HIDDEN_SIZE = 32
 

@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.gluon_moe_reference import GluonMoeFixture
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_amd_ci(est_time=180, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=180, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 # Each row names the expected module explicitly: a dispatcher regression must

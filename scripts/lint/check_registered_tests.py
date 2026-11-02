@@ -17,6 +17,12 @@ import sys
 # is always expressible the modern way.
 _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 
+_RUNNER_CONFIGS = os.path.join("scripts", "ci", "runner_configs.yml")
+_AMD_PR_WORKFLOWS = (
+    ".github/workflows/pr-test-amd.yml",
+    ".github/workflows/pr-test-amd-extra.yml",
+)
+
 # The only CUDA family still allowed on legacy `suite=`; anything else resolves
 # to a suite no workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
@@ -90,6 +96,47 @@ def taxonomy_errors(path: str, tree: ast.AST) -> list[str]:
     return []
 
 
+def _amd_pr_suites() -> set[str]:
+    """Suites the AMD PR-test workflows pass to `run_suite.py --hw amd --suite`."""
+    suites = set()
+    for wf in _AMD_PR_WORKFLOWS:
+        with open(wf, encoding="utf-8") as fh:
+            text = re.sub(r"\\\n", " ", fh.read())
+        suites.update(
+            re.findall(r"run_suite\.py\s+--hw\s+amd\s+--suite\s+([\w-]+)", text)
+        )
+    return suites
+
+
+def _amd_errors(
+    path: str, r, amd_runner_configs: set[str], amd_pr_suites: set[str]
+) -> list[str]:
+    """An AMD registration must name an amd_runner_configs key and a suite a job runs."""
+    if r.runner_config is not None:
+        if r.runner_config not in amd_runner_configs:
+            return [
+                f'{path}\n    runner_config="{r.runner_config}" is not in '
+                f"amd_runner_configs of {_RUNNER_CONFIGS}"
+            ]
+        if r.effective_suite not in amd_pr_suites:
+            return [
+                f"{path}\n    suite `{r.effective_suite}` is run by no job in "
+                f"{', '.join(_AMD_PR_WORKFLOWS)}"
+            ]
+        return []
+    # Only nightly suites stay legacy; any other suite= is a stale or misspelled
+    # name that no AMD job selects (AMD suites are not validated by run_suite.py).
+    if r.suite is None or r.suite.startswith("nightly-"):
+        return []
+    m = _MODERN_SHAPE.match(r.suite)
+    fix = (
+        f'stage="{m.group(1)}", runner_config="{m.group(2)}"'
+        if m and r.suite in amd_pr_suites
+        else f"stage=/runner_config= of a suite in {', '.join(_AMD_PR_WORKFLOWS)}"
+    )
+    return [f'{path}\n    suite="{r.suite}"  ->  {fix}']
+
+
 def main() -> int:
     # Import ci_register directly to avoid pulling in all of sglang
     spec = importlib.util.spec_from_file_location(
@@ -102,6 +149,14 @@ def main() -> int:
     # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
     # registration on these backends is filtered out of every run.
     no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
+    amd = ci_register.HWBackend.AMD
+    spec = importlib.util.spec_from_file_location(
+        "runner_configs", os.path.join("scripts", "ci", "runner_configs.py")
+    )
+    runner_configs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner_configs)
+    amd_runner_configs = set(runner_configs.load_amd())
+    amd_pr_suites = _amd_pr_suites()
 
     # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
@@ -118,6 +173,7 @@ def main() -> int:
     nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
+    amd_errors = []
     for f in files:
         try:
             registries, _has_main_entry = ci_register.ut_parse_one_file(f)
@@ -136,6 +192,16 @@ def main() -> int:
         for r in registries:
             if r.nightly and r.backend in no_nightly_flag:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
+            if r.backend == amd:
+                amd_errors.extend(
+                    _amd_errors(
+                        path=f,
+                        r=r,
+                        amd_runner_configs=amd_runner_configs,
+                        amd_pr_suites=amd_pr_suites,
+                    )
+                )
+                continue
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.
             if not (
                 r.backend == cuda
@@ -195,6 +261,16 @@ def main() -> int:
         )
         for f, backend, suite in nightly_flagged:
             print(f'  {f}\n    {backend} suite="{suite}"')
+        print()
+        exit_code = 1
+    if amd_errors:
+        print(
+            "ERROR: AMD test(s) whose runner is not resolved through the "
+            f"amd_runner_configs section of {_RUNNER_CONFIGS}. Register with "
+            "`stage=`/`runner_config=` and a runner_config listed there:\n"
+        )
+        for error in amd_errors:
+            print(f"  {error}")
         print()
         exit_code = 1
     if dead_tests:

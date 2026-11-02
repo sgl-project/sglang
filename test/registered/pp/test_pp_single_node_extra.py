@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=334, stage="extra-b", runner_config="4-gpu-h100")
-register_amd_ci(est_time=350, suite="extra-b-test-4-gpu-amd")
+register_amd_ci(est_time=350, stage="extra-b", runner_config="4-gpu-mi30x")
 
 
 @unittest.skipIf(

@@ -12,7 +12,7 @@ name: PR Test Extra (AMD)
 #
 # Stages: extra-a and extra-b. Each job mirrors the container bring-up of
 # pr-test-amd.yml and dispatches `run_suite.py --hw amd --suite
-# {stage}-test-{config}-amd`:
+# {stage}-test-{runner_config}`:
 #   - extra-a 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e
 #                          tests, plus LoRA eviction/drainer, priority
 #                          scheduling, torch-native attention
@@ -130,17 +130,38 @@ jobs:
       require-label: run-ci-amd-extra
     secrets: inherit
 
+  # runs-on labels and container env per runner_config, from the
+  # amd_runner_configs section of scripts/ci/runner_configs.yml.
+  amd-runner-map:
+    needs: call-gate
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      runs_on_map: ${{ steps.map.outputs.runs_on_map }}
+      extra_envs_map: ${{ steps.map.outputs.extra_envs_map }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Build AMD runs_on_map (resolves $amd_arch sentinel)
+        id: map
+        env:
+          AMD_ARCH: ${{ inputs.runner_arch || 'mi300' }}
+        run: python3 scripts/ci/runner_configs.py --amd-map "$AMD_ARCH" >> "$GITHUB_OUTPUT"
+
   # =============================================== extra-a (1-gpu-small) ===============================================
   # ~1.5h of tests in total; four shards keep each well under the step timeout.
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
+    needs: [call-gate, amd-runner-map]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3]
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-small-mi30x'] }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -163,21 +184,21 @@ jobs:
       - name: Run test
         timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
   # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
   # CUDA memory-tier label, not a separate AMD runner pool). ~50 min in total.
   extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
+    needs: [call-gate, amd-runner-map]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
-    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
+    runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'] }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -198,21 +219,21 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
   # throughput. Mirrors CUDA's extra-a 2-gpu-large stage; runs on the 2-GPU
   # AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
+    needs: [call-gate, amd-runner-map]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
         part: [0, 1]
-    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
+    runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['2-gpu-large-mi30x'] }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -233,16 +254,15 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-b (4-gpu) ===============================================
-  # 4-GPU tests that CUDA runs in extra-b. Same container env as the
-  # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
+  # 4-GPU tests that CUDA runs in extra-b.
   extra-b-test-4-gpu-amd:
-    name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
-    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-b-test-4-gpu-amd ({0}, {1})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['4-gpu-mi30x']) }}
+    needs: [call-gate, amd-runner-map]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
+    runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['4-gpu-mi30x'] }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -262,14 +282,15 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          EXTRA_ENVS: ${{ fromJson(needs.amd-runner-map.outputs.extra_envs_map)['4-gpu-mi30x'] }}
         run: |
+          extra_envs=()
+          for kv in $EXTRA_ENVS; do extra_envs+=(-e "$kv"); done
           bash scripts/ci/amd/amd_ci_exec.sh \
-            -e NCCL_CUMEM_ENABLE=0 \
-            -e NCCL_NVLS_ENABLE=0 \
-            -e RCCL_MSCCL_ENABLE=0 \
-            -e SGLANG_USE_ROCM700A=1 \
+            "${extra_envs[@]}" \
             -w "/sglang-checkout/test" \
-            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-mi30x --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job
@@ -279,6 +300,7 @@ jobs:
     needs:
       [
         call-gate,
+        amd-runner-map,
         extra-a-test-1-gpu-small-amd,
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,

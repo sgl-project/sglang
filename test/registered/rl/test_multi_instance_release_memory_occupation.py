@@ -23,7 +23,8 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=65, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(
     est_time=64,
-    suite="stage-c-test-4-gpu-amd",
+    stage="base-c",
+    runner_config="4-gpu-mi30x",
     disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
 )
 

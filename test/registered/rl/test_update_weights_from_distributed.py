@@ -44,7 +44,7 @@ from sglang.test.test_utils import (
 from sglang.utils import terminate_process
 
 register_cuda_ci(est_time=110, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=160, suite="extra-a-test-2-gpu-large-amd")
+register_amd_ci(est_time=160, stage="extra-a", runner_config="2-gpu-large-mi30x")
 
 mp.set_start_method("spawn", force=True)
 

@@ -43,19 +43,19 @@ PER_COMMIT_SUITES = {
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
-        "stage-a-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd-nondeterministic",
-        "stage-b-test-1-gpu-small-amd-mi35x",
-        "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
-        "stage-b-test-1-gpu-large-amd",
-        "stage-b-test-2-gpu-large-amd",
-        "jit-kernel-unit-test-amd",
-        "jit-kernel-benchmark-test-amd",
-        "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-c-test-4-gpu-amd",
-        "stage-c-test-large-8-gpu-amd",
-        "stage-c-test-large-8-gpu-amd-mi35x",
+        "base-a-test-1-gpu-small-mi30x",
+        "base-b-test-1-gpu-small-mi30x",
+        "base-b-nondeterministic-test-1-gpu-small-mi30x",
+        "base-b-test-1-gpu-small-mi35x",
+        "base-b-test-8-gpu-mi35x-fabric",
+        "base-b-test-1-gpu-large-mi30x",
+        "base-b-test-2-gpu-large-mi30x",
+        "base-b-kernel-unit-test-1-gpu-large-mi30x",
+        "base-b-kernel-benchmark-test-1-gpu-large-mi30x",
+        "base-b-kernel-unit-test-2-gpu-large-mi30x",
+        "base-c-test-4-gpu-mi30x",
+        "base-c-test-8-gpu-mi30x",
+        "base-c-test-8-gpu-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
         # dispatch when the PR carries the `run-ci-amd-extra` label). 1-gpu-small
@@ -70,11 +70,11 @@ PER_COMMIT_SUITES = {
         # Tests that pass on ROCm but sit in CUDA's extra tier (basic_perf,
         # torch.compile, LoRA/RL weight updates, ...) are registered here too
         # rather than in the always-on stage-b/c suites.
-        "extra-a-test-1-gpu-small-amd",
-        "extra-a-test-1-gpu-large-amd",
-        "extra-a-test-2-gpu-large-amd",
+        "extra-a-test-1-gpu-small-mi30x",
+        "extra-a-test-1-gpu-large-mi30x",
+        "extra-a-test-2-gpu-large-mi30x",
         # extra-b: 4-GPU tests that CUDA runs in extra-b (4-gpu-h100/b200).
-        "extra-b-test-4-gpu-amd",
+        "extra-b-test-4-gpu-mi30x",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [

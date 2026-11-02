@@ -9,7 +9,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.pp_fixture import CanaryPPFixture
 
 register_cuda_ci(est_time=326, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=540, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=540, stage="extra-a", runner_config="2-gpu-large-mi30x")
 
 
 class TestPPPerturbSwaSwa(CanaryPPFixture):

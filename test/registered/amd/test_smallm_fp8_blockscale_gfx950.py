@@ -9,7 +9,7 @@ from sglang.srt.layers.quantization import fp8_utils
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 SHAPES = [(5120, 4096), (4608, 4096), (4096, 2048), (2560, 4096), (4096, 1024)]
 MS = (1, 3, 4, 8, 9, 16, 17, 24, 32)

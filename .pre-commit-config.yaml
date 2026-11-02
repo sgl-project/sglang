@@ -133,7 +133,7 @@ repos:
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py
         language: system
-        files: ^test/registered/.*\.py$
+        files: ^(test/registered/.*\.py|scripts/ci/runner_configs\.yml|\.github/workflows/pr-test-amd(-extra)?\.yml)$
         pass_filenames: false
       - id: check-no-registered-tests-in-package
         name: reject CI-registered tests inside the sglang package

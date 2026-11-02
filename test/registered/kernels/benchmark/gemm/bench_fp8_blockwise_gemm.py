@@ -18,8 +18,8 @@ register_cuda_ci(
 )
 register_amd_ci(
     est_time=5,
-    stage="jit-kernel-benchmark",
-    runner_config="amd",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large-mi30x",
     disabled="requires SM120; self-skips on ROCm",
 )
 

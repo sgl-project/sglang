@@ -10,7 +10,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=90, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 class _FP8Linear(torch.nn.Module):

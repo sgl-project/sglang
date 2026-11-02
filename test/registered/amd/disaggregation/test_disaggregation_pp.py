@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=600, stage="base-b", runner_config="8-gpu-mi35x-fabric")
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
@@ -109,7 +109,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
         time.sleep(5)
 
 
-# register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
+# register_amd_ci(est_time=200, stage="base-c", runner_config="8-gpu-mi30x")
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -203,7 +203,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         time.sleep(5)
 
 
-# register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd")
+# register_amd_ci(est_time=200, stage="base-c", runner_config="8-gpu-mi30x")
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

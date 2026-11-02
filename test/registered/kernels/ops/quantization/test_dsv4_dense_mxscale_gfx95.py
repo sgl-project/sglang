@@ -11,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 # (N, K) of the DSv4-Pro dense fp8 projections: wqkv_a, wq_b TP8 / indexer wq_b,
 # wo_b TP8, wo_b attn-TP1, wq_b attn-TP1, shared-expert down TP1, DSpark main_proj.
