@@ -1,41 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # ViT runtime helpers for the MiniMax H3 visual VAE.
-import os
 from collections.abc import Sequence
 from typing import Tuple
 
 import torch
-from diffusers.utils import logging
-
-
-def _env_flag(name, default="0"):
-    value = os.environ.get(name, default)
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _env_optional_bool(name, default=""):
-    value = str(os.environ.get(name, default)).strip().lower()
-    if value in ("", "default", "auto", "none", "unset"):
-        return None
-    return value not in ("0", "false", "no", "off", "disabled")
-
-
-def _vit_torch_compile_kwargs(prefix):
-    kwargs = {}
-    backend = os.environ.get(f"{prefix}_BACKEND", "inductor").strip()
-    mode = os.environ.get(f"{prefix}_MODE", "reduce-overhead").strip()
-    if backend and backend.lower() not in ("default", "none"):
-        kwargs["backend"] = backend
-    if mode and mode.lower() not in ("default", "none"):
-        kwargs["mode"] = mode
-    kwargs["fullgraph"] = _env_flag(f"{prefix}_FULLGRAPH", "0")
-    dynamic = _env_optional_bool(f"{prefix}_DYNAMIC")
-    if dynamic is not None:
-        kwargs["dynamic"] = dynamic
-    return kwargs
-
-
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 def create_token_ids(
@@ -128,7 +96,6 @@ def prepare_rotary_pos_emb(
         or cos.shape[0] != 1
         or cos.shape[2] != 1
         or cos.shape[-1] % 2
-        or _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0")
     ):
         return cos, sin
 
@@ -149,66 +116,10 @@ def prepare_rotary_pos_emb(
     return cos, sin, cache, positions
 
 
-_COMPILED_APPLY_ROTARY_POS_EMB = None
-_APPLY_ROTARY_POS_EMB_COMPILE_DISABLED = False
-
-
-def _get_apply_rotary_pos_emb_impl():
-    global _COMPILED_APPLY_ROTARY_POS_EMB, _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED
-    if _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED or not _env_flag(
-        "MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE", "0"
-    ):
-        return _apply_rotary_pos_emb_impl
-    if _COMPILED_APPLY_ROTARY_POS_EMB is not None:
-        return _COMPILED_APPLY_ROTARY_POS_EMB
-    if not hasattr(torch, "compile"):
-        message = (
-            "torch.compile is unavailable; falling back to eager ViT rotary embedding"
-        )
-        if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE_FATAL", "0"):
-            raise RuntimeError(message)
-        logger.warning(f"[ViTRope] {message}")
-        _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED = True
-        return _apply_rotary_pos_emb_impl
-
-    kwargs = _vit_torch_compile_kwargs("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE")
-    try:
-        _COMPILED_APPLY_ROTARY_POS_EMB = torch.compile(
-            _apply_rotary_pos_emb_impl, **kwargs
-        )
-        logger.info(f"[ViTRope] torch.compile enabled kwargs={kwargs}")
-    except Exception as exc:
-        if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE_FATAL", "0"):
-            raise
-        logger.warning(
-            f"[ViTRope] torch.compile setup failed: {type(exc).__name__}: {exc}; "
-            "falling back to eager"
-        )
-        _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED = True
-        _COMPILED_APPLY_ROTARY_POS_EMB = None
-        return _apply_rotary_pos_emb_impl
-    return _COMPILED_APPLY_ROTARY_POS_EMB
-
-
 def apply_rotary_pos_emb(
     t: torch.Tensor, rotary_pos_emb: Sequence[torch.Tensor]
 ) -> torch.Tensor:
-    global _COMPILED_APPLY_ROTARY_POS_EMB, _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED
-    fn = _get_apply_rotary_pos_emb_impl()
-    try:
-        return fn(t, rotary_pos_emb)
-    except Exception as exc:
-        if fn is _COMPILED_APPLY_ROTARY_POS_EMB and not _env_flag(
-            "MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE_FATAL", "0"
-        ):
-            logger.warning(
-                f"[ViTRope] compiled call failed: {type(exc).__name__}: {exc}; "
-                "disabling compile and retrying eager"
-            )
-            _APPLY_ROTARY_POS_EMB_COMPILE_DISABLED = True
-            _COMPILED_APPLY_ROTARY_POS_EMB = None
-            return _apply_rotary_pos_emb_impl(t, rotary_pos_emb)
-        raise
+    return _apply_rotary_pos_emb_impl(t, rotary_pos_emb)
 
 
 def native_rope_cache(

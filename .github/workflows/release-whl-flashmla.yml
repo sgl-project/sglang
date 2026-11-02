@@ -1,0 +1,252 @@
+name: Release sgl-flash-mla
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wheel version (e.g. 1.0.0, 1.0.1rc0)"
+        type: string
+        required: true
+      branch:
+        description: "FlashMLA branch to build from (default: sgl)"
+        type: string
+        required: false
+        default: 'sgl'
+      validation_only:
+        description: "Build and test without publishing wheels"
+        type: boolean
+        required: false
+        default: false
+      skip_tests:
+        description: "Skip the GPU test suite (publishes untested wheels)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: release-sgl-flash-mla-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The wheel pins this; it is also what the test jobs install.
+  # The extensions use PyTorch's stable C++ ABI and would load against any 2.10+,
+  # but a release is tested against one version.
+  TORCH_VER: "2.14.1"
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      matrix:
+        # One wheel per architecture. No Python matrix: the wheel is abi3
+        # (cp310-abi3) and serves CPython 3.10+, so 3.12 only drives the build.
+        python-version: ["3.12"]
+        cuda-version: ["13.4"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+
+      - name: Checkout FlashMLA
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/FlashMLA
+          ref: ${{ inputs.branch || 'sgl' }}
+          path: FlashMLA
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set wheel version
+        run: |
+          echo -n "${{ inputs.version }}" > FlashMLA/flash_mla/VERSION
+          cat FlashMLA/flash_mla/VERSION
+
+      - name: Build wheel
+        run: |
+          chmod +x ./scripts/build_sgl_flash_mla.sh ./scripts/rename_sgl_flash_mla_whl.sh
+          ./scripts/build_sgl_flash_mla.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/FlashMLA" "${{ matrix.arch }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashmla-wheel-${{ matrix.arch }}
+          path: FlashMLA/dist/*.whl
+
+      - name: Upload PyPI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashmla-pypi-${{ matrix.arch }}
+          path: FlashMLA/dist-pypi/*.whl
+
+  test:
+    needs: build
+    if: ${{ !inputs.skip_tests }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SM90 runs only the frozen kernels: the current ones are sm_100a/sm_103a.
+          # The frozen ones are built for sm_90a/sm_100a/sm_103a, so SM100 runs both.
+          - arch_label: sm90
+            runner: 8-gpu-h200
+            wheel_arch: x86_64
+            tests: legacy
+            timeout: 90
+          - arch_label: sm100
+            runner: 8-gpu-b200
+            wheel_arch: x86_64
+            tests: current legacy
+            timeout: 180
+          - arch_label: sm103-aarch64
+            runner: 4-gpu-gb300
+            wheel_arch: aarch64
+            tests: current legacy
+            timeout: 180
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout FlashMLA
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/FlashMLA
+          ref: ${{ inputs.branch || 'sgl' }}
+          path: FlashMLA
+          submodules: recursive
+
+      # The tests need only tests/. The source package would shadow the installed
+      # wheel (its directory has no built extensions), so it is removed.
+      - name: Remove the FlashMLA source package
+        run: rm -rf FlashMLA/flash_mla
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: flashmla-wheel-${{ matrix.wheel_arch }}
+
+      - name: Install wheel and deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "torch==${TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+          python3 -m pip install numpy einops rich pytest
+          # --force-reinstall: a base image may already carry this version, in
+          # which case pip skips the wheel and the job tests a stale extension.
+          python3 -m pip install dist/*.whl --force-reinstall --no-deps
+          # Both extensions register through STABLE_TORCH_LIBRARY at dlopen time,
+          # so a missing symbol surfaces here rather than at the first launch.
+          python3 -c "
+          import flash_mla
+          from flash_mla._loader import get_ops
+          print('flash_mla:', flash_mla.__file__)
+          import os
+          assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), 'not the installed wheel'
+          print('version:', flash_mla.__version__)
+          print('has_legacy:', flash_mla.has_legacy())
+          assert get_ops(use_legacy=False).sparse_decode_fwd is not None
+          assert get_ops(use_legacy=True).dense_decode_fwd is not None
+          "
+
+      - name: Run tests (current kernels)
+        if: contains(matrix.tests, 'current')
+        working-directory: FlashMLA
+        env:
+          PYTHONPATH: ${{ github.workspace }}/FlashMLA/tests
+        run: |
+          python3 -c "import os, flash_mla; assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), flash_mla.__file__"
+          python3 tests/test-sparse-prefill.py
+          python3 tests/test-sparse-decode.py
+
+      - name: Run tests (frozen kernels)
+        if: contains(matrix.tests, 'legacy')
+        working-directory: FlashMLA
+        env:
+          # conftest.py only fixes sys.path under pytest; these are scripts.
+          PYTHONPATH: ${{ github.workspace }}/FlashMLA/tests
+        run: |
+          python3 -c "import os, flash_mla; assert not flash_mla.__file__.startswith(os.environ['GITHUB_WORKSPACE']), flash_mla.__file__"
+          python3 -m pytest tests/legacy/ -q
+          # Dense MLA decoding is SM90-only.
+          if [ "${{ matrix.arch_label }}" = sm90 ]; then
+            python3 tests/legacy/test_flash_mla_dense_decoding.py
+          fi
+          python3 tests/legacy/test_flash_mla_sparse_prefill.py
+          python3 tests/legacy/test_flash_mla_sparse_decoding.py
+          python3 tests/legacy/test_flash_mla_sparse_decoding_v32_bit_equal.py
+
+  release:
+    if: |
+      !cancelled() && !inputs.validation_only &&
+      needs.build.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: flashmla-wheel-*
+
+      - name: Download PyPI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-pypi/
+          merge-multiple: true
+          pattern: flashmla-pypi-*
+
+      - name: Record that the GPU test suite was skipped
+        if: ${{ inputs.skip_tests }}
+        run: |
+          echo "Releasing v${{ inputs.version }} with the GPU test suite skipped." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to PyPI
+        run: |
+          pip install --upgrade twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_FLASH_MLA_PYPI_TOKEN }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_flashmla_whl_index.py --cuda 130
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update sgl-flash-mla whl index for v${{ inputs.version }}${{ inputs.skip_tests && ' (GPU tests skipped)' || '' }}"
+          git push

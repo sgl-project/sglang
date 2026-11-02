@@ -49,7 +49,7 @@ def forward_compress_uniform_fp8(
     layer_id: int,
 ) -> None:
     """Compress, normalize, apply RoPE, and store as uniform e4m3."""
-    from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    from sglang.kernels.ops.attention.dsv4.rope import (
         fused_norm_rope_inplace_triton,
     )
     from sglang.srt.layers.attention.dsv4.compressor_v2 import (

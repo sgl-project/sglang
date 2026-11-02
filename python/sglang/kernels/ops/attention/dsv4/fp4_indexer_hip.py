@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
-import os
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
+import functools
+import itertools
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    quantize_fp4_indexer_row,
-    quantize_fp4_indexer_tensor,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
-from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import (
+    _reduce_scale_bf16_block,
+)
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _ceil_ue8m0_exp,
+    quantize_fp4_indexer_row,
+)
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -44,14 +49,21 @@ _PREFILL_BASE_CTA_TARGET = 1024
 LOW_RATIO_PAGE_TABLE_BUCKET = 64
 # AITER varctx cta_info row: [batch_packed, chunk_start, chunk_count, ctx_len].
 _DECODE_CTA_INFO_WIDTH = 4
+# Row-group decode: a request's verify rows share each key load from this many requests up;
+# below it each row scoring as its own sequence is faster (gfx950, H = 32, 8K..64K context).
+_ROWGROUP_MIN_GROUPED_SEQS = 4
+# DeepSeek-V4 C4 indexer (H = 64, 64-slot pages): a target-verify scores on the row-group
+# kernel, a request's rows one sequence, from this many rows up (4-row DSpark: 16 requests,
+# 7-row: 10); below it the prefill kernel's schedule is as fast or faster. MI355X, in a
+# DSpark decode step: 7 rows x 16 requests at 131K 1.36x, 4 x 32 per DP rank at 32K 1.11x,
+# 4 x 8 at 64K 0.88x (bench_dsv4_c4_indexer_rowgroup_hip.py for the kernel alone).
+C4_ROWGROUP_MIN_VERIFY_ROWS = 64
 
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
 # (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
 # independently of context length and chunked-prefill size; smaller budgets only
 # buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
-_LOGITS_BUDGET_ELEMS = (
-    int(os.environ.get("SGLANG_DSV4_FP4_LOGITS_BUDGET_MB", "2048")) * 2**20 // 4
-)
+_LOGITS_BUDGET_ELEMS = envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get() * 2**20 // 4
 _LOGITS_POOL: dict = {}
 
 
@@ -66,6 +78,17 @@ class FP4DecodeWorkspace(NamedTuple):
     schedule_scratch: torch.Tensor
 
 
+class FP4RowgroupDecodeWorkspace(NamedTuple):
+    """Decode workspace of the schedule-free row-group kernel."""
+
+    guarded_page_table: torch.Tensor
+    max_seq_len: int
+    # sequence b's rows are query_start_loc[b] .. [b + 1] - 1, rows_per_seq each,
+    # all on page-table row query_start_loc[b]
+    query_start_loc: torch.Tensor
+    rows_per_seq: int
+
+
 class FP4PrefillWorkspace(NamedTuple):
     guarded_page_table: torch.Tensor
     row_to_batch: torch.Tensor
@@ -77,6 +100,16 @@ class FP4PrefillWorkspace(NamedTuple):
     # cta_info kernel reads. Pinned with the workspace so a refresh allocates
     # nothing and the buffers never return to the graph memory pool.
     schedule_buffers: Optional[PrefillScheduleBuffers] = None
+
+
+class FP4RowgroupPrefillWorkspace(NamedTuple):
+    """Prefill workspace of the row-group kernel, no schedule: each request's padded
+    page-table row, and per scored row range the sequences' query_start_loc, built on first
+    use and shared by the step's layers."""
+
+    request_page_table: torch.Tensor
+    max_seq_len: int
+    query_start_locs: Dict[Tuple[int, int], torch.Tensor]
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -153,17 +186,32 @@ def _guarded_pages(logical_width: int, page_table_bucket: int = 4) -> int:
     )
 
 
+def rowgroup_table_columns(
+    max_context_len: int, ratio: int, page_table_bucket: int = 4
+) -> int:
+    """Block-table columns of every row-group launch at ``ratio``: one width for the
+    server's life. AITER compiles the row-group kernel per block-table width and stride,
+    and its bounded compile cache unloads an evicted variant that a captured CUDA graph
+    still launches; widths that track the context would also compile on the request path."""
+    compressed_len = -(-max_context_len // ratio)
+    pages = -(-compressed_len // _KV_BLOCK_SIZE)
+    return _guarded_pages(pages, page_table_bucket) + 4
+
+
 def _guard_page_table(
     page_table: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     page_table_bucket: int = 4,
+    columns: Optional[int] = None,
 ):
     """Pad page tables for 256-token scheduling and one-chunk lookahead."""
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         pad_page_table,
     )
 
-    return pad_page_table(page_table, out=out, page_table_bucket=page_table_bucket)
+    return pad_page_table(
+        page_table, out=out, page_table_bucket=page_table_bucket, columns=columns
+    )
 
 
 def logits_rows_per_chunk(page_table: torch.Tensor, page_table_bucket: int = 4) -> int:
@@ -242,6 +290,89 @@ def prepare_fp4_decode_workspace(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def aiter_has_fp4_rowgroup() -> bool:
+    """Whether the installed AITER ships the row-group FP4 MQA logits kernel (#6145)."""
+    try:
+        from aiter.ops.flydsl import make_fp4_mqa_plan  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def prepare_fp4_rowgroup_decode_workspace(
+    page_table: torch.Tensor,
+    rows_per_request: int,
+    page_table_bucket: int = 4,
+    table_columns: Optional[int] = None,
+    min_grouped_seqs: int = _ROWGROUP_MIN_GROUPED_SEQS,
+) -> FP4RowgroupDecodeWorkspace:
+    """The decode workspace of the row-group logits kernel: the padded page table and the
+    rows' sequences, no schedule. ``rows_per_request`` consecutive rows belong to one
+    request (one page-table row, non-decreasing bounds); they score as one sequence once
+    there are ``min_grouped_seqs`` requests, else every row is its own. The table has at
+    least ``table_columns`` columns (``rowgroup_table_columns``). Capture-safe."""
+    guarded, max_seq_len = _guard_page_table(
+        page_table, page_table_bucket=page_table_bucket, columns=table_columns
+    )
+    rows = guarded.shape[0]
+    grouped = (
+        rows_per_request > 1
+        and rows % rows_per_request == 0
+        and rows // rows_per_request >= min_grouped_seqs
+    )
+    rows_per_seq = rows_per_request if grouped else 1
+    query_start_loc = torch.arange(
+        0, rows + 1, rows_per_seq, dtype=torch.int32, device=guarded.device
+    )
+    return FP4RowgroupDecodeWorkspace(
+        guarded, max_seq_len, query_start_loc, rows_per_seq
+    )
+
+
+def _pinned_int32(values: List[int], device: torch.device) -> torch.Tensor:
+    return (
+        torch.tensor(values, dtype=torch.int32)
+        .pin_memory()
+        .to(device, non_blocking=True)
+    )
+
+
+def prepare_fp4_rowgroup_prefill_workspace(
+    page_table: torch.Tensor,
+    extend_lens: List[int],
+    page_table_bucket: int = 4,
+    table_columns: Optional[int] = None,
+) -> FP4RowgroupPrefillWorkspace:
+    """The row-group prefill workspace of a step whose requests own extend_lens consecutive
+    page-table rows each, the request table at least ``table_columns`` columns
+    (``rowgroup_table_columns``)."""
+    num_rows = page_table.shape[0]
+    starts = itertools.accumulate([0, *extend_lens[:-1]])
+    first_rows = [min(s, num_rows - 1) for s in starts]
+    request_page_table, max_seq_len = _guard_page_table(
+        page_table.index_select(0, _pinned_int32(first_rows, page_table.device)),
+        page_table_bucket=page_table_bucket,
+        columns=table_columns,
+    )
+    return FP4RowgroupPrefillWorkspace(request_page_table, max_seq_len, {})
+
+
+def rowgroup_prefill_query_start_loc(
+    workspace: FP4RowgroupPrefillWorkspace, rows: slice, rows_per_request: List[int]
+) -> torch.Tensor:
+    """query_start_loc of the consecutive requests rows_per_request scored as rows."""
+    key = (rows.start, rows.stop)
+    query_start_loc = workspace.query_start_locs.get(key)
+    if query_start_loc is None:
+        query_start_loc = _pinned_int32(
+            [0, *itertools.accumulate(rows_per_request)],
+            workspace.request_page_table.device,
+        )
+        workspace.query_start_locs[key] = query_start_loc
+    return query_start_loc
+
+
 def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
@@ -307,6 +438,103 @@ def prepare_fp4_prefill_workspace(
     return workspace
 
 
+def _rowgroup_decode_logits(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    workspace: FP4RowgroupDecodeWorkspace,
+    row_ends: torch.Tensor,
+    page8: bool = False,
+    is_decode: bool = True,
+) -> torch.Tensor:
+    """Decode logits from AITER's row-group kernel over a row-group workspace."""
+    q = workspace.rows_per_seq
+    return rowgroup_paged_mqa_logits(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        k_payload=k_payload,
+        k_scale=k_scale,
+        weights=weights,
+        weight_scale=weight_scale,
+        block_tables=workspace.guarded_page_table[::q],
+        query_start_loc=workspace.query_start_loc,
+        row_ends=row_ends,
+        max_query_len=q,
+        max_seq_len=workspace.max_seq_len,
+        page8=page8,
+        pages_per_block=8 if page8 else 1,
+        is_decode=is_decode,
+    )
+
+
+def rowgroup_paged_mqa_logits(
+    *,
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_payload: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    weight_scale: float,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_ends: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    page8: bool,
+    pages_per_block: int = 1,
+    is_decode: bool = True,
+) -> torch.Tensor:
+    """[rows, max_seq_len] fp32 logits from AITER's row-group kernel: sequence b's rows
+    query_start_loc[b] .. [b + 1] - 1 score the keys of block_tables[b] up to their own
+    row_ends. An entry names a 64-slot page of the pool, or with page8 pages_per_block of
+    the pool's 8-slot pages (8: the 64-slot page table as is; 1: an 8-slot page each, the
+    candidate table). Past a row's bound the logits are left unwritten; the length-aware
+    top-k never reads them."""
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, make_fp4_mqa_plan
+
+    num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
+    if page8:
+        kv, ks = index_k_page8_views(k_payload, k_scale)
+        page_size = 8
+    else:
+        assert pages_per_block == 1, "a 64-slot page entry names one page"
+        kv, ks = k_payload.view(torch.uint8), k_scale
+        page_size = _KV_BLOCK_SIZE
+    plan = make_fp4_mqa_plan(
+        num_seqs=query_start_loc.shape[0] - 1,
+        max_qlen=max_query_len,
+        num_rows=num_rows,
+        heads=heads,
+        page_size=page_size,
+        max_seq_len=max_seq_len,
+        pages_per_block=pages_per_block,
+    )
+    logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, is_decode)
+    flydsl_pa_mqa_logits_fp4(
+        q_fp4.view(torch.uint8).reshape(num_rows, 1, heads, _HEAD_DIM // 2),
+        q_scale.reshape(num_rows, 1, *_Q_SCALE_SHAPE),
+        kv,
+        ks,
+        block_tables,
+        weights,
+        None,
+        max_seq_len,
+        weight_scale=weight_scale,
+        kv_block_size=page_size,
+        out=logits,
+        row_ends=_as_int32_1d(row_ends),
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        pages_per_block=pages_per_block,
+        plan=plan,
+    )
+    return logits
+
+
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -318,11 +546,17 @@ def aiter_fp4_paged_mqa_logits(
     c4_seq_lens: torch.Tensor,
     weight_scale: float,
     is_decode: bool,
-    decode_workspace: Optional[FP4DecodeWorkspace] = None,
+    decode_workspace: Optional[
+        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
+    ] = None,
     prefill_workspace: Optional[FP4PrefillWorkspace] = None,
     page_table_bucket: int = 4,
+    page8: bool = False,
+    rowgroup_table_columns: Optional[int] = None,
 ) -> torch.Tensor:
-    """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel."""
+    """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel. A page8 pool
+    is read by the row-group kernel only: without a row-group decode workspace every row
+    scores as its own sequence, on a table of ``rowgroup_table_columns`` columns."""
     from aiter.ops.flydsl import (
         flydsl_pa_mqa_logits_fp4,
         flydsl_pa_mqa_logits_fp4_prefill,
@@ -334,7 +568,42 @@ def aiter_fp4_paged_mqa_logits(
     # A workspace is bound to one row count. DP padding or truncated activations
     # can leave it stale, in which case fall back to building the schedule here.
     if workspace is not None and workspace.guarded_page_table.shape[0] != num_tokens:
-        workspace = None
+        if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace):
+            # Stay on the row-group kernel, capture-safe and on the same compiled table
+            # width, scoring every row as its own sequence.
+            workspace = prepare_fp4_rowgroup_decode_workspace(
+                page_table,
+                1,
+                page_table_bucket=page_table_bucket,
+                table_columns=workspace.guarded_page_table.shape[1],
+            )
+        else:
+            workspace = None
+    rowgroup_ws = (
+        workspace
+        if is_decode and isinstance(workspace, FP4RowgroupDecodeWorkspace)
+        else None
+    )
+    if page8 and rowgroup_ws is None:
+        rowgroup_ws = prepare_fp4_rowgroup_decode_workspace(
+            page_table,
+            1,
+            page_table_bucket=page_table_bucket,
+            table_columns=rowgroup_table_columns,
+        )
+    if rowgroup_ws is not None:
+        return _rowgroup_decode_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights,
+            weight_scale=weight_scale,
+            workspace=rowgroup_ws,
+            row_ends=c4_seq_lens,
+            page8=page8,
+            is_decode=is_decode,
+        )
     # Built on the fallback path below; kept in scope so the schedule scratch
     # outlives the logits kernel that reads it.
     fallback_schedule = None
@@ -543,91 +812,16 @@ def aiter_k_indexer_fp4_cache_write(
     )
 
 
-# FlyDSL split payload / scale layout; bytes equal AITER's fp4 writer up to the sign of zero
-@triton.jit
-def _store_fp4_index_k_split_kernel(
-    k_fp4,
-    k_sf,
-    payload,
-    scale,
-    loc,
-    page_size: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    cache_loc = tl.load(loc + token_id)
-    page = cache_loc // page_size
-    page_offset = cache_loc - page * page_size
-
-    # payload [page, 1, 4 chunks, page_size, 16 bytes]: chunk c holds dims [32c, 32c + 32).
-    offsets = tl.arange(0, BLOCK)
-    chunk = offsets // 16
-    byte = offsets - chunk * 16
-    k = tl.load(k_fp4 + token_id * BLOCK + offsets)
-    tl.store(
-        payload
-        + page * (4 * page_size * 16)
-        + chunk * (page_size * 16)
-        + page_offset * 16
-        + byte,
-        k,
-    )
-    # scale [page, 1, 4, page_size]: the slot axis is a 16 x 4 tile transposed (the FlyDSL K ABI)
-    shuffled = (page_offset % 16) * 4 + page_offset // 16
-    sf = tl.load(k_sf + token_id)
-    sf_offsets = tl.arange(0, 4)
-    sf_bytes = ((sf >> (sf_offsets * 8)) & 0xFF).to(tl.uint8)
-    tl.store(
-        scale + page * (4 * page_size) + sf_offsets * page_size + shuffled, sf_bytes
-    )
-
-
-def store_fp4_index_k_cache_split(
-    input: torch.Tensor,
-    payload: torch.Tensor,
-    scale: torch.Tensor,
-    loc: torch.Tensor,
-    *,
-    page_size: int,
-    rne: bool = False,
-) -> None:
-    """Quantize input [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
-    loc[i] of the split FlyDSL K layout (payload [pages, 1, 4, page_size, 16],
-    scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
-    assert input.shape[-1] == _HEAD_DIM
-    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
-    assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
-    assert scale.shape[1:] == (1, 4, page_size), scale.shape
-    k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
-    n_tokens = k_fp4.shape[0]
-    if n_tokens == 0:
-        return
-    _store_fp4_index_k_split_kernel[(n_tokens,)](
-        k_fp4.view(torch.uint8),
-        k_sf,
-        payload.view(torch.uint8),
-        scale,
-        loc,
-        page_size,
-        BLOCK=64,
-    )
-
-
-def read_fp4_index_k_split(
-    payload: torch.Tensor, scale: torch.Tensor, slots: torch.Tensor, *, page_size: int
+def index_k_page8_views(
+    payload: torch.Tensor, scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of store_fp4_index_k_cache_split: (payload int8 [n, 64], scales
-    int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
-    quantize_fp4_indexer_tensor."""
-    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
-    slots = slots.to(torch.int64)
-    page, off = slots // page_size, slots % page_size
-    rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
-    rows = rows.reshape(-1, 64).view(torch.int8)
-    shuffled = (off % 16) * 4 + off // 16
-    sf = scale[page, 0, :, shuffled].to(torch.int32)  # [n, 4]
-    packed = sf[:, 0] | (sf[:, 1] << 8) | (sf[:, 2] << 16) | (sf[:, 3] << 24)
-    return rows, packed
+    """A page8 pool's buffers as aiter's 8-slot pages: (payload uint8 [pages * 8, 512],
+    scale uint8 [pages * 8, 32]); 8-slot page p covers slots 8p .. 8p + 7."""
+    pages8 = payload.shape[0] * (payload.shape[3] // 8)
+    return (
+        payload.view(torch.uint8).view(pages8, 8 * _HEAD_DIM // 2),
+        scale.view(pages8, 8 * _HEAD_DIM // 32),
+    )
 
 
 @triton.jit
@@ -687,60 +881,117 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @triton.jit
-def _reduce_scale_bf16_block(
-    block,
-    part_ptr,
-    out_ptr,
-    M,
-    stride_ps,
-    stride_pm,
-    stride_om,
-    scale,
-    N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """One BLOCK of _reduce_scale_bf16_kernel (shared with the fused index-Q launch)."""
-    offs = block * BLOCK + tl.arange(0, BLOCK)
-    m = offs // N
-    n = offs % N
-    mask = m < M
-    acc = tl.load(part_ptr + m * stride_pm + n, mask=mask, other=0.0)
-    for s in tl.static_range(1, SPLIT_K):
-        acc += tl.load(
-            part_ptr + s * stride_ps + m * stride_pm + n, mask=mask, other=0.0
-        )
-    # bf16(bf16(sum) * scale): the linear's bf16 output, then the aten multiply rounded to bf16
-    w = acc.to(tl.bfloat16).to(tl.float32) * scale
-    tl.store(out_ptr + m * stride_om + n, w.to(tl.bfloat16), mask=mask)
+def _fp4_e2m1_code_rne_lean(x):
+    """_fp4_e2m1_code_rne for every fp32 x (checked over all 2**32): within each spacing of the
+    e2m1 grid, rint's ties-to-even picks the even code at the midpoints."""
+    ax = tl.minimum(tl.abs(x), 6.0)
+    lo = ax < 2.0
+    mid = ax < 4.0
+    rstep = tl.where(lo, 2.0, tl.where(mid, 1.0, 0.5))
+    idx = (libdevice.rint(ax * rstep) + tl.where(lo, 0.0, tl.where(mid, 2.0, 4.0))).to(
+        tl.uint8
+    )
+    idx = tl.where(ax == ax, idx, 0)
+    sign = ((x < 0) & (idx != 0)).to(tl.uint8)
+    return idx | (sign << 3)
 
 
 @triton.jit
-def _reduce_scale_bf16_kernel(
-    part_ptr,
-    out_ptr,
-    M,
-    stride_ps,
-    stride_pm,
-    stride_om,
-    scale,
-    N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    _reduce_scale_bf16_block(
-        tl.program_id(0),
-        part_ptr,
-        out_ptr,
-        M,
-        stride_ps,
-        stride_pm,
-        stride_om,
-        scale,
-        N=N,
-        SPLIT_K=SPLIT_K,
-        BLOCK=BLOCK,
+def _index_q_quant_groups(v, AMAX_FLOOR: tl.constexpr):
+    """[16, G, 32] fp32 through the fake-quant of rope_tail_fake_quant_fp4_row (rounded to bf16
+    as the standalone kernel stores it) and quantize_fp4_indexer_row (RNE): (packed codes
+    [16, G * 16], ue8m0 exponents [16, G]). The power-of-two divisions run as multiplies by
+    exact reciprocals, which round identically."""
+    amax = tl.maximum(tl.max(tl.abs(v), axis=2), AMAX_FLOOR) * (1.0 / 6.0)
+    bits = amax.to(tl.int32, bitcast=True)
+    expo = ((bits >> 23) & 0xFF) - 127
+    expo = expo + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = ((expo + 127) << 23).to(tl.float32, bitcast=True)
+    # 1 / scale: 2^-expo for a finite amax (expo <= 126), 0 for inf (scale = inf),
+    # -inf for nan (expo = 129 wraps scale to -0.0)
+    rscale = tl.where(
+        expo <= 126,
+        ((127 - expo) << 23).to(tl.float32, bitcast=True),
+        tl.where(expo == 128, 0.0, float("-inf")),
     )
+    s = tl.minimum(tl.maximum(v * rscale[:, :, None], -6.0), 6.0)
+    mag = tl.abs(s)
+    rstep = tl.where(mag < 2.0, 2.0, tl.where(mag < 4.0, 1.0, 0.5))
+    step = ((254 << 23) - rstep.to(tl.int32, bitcast=True)).to(tl.float32, bitcast=True)
+    # rint is odd-symmetric, so the sign rides along; a zero may come out as -0, which neither
+    # the amax nor the codes below tell apart
+    values = (libdevice.rint(s * rstep) * step * scale[:, :, None]).to(tl.bfloat16)
+    values = values.to(tl.float32)
+
+    exp = _ceil_ue8m0_exp(tl.maximum(tl.max(tl.abs(values), axis=2) / 6.0, 1.0e-4))
+    # 1 / 2^(exp - 127); exp = 254 (an inf / nan group) as 0.5 * 2^-126, where any value
+    # rounded differently is below 2^-126 and codes 0 either way
+    top = exp == 254
+    ra = tl.where(top, 0.5, 1.0)
+    rb = tl.where(top, 2.0**-126, ((254 - exp) << 23).to(tl.float32, bitcast=True))
+    code = _fp4_e2m1_code_rne_lean(values * ra[:, :, None] * rb[:, :, None])
+    G: tl.constexpr = v.shape[1]
+    c0, c1 = tl.split(tl.reshape(code, (16, G * 16, 2)))
+    return (c0 & 0x0F) | ((c1 & 0x0F) << 4), exp
+
+
+@triton.jit
+def _index_q_rope_pack_kernel(
+    q_ptr,  # [T, H * 128] bf16 (wq_b output)
+    f_ptr,  # [max_pos, RD // 2, 2] fp32: the real view of the complex freqs table
+    pos_ptr,  # [T] int
+    q_fp4_ptr,  # [T, H, 64] int8
+    q_scale_ptr,  # [T, 1, 4, 16, 4] uint8
+    stride_qt,
+    num_pos,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    """Grid (T, H // 16): 16 heads of one token per program, through _index_q_quant_groups, in
+    the FlyDSL MQA-logits layout."""
+    NOPE: tl.constexpr = D - RD
+    t = tl.program_id(0)
+    h0 = tl.program_id(1) * 16
+    hh = h0 + tl.arange(0, 16)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    # the caller owns positions < num_pos; an out-of-range row reads entry 0 instead of past the table
+    pos = tl.where((pos >= 0) & (pos < num_pos), pos, 0)
+    q_row = q_ptr + t.to(tl.int64) * stride_qt + hh[:, None] * D
+    out_row = q_fp4_ptr + (t.to(tl.int64) * H + hh[:, None]) * (D // 2)
+
+    x = tl.load(q_row + tl.arange(0, NOPE)[None, :]).to(tl.float32)
+    packed, exp_nope = _index_q_quant_groups(
+        tl.reshape(x, (16, NOPE // 32, 32)), AMAX_FLOOR
+    )
+    tl.store(out_row + tl.arange(0, NOPE // 2)[None, :], packed)
+
+    # RoPE on the last RD features, adjacent pairs as one complex number
+    x = tl.load(q_row + NOPE + tl.arange(0, RD)[None, :]).to(tl.float32)
+    re, im = tl.split(tl.reshape(x, (16, RD // 2, 2)))
+    j = tl.arange(0, RD // 2)
+    fr = tl.load(f_ptr + pos * RD + 2 * j)[None, :]
+    fi = tl.load(f_ptr + pos * RD + 2 * j + 1)[None, :]
+    re_rot = (re * fr - im * fi).to(tl.bfloat16).to(tl.float32)
+    im_rot = (re * fi + im * fr).to(tl.bfloat16).to(tl.float32)
+    packed, exp_rope = _index_q_quant_groups(
+        tl.reshape(tl.join(re_rot, im_rot), (16, RD // 32, 32)), AMAX_FLOOR
+    )
+    tl.store(out_row + NOPE // 2 + tl.arange(0, RD // 2)[None, :], packed)
+
+    # scale bytes: chunk c of head h at [t, 0, c, h % 16, h // 16]
+    base = q_scale_ptr + t.to(tl.int64) * (4 * 16 * 4)
+    i = tl.arange(0, 16)[:, None]
+    c_nope = tl.arange(0, NOPE // 32)[None, :]
+    c_rope = NOPE // 32 + tl.arange(0, RD // 32)[None, :]
+    tl.store(base + (c_nope * 16 + i) * 4 + h0 // 16, exp_nope.to(tl.uint8))
+    tl.store(base + (c_rope * 16 + i) * 4 + h0 // 16, exp_rope.to(tl.uint8))
+    if h0 == 0:
+        # groups this head count does not have stay zero
+        slot = (tl.arange(0, 4)[None, :] * 16 + i) * 4
+        for g in tl.static_range(H // 16, 4):
+            tl.store(base + slot + g, tl.zeros((16, 4), dtype=tl.uint8))
 
 
 @triton.jit
@@ -817,6 +1068,54 @@ def _index_q_pack_weights_kernel(
         )
 
 
+def index_q_rope_pack_flydsl(
+    q: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    *,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The index-Q RoPE and fp4 pack at any row count: (q_fp4 [T, H, 64] int8, q_scale
+    [T, 1, 4, 16, 4] uint8), bitwise pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
+    freqs_cis[positions], rope_dim)) without the bf16 fake-quant round trip through memory."""
+    T = q.shape[0]
+    H = num_heads
+    assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
+    assert q.stride(1) == 1
+    assert H % 16 == 0 and 0 < H <= 64, H
+    assert freqs_cis.dtype == torch.complex64 and freqs_cis.shape[1] == rope_dim // 2
+    # the plain and rotated halves are each whole 32-groups of a power-of-two width
+    assert rope_dim == 64, rope_dim
+    assert positions.shape == (T,)
+    # the kernel reads positions[t] at pos_ptr + t
+    positions = positions.contiguous()
+    f_real = torch.view_as_real(freqs_cis)
+    assert f_real.is_contiguous()
+    q_fp4 = torch.empty((T, H, 64), dtype=torch.int8, device=q.device)
+    q_scale = torch.empty((T, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    if T == 0:
+        return q_fp4, q_scale
+    _index_q_rope_pack_kernel[(T, H // 16)](
+        q,
+        f_real,
+        positions,
+        q_fp4,
+        q_scale,
+        q.stride(0),
+        f_real.shape[0],
+        H=H,
+        D=128,
+        RD=rope_dim,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        num_warps=2,
+        # bitwise parity with the standalone RoPE kernel: a contracted FMA in the rotation flips
+        # the bf16 rounding of a few values in 10^8
+        enable_fp_fusion=False,
+    )
+    return q_fp4, q_scale
+
+
 def index_q_rope_pack_weights_flydsl(
     q: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -874,29 +1173,3 @@ def index_q_rope_pack_weights_flydsl(
         num_warps=4,
     )
     return q_fp4, q_scale, weights
-
-
-def indexer_head_weights(
-    x: torch.Tensor, weight: torch.Tensor, scale: float
-) -> torch.Tensor:
-    """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the layout the
-    FlyDSL logits kernels take. x bf16 [M, K] and weight bf16 [N, K], with
-    M <= rocm_gemv_split_k_max_tokens(n=N, k=K, weight_dtype=torch.bfloat16)."""
-    partials = rocm_router_gemv_split_k(x, weight)
-    split_k, M, N = partials.shape
-    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-    block = triton.next_power_of_2(M * N)
-    _reduce_scale_bf16_kernel[(triton.cdiv(M * N, block),)](
-        partials,
-        out,
-        M,
-        partials.stride(0),
-        partials.stride(1),
-        out.stride(0),
-        float(scale),
-        N=N,
-        SPLIT_K=split_k,
-        BLOCK=block,
-        num_warps=4,
-    )
-    return out

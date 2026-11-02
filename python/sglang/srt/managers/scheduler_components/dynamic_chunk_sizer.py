@@ -140,11 +140,16 @@ class DynamicChunkSizer:
         model_runner = self.model_runner
         model_config = model_runner.model_config
         input_ids_list: List[array[int]] = []
+        # Each sample is a complete request. Allocating past its mapping row
+        # would leave KV slots that release_kv_cache cannot address.
+        max_profile_tokens = min(
+            int(self.chunked_prefill_size * 1.25),
+            model_config.context_len,
+            self.req_to_token_pool.max_context_len,
+        )
+        step = max(1, max_profile_tokens // 128)
         for i in range(128):
-            chunk_size = int(
-                self.chunked_prefill_size * 1.25
-                - i * (self.chunked_prefill_size * 1.25 // 128)
-            )
+            chunk_size = max_profile_tokens - i * step
             if chunk_size <= 0:
                 break
             input_ids = array(
@@ -221,34 +226,35 @@ class DynamicChunkSizer:
             start = time.perf_counter()
             batch.prepare_for_extend()
 
-            # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
-            if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
-                batch.input_ids = batch.prefill_input_ids_cpu.to(
-                    self.device, non_blocking=True
+            try:
+                # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
+                if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+                    batch.input_ids = batch.prefill_input_ids_cpu.to(
+                        self.device, non_blocking=True
+                    )
+                    batch.prefill_input_ids_cpu = None
+
+                forward_batch = ForwardBatch.init_new(
+                    batch,
+                    model_runner,
+                    return_hidden_states_before_norm=False,
                 )
-                batch.prefill_input_ids_cpu = None
+                set_is_extend_in_batch(batch.forward_mode.is_extend())
 
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            set_is_extend_in_batch(batch.forward_mode.is_extend())
+                _ = model_runner.forward(
+                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
+                )
 
-            _ = model_runner.forward(
-                forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
-            )
+                # Synchronize after forward to ensure GPU operations complete
+                device_module.synchronize()
 
-            # Synchronize after forward to ensure GPU operations complete
-            device_module.synchronize()
-
-            latency_seconds = time.perf_counter() - start
-            latency_ms = latency_seconds * 1e3  # Convert to milliseconds
-            seq_lens.append(len(input_ids))
-            latencies.append(latency_ms)
-
-            # Release KV and Mamba cache
-            if req.kv.holds_kv:
+                latency_seconds = time.perf_counter() - start
+                latency_ms = latency_seconds * 1e3  # Convert to milliseconds
+                seq_lens.append(len(input_ids))
+                latencies.append(latency_ms)
+            finally:
+                # Profiling failures disable the predictor; they must still
+                # return the synthetic request's KV and recurrent state.
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         logger.info(

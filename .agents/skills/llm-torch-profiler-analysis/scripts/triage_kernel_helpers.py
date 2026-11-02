@@ -482,7 +482,9 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="Fused QK RoPE reshape + KV cache write",
-        candidate_path="python/sglang/srt/layers/attention/utils.py",
+        candidate_path=(
+            "python/sglang/kernels/ops/attention/fused_qk_rope_reshape_and_cache.py"
+        ),
         active_keywords=("fused_qk_rope_reshape_and_cache",),
         split_groups=(
             ("rotary", "rope", "mrope"),
@@ -533,7 +535,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="NSA fused metadata copy for graph replay",
-        candidate_path="python/sglang/kernels/ops/attention/fused_metadata_copy.py",
+        candidate_path="python/sglang/kernels/ops/attention/dsa/fused_metadata_copy.py",
         active_keywords=(
             "fused_metadata_copy",
             "fused_metadata_copy_multi",
@@ -700,7 +702,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="Fused MoE activation + quant / re-quant",
         candidate_path=(
             "python/sglang/srt/layers/moe/ep_moe/kernels.py"
-            "<br>python/sglang/kernels/ops/quantization/nvfp4_gemm_swiglu_nvfp4_quant.py"
+            "<br>python/sglang/kernels/ops/gemm/nvfp4_gemm_swiglu_nvfp4_quant.py"
             "<br>python/sglang/srt/layers/moe/cutlass_w4a8_moe.py"
         ),
         active_keywords=(
@@ -761,7 +763,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="NSA fused quantize + indexed K-cache store",
         candidate_path=(
-            "python/sglang/kernels/ops/attention/fused_store_index_cache.py"
+            "python/sglang/kernels/ops/kvcache/dsa_fused_store_index_cache.py"
             "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
         ),
         active_keywords=("fused_store_index_k_cache",),

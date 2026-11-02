@@ -606,8 +606,16 @@ def _get_full_multimodal_text_prompt(
 
 
 def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
+    request: ChatCompletionRequest,
+    template_name: str,
+    *,
+    inline_image_placeholders: bool = False,
 ) -> Conversation:
+    """Build the conversation for ``request`` under ``template_name``.
+
+    ``inline_image_placeholders`` keeps a user message whose text already
+    carries one image token per image as is, instead of adding the tokens again.
+    """
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,
@@ -667,6 +675,14 @@ def generate_chat_conv(
                 )
                 if add_token_as_needed:
                     image_token = ""
+                if inline_image_placeholders and num_image_url > 0:
+                    text_placeholders = sum(
+                        c.text.count(conv.image_token)
+                        for c in message.content
+                        if c.type == "text"
+                    )
+                    if text_placeholders == num_image_url:
+                        image_token = ""
 
                 audio_token = conv.audio_token
                 video_token = conv.video_token
@@ -1118,6 +1134,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "unlimited-ocr": "unlimited-ocr",
+    "unlimited_ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1196,11 +1213,11 @@ def match_minicpm(model_path: str):
     # must NOT fall back to the legacy `minicpmv` conv template (which encodes
     # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
     model_type = get_model_type(model_path)
-    if model_type == "minicpmv4_6":
+    if model_type in ("minicpmv4_6", "minicpmv4_7"):
         return None
     # For HF-hub paths (where config.json isn't on local disk yet), fall back
     # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
-    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+    if re.search(r"minicpm-(v|o)-4[._][67]", model_path, re.IGNORECASE):
         return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
@@ -1230,7 +1247,7 @@ def match_unlimited_ocr(model_path: str):
     if "unlimited" in model_path.lower():
         return "unlimited-ocr"
     model_type = get_model_type(model_path)
-    if model_type == "unlimited-ocr":
+    if model_type in ("unlimited-ocr", "unlimited_ocr"):
         return "unlimited-ocr"
     return None
 

@@ -8,10 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
-    get_device_core_count,
     get_device_name,
     is_cuda,
     is_gfx1250_supported,
@@ -679,7 +679,7 @@ if _is_hip:
         num_workgroups = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
-        num_workgroups <= get_device_core_count()
+        num_workgroups <= current_arch().num_sms
 
     def select_w8a8_block_fp8_matmul_kernel(M, N, META):
         if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
@@ -878,24 +878,6 @@ def w8a8_block_fp8_matmul_triton(
         )
 
     return C
-
-
-def w8a8_block_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return w8a8_block_fp8_matmul_deepgemm(
-            A, B, As, Bs, block_size, output_dtype=output_dtype
-        )
-
-    return w8a8_block_fp8_matmul_triton(
-        A, B, As, Bs, block_size, output_dtype=output_dtype
-    )
 
 
 def is_weak_contiguous(x: torch.Tensor):

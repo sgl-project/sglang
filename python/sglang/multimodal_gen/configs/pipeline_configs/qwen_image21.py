@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -15,6 +16,16 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def _decode_scale_and_shift(latents_mean, latents_std, z_dim, device, dtype):
+    # uploaded once per (device, dtype): a per-request upload blocks the host
+    mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(
+        1, z_dim, 1, 1, 1
+    )
+    std = torch.tensor(latents_std, device=device, dtype=dtype).view(1, z_dim, 1, 1, 1)
+    return std.reciprocal(), mean
 
 
 @dataclass
@@ -95,13 +106,9 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         ac = self.vae_config.arch_config
-        mean = torch.tensor(ac.latents_mean, device=device, dtype=dtype).view(
-            1, ac.z_dim, 1, 1, 1
+        return _decode_scale_and_shift(
+            tuple(ac.latents_mean), tuple(ac.latents_std), ac.z_dim, device, dtype
         )
-        std = torch.tensor(ac.latents_std, device=device, dtype=dtype).view(
-            1, ac.z_dim, 1, 1, 1
-        )
-        return std.reciprocal(), mean
 
     def preprocess_condition_image(self, image, **kwargs):
         return image
