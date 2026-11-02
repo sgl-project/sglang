@@ -1182,10 +1182,12 @@ class TestJointLRUEviction(unittest.TestCase):
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.unfix_pages("blocked")
 
-    def _params(self, allocator, num_tokens=0, window_tokens=0):
+    @staticmethod
+    def _params(allocator, num_tokens=0, window_tokens=0):
+        window = allocator.swa_attn_allocator.sub_pool_name
         return EvictParams(
             num_tokens=num_tokens,
-            window_num_tokens={self.SWA: window_tokens} if window_tokens else {},
+            window_num_tokens={window: window_tokens} if window_tokens else {},
         )
 
     @staticmethod

@@ -488,7 +488,10 @@ class TestUnifiedTriPool(_PoolTestCase):
                 self.assertEqual(walk["freed_leaves"], 1)
                 self.assertEqual(result.num_tokens_evicted, page_size)
                 self.assertEqual(
-                    result.window_num_tokens_evicted.get(ComponentType.SWA, 0), 0
+                    result.window_num_tokens_evicted.get(
+                        cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                    ),
+                    0,
                 )
                 self.assertEqual(result.mamba_num_evicted, 0)
                 self.assertEqual(
