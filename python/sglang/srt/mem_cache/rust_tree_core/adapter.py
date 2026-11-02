@@ -18,6 +18,10 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import (
+    get_cp_strategy,
+    is_cp_sharded_padded,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -443,6 +447,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError("the SWA tree component requires a positive window")
 
         self._page_size = params.page_size
+        self.logical_page_size = self._page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self._swa_backup_index_mapper: Optional[
             Callable[[torch.Tensor], torch.Tensor]
         ] = None
@@ -512,6 +519,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_host_only_checkpoint=(
                     host_only_mamba_checkpoint() if has_mamba else False
                 ),
+                cp_size=get_cp_strategy().cp_size if is_cp_sharded_padded() else None,
             ),
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.

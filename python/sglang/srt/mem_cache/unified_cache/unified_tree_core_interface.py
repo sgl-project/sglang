@@ -197,6 +197,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
+    logical_page_size: int
     is_eagle: bool
     device: torch.device
     enable_hicache: bool

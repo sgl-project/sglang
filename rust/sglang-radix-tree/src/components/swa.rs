@@ -19,7 +19,7 @@ use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
     CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
-    PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
+    PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore, from_cp_sharded,
 };
 
 /// SWA component driver; owns the SWA device/host value slots.
@@ -68,7 +68,7 @@ impl SwaComponent {
             return None;
         }
 
-        let page_size = tree_core.page_size;
+        let page_size = from_cp_sharded(tree_core.page_size, tree_core.cp_size);
         // Smallest page-aligned size that still covers the sliding window.
         let tail_size = self.sliding_window_size.div_ceil(page_size) * page_size;
         let leaf_len = leaf.key.atom_len();
@@ -460,7 +460,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         // full-value swap below is safe because full lock_ref >= swa
         // lock_ref, so a locked-SWA node always takes the Recover branch.
         assert_eq!(
-            swa_evicted_seqlen % tree_core.page_size,
+            swa_evicted_seqlen % from_cp_sharded(tree_core.page_size, tree_core.cp_size),
             0,
             "Swa: swa_evicted_seqlen must be page-aligned, swa_evicted_seqlen={swa_evicted_seqlen}"
         );
@@ -547,7 +547,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
         let swa_evicted_seqlen = params.swa_evicted_seqlen;
         assert_eq!(
-            swa_evicted_seqlen % tree_core.page_size,
+            swa_evicted_seqlen % from_cp_sharded(tree_core.page_size, tree_core.cp_size),
             0,
             "Swa: swa_evicted_seqlen must be page-aligned, swa_evicted_seqlen={swa_evicted_seqlen}"
         );

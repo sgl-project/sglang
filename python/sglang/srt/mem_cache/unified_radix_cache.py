@@ -25,6 +25,10 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    from_cp_sharded,
+    get_cp_sharded_padded_cache_indices,
+)
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -806,6 +810,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa_num_tokens=params.swa_num_tokens,
                 mamba_num=mamba_id_shortfall,
             )
+        if is_cp_sharded_padded():
+            # Allocator quotas are local; tree eviction counts logical tokens.
+            initial_params = replace(
+                initial_params,
+                num_tokens=from_cp_sharded(initial_params.num_tokens),
+                swa_num_tokens=from_cp_sharded(initial_params.swa_num_tokens),
+            )
         result = self._evict(initial_params, available_size_targets)
 
         if mamba_target is not None and mamba_full_donor is not None:
@@ -1364,7 +1375,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = radix_key.page_aligned(self.page_size)
+        radix_key = radix_key.page_aligned(self.tree_core.logical_page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
@@ -1411,7 +1422,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
+        ).page_aligned(self.tree_core.logical_page_size)
         if (
             len(self._components_tuple) == 1
             and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
@@ -1553,10 +1564,15 @@ class UnifiedRadixCache(BasePrefixCache):
             # tree values are page-aligned copies of a kv row: page-exact segments
             storage = self.kv_storage()
             for indices in action.indices:
-                storage.free_token_rows(indices)
+                local_indices = indices
+                if is_cp_sharded_padded():
+                    local_indices = get_cp_sharded_padded_cache_indices(local_indices)
+                storage.free_token_rows(local_indices)
         elif isinstance(action, FreeDeviceKVFullOnly):
             storage = self.kv_storage()
             for indices in action.indices:
+                if is_cp_sharded_padded():
+                    indices = get_cp_sharded_padded_cache_indices(indices)
                 storage.free_owner_rows(indices)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
@@ -4123,8 +4139,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # TODO(zhangmj): need more detailed log info for session reference.
         if self.supports_swa():
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            if is_cp_sharded_padded():
+                full_available_size = from_cp_sharded(full_available_size)
         else:
             full_available_size = self.token_to_kv_pool_allocator.available_size()
+            if is_cp_sharded_padded():
+                full_available_size = from_cp_sharded(full_available_size)
         full_evictable = self.tree_core.component_evictable_size(BASE_COMPONENT_TYPE)
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "
@@ -4135,6 +4155,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             if ct.is_swa:
                 available_size = self.token_to_kv_pool_allocator.swa_available_size()
+                if is_cp_sharded_padded():
+                    available_size = from_cp_sharded(available_size)
             elif ct.is_mamba:
                 available_size = (
                     self.token_to_kv_pool_allocator.state_slots.available_size()

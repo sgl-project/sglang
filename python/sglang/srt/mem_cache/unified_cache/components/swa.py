@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_cache_indices,
+    get_cp_sharded_padded_cache_transfer_indices,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -42,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     TreeComponent,
     next_component_uuid,
 )
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -86,6 +92,9 @@ class SWAComponent(TreeComponent):
         # (a fused draft's reads included); not the model's attention window.
         self.sliding_window_size = slot.window
         self.gates_prefix_match = params.swa_gates_prefix_match
+        self.logical_page_size = params.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -235,7 +244,24 @@ class SWAComponent(TreeComponent):
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         # Tree component values use int64 indices; the storage hands them so.
         storage, sub_pool = self.storage_and_sub_pool()
-        return storage.window_ids(sub_pool, full_indices)
+        local_full_indices = full_indices
+        if is_cp_sharded_padded():
+            local_full_indices = get_cp_sharded_padded_cache_transfer_indices(
+                local_full_indices
+            )
+        swa_indices = storage.window_ids(sub_pool, local_full_indices)
+        if is_cp_sharded_padded():
+            # Restore cache columns after translating physical FULL rows to SWA.
+            cp_size = get_cp_strategy().cp_size
+            page_size = get_schedule().page_size
+            columns = (
+                (full_indices.to(torch.int64) + (cp_size - 1) * page_size) // page_size
+            ) % cp_size
+            expanded = (
+                (swa_indices // page_size - 1) * cp_size + 1 + columns
+            ) * page_size + swa_indices % page_size
+            swa_indices = torch.where(swa_indices > 0, expanded, swa_indices)
+        return swa_indices
 
     def _unified_allocator(self):
         """The unified pool's allocator, or None when running on the static pool."""
@@ -249,6 +275,15 @@ class SWAComponent(TreeComponent):
     ) -> torch.Tensor:
         """Move incoming SWA rows to kept Full IDs and return their SWA indices."""
         storage, sub_pool = self.storage_and_sub_pool()
+        if is_cp_sharded_padded():
+            # The storage rebinds local rows; the tree keeps cache-row SWA values.
+            swa_value = self._translate_full_to_swa(incoming_full)
+            storage.rehome_window(
+                sub_pool,
+                get_cp_sharded_padded_cache_indices(kept_full),
+                get_cp_sharded_padded_cache_indices(incoming_full),
+            )
+            return swa_value
         return storage.rehome_window(sub_pool, kept_full, incoming_full)
 
     def refresh_lru(
@@ -364,7 +399,7 @@ class SWAComponent(TreeComponent):
     def _clip_to_window(self, *, node, start, end, window_start, cache_actions):
         if node.component_data[self.component_type].value is not None:
             return None
-        assert window_start % self.tree_core.page_size == 0, (
+        assert window_start % self.logical_page_size == 0, (
             f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {window_start=}"
         )
         live_start = max(start, window_start)
@@ -538,7 +573,7 @@ class SWAComponent(TreeComponent):
         if leaf is self.tree_core.root_node or cd.lock_ref > 0:
             return None
 
-        page_size = self.tree_core.page_size
+        page_size = self.logical_page_size
         # Smallest page-aligned size that still covers the sliding window.
         tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
         leaf_len = len(leaf.key)
@@ -1500,6 +1535,8 @@ class SWAComponent(TreeComponent):
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 # Component values are page-aligned copies of a kv row.
+                if is_cp_sharded_padded():
+                    indices = get_cp_sharded_padded_cache_indices(indices)
                 storage.free_units(sub_pool, indices)
             return
         if isinstance(action, FreeComponentHostSlot):
@@ -1523,7 +1560,10 @@ class SWAComponent(TreeComponent):
             # Keep the locked full; hand the node the INCOMING ids' swa pages,
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._set_swa(action.kept_full, action.incoming_full)
-            storage.release_rehomed_owner_rows(action.incoming_full)
+            incoming_full = action.incoming_full
+            if is_cp_sharded_padded():
+                incoming_full = get_cp_sharded_padded_cache_indices(incoming_full)
+            storage.release_rehomed_owner_rows(incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )

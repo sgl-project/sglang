@@ -134,8 +134,11 @@ def free_swa_out_of_window_slots(
         # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
         # a key that ends at page_floor(pre_len) still has a full window of live SWA,
         # and the last leaf, below page_floor(seq_len), is never all-tombstone.
+        logical_page_size = page_size
+        if is_cp_sharded_padded():
+            logical_page_size = from_cp_sharded(logical_page_size)
         evict_threshold = pre_len - ceil_align(
-            max(sliding_window_size, page_size), page_size
+            max(sliding_window_size, logical_page_size), logical_page_size
         )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);

@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_indices
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -538,6 +540,8 @@ class FullComponent(TreeComponent):
             storage, sub_pool = self.storage_and_sub_pool()
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
+                if is_cp_sharded_padded():
+                    indices = get_cp_sharded_padded_cache_indices(indices)
                 storage.free_units(sub_pool, indices)
         else:
             raise AssertionError(

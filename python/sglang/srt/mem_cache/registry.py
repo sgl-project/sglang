@@ -297,16 +297,29 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 "option that selected another tree cache for this model."
             )
 
-    # Radix trees and streaming-session tails align and free pages, not CP groups.
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    # UnifiedRadixCache itself aligns and frees CP groups; its subclasses, other
+    # radix trees, host and session caching, external-linker loads and
+    # streaming-session tails may align and free pages.
     if is_cp_sharded_padded() and (
-        not cache.disable or get_serving().enable_streaming_session
+        (
+            not cache.disable
+            and (
+                type(cache) is not UnifiedRadixCache
+                or get_memory().enable_hierarchical_cache
+                or get_memory().enable_session_radix_cache
+                or get_memory().enable_unified_cache_external_linker
+            )
+        )
+        or get_serving().enable_streaming_session
     ):
         raise ValueError(
-            "A sharded --cp-kv-layout does not support radix caching or streaming "
-            "sessions; set --disable-radix-cache and drop --enable-streaming-session."
+            "A sharded --cp-kv-layout supports radix caching only on "
+            "UnifiedRadixCache itself, not its subclasses, and without "
+            "hierarchical caching, session radix caching or the unified-cache "
+            "external linker; it does not support streaming sessions."
         )
-
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     if get_serving().enable_streaming_session and not isinstance(
         cache, UnifiedRadixCache

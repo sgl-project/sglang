@@ -6,6 +6,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
+    get_cp_sharded_padded_available_tokens,
+    get_cp_sharded_padded_chunk_tokens,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
@@ -1157,6 +1159,13 @@ class PrefillAdder:
         if is_cp_sharded_padded():
             # Existing prefix padding can supply part of this chunk's KV rows.
             prefix_tokens = req.prefix_len
+            # The budget adds group size - 1 padding tokens; only this prefix's tail is free.
+            cp_chunk_tokens = get_cp_sharded_padded_chunk_tokens(
+                get_cp_sharded_padded_available_tokens(int(self.rem_total_tokens)),
+                prefix_tokens=prefix_tokens,
+            )
+            if cp_chunk_tokens > 0:
+                _rem_tokens = min(_rem_tokens, cp_chunk_tokens)
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),

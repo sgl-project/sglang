@@ -29,6 +29,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -482,6 +483,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         # Each family's slot id: the tree names a slot by its family, never by
         # a kind (one slot per family; several windows would list more).
         self._family_slot_ids: dict[str, ComponentType] = {}
@@ -955,7 +959,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if len(key) == 0:
             return self._empty_match_result
-        key = key.page_aligned(self.page_size)
+        key = key.page_aligned(self.logical_page_size)
         if len(key) == 0:
             return self._empty_match_result
 
@@ -978,7 +982,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # match for scheduler prefix indices and locking.
         node = self.root_node
         key_offset = 0
-        child_key = key.child_key_at(key_offset, self.page_size)
+        child_key = key.child_key_at(key_offset, self.logical_page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -1021,7 +1025,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
+            prefix_len = child.key.match_at(
+                key, key_offset, page_size=self.logical_page_size
+            )
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -1036,7 +1042,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             _update_best_if_valid(node)
             key_offset += prefix_len
             if key_offset < len(key):
-                child_key = key.child_key_at(key_offset, self.page_size)
+                child_key = key.child_key_at(key_offset, self.logical_page_size)
 
         return self._match_post_processor(
             params,
@@ -1251,7 +1257,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
-        key = key.page_aligned(self.page_size)
+        key = key.page_aligned(self.logical_page_size)
         if value is not None:
             value = value[: len(key)]
         else:
@@ -1399,7 +1405,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
         key = state.key
-        child_key = key.child_key(self.page_size) if len(key) else None
+        child_key = key.child_key(self.logical_page_size) if len(key) else None
         if child_key not in state.node.children:
             state.phase = _InsertPhase.COMMIT
             return
@@ -1408,7 +1414,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Under joint_lru an access to only the prefix keeps the suffix's recency.
         suffix_time = node.last_access_time if self.joint_lru is not None else None
         self._touch_node(node)
-        prefix_len = node.key.match(key, page_size=self.page_size)
+        prefix_len = node.key.match(key, page_size=self.logical_page_size)
         if prefix_len < len(node.key):
             suffix = node
             node, action = self._split_node(node.key, node, prefix_len)
@@ -1594,7 +1600,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> tuple[UnifiedTreeNode, Optional[CacheAction | ComponentAction]]:
         new_node = self._new_node(priority=child.priority)
-        new_node.children = {key[split_len:].child_key(self.page_size): child}
+        new_node.children = {key[split_len:].child_key(self.logical_page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
@@ -1625,7 +1631,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
-        new_node.parent.children[key.child_key(self.page_size)] = new_node
+        new_node.parent.children[key.child_key(self.logical_page_size)] = new_node
 
         # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
@@ -1682,7 +1688,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
-        parent.children[key.child_key(self.page_size)] = new_node
+        parent.children[key.child_key(self.logical_page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
             BASE_COMPONENT_TYPE
         ].reclaimable_value_len(new_node)
@@ -2420,7 +2426,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
-        key = node.key.child_key(self.page_size)
+        key = node.key.child_key(self.logical_page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
         # Deleted nodes must not linger in duplicate tracking as ghosts.
