@@ -269,7 +269,7 @@ class NonCudaDecoderMixin:
                 self.hc_sinkhorn_iters,
                 input_norm_weight,
                 self.input_layernorm.variance_epsilon,
-                fn_transpose=False,
+                fn_transpose=True,
             )
         if fused is not None:
             residual, hidden_states, post, comb, norm_fused = fused
