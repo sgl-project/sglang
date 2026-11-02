@@ -13,7 +13,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import is_qwen3_5
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attn_tp_size, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -295,11 +295,16 @@ def _validate_mha_dcp_hicache(server_args: Any) -> None:
         unsupported.append("sliding-window attention")
     if getattr(model.hf_text_config, "indexer_n_heads", 0):
         unsupported.append("sparse attention indexers")
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_dp_size=cfg.attn_dp_size,
+        attn_cp_size=cfg.attn_cp_size,
+    )
     # Qwen3.5 adjusts its K/V projections for DCP. Other models retain their
     # TP-only projection layout, which must already match the DCP pool.
     if not is_qwen3_5(model.hf_config) and model.get_num_kv_heads(
-        cfg.tp_size, cfg.dcp_size
-    ) != model.get_num_kv_heads(cfg.tp_size):
+        attn_tp_size, cfg.dcp_size
+    ) != model.get_num_kv_heads(attn_tp_size):
         unsupported.append("a KV-head layout not provided by the model's projections")
     if unsupported:
         raise NotImplementedError(
