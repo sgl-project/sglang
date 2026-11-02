@@ -4,11 +4,11 @@ import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
-from fastapi import HTTPException  # noqa: E402
+from fastapi import HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -1890,6 +1891,72 @@ class TestDetectInlineSystemSupport(unittest.TestCase):
     def test_no_template_not_supported(self):
         self.assertFalse(detect_inline_system_support(None))
         self.assertFalse(detect_inline_system_support(""))
+
+
+class TestAnthropicConversionHTTPError(CustomTestCase):
+    def test_invalid_routing_header_keeps_status_before_stream_start(self):
+        class RoutingChat:
+            supports_inline_system = False
+
+            def _validate_request(self, request):
+                return None
+
+            def _convert_to_internal_request(self, request, raw_request):
+                OpenAIServingBase.extract_routed_dp_rank_from_header(self, raw_request)
+                raise AssertionError("Malformed routing header was not rejected")
+
+        raw_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": [(b"x-data-parallel-rank", b"not-an-integer")],
+            }
+        )
+        serving = AnthropicServing(RoutingChat())
+        chat_request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+        request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                handler = (
+                    serving._handle_streaming
+                    if stream
+                    else serving._handle_non_streaming
+                )
+                response = asyncio.run(handler(chat_request, request, raw_request))
+                error = json.loads(response.body)["error"]
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(error["type"], "invalid_request_error")
+                self.assertIn("Invalid X-Data-Parallel-Rank header", error["message"])
+
+    def test_conversion_http_error_preserves_headers_and_scrubbing(self):
+        class RejectedChat:
+            supports_inline_system = False
+
+            def _validate_request(self, request):
+                return None
+
+            def _convert_to_internal_request(self, request, raw_request):
+                raise HTTPException(
+                    503, "internal diagnostic", headers={"Retry-After": "7"}
+                )
+
+        serving = AnthropicServing(RejectedChat())
+        for handler in (serving._handle_non_streaming, serving._handle_streaming):
+            with self.subTest(handler=handler.__name__):
+                response = asyncio.run(handler(None, None, None))
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.headers.get("retry-after"), "7")
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": "overloaded_error", "message": "Internal server error"},
+                )
 
 
 if __name__ == "__main__":

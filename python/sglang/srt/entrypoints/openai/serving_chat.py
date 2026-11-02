@@ -2593,14 +2593,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    code = finish_reason.get("status_code")
+                    if (
+                        finish_reason_type == "abort"
+                        and isinstance(code, int)
+                        and 400 <= code < 600
                     ):
-                        code = finish_reason["status_code"]
+                        try:
+                            error_type = HTTPStatus(code).name
+                        except ValueError:
+                            error_type = str(code)
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            error_type,
+                            code,
                         )
                         yield f"data: {error}\n\n"
                         error_aborted = True

@@ -563,10 +563,13 @@ def _anthropic_validation_message(raw_errors) -> str:
     return text
 
 
-def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+def _anthropic_error_response(
+    *, status_code: int, error_type: str, message: str, headers=None
+):
     """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
     return ORJSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "type": "error",
             "error": {"type": error_type, "message": message},
@@ -582,7 +585,8 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
-    if request.url.path.startswith("/v1/messages"):
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
         anthropic_type = {
             400: "invalid_request_error",
@@ -607,10 +611,11 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             status_code=exc.status_code,
             error_type=anthropic_type,
             message=message,
+            headers=exc.headers,
         )
 
     # adjust fmt for responses api
-    if request.url.path.startswith("/v1/responses"):
+    if route_path.startswith("/v1/responses"):
         nested_error = {
             "message": exc.detail,
             "type": HTTPStatus(exc.status_code).phrase,
@@ -618,7 +623,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             "code": exc.status_code,
         }
         return ORJSONResponse(
-            content={"error": nested_error}, status_code=exc.status_code
+            content={"error": nested_error},
+            status_code=exc.status_code,
+            headers=exc.headers,
         )
 
     error = ErrorResponse(
@@ -627,7 +634,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         type=str(exc.status_code),
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    return ORJSONResponse(
+        content=error.model_dump(), status_code=exc.status_code, headers=exc.headers
+    )
 
 
 # Custom exception handlers to change validation error status codes
@@ -641,14 +650,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
-    if request.url.path.startswith("/v1/messages"):
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
         )
 
-    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
     if route_path == "/v1/systemone":
         # The System One API documents FastAPI's default 422 detail list. The
         # optional input echo is left out, since it can be any client value.
@@ -669,7 +678,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     else:
         message = exc_str
 
-    if request.url.path.startswith("/v1/responses"):
+    if route_path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
         nested_error = {
             "message": message,
