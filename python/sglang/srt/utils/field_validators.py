@@ -34,7 +34,9 @@ Usage::
 
 from __future__ import annotations
 
+import os
 from array import array
+from pathlib import Path
 from typing import Any
 
 
@@ -79,3 +81,38 @@ def validate_optional_list_i64_1d_2d(
                 raise ValueError(f"row {i}: {e}") from None
         return v
     raise ValueError(f"elements must be int or list; got {type(v[0]).__name__}")
+
+
+def validate_filename_component(
+    name: Any, field_name: str = "filename component"
+) -> None:
+    """Validate that a filename component (e.g. profile_id, profile_prefix) is safe
+    and cannot escape its destination directory via path separators or traversal."""
+    if name is None or name == "":
+        return
+    if not isinstance(name, str):
+        raise ValueError(f"{field_name} must be a string; got {type(name).__name__}")
+    if (
+        os.path.isabs(name)
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or "\0" in name
+    ):
+        raise ValueError(
+            f"Invalid {field_name}: '{name}'. Must be a safe filename component without path separators or traversal."
+        )
+
+
+def get_contained_path(base_dir: str | Path, filename: str) -> str:
+    """Join base_dir and filename and ensure the resolved path remains strictly
+    within base_dir, preventing path traversal."""
+    base_path = Path(base_dir).resolve()
+    target_path = (base_path / filename).resolve()
+    try:
+        target_path.relative_to(base_path)
+    except ValueError:
+        raise ValueError(
+            f"Target path '{target_path}' escapes output directory '{base_path}'"
+        )
+    return str(target_path)
