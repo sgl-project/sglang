@@ -243,6 +243,9 @@ def _try_unify_shape(x: torch.Tensor, target_shape):
 def _calc_rel_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
+    if denominator == 0:
+        # Both all-zero: identical, and 0 / 0 would make the diff NaN.
+        return torch.zeros_like(denominator)
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
 
