@@ -84,7 +84,7 @@ from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, dsa_draft_shards_under_dcp
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
     log_mla_gluon_capability,
@@ -421,6 +421,12 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
+        self._reject_mla_draft_under_dcp(
+            use_mla=self.use_mla,
+            dcp_world_size=self.dcp_world_size,
+            is_draft_worker=model_runner.is_draft_worker,
+            hf_config=model_runner.model_config.hf_config,
+        )
         self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
         if self.mla_decode_backend not in ("gluon", "asm"):
             raise ValueError(
@@ -3654,6 +3660,31 @@ class AiterAttnBackend(AttentionBackend):
         # the merge_state_triton needs lse layout [tokens, heads].
         # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
+
+    @staticmethod
+    def _reject_mla_draft_under_dcp(
+        *, use_mla, dcp_world_size, is_draft_worker, hf_config
+    ):
+        """Reject an MLA draft model under decode context parallelism.
+
+        A draft that does not shard its KV like the target (all but a ROCm DSA
+        draft) keeps a replicated pool, but the MLA model code still sends its
+        draft extend through the DCP decode branch without the step's keys. This
+        backend's extend cannot take that and failed at startup with an opaque
+        ``AttributeError``. Fail loudly instead. Inert for targets, non-MLA
+        drafts and DCP 1.
+        """
+        if (
+            use_mla
+            and is_draft_worker
+            and dcp_world_size > 1
+            and not dsa_draft_shards_under_dcp(hf_config, dcp_world_size)
+        ):
+            raise ValueError(
+                f"aiter cannot run an MLA draft model with --dcp-size {dcp_world_size}: "
+                "its draft extend has no DCP path. Use --dcp-size 1, or a draft "
+                "model without MLA attention (for example DSpark)."
+            )
 
     @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
