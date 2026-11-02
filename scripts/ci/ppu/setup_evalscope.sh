@@ -26,6 +26,7 @@
 #   EVALSCOPE_VENV        where to build the environment (default /opt/evalscope-venv)
 #   EVALSCOPE_SPEC        the requirement to install
 #   EVALSCOPE_WHEELHOUSE  optional local wheel directory, tried before the index
+#   EVALSCOPE_CACHE_DIR   shared archives (default /wl_nas/cache/evalscope)
 #
 # Usage: bash /workspace/source/scripts/ci/ppu/setup_evalscope.sh
 set -euo pipefail
@@ -33,25 +34,99 @@ set -euo pipefail
 EVALSCOPE_VENV="${EVALSCOPE_VENV:-/opt/evalscope-venv}"
 EVALSCOPE_SPEC="${EVALSCOPE_SPEC:-evalscope[ifeval]==1.11.1}"
 EVALSCOPE_WHEELHOUSE="${EVALSCOPE_WHEELHOUSE:-/nas_aisw/datasets/packages/evalscope}"
+EVALSCOPE_CACHE_DIR="${EVALSCOPE_CACHE_DIR:-/wl_nas/cache/evalscope}"
 
 evalscope_bin="${EVALSCOPE_VENV}/bin/evalscope"
 venv_python="${EVALSCOPE_VENV}/bin/python"
+cache_key=$(python3 - "${EVALSCOPE_SPEC}" "${EVALSCOPE_VENV}" <<'PYEOF'
+import hashlib
+import json
+from pathlib import Path
+import platform
+import sys
+import sysconfig
 
-# Idempotent, because a pod that retries a step should not pay for the install
-# twice and because a human debugging inside the pod runs this by hand.
-if [ -x "${evalscope_bin}" ] && "${venv_python}" -c "import evalscope" >/dev/null 2>&1; then
+interpreter = Path(sys.executable).resolve()
+identity = {
+    "format": 1,
+    "spec": sys.argv[1],
+    "venv": str(Path(sys.argv[2]).absolute()),
+    "python": sys.version,
+    "interpreter": str(interpreter),
+    "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+    "base_prefix": sys.base_prefix,
+    "abi": sysconfig.get_config_var("SOABI"),
+    "arch": platform.machine(),
+    "libc": platform.libc_ver(),
+    "os": Path("/etc/os-release").read_text(),
+}
+print(hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16])
+PYEOF
+)
+key_dir="${EVALSCOPE_CACHE_DIR}/${cache_key}"
+cache_archive="${key_dir}/venv.tar.gz"
+echo "EvalScope cache key: ${cache_key}"
+
+verify_environment() {
+  [ -x "${evalscope_bin}" ] || return 1
+  "${venv_python}" - "${EVALSCOPE_SPEC}" <<'PYEOF' || return 1
+import evalscope
+from evalscope.api.metric.semantics import MetricIdentity  # noqa: F401
+from evalscope.report import Report
+from importlib.metadata import version
+from packaging.requirements import Requirement
+import sys
+
+requirement = Requirement(sys.argv[1])
+installed = version(requirement.name)
+if installed not in requirement.specifier:
+    raise SystemExit(f"evalscope {installed} does not satisfy {requirement}")
+for name in ("schema_version", "metrics", "primary_metric_identity"):
+    if name not in Report.model_fields:
+        raise SystemExit(f"evalscope {installed} has no Report.{name}")
+print(f"evalscope {installed}, report schema v2 present")
+PYEOF
+  "${evalscope_bin}" --help >/dev/null || return 1
+  "${venv_python}" -m pip check || return 1
+}
+
+ready=0
+built=0
+if [ -f "${EVALSCOPE_VENV}/.cache-key" ] \
+    && [ "$(<"${EVALSCOPE_VENV}/.cache-key")" = "${cache_key}" ] \
+    && verify_environment; then
   echo "EvalScope environment already present at ${EVALSCOPE_VENV}"
-else
-  echo "Building the EvalScope environment at ${EVALSCOPE_VENV}"
-  python3 -m venv "${EVALSCOPE_VENV}"
+  ready=1
+elif [ -r "${cache_archive}" ]; then
+  echo "EvalScope cache HIT: ${cache_archive}"
+  restore_stage=$(mktemp -d)
+  if tar -xzf "${cache_archive}" -C "${restore_stage}" \
+      && [ -f "${restore_stage}/.cache-key" ] \
+      && [ "$(<"${restore_stage}/.cache-key")" = "${cache_key}" ]; then
+    if [ -d "${EVALSCOPE_VENV}" ]; then
+      python3 -m venv --clear "${EVALSCOPE_VENV}"
+      cp -a "${restore_stage}/." "${EVALSCOPE_VENV}/"
+    else
+      mkdir -p "$(dirname "${EVALSCOPE_VENV}")"
+      mv -T "${restore_stage}" "${EVALSCOPE_VENV}"
+      restore_stage=""
+    fi
+    if verify_environment; then
+      ready=1
+    else
+      echo "EvalScope cache validation failed, rebuilding locally"
+    fi
+  else
+    echo "EvalScope cache restore failed, rebuilding locally"
+  fi
+  rm -rf "${restore_stage}"
+fi
+
+if [ "${ready}" != 1 ]; then
+  echo "EvalScope cache MISS: building at ${EVALSCOPE_VENV}"
+  python3 -m venv --clear "${EVALSCOPE_VENV}"
   "${venv_python}" -m pip install --no-cache-dir --upgrade pip wheel
 
-  # The wheel directory first when the NAS carries one: it makes the install
-  # independent of egress on a cluster whose network is the least reliable thing
-  # about it. Not --no-index by itself, because a wheelhouse assembled for one
-  # release is not guaranteed to close over a later pin -- the index stays as the
-  # fallback rather than as the plan. Today there is no wheelhouse and the index
-  # is what runs: it carries evalscope 1.11.1 (measured, run 34374868204).
   installed=0
   if [ -d "${EVALSCOPE_WHEELHOUSE}" ]; then
     echo "Trying the local wheel directory ${EVALSCOPE_WHEELHOUSE}"
@@ -65,26 +140,27 @@ else
   if [ "${installed}" != 1 ]; then
     "${venv_python}" -m pip install --no-cache-dir "${EVALSCOPE_SPEC}"
   fi
+  verify_environment
+  printf '%s\n' "${cache_key}" > "${EVALSCOPE_VENV}/.cache-key"
+  built=1
 fi
 
-# What the evaluator actually depends on, checked here so a wrong version costs
-# seconds rather than the hour a weight load and an evaluation would spend before
-# the report turned out to be unreadable.
-"${venv_python}" - <<'PYEOF'
-import evalscope
-from evalscope.api.metric.semantics import MetricIdentity  # noqa: F401
-from evalscope.report import Report
-
-version = getattr(evalscope, "__version__", "unknown")
-fields = Report.model_fields
-for name in ("schema_version", "metrics", "primary_metric_identity"):
-    if name not in fields:
-        raise SystemExit(
-            f"evalscope {version} has no Report.{name}: this is not the report v2 "
-            "schema accuracy_eval_kit reads"
-        )
-print(f"evalscope {version}, report schema v2 present")
-PYEOF
+if [ "${built}" = 1 ]; then
+  (
+    local_stage=""
+    nas_stage=""
+    trap 'rm -rf "${local_stage}" "${nas_stage}"' EXIT
+    mkdir -p "${key_dir}" || exit 1
+    local_stage=$(mktemp -d) || exit 1
+    nas_stage=$(mktemp -d "${EVALSCOPE_CACHE_DIR}/.${cache_key}.XXXXXX") || exit 1
+    "${venv_python}" -m pip freeze > "${EVALSCOPE_VENV}/.cache-requirements.txt" || exit 1
+    # Pack locally so NAS only receives one sequential file write.
+    tar -I 'gzip -1' -cf "${local_stage}/venv.tar.gz" -C "${EVALSCOPE_VENV}" . || exit 1
+    cp "${local_stage}/venv.tar.gz" "${nas_stage}/venv.tar.gz" || exit 1
+    # Replacing a single archive is atomic even when workers publish concurrently.
+    mv -fT "${nas_stage}/venv.tar.gz" "${cache_archive}" || exit 1
+    echo "EvalScope cache published: ${cache_archive}"
+  ) || echo "::warning::EvalScope cache publication failed; the local environment remains usable"
+fi
 
 echo "evalscope binary: ${evalscope_bin}"
-"${evalscope_bin}" --help >/dev/null
