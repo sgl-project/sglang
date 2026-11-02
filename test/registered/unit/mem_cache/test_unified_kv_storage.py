@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.kv.layout.mha import MHAHostLayout
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import StateHostLayout
+from sglang.srt.mem_cache.kv.plan import tree_slot_ids
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,11 +42,6 @@ CHAINS = {
         state_layer_ids=(0, 2),
         **_P16,
     ),
-}
-_COMPONENTS = {
-    "swa": {ComponentType.FULL, ComponentType.SWA},
-    "mamba": {ComponentType.FULL, ComponentType.MAMBA},
-    "tri": {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA},
 }
 
 
@@ -277,8 +273,10 @@ class TestHostStack(CustomTestCase):
     def _build(self, name, *, backend):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
-        chain = CHAINS[name].chain
-        cache = _RecordingCache(bundle, _COMPONENTS[chain])
+        # The tree's components, numbered as the storage's slots number them.
+        cache = _RecordingCache(
+            bundle, tree_slot_ids(allocator.storage.tree_slots()).values()
+        )
         params = SimpleNamespace(
             token_to_kv_pool_allocator=allocator,
             req_to_token_pool=getattr(bundle, "req_to_token_pool", None),
@@ -338,7 +336,8 @@ class TestHostStack(CustomTestCase):
             self.assertEqual(entry.host_pool.name, sub_pool)
             self.assertIs(entry.host_pool.device_pool, storage.view(sub_pool))
         # Each side's host pressure evicts its own tree component.
-        for entry, component in ((kv, ComponentType.FULL), (swa, ComponentType.SWA)):
+        window = tree_slot_ids(storage.tree_slots())["WINDOW_32"]
+        for entry, component in ((kv, ComponentType.FULL), (swa, window)):
             cache.calls.clear()
             entry.host_evict_fn(3)
             self.assertEqual(cache.calls, [("host", 3, component)])

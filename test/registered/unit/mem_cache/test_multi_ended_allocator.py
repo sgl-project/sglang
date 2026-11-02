@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW, TreeSlot
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -1138,7 +1139,7 @@ class TestJointLRUEviction(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _cache(self, eviction_policy="joint_lru", **params):
+    def _cache(self, eviction_policy="joint_lru", window_slot=None, **params):
         # The allocator fixture reads no instance state.
         _, allocator, _ = TestWindowChainAllocator._build(
             self, n_full_slots=48, n_swa_slots=48, full_layer_num=2, swa_layer_num=6
@@ -1150,7 +1151,12 @@ class TestJointLRUEviction(unittest.TestCase):
                 page_size=1,
                 disable=False,
                 sliding_window_size=4,
-                tree_slots=tree_slots_of((self.FULL, self.SWA), window=4),
+                tree_slots=(
+                    tree_slots_of((self.FULL, self.SWA), window=4)
+                    if window_slot is None
+                    else tree_slots_of((self.FULL,))
+                    + (TreeSlot(component=window_slot, family=TREE_WINDOW, window=4),)
+                ),
                 tree_core_backend="python",
                 eviction_policy=eviction_policy,
                 **params,
@@ -1242,6 +1248,21 @@ class TestJointLRUEviction(unittest.TestCase):
         )
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_a_window_slot_named_by_its_length_keeps_the_joint_order(self):
+        # Unified pools name a window's tree slot by its length, not SWA.
+        orders = []
+        for window_slot in (None, "WINDOW_4"):
+            cache, allocator = self._cache(window_slot=window_slot)
+            self.assertTrue(cache.evicts_by_joint_lru)
+            self._insert(cache, allocator, [1, 2, 3, 4])
+            self._insert(cache, allocator, list(range(1, 11)))
+            self._insert(cache, allocator, [20, 21])
+            self._match(cache, list(range(1, 11)))
+            victims = self._record_victims(cache)
+            cache.evict(self._params(allocator, 12, 12))
+            orders.append([(int(ct != self.FULL), key) for ct, key in victims])
+        self.assertEqual(orders[0], orders[1])
 
     def test_joint_walk_strips_leaf_swa_and_the_next_legacy_walk_collapses(self):
         cache, allocator = self._tree()

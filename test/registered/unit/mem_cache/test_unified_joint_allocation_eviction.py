@@ -14,8 +14,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -476,7 +476,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             cache.evict_until(
                 EvictParams(
                     window_num_tokens={
-                        cache.window_sub_pool_of_slot(ComponentType.SWA): 2
+                        cache.window_sub_pool_of_slot(cache.slot_id(TREE_WINDOW)): 2
                     }
                 ),
                 lambda: allocator.ensure_capacity(token_demand(allocator, 4, 4)),

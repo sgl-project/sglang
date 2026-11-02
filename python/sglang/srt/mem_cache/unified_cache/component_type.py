@@ -21,10 +21,11 @@ class ComponentType(int, metaclass=_ComponentTypeMeta):
     """A prefix-tree component id, an int so that per-node list storage can be
     indexed directly.
 
-    The fixed ids are the token component (FULL), the first window (SWA), the
-    recurrent state (MAMBA) and the C128 sidecar. A tree whose storage keeps
-    further windows names each by its sub-pool (`of`), which gives it the next
-    free id; a name keeps its id for the life of the process.
+    The fixed ids are the token component (FULL), the window of a pool that
+    names its one window slot `SWA` (static pools, and the native tree core's
+    window), the recurrent state (MAMBA) and the C128 sidecar. Any other slot
+    name, such as a unified window sub-pool's, gets the next free id (`of`); a
+    name keeps its id for the life of the process.
     """
 
     _by_value: dict[int, ComponentType] = {}
@@ -87,10 +88,6 @@ class ComponentType(int, metaclass=_ComponentTypeMeta):
     @property
     def is_full(self) -> bool:
         return self == ComponentType.FULL
-
-    @property
-    def is_swa(self) -> bool:
-        return self == ComponentType.SWA
 
     @property
     def is_mamba(self) -> bool:

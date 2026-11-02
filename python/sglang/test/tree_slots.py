@@ -2,6 +2,8 @@
 
 from typing import Iterable, Optional, Tuple
 
+import msgspec
+
 from sglang.srt.mem_cache.kv.plan import (
     TREE_BLOCK,
     TREE_STATE,
@@ -48,6 +50,32 @@ def tree_slots_of(
             TreeSlot(component=ComponentType(c).name, family=family, **numbers)
         )
     return tuple(slots)
+
+
+def storage_tree_slots(
+    storage,
+    *,
+    window: Optional[int] = None,
+    components: Optional[Iterable[ComponentType]] = None,
+) -> Tuple[TreeSlot, ...]:
+    """The slots a cache over unified ``storage`` keeps, as production builds
+    them: the storage's own, a window slot named by its sub-pool. ``window``
+    sets a window slot's length where the test chooses one; ``components``
+    keeps only the slots of those components' families."""
+    families = (
+        None
+        if components is None
+        else {FAMILY_OF[ComponentType(c)] for c in components}
+    )
+    return tuple(
+        (
+            msgspec.structs.replace(slot, window=window)
+            if window is not None and slot.family == TREE_WINDOW
+            else slot
+        )
+        for slot in storage.tree_slots()
+        if families is None or slot.family in families
+    )
 
 
 def slot_of(params, component: ComponentType) -> TreeSlot:

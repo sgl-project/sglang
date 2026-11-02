@@ -58,10 +58,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# The token and state components the linker stores, besides the tree's one
+# window slot (which it finds by family, whatever id the tree gives it).
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
-        ComponentType.SWA,
         ComponentType.MAMBA,
     }
 )
@@ -261,19 +262,24 @@ class UnifiedCacheLinkerWrapper:
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
     ):
-        unsupported = set(cache.tree_components) - _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
+        # The linker keeps one window: the tree's window slot when it has one.
+        windows = cache.window_slots()
+        supported = _EXTERNAL_LINKER_SUPPORTED_COMPONENTS | (
+            set(windows) if len(windows) == 1 else set()
+        )
+        unsupported = set(cache.tree_components) - supported
         if unsupported:
             names = ", ".join(
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full, SWA and Mamba tree "
+                "External cache linker supports only Full, one window and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
-        swa = cache.components.get(ComponentType.SWA)
+        swa = cache.components[windows[0]] if windows else None
         # A store without SWA pages tombstones restored tails instead.
         self._swa_pool = swa.pool_name if swa is not None else PoolName.SWA
         self._skip_swa = swa is not None and self._swa_pool not in cache_linker.pools

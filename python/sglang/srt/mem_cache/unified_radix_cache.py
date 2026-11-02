@@ -1275,11 +1275,12 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Evict the oldest Full leaves and SWA entries until the freed bytes,
-        cascades included, reach the requested quotas' bytes, or until
+        """Evict the oldest token leaves and window entries until the freed
+        bytes, cascades included, reach the requested quotas' bytes, or until
         ``allocation_reclaim_satisfied`` holds. Compaction can run, so bytes
         freed on either side serve the other side's allocation."""
         allocator = self.token_to_kv_pool_allocator
+        window = self.tree_core.joint_window_type
 
         def satisfied() -> bool:
             return (
@@ -1296,9 +1297,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.start_joint_eviction()
         try:
             while (
-                allocator.shared_bytes(
-                    tracker[BASE_COMPONENT_TYPE], tracker[ComponentType.SWA]
-                )
+                allocator.shared_bytes(tracker[BASE_COMPONENT_TYPE], tracker[window])
                 < target
                 and not satisfied()
             ):

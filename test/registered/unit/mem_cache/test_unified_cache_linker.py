@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -61,7 +62,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import index_slots
+from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
@@ -167,6 +168,15 @@ def _cache_for_wrapper(**kwargs):
         "pp_group": None,
     }
     defaults.update(kwargs)
+    # The stand-in's window slots, as a tree with these slots reports them.
+    windows = tuple(
+        dict.fromkeys(
+            ct
+            for ct in (*defaults["tree_components"], *defaults["components"])
+            if FAMILY_OF.get(ct) == TREE_WINDOW
+        )
+    )
+    defaults.setdefault("window_slots", lambda: windows)
     return SimpleNamespace(**defaults)
 
 

@@ -145,15 +145,15 @@ class TestWindowNames(CustomTestCase):
             [slot.host_pool for slot in slots], ["kv", "window_64", "window_16"]
         )
         self.assertEqual([slot.window for slot in slots][1:], [64, 16])
-        # With several windows every window slot goes by its own name; only a
-        # tree's single window plays the window role.
+        # Every window slot goes by its own name, a single window's too: a
+        # boundary keeping one window maps it to its own id itself.
         self.assertEqual(
             [ct.name for ct in tree_slot_ids(slots).values()],
             ["FULL", "WINDOW_64", "WINDOW_16"],
         )
         self.assertEqual(
             [ct.name for ct in tree_slot_ids(_plan((64,)).tree_slots()).values()],
-            ["FULL", "SWA"],
+            ["FULL", "WINDOW_64"],
         )
         self.assertEqual(
             [(e.sub_pool, e.state_type) for e in two.wire_entries()],
