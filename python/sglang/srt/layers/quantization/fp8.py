@@ -598,8 +598,6 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
-        # Set once the block-FP8 weights are final (process_weights_after_loading_block_quant).
-        self.small_m_w8a16 = False
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -776,6 +774,8 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # Per layer, not on self: a DCP q_b_proj replica shares this method.
+        layer.small_m_w8a16 = False
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
@@ -980,7 +980,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
 
-        self.small_m_w8a16 = fp8_small_m_eligible(
+        layer.small_m_w8a16 = fp8_small_m_eligible(
             layer=layer, weight_block_size=self.weight_block_size
         )
 
@@ -1459,7 +1459,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
-            if self.small_m_w8a16 and not isinstance(x, tuple):
+            if layer.small_m_w8a16 and bias is None and not isinstance(x, tuple):
                 small_m_out = fp8_small_m_linear(layer, x)
                 if small_m_out is not None:
                     return small_m_out

@@ -241,7 +241,6 @@ def fp8_projection(cuda_device, monkeypatch):
             _, weight, scales, _ = _fp8_case(1, 144, 640, "fp32")
             self.weight = torch.nn.Parameter(weight, requires_grad=False)
             self.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
-            self.bias = None
             self.quant_method = method
 
     return Projection()
@@ -264,7 +263,6 @@ def _fp8_projection_reference(layer, x):
         "sm100",
         "sm107",
         "sm120",
-        "bias",
         "deterministic",
         "block32",
         "bad_scales",
@@ -285,8 +283,6 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
         monkeypatch.setattr(dispatch, "_FP8_SMALL_M_SHAPES", frozenset())
     elif case in ("sm90", "sm100", "sm107", "sm120"):
         monkeypatch.setattr(dispatch, "_DEVICE_SM", int(case[2:]))
-    elif case == "bias":
-        fp8_projection.bias = torch.ones(144, device="cuda")
     elif case == "deterministic":
         monkeypatch.setattr(
             runtime_context,
@@ -331,9 +327,8 @@ def test_fp8_small_m_linear_declines(fp8_projection, case):
 @pytest.mark.usefixtures("cuda_sm10x")
 def test_fp8_small_m_apply_after_weight_loading(fp8_projection):
     method = fp8_projection.quant_method
-    assert not method.small_m_w8a16
     method.process_weights_after_loading_block_quant(fp8_projection)
-    assert method.small_m_w8a16
+    assert fp8_projection.small_m_w8a16
     x = torch.randn((3, 640), device="cuda", dtype=torch.bfloat16)
     torch.testing.assert_close(
         method.apply(fp8_projection, x),
@@ -341,6 +336,25 @@ def test_fp8_small_m_apply_after_weight_loading(fp8_projection):
         rtol=1e-2,
         atol=1e-3,
     )
+    # The kernel has no bias epilogue, so a call with a bias keeps the W8A8 path.
+    w8a8_out = object()
+    method.w8a8_block_fp8_linear = lambda **kw: w8a8_out
+    bias = torch.ones(144, device="cuda")
+    assert method.apply(fp8_projection, x, bias=bias) is w8a8_out
+
+
+@pytest.mark.usefixtures("cuda_sm10x")
+def test_fp8_small_m_flag_is_per_layer(fp8_projection):
+    """Loading a bias-less module that shares the quant method (the DCP q_b_proj
+    replica) must not raise or change the original layer's flag."""
+    method = fp8_projection.quant_method
+    method.process_weights_after_loading_block_quant(fp8_projection)
+    _, weight, scales, _ = _fp8_case(1, 288, 640, "fp32")
+    replica = torch.nn.Module()
+    replica.weight = torch.nn.Parameter(weight, requires_grad=False)
+    replica.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
+    method.process_weights_after_loading_block_quant(replica)
+    assert fp8_projection.small_m_w8a16 and not replica.small_m_w8a16
 
 
 if __name__ == "__main__":

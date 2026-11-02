@@ -78,12 +78,7 @@ def fused_a_gemm_weight_eligible(
 
 def fp8_small_m_eligible(layer: torch.nn.Module, weight_block_size: list[int]) -> bool:
     # SM10x only (SM100, SM103, SM107), where the kernel is validated; MXFP8-view layers have 32-wide K blocks.
-    if (
-        not _IS_CUDA
-        or _DEVICE_SM // 10 != 10
-        or weight_block_size != [128, 128]
-        or layer.bias is not None
-    ):
+    if not _IS_CUDA or _DEVICE_SM // 10 != 10 or weight_block_size != [128, 128]:
         return False
     from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
     from sglang.srt.runtime_context import get_exec
