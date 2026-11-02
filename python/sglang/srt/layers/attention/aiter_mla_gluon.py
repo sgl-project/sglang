@@ -60,6 +60,11 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
     )
 
 
+def mla_gluon_available() -> bool:
+    """Whether aiter's Gluon MLA decode can run here; _gluon_fn logs why not."""
+    return _gluon_fn() is not None
+
+
 def prefer_mla_gluon_decode(
     *, head_pad_mode: str, num_head: int, kv_cache_dtype: torch.dtype
 ) -> bool:

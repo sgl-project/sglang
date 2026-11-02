@@ -445,5 +445,34 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         self.assertFalse(be._use_mla_decode_persist_metadata())
 
 
+class TestMlaDcpDecodeRoute(CustomTestCase):
+    """The asm DCP decode casts the gathered query to fp8 and passes the KV cache's
+    fp8 scale. Over a bf16 cache there is no scale, aiter rejected the call ("fp8 Q
+    requires q_scale and kv_scale"), and a DCP server with the default KV dtype
+    failed at startup. Such caches decode on Gluon."""
+
+    def _selected(self, **overrides):
+        from sglang.srt.layers.attention.aiter_backend import _mla_dcp_asm_selected
+
+        kwargs = dict(
+            use_mla=True,
+            dcp_world_size=2,
+            decode_backend="asm",
+            kv_cache_dtype=fp8_dtype,
+        )
+        kwargs.update(overrides)
+        return _mla_dcp_asm_selected(**kwargs)
+
+    def test_fp8_cache_takes_the_asm_decode(self):
+        self.assertTrue(self._selected())
+
+    def test_bf16_cache_decodes_on_gluon(self):
+        self.assertFalse(self._selected(kv_cache_dtype=torch.bfloat16))
+
+    def test_dcp1_and_the_gluon_backend_skip_the_asm_decode(self):
+        self.assertFalse(self._selected(dcp_world_size=1))
+        self.assertFalse(self._selected(decode_backend="gluon"))
+
+
 if __name__ == "__main__":
     unittest.main()
