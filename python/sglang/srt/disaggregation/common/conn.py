@@ -56,6 +56,7 @@ from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_memory,
     get_observability,
     get_parallel,
     get_schedule,
@@ -133,6 +134,7 @@ class PrefillServerInfo:
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
+    stores_to_linker: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -159,6 +161,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.stores_to_linker = bool(self.stores_to_linker)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -1637,6 +1640,7 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
+            "stores_to_linker": get_memory().enable_unified_cache_external_linker,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -2097,7 +2101,9 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k
+                for k in self.connection_pool
+                if k.startswith(f"{failed_bootstrap_addr}_")
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
@@ -3072,6 +3078,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
+        self.stores_to_linker: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3084,6 +3091,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3197,6 +3206,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_kv_cache_sharding", False)
             )
 
+        if self.stores_to_linker is None:
+            self.stores_to_linker = bool(data.get("stores_to_linker", False))
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -3264,6 +3276,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
+                stores_to_linker=bool(self.stores_to_linker),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
@@ -3364,8 +3377,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            if self._loop is not None:
+                if self._runner is not None:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                self._loop.close()
 
     def close(self):
         """Shutdown"""

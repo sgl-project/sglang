@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -693,6 +694,19 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def _linker_offload_skip_prefix(self, req: Req, token_ids):
+        # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
+        # Convert the request's raw-token skip boundary to page-aligned radix-key units.
+        if self.linker is None:
+            return nullcontext()
+        skip_key = RadixKey(
+            token_ids[: req.linker_offload_skip_prefix_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        return self.linker.skip_offload_prefix(len(skip_key))
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
@@ -1366,7 +1380,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if reuse_existing_mamba:
             insert_params.allow_missing_mamba = True
         try:
-            result = self.insert(insert_params)
+            with self._linker_offload_skip_prefix(req, token_ids):
+                result = self.insert(insert_params)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False

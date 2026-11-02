@@ -2146,22 +2146,12 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
             )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if process_last_batch_early:
                 pop_and_process()
-                # Opportunistic flush at the disable_overlap sync boundary:
+                # Opportunistic flush at the early-processing sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
                 if self.enable_unified_memory:
@@ -2169,6 +2159,14 @@ class Scheduler(
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
                         pass
+
+            # Get the next batch to run
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
 
             # Launch the current batch
             if batch:
@@ -2182,7 +2180,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2199,43 +2197,26 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
-    def is_disable_overlap_for_batch(
-        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    def should_process_last_batch_early(
+        self, last_batch: Optional[ScheduleBatch]
     ) -> bool:
-        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
-        # This might slightly hurt the throughput, so we use an environment variable to control it.
-        # In DP attention mode, use the globally synchronized is_extend_in_batch
-        # so all DP ranks make the same overlap decision (avoiding deadlock).
-        # In non-DP mode, use the local forward_mode directly.
-        if self.require_mlp_sync:
-            is_extend = lambda b: b and b.is_extend_in_batch
-        else:
-            is_extend = lambda b: b and b.forward_mode.is_extend()
+        """Whether to process the last result before scheduling the next batch,
+        not after launching it, so the requests it finishes are never launched."""
+        if last_batch is None:
+            return False
 
-        batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(last_batch)
+        # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
+        # synced, so all ranks decide the same (no deadlock).
+        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get():
+            if self.require_mlp_sync:
+                last_batch_is_extend = last_batch.is_extend_in_batch
+            else:
+                last_batch_is_extend = last_batch.forward_mode.is_extend()
+            if last_batch_is_extend:
+                return True
 
-        disable_overlap_for_batch = (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch_is_extend
-            and last_batch_is_extend
-        )
-
-        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
-        # path for host-draft algorithms, not a pending migration.
-        need_grammar_sync = (
-            batch
-            and not batch.spec_algorithm.is_none()
-            and batch.grammar_needs_sync()
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
-
-        # Algorithms that support grammar overlap advance the FSM inside verify()
-        # via the grammar barrier (overlapping the target forward), which resolves
-        # whatever result is still pending in the queue — including the
-        # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        # The next batch's grammar bitmask needs this result's FSM advance.
+        return last_batch.grammar_needs_sync()
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -4784,12 +4765,37 @@ class Scheduler(
 
     def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
         """Launching a request's last prefill chunk starts it running. A row of a
-        mixed or DP-converted step that is running already stays; one a result
-        processed just before this launch finished does not join."""
+        mixed or DP-converted step that is running already stays."""
         if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
-            self.running_reqs.join(
-                r for r in batch.reqs if r is not batch.chunked_req and not r.finished()
-            )
+            self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
+
+    def _on_step_launch(self, batch: ScheduleBatch) -> None:
+        """The bookkeeping of every step launch, before its forward is issued."""
+        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_run_batch(batch)
+
+        # Whether to run the profiler; a capture it starts here covers this step.
+        self.profiler_manager._profile_batch_predicate(batch)
+        batch.add_inflight_step()
+        self._join_launched_reqs(batch)
+
+    def _on_step_processed(self, batch: ScheduleBatch) -> None:
+        """The bookkeeping of every step once its result is processed."""
+        self.invariant_checker.maybe_check_batch_consistency(batch)
+        batch.drop_inflight_step()
+        # Running requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -4973,22 +4979,8 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
-        self.forward_ct += 1
-        batch.forward_iter = self.forward_ct
-        batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
-        self._sched_idled = False
+        self._on_step_launch(batch)
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
-            self.processed_tokens_counter += batch.extend_num_tokens
-
-        if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.on_run_batch(batch)
-
-        # Whether to run the profiler
-        self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -4996,8 +4988,6 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
-
-        self._join_launched_reqs(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -5482,8 +5472,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-        # Running requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
+        self._on_step_processed(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
