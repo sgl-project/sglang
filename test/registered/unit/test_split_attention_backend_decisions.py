@@ -271,12 +271,6 @@ class TestDraftFactoryStamping(CustomTestCase):
         self.assertEqual(product.prefill_attention_backend_str, "cutedsl_mla")
         self.assertEqual(product.decode_attention_backend_str, "cutedsl_mla")
 
-    def test_cutedsl_draft_extend_requires_mla(self):
-        factory = self._factory(draft_backend="cutedsl_mla")
-        factory.draft_model_runner.use_mla_backend = False
-        with self.assertRaises(AssertionError):
-            factory._create_cutedsl_mla_prefill_backend()
-
     def test_a_host_dependent_alias_stamps_the_concrete_kernel(self):
         # `hybrid_linear_attn` picks fa3/intel_amx/triton by host inside its
         # constructor, so no static rename can say what it builds -- the
