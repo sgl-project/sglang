@@ -39,7 +39,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
@@ -1727,7 +1728,11 @@ class TritonAttnBackend(AttentionBackend):
                     # For MLA, scale K manually before storing since MLATokenToKVPool
                     # doesn't accept scale parameters. Clone to protect k from mutation
                     # since it's used later in the attention kernel.
-                    k_scaled = k.clone().div_(layer.k_scale)
+                    k_scaled = (
+                        k
+                        if layer.k_scale_float == 1.0
+                        else k.clone().div_(layer.k_scale)
+                    )
                     self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         loc_info,
@@ -2326,7 +2331,7 @@ class TritonAttnBackend(AttentionBackend):
                     f"entries for {forward_batch.out_cache_loc.shape[0]} tokens"
                 )
             if self.use_mla:
-                if layer.k_scale is not None:
+                if layer.k_scale is not None and layer.k_scale_float != 1.0:
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
