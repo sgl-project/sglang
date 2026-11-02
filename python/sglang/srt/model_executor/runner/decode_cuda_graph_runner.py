@@ -272,6 +272,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
+    _padded_glue = False
     _metadata_prep_fork: Optional[tuple] = None
     _metadata_prep_fork_resolved = False
     _early_verify_metadata = None
@@ -605,6 +606,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.device, strict=envs.SGLANG_IS_IN_CI.get()
             )
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
+        self._padded_glue = (
+            self._draft_metadata_glue or self._target_metadata_glue
+        ) and not self.ragged_verify_mode
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
         self._early_verify_metadata: Optional[EarlyVerifyMetadata] = (
@@ -1717,7 +1721,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         glue_route = (
             self._metadata_glue is not None
             and not self._metadata_glue.disabled
-            and raw_bs == bs
+            and (raw_bs == bs or (self._padded_glue and 0 < raw_bs < bs))
             and not self.enable_two_batch_overlap
             and self.model_runner.lora_manager is None
         )
@@ -1775,7 +1779,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 cast(ForwardBatch, fb_view)
             )
         if glue_key is not None:
-            self._glue_draft_inputs(fb_view)
+            self._glue_draft_inputs(fb_view, num_tokens)
             with self._prep_attention_variant(attention_variant):
                 self._metadata_glue.run(attn_backend, fb_view, glue_key)
         else:
@@ -1942,14 +1946,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 glue.eager,
             )
 
-    def _glue_draft_inputs(self, fb_view) -> None:
+    def _glue_draft_inputs(self, fb_view, num_tokens: int) -> None:
         """The draft glue graph reads its inputs by address: out_cache_loc from the
-        registry slot fill_from just wrote, not the step's own (fresh) tensor."""
+        registry slot fill_from just wrote, not the step's own (fresh) tensor. A
+        padded replay reads the whole padded slot (fill_from zeroed its tail)."""
         if (
             self._draft_metadata_glue or self._target_metadata_glue
         ) and fb_view.out_cache_loc is not None:
-            n = fb_view.out_cache_loc.shape[0]
-            fb_view.out_cache_loc = self.buffers.out_cache_loc[:n]
+            fb_view.out_cache_loc = self.buffers.out_cache_loc[:num_tokens]
 
     def execute(
         self,
