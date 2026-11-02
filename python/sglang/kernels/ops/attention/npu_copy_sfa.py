@@ -46,8 +46,9 @@ def fused_scatter_copy_sparse_flash_attention(
     Query tensors use contiguous TND ``[T, H, 512|64]`` and request-level
     cumulative query lengths. The default mode retains the native sparse-plus-
     tail contract. ``full_visible=True`` selects exactly K=2048 resident slots
-    without appending a tail; Q4 supports C=12288 and a request union miss list
-    with up to 32768 entries. Native host validation checks the remaining
+    without appending a tail, with a request union miss list of up to 32768
+    entries. The query width comes from cumulative query lengths.
+    Native host validation checks the remaining
     metadata, layout and device contract without reading device scalar values.
     ``resident_refresh_tail=True`` enables source-aware overlap for native LIM
     plans whose rewritten-resident entries form a suffix of at most Q items.

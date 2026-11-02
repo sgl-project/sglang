@@ -32,20 +32,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
-def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
-    """Require every live row to have enough tokens to populate its cache.
-
-    C defaults to K=2048. Larger native LIM caches use host gather until C
-    visible tokens exist, so those batches must also stay outside this graph.
-    """
-    if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
-        return True
-    capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or 2048
-    return seq_lens_cpu is not None and not any(
-        0 < int(length) < capacity for length in seq_lens_cpu.tolist()
-    )
-
-
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
@@ -56,19 +42,7 @@ def is_sparsity_driven_kv_offload_enabled(
     # pool even though the process inherits the target's environment flags.
     if is_draft_worker:
         return False
-    indexer_impl = get_sparse_kv_indexer_impl()
-    if (
-        envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
-        and not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-    ):
-        raise ValueError(
-            "SGLANG_NPU_ENABLE_COPY_SFA requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD."
-        )
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
-        if indexer_impl != "legacy":
-            raise ValueError(
-                "LIM/reference indexer requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1."
-            )
         return False
 
     prefill_attention_backend, decode_attention_backend = attention_backends()
@@ -90,17 +64,14 @@ def is_sparsity_driven_kv_offload_enabled(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
             "to be set to bound the per-process host KV allocation."
         )
-    if indexer_impl != "legacy":
-        if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
-            raise ValueError(
-                "LIM/reference integration requires model index_topk=2048."
-            )
-        if get_schedule().page_size != 128:
-            raise ValueError("LIM/reference integration requires --page-size 128.")
-        if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
-            raise ValueError(
-                "LIM/reference integration currently requires PP=1 and DCP disabled."
-            )
+    if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
+        raise ValueError("Native LIM integration requires model index_topk=2048.")
+    if get_schedule().page_size != 128:
+        raise ValueError("Native LIM integration requires --page-size 128.")
+    if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
+        raise ValueError(
+            "Native LIM integration currently requires PP=1 and DCP disabled."
+        )
     algorithm = (get_spec().speculative_algorithm or "NONE").upper()
     if algorithm != "NONE" and (
         algorithm not in ("EAGLE", "NEXTN")
@@ -115,14 +86,18 @@ def is_sparsity_driven_kv_offload_enabled(
     return True
 
 
-def get_sparse_kv_indexer_impl() -> str:
-    value = envs.SGLANG_NPU_SPARSE_KV_INDEXER.get()
-    if value not in ("legacy", "li_reference", "lim"):
+def get_sparse_kv_max_query_width() -> int:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
+        MAX_QUERY_WIDTH,
+    )
+
+    spec = get_spec()
+    width = int(spec.speculative_num_draft_tokens or 1)
+    if not 1 <= width <= MAX_QUERY_WIDTH:
         raise ValueError(
-            "SGLANG_NPU_SPARSE_KV_INDEXER must be legacy, li_reference or lim; "
-            f"got {value!r}."
+            f"Native LIM supports chain query widths 1..{MAX_QUERY_WIDTH}."
         )
-    return value
+    return width
 
 
 def get_sparsity_driven_kv_offload_sparse_context_len(
@@ -205,13 +180,8 @@ def get_sparse_kv_budget(
         kv_bytes_per_token=kv_bytes_per_token,
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
-        indexer_impl=get_sparse_kv_indexer_impl(),
-        copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
+        max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        mtp_full_visible=(
-            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
-            or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
-        ),
         device_tail_tokens=256 if envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() else 0,
         graph_batch_capacity=sparse_batch_capacity(
             request_rows,

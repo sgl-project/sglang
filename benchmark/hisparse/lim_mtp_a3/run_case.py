@@ -57,7 +57,6 @@ SAFE_ENV_KEYS = (
     "MTP",
     "GRAPH",
     "OUTPUT_TOKENS",
-    "SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE",
     "SGLANG_ENABLE_ASYNC_ASSERT",
     "SGLANG_SOURCE_ROOT",
     "MODEL_PATH",
@@ -83,9 +82,7 @@ SAFE_ENV_KEYS = (
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM",
     "SGLANG_NPU_PROFILING",
     "TRANSFORMERS_VERBOSITY",
-    "SGLANG_NPU_SPARSE_KV_INDEXER",
     "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD",
-    "SGLANG_NPU_ENABLE_COPY_SFA",
     "SGLANG_NPU_SPARSE_KV_CACHE_SIZE",
     "DEEPEP_HYBRID_DEPLOYMENT",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND",
@@ -242,13 +239,8 @@ def predicted_launcher_env_snapshot(
             "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
             "SGLANG_NPU_PROFILING": "0",
             "TRANSFORMERS_VERBOSITY": "error",
-            "SGLANG_NPU_SPARSE_KV_INDEXER": "lim" if case["offload"] else "legacy",
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": str(case["offload"]),
-            "SGLANG_NPU_ENABLE_COPY_SFA": str(case["copy_sfa"]),
             "SGLANG_NPU_SPARSE_KV_CACHE_SIZE": "12288",
-            "SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE": str(
-                int(bool(mtp and case["offload"]))
-            ),
             "SGLANG_ENABLE_ASYNC_ASSERT": env["SGLANG_ENABLE_ASYNC_ASSERT"],
             "DEEPEP_HYBRID_DEPLOYMENT": "1",
             "DEEPEP_NORMAL_LONG_SEQ_ROUND": "72",
@@ -400,7 +392,6 @@ def launch_env(
     mtp: bool,
     port: int,
 ) -> dict[str, str]:
-    case = ACTIVE_CASES[case_id]
     env = os.environ.copy()
     env.update(
         CASE_ID=case_id,
@@ -414,9 +405,6 @@ def launch_env(
         MTP="1" if mtp else "0",
         GRAPH="1",
         OUTPUT_TOKENS=str(FORMAL_OUTPUT_TOKENS),
-        SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE=(
-            "1" if mtp and case["offload"] else "0"
-        ),
         SGLANG_ENABLE_ASYNC_ASSERT=str(args.async_assert),
     )
     return env

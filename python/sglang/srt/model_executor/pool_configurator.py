@@ -293,22 +293,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * torch._utils._element_size(kvc.kv_cache_dtype),
                 )
                 budget = get_sparse_kv_budget(num_layers=num_layers, **budget_options)
-                reservation = budget.managed_hbm_bytes
-                if (
-                    envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() == 0
-                    and envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() > 0
-                ):
-                    # Final admission capacity may be smaller than the configured
-                    # maximum; auto-sizing can then use more of the byte budget.
-                    reservation = (
-                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
-                    )
-                self._fixed_overhead_bytes += reservation
-                if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
-                    # One FP32 dequant-scale workspace shared across indexer
-                    # layers, with a row for every physical indexer token.
-                    self._cell_size += 4
-                    self._fixed_overhead_bytes += 4 * get_schedule().page_size
+                self._fixed_overhead_bytes += budget.managed_hbm_bytes
+                # One FP32 dequant-scale workspace shared across indexer
+                # layers, with a row for every physical indexer token.
+                self._cell_size += 4
+                self._fixed_overhead_bytes += 4 * get_schedule().page_size
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -377,9 +366,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             * draft_loc_space_scale
                             * dcp_size
                         )
-                        self._cell_size += draft_kv_size + draft_indexer_size
-                    else:
-                        self._cell_size += draft_kv_size + draft_indexer_size
+                    self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     draft_kv_size = int(
                         self._cell_size * draft_num_layers / int(num_layers)

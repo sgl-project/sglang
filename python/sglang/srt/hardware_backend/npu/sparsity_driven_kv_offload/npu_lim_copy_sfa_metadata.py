@@ -38,6 +38,7 @@ def _lim_copy_sfa_metadata_kernel(
     HOST_S0: tl.constexpr,
     HOST_S1: tl.constexpr,
     TAIL_MODE: tl.constexpr,
+    FULL_VISIBLE: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -48,7 +49,7 @@ def _lim_copy_sfa_metadata_kernel(
     is_sparse = tl.load(sparse_rows_ptr + row_id) != 0
     request_slot = tl.load(request_slots_ptr + row_id).to(tl.int32)
     active = is_valid & is_sparse
-    base_request = tl.where(active, request_slot, 0).to(tl.int32)
+    base_request = tl.where(is_valid, request_slot, 0).to(tl.int32)
 
     col = tile_id * BLOCK + tl.arange(0, BLOCK).to(tl.int32)
     if tile_id * BLOCK < K:
@@ -66,7 +67,7 @@ def _lim_copy_sfa_metadata_kernel(
         if TAIL_MODE:
             prefix = tl.maximum(tl.load(next_prefix_ptr + row_id), 0)
             hbm_values = base_request * HBM_PAGES + tl.where(
-                col < C // 128,
+                (col < C // 128) | ~is_sparse,
                 col,
                 C // 128 + (prefix // 128 + col - C // 128) % 2,
             )
@@ -84,7 +85,7 @@ def _lim_copy_sfa_metadata_kernel(
                 mask=col < HOST_COLS,
                 other=0,
             ).to(tl.int32)
-            dram_values = tl.where(active, pages, 0)
+            dram_values = tl.where(is_valid, pages, 0)
         else:
             dram_values = base_request * DRAM_PAGES + col
         tl.store(
@@ -98,16 +99,14 @@ def _lim_copy_sfa_metadata_kernel(
             tl.store(topk_misses_ptr + row_id * Q + route, 0, mask=~active)
         tl.store(miss_counts_ptr + row_id, 0, mask=~active)
         cache_length = tl.where(active, C, 0).to(tl.int32)
-        logical_length = C + Q - 1
+        seq_len = tl.load(tail_seq_lens_ptr + row_id)
+        sparse_length = C + Q - 1
         if TAIL_MODE:
-            logical_length = (
-                C
-                + tl.load(tail_seq_lens_ptr + row_id)
-                - tl.load(next_prefix_ptr + row_id)
-            )
+            sparse_length = C + seq_len - tl.load(next_prefix_ptr + row_id)
+        logical_length = tl.where(is_sparse, sparse_length, seq_len)
         tl.store(
             actual_seq_lengths_kv_ptr + row_id,
-            tl.where(active, logical_length, 0).to(tl.int32),
+            tl.where(is_valid, logical_length, 0).to(tl.int32),
         )
         tl.store(num_cache_tokens_ptr + row_id, cache_length)
         tl.store(
@@ -166,6 +165,7 @@ def fused_lim_copy_sfa_metadata(
     host_block_table: torch.Tensor | None = None,
     tail_seq_lens: torch.Tensor | None = None,
     tail_tokens: int = 0,
+    full_visible: bool = True,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -174,8 +174,8 @@ def fused_lim_copy_sfa_metadata(
     request rows are reset to -1 across all their query rows.
     The miss source/slot buffers and all KV payloads are deliberately untouched.
     """
-    if query_width not in (1, 4):
-        raise ValueError("query_width must be 1 or 4.")
+    if not 1 <= query_width <= 14:
+        raise ValueError("query_width must be in [1,14].")
     if not isinstance(capacity, int) or not 2048 <= capacity <= 32640:
         raise ValueError("capacity must be an integer in [2048, 32640].")
     if capacity % 128:
@@ -232,8 +232,7 @@ def fused_lim_copy_sfa_metadata(
     if tail_tokens not in (0, 256):
         raise ValueError("tail_tokens must be0 or256")
     if tail_seq_lens is not None and (
-        tail_tokens != 256
-        or tail_seq_lens.shape != (batch,)
+        tail_seq_lens.shape != (batch,)
         or tail_seq_lens.dtype != torch.int32
         or tail_seq_lens.device != source_ids.device
         or not tail_seq_lens.is_contiguous()
@@ -292,6 +291,11 @@ def fused_lim_copy_sfa_metadata(
     _validate_tensor("valid_rows", valid_rows, dtype=torch.bool, device=device)
     _validate_tensor("sparse_rows", sparse_rows, dtype=torch.bool, device=device)
 
+    if tail_seq_lens is None:
+        raise ValueError("Real sequence lengths are required for dense short rows.")
+    if not full_visible and tail_tokens != 256:
+        raise ValueError("Prefix/tail attention requires 256 HBM tail tokens.")
+
     hbm_pages = (capacity + tail_tokens) // 128
     dram_pages = host_context_len // 128
     tiles = triton.cdiv(max(2048, hbm_pages, dram_pages), 2048)
@@ -324,7 +328,8 @@ def fused_lim_copy_sfa_metadata(
         host_block_table.shape[1] if host_block_table is not None else 0,
         host_block_table.stride(0) if host_block_table is not None else 0,
         host_block_table.stride(1) if host_block_table is not None else 0,
-        tail_seq_lens is not None,
+        not full_visible,
+        full_visible,
     )
 
 

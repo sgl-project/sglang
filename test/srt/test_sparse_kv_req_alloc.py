@@ -1,6 +1,6 @@
 from array import array
+from types import SimpleNamespace
 
-import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
@@ -29,23 +29,21 @@ def make_pool(size: int = 4) -> ReqToTokenPool:
     )
 
 
-def install_sparse_reset(pool: ReqToTokenPool, copy_sfa_enabled: bool):
+def install_sparse_reset(pool: ReqToTokenPool):
     manager = SparseKVCacheManager.__new__(SparseKVCacheManager)
     manager.device = "cpu"
     manager.layer_num = 2
-    manager.use_lru = False
-    manager.lim_adapter = None
-    manager.copy_sfa_enabled = copy_sfa_enabled
+    manager.lim_adapter = SimpleNamespace(reset_requests=lambda slots: None)
     manager.device_slot_map = [torch.full((pool._alloc_size, 2), 7) for _ in range(2)]
-    manager.device_slot_owner = [torch.full((pool._alloc_size, 2), 9) for _ in range(2)]
+    manager.resident_begin = torch.full((2, pool._alloc_size), 9)
+    manager.resident_end = torch.full_like(manager.resident_begin, 17)
     manager._install_req_alloc_hook(pool)
     return manager
 
 
-@pytest.mark.parametrize("copy_sfa_enabled", [False, True])
-def test_fresh_req_allocation_resets_only_new_sparse_rows(copy_sfa_enabled: bool):
+def test_fresh_req_allocation_resets_only_new_sparse_rows():
     pool = make_pool()
-    manager = install_sparse_reset(pool, copy_sfa_enabled)
+    manager = install_sparse_reset(pool)
     req = make_req("fresh")
 
     req_ids = pool.alloc([req])
@@ -57,25 +55,18 @@ def test_fresh_req_allocation_resets_only_new_sparse_rows(copy_sfa_enabled: bool
             manager.device_slot_map[layer_idx][row], torch.tensor([-1, -1])
         )
         assert torch.equal(manager.device_slot_map[layer_idx][0], torch.tensor([7, 7]))
-        if copy_sfa_enabled:
-            assert torch.equal(
-                manager.device_slot_owner[layer_idx][row], torch.tensor([-1, -1])
-            )
-        else:
-            assert torch.equal(
-                manager.device_slot_owner[layer_idx][row], torch.tensor([9, 9])
-            )
+        assert torch.equal(manager.resident_begin[layer_idx][row], torch.tensor(-1))
 
 
 def test_chunk_continuation_reuses_dirty_sparse_row_without_reset():
     pool = make_pool()
-    manager = install_sparse_reset(pool, copy_sfa_enabled=True)
+    manager = install_sparse_reset(pool)
     req = make_req("continuation")
     req_id = pool.alloc([req])[0]
     req.kv.kv_allocated_len = 1
     for layer_idx in range(manager.layer_num):
         manager.device_slot_map[layer_idx][req_id] = torch.tensor([3, 4])
-        manager.device_slot_owner[layer_idx][req_id] = torch.tensor([5, 6])
+        manager.resident_begin[layer_idx][req_id] = torch.tensor(5)
 
     assert pool.alloc([req]) == [req_id]
 
@@ -83,21 +74,19 @@ def test_chunk_continuation_reuses_dirty_sparse_row_without_reset():
         assert torch.equal(
             manager.device_slot_map[layer_idx][req_id], torch.tensor([3, 4])
         )
-        assert torch.equal(
-            manager.device_slot_owner[layer_idx][req_id], torch.tensor([5, 6])
-        )
+        assert torch.equal(manager.resident_begin[layer_idx][req_id], torch.tensor(5))
 
 
 def test_mixed_reuse_and_fresh_allocation_resets_only_fresh_row():
     pool = make_pool()
-    manager = install_sparse_reset(pool, copy_sfa_enabled=True)
+    manager = install_sparse_reset(pool)
     continuation = make_req("continuation")
     continuation_id = pool.alloc([continuation])[0]
     continuation.kv.kv_allocated_len = 1
     fresh = make_req("fresh")
     for layer_idx in range(manager.layer_num):
         manager.device_slot_map[layer_idx][continuation_id] = torch.tensor([3, 4])
-        manager.device_slot_owner[layer_idx][continuation_id] = torch.tensor([5, 6])
+        manager.resident_begin[layer_idx][continuation_id] = torch.tensor(5)
 
     req_ids = pool.alloc([continuation, fresh])
 
@@ -108,24 +97,24 @@ def test_mixed_reuse_and_fresh_allocation_resets_only_fresh_row():
             manager.device_slot_map[layer_idx][continuation_id], torch.tensor([3, 4])
         )
         assert torch.equal(
-            manager.device_slot_owner[layer_idx][continuation_id], torch.tensor([5, 6])
+            manager.resident_begin[layer_idx][continuation_id], torch.tensor(5)
         )
         assert torch.equal(
             manager.device_slot_map[layer_idx][fresh_id], torch.tensor([-1, -1])
         )
         assert torch.equal(
-            manager.device_slot_owner[layer_idx][fresh_id], torch.tensor([-1, -1])
+            manager.resident_begin[layer_idx][fresh_id], torch.tensor(-1)
         )
 
 
 def test_failed_allocation_does_not_reset_sparse_rows():
     pool = make_pool(size=1)
-    manager = install_sparse_reset(pool, copy_sfa_enabled=True)
+    manager = install_sparse_reset(pool)
     allocated = make_req("allocated")
     allocated_id = pool.alloc([allocated])[0]
     for layer_idx in range(manager.layer_num):
         manager.device_slot_map[layer_idx][allocated_id] = torch.tensor([3, 4])
-        manager.device_slot_owner[layer_idx][allocated_id] = torch.tensor([5, 6])
+        manager.resident_begin[layer_idx][allocated_id] = torch.tensor(5)
 
     assert pool.alloc([make_req("first"), make_req("second")]) is None
 
@@ -134,18 +123,18 @@ def test_failed_allocation_does_not_reset_sparse_rows():
             manager.device_slot_map[layer_idx][allocated_id], torch.tensor([3, 4])
         )
         assert torch.equal(
-            manager.device_slot_owner[layer_idx][allocated_id], torch.tensor([5, 6])
+            manager.resident_begin[layer_idx][allocated_id], torch.tensor(5)
         )
 
 
 def test_reallocated_row_resets_stale_copy_sfa_owners():
     pool = make_pool(size=1)
-    manager = install_sparse_reset(pool, copy_sfa_enabled=True)
+    manager = install_sparse_reset(pool)
     previous = make_req("previous")
     previous_id = pool.alloc([previous])[0]
     for layer_idx in range(manager.layer_num):
         manager.device_slot_map[layer_idx][previous_id] = torch.tensor([3, 4])
-        manager.device_slot_owner[layer_idx][previous_id] = torch.tensor([5, 6])
+        manager.resident_begin[layer_idx][previous_id] = torch.tensor(5)
     pool.free(previous)
 
     current = make_req("current")
@@ -157,5 +146,5 @@ def test_reallocated_row_resets_stale_copy_sfa_owners():
             manager.device_slot_map[layer_idx][current_id], torch.tensor([-1, -1])
         )
         assert torch.equal(
-            manager.device_slot_owner[layer_idx][current_id], torch.tensor([-1, -1])
+            manager.resident_begin[layer_idx][current_id], torch.tensor(-1)
         )

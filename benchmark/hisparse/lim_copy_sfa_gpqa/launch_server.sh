@@ -32,13 +32,9 @@ export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export TORCHINDUCTOR_CACHE_DIR=/task/cache/inductor
 export TRITON_CACHE_DIR=/task/cache/triton
 export SGLANG_NPU_SPARSE_KV_CACHE_SIZE=2048
-export SGLANG_NPU_SPARSE_KV_INDEXER=legacy
 export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=0
-export SGLANG_NPU_ENABLE_COPY_SFA=0
 if [ "$MODE" = lim_copy_sfa ]; then
-  export SGLANG_NPU_SPARSE_KV_INDEXER=lim
   export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
-  export SGLANG_NPU_ENABLE_COPY_SFA=1
 elif [ "$MODE" != baseline ]; then
   echo "Unknown mode: $MODE" >&2; exit 2
 fi

@@ -86,10 +86,8 @@ def test_separate_tail_manager_lifecycle(graph, async_checks, heads, capacity):
         num_layers=2,
         top_k=K,
         kv_bytes_per_token=1152,
-        indexer_impl="lim",
-        copy_sfa=True,
         copy_sfa_query_heads=heads,
-        mtp_full_visible=True,
+        max_query_width=Q,
         device_tail_tokens=256,
     )
     inputs = SimpleNamespace(
@@ -135,11 +133,7 @@ def test_separate_tail_manager_lifecycle(graph, async_checks, heads, capacity):
     try:
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.override(True))
-            stack.enter_context(envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True))
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
-            stack.enter_context(
-                envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.override(True)
-            )
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )
@@ -151,8 +145,8 @@ def test_separate_tail_manager_lifecycle(graph, async_checks, heads, capacity):
             )
             stack.enter_context(
                 patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_sparse_kv_indexer_impl",
-                    return_value="lim",
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_sparse_kv_max_query_width",
+                    return_value=Q,
                 )
             )
             stack.enter_context(
@@ -184,7 +178,7 @@ def test_separate_tail_manager_lifecycle(graph, async_checks, heads, capacity):
             )
 
             def run():
-                plan = manager.lim_adapter.select_mtp(
+                plan = manager.lim_adapter.select(
                     manager,
                     query=query,
                     weights=weights,

@@ -12,9 +12,7 @@ class TestDraftOffloadPolicy(unittest.TestCase):
     def test_draft_bypasses_target_validation(self):
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-            patch.object(
-                config, "get_sparse_kv_indexer_impl", side_effect=AssertionError
-            ),
+            patch.object(config, "attention_backends", side_effect=AssertionError),
         ):
             self.assertFalse(
                 config.is_sparsity_driven_kv_offload_enabled(
@@ -39,14 +37,19 @@ class TestDraftOffloadPolicy(unittest.TestCase):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             patch.object(config, "is_npu", return_value=True),
             patch.object(config, "is_deepseek_dsa", return_value=True),
-            patch.object(config, "get_sparse_kv_indexer_impl", return_value="legacy"),
+            patch.object(config, "get_dsa_index_topk", return_value=2048),
+            patch.object(
+                config,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=1, dcp_enabled=False),
+            ),
             patch.object(
                 config, "attention_backends", return_value=("ascend", "ascend")
             ),
             patch.object(
                 config,
                 "get_schedule",
-                return_value=SimpleNamespace(max_running_requests=16),
+                return_value=SimpleNamespace(max_running_requests=16, page_size=128),
             ),
             patch.object(
                 config,
@@ -65,7 +68,6 @@ class TestDraftOffloadPolicy(unittest.TestCase):
     def test_target_still_validates_unsupported_backend(self):
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
-            patch.object(config, "get_sparse_kv_indexer_impl", return_value="legacy"),
             patch.object(config, "attention_backends", return_value=("torch", "torch")),
         ):
             with self.assertRaisesRegex(ValueError, "Ascend MLA"):

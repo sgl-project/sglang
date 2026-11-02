@@ -86,10 +86,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
         num_layers=2,
         top_k=K,
         kv_bytes_per_token=1152,
-        indexer_impl="lim",
-        copy_sfa=True,
         copy_sfa_query_heads=heads,
-        mtp_full_visible=True,
+        max_query_width=Q,
     )
     inputs = SimpleNamespace(
         batch_size=batch,
@@ -133,11 +131,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
     spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=4)
     try:
         with ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True))
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
-            stack.enter_context(
-                envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.override(True)
-            )
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )
@@ -149,8 +143,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
             )
             stack.enter_context(
                 patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_sparse_kv_indexer_impl",
-                    return_value="lim",
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.get_sparse_kv_max_query_width",
+                    return_value=Q,
                 )
             )
             stack.enter_context(
@@ -182,7 +176,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, async_checks, heads, capa
             )
 
             def run():
-                plan = manager.lim_adapter.select_mtp(
+                plan = manager.lim_adapter.select(
                     manager,
                     query=query,
                     weights=weights,
@@ -357,7 +351,6 @@ def test_paged_host_overlap_move_real_npu():
     device_id = torch.npu.current_device()
     manager = SparseKVCacheManager.__new__(SparseKVCacheManager)
     manager.device = torch.device("npu", device_id)
-    manager.host_kv_is_paged = True
     manager.head_num, manager.head_dim = 1, 576
     manager.store_dtype = torch.bfloat16
     host, _, pointer = create_shm_tensor(
