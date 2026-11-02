@@ -1,3 +1,4 @@
+import contextlib
 import pickle
 import unittest
 from array import array
@@ -630,6 +631,134 @@ class TestMultiTokenizerMixin(CustomTestCase):
             worker.multi_http_worker_event_loop()
 
         self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
+
+
+class _FakeWatchdog:
+    def disable(self):
+        return contextlib.nullcontext()
+
+    def feed(self):
+        pass
+
+
+def _make_processing_histogram(registry):
+    from prometheus_client import Histogram
+
+    return Histogram(
+        "sglang:detokenizer_processing_seconds",
+        "Time spent handling one received message in the detokenizer.",
+        buckets=(0.001, 0.01, 0.1, 1.0),
+        registry=registry,
+    )
+
+
+def _make_detokenizer_manager(processing_seconds):
+    from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+
+    manager = object.__new__(DetokenizerManager)
+    manager.soft_watchdog = _FakeWatchdog()
+    manager.processing_seconds = processing_seconds
+    manager.recv_from_scheduler = object()
+    manager.send_to_tokenizer = object()
+    manager._request_dispatcher = MagicMock(
+        return_value=SimpleNamespace(http_worker_ipcs=["ipc-a"])
+    )
+    return manager
+
+
+class TestDetokenizerProcessingMetrics(CustomTestCase):
+    def test_event_loop_records_one_observation_per_message(self):
+        from prometheus_client import CollectorRegistry
+
+        from sglang.srt.managers import detokenizer_manager
+
+        registry = CollectorRegistry()
+        manager = _make_detokenizer_manager(_make_processing_histogram(registry))
+        with (
+            patch.object(
+                detokenizer_manager,
+                "sock_recv",
+                side_effect=[object(), object(), EOFError("end of input")],
+            ),
+            patch.object(detokenizer_manager, "sock_send") as send,
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            manager.event_loop()
+
+        self.assertEqual(manager._request_dispatcher.call_count, 2)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(
+            registry.get_sample_value("sglang:detokenizer_processing_seconds_count"),
+            2.0,
+        )
+
+    def test_event_loop_records_observation_when_handling_raises(self):
+        from prometheus_client import CollectorRegistry
+
+        from sglang.srt.managers import detokenizer_manager
+
+        registry = CollectorRegistry()
+        manager = _make_detokenizer_manager(_make_processing_histogram(registry))
+        manager._request_dispatcher = MagicMock(
+            side_effect=RuntimeError("handler failed")
+        )
+        with (
+            patch.object(
+                detokenizer_manager, "sock_recv", side_effect=[object()]
+            ),
+            self.assertRaisesRegex(RuntimeError, "handler failed"),
+        ):
+            manager.event_loop()
+
+        self.assertEqual(
+            registry.get_sample_value("sglang:detokenizer_processing_seconds_count"),
+            1.0,
+        )
+
+    def test_event_loop_without_metrics_still_dispatches(self):
+        from sglang.srt.managers import detokenizer_manager
+
+        manager = _make_detokenizer_manager(None)
+        manager._request_dispatcher = MagicMock(return_value=None)
+        with (
+            patch.object(
+                detokenizer_manager,
+                "sock_recv",
+                side_effect=[object(), EOFError("end of input")],
+            ),
+            patch.object(detokenizer_manager, "sock_send") as send,
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            manager.event_loop()
+
+        self.assertEqual(manager._request_dispatcher.call_count, 1)
+        self.assertEqual(send.call_count, 0)
+
+    def test_multi_worker_loop_records_processing_time(self):
+        from prometheus_client import CollectorRegistry
+
+        from sglang.srt.managers import multi_tokenizer_mixin
+
+        registry = CollectorRegistry()
+        manager = _make_detokenizer_manager(_make_processing_histogram(registry))
+        with (
+            patch.object(
+                multi_tokenizer_mixin,
+                "sock_recv",
+                side_effect=[_make_batch_str_output(), EOFError("end of input")],
+            ),
+            patch.object(
+                multi_tokenizer_mixin, "_send_output_to_tokenizer_workers"
+            ) as fan_out,
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            manager.multi_http_worker_event_loop()
+
+        self.assertEqual(fan_out.call_count, 1)
+        self.assertEqual(
+            registry.get_sample_value("sglang:detokenizer_processing_seconds_count"),
+            1.0,
+        )
 
 
 if __name__ == "__main__":
