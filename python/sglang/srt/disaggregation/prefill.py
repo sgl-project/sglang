@@ -990,7 +990,10 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
-        if self.spec_algorithm.is_eagle() and draft_input is not None:
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and draft_input is not None
+        ):
             draft_hidden_states_cpu = draft_input.hidden_states.to(
                 "cpu", non_blocking=False
             )
@@ -1085,9 +1088,13 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and draft_input is not None:
+                if self.spec_algorithm.need_topk() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
+                else:
+                    req.output_topk_p = None
+                    req.output_topk_index = None
+                if draft_hidden_states_cpu is not None:
                     req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
                     if draft_dsa_topk_indices_cpu is not None:
                         req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[

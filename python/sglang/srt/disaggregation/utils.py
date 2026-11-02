@@ -742,28 +742,36 @@ class MetadataBuffers:
             self.output_token_sampling_logprobs[
                 req.metadata_buffer_index, : len(chunk.logprobs)
             ].copy_(torch.from_numpy(chunk.logprobs))
-        # For PD + spec decode
-        if req.hidden_states_tensor is not None:
-            # speculative_eagle_topk should not be greater than 16 currently
-            topk = req.output_topk_p.size(0)
+        # STANDALONE carries a top-k seed without target hidden states. Keep
+        # these fields independent, and clear reused rows before publishing
+        # bootstrap_room so an omitted field cannot inherit an older seed.
+        idx = req.metadata_buffer_index
+        self.output_topk_p[idx].zero_()
+        self.output_topk_index[idx].zero_()
+        if req.output_topk_p is not None or req.output_topk_index is not None:
+            if req.output_topk_p is None or req.output_topk_index is None:
+                raise ValueError(
+                    "PD draft seed requires both top-k probabilities and indices"
+                )
+            if (
+                req.output_topk_p.ndim != 1
+                or req.output_topk_index.shape != req.output_topk_p.shape
+                or not 0 < req.output_topk_p.shape[0] <= self.output_topk_p.shape[1]
+            ):
+                raise ValueError("PD draft seed exceeds or mismatches metadata capacity")
+            topk = req.output_topk_p.shape[0]
+            self.output_topk_p[idx, :topk].copy_(req.output_topk_p)
+            self.output_topk_index[idx, :topk].copy_(req.output_topk_index)
 
-            self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_p
-            )
-            self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_index
-            )
-            self.output_hidden_states[req.metadata_buffer_index].copy_(
-                req.hidden_states_tensor
-            )
-            if self.output_dsa_topk_indices is not None:
-                dsa_topk_indices = req.output_dsa_topk_indices
-                if dsa_topk_indices is not None:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
-                        dsa_topk_indices
-                    )
-                else:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
+        self.output_hidden_states[idx].zero_()
+        if req.hidden_states_tensor is not None:
+            self.output_hidden_states[idx].copy_(req.hidden_states_tensor)
+        if self.output_dsa_topk_indices is not None:
+            dsa_topk_indices = req.output_dsa_topk_indices
+            if req.hidden_states_tensor is not None and dsa_topk_indices is not None:
+                self.output_dsa_topk_indices[idx].copy_(dsa_topk_indices)
+            else:
+                self.output_dsa_topk_indices[idx].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
