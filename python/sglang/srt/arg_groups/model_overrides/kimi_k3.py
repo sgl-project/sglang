@@ -119,7 +119,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["dcp_replicate_q_proj"] = True
         return overrides
 
-    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
+    if not get_platform().is_sm100:
+        return {}
+    sm = get_platform().device_sm
+    if not (sm in (100, 103) or (sm == 107 and cfg.speculative_algorithm is None)):
         return {}
     backends_unset = is_attention_backend_not_set(cfg)
     if cfg.speculative_algorithm != "DSPARK":
@@ -127,7 +130,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             return {}
         logger.info(
             "Use trtllm_mla as the default prefill and decode attention "
-            "backend for Kimi-K3 on SM100/SM103."
+            "backend for Kimi-K3 on SM100/SM103/SM107."
         )
         return {
             "decode_attention_backend": "trtllm_mla",

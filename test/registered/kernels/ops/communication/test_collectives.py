@@ -11,11 +11,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention import attn_res
 from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
-from sglang.kernels.ops.communication import (
-    attn_res_collective,
-    gemm_ag,
-    sp_collective,
-)
+from sglang.kernels.ops.communication import attn_res_collective, gemm_ag, sp_collective
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
@@ -236,6 +232,46 @@ def test_gemm_all_gather():
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_gemm_all_gather_split8_with_c(num_tokens):
+    # split 8 is the Rubin dispatch; call it directly so every arch covers it
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
+        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
+    comm = _init_comm()
+    generator = torch.Generator().manual_seed(60 + num_tokens)
+    x = (
+        (torch.randn(num_tokens, gemm_ag.K, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .to(_device())
+    )
+    weight = (
+        (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05)
+        .to(torch.bfloat16)
+        .to(_device())
+    )
+    bias, third = (
+        torch.randn(num_tokens, gemm_ag.N, generator=generator).to(
+            device=_device(), dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    output = torch.empty(num_tokens, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
+    expected = (x.float() @ weight.float().t() + bias.float() + third.float()).to(
+        torch.bfloat16
+    )
+
+    module = gemm_ag._jit_module(8)
+    for _ in range(3):
+        output.zero_()
+        module.run(
+            all_reduce._COMM_MAP[comm.world_size], x, weight, bias, third, output
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+
+
+@torch.inference_mode()
 def test_attention_residual_direct_all_gather():
     _require_sm100()
     comm = _init_comm()
@@ -309,6 +345,7 @@ def _precompile(num_gpus):
         sp_collective._jit_module(world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
+        gemm_ag._jit_module(8)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 
