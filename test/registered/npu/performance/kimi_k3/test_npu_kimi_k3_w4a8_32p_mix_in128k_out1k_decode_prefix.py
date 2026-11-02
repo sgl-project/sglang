@@ -12,22 +12,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 logger = logging.getLogger(__name__)
 
-# Pure-decode (low-latency tier) acceptance scenario for Kimi-K3 W4A8 32P
-# (4-node mix): 131072 shared prefix in / 1024 out, C12/N12, mean
-# TPOT <= 30 ms.
-#
-# Benchmark: aisbench fixed-count perf run aligned with the dev method:
-# raw /v1/completions (no chat template), a cache-fill warmup (4 requests
-# at batch 1, one per DP rank) plus one unscored full-shape pass, then a
-# single measured batch N=C=12 with the built-in warmup disabled. The
-# dataset is identical natural-text rows from one GSM8K QA pool padded
-# past 131072 tokens, so every request hits the same shared radix prefix
-# (~99.9% cache hit, the dev shared-prefix shape).
-#
-# The pure-prefill and pure-decode server configs are mutually exclusive,
-# so each scenario is its own case/server. This server mirrors the dev
-# 128k decode serve config (DSPARK draft, radix cache, decode graphs
-# {2,4,8,12,16}).
 register_npu_ci(
     est_time=3600,
     suite="",
@@ -55,8 +39,6 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    # Low-latency decode tier (dev value); DEEPEP_HCCL_BUFFSIZE must stay
-    # unset - setting it crashes the DeepEP combine tiling in the CI pod.
     "HCCL_BUFFSIZE": "2000",
     "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
@@ -82,15 +64,11 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    # Deprecated spelling, still auto-converted to --attn-dp-size on main;
-    # required by the older sglang build in the nightly image.
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
-    # Everything below mirrors the dev 128k decode serve config.
     "--mamba-ssm-dtype",
     "bfloat16",
     "--mem-fraction-static",
@@ -101,7 +79,6 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     240,
     "--chunked-prefill-size",
     20480,
-    # C12 must land on a captured decode graph batch size.
     "--cuda-graph-bs-decode",
     2,
     4,
@@ -149,10 +126,9 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
     """Pure decode low latency: 128k shared prefix in / 1024 out, C12,
-    mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
+    mean TPOT <= 30 ms."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    # Dev-aligned aisbench fixed-count perf run (see the module comment).
     benchmark_tool = AISBENCHMARK
     dataset_type = "gsm8k-shared-prefix"
     dataset_path = None
@@ -161,10 +137,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     num_prompts = 12
     max_concurrency = 12
     request_rate = 0
-    # Raw /v1/completions: the prompt goes out verbatim, no chat template.
     api_type = "raw"
-    # Dev warmup ordering: prime the prefix on every DP rank, then one
-    # unscored full-shape pass, before the measured batch.
     warmup_dp = 4
     warmup_shape = 1
     tpot = 30.0

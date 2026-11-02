@@ -12,15 +12,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 logger = logging.getLogger(__name__)
 
-# Pure-prefill acceptance scenario for Kimi-K3 W4A8 32P (4-node mix):
-# cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s.
-#
-# Server config reproduces the dev CPP acceptance environment (PP4 x
-# TP16 x DP2, layer partition 24,24,24,21, no DSPARK, radix disabled,
-# decode graphs off). The pure-prefill and pure-decode server configs are
-# mutually exclusive, so each scenario is its own case/server; the mixed
-# TP64/DP4 topology is architecturally slower for single-stream 128k
-# prefill (one DP attention domain) and cannot reach the SLO.
 register_npu_ci(
     est_time=3600,
     suite="",
@@ -64,7 +55,6 @@ KIMI_K3_W4A8_32P_PREFILL_ARGS = [
     "modelslim",
     "--dtype",
     "bfloat16",
-    # CPP topology: PP4 x TP16 x DP2, layer partition 24,24,24,21.
     "--tp-size",
     16,
     "--pp-size",
@@ -72,8 +62,7 @@ KIMI_K3_W4A8_32P_PREFILL_ARGS = [
     "--pp-async-batch-depth",
     0,
     "--disable-overlap-schedule",
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     2,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
