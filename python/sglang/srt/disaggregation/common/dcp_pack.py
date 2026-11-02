@@ -71,6 +71,10 @@ def try_pack_dcp_src(
         return None
 
     pack = pack_buffer.buffer.narrow(0, pack_offset_bytes, required)
+    # Transfer worker threads start on device 0, and leaving the stream context
+    # restores it, creating a context on device 0 in every rank. Bind the thread
+    # to the pack buffer's device first.
+    torch.get_device_module(pack.device).set_device(pack.device)
     row_indices = torch.as_tensor(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
