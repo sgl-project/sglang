@@ -313,5 +313,39 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat3.5-432B-A28B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of DeepSeek-style MLA full attention and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, and multiple multi-token-prediction (MTP) heads for speculative decoding. Emits tool calls in GCML format.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>SenseNova Loop</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical HF checkpoint with <code>model_type: sensenova_loop</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation from text, image, or video inputs with unquantized weights.</td>
+    </tr>
 </tbody>
 </table>
+
+## SenseNova Loop
+
+Use the canonical, unexpanded checkpoint with `model_type: sensenova_loop`.
+The native implementation reads the existing `loop_settings`, `mhc`, and
+`text_config` fields. It shares the physical layers' parameters across Loop
+visits, while every execution slot owns its full-attention KV cache or GDN
+convolution and recurrent state. No weight expansion or custom Transformers
+code is required for SGLang serving.
+
+On NVIDIA CUDA, launch the checkpoint with:
+
+```shell Command
+sglang serve --model-path /path/to/canonical-checkpoint
+```
+
+SGLang derives the context length and dtype from the checkpoint and uses its
+default memory and concurrency settings. Set `--context-length` only if you
+want to override the checkpoint's context length.
+
+The initial implementation supports fixed-count, ungated Loop and optional
+two- or four-stream mHC, with FP32 router parameters and log-space Sinkhorn
+normalization. An mHC interval must stay within one Loop phase. Image and video
+inputs use the existing Qwen3.5 vision encoder, processor, and three-axis mRoPE
+path. The original vision weights are loaded together with the shared language
+backbone. Pure text requests use the same entry point.
+
+Pipeline parallelism, quantization, and speculative decoding are outside this
+implementation's support scope.
