@@ -110,7 +110,7 @@ tracing = [
 
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@b10f3b71c45a70f504c5cad2d622c3e423196e90",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@517040fbd2cc1ff6216ea5584e10aad6464b4d07",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
