@@ -1,11 +1,17 @@
+import itertools
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -423,6 +429,370 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     torch.equal(pool[untouched], pool_init[untouched]),
                     f"{label}: padded rows wrote into the state pool",
                 )
+
+    # ------------------------------------------------------------------
+    # Chunk output kernel on its own (GQA, ragged sequences)
+    # ------------------------------------------------------------------
+    def test_chunk_output_matches_reference(self):
+        """chunk_fwd_o against a float64 evaluation of its formula: per chunk,
+        o = scale * (exp(g) * q @ h^T + causal(exp(g_i - g_j) * q @ k^T) @ v).
+
+        Ragged lengths (chunk tails, a 1-token sequence) and 3 value heads per
+        key head, so every launch tile and boundary shows up in the output.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        lens, Hg, H, K, V, BT = [1, 63, 64, 65, 300, 1000], 4, 12, 128, 128, 64
+        T = sum(lens)
+        torch.manual_seed(7)
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(lens)], dtype=torch.long, device=device
+        )
+        chunks = [
+            (bos + c * BT, min(bos + (c + 1) * BT, bos + n))
+            for bos, n in zip(cu_seqlens.tolist(), lens)
+            for c in range(-(-n // BT))
+        ]
+        q = torch.randn(1, T, Hg, K, dtype=dtype, device=device) * 0.1
+        k = torch.randn(1, T, Hg, K, dtype=dtype, device=device) * 0.1
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        h = torch.randn(len(chunks), H, V, K, dtype=dtype, device=device) * 0.1
+        # g is the in-chunk cumulative sum of the log decay
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=torch.float32, device=device)
+        )
+        for s, e in chunks:
+            g[:, s:e] = g[:, s:e].cumsum(1)
+        scale = K**-0.5
+
+        o = chunk_fwd_o(q=q, k=k, v=v, h=h, g=g, scale=scale, cu_seqlens=cu_seqlens)
+
+        ref = torch.empty(T, H, V, dtype=torch.float64, device=device)
+        rep = H // Hg
+        for n, (s, e) in enumerate(chunks):
+            qc = q[0, s:e].double().repeat_interleave(rep, dim=1)  # [L, H, K]
+            kc = k[0, s:e].double().repeat_interleave(rep, dim=1)
+            gc = g[0, s:e].double()  # [L, H]
+            inter = torch.einsum("lhk,hvk->lhv", qc, h[n].double())
+            inter = inter * gc.exp()[..., None]
+            attn = torch.einsum("lhk,mhk->hlm", qc, kc)
+            causal = torch.ones(e - s, e - s, device=device).tril().bool()
+            decay = (gc.T[:, :, None] - gc.T[:, None, :]).exp()
+            attn = torch.where(causal, attn * decay, 0.0)
+            intra = torch.einsum("hlm,mhv->lhv", attn, v[0, s:e].double())
+            ref[s:e] = scale * (inter + intra)
+
+        # bf16 output and the kernel's bf16 cast of the decayed q @ k^T: ~1e-4 here
+        torch.testing.assert_close(
+            o[0].double(), ref, atol=2e-3, rtol=1e-2, check_dtype=False
+        )
+
+    def test_output_buffer_is_written_in_place(self):
+        """A contiguous buffer of v's shape and dtype, such as the real rows of a
+        CUDA graph's static output, receives the output in place; any other
+        buffer is left alone and a new tensor is returned. The output and the
+        final states are the same either way."""
+        device = get_device()
+        dtype = torch.bfloat16
+        B, T_per_seq, pad, H, K, V, pool_size = 3, 100, 40, 4, 128, 128, 8
+        T = B * T_per_seq
+        torch.manual_seed(0)
+
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cache_indices = torch.arange(B, dtype=torch.int32, device=device)
+        cu_seqlens = torch.arange(0, T + 1, T_per_seq, dtype=torch.long, device=device)
+        q = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=dtype, device=device))
+        o_ref, pool_ref = self._run_chunk(
+            pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+        )
+
+        def nans(*shape, dtype=dtype):
+            return torch.full(shape, float("nan"), dtype=dtype, device=device)
+
+        padded = nans(1, T + pad, H, V)
+        for label, output, in_place in (
+            ("contiguous", nans(1, T, H, V), True),
+            ("real rows of a padded buffer", padded[:, :T], True),
+            ("other dtype", nans(1, T, H, V, dtype=torch.float32), False),
+            ("strided", nans(1, T, H, 2 * V)[..., :V], False),
+        ):
+            with self.subTest(label):
+                pool = pool_init.clone()
+                o, _, _ = chunk_gated_delta_rule(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=pool,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=cu_seqlens,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    output=output,
+                )
+                self.assertEqual(o.data_ptr() == output.data_ptr(), in_place)
+                self.assertTrue(torch.equal(o, o_ref))
+                self.assertTrue(torch.equal(pool, pool_ref))
+                if not in_place:
+                    self.assertTrue(torch.isnan(output.float()).all())
+        # Nothing is written past the rows of the output.
+        self.assertTrue(torch.isnan(padded[:, T:].float()).all())
+
+    def test_pipelined_scan_is_bit_identical(self):
+        """With SGLANG_GDN_CHUNK_PIPELINE one long sequence runs as up to 4
+        parts over two streams; the output, the per-chunk states and the final
+        state are the same bits as in one pass, also with a padded tail and a
+        part boundary inside the last chunk. Batches of several sequences,
+        sequences under 8192 tokens and read-only states keep the one pass."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V, pool_size = 2, 6, 128, 128, 4
+        torch.manual_seed(0)
+        cases = (
+            # label, rows, sequence lengths, inplace_update
+            ("16384 tokens, 4 parts", 16384, [16384], True),
+            ("12600 tokens, 3 parts", 12600, [12600], True),
+            ("8192 tokens, 2 parts", 8192, [8192], True),
+            ("10000 tokens + padded tail", 10240, [10000], True),
+            ("8000 tokens, one pass", 8000, [8000], True),
+            ("two sequences, one pass", 18000, [9000, 9000], True),
+            ("read-only state, one pass", 16384, [16384], False),
+        )
+        for label, T, lens, inplace_update in cases:
+            with self.subTest(label):
+                pool_init = (
+                    torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device)
+                    * 0.1
+                )
+                cache_indices = torch.arange(
+                    1, len(lens) + 1, dtype=torch.int32, device=device
+                )
+                cu_seqlens = torch.tensor(
+                    [0] + torch.tensor(lens).cumsum(0).tolist(),
+                    dtype=torch.long,
+                    device=device,
+                )
+                q = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                k = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                results = []
+                for pipeline in (False, True):
+                    pool = pool_init.clone()
+                    output = torch.full_like(v, float("nan"))
+                    with envs.SGLANG_GDN_CHUNK_PIPELINE.override(pipeline):
+                        o, _, h = chunk_gated_delta_rule(
+                            q=q,
+                            k=k,
+                            v=v,
+                            g=g,
+                            beta=beta,
+                            initial_state=pool,
+                            initial_state_indices=cache_indices,
+                            cu_seqlens=cu_seqlens,
+                            head_first=False,
+                            use_qk_l2norm_in_kernel=True,
+                            inplace_update=inplace_update,
+                            output=output,
+                        )
+                    self.assertEqual(o.data_ptr(), output.data_ptr())
+                    results.append((o, h, pool))
+                (o0, h0, pool0), (o1, h1, pool1) = results
+                self.assertTrue(torch.equal(o1, o0))
+                self.assertTrue(torch.equal(h1, h0))
+                self.assertTrue(torch.equal(pool1, pool0))
+                if sum(lens) < T:
+                    self.assertTrue(
+                        torch.equal(
+                            o1[:, sum(lens) :], torch.zeros_like(o1[:, sum(lens) :])
+                        )
+                    )
+
+    def test_host_offsets_are_bit_identical_without_syncs(self):
+        """With cu_seqlens_cpu the scan plans from the host offsets instead of
+        reading cu_seqlens back: the same bits as without it, in one pass and
+        pipelined, and no synchronizing call once the kernels are compiled."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V, pool_size = 2, 6, 128, 128, 4
+        torch.manual_seed(0)
+        cases = (
+            # label, rows, sequence lengths, pipeline
+            ("three sequences, one pass", 3000, [1000, 64, 1936], False),
+            ("16384 tokens, pipelined", 16384, [16384], True),
+            ("10000 tokens + padded tail, pipelined", 10240, [10000], True),
+            ("1696 tokens + padded tail, one pass", 2048, [1696], True),
+        )
+        for label, T, lens, pipeline in cases:
+            with self.subTest(label):
+                pool_init = (
+                    torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device)
+                    * 0.1
+                )
+                cache_indices = torch.arange(
+                    1, len(lens) + 1, dtype=torch.int32, device=device
+                )
+                q = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                k = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                offsets = [0, *itertools.accumulate(lens)]
+
+                def run(host):
+                    # Fresh offsets per call, as per forward pass: nothing comes
+                    # from the index caches of an earlier call.
+                    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+                    cu_seqlens_cpu = (
+                        torch.tensor(offsets, dtype=torch.int32) if host else None
+                    )
+                    pool = pool_init.clone()
+                    output = torch.full_like(v, float("nan"))
+                    torch.cuda.synchronize()
+                    with envs.SGLANG_GDN_CHUNK_PIPELINE.override(pipeline):
+                        if host and torch.cuda.is_available():
+                            torch.cuda.set_sync_debug_mode("error")
+                        try:
+                            o, _, h = chunk_gated_delta_rule(
+                                q=q,
+                                k=k,
+                                v=v,
+                                g=g,
+                                beta=beta,
+                                initial_state=pool,
+                                initial_state_indices=cache_indices,
+                                cu_seqlens=cu_seqlens,
+                                head_first=False,
+                                use_qk_l2norm_in_kernel=True,
+                                output=output,
+                                cu_seqlens_cpu=cu_seqlens_cpu,
+                            )
+                        finally:
+                            if torch.cuda.is_available():
+                                torch.cuda.set_sync_debug_mode(0)
+                    return o, h, pool
+
+                o0, h0, pool0 = run(host=False)
+                o1, h1, pool1 = run(host=True)
+                self.assertTrue(torch.equal(o1, o0))
+                self.assertTrue(torch.equal(h1, h0))
+                self.assertTrue(torch.equal(pool1, pool0))
+
+    def test_chunk_indices_and_offsets_from_host_offsets(self):
+        """Chunk indices built from host offsets and chunk offsets padded on
+        the device match the device-read versions, values and dtype."""
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        device = get_device()
+        for lens in ([1], [64], [65], [1000, 64, 1936], [5, 0, 3], [16384]):
+            for dtype in (torch.int32, torch.long):
+                with self.subTest(lens=lens, dtype=dtype):
+                    offsets = [0, *itertools.accumulate(lens)]
+                    cu_seqlens = torch.tensor(offsets, dtype=dtype, device=device)
+                    expected = prepare_chunk_indices(cu_seqlens.clone(), 64)
+                    actual = prepare_chunk_indices(
+                        cu_seqlens, 64, torch.tensor(offsets, dtype=dtype)
+                    )
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertEqual(actual.device, expected.device)
+                    self.assertTrue(torch.equal(actual, expected))
+
+                    lens_t = cu_seqlens[1:] - cu_seqlens[:-1]
+                    expected = torch.cat(
+                        [cu_seqlens.new_tensor([0]), (lens_t + 63) // 64]
+                    ).cumsum(-1)
+                    actual = prepare_chunk_offsets(cu_seqlens.clone(), 64)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertTrue(torch.equal(actual, expected))
+
+    # ------------------------------------------------------------------
+    # The fused kkt + solve kernel writes all of A (no zero fill first)
+    # ------------------------------------------------------------------
+
+    def test_intra_writes_every_element_of_a(self):
+        """A is allocated without a fill, so the kernel must write every element
+        of each chunk's rows, including the zero blocks above the diagonal.
+
+        Runs the intra-chunk forward with fresh memory holding 0 (what a zero
+        fill gave), NaN and 7, and expects the same bits from all three.
+        """
+        device = get_device()
+        if device == "xpu":
+            self.skipTest("XPU runs its own chunk_fwd kernels")
+        dtype = torch.bfloat16
+        H, Hg, K, V, BT = 6, 2, 128, 128, 64
+        empty = torch.empty
+
+        for label, lens in (("one sequence", [300]), ("varlen", [64, 1, 130, 77])):
+            with self.subTest(label):
+                torch.manual_seed(0)
+                T = sum(lens)
+                cu_seqlens = None
+                if len(lens) > 1:
+                    cu_seqlens = torch.tensor(
+                        [0, *itertools.accumulate(lens)],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                k = torch.nn.functional.normalize(
+                    torch.randn(1, T, Hg, K, device=device), dim=-1
+                ).to(dtype)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = chunk_local_cumsum(
+                    torch.nn.functional.logsigmoid(torch.randn(1, T, H, device=device)),
+                    chunk_size=BT,
+                    cu_seqlens=cu_seqlens,
+                )
+                beta = torch.sigmoid(torch.randn(1, T, H, device=device)).to(dtype)
+
+                runs = []
+                for fill in (0.0, float("nan"), 7.0):
+
+                    def stale_empty(*args, fill=fill, **kwargs):
+                        out = empty(*args, **kwargs)
+                        return out.fill_(fill) if out.is_floating_point() else out
+
+                    with mock.patch.object(torch, "empty", stale_empty):
+                        runs.append(
+                            chunk_gated_delta_rule_fwd_intra(
+                                k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens
+                            )
+                        )
+
+                w0, u0, A0 = runs[0]
+                upper = torch.ones(BT, BT, dtype=torch.bool, device=device).triu(1)
+                for fill, (w, u, A) in zip(("nan", "7"), runs[1:]):
+                    self.assertTrue(torch.equal(A, A0), f"A differs with {fill}")
+                    self.assertTrue(torch.equal(w, w0), f"w differs with {fill}")
+                    self.assertTrue(torch.equal(u, u0), f"u differs with {fill}")
+                # Within each chunk, entries above the diagonal stay zero.
+                starts = [0, *itertools.accumulate(lens)][:-1]
+                for start, n in zip(starts, lens):
+                    for c in range(0, n, BT):
+                        rows = min(BT, n - c)
+                        block = A0[0, start + c : start + c + rows].transpose(0, 1)
+                        self.assertFalse(block[:, upper[:rows]].any())
 
 
 if __name__ == "__main__":

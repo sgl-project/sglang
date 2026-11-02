@@ -24,6 +24,12 @@ CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+# ROCm only: MFMA instruction size (16 for 16x16, 32 for 32x32; 0 leaves it to the compiler).
+GDN_CHUNK_H_MATRIX_INSTR_NONKDIM = (
+    int(os.getenv("SGLANG_GDN_CHUNK_H_MATRIX_INSTR_NONKDIM", "0"))
+    if torch.version.hip
+    else 0
+)
 
 
 @triton.autotune(
@@ -41,7 +47,12 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     # tile without corrupting the state pool through multi-config autotune.
     configs=[
         triton.Config(
-            {"BV": GDN_CHUNK_H_BV},
+            {"BV": GDN_CHUNK_H_BV}
+            | (
+                {"matrix_instr_nonkdim": GDN_CHUNK_H_MATRIX_INSTR_NONKDIM}
+                if GDN_CHUNK_H_MATRIX_INSTR_NONKDIM
+                else {}
+            ),
             num_warps=GDN_CHUNK_H_NUM_WARPS,
             num_stages=GDN_CHUNK_H_NUM_STAGES,
         )
@@ -364,6 +375,7 @@ def chunk_gated_delta_rule_fwd_h(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    h: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
@@ -394,7 +406,12 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # A caller's buffer for the per-chunk states, e.g. this run's chunks of a
+    # longer scan's states.
+    if h is None:
+        h = k.new_empty(B, NT, H, V, K)
+    else:
+        assert h.shape == (B, NT, H, V, K) and h.dtype == k.dtype and h.is_contiguous()
 
     v_new = torch.empty_like(u) if save_new_value else None
 

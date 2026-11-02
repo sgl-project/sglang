@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
 from typing import Optional
 
 import torch
@@ -11,9 +12,36 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.utils import is_gfx95_supported
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+@functools.cache
+def _launch_config() -> dict:
+    # On gfx95, one program per (chunk, head) covers V = 128: with BV = 64 the two
+    # programs of a head both compute the same q @ k^T. With 16x16 MFMA tiles this
+    # is 0.40 -> 0.23 ms per call on MI355X (16384 tokens, 48 heads, K = V = 128).
+    if is_gfx95_supported():
+        return dict(BV=128, num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+    return dict(BV=64, num_warps=4, num_stages=2)
+
+
+@triton.jit
+def _zero_rows_past_last_seq_kernel(
+    o, cu_seqlens, N, T, ROW: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr
+):
+    # Zero rows [cu_seqlens[N], T): a padded batch's rows past the last sequence,
+    # which chunk_fwd_kernel_o does not write.
+    i_t, i_c = tl.program_id(0), tl.program_id(1)
+    end = tl.load(cu_seqlens + N).to(tl.int32)
+    if (i_t + 1) * BLOCK_T > end:
+        rows = i_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        cols = i_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask = ((rows >= end) & (rows < T))[:, None] & (cols < ROW)[None, :]
+        offs = rows.to(tl.int64)[:, None] * ROW + cols[None, :]
+        tl.store(o + offs, tl.zeros([BLOCK_T, BLOCK_C], o.dtype.element_ty), mask=mask)
 
 
 # @triton.autotune(
@@ -134,18 +162,40 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    output: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    # chunk_indices: the caller's, for chunk_size; a short input uses smaller
+    # chunks and needs its own.
+    if cu_seqlens is None:
+        chunk_indices = None
+    elif chunk_indices is None or BT != chunk_size:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
+    # The kernel writes every row of every sequence; only a padded batch's rows
+    # past the last sequence need zeros, so they are cleared on their own instead
+    # of zero-filling the whole output first. A caller's buffer of the output's
+    # shape and dtype (e.g. a CUDA graph's static output) is written in place.
+    if (
+        output is not None
+        and output.shape == v.shape
+        and output.dtype == v.dtype
+        and output.is_contiguous()
+    ):
+        o = output
+    else:
+        o = torch.empty_like(v)
+    if cu_seqlens is not None and T > 0:
+        row = H * V
+        _zero_rows_past_last_seq_kernel[(triton.cdiv(T, 16), triton.cdiv(row, 1024))](
+            o, cu_seqlens, len(cu_seqlens) - 1, T, ROW=row, BLOCK_T=16, BLOCK_C=1024
+        )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
@@ -167,10 +217,8 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        **_launch_config(),
     )
     return o
