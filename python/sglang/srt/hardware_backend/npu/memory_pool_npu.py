@@ -6,6 +6,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
@@ -83,6 +84,24 @@ def _init_npu_conv_state(
         for conv_shape in conv_state_shape
     ]
     return conv_state
+
+
+def init_mxfp8_kv_scales(model, pool, cache_layout):
+    # Draft steps share the same pool; initialize its static scales only once.
+    full_pool = pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+    if full_pool._mxfp8_scales_initialized:
+        return
+    for module in model.modules():
+        scheme = getattr(module, "scheme", None)
+        if getattr(scheme, "cache_layout", None) == cache_layout:
+            # Keep the hybrid pool's global-to-local layer mapping.
+            _, v_scale = pool.get_kv_scale_buffer(module.layer_id)
+            v_scale.copy_(
+                scheme.v_scale_encoded.view(
+                    1, v_scale.shape[1], 1, v_scale.shape[-2], 1
+                )
+            )
+    full_pool._mxfp8_scales_initialized = True
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
@@ -179,6 +198,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             self.v_buffer_tensor = self._hicache_v_buffer
 
             if self.is_modelslim_mxfp8:
+                self._mxfp8_scales_initialized = False
                 # QFA uses PA_BNBD, with pairs of per-32 UE8M0 scales.
                 self.k_buffer = list(self.k_buffer_tensor.unbind(0))
                 self.v_buffer = list(self.v_buffer_tensor.unbind(0))

@@ -33,6 +33,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.memory_pool_npu import init_mxfp8_kv_scales
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -365,6 +366,9 @@ class AscendAttnBackend(AttentionBackend):
             self.qfa_cache_layout = cache_layout
             self.qfa_num_heads = model_runner.model_config.get_num_attention_heads(
                 get_parallel().attn_tp_size
+            )
+            init_mxfp8_kv_scales(
+                model_runner.model, model_runner.token_to_kv_pool, cache_layout
             )
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.

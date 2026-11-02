@@ -113,10 +113,6 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
-    from sglang.srt.layers.quantization.modelslim.modelslim import (
-        ModelSlimKVCacheMethod,
-    )
-
 
 def compute_yarn_parameters(
     config: PretrainedConfig,
@@ -607,15 +603,7 @@ class Qwen3MoeAttention(nn.Module):
             and quant_config is not None
             and quant_config.get_name() == "modelslim"
         ):
-            scheme = quant_config.get_modelslim_kv_scheme(prefix)
-            if scheme is not None:
-                self.attn.scheme = scheme
-                self.attn.quant_method = ModelSlimKVCacheMethod()
-                self.attn.quant_method.create_weights(
-                    self.attn,
-                    qkv_proj=self.qkv_proj,
-                    params_dtype=torch.get_default_dtype(),
-                )
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)

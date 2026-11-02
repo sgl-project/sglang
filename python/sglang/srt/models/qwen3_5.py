@@ -288,10 +288,6 @@ if _is_npu:
     # original Triton kernel.
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
-    from sglang.srt.layers.quantization.modelslim.modelslim import (
-        ModelSlimKVCacheMethod,
-    )
-
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
@@ -1382,15 +1378,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and quant_config is not None
             and quant_config.get_name() == "modelslim"
         ):
-            scheme = quant_config.get_modelslim_kv_scheme(prefix)
-            if scheme is not None:
-                self.attn.scheme = scheme
-                self.attn.quant_method = ModelSlimKVCacheMethod()
-                self.attn.quant_method.create_weights(
-                    self.attn,
-                    qkv_proj=self.qkv_proj,
-                    params_dtype=torch.get_default_dtype(),
-                )
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
