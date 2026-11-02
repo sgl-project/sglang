@@ -14,9 +14,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import ScheduleVerifyLensTopk
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildOutTokens,
 )
+from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -89,11 +91,20 @@ class TestDSparkNpuDispatch(CustomTestCase):
             self.assertTrue(torch.equal(actual, expected))
 
     def test_argmax_and_accept_match_torch(self):
+        from sgl_kernel_npu.operators import sample
+
         rows, block, vocab = 9, 7, 4097
         logits = torch.randn(rows * block, vocab, device="npu")
         logits[0, 5] = float("nan")
+        logits[0, 10] = float("nan")
+        logits[1] = -float("inf")
+        logits[2, 5] = float("inf")
+        logits[2, 10] = float("inf")
         expected_top1 = logits.cpu().argmax(-1)
-        self.assertTrue(torch.equal(_row_argmax(logits).cpu(), expected_top1))
+        with mock.patch.object(sample, "row_argmax", wraps=sample.row_argmax) as kernel:
+            actual = _row_argmax(logits, fused=True)
+        kernel.assert_called_once_with(logits)
+        self.assertTrue(torch.equal(actual.cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
         candidates = predict.clone()
         candidates[:, 1:] = predict[:, :-1]
@@ -113,6 +124,42 @@ class TestDSparkNpuDispatch(CustomTestCase):
         self.assertEqual(integrated[1].dtype, torch.int64)
         self.assertTrue(torch.equal(integrated[0].cpu(), lengths.int()))
         self.assertTrue(torch.equal(integrated[1].cpu(), bonus))
+
+    def test_argmax_fallback_for_unsupported_inputs(self):
+        from sgl_kernel_npu.operators import sample
+
+        for logits in (
+            torch.randn(3, 32, device="npu", dtype=torch.float16),
+            torch.randn(3, 64, device="npu")[:, ::2],
+        ):
+            with mock.patch.object(sample, "row_argmax") as kernel:
+                actual = _row_argmax(logits, fused=True)
+            kernel.assert_not_called()
+            self.assertTrue(torch.equal(actual.cpu(), logits.cpu().argmax(-1)))
+
+    def test_schedule_verify_lens_matches_torch(self):
+        from sgl_kernel_npu.operators import sample
+
+        cfg = DSparkScheduleConfig(gamma=6, survival_eps=0.1)
+        for confidence, budget in (
+            (torch.rand(8, 12)[:, ::2], 16),
+            (torch.ones(2, 6), 3),
+            (torch.rand(8, 6), 0),
+            (torch.empty(0, 6), 3),
+        ):
+            expected = ScheduleVerifyLensTopk.torch(
+                confidence=confidence, budget=budget, cfg=cfg
+            )
+            inputs = {"confidence": confidence.npu(), "budget": budget, "cfg": cfg}
+            with mock.patch.object(
+                sample,
+                "schedule_verify_lens_topk_triton",
+                wraps=sample.schedule_verify_lens_topk_triton,
+            ) as kernel:
+                actual = ScheduleVerifyLensTopk.execute(**inputs)
+            kernel.assert_called_once_with(**inputs)
+            self.assertEqual(actual.dtype, torch.int32)
+            self.assertTrue(torch.equal(actual.cpu(), expected))
 
     def test_softmax_temperature_mapping(self):
         logits = torch.randn(9, 4097, device="npu")
