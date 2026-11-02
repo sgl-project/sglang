@@ -2158,6 +2158,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     obj,
                     out,
                     request=request,
+                    tokenizer=self.tokenizer,
                 )
 
                 if self.request_metrics_exporter_manager.exporter_enabled():
