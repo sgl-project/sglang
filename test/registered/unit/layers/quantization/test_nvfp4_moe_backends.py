@@ -9,8 +9,10 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import get_device_sm, round_up
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -35,7 +37,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
-    def _run_backend(self, backend: str, intermediate_size: int = I):
+    def _run_backend(self, backend: str, intermediate_size: int = I, w4a16_phase=None):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -44,6 +46,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             is_checkpoint_nvfp4_serialized=True, group_size=16
         )
         with (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_phase or False),
             get_context().override_server_args(model_path="dummy"),
             get_flags().moe.override(runner_backend=MoeRunnerBackend(backend)),
             get_parallel().override(
@@ -132,20 +135,41 @@ class TestNvFp4MoeBackends(CustomTestCase):
             )
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
-            out = layer.forward(x, topk_output)
-            if not isinstance(out, torch.Tensor):
-                out = out[0] if isinstance(out, tuple) else out.hidden_states
+            phases = ("prefill", "decode", "prefill") if w4a16_phase else ("decode",)
+            for phase in phases:
+                with forward_context(
+                    ForwardContext(attn_backend=None, moe_forward_phase=phase)
+                ):
+                    out = layer.forward(x, topk_output)
+                    if not isinstance(out, torch.Tensor):
+                        out = out[0] if isinstance(out, tuple) else out.hidden_states
 
-            ref = self._torch_moe_reference(
-                x, topk_weights, topk_ids, refs["w1"], refs["w3"], refs["w2"]
-            )
-            assert_output_close(self, out, ref)
+                    ref = self._torch_moe_reference(
+                        x,
+                        topk_weights,
+                        topk_ids,
+                        refs["w1"],
+                        refs["w3"],
+                        refs["w2"],
+                        use_w4a16=w4a16_phase is True or phase == w4a16_phase,
+                    )
+                    assert_output_close(self, out, ref)
+                    if w4a16_phase:
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            captured = layer.forward(x, topk_output)
+                        graph.replay()
+                        torch.testing.assert_close(captured, out, rtol=0, atol=0)
 
     @staticmethod
-    def _torch_moe_reference(x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref):
+    def _torch_moe_reference(
+        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, use_w4a16=False
+    ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
+            if use_w4a16:
+                return t2d.to(torch.bfloat16).float()
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
@@ -182,6 +206,11 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_flashinfer_cutedsl_w4a16_by_phase(self):
+        for phase in (True, "prefill", "decode"):
+            with self.subTest(w4a16_phase=phase):
+                self._run_backend("flashinfer_cutedsl", w4a16_phase=phase)
 
 
 if __name__ == "__main__":

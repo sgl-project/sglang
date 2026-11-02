@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_autotune_moe_phases,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -398,18 +399,24 @@ class BaseRunner(ABC):
         runner exists; a freshly-allocated dummy set in the eager path).
         """
         mr = self.model_runner
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
 
         def forward_fn():
-            self._dummy_run(
-                batch_size=batch_size,
-                buffers=buffers,
-                run_ctx=canary_run_ctx,
-            )
+            # A decode-shaped dummy can tune both activation-precision paths without
+            # allocating a second buffer set or forcing speculative attention
+            # through an unsupported EXTEND dummy. Each phase must run before
+            # capture to prepare its precision-specific wrapper and tactics.
+            for phase in flashinfer_autotune_moe_phases(mr):
+                canary_run_ctx = (
+                    c.with_active_single_forward_manager(0)
+                    if (c := mr.canary_manager) is not None
+                    else empty_context()
+                )
+                self._dummy_run(
+                    batch_size=batch_size,
+                    buffers=buffers,
+                    run_ctx=canary_run_ctx,
+                    moe_forward_phase_override=phase,
+                )
 
         run_flashinfer_autotune_forward(
             self.model_runner, forward_fn, run_lm_head=False
@@ -470,6 +477,7 @@ class BaseRunner(ABC):
         *,
         buffers,
         extend_num_tokens_per_req: Optional[int] = None,
+        moe_forward_phase_override: Optional[str] = None,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -712,6 +720,7 @@ class BaseRunner(ABC):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             global_forward_mode=capture_forward_mode,
+            moe_forward_phase_override=moe_forward_phase_override,
             lora_ids=lora_ids,
         )
         mr.runner_ids.bind_runner_slots(forward_batch)

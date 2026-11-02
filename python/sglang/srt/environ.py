@@ -152,6 +152,39 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvBoolOrPhase(EnvBool):
+    """Boolean opt-in which can also apply to one inference phase.
+
+    Boolean spellings retain their original meaning; a phase-specific value
+    must be resolved explicitly rather than tested for string truthiness.
+    """
+
+    def parse(self, value: str) -> bool | str:
+        value = value.strip().lower()
+        if value in ("prefill", "decode"):
+            return value
+        if value == "all":
+            return True
+        try:
+            return super().parse(value)
+        except ValueError:
+            raise ValueError(
+                f'{value!r} must be a boolean, "all", "prefill", or "decode"'
+            ) from None
+
+    def enabled_for(self, phase: str) -> bool:
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"Unknown inference phase: {phase!r}")
+        value = self.get()
+        return value is True or value == phase
+
+    def enabled_for_all(self) -> bool:
+        return self.get() is True
+
+    def enabled_for_any(self) -> bool:
+        return self.get() in (True, "prefill", "decode")
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -1308,10 +1341,10 @@ class Envs:
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
-    SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBoolOrPhase(False)
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
     # including the flashinfer_megamoe runner (BF16 combine).
-    SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBoolOrPhase(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
