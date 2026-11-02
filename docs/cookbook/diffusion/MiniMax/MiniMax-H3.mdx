@@ -859,6 +859,74 @@ the reference video and two 2048-pixel reference images.
 Pika H3 Flex is a Model Derivative of MiniMax H3 by Mellis, Inc., distributed
 under the MiniMax H3 Community License Agreement.
 
+### Open-H3-Regenerate-2K: 2K draft refinement
+
+[Efficient-Large-Model/Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+is NVlabs/Sana's open replacement for MiniMax's closed H3-Regenerate-2K stage.
+It refines an existing H3 draft at up to 2560×1440 in three Euler steps:
+
+1. The draft is encoded at its 768P canvas.
+2. The author's 3D latent upscaler enlarges it.
+3. It is re-noised to σ₀ = 0.909 and refined with CFG off.
+
+The release ships add-ons for MiniMax-H3, not a new DiT:
+
+- one merged FP32 refiner LoRA (12.4 GB, rank 576)
+- 50 LMS Sharp timestep-curve AdaLN branches
+- the latent upscaler
+
+Pass the repository directly to `--model-path`. SGLang downloads only those
+files from it, never the release's `base_model/` copy. It loads MiniMax-H3's
+`FL2VA/` partition at the revision the release pins, so an existing MiniMax-H3
+download is reused. It also fetches the 1025×8 curve table the branches read
+from a Comfy-Org checkpoint by byte range, checked against the sha256 that the
+release pins. By default the pipeline keeps the text encoder off the GPU
+between prompts and merges the LoRA into the DiT, as the reference does, so a
+2K refine fits one H200.
+
+```bash Command
+sglang serve --model-path Efficient-Large-Model/Open-H3-Regenerate-2K --port 30010
+```
+
+A request is a `t2va` request that names the draft in `source_video`. Use the
+prompt that describes the draft. `target` sets the output canvas and defaults
+to `{"short_edge": 1440, "aspect_ratio": "16:9", "duration_seconds": 5.0}`.
+The other request fields are:
+
+- `num_inference_steps`: 3 (the default) or 2.
+- `start_sigma`: overrides the release schedule with a shift-6 grid from that
+  noise level. The default 0.909 redraws the most detail but also redraws the
+  subject. Values around 0.6–0.7 keep faces and identity close to the draft.
+- `keep_source_audio`: true by default, which holds the draft's soundtrack
+  clean through every step. Set it to false to condition on silence instead,
+  as the reference does.
+- `source_short_edge`: 768 by default; 576 for drafts from other video models.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Efficient-Large-Model/Open-H3-Regenerate-2K",
+    "prompt": "A small orange cat walks slowly on a sunny beach. Gentle ocean waves.",
+    "task": "t2va",
+    "conditions": [],
+    "source_video": "file:///data/draft_768p.mp4",
+    "start_sigma": 0.6
+  }'
+```
+
+On 1× H200, a 5-second 768P draft refined to 2560×1440 took 177 s warm:
+
+| Stage | Time |
+| --- | --- |
+| Draft encode, upscale and audio | 19 s |
+| 3 refine steps | 98 s |
+| VAE decode | 15 s |
+
+The refiner LoRA and the MiniMax-H3 weights follow the MiniMax H3 Community
+License. The latent upscaler (MIT), LightX2V FL2VA Turbo and LMS Sharp keep
+their own licenses; see the release's NOTICE.
+
 ### PDD acceleration LoRAs
 
 [Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)

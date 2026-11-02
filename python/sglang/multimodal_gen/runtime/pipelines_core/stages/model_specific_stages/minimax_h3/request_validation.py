@@ -67,7 +67,9 @@ def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
     return normalized
 
 
-def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str, Any]:
+def _validate_target(
+    target: Any, *, profile: MiniMaxH3TaskProfile, max_pixels: int | None = None
+) -> dict[str, Any]:
     path = "target"
     if not isinstance(target, Mapping):
         raise ValueError(f"{path} is required and must be an object")
@@ -108,6 +110,12 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
         "short_edge": short_edge,
         "aspect_ratio": aspect_ratio,
     }
+    if max_pixels is not None:
+        if isinstance(max_pixels, bool) or not isinstance(max_pixels, int):
+            raise ValueError("max_pixels must be a positive integer")
+        if max_pixels <= 0:
+            raise ValueError("max_pixels must be a positive integer")
+        out["max_pixels"] = max_pixels
     if has_duration:
         duration = target["duration_seconds"]
         if isinstance(duration, bool) or not isinstance(duration, (int, float)):
@@ -274,6 +282,7 @@ def minimax_h3_validate_canonical_request(
     flow_shift: Any = None,
     audio_flow_shift: Any = None,
     seed: Any = None,
+    max_pixels: int | None = None,
     **_extra_kwargs: Any,
 ) -> dict[str, Any]:
     """Validate and normalize a `minimax_h3.request/v1` canonical request.
@@ -291,7 +300,9 @@ def minimax_h3_validate_canonical_request(
     profile = minimax_h3_task_profile(task_name)
     prompt_text = _require_str(prompt, "prompt")
 
-    normalized_target = _validate_target(target, profile=profile)
+    normalized_target = _validate_target(
+        target, profile=profile, max_pixels=max_pixels
+    )
     requested_frame_count = None
     if normalized_target.get("duration_seconds") is not None:
         requested_frame_count = int(

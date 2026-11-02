@@ -1691,9 +1691,22 @@ class MiniMaxH3AdalnProj(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
+        # Optional timestep-curve branch (LMS Sharp): x += B(A(curve(t))), with
+        # this rank's output rows of B. Loaded by load_adaln_curve_branches;
+        # the model sets curve_coords for each forward.
+        self.curve_a: torch.Tensor | None = None
+        self.curve_b: torch.Tensor | None = None
+        self.curve_coords: torch.Tensor | None = None
 
     def project_local(self, adaln_input: torch.Tensor) -> torch.Tensor:
         x, _ = self.linear(adaln_input)
+        if self.curve_a is not None:
+            if self.curve_coords is None:
+                raise ValueError("MiniMax H3 AdaLN curve branch needs curve coords")
+            delta = nn.functional.linear(
+                nn.functional.linear(self.curve_coords, self.curve_a), self.curve_b
+            )
+            x = x + delta.to(x.dtype)
         return x
 
     def split_output(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -2389,6 +2402,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self._adaln_precomputed = (
             adaln_cache_path is not None or adaln_weight_files is not None
         )
+        # [grid, 8] curve table once load_adaln_curve_branches has run
+        self._adaln_curve_table: torch.Tensor | None = None
         self.arch = arch
         if arch.checkpoint_uses_diffusers_layout:
             self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
@@ -2682,6 +2697,66 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             )
         if self.adaln_cache is not None:
             self.adaln_cache.load(self.video_patch_proj.weight.device)
+
+    def load_adaln_curve_branches(self, branches_path: str, table_path: str) -> None:
+        """Attach per-block timestep-curve AdaLN branches (LMS Sharp).
+
+        ``branches_path`` holds ``transformer.transformer_blocks.N.adaln_proj.
+        linear.curve_{A,B}.weight`` ([r, 8] / [out, r], fp32) for every block;
+        ``table_path`` is the raw fp32 [grid, 8] curve table, linearly
+        interpolated at the model timestep. Each block's AdaLN output gains
+        ``B @ A @ curve(t)``, added in the projection's output dtype.
+        """
+        from safetensors import safe_open
+
+        if self.adaln_cache is not None:
+            raise ValueError(
+                "MiniMax H3 AdaLN curve branches cannot use a precomputed AdaLN cache"
+            )
+        raw = open(table_path, "rb").read()
+        table = torch.frombuffer(bytearray(raw), dtype=_FP32_DTYPE).reshape(-1, 8)
+        prefix = "transformer.transformer_blocks"
+        with safe_open(branches_path, "pt") as f:
+            keys = set(f.keys())
+            if len(keys) != 2 * len(self.blocks):
+                raise ValueError(
+                    f"expected curve branches for all {len(self.blocks)} blocks, "
+                    f"got {len(keys)} tensors"
+                )
+            for index, block in enumerate(self.blocks):
+                proj = block.adaln_proj
+                base = f"{prefix}.{index}.adaln_proj.linear"
+                a = f.get_tensor(f"{base}.curve_A.weight").to(_FP32_DTYPE)
+                b = f.get_tensor(f"{base}.curve_B.weight").to(_FP32_DTYPE)
+                linear = proj.linear
+                if a.shape[1] != 8 or b.shape != (linear.output_size, a.shape[0]):
+                    raise ValueError(f"curve branch {base} has an unexpected shape")
+                width = linear.output_size_per_partition
+                b = b.narrow(0, linear.tp_rank * width, width)
+                device = linear.weight.device
+                if device.type == "cpu" and torch.cuda.is_available():
+                    device = torch.device("cuda", torch.cuda.current_device())
+                proj.curve_a = a.to(device)
+                proj.curve_b = b.contiguous().to(device)
+        self._adaln_curve_table = table
+        logger.info(
+            "MiniMax-H3: %d AdaLN curve branches loaded from %s",
+            len(self.blocks),
+            branches_path,
+        )
+
+    def _set_adaln_curve_coords(self, timesteps: torch.Tensor) -> None:
+        """Interpolate the curve table at this forward's unique timesteps."""
+        table = self._adaln_curve_table.to(timesteps.device)
+        position = timesteps.to(_FP32_DTYPE).clamp(0, 1) * (table.shape[0] - 1)
+        lower = position.floor().clamp(max=table.shape[0] - 2).to(torch.long)
+        coords = torch.lerp(
+            table.index_select(0, lower),
+            table.index_select(0, lower + 1),
+            (position - lower).unsqueeze(-1),
+        )
+        for block in self.blocks:
+            block.adaln_proj.curve_coords = coords
 
     def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
         if self.adaln_t_table is None:
@@ -3136,6 +3211,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
         self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        if self._adaln_curve_table is not None:
+            self._set_adaln_curve_coords(unique_timesteps.view(-1).to(device))
         # request-step AdaLN input shared by all blocks
         adaln_input = (
             t_emb

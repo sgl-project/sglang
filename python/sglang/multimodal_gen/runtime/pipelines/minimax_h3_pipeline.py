@@ -5,6 +5,8 @@ import os
 import shutil
 from dataclasses import replace
 
+import torch
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -54,6 +56,17 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # minimax_h3/denoise_loop.py (stages accept scheduler=None).
         "transformer",
     ]
+
+    # Releases that ship only add-ons for the MiniMax-H3 base: the model path is
+    # the release repo, of which only ``release_files`` (at ``release_revision``)
+    # are fetched, and the weights load from ``base_model``'s partition at
+    # ``base_revision``. None loads the model path as a full H3 checkpoint.
+    base_model: str | None = None
+    base_revision: str | None = None
+    release_revision: str | None = None
+    release_files: tuple[str, ...] = ()
+    # the release's LoRA adapter, relative to the release dir
+    release_lora_file: str | None = None
 
     def __init__(self, *args, **kwargs):
         # TODO: Enable this check on ROCm after adding ffmpeg to the AMD Docker
@@ -115,7 +128,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     f"{explicit_subfolder!r}"
                 )
             self.server_args.model_subfolder = semantic_subfolder
-        model_index = super()._load_config()
+        model_index = (
+            super()._load_config()
+            if self.base_model is None
+            else self._load_base_partition_config()
+        )
         self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
         if (
             model_variant is not None
@@ -136,12 +153,45 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self._apply_release_lora_adapter()
         return model_index
 
+    def _load_base_partition_config(self) -> dict:
+        """Fetch the release's add-ons and load the base model's partition."""
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model,
+            verify_model_config_and_directory,
+        )
+
+        self.release_path = maybe_download_model(
+            self.model_path,
+            allow_patterns=list(self.release_files),
+            revision=self.server_args.revision or self.release_revision,
+        )
+        missing = [
+            name
+            for name in self.release_files
+            if not os.path.isfile(os.path.join(self.release_path, name))
+        ]
+        if missing:
+            raise ValueError(f"{self.pipeline_name} release is missing {missing}")
+        subfolder = self.server_args.model_subfolder or self.default_model_subfolder
+        base_root = maybe_download_model(
+            self.base_model,
+            allow_patterns=[f"{subfolder}/**"],
+            revision=self.base_revision,
+        )
+        self.model_path = os.path.join(base_root, subfolder)
+        return verify_model_config_and_directory(self.model_path)
+
+    def _release_lora_adapter_path(self) -> str | None:
+        if self.release_lora_file is not None:
+            return os.path.join(self.release_path, self.release_lora_file)
+        adapter = self.release_metadata.lora_adapter
+        return None if adapter is None else os.path.join(self.model_path, adapter)
+
     def _apply_release_lora_adapter(self) -> None:
         """Load a release's bundled LoRA adapter as the startup adapter."""
-        adapter = self.release_metadata.lora_adapter
-        if adapter is None:
+        adapter_path = self._release_lora_adapter_path()
+        if adapter_path is None:
             return
-        adapter_path = os.path.join(self.model_path, adapter)
         if not os.path.isfile(adapter_path):
             raise ValueError(
                 f"{self.pipeline_name} release adapter not found: {adapter_path}"
@@ -149,7 +199,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         if self.server_args.lora_path not in (None, adapter_path):
             raise ValueError(
                 f"{self.pipeline_name} applies its own release adapter "
-                f"({adapter}); --lora-path cannot replace it"
+                f"({os.path.basename(adapter_path)}); --lora-path cannot replace it"
             )
         # LoRAPipeline reads server_args.lora_path once the modules are loaded
         self.server_args.lora_path = adapter_path
@@ -211,6 +261,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
             )
         )
+        self.add_source_stages(server_args)
         self.add_stage(MiniMaxH3LatentPreparationStage())
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
@@ -239,6 +290,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 audio_vae=self.get_module("audio_vae"),
             )
         )
+
+    def add_source_stages(self, server_args: ServerArgs) -> None:
+        """Stages that prepare the denoise state ahead of latent preparation."""
 
     def create_comfyui_stages(self, server_args: ServerArgs) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
@@ -278,4 +332,131 @@ class PikaH3FlexPipeline(MiniMaxH3Pipeline):
     pipeline_name = "PikaH3FlexPipeline"
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, PikaH3FlexPipeline]
+class OpenH3RegeneratePipeline(MiniMaxH3Pipeline):
+    """Open-H3-Regenerate-2K: MiniMax-H3 refining a draft at up to 2560x1440.
+
+    NVlabs/Sana's open replacement for MiniMax's H3-Regenerate-2K stage. From
+    the release repo only the merged refiner LoRA (the startup adapter), the
+    LMS Sharp timestep-curve AdaLN branches and the author latent upscaler are
+    fetched; the weights are MiniMax-H3's FL2VA partition at the revision the
+    release pins. A request draft is encoded, upscaled, re-noised and refined
+    in 3 Euler steps; see ``MiniMaxH3RegenerateSourceStage``.
+    """
+
+    pipeline_name = "OpenH3RegeneratePipeline"
+    base_model = "MiniMaxAI/MiniMax-H3"
+    base_revision = "6818f6c32d12b210915e44ad56a4228c2608f160"
+    release_revision = "5809c33730c18b6b1c827b40974855a4288641b3"
+    release_lora_file = "lora/open_h3_regenerate_2k_lora.safetensors"
+    upscaler_file = (
+        "latent_upsampler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+    )
+    curve_branches_file = "lora/sharp_curve_branches.safetensors"
+    release_config_file = "lora/lora_config.json"
+    release_files = (
+        release_lora_file,
+        curve_branches_file,
+        release_config_file,
+        upscaler_file,
+    )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        from safetensors.torch import load_file
+
+        from sglang.multimodal_gen.runtime.models.upsampler.minimax_h3_latent_upscaler import (
+            MiniMaxH3LatentUpscaler,
+        )
+
+        super().initialize_pipeline(server_args)
+        self.get_module("transformer").load_adaln_curve_branches(
+            os.path.join(self.release_path, self.curve_branches_file),
+            self._adaln_curve_table_path(),
+        )
+        upscaler = MiniMaxH3LatentUpscaler.from_state_dict(
+            load_file(os.path.join(self.release_path, self.upscaler_file))
+        )
+        device = current_platform.get_local_torch_device()
+        self.latent_upscaler = upscaler.to(device, torch.bfloat16).eval()
+
+    def _adaln_curve_table_path(self) -> str:
+        """The 1025x8 curve table the release pins, cached on first use.
+
+        The release does not redistribute it; it is one tensor of a Comfy-Org
+        MiniMax-H3 checkpoint, read from the local hub cache when that file is
+        there and by HTTP byte range otherwise, then checked against the
+        release config's sha256.
+        """
+        import hashlib
+        import json
+
+        with open(os.path.join(self.release_path, self.release_config_file)) as f:
+            table = json.load(f)["curve_branches"]["table"]
+        path = os.path.join(
+            envs.SGLANG_DIFFUSION_CACHE_ROOT,
+            "minimax_h3",
+            f"adaln_t_table-{table['sha256'][:16]}.bin",
+        )
+        if os.path.isfile(path):
+            return path
+        data = _read_hub_safetensors_tensor(
+            table["repo"], table["revision"], table["file"], table["tensor"]
+        )
+        if hashlib.sha256(data).hexdigest() != table["sha256"]:
+            raise ValueError(
+                "adaln_t_table does not match the sha256 the release config pins"
+            )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        return path
+
+    def add_source_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.regenerate_source import (
+            MiniMaxH3RegenerateSourceStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3RegenerateSourceStage(
+                video_vae=self.get_module("video_vae"),
+                audio_vae=self.get_module("audio_vae"),
+                upscaler=self.latent_upscaler,
+                pipeline_config=server_args.pipeline_config,
+            )
+        )
+
+
+def _read_hub_safetensors_tensor(
+    repo: str, revision: str, path: str, name: str
+) -> bytes:
+    """One fp32 tensor's raw bytes from a hub safetensors file.
+
+    Uses the local hub cache when the file is there; otherwise reads only the
+    header and the tensor by HTTP byte range.
+    """
+    import json
+    import struct
+
+    from huggingface_hub import HfFileSystem, try_to_load_from_cache
+
+    cached = try_to_load_from_cache(repo, path, revision=revision)
+    if isinstance(cached, str):
+        from safetensors import safe_open
+
+        with safe_open(cached, "pt") as f:
+            return f.get_tensor(name).to(torch.float32).contiguous().numpy().tobytes()
+    with HfFileSystem().open(f"{repo}@{revision}/{path}", "rb", block_size=0) as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+        begin, end = header[name]["data_offsets"]
+        f.seek(8 + header_len + begin)
+        return f.read(end - begin)
+
+
+EntryClass = [
+    MiniMaxH3Pipeline,
+    FastH3Pipeline,
+    PikaH3FlexPipeline,
+    OpenH3RegeneratePipeline,
+]

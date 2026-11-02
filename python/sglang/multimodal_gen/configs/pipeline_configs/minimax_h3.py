@@ -451,8 +451,37 @@ class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
         )
 
 
+@dataclass
+class OpenH3RegeneratePipelineConfig(MiniMaxH3PipelineConfig):
+    """Open-H3-Regenerate-2K: MiniMax-H3 refining a draft at up to 2K."""
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; Open-H3-Regenerate-2K has no audited "
+            'high-quality deployment. Use quality="exact", or the default '
+            '"lossless".'
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "Open-H3-Regenerate-2K serves one FL2VA-based refiner; "
+                "--model-variant does not apply."
+            )
+        # A 2560x1440 refine needs the activation headroom: keep the 48 GB text
+        # encoder off the GPU between prompts, and merge the 12 GB FP32 LoRA
+        # into the DiT as the reference does (W = cast(W_fp32 + B @ A)).
+        if not server_args.is_arg_explicitly_set("text_encoder_cpu_offload"):
+            server_args.text_encoder_cpu_offload = True
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "merge"
+        super().validate_server_args(server_args)
+
+
 __all__ = [
     "FastH3OmniPipelineConfig",
+    "OpenH3RegeneratePipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
     "PikaH3FlexPipelineConfig",
@@ -464,6 +493,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        OpenH3RegenerateSamplingParams,
         PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
@@ -516,6 +546,19 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=OpenH3RegenerateSamplingParams,
+        pipeline_config_cls=OpenH3RegeneratePipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/Open-H3-Regenerate-2K",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "openh3regenerate"
+                in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )
