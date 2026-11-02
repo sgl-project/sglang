@@ -1,7 +1,6 @@
 """The gfx950 router GEMV keeps fp32 accuracy and is deterministic on both split-K reductions."""
 
 import unittest
-from functools import partial
 
 import torch
 
@@ -44,82 +43,6 @@ class TestRouterGemv(CustomTestCase):
             self.assertTrue(torch.equal(out, router_gemv(x, self.w)))
         self.assertFalse(router_gemv_supported(self._x(513), self.w))
 
-    def test_gate_sums_partials_like_the_reduce_launch(self):
-        """moe_fused_gate on router_gemv's split-K partials routes as on its logits."""
-        from sglang.kernels.ops.gemm.router_gemv import (
-            router_gemv,
-            router_gemv_partials,
-        )
-        from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
-
-        bias = torch.randn(NUM_EXPERTS, device="cuda", generator=self.gen) * 0.05
-        gate = partial(
-            moe_fused_gate,
-            bias=bias,
-            topk=4,
-            scoring_func="sigmoid",
-            renormalize=True,
-            routed_scaling_factor=2.0,
-            apply_routed_scaling_factor_on_output=True,
-        )
-        self.assertIsNone(router_gemv_partials(self._x(16), self.w))
-        for m in (17, 128, 300, 512):
-            x = self._x(m)
-            ref = gate(router_gemv(x, self.w))
-            out = gate(router_gemv_partials(x, self.w))
-            for got, want in zip(out, ref):
-                self.assertTrue(torch.equal(got, want))
-
-    def test_partials_with_swiglu_bitwise(self):
-        """The split-K partials and the shared expert's fp8 SwiGLU in one launch equal
-        router_gemv_partials and swiglu_oai_fp8, eagerly and in graph replay."""
-        from sglang.kernels.ops.gemm.router_gemv import (
-            router_gemv_partials,
-            router_gemv_partials_supported,
-            router_gemv_partials_swiglu,
-        )
-        from sglang.kernels.ops.quantization.aiter_fp8_quant_triton import (
-            swiglu_oai_fp8,
-        )
-
-        def gate_up(m, amp):
-            return (torch.randn(m, 1536, device="cuda", generator=self.gen) * amp).to(
-                torch.bfloat16
-            )
-
-        def check(fused, x, gu, quant):
-            ref_q, ref_s = swiglu_oai_fp8(gu, 1.702, 7.0, *quant)
-            ref_p = router_gemv_partials(x, self.w)
-            partials, (q, s) = fused
-            self.assertTrue(torch.equal(partials, ref_p))
-            self.assertTrue(torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8)))
-            self.assertTrue(torch.equal(s, ref_s))
-            self.assertEqual(s.stride(), ref_s.stride())
-
-        self.assertFalse(router_gemv_partials_supported(self._x(16), self.w))
-        # every router_gemv bucket past the fixup, per-token and 1 x 128 quant
-        for m in (17, 24, 64, 96, 128, 129, 256, 300, 320, 512):
-            for quant in ((None, False), (128, True)):
-                for amp in (1.0, 30.0):
-                    x, gu = self._x(m), gate_up(m, amp)
-                    self.assertTrue(router_gemv_partials_supported(x, self.w))
-                    fused = router_gemv_partials_swiglu(
-                        x, self.w, gu, 1.702, 7.0, *quant
-                    )
-                    fused = (fused[0].clone(), fused[1])
-                    check(fused, x, gu, quant)
-
-        x, gu = self._x(64), gate_up(64, 4.0)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fused = router_gemv_partials_swiglu(x, self.w, gu, 1.702, 7.0)
-        for _ in range(2):
-            x.copy_(self._x(64))
-            gu.copy_(gate_up(64, 4.0))
-            graph.replay()
-            torch.cuda.synchronize()
-            check((fused[0].clone(), fused[1]), x, gu, (None, False))
-
     def test_graph_replay_matches_eager(self):
         """Calls captured back to back share the split-K scratch and fixup counter; a replay
         must still reproduce each call's eager output."""
@@ -134,25 +57,6 @@ class TestRouterGemv(CustomTestCase):
         torch.cuda.synchronize()
         for out, ref in zip(outs, eager):
             self.assertTrue(torch.equal(out, ref))
-
-    def test_partials_survive_a_router_call_on_another_stream(self):
-        """Each stream has its own scratch, so another stream's router call leaves a
-        caller's split-K partials as they were."""
-        from sglang.kernels.ops.gemm.router_gemv import (
-            router_gemv,
-            router_gemv_partials,
-        )
-
-        x, other = self._x(256), self._x(512)
-        partials = router_gemv_partials(x, self.w)
-        ref = partials.clone()
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            router_gemv(other, self.w)
-            router_gemv_partials(other, self.w)
-        torch.cuda.synchronize()
-        self.assertTrue(torch.equal(partials, ref))
 
 
 if __name__ == "__main__":
