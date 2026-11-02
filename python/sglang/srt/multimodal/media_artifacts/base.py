@@ -154,10 +154,11 @@ class MediaArtifactCacheMixin:
             return data
         if isinstance(data, np.ndarray):
             return torch.from_numpy(data)
-        if isinstance(data, Image.Image):
-            data.load()
-            return data
-        image, _ = load_image(data, self.gpu_image_decode)
+        image, _ = load_image(
+            data,
+            self.gpu_image_decode,
+            apply_exif_orientation=self.apply_exif_orientation,
+        )
         if isinstance(image, Image.Image):
             image.load()
         return image
