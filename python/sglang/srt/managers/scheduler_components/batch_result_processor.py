@@ -189,7 +189,8 @@ class SchedulerBatchResultProcessor:
         if not req.return_routed_experts:
             return
         capturer = get_global_experts_capturer()
-        if capturer is None:
+        # Only the rank that sends outputs keeps routed experts on the host.
+        if capturer is None or not capturer.has_host_cache:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
