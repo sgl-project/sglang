@@ -56,26 +56,20 @@ class TestGfx1250V4UnifiedKvFp8Gate(CustomTestCase):
         is_unified_kv_fp8.cache_clear()
 
     def test_fp8_allowed_on_gfx1250(self):
-        with patch.object(
-            env_gate, "is_unified_kv_triton", return_value=True
-        ), patch.object(
-            envs.SGLANG_DSV4_UNIFIED_KV_FP8, "get", return_value=True
-        ), patch.object(
-            env_gate, "is_gfx95_supported", return_value=False
-        ), patch.object(
-            env_gate, "is_gfx1250_supported", return_value=True
+        with (
+            patch.object(env_gate, "is_unified_kv_triton", return_value=True),
+            patch.object(envs.SGLANG_DSV4_UNIFIED_KV_FP8, "get", return_value=True),
+            patch.object(env_gate, "is_gfx95_supported", return_value=False),
+            patch.object(env_gate, "is_gfx1250_supported", return_value=True),
         ):
             self.assertTrue(is_unified_kv_fp8())
 
     def test_fp8_falls_back_off_gfx95_and_gfx1250(self):
-        with patch.object(
-            env_gate, "is_unified_kv_triton", return_value=True
-        ), patch.object(
-            envs.SGLANG_DSV4_UNIFIED_KV_FP8, "get", return_value=True
-        ), patch.object(
-            env_gate, "is_gfx95_supported", return_value=False
-        ), patch.object(
-            env_gate, "is_gfx1250_supported", return_value=False
+        with (
+            patch.object(env_gate, "is_unified_kv_triton", return_value=True),
+            patch.object(envs.SGLANG_DSV4_UNIFIED_KV_FP8, "get", return_value=True),
+            patch.object(env_gate, "is_gfx95_supported", return_value=False),
+            patch.object(env_gate, "is_gfx1250_supported", return_value=False),
         ):
             self.assertFalse(is_unified_kv_fp8())
 

@@ -4,7 +4,7 @@ import functools
 import logging
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx1250_supported, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 logger = logging.getLogger(__name__)
 

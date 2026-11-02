@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx1250_supported, is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 _fp8_fnuz = is_fp8_fnuz()
 
