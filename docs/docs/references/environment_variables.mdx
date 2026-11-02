@@ -512,7 +512,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>This argument devives <code>SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code> which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default <code>0</code> means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>This argument derives <code>SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code> which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default <code>0</code> means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
 <tr>
