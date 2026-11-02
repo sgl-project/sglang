@@ -10,6 +10,8 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import ceil_align
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
@@ -182,6 +185,7 @@ class SchedulerPoolStatsObserver:
     session_controller: Any
     hisparse_coordinator: Any
     enable_hisparse: bool
+    uocr_doc_hooks: Optional[UocrDocHooks] = None
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -194,18 +198,27 @@ class SchedulerPoolStatsObserver:
         records = self.tree_cache.session_records().values()
         return [kv for kv in records if kv.holds_kv]
 
+    def _uocr_held_tokens(self) -> int:
+        # Retained document windows keep only some pages of their rows.
+        return 0 if self.uocr_doc_hooks is None else self.uocr_doc_hooks.held_tokens()
+
     def session_held_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        total = sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        return total + self._uocr_held_tokens()
 
     def session_held_swa_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(
+        total = sum(
             kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
         )
+        return total + self._uocr_held_tokens()
 
     def session_held_req_count(self) -> int:
-        return len(self._session_kv_rows())
+        held = len(self._session_kv_rows())
+        if self.uocr_doc_hooks is not None:
+            held += self.uocr_doc_hooks.held_req_count()
+        return held
 
     def session_held_mamba_slots(self) -> int:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
@@ -237,6 +250,8 @@ class SchedulerPoolStatsObserver:
 
     def _get_token_info(self, full: SubPoolUsage) -> PoolStats:
         available_size = full.available
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.tree_cache.evictable_size()
         num_used = full.capacity - (available_size + evictable_size)
         token_usage = num_used / full.capacity
@@ -308,6 +323,11 @@ class SchedulerPoolStatsObserver:
     def _get_swa_token_info(self, full: SubPoolUsage, swa: SubPoolUsage) -> PoolStats:
         full_capacity, full_available_size = full.capacity, full.available
         swa_capacity, swa_available_size = swa.capacity, swa.available
+        if is_cp_sharded_padded():
+            full_capacity = from_cp_sharded(full_capacity)
+            full_available_size = from_cp_sharded(full_available_size)
+            swa_capacity = from_cp_sharded(swa_capacity)
+            swa_available_size = from_cp_sharded(swa_available_size)
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         # Per-request SWA ring: released with the req slot, yet cached radix

@@ -1,13 +1,15 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_gfx95_supported
 
+from ..common.nvfp4 import Nvfp4Cache
 from ..common.tile_ptr import tile_ptrs_1d, tile_ptrs_2d
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -377,12 +379,28 @@ def _merge_topk_attn_out_kernel(
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)
 
 
+def _use_nvfp4_decode_gfx950(
+    q: torch.Tensor,
+    k_cache: Nvfp4Cache,
+    v_cache: Nvfp4Cache,
+    topk_idx: torch.Tensor,
+    block_size: int,
+) -> bool:
+    if not is_gfx95_supported():
+        return False
+    try:
+        from .nvfp4_decode_gfx950 import can_use_nvfp4_decode_gfx950
+    except ImportError:  # Gluon without the CDNA4 MFMA op
+        return False
+    return can_use_nvfp4_decode_gfx950(q, k_cache, v_cache, topk_idx, block_size)
+
+
 @torch.no_grad()
 def flash_decode_with_gqa_share_sparse(
     q: torch.Tensor,  # [batch_size, num_q_heads, head_dim]
     sink: Optional[torch.Tensor],
-    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
-    v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
+    k_cache: Union[torch.Tensor, Nvfp4Cache],  # [max_slots, num_kv_heads, head_dim]
+    v_cache: Union[torch.Tensor, Nvfp4Cache],  # [max_slots, num_kv_heads, head_dim]
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     seq_lens: torch.Tensor,  # [batch_size, ]
     slot_ids: torch.Tensor,  # [batch_size, ]
@@ -395,7 +413,36 @@ def flash_decode_with_gqa_share_sparse(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     hisparse_slots: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    out_quant: str = "",
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # out_quant only reaches the NVFP4 cache's kernels; the others return bf16 O.
+    if isinstance(k_cache, Nvfp4Cache):
+        assert sink is None and hisparse_slots is None, (
+            "NVFP4 sparse decode supports neither attention sinks nor HiSparse"
+        )
+        if not _use_nvfp4_decode_gfx950(q, k_cache, v_cache, topk_idx, block_size):
+            raise NotImplementedError(
+                "NVFP4 sparse decode runs on the gfx950 Gluon kernel only, which needs block "
+                "size 128, 16 query heads per KV head and each layer's NVFP4 cache under 2 "
+                "GiB; lower --mem-fraction-static for a smaller cache"
+            )
+        from .nvfp4_decode_gfx950 import flash_decode_nvfp4_gfx950
+
+        if sm_scale is None:
+            sm_scale = q.shape[-1] ** -0.5
+        return flash_decode_nvfp4_gfx950(
+            q,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens,
+            slot_ids,
+            block_size,
+            topk_idx,
+            sm_scale=sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
+            v_scale=unit_scale(v_scale),
+            out_quant=out_quant,
+        )
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)

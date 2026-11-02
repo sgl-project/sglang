@@ -80,8 +80,23 @@ def build_eagle_disagg_draft_input(
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+        # Metadata buffers live on the GPU under INTRA_NODE_NVLINK.
+        dsa_topk_indices_cpu = torch.stack(dsa_indices_list, dim=0).cpu()
+        # The remap's row checks below, on the host copy. Its slot <= 0 check needs
+        # no mirror: every slot below seq_len is allocated before prebuilt.
+        no_seed = torch.all(dsa_topk_indices_cpu < 0, dim=1)
+        remap = should_remap_pd_dsa_seed_to_local_slots()
+        if remap:
+            table_width = batch.req_to_token_pool.req_to_token.shape[1]
+            no_seed |= torch.any(
+                (dsa_topk_indices_cpu < -1)
+                | (dsa_topk_indices_cpu >= batch.seq_lens_cpu[:, None])
+                | (dsa_topk_indices_cpu >= table_width),
+                dim=1,
+            )
+        no_seed_row = bool(torch.any(no_seed))
         dsa_topk_indices = async_h2d_stack(dsa_indices_list, device=batch.device)
-        if should_remap_pd_dsa_seed_to_local_slots():
+        if remap:
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token
@@ -105,7 +120,7 @@ def build_eagle_disagg_draft_input(
             local_slots.masked_fill_(~valid_positions, -1)
             local_slots.masked_fill_(invalid_rows[:, None], -1)
             dsa_topk_indices = local_slots
-        if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+        if no_seed_row:
             dsa_topk_indices = None
 
     requires_dsa_seed_for_cuda_graph = _requires_dsa_seed_for_cuda_graph(

@@ -56,6 +56,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
+        s.invariant_checker = Mock()
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()

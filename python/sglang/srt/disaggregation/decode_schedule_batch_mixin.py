@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -55,7 +56,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_len] = chunk
             offset += req.extend_len
 
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            seq_len = pre_alloc_fill_len(req)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert seq_len - pre_len == req.extend_len, (
@@ -72,8 +73,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
-            if getattr(req, "pd_rebootstrap_in_progress", False):
-                req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
 
         # Set fields
@@ -132,11 +131,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
-                    # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
+                    # Use request_finish (not finish_outside_step) so that process_batch_result_prebuilt
                     # handles the release via update_finish_state -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    req.to_finish = FINISH_ABORT(
-                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+                    req.request_finish(
+                        FINISH_ABORT(error_message, HTTPStatus.INTERNAL_SERVER_ERROR)
                     )
                 req.grammar.finished = req.finished()
         last_tokens_tensor = async_h2d(

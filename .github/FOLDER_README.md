@@ -55,11 +55,11 @@ For existing PRs, update the branch to include the registry, handler, and gate
 changes, then push to create fresh runs. Rerunning an older run keeps its original
 workflow revision and label behavior.
 
-The registry also contains `nv` and `amd` Base selections and `mlu`, selecting
-`pr-test-mlu.yml` with `run-ci-mlu`. PPU remains outside the registry; its workflow
-uses `run-ci` and `run-ci-ppu` labels plus PPU path filters. Each Extra workflow
-requires its dedicated opt-in label through `require-label` in `pr-gate.yml`,
-in addition to `run-ci`. Register each opt-in workflow under its matching tier.
+The registry also contains `nv` and `amd` Base selections, `mlu`, selecting
+`pr-test-mlu.yml` with `run-ci-mlu`, and `ppu`, selecting `pr-test-ppu.yml`
+with `run-ci-ppu`. PPU keeps its existing path filters. Each opt-in workflow
+requires its dedicated label through `require-label` in `pr-gate.yml`, in
+addition to `run-ci`. Register each opt-in workflow under its matching tier.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

@@ -21,7 +21,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=200, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=200, stage="extra-b", runner_config="4-gpu-b200")
 
 PAGE_SIZE = 64
 # trtllm_mla is the Blackwell MLA backend that supports KV sharding.

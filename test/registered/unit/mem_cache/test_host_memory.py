@@ -122,9 +122,35 @@ class TestHostMemory(unittest.TestCase):
         self.memory("task/sibling", 600, stat={"inactive_file": 600})
         self.assertEqual(self.available(), 650)
 
-        # Parent reclaim must preserve the sibling's protected cache.
-        (self.mount / "task/sibling/memory.min").write_text("600")
-        self.assertEqual(self.available(), 50)
+        # Parent reclaim must preserve the sibling's protected cache, up to its
+        # usage. Unreadable protection withholds all of it.
+        for minimum, expected in [("600", 50), ("max", 50), ("200", 450), ("?", 50)]:
+            with self.subTest(minimum=minimum):
+                (self.mount / "task/sibling/memory.min").write_text(minimum)
+                self.assertEqual(self.available(), expected)
+
+    def test_systemd_service_keeps_cache_credit(self):
+        """A service under system.slice: a large file read fills page cache toward
+        memory.high, and systemd-oomd sets the only memory.min."""
+        self.configure("/task/system.slice/server.service")
+        self.memory("task", 2850, high=3500, stat={"inactive_file": 2750})
+        self.memory("task/system.slice", 2850, stat={"inactive_file": 2750})
+        self.memory("task/system.slice/server.service", 2846)
+        self.memory("task/system.slice/systemd-oomd.service", 4, minimum=64)
+        # Children without the memory controller have no memory.min.
+        (self.mount / "task/init.scope").mkdir()
+        self.assertEqual(self.available(), 3400)
+
+        # A direct child's protection is capped at its usage.
+        self.memory("task/oomd", 4, minimum=64)
+        self.assertEqual(self.available(), 3396)
+
+    def test_ancestor_caps_descendant_protection(self):
+        self.configure("/task/main/engine")
+        self.memory("task", 2850, high=3500, stat={"inactive_file": 2750})
+        self.memory("task/main", 2750, stat={"inactive_file": 2750})
+        self.memory("task/main/engine", 2750, minimum="max")
+        self.assertEqual(self.available(), 3400)
 
     def test_independent_engines_have_separate_allowances(self):
         # Both engines see the same host RAM but have different charged usage.

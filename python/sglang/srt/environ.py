@@ -37,8 +37,8 @@ def _default_cache_subdir(name: str) -> str:
     return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
-def _default_tree_cache_sanity_check() -> bool:
-    """Enable the expensive tree-cache sanity check by default in CI."""
+def _default_on_in_ci() -> bool:
+    """Enable an expensive self-check by default in CI."""
     return envs.SGLANG_IS_IN_CI.get()
 
 
@@ -506,7 +506,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
-    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
+    # Check each schedule that the running requests equal the ones batches hold.
+    SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -712,11 +714,17 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Most per-request states the detokenizer keeps; past it, the oldest is
+    # evicted. See https://github.com/sgl-project/sglang/issues/2812
+    SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
-    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Process a prefill step's result before scheduling the next step, for TTFT.
+    SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP"
+    )
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -730,15 +738,27 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
+    # Write the forward's small metadata (DP token counts, extend lengths, the
+    # non-padded token count) with one kernel launch per array instead of pinned
+    # host-to-device copies. Where other host-to-device DMA can be queued ahead of
+    # these small copies on the copy engine, they wait behind it and stall the
+    # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
+    # copy kernel, so as not to disturb persistent kernels.
+    SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP rank 0 posts its output recv only after its own forward. Enable it if PP
+    # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
+    SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in: retire finished prefill KV transfers while a forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -778,6 +798,7 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES = EnvInt(0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
@@ -802,6 +823,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Under overlap, publish decode KV destinations one iteration later instead of
+    # reading them back inline; False restores the inline publish.
+    SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -997,6 +1021,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
+    # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
+    # INT4 at every size.
+    SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB = EnvInt(64)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
@@ -1057,7 +1085,13 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
+    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
+    SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
+    # instead of `topk_gating`.
+    SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
@@ -1153,10 +1187,10 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time so arch35 (Atlas A5) dense linears run on the native quantized
-    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
-    # scales -> 1x32 UE8M0): off by default; enable explicitly for
-    # performance after validating accuracy for the workload.
+    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
+    # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
+    # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
@@ -1291,6 +1325,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
     SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
+    # Opt in to the dual decode graph for triton_v2 LoRA: a base-only graph for
+    # adapter-free batches next to the adapter graph (two graphs per batch
+    # size); off by default.
+    SGLANG_ENABLE_LORA_DUAL_GRAPH = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1380,6 +1418,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -1599,42 +1638,60 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
+    # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
+    # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
-    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_BK_VEC_COPY",
+    )
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
     # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
     # same-stream pre-planned load_batch already made.
-    SGLANG_Q35MF_MKH_N3B = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_MKH_N3B",
+    )
     # The post-verify graphs' per-round input load as one small_field_copy launch that also
     # reads the injected acceptance length from its pinned host slot (bit-identical); needs
     # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
-    SGLANG_Q35MF_MKH_N3C = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
+    SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_MKH_N3C",
+    )
     # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
     # with build_chain_tree instead of a full-context tree mask.
-    SGLANG_Q35MF_EDGE_CHAIN_TREE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_CHAIN_TREE",
     )
     # A verify whose requests all sample with a finite top-k within the compact limit
     # samples on that support (eagle_sample's compact branch), graphed or eager.
-    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
     )
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
-    SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST",
     )
     # The scheduler's per-pass TP syncs (request broadcast size, HiCache ready counts)
     # through a shared-memory table when the group shares a host (shm_tag_exchange.py).
-    SGLANG_Q35MF_EDGE_SHM_SYNC = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
-    # With SGLANG_Q35MF_EDGE_SHM_SYNC, a group across hosts exchanges per host and only
-    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
-    SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    SGLANG_OPT_SCHEDULER_SHM_SYNC = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC",
     )
-    SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    # With SGLANG_OPT_SCHEDULER_SHM_SYNC, a group across hosts exchanges per host and only
+    # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST",
+    )
+    SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP = EnvBoolWithAlias(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
+        deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
@@ -1689,6 +1746,24 @@ class Envs:
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
     # ===================================================================
+    # Unlimited-OCR v2
+    # ===================================================================
+    # Send a split document's next window while the current one decodes.
+    SGLANG_ENABLE_UOCR_DOC_PREFETCH = EnvBool(True)
+    # GPU memory for early-encoded follow-up pages; past it they encode at prefill.
+    SGLANG_UOCR_DOC_PREFETCH_MAX_MB = EnvInt(1024)
+    # Stage Unlimited-OCR crops in pinned host memory ahead of the forward.
+    SGLANG_ENABLE_UOCR_CROP_PREFETCH = EnvBool(True)
+    # Pinned host memory for prefetched crops; past it crops stage inline.
+    SGLANG_UOCR_CROP_PREFETCH_MAX_MB = EnvInt(1024)
+    # Materialize multimodal SHM segments off the scheduler thread.
+    SGLANG_ENABLE_UOCR_ASYNC_SHM_MATERIALIZATION = EnvBool(True)
+    # SHM bytes materializing at once; past it a request materializes inline.
+    SGLANG_UOCR_ASYNC_SHM_MAX_MB = EnvInt(4096)
+    # Send processor-owned model_specific_data tensors (crops) through SHM.
+    SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA = EnvBool(True)
+
+    # ===================================================================
     # Multimodal CUDA IPC transport
     # ===================================================================
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
@@ -1711,6 +1786,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: store radix mamba checkpoints only in the hicache host pool.
+    # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
+    # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
+    # still writes. Requires --enable-hierarchical-cache. Off keeps the
+    # donated GPU slot and the previous ratio.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -1916,6 +1997,10 @@ class Envs:
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # SM90 paged decode indexer: split all rows' tiles evenly over the GPU instead of a
+    # fixed number of CTAs per row, so one long context no longer sets the step time, and
+    # load each row's queries once. Scores are bitwise identical to the per-row kernel.
+    SGLANG_OPT_DSV41_FAST_DECODE_INDEXER = EnvBool(True)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
@@ -2204,7 +2289,7 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
@@ -2235,6 +2320,7 @@ class Envs:
     # KV-Canary and Token-Oracle (testing only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_INFO = EnvBool(False)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
@@ -2244,6 +2330,7 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_DETOKENIZER_SWAP_AT_OUTPUT = EnvInt(-1)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
@@ -2410,6 +2497,8 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # default the burst is invisible to anyone warming, mounting or baking
         # SGLANG_CACHE_DIR, and gets paid again on every cold container.
         "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
+        "HUMMING_CACHE_DIR": os.path.join(base, "humming", "cache"),
+        "HUMMING_TMP_DIR": os.path.join(base, "humming", "tmp"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
@@ -2426,6 +2515,7 @@ def redirect_third_party_caches():
     - FlashInfer was imported. It resolves its workspace at import time.
     - Inductor made its first ``cache_dir()`` call. That call setdefaults
       TORCHINDUCTOR_CACHE_DIR itself.
+    - Humming resolved its cache or temporary directory for the first time.
     """
     for key, value in third_party_cache_defaults().items():
         os.environ.setdefault(key, value)

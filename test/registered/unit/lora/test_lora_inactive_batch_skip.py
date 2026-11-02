@@ -1,13 +1,19 @@
 """Skip dense LoRA for adapter-free batches, except when capturing adapter graphs.
-Decode uses the separate nolora graph variant for adapter-free batches.
+Decode uses a separate nolora graph for adapter-free batches only when
+SGLANG_ENABLE_LORA_DUAL_GRAPH is set.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.environ import envs
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.utils import kv_b_lora_correction
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+    _should_record_nolora_graph,
+)
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -68,6 +74,24 @@ def test_capture_keeps_lora_except_for_the_nolora_variant(capture, variant, expe
     assert layer.lora_active is expected
     # The kv_b correction shares the capture boundary.
     assert kv_b_lora_correction(_attn(layer)) == ("v2" if expected else None)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_nolora_graph_toggle_preserves_explicit_variants(enabled):
+    runner = object.__new__(DecodeCudaGraphRunner)
+    with envs.SGLANG_ENABLE_LORA_DUAL_GRAPH.override(enabled):
+        for skip_dense in (False, True):
+            model = SimpleNamespace(lora_manager=_layer(False, skip_dense=skip_dense))
+            runner.record_nolora_graph = _should_record_nolora_graph(model)
+            expected = skip_dense and enabled
+            assert runner.record_nolora_graph is expected
+            for ids, variant in (([None], "nolora"), (["adapter"], "lora")):
+                batch = SimpleNamespace(lora_ids=ids)
+                assert runner._resolve_lora_variant(batch) == (
+                    variant if expected else None
+                )
+            assert _should_record_nolora_graph(model, explicitly_requested=True)
+        assert not _should_record_nolora_graph(SimpleNamespace(lora_manager=None))
 
 
 def test_kv_b_correction_runs_v2_legacy_or_nothing(capture):

@@ -24,11 +24,9 @@ from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
+    is_supported_rmsnorm_hidden_size,
 )
-from sglang.kernels.ops.layernorm.rmsnorm_hf import (
-    is_supported_rmsnorm_hf_hidden_size,
-    rmsnorm_hf,
-)
+from sglang.kernels.ops.layernorm.norm import rmsnorm as jit_rmsnorm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -150,13 +148,17 @@ class RMSNorm(CustomOp):
             if (
                 x_2d.dtype in (torch.float16, torch.bfloat16)
                 and self.weight.dtype == x_2d.dtype
-                and is_supported_rmsnorm_hf_hidden_size(x_2d.shape[-1])
+                and is_supported_rmsnorm_hidden_size(x_2d.shape[-1])
             ):
-                return rmsnorm_hf(
+                out = torch.empty_like(x_2d)
+                jit_rmsnorm(
                     x_2d,
                     self.weight.data,
+                    out,
                     self.variance_epsilon,
-                ).view(shape)
+                    cast_x_before_out_mul=True,
+                )
+                return out.view(shape)
             return self.forward_native(x)
 
         x = x.reshape(-1, shape[-1])

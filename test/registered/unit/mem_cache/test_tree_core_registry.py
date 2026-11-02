@@ -119,6 +119,12 @@ class TreeCoreRegistryTest(CustomTestCase):
         self.assertNotIsInstance(core, UnifiedTreeCoreInspectionInterface)
         self.assertIs(component.tree_core, core)
 
+    def test_registry_resolves_the_rust_backend_lazily(self):
+        core = create_tree_core(name="rust", params=_cache_init_params(), components={})
+        assert type(core).__name__ == "RustUnifiedTreeCore"
+        assert not isinstance(core, UnifiedTreeCoreInspectionInterface)
+        assert not any(name.startswith("inspect_") for name in dir(core._binding))
+
     def test_unknown_backend_raises_naming_the_known_backends(self):
         with self.assertRaisesRegex(ValueError, "not registered") as cm:
             create_tree_core(

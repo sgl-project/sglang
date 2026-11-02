@@ -282,6 +282,8 @@ class DecodeStagingHandler:
         Called from decode_thread.  Records a device event on decode_req so
         the main thread can later check completion and free the allocation.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
+
         with self._staging_lifecycle:
             decode_req = self._room_to_decode_req.get(room)
             if decode_req is None:
@@ -315,7 +317,13 @@ class DecodeStagingHandler:
                 # Append before zeroing so the completion check always sees either
                 # the slot or the event.
                 decode_req._chunk_events.append((event, alloc_id))
-                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+                chunk_infos[chunk_idx] = (
+                    -1,
+                    StagingAllocator.CHUNK_SCATTERED,
+                    0,
+                    -1,
+                    0,
+                )
             else:
                 logger.warning(
                     "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
@@ -867,6 +875,14 @@ def handle_staging_req(
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
         _, offset, rnd, end, _ = infos[chunk_idx]
+    elif (
+        chunk_idx < len(infos)
+        and infos[chunk_idx][1] == StagingAllocator.CHUNK_SCATTERED
+    ):
+        # Another prefill writer's request (sent on a separate socket) can land
+        # after this chunk already scattered; a fresh allocation would never be
+        # scattered and would pin the ring until the room times out.
+        return
     elif (
         chunk_idx < len(infos)
         and infos[chunk_idx][1] == StagingAllocator.ALLOC_OVERSIZED
