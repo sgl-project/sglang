@@ -2633,6 +2633,11 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.video_tokens {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "video_tokens", v)?;
         }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens_details",
+            &self.cached_tokens_details,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2669,6 +2674,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_image_tokens = None;
                 let mut f_audio_tokens = None;
                 let mut f_video_tokens = None;
+                let mut f_cached_tokens_details = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2830,6 +2836,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_video_tokens = Some(map.next_value::<Option<u32>>()?);
                         }
+                        "cached_tokens_details" => {
+                            if f_cached_tokens_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "cached_tokens_details",
+                                ));
+                            }
+                            f_cached_tokens_details =
+                                Some(map.next_value::<Option<CachedTokensDetails>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2856,6 +2871,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     image_tokens: f_image_tokens.flatten(),
                     audio_tokens: f_audio_tokens.flatten(),
                     video_tokens: f_video_tokens.flatten(),
+                    cached_tokens_details: f_cached_tokens_details.flatten(),
                 })
             }
         }
@@ -2917,6 +2933,81 @@ impl<'de> ::serde::Deserialize<'de> for WeightVersionSpan {
                     version: f_version.unwrap_or_default(),
                     start: f_start.unwrap_or_default(),
                     end: f_end.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for CachedTokensDetails {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "device", &self.device)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "host", &self.host)?;
+        if let Some(v) = &self.storage {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "storage", v)?;
+        }
+        if let Some(v) = &self.storage_backend {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "storage_backend", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for CachedTokensDetails {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = CachedTokensDetails;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct CachedTokensDetails")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_device = None;
+                let mut f_host = None;
+                let mut f_storage = None;
+                let mut f_storage_backend = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "device" => {
+                            if f_device.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("device"));
+                            }
+                            f_device = Some(map.next_value::<u32>()?);
+                        }
+                        "host" => {
+                            if f_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("host"));
+                            }
+                            f_host = Some(map.next_value::<u32>()?);
+                        }
+                        "storage" => {
+                            if f_storage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("storage"));
+                            }
+                            f_storage = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "storage_backend" => {
+                            if f_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("storage_backend"));
+                            }
+                            f_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(CachedTokensDetails {
+                    device: f_device.unwrap_or_default(),
+                    host: f_host.unwrap_or_default(),
+                    storage: f_storage.flatten(),
+                    storage_backend: f_storage_backend.flatten(),
                 })
             }
         }

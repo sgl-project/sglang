@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -60,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_gfx1250_supported,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -185,6 +187,31 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     }
 
 
+_use_gfx1250_absorb_bmm = _use_aiter and _is_gfx1250_supported
+if _use_gfx1250_absorb_bmm:
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+    except ImportError:
+        logger.warning(
+            "aiter has no batched_gemm_bf16; the gfx1250 MLA absorb BMMs keep torch.bmm"
+        )
+        _use_gfx1250_absorb_bmm = False
+
+
+def _gfx1250_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
+    """aiter's bf16 batched GEMM beats torch.bmm on gfx1250 at decode rows only;
+    prefill rows stay on torch.bmm. Piecewise CUDA graphs also keep torch.bmm,
+    since dynamo does not trace the aiter launch."""
+    return (
+        x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+        and x.shape[0] <= _ABSORB_BMM_DECODE_MAX_M
+        and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
     """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
     if (
@@ -240,6 +267,14 @@ def rocm_absorb_q_bmm(
                         q_nope.shape[1], q_nope.shape[0], attn.w_kc.shape[2]
                     ),
                 )
+            )
+        elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+            x=q_nope, w=attn.w_kc, w_scale=attn.w_scale
+        ):
+            q_nope_out = batched_gemm_bf16(
+                XQ=q_nope.transpose(0, 1),
+                WQ=attn.w_kc.transpose(1, 2),
+                backend="gluon" if q_nope.shape[0] <= 4 else "triton",
             )
         else:
             q_nope_out = torch.bmm(
@@ -312,11 +347,21 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                out=_bmm_buf.transpose(0, 1),
-            )
+            if _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+                x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
+            ):
+                batched_gemm_bf16(
+                    XQ=attn_output.transpose(0, 1),
+                    WQ=attn.w_vc.transpose(1, 2),
+                    YQ=_bmm_buf.transpose(0, 1),
+                    backend="gluon",
+                )
+            else:
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                    out=_bmm_buf.transpose(0, 1),
+                )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
@@ -681,7 +726,18 @@ class DeepseekMLARocmForwardMixin:
             and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
-        if q_replicate_active:
+        if q_replicate_active and not is_in_tc_piecewise_cuda_graph():
+            # Write token-major directly; a head-major result would need a full
+            # [T, H, kv_lora_rank] transpose copy before attention.
+            q_nope_out = q_nope.new_empty(
+                q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank
+            )
+            torch.bmm(
+                q_nope.transpose(0, 1),
+                self.w_kc_qrep,
+                out=q_nope_out.transpose(0, 1),
+            )
+        elif q_replicate_active:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
@@ -1023,6 +1079,23 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
+                if self._dcp_project_before_merge():
+                    # Project-before-merge: the LSE merge is linear in the
+                    # partial output, so V-project every group head first and
+                    # exchange v_head_dim instead of kv_lora_rank per head.
+                    attn_bmm_output = dcp_a2a_lse_reduce(
+                        self._dcp_project_partials(attn_output),
+                        lse.contiguous(),
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        comm_backend=dcp_comm_backend,
+                    ).flatten(1, 2)
+                    output, _ = self.o_proj(attn_bmm_output)
+                    if self.next_skip_topk is None:
+                        return output
+                    if not self.next_skip_topk:
+                        return output, None
+                    return output, topk_indices
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     attn_output = dcp_a2a_lse_reduce(
@@ -1119,6 +1192,26 @@ class DeepseekMLARocmForwardMixin:
         if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             return None
         return dtype
+
+    def _dcp_project_before_merge(self: DeepseekV2AttentionMLA) -> bool:
+        return (
+            get_parallel().dcp_comm_backend == "a2a"
+            and self.w_vc_qrep is not None
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and not is_kv_b_lora_active(self)
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        )
+
+    def _dcp_project_partials(
+        self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+    ) -> torch.Tensor:
+        projected = attn_output.new_empty(
+            attn_output.shape[0], attn_output.shape[1], self.v_head_dim
+        )
+        torch.bmm(
+            attn_output.transpose(0, 1), self.w_vc_qrep, out=projected.transpose(0, 1)
+        )
+        return projected
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """

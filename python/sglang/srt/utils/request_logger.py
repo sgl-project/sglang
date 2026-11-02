@@ -102,10 +102,11 @@ class RequestLogger:
 
         max_length, skip_names, _ = self.metadata
         headers = _extract_whitelisted_headers(request)
+        obj_to_log = _redact_client_watermark(obj)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(obj_to_log, max_length, skip_names),
             }
             if headers:
                 log_data["headers"] = headers
@@ -113,7 +114,7 @@ class RequestLogger:
         else:
             headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}{headers_str}"
+                f"Receive: obj={_dataclass_to_string_truncated(obj_to_log, max_length, skip_names=skip_names)}{headers_str}"
             )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
@@ -148,6 +149,7 @@ class RequestLogger:
             obj_to_log = obj.model_dump(exclude_none=True)
         else:
             obj_to_log = obj
+        obj_to_log = _redact_client_watermark(obj_to_log)
 
         if self.log_requests_format == "json":
             log_data = {
@@ -177,10 +179,11 @@ class RequestLogger:
 
         max_length, skip_names, out_skip_names = self.metadata
         headers = _extract_whitelisted_headers(request)
+        obj_to_log = _redact_client_watermark(obj)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+                "obj": _transform_data_for_logging(obj_to_log, max_length, skip_names),
             }
             if headers:
                 log_data["headers"] = headers
@@ -190,7 +193,7 @@ class RequestLogger:
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
-                obj, max_length, skip_names=skip_names
+                obj_to_log, max_length, skip_names=skip_names
             )
             out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
@@ -255,6 +258,41 @@ def _maybe_redact_watermark_secrets(data: Any) -> Any:
     if not _watermark_redaction_enabled():
         return data
     return redact_watermark_secrets(data)
+
+
+def _has_client_watermark(obj: Any) -> bool:
+    # Look only where a client can put a watermark config; walking the request
+    # would scan its token-id lists.
+    if isinstance(obj, dict):
+        # The OpenAI request, dumped to a dict.
+        return obj.get("watermark") is not None
+    # EmbeddingReqInput has no watermark field.
+    watermark = getattr(obj, "watermark", None)
+    watermarks = watermark if isinstance(watermark, list) else [watermark]
+    sampling_params = obj.sampling_params
+    if isinstance(sampling_params, dict):
+        sampling_params = [sampling_params]
+    return any(item is not None for item in watermarks) or any(
+        isinstance(params, dict) and params.get("watermark") is not None
+        for params in sampling_params or ()
+    )
+
+
+def _redact_client_watermark(obj: Any) -> Any:
+    # A client can send a watermark key to a server without --enable-watermark,
+    # and the request is logged before validation rejects it.
+    if not _has_client_watermark(obj) or _watermark_redaction_enabled():
+        return obj
+    if isinstance(obj, dict):
+        # Redact only the OpenAI request's watermark config; walking the whole
+        # dict would scan its prompt.
+        return {
+            **obj,
+            "watermark": redact_watermark_secrets(
+                obj["watermark"], in_watermark_config=True
+            ),
+        }
+    return redact_watermark_secrets(obj)
 
 
 def _redact_field(name: str, value: Any) -> Any:

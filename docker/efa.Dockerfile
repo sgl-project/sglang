@@ -10,8 +10,8 @@ ARG BASE_IMAGE=lmsysorg/sglang:latest-runtime
 FROM ${BASE_IMAGE}
 
 ARG TARGETARCH
-ARG EFA_INSTALLER_VERSION=1.50.0
-ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 # Install the AWS EFA userspace stack. The distro libfabric1 stays (libopenmpi
 # depends on it); the ENV below makes the AWS copy win at runtime.
@@ -24,9 +24,10 @@ RUN set -eux; \
     tar -xzf "${EFA_INSTALLER_ARCHIVE}" -C /tmp; \
     # The installer apt-installs dependencies; the base image purged the lists.
     apt-get update -y; \
-    # Not --minimal: it skips libfabric, which the EFA data path needs.
+    # Minimal install: libfabric, aws-ofi-nccl and hwloc only. --build-ngc
+    # implies --skip-kmod --skip-limit-conf --no-verify.
     (cd /tmp/aws-efa-installer && \
-        ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify); \
+        ./efa_installer.sh --skip-mpi --skip-rdma-core --build-ngc); \
     test -x /opt/amazon/efa/bin/fi_info; \
     /opt/amazon/efa/bin/fi_info --version; \
     # `-l` lists providers without EFA hardware, so this works in a build.

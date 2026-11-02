@@ -478,6 +478,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,

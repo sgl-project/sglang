@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 
@@ -146,6 +147,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -174,11 +176,12 @@ def _use_rocm_triton_softmax_topk(
     num_shared_topk_slots: int,
     packed_out: Optional[torch.Tensor],
 ) -> bool:
-    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    """Use the lower-latency Triton router for Qwen3.5 and Qwen3-Next
+    decode-sized rows."""
     return (
         _use_aiter
         and _is_gfx95
-        and hidden_states.shape[1] == 4096
+        and hidden_states.shape[1] in (2048, 4096)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[0] <= 128
         and gating_output.shape[1] == 512
@@ -186,6 +189,40 @@ def _use_rocm_triton_softmax_topk(
         and topk == 10
         and correction_bias is None
         and num_shared_topk_slots == 0
+        and packed_out is None
+    )
+
+
+_use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
+
+# Above this, topk_gating is slower than fused_topk on GPU time.
+_AITER_TOPK_GATING_MAX_ROWS = 4096
+
+
+def _use_aiter_topk_gating_softmax(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    correction_bias: Optional[torch.Tensor],
+    num_fused_shared_experts: int,
+    packed_out: Optional[torch.Tensor],
+) -> bool:
+    # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
+    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
+    # (Qwen3.8-Flash-Next) limit this to those two models.
+    return (
+        _use_aiter
+        and _use_aiter_topk_gating
+        and _is_gfx95
+        and hidden_states.shape[1] in (2560, 8192)
+        and hidden_states.dtype == torch.bfloat16
+        and gating_output.shape[1] == 512
+        and gating_output.dtype == torch.bfloat16
+        and topk == 10
+        and gating_output.is_contiguous()
+        and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
+        and correction_bias is None
+        and num_fused_shared_experts == 0
         and packed_out is None
     )
 
@@ -469,10 +506,15 @@ def _simulate_balanced_routing_kernel(
     stride_wm,
     stride_wk,
     num_non_padded_ptr,
+    to_physical_map_ptr,
+    logical_count_ptr,
+    num_duplicates,
+    ep_rank,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     RANDOM: tl.constexpr,
     HAS_NON_PADDED: tl.constexpr = False,
+    HAS_PHYSICAL_MAP: tl.constexpr = False,
 ):
     """One program per token: overwrite its top-k row with a balanced expert
     assignment and uniform ``1/k`` weights, in a single launch — so the
@@ -494,8 +536,10 @@ def _simulate_balanced_routing_kernel(
     so it is baked at CUDA-graph capture and replays stay balanced) spread by
     ``step``; it is the only path that reads ``token_shard_rank`` /
     ``num_token_shards``, to seed scattered DP shards differently. Both emit
-    global expert ids (any EP logical->physical remap happens later in
-    ``_post_process_topk_ids``)."""
+    global logical expert ids; ``HAS_PHYSICAL_MAP`` then maps them to physical
+    slots with the replica pick of DeepGEMM's MegaGate (``(ep_rank + t * 23333)
+    % logical_count``), otherwise the remap happens later in
+    ``_post_process_topk_ids``."""
     t = tl.program_id(0)
     j = tl.arange(0, BLOCK_K)
     mask = j < K
@@ -509,6 +553,14 @@ def _simulate_balanced_routing_kernel(
             deal // num_ranks
         ) % experts_per_rank
     w = tl.full((BLOCK_K,), inv_k, tl.float32)
+    if HAS_PHYSICAL_MAP:
+        count = tl.load(logical_count_ptr + gid, mask=mask, other=1)
+        dup = (ep_rank + t.to(tl.int64) * 23333) % count
+        gid = tl.load(
+            to_physical_map_ptr + gid.to(tl.int64) * num_duplicates + dup,
+            mask=mask,
+            other=0,
+        )
     if HAS_NON_PADDED:
         is_pad = t >= tl.load(num_non_padded_ptr)
         gid = tl.where(is_pad, -1, gid)
@@ -535,6 +587,9 @@ def _simulate_balanced_routing(
     seed: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     weight_scale: float = 1.0,
+    to_physical_map: Optional[torch.Tensor] = None,
+    logical_count: Optional[torch.Tensor] = None,
+    ep_rank: int = 0,
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
@@ -559,7 +614,9 @@ def _simulate_balanced_routing(
     shard count is a multiple of ``num_ranks``, and otherwise differs by at
     most one slot per shard whose ``tokens * k`` leaves a remainder. Balance is
     over logical expert blocks ``num_experts // num_ranks``: a non-trivial
-    expert placement (EPLB, redundant experts) remaps it afterwards.
+    expert placement (EPLB, redundant experts) remaps it afterwards, or here
+    when ``to_physical_map`` (``[num_experts, dup]`` int32) and
+    ``logical_count`` (``[num_experts]`` int32) are given.
 
     ``seed`` is exposed for deterministic tests; production calls use a
     per-launch seed.
@@ -604,10 +661,15 @@ def _simulate_balanced_routing(
         topk_weights.stride(0),
         topk_weights.stride(1),
         num_token_non_padded if num_token_non_padded is not None else topk_ids,
+        to_physical_map if to_physical_map is not None else topk_ids,
+        logical_count if logical_count is not None else topk_ids,
+        to_physical_map.shape[1] if to_physical_map is not None else 1,
+        ep_rank,
         K=k,
         BLOCK_K=triton.next_power_of_2(k),
         RANDOM=random,
         HAS_NON_PADDED=num_token_non_padded is not None,
+        HAS_PHYSICAL_MAP=to_physical_map is not None,
     )
 
 
@@ -1267,15 +1329,35 @@ def fused_topk(
             packed_out,
         )
         if _use_aiter and not use_rocm_triton:
-            # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
-            topk_weights, topk_ids = aiter_fused_topk(
+            if _use_aiter_topk_gating_softmax(
                 hidden_states,
                 gating_output,
                 topk,
-                renormalize,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
+                correction_bias,
+                num_fused_shared_experts,
+                packed_out,
+            ):
+                from aiter import topk_gating
+
+                topk_gating(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    correction_bias=None,
+                    need_renorm=renormalize,
+                    routed_scaling_factor=1.0,
+                    score_func="softmax",
+                )
+            else:
+                # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
+                topk_weights, topk_ids = aiter_fused_topk(
+                    hidden_states,
+                    gating_output,
+                    topk,
+                    renormalize,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
@@ -2025,6 +2107,9 @@ def biased_grouped_topk_gpu(
         # flashinfer always renormalizes the selected weights
         and renormalize
         and is_power_of_two(num_experts)
+        # SAIL's torch backend reports as CUDA, but flashinfer topk asserts
+        # sm >= 89, which SAIL Zhenwu 810E devices do not satisfy.
+        and not _is_sail
         # flashinfer constraints (applied to routed experts only)
         and topk_routed <= 8
         and topk_group <= num_expert_group
@@ -2407,6 +2492,8 @@ def apply_routing_simulation(
     layer_id: Optional[int],
     num_token_non_padded: Optional[torch.Tensor] = None,
     weight_scale: float = 1.0,
+    to_physical_map: Optional[torch.Tensor] = None,
+    logical_count: Optional[torch.Tensor] = None,
 ) -> None:
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     # Benchmark-only: override gating with a balanced expert assignment (so
@@ -2449,6 +2536,9 @@ def apply_routing_simulation(
         num_token_shards=num_token_shards,
         num_token_non_padded=num_token_non_padded,
         weight_scale=weight_scale,
+        to_physical_map=to_physical_map,
+        logical_count=logical_count,
+        ep_rank=parallel.moe_ep_rank if to_physical_map is not None else 0,
     )
 
 

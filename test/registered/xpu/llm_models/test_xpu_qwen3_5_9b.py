@@ -1,6 +1,6 @@
 """Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=1).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``. Covers both standalone SYCL GDN
+Scored by sgl-eval ``gsm8k`` with thinking disabled. Covers both standalone SYCL GDN
 (``--linear-attn-backend intel_xpu``) and Triton GDN. Both use SYCL conv1d.
 """
 
@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=900, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -22,11 +22,14 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=Tr
 class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
     tp_size = 1
-    accuracy = 0.90
-    # max_tokens=8192 lets the GSM8K CoT complete under num_threads=4.
-    num_examples = 50
+    # Thinking loops re-checking sgl-eval's boxed answer until max_tokens;
+    # non-thinking scored 0.96 on 50 examples (3 runs, B70).
+    chat_template_kwargs = {"enable_thinking": False}
+    # Lowest score over 3 runs of all 3 classes (B70); raise only on new data.
+    accuracy = 0.95
+    num_examples = 20
     num_threads = 4
-    max_tokens = 8192
+    max_tokens = 2048
 
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--page-size",

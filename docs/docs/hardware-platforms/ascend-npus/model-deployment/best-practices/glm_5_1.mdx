@@ -14,17 +14,17 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Ascend A3 Series Products | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
-| GLM-5.1 | Ascend A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | A3 Series Products | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | A3 Series Products | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -34,7 +34,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -153,7 +153,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -363,7 +363,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -565,7 +565,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -775,7 +775,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
@@ -978,7 +978,7 @@ python -m sglang.bench_serving \
 
 **Model**: GLM-5.1
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 
