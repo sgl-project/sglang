@@ -265,8 +265,8 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
         return dispatcher
 
     def test_tbo_child_marked_only_while_its_stage_runs(self):
-        """A TBO child's stage sees itself marked and its parent's DP rows; once
-        the stage returns, both are gone, so later forwards are ordinary even
+        """A TBO child's stage sees itself marked and the DP rows that bound it;
+        once the stage returns, both are gone, so later forwards are ordinary even
         where no DP metadata is republished (no DP attention)."""
         from sglang.srt.batch_overlap.operations import _StageExecutor
         from sglang.srt.model_executor.forward_context import (
@@ -286,6 +286,7 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             global_dp_buffer_len=None,
             tbo_padded_len=None,
             global_num_tokens_cpu=None,
+            tbo_parent_token_range=(0, 8),
             tbo_dp_global_num_tokens_bound=[3, 5],
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
             moe_num_token_non_padded=None,
@@ -296,17 +297,23 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             [[SimpleNamespace(debug_name="probe", fn=probe)]],
             inputs={"forward_batch": child},
             child_ctx=ForwardContext(attn_backend=None),
-            micro_batch=True,
         )
         executor.next()
         self.assertEqual(seen, [(True, [3, 5])])
         self.assertFalse(has_forward_context())
 
         # An unsplit forward (execute_operations) runs no micro-batch.
+        parent = SimpleNamespace(
+            **{
+                **vars(child),
+                "tbo_parent_token_range": None,
+                "tbo_dp_global_num_tokens_bound": None,
+            }
+        )
         _StageExecutor(
             "primary",
             [[SimpleNamespace(debug_name="probe", fn=probe)]],
-            inputs={"forward_batch": child},
+            inputs={"forward_batch": parent},
             child_ctx=ForwardContext(attn_backend=None),
         ).next()
         self.assertEqual(seen[-1], (False, None))
