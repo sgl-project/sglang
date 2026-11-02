@@ -114,7 +114,9 @@ def _enqueue(ranks, kind, names):
     out = []
     for r in ranks:
         acks = [_Ack(n) for n in names]
-        getattr(r.cache_controller, f"ack_{kind}_queue").extend(acks)
+        cc = r.cache_controller
+        queue = {"write": cc.ack_write_queue, "load": cc.ack_load_queue}[kind]
+        queue.extend(acks)
         out.append(acks)
     return out
 
