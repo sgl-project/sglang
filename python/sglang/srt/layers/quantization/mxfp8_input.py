@@ -16,6 +16,21 @@ class Mxfp8SwizzledInput(NamedTuple):
     scales: torch.Tensor
 
 
+class Mxfp8Block128Input(NamedTuple):
+    """E4M3 activations [M, K] and per-128 UE8M0 scales whose (M, K // 128) view
+    holds column-major (K // 128, M) bytes: the gfx1250 mx128 GEMM A operand."""
+
+    data: torch.Tensor
+    scales: torch.Tensor
+
+    def head_rows(self, n: int) -> "Mxfp8Block128Input":
+        m = self.data.shape[0]
+        if n == m:
+            return self
+        scales = self.scales.view(-1, m)[:, :n].contiguous()
+        return Mxfp8Block128Input(self.data[:n], scales.view(n, -1))
+
+
 def accepts_mxfp8_swizzled_input(linear) -> bool:
     """Whether a linear can consume the explicit 128x4 producer contract."""
     qm = getattr(linear, "quant_method", None)

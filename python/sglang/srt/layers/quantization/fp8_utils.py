@@ -1823,22 +1823,23 @@ def aiter_mxfp8_gfx1250_block_fp8_linear(
         )
     output_shape = [*input.shape[:-1], weight.shape[0]]
     input_2d = input.view(-1, input.shape[-1])
-    m, k = input_2d.shape
-    if input_scale is not None:
-        groups = input_2d.float().view(m, k // 128, 128)
-        input_2d = (groups * input_scale.float().reshape(m, -1, 1)).view(m, k)
-        input_2d = input_2d.to(torch.bfloat16)
-    if m == 0:
-        return input_2d.new_empty(output_shape)
-    q_input, x_scale = aiter_per_group_quant(
-        input_2d,
-        quant_dtype=aiter_dtypes.fp8,
-        group_size=128,
-        transpose_scale=True,
-        scale_type=aiter_dtypes.fp8_e8m0,
-    )
+    output_dtype = input_2d.dtype if input_scale is None else torch.bfloat16
+    if input_2d.shape[0] == 0:
+        return input_2d.new_empty(output_shape, dtype=output_dtype)
+    if input_scale is None:
+        q_input, x_scale = aiter_per_group_quant(
+            input_2d,
+            quant_dtype=aiter_dtypes.fp8,
+            group_size=128,
+            transpose_scale=True,
+            scale_type=aiter_dtypes.fp8_e8m0,
+        )
+    else:
+        # Mxfp8Block128Input: e8m0 bytes column-major (K // 128, M).
+        assert input_scale.dtype == aiter_dtypes.fp8_e8m0, input_scale.dtype
+        q_input, x_scale = input_2d, input_scale
     output = aiter_mxfp8_gemm_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, dtype=input_2d.dtype
+        q_input, weight, x_scale, weight_scale, dtype=output_dtype
     )
     if bias is not None:
         output += bias

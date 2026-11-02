@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8Block128Input
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -803,11 +804,15 @@ class C4IndexerBackendMixin:
             widened = getattr(metadata, "fp4_q_positions", None)
             if widened is not None and widened.shape == positions.shape:
                 positions = widened
-        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+        prequant_q = isinstance(q_lora, Mxfp8Block128Input)
+        q_rows = q_lora.data.shape[0] if prequant_q else q_lora.shape[0]
+        num_queries = min(x.shape[0], q_rows, positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
-        if q_lora.shape[0] != num_queries:
-            q_lora = q_lora[:num_queries]
+        if q_rows != num_queries:
+            q_lora = (
+                q_lora.head_rows(num_queries) if prequant_q else q_lora[:num_queries]
+            )
             q_lora_quant = None
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]

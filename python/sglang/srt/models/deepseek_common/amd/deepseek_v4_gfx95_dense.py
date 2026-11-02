@@ -24,13 +24,11 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
-_is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 # V4.1's wo_a route on gfx950: an aiter batched GEMM fork with wo_b's fp8-grid rounding in its
@@ -49,7 +47,7 @@ def fused_rmsnorm_fp8_quant_eligible(
     output is consumed only by the 128x128-block dense GEMM."""
     return bool(
         _use_aiter
-        and (_is_gfx95_supported or _is_gfx1250_supported)
+        and _is_gfx95_supported
         and isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size == [128, 128]
     )

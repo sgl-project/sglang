@@ -407,7 +407,7 @@ _is_gfx1250_supported = is_gfx1250_supported()
 
 
 _fused_rms_fp8_group_quant = None
-if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
+if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_rms_fp8_group_quant as _fused_rms_fp8_group_quant,
     )
