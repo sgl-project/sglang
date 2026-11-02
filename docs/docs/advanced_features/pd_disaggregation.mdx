@@ -461,6 +461,70 @@ python -m sglang_router.launch_router \
   --host 0.0.0.0 --port 8000
 ```
 
+### Mooncake SWA sender packing
+
+For hybrid sliding-window attention (SWA) models with a smaller prefill attention
+TP size than decode attention TP size, you can pack the destination's KV-head
+slice on the sender and transfer whole pages into the final decode SWA pool.
+This option is independent of full-attention KV staging: it does not change that
+path's receive buffer, scatter or completion protocol.
+
+The packed path uses GPU gather kernels and Mooncake RDMA. It has been exercised
+on AMD ROCm with MI355X GPUs; this validation does not establish support for every
+platform on which the general Mooncake backend runs.
+
+#### Configuration
+
+Use matching SGLang builds that include packing support on both peers. On the
+prefill server, set these variables before launching your existing Mooncake PD
+configuration:
+
+```bash
+export SGLANG_MOONCAKE_SWA_PACKING=1
+export SGLANG_MOONCAKE_SWA_PACK_BUFFER_SIZE_MB=64
+```
+
+Packing defaults to disabled. The buffer defaults to 64 MiB per initialized
+sender worker and is allocated and registered when that worker first uses the
+packed path. It must hold at least one destination page per transferred tensor;
+otherwise, the sender falls back before gathering.
+
+On both peers, leave `MC_FORCE_TCP` unset and verify that Mooncake uses RDMA.
+Mooncake checks whether that variable exists, so setting it to `0` can still
+force TCP. Keep `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE` enabled
+(the default); packing requires deferred decode KV release.
+
+#### Supported layouts and fallback
+
+The packed path requires:
+
+- Prefill attention TP smaller than decode attention TP, with an integer ratio
+  and nonreplicated grouped-query attention (GQA) KV heads.
+- Pipeline parallelism (PP), attention context parallelism (CP), and decode
+  context parallelism (DCP) all set to 1, with no DCP relayout.
+- Ordinary contiguous NHD storage (token, head, head-dimension order) with
+  matching logical and storage dtypes, head dimensions, page geometry, tensor
+  and layer ordering, and registered buffer capacities on both peers.
+- SWA as the only state type and no draft KV entries.
+
+The sender checks peer layout metadata and signed page indices before gathering.
+Missing or malformed optional metadata, unsupported geometry, multi-head latent
+attention (MLA), scale sidecars, unified page envelopes and unsupported state
+layouts preserve the existing transfer path. Packing does not add support for
+layouts that the existing path cannot transfer.
+
+#### Failure and buffer lifetime
+
+Fallback is allowed only before gathering or submission. If a native transfer
+raises or returns a nonzero status, completion is uncertain: the sender retains
+its registered scratch buffer, engine and futures in quarantine, and marks the
+room's deferred abort acknowledgement as unsafe. A completed Python future does
+not prove that timed-out native writes have stopped.
+
+Unsettled GPU gathers also retain their buffers and metadata. Teardown deregisters
+only buffers known to be idle. After submission, the sender does not retry through
+the direct path, where late writes could race with reused memory.
+
 ## NIXL
 ### Requirements
 
