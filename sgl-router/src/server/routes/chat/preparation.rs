@@ -1588,7 +1588,7 @@ fn invalid_request() -> ApiError {
 /// `reasoning.effort` / `reasoning.reasoning_effort` and
 /// `chat_template_kwargs.reasoning_effort`. Returns whether the request was
 /// rewritten, so the caller re-serializes the forwarded body.
-fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, ApiError> {
+pub(crate) fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, ApiError> {
     let Some(obj) = value.as_object_mut() else {
         return Ok(false);
     };

@@ -424,6 +424,28 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Canonicalize an alias, preserving an optional LoRA suffix. Match whole
+    /// names before suffixes, then the longest name, so URI colons and aliases
+    /// that extend another alias are not mistaken for adapter separators.
+    pub fn canonical_alias(&self, model: &str) -> Option<String> {
+        if model == self.id {
+            return None;
+        }
+        if self.aliases.iter().any(|alias| alias == model) {
+            return Some(self.id.clone());
+        }
+        let (name, adapter) = std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .filter_map(|name| {
+                model
+                    .strip_prefix(name.as_str())?
+                    .strip_prefix(':')
+                    .map(|adapter| (name, adapter))
+            })
+            .max_by_key(|(name, _)| name.len())?;
+        (name != &self.id).then(|| format!("{}:{adapter}", self.id))
+    }
+
     /// `model` as served: a `--model-alias` names `id`.
     pub fn served_name<'a>(&'a self, model: &'a str) -> &'a str {
         if self.aliases.iter().any(|alias| alias == model) {

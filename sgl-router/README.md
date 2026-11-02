@@ -85,7 +85,9 @@ curl http://localhost:30000/v1/chat/completions \
 
 `--model-id` is required. `--model-alias` (repeatable) serves another `model`
 name as `--model-id`, for example a gateway that sends the engine's
-`--model-path`; `/v1/models` lists only `--model-id`. `--tokenizer-path` takes a local `tokenizer.json` or a
+`--model-path`. Aliases are forwarded as `--model-id`, preserving an optional
+`:adapter` LoRA suffix; names containing colons, such as `s3://bucket/model`,
+are matched in full. `/v1/models` lists only `--model-id`. `--tokenizer-path` takes a local `tokenizer.json` or a
 HuggingFace repo id; when omitted, the tokenizer for `--model-id` is downloaded
 from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists
 every flag.
