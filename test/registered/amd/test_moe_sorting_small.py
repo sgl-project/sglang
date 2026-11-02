@@ -33,7 +33,8 @@ class TestMoeSortingSmall(CustomTestCase):
         cls.fm = fm
         orig_sort = fm._moe_sorting_impl
         orig_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
-        S.apply_aiter_small_moe_sort_patch()
+        if not S.apply_aiter_small_moe_sort_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own MoE sort")
         if fm._moe_sorting_impl is orig_sort:
             # an earlier import already patched aiter; recover the originals
             orig_sort = fm._moe_sorting_impl.__wrapped__
@@ -180,6 +181,168 @@ class TestMoeSortingSmallNoQuant(CustomTestCase):
                 for hot in (num_experts, 12):  # uniform and skewed routing
                     with self.subTest(e=num_experts, topk=topk, m=m, hot=hot):
                         self._check(m, topk, num_experts, block_size, hot)
+
+
+@unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
+class TestMoeSortQuant(CustomTestCase):
+    """The one-launch sort (+ MXFP4 stage1 quant) must equal aiter's two-phase sort and
+    fused_dynamic_mxfp4_quant_moe_sort byte for byte (MiniMax-M3.1 TP4: 128 experts, top-4)."""
+
+    E, TOPK, DIM = 128, 4, 6144
+
+    @classmethod
+    def setUpClass(cls):
+        import aiter.fused_moe as fm
+
+        from sglang.kernels.ops.moe import moe_sorting_small as S
+
+        if not S.apply_aiter_small_moe_sort_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own MoE sort")
+        if not hasattr(fm.fused_dynamic_mxfp4_quant_moe_sort, "__wrapped__"):
+            raise unittest.SkipTest(
+                "the pinned aiter has no MXFP4 stage1 quant to emit"
+            )
+        cls.S = S
+        cls.fm = fm
+        cls.orig_sort = staticmethod(fm._moe_sorting_impl.__wrapped__)
+        cls.orig_fp4_quant = staticmethod(
+            fm.fused_dynamic_mxfp4_quant_moe_sort.__wrapped__
+        )
+        cls.dev = torch.device("cuda", 0)
+
+    def _routing(self, m, seed, padded=0):
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        ids = torch.stack(
+            [torch.randperm(self.E, generator=g)[: self.TOPK] for _ in range(m)]
+        )
+        w = torch.rand(m, self.TOPK, generator=g) + 0.05
+        # graph-padded rows past moe_num_token_non_padded: -1 ids, zero weights
+        if padded:
+            ids[m - padded :] = -1
+            w[m - padded :] = 0.0
+        return ids.to(torch.int32).to(self.dev), w.to(self.dev)
+
+    def _aiter_sort(self, ids, w, bs):
+        return self.orig_sort(
+            ids,
+            w,
+            self.E,
+            self.DIM,
+            torch.bfloat16,
+            bs,
+            None,
+            None,
+            2,
+            True,
+            accumulate=False,
+        )
+
+    def test_sort_matches_aiter(self):
+        from sglang.kernels.ops.moe.moe_sort_quant import moe_sort_quant
+
+        empty = torch.empty((0, 0), dtype=torch.bfloat16, device=self.dev)
+        for bs in (16, 32, 64):
+            for m, padded in ((17, 0), (64, 0), (200, 0), (384, 0), (1000, 0),
+                              (64, 9), (1000, 337)):  # fmt: skip
+                ids, w = self._routing(m, m + bs, padded)
+                ref = self._aiter_sort(ids, w, bs)
+                out = moe_sort_quant(ids, w, self.E, bs, empty)
+                nv = int(ref[3][0])
+                msg = f"m={m} padded={padded} bs={bs}"
+                self.assertTrue(torch.equal(ref[3], out[3]), msg)
+                self.assertTrue(torch.equal(ref[0][:nv], out[0][:nv]), msg)
+                self.assertTrue(torch.equal(ref[1][:nv], out[1][:nv]), msg)
+                self.assertTrue(
+                    torch.equal(ref[2][: nv // bs], out[2][: nv // bs]), msg
+                )
+
+    def test_fp4_quant_matches_aiter(self):
+        from sglang.kernels.ops.moe.moe_sort_quant import moe_sort_quant
+
+        empty = torch.empty((0, 0), dtype=torch.bfloat16, device=self.dev)
+        for m, bs, padded in ((256, 32, 0), (384, 32, 0), (1000, 64, 0), (384, 32, 61)):
+            ids, w = self._routing(m, m, padded)
+            x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
+            sid, sw, _, nv, _ = self._aiter_sort(ids, w, bs)
+            ref_q, ref_s = self.orig_fp4_quant(
+                x,
+                sorted_ids=sid,
+                num_valid_ids=nv,
+                token_num=m,
+                topk=self.TOPK,
+                block_size=bs,
+                sorted_weights=sw,
+                num_experts_upper_bound=self.E,
+            )
+            out = moe_sort_quant(ids, w, self.E, bs, empty, x=x)
+            msg = f"m={m} padded={padded} bs={bs}"
+            # aiter skips the codes of padded tokens, which no sorted row reads
+            live = m - padded
+            self.assertTrue(
+                torch.equal(
+                    ref_q.view(torch.uint8)[:live], out[4].view(torch.uint8)[:live]
+                ),
+                msg,
+            )
+            # aiter leaves the scale rows of padding slots unwritten; compare the real ones
+            n = int(nv[0])
+            rows = torch.arange(n, device=self.dev)[(sid[:n] & 0xFFFFFF) < m][:, None]
+            y = torch.arange(self.DIM // 32, device=self.dev)[None, :]
+            addr = (
+                (rows // 32) * (192 * 32)
+                + (y // 8) * 256
+                + (y % 4) * 64
+                + (rows % 16) * 4
+                + ((y % 8) // 4) * 2
+                + (rows % 32) // 16
+            )
+            self.assertTrue(
+                torch.equal(
+                    ref_s.view(torch.uint8).flatten()[addr],
+                    out[5].view(torch.uint8).flatten()[addr],
+                ),
+                msg,
+            )
+
+    def test_patched_sort_hands_its_quant_to_aiter(self):
+        """The patched sort emits the stage1 quant, which the patched quant call returns."""
+        m, bs = 384, 32
+        ids, w = self._routing(m, 1)
+        x = torch.randn(m, self.DIM, dtype=torch.bfloat16, device=self.dev)
+        S = self.S
+        tok = S._pending_fp4_input.set(x)
+        etok = S._emitted_fp4_quant.set(None)
+        try:
+            sid, sw, _, nv, _ = self.fm._moe_sorting_impl(
+                ids,
+                w,
+                self.E,
+                self.DIM,
+                torch.bfloat16,
+                bs,
+                None,
+                None,
+                2,
+                True,
+                accumulate=False,
+            )
+            emitted = S._emitted_fp4_quant.get()
+            self.assertIsNotNone(emitted)
+            q, scale = self.fm.fused_dynamic_mxfp4_quant_moe_sort(
+                x,
+                sorted_ids=sid,
+                num_valid_ids=nv,
+                token_num=m,
+                topk=self.TOPK,
+                block_size=bs,
+                sorted_weights=sw,
+                num_experts_upper_bound=self.E,
+            )
+            self.assertIs(q, emitted[0])
+            self.assertIs(scale, emitted[1])
+        finally:
+            S._emitted_fp4_quant.reset(etok)
+            S._pending_fp4_input.reset(tok)
 
 
 if __name__ == "__main__":
