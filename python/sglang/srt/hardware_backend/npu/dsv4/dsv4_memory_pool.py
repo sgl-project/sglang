@@ -427,13 +427,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """GPU-compatible ``StateType.SWA`` component.
+        """SWA KV pages only; C4 state ships separately as physical rows.
 
-        On pre-A5 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
-        indexer state retain separate buffers but share the same SWA page/state
-        index.  On A5 (CYCLE cache_mode) the compressor addresses the C4 state
-        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
-        here and registered separately via :meth:`get_c4_state_buf_infos`.
+        Even on A3, where C4 state follows SWA pages, the ring sizes can differ
+        between P and D. A whole-ring item would give them different byte
+        strides. :meth:`get_c4_state_buf_infos` exposes equal-sized row items.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -444,26 +442,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
-        if not is_npu_arch35():
-            for pools in (
-                self.compress_state_pools,
-                self.indexer_compress_state_pools,
-            ):
-                for pool in pools:
-                    if pool is None or pool.ratio != 4:
-                        continue
-                    state = pool.kv_score_buffer.kv_score
-                    data_ptrs.append(state.data_ptr())
-                    data_lens.append(state.nbytes)
-                    item_lens.append(state[0].nbytes * pool.ring_size)
-
         return data_ptrs, data_lens, item_lens
 
     def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """C4 compress state ring (attention + indexer).
 
         Register one physical state row as an item.  PD peers can have
-        different request-local ring sizes (for example prefill without MTP
+        different local ring sizes (for example prefill without MTP
         and decode with MTP), so payload indices map the same logical token
         positions into each peer's local ring independently.
         """

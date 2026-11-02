@@ -83,6 +83,32 @@ class DSV4ReqToTokenTablesMixin:
             raise RuntimeError("DSV4 allocator is not registered")
         return self._dsv4_allocator.get_kvcache().get_ring_size(4)
 
+    def get_dsv4_c4_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
+        """Map the live overlap tail to this peer's physical C4 state rows."""
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+            c4_state_transfer_indices,
+        )
+
+        ring_size = self.get_dsv4_c4_state_ring_size()
+        if is_npu_arch35():
+            return c4_state_transfer_indices(req_pool_idx, seq_len, ring_size=ring_size)
+
+        # A3's explicit compressor table follows full -> SWA -> state, rather
+        # than req_pool_idx. Pair rows in logical token order, including both
+        # sides of a SWA page boundary and the previous complete C4 group.
+        seq_len = max(0, int(seq_len))
+        # Match _build_explicit_state_block_table's coff * compress_ratio
+        # history (2 * 4). Eight rows are unique even in the smallest ring.
+        state_len = 8
+        full_locs = self.req_to_token[
+            req_pool_idx, max(0, seq_len - state_len) : seq_len
+        ]
+        kv_pool = self._dsv4_allocator.get_kvcache()
+        swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
+        rows = swa_locs // kv_pool.swa_page_size * ring_size + swa_locs % ring_size
+        return rows.to(torch.int32).cpu().numpy()
+
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
         """Install pages returned by a Radix match.
 
