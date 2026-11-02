@@ -1273,6 +1273,8 @@ class Req(ReqDllmMixin):
 
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
+        # Index in output_ids just past the think-end marker; stop strings/regex only match from here on
+        self._reasoning_end_idx = 0
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
@@ -1952,6 +1954,9 @@ class Req(ReqDllmMixin):
         self.detokenize_header_sent = True
         return due
 
+    def _in_reasoning(self) -> bool:
+        return self.require_reasoning and not self._is_reasoning_over
+
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         max_len_tail_str = max(
             self.sampling_params.stop_str_max_len + 1,
@@ -1959,9 +1964,11 @@ class Req(ReqDllmMixin):
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
+        tail_len = min(
             max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
         )
+        # Never look back into the reasoning section.
+        return max(min(tail_len, len(self.output_ids) - self._reasoning_end_idx), 0)
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
@@ -1972,10 +1979,15 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
+        if tail_len == 0:
+            return ""
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
+            return False
+
+        if self._in_reasoning():
             return False
 
         tail_str = self.tail_str()
@@ -2186,7 +2198,8 @@ class Req(ReqDllmMixin):
         # Stop string beats EOS/stop-token matched in the same step (speculative
         # decoding can accept >1 token): token-based would trim only the last
         # token and leak the stop string.
-        if self._check_str_based_finish(new_accepted_len):
+        # User stop strings/regex only apply to the final answer, not the reasoning.
+        if not self._in_reasoning() and self._check_str_based_finish(new_accepted_len):
             self._cap_finished_len_at_max_new_tokens()
             return
 
@@ -2400,6 +2413,9 @@ class Req(ReqDllmMixin):
             if matched == len(self._think_end_matcher):
                 self.reasoning_tokens += position + 1
                 self._is_reasoning_over = True
+                self._reasoning_end_idx = len(self.output_ids) - (
+                    len(token_id) - 1 - position
+                )
                 return
 
         self._think_end_match_len = matched
