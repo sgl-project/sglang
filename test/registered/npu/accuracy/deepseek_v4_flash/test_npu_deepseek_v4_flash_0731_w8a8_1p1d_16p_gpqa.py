@@ -136,6 +136,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--hicache-write-policy",
     "write_through",
     "--enable-cache-report",
+    "--max-total-tokens",
+    140000,
 ]
 
 # Decode node launch arguments.
@@ -230,6 +232,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
+
 
 if __name__ == "__main__":
     unittest.main()
