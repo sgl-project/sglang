@@ -24,6 +24,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     select_decode,
+    sharded_dense_prefill_topk,
     write_prefill,
 )
 from .types import (
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     from .scoring import DeepGEMMPrefillData
+
+
+def _lite_topk_wins(num_rows: int, max_len: int) -> bool:
+    """Whether LiteTopK beats the dense path on a chunk of ``num_rows`` query rows scored by this rank."""
+    # LiteTopK needs rows x keys to fill the GPU: with few rows a CTA per 4 rows scans the whole key range and the
+    # dense path wins. Rows of at most 6144 keys make every block dense (no sampling), where LiteTopK wins at any size.
+    return (num_rows >= 512 and num_rows * max_len >= 1 << 26) or max_len <= 6144
 
 
 class FullTopKIndexer:
@@ -74,19 +82,31 @@ class FullTopKIndexer:
         if data is None:
             return
         out = inputs.out_raw_indices[: data.num_rows]
-        # LiteTopK needs rows x keys to fill the GPU: with few rows a CTA per 4 rows scans the whole key range and the
-        # dense path wins.
-        max_len = max(data.lens_per_request)
-        use_lite = data.num_rows >= 512 and data.num_rows * max_len >= 1 << 26
-        # Rows of at most 6144 keys make every block dense (no sampling), where LiteTopK wins at any size.
-        use_lite = use_lite or max_len <= 6144
-        if self.use_prefill_lite_topk and use_lite:
-            self._prefill_lite_topk(inputs, data, out)
-        else:
-            kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            )
+        shard = inputs.row_shard
+        if self.use_prefill_lite_topk and _lite_topk_wins(
+            data.num_rows if shard is None else shard.rows_per_rank(data.num_rows),
+            max(data.lens_per_request),
+        ):
+            if shard is None:
+                self._prefill_lite_topk(inputs, data, out)
+            else:
+                local = out.new_full(
+                    (shard.rows_per_rank(data.num_rows), out.shape[1]), -1
+                )
+                local_data = data.narrow(shard.local_rows(data.num_rows))
+                self._prefill_lite_topk(
+                    inputs, local_data, local[: local_data.num_rows]
+                )
+                out.copy_(shard.gather(local, data.num_rows))
+            data.write_page_indices(inputs)
+            return
+        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+            inputs.layer_id, data.k_slots
+        )
+        if shard is None:
             dense_prefill_topk(data, kv, out=out)
+        else:
+            sharded_dense_prefill_topk(data, kv, out=out, shard=shard)
         data.write_page_indices(inputs)
 
     def _prefill_lite_topk(
