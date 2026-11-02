@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    ensure_memfabric_capacity,
+    memfabric_host_memory_enabled,
+)
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -936,6 +940,74 @@ def _build_dsv4_rope_entry(
     )
 
 
+def _reserve_dsv4_paged_memfabric(
+    *,
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    swa_num_host_pages: int,
+    c128_num_host_pages: int,
+    has_paged_swa: bool,
+    mtp_swa_device_buffers: list,
+    c4_layer_mapping: dict[int, int],
+    c4_state_global_layers: list[int],
+    c128_layer_mapping: dict[int, int],
+) -> None:
+    if not (
+        is_npu()
+        and get_memory().hicache_mem_layout
+        in ("layer_first_kv_split", "page_first_kv_split")
+        and memfabric_host_memory_enabled()
+    ):
+        return
+
+    import torch
+
+    # Memfabric fixes its reservation at the first allocation. Include every
+    # DSV4 paged sidecar before constructing the SWA host pool.
+    paged_blocks = []
+
+    def add_paged(buffers, item_bytes, pages):
+        paged_blocks.append(len(buffers) * pages * item_bytes)
+
+    if has_paged_swa:
+        add_paged(
+            [*kvcache.swa_kv_pool.kv_buffer, *mtp_swa_device_buffers],
+            kvcache.swa_kv_pool.bytes_per_page_padded,
+            swa_num_host_pages,
+        )
+    if c4_layer_mapping:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
+        add_paged(buffers, item_bytes, num_host_pages)
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add_paged(region.device_buffers, region.item_bytes, num_host_pages)
+        sibling = _dsv4_rope_sibling(kvcache, 4)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], num_host_pages)
+        if not getattr(kvcache, "_unified_kv", False):
+            for state_pools in (
+                kvcache.compress_state_pools,
+                kvcache.indexer_compress_state_pools,
+            ):
+                state_bytes = 0
+                for layer_id in c4_state_global_layers:
+                    pool = state_pools[layer_id]
+                    state_bytes += (
+                        swa_num_host_pages
+                        * pool.ring_size
+                        * pool.kv_score_buffer.kv_score[0].nbytes
+                    )
+                paged_blocks.append(state_bytes)
+    if c128_layer_mapping:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
+        add_paged(buffers, item_bytes, c128_num_host_pages)
+        sibling = _dsv4_rope_sibling(kvcache, 128)
+        if sibling is not None:
+            add_paged(sibling[1], sibling[2], c128_num_host_pages)
+    if paged_blocks:
+        ensure_memfabric_capacity(paged_blocks, torch.npu.current_device())
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -1002,6 +1074,19 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+    )
+
+    _reserve_dsv4_paged_memfabric(
+        kvcache=kvcache,
+        page_size=page_size,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        has_paged_swa=has_paged_swa,
+        mtp_swa_device_buffers=mtp_swa_device_buffers,
+        c4_layer_mapping=c4_layer_mapping,
+        c4_state_global_layers=c4_state_global_layers,
+        c128_layer_mapping=c128_layer_mapping,
     )
 
     logical_host_pool = LogicalHostPool(

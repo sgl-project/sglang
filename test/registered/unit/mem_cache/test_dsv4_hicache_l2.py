@@ -64,6 +64,8 @@ class TestDSV4DecodeCapacity(CustomTestCase):
 class TestDSV4HostViews(CustomTestCase):
     @staticmethod
     def _layout_buffer(raw, layout):
+        if layout == "layer_first_kv_split":
+            return raw.transpose(0, 1).contiguous()
         if layout == "layer_first":
             return [raw[:, layer, :].clone() for layer in range(raw.shape[1])]
         if layout == "page_first":
@@ -72,13 +74,13 @@ class TestDSV4HostViews(CustomTestCase):
 
     @staticmethod
     def _selected_layer(buffer, layout, layer):
-        if layout == "layer_first":
+        if layout in ("layer_first", "layer_first_kv_split"):
             return buffer[layer]
         if layout == "page_first":
             return buffer[:, layer, :]
         return buffer[:, layer, 0, :]
 
-    def test_paged_and_state_host_views_support_every_layout(self):
+    def test_paged_and_state_host_views_support_ascend_layouts(self):
         pages, layers, page_slots, last_dim = 2, 2, 2, 3
         item_bytes = page_slots * last_dim
         raw = torch.arange(pages * layers * item_bytes, dtype=torch.uint8).reshape(
@@ -93,7 +95,7 @@ class TestDSV4HostViews(CustomTestCase):
             pages * layers * state_page_bytes, dtype=torch.uint8
         ).reshape(pages, layers, state_page_bytes)
 
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in ("page_first_kv_split", "layer_first_kv_split"):
             with self.subTest(pool="paged", layout=layout):
                 host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
                 host.pool_name = "c4"
@@ -110,11 +112,17 @@ class TestDSV4HostViews(CustomTestCase):
                 expected = self._selected_layer(host.kv_buffer, layout, 1).view(
                     torch.int8
                 )
-                self.assertEqual(view.shape, (pages, 1, page_slots, 1, last_dim))
+                shape = (
+                    (1, pages, page_slots, 1, last_dim)
+                    if layout == "layer_first_kv_split"
+                    else (pages, 1, page_slots, 1, last_dim)
+                )
+                self.assertEqual(view.shape, shape)
                 self.assertTrue(
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
                 )
 
+        for layout in ("page_first_kv_split", "layer_first_kv_split"):
             with self.subTest(pool="state", layout=layout):
                 host = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
                 host.pool_name = "c4_state"
@@ -136,7 +144,11 @@ class TestDSV4HostViews(CustomTestCase):
                 expected = self._selected_layer(host.kv_buffer, layout, 1).view(
                     state_dtype
                 )
-                self.assertEqual(view.shape, (pages, 1, ring_size, 1, state_last_dim))
+                if layout == "layer_first_kv_split":
+                    shape = (1, pages, ring_size, 1, state_last_dim)
+                else:
+                    shape = (pages, 1, ring_size, 1, state_last_dim)
+                self.assertEqual(view.shape, shape)
                 self.assertTrue(
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
                 )
