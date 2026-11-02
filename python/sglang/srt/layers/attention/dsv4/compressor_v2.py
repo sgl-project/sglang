@@ -9,10 +9,12 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
+    compress_fused_norm_rope_store,
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
@@ -27,6 +29,7 @@ CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
 FusedCompressMetadata: TypeAlias = CompressMetadata
 
 _is_hip = is_hip_runtime()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def _use_online_compress(compress_ratio: int) -> bool:
@@ -103,6 +106,26 @@ class CompressorBackendMixin:
             assert kv_score_buffer.shape[-1] == last_dim
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
+        # Measured on gfx1250: fused C128 wins up to ~1k tokens, loses beyond 2k.
+        fused_wins = compress_ratio == 4 or kv_score_input.shape[0] <= 1024
+        use_fused = _is_gfx1250_supported and fused_wins and kv_layout == KVLayout.V4
+        if use_fused and not (is_online or fp8_2buff or use_fp4_indexer):
+            compress_fused_norm_rope_store(
+                kv_score_buffer,
+                kv_score_input,
+                ape.view(-1, head_dim),
+                plan,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                freq_cis=freqs_cis_cache,
+                out_loc=out_loc,
+                kvcache=kv_cache,
+                page_size=page_size,
+                bf16_store=bf16_store,
+            )
+            return
+        kv_score_input = kv_score_input.float()
+
         # Step 1: compress_forward
         compress_out = None
         if _is_hip and use_fp4_indexer:
@@ -165,6 +188,8 @@ class CompressorBackendMixin:
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        if _use_online_compress(compressor.ratio):
+            kv_score_input = kv_score_input.float()
 
         state_pool = compressor.get_state_pool(self)
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (

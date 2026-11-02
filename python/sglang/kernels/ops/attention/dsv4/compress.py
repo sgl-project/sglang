@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_xpu
 
 from .kv_layout import KVLayout
@@ -104,6 +105,40 @@ def _jit_compress_module(
             ("prefill", f"{kernel_class}::run_prefill"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_fused_compress_module(
+    compress_ratio: int,
+    head_dim: int,
+    dtype_buffer: torch.dtype,
+    dtype_in: torch.dtype,
+    dtype_bias: torch.dtype,
+    page_size: int,
+    bf16_store: bool,
+) -> Module:
+    preshuffle = head_dim == 128 and aiter_can_use_preshuffle_paged_mqa()
+    args = make_cpp_args(
+        compress_ratio,
+        head_dim,
+        dtype_buffer,
+        dtype_in,
+        dtype_bias,
+        page_size,
+        INDEXER_K_CACHE_PRESHUFFLE_TILE if preshuffle else 0,
+        bf16_store,
+        is_arch_support_pdl(),
+    )
+    kernel_class = f"FusedCompressNormRopeKernel<{args}>"
+    return load_jit(
+        make_name("compress_norm_rope"),
+        *args,
+        cuda_files=["deepseek_v4/compress_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::decode"),
+            ("extend", f"{kernel_class}::extend"),
+        ],
     )
 
 
@@ -544,3 +579,58 @@ def compress_norm_rope_store(
             plan.is_decode,
             plan.compress_ratio,
         )
+
+
+def compress_fused_norm_rope_store(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    bf16_store: bool = False,
+) -> None:
+    """`compress_forward` + `compress_norm_rope_store` in one launch: 512-dim C4/C128 V4 latent or C4 fp8 indexer."""
+    module = _jit_fused_compress_module(
+        plan.compress_ratio,
+        ape.shape[-1],
+        kv_score_buffer.dtype,
+        kv_score_input.dtype,
+        ape.dtype,
+        page_size,
+        bf16_store,
+    )
+    scratch = arrivals = None
+    if plan.compress_ratio == 128:
+        rows = plan[1].shape[0]
+        scratch = kv_score_input.new_empty(rows, 512, dtype=torch.float32)
+        arrivals = _c128_arrivals(rows, kv_score_input.device)
+    fn = module.decode if plan.is_decode else module.extend
+    fn(
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        norm_weight.float(),
+        norm_eps,
+        torch.view_as_real(freq_cis).flatten(-2),
+        out_loc,
+        kvcache,
+        *plan[1:3],
+        scratch,
+        arrivals,
+    )
+
+
+def _c128_arrivals(rows: int, device: torch.device) -> torch.Tensor:
+    # Per stream: concurrent launches must not share counters. Outgrown buffers are kept so
+    # captured graphs keep valid addresses; the kernel leaves every counter a multiple of its splits.
+    stream = torch.cuda.current_stream(device).cuda_stream
+    bufs = get_buffer(f"dsv4_c128_arrivals:{device}:{stream}", list)
+    if not bufs or bufs[-1].numel() < rows:
+        bufs.append(torch.zeros(max(rows, 4096), dtype=torch.int32, device=device))
+    return bufs[-1]
