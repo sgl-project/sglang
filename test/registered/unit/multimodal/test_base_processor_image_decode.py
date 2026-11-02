@@ -214,5 +214,28 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertFalse(pool._decode_params.apply_exif_orientation)
 
 
+class TestGetMmItemsOffset(CustomTestCase):
+    def test_boundary_spans_do_not_wrap_around(self):
+        """Spans touching both ends of input_ids must not merge across the boundary."""
+        for ids, expected in (
+            ([], []),
+            ([1, 2, 4], []),
+            ([3], [(0, 0)]),
+            ([3, 3, 3], [(0, 2)]),
+            ([3, 3, 1, 2, 3, 3], [(0, 1), (4, 5)]),
+            ([3, 1, 3], [(0, 0), (2, 2)]),
+            ([1, 2, 3, 3, 3, 4, 3, 3], [(2, 4), (6, 7)]),
+            ([3, 3, 1, 3, 2], [(0, 1), (3, 3)]),
+        ):
+            with self.subTest(ids=ids):
+                tensor_ids = torch.tensor(ids, dtype=torch.long)
+                self.assertEqual(
+                    BaseMultimodalProcessor.get_mm_items_offset(
+                        input_ids=tensor_ids, mm_token_id=3
+                    ),
+                    expected,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
