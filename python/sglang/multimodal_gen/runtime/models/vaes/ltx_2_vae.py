@@ -32,6 +32,10 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 
 
 @lru_cache(maxsize=128)
@@ -70,19 +74,42 @@ class PerChannelRMSNorm(nn.Module):
         super().__init__()
         self.channel_dim = channel_dim
         self.eps = eps
+        self.fast_path_gate: VaeFastPathGate | None = None
 
     def forward(
-        self, x: torch.Tensor, channel_dim: Optional[int] = None
+        self,
+        x: torch.Tensor,
+        channel_dim: Optional[int] = None,
+        *,
+        activation: nn.Module | None = None,
     ) -> torch.Tensor:
         """
         Apply RMS normalization along the configured dimension.
         """
+        if (
+            self.fast_path_gate is not None
+            and self.fast_path_gate.enabled
+            and isinstance(activation, nn.SiLU)
+            and self.channel_dim == 1
+            and x.ndim == 5
+            and x.numel() > 0
+            and 0 < x.shape[1] <= 2048
+            and x.is_cuda
+            and torch.version.hip is None
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.diffusion import pixel_norm_silu
+
+            return pixel_norm_silu(x, self.eps)
         channel_dim = channel_dim or self.channel_dim
         # Compute mean of squared values along `dim`, keep dimensions for broadcasting.
         mean_sq = torch.mean(x**2, dim=self.channel_dim, keepdim=True)
         # Normalize by the root-mean-square (RMS).
         rms = torch.sqrt(mean_sq + self.eps)
-        return x / rms
+        out = x / rms
+        return activation(out) if activation is not None else out
 
 
 # Like LTXCausalConv3d, but whether causal inference is performed can be specified at runtime
@@ -169,6 +196,38 @@ class LTX2VideoCausalConv3d(nn.Module):
         use_channels_last_pad = (
             hidden_states.dim() == 5 and self._weight_is_channels_last_3d()
         )
+
+        if (
+            use_channels_last_pad
+            and conv_cache is None
+            and hidden_states.is_cuda
+            and torch.version.hip is None
+            and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and type(self.conv) is nn.Conv3d
+            and self.conv.padding_mode == "reflect"
+        ):
+            from sglang.kernels.ops.diffusion import replicate_reflect_pad3d
+
+            left, right = (
+                (time_kernel_size - 1, 0)
+                if causal
+                else ((time_kernel_size - 1) // 2,) * 2
+            )
+            _, height_pad, width_pad = self.conv.padding
+            hidden_states = replicate_reflect_pad3d(
+                hidden_states, left, right, height_pad, width_pad
+            )
+            return F.conv3d(
+                hidden_states,
+                self.conv.weight,
+                self.conv.bias,
+                self.conv.stride,
+                0,
+                self.conv.dilation,
+                self.conv.groups,
+            )
 
         if causal:
             left, right = time_kernel_size - 1, 0
@@ -378,7 +437,10 @@ class LTX2VideoResnetBlock3d(nn.Module):
     ) -> torch.Tensor:
         hidden_states = inputs
 
-        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.norm1(
+            hidden_states,
+            activation=self.nonlinearity if self.scale_shift_table is None else None,
+        )
 
         if self.scale_shift_table is not None:
             temb = (
@@ -387,8 +449,7 @@ class LTX2VideoResnetBlock3d(nn.Module):
             )
             shift_1, scale_1, shift_2, scale_2 = temb.unbind(dim=1)
             hidden_states = hidden_states * (1 + scale_1) + shift_1
-
-        hidden_states = self.nonlinearity(hidden_states)
+            hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.conv1(
             hidden_states,
             causal=causal,
@@ -409,12 +470,14 @@ class LTX2VideoResnetBlock3d(nn.Module):
                 + (spatial_noise * self.per_channel_scale1)[None, :, None, ...]
             )
 
-        hidden_states = self.norm2(hidden_states)
+        hidden_states = self.norm2(
+            hidden_states,
+            activation=self.nonlinearity if self.scale_shift_table is None else None,
+        )
 
         if self.scale_shift_table is not None:
             hidden_states = hidden_states * (1 + scale_2) + shift_2
-
-        hidden_states = self.nonlinearity(hidden_states)
+            hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(
             hidden_states,
@@ -1778,6 +1841,12 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 upsample_type=upsample_type,
                 spatial_padding_mode=decoder_spatial_padding_mode,
             )
+
+        gate = VaeFastPathGate()
+        for module in self.decoder.modules():
+            if isinstance(module, PerChannelRMSNorm):
+                module.fast_path_gate = gate
+        register_vae_fast_path_gate(self, gate)
 
         latents_mean = torch.zeros((latent_channels,), requires_grad=False)
         latents_std = torch.ones((latent_channels,), requires_grad=False)

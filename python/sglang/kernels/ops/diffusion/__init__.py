@@ -46,6 +46,18 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.pixel_norm_silu",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.pixel_norm_silu:pixel_norm_silu",
+        _CUDA,
+    ),
+    (
+        "diffusion.replicate_reflect_pad3d",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.replicate_reflect_pad3d:replicate_reflect_pad3d",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_packed_swiglu_fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
@@ -666,6 +678,8 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "pixel_norm_silu": "sglang.kernels.kda_kernels.pixel_norm_silu",
+    "replicate_reflect_pad3d": "sglang.kernels.kda_kernels.replicate_reflect_pad3d",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
