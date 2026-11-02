@@ -20,10 +20,10 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
+    training_kv_window,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_transfer import (
     CosmosDreamsTransferConfig,
-    training_kv_window,
 )
 from sglang.multimodal_gen.configs.sample.cosmos_dreams_transfer import (
     CosmosDreamsTransferSamplingParams,
@@ -254,6 +254,10 @@ class TestCosmosDreamsTransferHistory(unittest.TestCase):
             with open(os.path.join(root, "config.json"), "w") as f:
                 json.dump({"model": {"config": {"kv_cache_inference_size": None}}}, f)
             self.assertEqual(training_kv_window(root), (None, 0))
+            with open(os.path.join(root, "config.json"), "w") as f:
+                json.dump({"model": {"config": {"kv_cache_inference_size": "51"}}}, f)
+            with self.assertRaisesRegex(ValueError, "kv_cache_inference_size"):
+                training_kv_window(root)
         self.assertEqual(training_kv_window(None), (None, 0))
 
 
