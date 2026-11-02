@@ -14,6 +14,10 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -64,7 +68,11 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     ) -> SimpleNamespace:
         return SimpleNamespace(
             collect_inflight_reqs=lambda: set(inflight),
-            _deferred_responses=None,
+            deferred_responses=DeferredResponses(
+                disaggregation_mode=DisaggregationMode.NULL,
+                output_streamer=None,
+                send_abort=None,
+            ),
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
@@ -150,6 +158,11 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 
     def _scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.publish_load_snapshot = MagicMock()
@@ -158,6 +171,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
         scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,

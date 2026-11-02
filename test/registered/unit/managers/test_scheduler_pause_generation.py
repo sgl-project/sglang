@@ -24,10 +24,17 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -91,6 +98,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
         scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -338,6 +346,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
         scheduler.draft_worker = None
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
         self.assertTrue(scheduler.flush_cache(empty_cache=False))
