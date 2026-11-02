@@ -191,9 +191,7 @@ DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH = {
 }
 
 
-class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
-    TestNpuAccuracyMultiNodePdSepTestCaseBase
-):
+class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 32p 1P1D GPQA"""
 
     model_config = DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG
