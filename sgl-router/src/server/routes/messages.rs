@@ -57,7 +57,11 @@ pub(crate) async fn count_tokens(
         return adapt(e.into_response(), None).await;
     }
     // No raw-text fallback: a count without template and tool overhead is wrong.
-    match ctx.tokenizers.encode_chat(&model, &converted.chat) {
+    match ctx
+        .preprocessor
+        .tokenizers()
+        .encode_chat(&model, &converted.chat)
+    {
         Some(ids) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,

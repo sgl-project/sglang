@@ -25,8 +25,7 @@ pub enum ForwardingScope {
     AllText,
 }
 
-/// Whether a dispatched chat request carried router-rendered `input_ids` to
-/// the engine, and why not otherwise. See the module doc for each label.
+/// Whether a chat request can forward rendered `input_ids` to the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputIdsForwarding {
     Forwarded,

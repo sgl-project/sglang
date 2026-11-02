@@ -43,7 +43,7 @@ pub struct DetokenizeResponse {
 
 /// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
 pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
-    ctx.tokenizers.get(model).ok_or_else(|| {
+    ctx.preprocessor.tokenizers().get(model).ok_or_else(|| {
         if model == ctx.config.model.id {
             ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
         } else {
@@ -357,7 +357,12 @@ mod tests {
     #[tokio::test]
     async fn disabled_tokenizer_is_a_bad_request() {
         let mut ctx = ctx_with_tiny();
-        Arc::get_mut(&mut ctx).unwrap().tokenizers = Default::default();
+        let ctx_mut = Arc::get_mut(&mut ctx).unwrap();
+        ctx_mut.preprocessor = crate::server::routes::chat::Preprocessor::new(
+            &ctx_mut.config.model,
+            Default::default(),
+            Arc::clone(&ctx_mut.metrics),
+        );
         let res = crate::server::app::build_router(ctx)
             .oneshot(
                 Request::builder()

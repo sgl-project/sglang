@@ -6,6 +6,8 @@ mod openai;
 mod preparation;
 mod reorg;
 
+pub use preparation::Preprocessor;
+
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
@@ -26,8 +28,8 @@ use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
 use forward::{forward_request, forward_request_grpc, RequestDurationGuard, SelectedWorkers};
 use preparation::{
-    forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
-    CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
+    parse_embedding_request, parse_routing_fields, PreparedRequest, CHAT_PATH, CLASSIFY_PATH,
+    COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::HashMap;
@@ -157,7 +159,7 @@ pub async fn route_typed<R: TypedRpc>(
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
-        let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
+        let prepared = ctx.preprocessor.typed(path, model, &request.view())?;
         Ok::<_, ApiError>((prepared, routing))
     };
     match prepared.await {
@@ -172,7 +174,9 @@ pub async fn route_typed<R: TypedRpc>(
 /// when it keeps the text, as under `--disable-input-ids-forwarding`.
 pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Vec<i32>> {
     let model = ModelId(ctx.config.model.id.clone());
-    let ids = forwarded_prompt_ids(ctx, &model, endpoint.path(), text)?;
+    let ids = ctx
+        .preprocessor
+        .forwarded_prompt_ids(&model, endpoint.path(), text)?;
     ids.into_iter().map(|id| i32::try_from(id).ok()).collect()
 }
 
@@ -205,32 +209,43 @@ async fn prepare<'a>(
             let model =
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
-            let needs_tokens = routing.needs_request_tokens(ctx);
+            let needs_tokens =
+                routing.needs_request_tokens(ctx) || ctx.bucket_selector.is_enabled();
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
                 COMPLETIONS_PATH
             };
             let request = if grpc && matches!(endpoint, Endpoint::Completions) {
-                PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
+                ctx.preprocessor
+                    .completion(model, fields, body, needs_tokens)?
             } else if grpc {
-                PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
+                ctx.preprocessor
+                    .openai_grpc(path, model, fields, headers, body, needs_tokens)?
             } else {
-                PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
+                ctx.preprocessor.openai(
+                    model_openai_settings(ctx, &model).as_deref(),
+                    path,
+                    model,
+                    fields,
+                    headers,
+                    body,
+                    needs_tokens,
+                )?
             };
             (routing, request)
         }
         Endpoint::Generate => {
             let model = served_model();
             let routing = ModelRouting::lookup(ctx, &model)?;
-            (routing, PreparedRequest::generate(ctx, model, body)?)
+            (routing, ctx.preprocessor.generate(model, body)?)
         }
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
             let (model, value) = parse_embedding_request(&body)?;
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
             require_plain_workers(ctx, &model, path)?;
-            let request = PreparedRequest::embeddings(ctx, path, model, body, value)?;
+            let request = ctx.preprocessor.embeddings(path, model, body, value)?;
             (routing, request)
         }
         Endpoint::Rerank => {

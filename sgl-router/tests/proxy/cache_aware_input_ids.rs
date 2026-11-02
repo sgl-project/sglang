@@ -141,7 +141,7 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
             "input_ids": ids,
         });
         let tokens = sgl_router::policies::request_tokens_for(
-            &ctx.tokenizers,
+            ctx.preprocessor.tokenizers(),
             &ModelId(MODEL.into()),
             &request,
         );
