@@ -1043,7 +1043,9 @@ def test_pixel_norm_silu_preserves_dtype_rounding_and_strides(dtype, layout):
         assert_error_no_worse_than_reference,
     )
 
-    x = torch.randn((2, 130, 3, 5, 7), device=DEVICE, dtype=dtype)
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    x = torch.randn((2, 130, 3, 5, 7), device=device, dtype=dtype)
     if layout == "cl":
         x = x.contiguous(memory_format=torch.channels_last_3d)
     elif layout == "sliced":
@@ -1053,6 +1055,7 @@ def test_pixel_norm_silu_preserves_dtype_rounding_and_strides(dtype, layout):
     x[1, 0, 1, 0, 0] = float("inf")
     baseline = F.silu(x / (x.square().mean(1, keepdim=True) + 1e-8).sqrt())
     actual = pixel_norm_silu(x)
+    assert torch.cuda.current_device() == current_device
     precise = x.double()
     precise = F.silu(precise / (precise.square().mean(1, keepdim=True) + 1e-8).sqrt())
     assert torch.equal(torch.isnan(actual), torch.isnan(baseline))

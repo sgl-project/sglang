@@ -59,7 +59,8 @@ def replicate_reflect_pad3d(
         device=x.device,
         memory_format=torch.channels_last_3d,
     )
-    _pad[(triton.cdiv(y.numel(), 1024),)](
-        x, y, y.numel(), x.shape, x.stride(), (left, right, ph, pw), 1024
-    )
+    with torch.cuda.device(x.device):
+        _pad[(triton.cdiv(y.numel(), 1024),)](
+            x, y, y.numel(), x.shape, x.stride(), (left, right, ph, pw), 1024
+        )
     return y

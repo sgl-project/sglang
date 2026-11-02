@@ -768,7 +768,9 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
 )
 def test_replicate_reflect_pad3d_preserves_borders(dtype, left, right):
     """Time repeats the edge; space reflects without repeating it, even for one frame."""
-    x = torch.randn((2, 7, 1, 5, 12), device=DEVICE, dtype=dtype)[..., ::2]
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    x = torch.randn((2, 7, 1, 5, 12), device=device, dtype=dtype)[..., ::2]
     temporal = torch.cat(
         [
             x[:, :, :1].expand(-1, -1, left, -1, -1),
@@ -779,6 +781,7 @@ def test_replicate_reflect_pad3d_preserves_borders(dtype, left, right):
     )
     expected = torch.nn.functional.pad(temporal, (2, 2, 1, 1, 0, 0), mode="reflect")
     actual = replicate_reflect_pad3d(x, left, right, 1, 2)
+    assert torch.cuda.current_device() == current_device
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 

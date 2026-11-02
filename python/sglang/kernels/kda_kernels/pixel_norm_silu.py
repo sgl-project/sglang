@@ -65,15 +65,16 @@ def pixel_norm_silu(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     bc = triton.next_power_of_2(c)
     bp = max(1, 2048 // bc)
     if x.numel():
-        _pixel_norm_silu[(triton.cdiv(n * d * h * w, bp),)](
-            x,
-            y,
-            n * d * h * w,
-            x.shape,
-            x.stride(),
-            eps,
-            bc,
-            bp,
-            enable_fp_fusion=False,
-        )
+        with torch.cuda.device(x.device):
+            _pixel_norm_silu[(triton.cdiv(n * d * h * w, bp),)](
+                x,
+                y,
+                n * d * h * w,
+                x.shape,
+                x.stride(),
+                eps,
+                bc,
+                bp,
+                enable_fp_fusion=False,
+            )
     return y
