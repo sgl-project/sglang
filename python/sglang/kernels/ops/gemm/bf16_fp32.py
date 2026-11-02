@@ -111,6 +111,15 @@ def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.mm(x.float(), y.float().t())
 
 
+@functools.cache
+def _get_aiter_tgemm():
+    try:
+        from aiter.tuned_gemm import tgemm
+    except ImportError:
+        return None
+    return tgemm
+
+
 def _linear_bf16_fp32_hpc(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -156,5 +165,8 @@ def linear_bf16_fp32(
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
-    else:
-        return _linear_bf16_fp32_cublas(x, y)
+    elif envs.SGLANG_USE_AITER.get():
+        tgemm = _get_aiter_tgemm()
+        if tgemm is not None:
+            return tgemm.mm(x, y, None, otype=torch.float32)
+    return _linear_bf16_fp32_cublas(x, y)
