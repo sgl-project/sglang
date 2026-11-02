@@ -127,6 +127,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = None
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.dllm_config = None
+        scheduler.uocr_runtime = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
