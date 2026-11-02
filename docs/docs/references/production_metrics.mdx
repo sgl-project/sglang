@@ -115,6 +115,42 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Prefix cache hit rate
+
+`sglang:cache_hit_rate` is the hit rate over the tokens admitted in one scheduler reporting interval: token-weighted, excluding tokens that had to be reprocessed after a retraction. It is exported whenever `--enable-metrics` is on and its semantics do not depend on any flag.
+
+`--enable-prefix-cache-hit-rate-window` additionally reports a token-weighted hit rate over the most recent **1000 admitted requests**, using the same sliding-window semantics vLLM uses for its log line (`CachingMetrics`). It is log-only: no new metric is exported.
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path <your_model_path> \
+  --enable-prefix-cache-hit-rate-window
+```
+
+The rate is appended to the prefill and decode scheduler log lines. It needs neither `--enable-metrics` nor a Prometheus scrape:
+
+```text Output
+Prefill batch, #new-seq: 6, #new-token: 2512, #cached-token: 2048, cache hit rate: 81.5%, token usage: 0.28, #running-req: 32, #queue-req: 12
+Decode batch, #running-req: 32, token usage: 0.28, cuda graph: True, cache hit rate: 81.5%, gen throughput (token/s): 86.51, #queue-req: 12
+```
+
+How the window is counted:
+
+- One sample per admitted request -- the full prompt length as queries, the device-tier radix cache match as hits. A prompt served in several chunks counts once, not once per chunk.
+- Host and storage tier hits (HiCache) are excluded, matching vLLM, which reports external hits separately.
+- Retracted (preempted) requests are excluded, again matching vLLM, which tracks them in separate preempted counters.
+- The line is omitted while the window is empty -- before the first admission, right after a prefix cache flush, and on a PD decode node, which never admits requests.
+- Flushing the prefix cache clears the window.
+
+For a Prometheus-side approximation of the same ratio, divide the existing counters:
+
+```promql
+sum(rate(sglang:cached_tokens_total{cache_source="device"}[5m]))
+  / sum(rate(sglang:prompt_tokens_total[5m]))
+```
+
+These two counters are recorded when a request finishes rather than at admission, so the result lags the log line slightly.
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:
