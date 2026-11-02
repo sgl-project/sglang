@@ -16,6 +16,32 @@ from pathlib import Path
 import requests
 
 
+def response_token_ids(row, expected_length):
+    """Check the emitted IDs independently of the logprob metadata being tested."""
+    ids = row["output_ids"]
+    logprob_ids = [item[1] for item in row["meta_info"]["output_token_logprobs"]]
+    assert ids == logprob_ids, "Emitted output_ids disagree with logprob token IDs"
+    assert len(ids) == expected_length, (len(ids), expected_length)
+    return ids
+
+
+def token_mismatch(actual, expected, *, mode, row, wave):
+    if actual == expected:
+        return None
+    first = next(
+        (i for i, (a, b) in enumerate(zip(actual, expected)) if a != b),
+        min(len(actual), len(expected)),
+    )
+    return dict(
+        mode=mode,
+        row=row,
+        wave=wave,
+        first_difference=first,
+        actual=actual,
+        expected=expected,
+    )
+
+
 def install_probes():
     # Executed at module scope in the server bootstrap, including spawned ranks.
     import torch
@@ -102,9 +128,9 @@ def run():
     summary = {}
     mismatches = []
 
-    def compare_tokens(actual, expected, mode, row):
-        if actual != expected:
-            mismatch = dict(mode=mode, row=row, actual=actual, expected=expected)
+    def compare_tokens(actual, expected, mode, row, wave):
+        mismatch = token_mismatch(actual, expected, mode=mode, row=row, wave=wave)
+        if mismatch is not None:
             mismatches.append(mismatch)
             print("OUTPUT_MISMATCH", json.dumps(mismatch), flush=True)
 
@@ -128,6 +154,8 @@ def run():
             "127.0.0.1",
             "--port",
             "30000",
+            "--random-seed",
+            "0",
             "--attention-backend",
             "triton",
             "--mem-fraction-static",
@@ -177,23 +205,40 @@ def run():
             else:
                 raise TimeoutError(f"{mode} server launch timed out")
 
+            wave = 0
+
             def generate(flags, limits=(96, 96, 96)):
+                nonlocal wave
+                wave += 1
+                payload = {
+                    "text": PROMPTS,
+                    "sampling_params": [
+                        dict(
+                            temperature=0,
+                            max_new_tokens=n,
+                            ignore_eos=True,
+                            disable_speculative_decoding=flag,
+                        )
+                        for flag, n in zip(flags, limits)
+                    ],
+                    "return_logprob": True,
+                    "top_logprobs_num": 5,
+                }
                 response = requests.post(
                     url + "/generate",
-                    json={
-                        "text": PROMPTS,
-                        "sampling_params": [
-                            dict(
-                                temperature=0,
-                                max_new_tokens=n,
-                                ignore_eos=True,
-                                disable_speculative_decoding=flag,
-                            )
-                            for flag, n in zip(flags, limits)
-                        ],
-                        "return_logprob": True,
-                    },
+                    json=payload,
                     timeout=180,
+                )
+                # Persist before any assertion, including an HTTP/schema failure.
+                (root / f"{mode}-wave-{wave}.json").write_text(
+                    json.dumps(
+                        dict(
+                            request=payload,
+                            status_code=response.status_code,
+                            response_text=response.text,
+                        ),
+                        indent=2,
+                    )
                 )
                 assert response.ok, response.text
                 rows = response.json()
@@ -201,8 +246,7 @@ def run():
                 tokens = []
                 for row, flag, n in zip(rows, flags, limits):
                     meta = row["meta_info"]
-                    ids = [item[1] for item in meta["output_token_logprobs"]]
-                    assert len(ids) == n, (len(ids), n, row)
+                    ids = response_token_ids(row, n)
                     if flag and mode != "target":
                         assert meta["spec_num_correct_drafts"] == 0, meta
                         assert meta["spec_verify_ct"] > 0, meta
@@ -223,12 +267,14 @@ def run():
                     actual = generate(flags, limits)
                     for i, flag in enumerate(flags):
                         if flag:
-                            compare_tokens(actual[i], baseline[i][: limits[i]], mode, i)
+                            compare_tokens(
+                                actual[i], baseline[i][: limits[i]], mode, i, wave
+                            )
                 response = requests.get(url + "/flush_cache", timeout=30)
                 assert response.ok, response.text
                 actual = generate([True] * 3)
                 for i in range(3):
-                    compare_tokens(actual[i], baseline[i], mode, i)
+                    compare_tokens(actual[i], baseline[i], mode, i, wave)
             # Probe idle checks after all requests have released their rows.
             time.sleep(2)
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -248,6 +294,8 @@ def run():
                 assert (graph_rounds > 0) == (mode == "graph"), graph_rounds
                 counts["verify_cuda_graph_rounds"] = graph_rounds
             summary[mode] = counts
+            summary["output_mismatches"] = mismatches
+            (root / "summary.json").write_text(json.dumps(summary, indent=2))
             print(mode, counts, flush=True)
         finally:
             if process.poll() is None:

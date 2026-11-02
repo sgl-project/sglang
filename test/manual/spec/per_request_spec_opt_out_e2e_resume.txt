@@ -65,6 +65,10 @@ groups on exit. No repeat of the already-passed GPU unit suites is needed unless
 code/environment changes justify it. The script never starts or stops a Pod.
 
 Pass criteria
+- See per_request_spec_opt_out_mismatch_analysis.txt for the unresolved output
+  differences from the first completed run. Do not discard these failures.
+- Every response is saved as MODE-wave-N.json before validation. Compare actual
+  output_ids against logprob IDs; top-5 logprobs help inspect the first divergence.
 - Driver prints MODEL_E2E_AND_KV_SMOKE_PASS and writes summary.json.
 - Target, eager and graph modes complete, real mixed/all-opt-out batches appear.
 - Opted-out rows retain exactly one token; enabled rows sometimes accept >1.
@@ -83,7 +87,8 @@ convert these bounded checks into a general cross-server determinism guarantee.
 
 Shutdown and evidence
 Before stopping, download preflight.log and the entire unique e2e-* directory
-(driver.log, target/eager/graph logs and JSONL traces, serve_probe.py, summary.json).
+(driver.log, target/eager/graph logs and JSONL traces, MODE-wave-N.json responses,
+serve_probe.py, summary.json).
 Record commit, image, model snapshot IDs, elapsed time and nvidia-smi output.
 Export evidence before stopping ephemeral storage. Stop the Pod even after a
 failed test or timeout, verify compute/storage Not running and $0.00/hr. Keep PR

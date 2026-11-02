@@ -207,6 +207,9 @@ class TestPerRequestSpecOptOut(CustomTestCase):
     def test_root_sampler_matches_ordinary_sampling(self):
         self._check_root_sampling(seeded=False)
 
+    def test_greedy_root_sampler_matches_ordinary_logprob_sampling(self):
+        self._check_root_sampling(seeded=False, greedy=True)
+
     def test_root_sampler_matches_ordinary_seeded_sampling(self):
         if (
             not torch.cuda.is_available()
@@ -215,14 +218,14 @@ class TestPerRequestSpecOptOut(CustomTestCase):
             self.skipTest("seeded sampling requires native sgl_kernel on CPU or CUDA")
         self._check_root_sampling(seeded=True)
 
-    def _check_root_sampling(self, seeded):
+    def _check_root_sampling(self, seeded, greedy=False):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         batch, verify, output = fixture(device=device)
         output.next_token_logits.copy_(
             torch.randn(12, 8, generator=torch.Generator().manual_seed(42)).to(device)
         )
         info = batch.sampling_info
-        info.is_all_greedy = False
+        info.is_all_greedy = greedy
         info.top_ks.fill_(8)
         info.sampling_seed = (
             torch.tensor([11, 22, 33], device=device) if seeded else None
@@ -260,13 +263,13 @@ class TestPerRequestSpecOptOut(CustomTestCase):
                 actual = _sample_spec_opt_out_roots(
                     output.next_token_logits, verify, batch, sampler
                 )
-                torch.manual_seed(1234)
+                torch.manual_seed(4321 if greedy else 1234)
                 expected = sampler(
                     LogitsProcessorOutput(
                         next_token_logits=original_logits[roots].clone()
                     ),
                     info,
-                    False,
+                    greedy,
                     [],
                     [],
                     batch.seq_lens,
