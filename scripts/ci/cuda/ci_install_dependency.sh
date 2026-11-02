@@ -817,6 +817,28 @@ install_extra_deps() {
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
     NIXL_BIN_NAME="nixl-cu13"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
+
+    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #5063 wheel -----------
+    # The validation artifact currently contains an x86_64 wheel only. Keep
+    # arm64 runners on the normal PyPI package, which provides an aarch64
+    # wheel for this version.
+    MOONCAKE_WHEEL_ZIP_URL=""
+    if [ "$(uname -m)" = "x86_64" ]; then
+        MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12965717956.zip"
+    else
+        echo "TEMP: skipping x86_64-only Mooncake PR #5063 wheel on $(uname -m)"
+    fi
+    if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
+        MOONCAKE_WHEEL_DIR="$(mktemp -d)"
+        curl -fSL --retry 3 --retry-delay 2 \
+            -o "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_ZIP_URL}"
+        python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+            "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
+        MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
+        echo "TEMP: overriding Mooncake with PR #5063 wheel for x86_64/py${CI_PYTHON_VER}: ${MOONCAKE_PKG}"
+    fi
+    # <<< TEMP ---------------------------------------------------------------
+
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
