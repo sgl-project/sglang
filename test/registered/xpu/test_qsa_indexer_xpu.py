@@ -60,7 +60,7 @@ class _DispatchIndexer:
 
 
 class _DispatchMetadata:
-    token_to_kv_pool = None
+    token_to_kv_pool = SimpleNamespace(qsa_ring_size=4)
     out_cache_loc = None
     compress_member_rows = None
     decode_logical_positions = None
