@@ -18,6 +18,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -58,6 +60,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -81,6 +84,15 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Host-only checkpoint: hicache host-pool index. The radix node keeps this
+    # and no GPU slot. Mutually exclusive with mamba_value.
+    mamba_host_value: Optional[torch.Tensor] = None
+    # GPU slot to copy into the host pool. Set by prepare; the copy itself
+    # waits until the insert key is known, so a leaf that already has mamba
+    # never pays the D2H.
+    mamba_host_src: Optional[torch.Tensor] = None
+    # Both mamba values stay empty and the leaf already holds the checkpoint.
+    allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
 
@@ -504,11 +516,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            swa_dead_lo=kv.swa_dead_lo(global_page_size),
         )
 
     @abstractmethod
@@ -719,5 +732,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

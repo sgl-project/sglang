@@ -305,7 +305,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             (self.q_lora_rank, self.num_local_heads * self.qk_head_dim),
         )
         if self.weight_quant_mode == 2:
-            if self.rotary_emb.is_neox_style:
+            if self.rotary_emb is not None and self.rotary_emb.is_neox_style:
                 raise RuntimeError("Dynamic INT8 MLAProlog requires interleaved RoPE")
             # ModelSlim has already transposed INT8 weights to [K, N].
             for norm in (self.q_a_layernorm, self.kv_a_layernorm):
@@ -697,6 +697,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         return (
             self.is_npu_arch35
+            or (self.no_rope_mlaprolog is not None and self.weight_quant_mode in (0, 2))
             or _is_dsa_mlaprolog
             or (
                 hasattr(self.quant_config, "ignore")

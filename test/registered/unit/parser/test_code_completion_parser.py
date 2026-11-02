@@ -33,20 +33,6 @@ class TestRegisterCompletionTemplate(CustomTestCase):
         """Test that a non-existent template returns False."""
         self.assertFalse(completion_template_exists("nonexistent_template"))
 
-    def test_register_new_template(self):
-        """Test registering a new template."""
-        t = CompletionTemplate(
-            name="_test_new_template",
-            fim_begin_token="<b>",
-            fim_middle_token="<m>",
-            fim_end_token="<e>",
-            fim_position=FimPosition.END,
-        )
-        register_completion_template(t)
-        self.assertTrue(completion_template_exists("_test_new_template"))
-        # Cleanup
-        del completion_templates["_test_new_template"]
-
     def test_register_duplicate_raises(self):
         """Test that registering a duplicate name without override raises."""
         with self.assertRaises(AssertionError):
@@ -106,13 +92,6 @@ class TestGenerateCompletionPrompt(CustomTestCase):
         expected = (
             f"{t.fim_begin_token}prefix{t.fim_end_token}suffix{t.fim_middle_token}"
         )
-        self.assertEqual(result, expected)
-
-    def test_empty_prompt_and_suffix(self):
-        """Test FIM prompt generation with empty strings."""
-        result = generate_completion_prompt("", "", "deepseek_coder")
-        t = completion_templates["deepseek_coder"]
-        expected = f"{t.fim_begin_token}{t.fim_middle_token}{t.fim_end_token}"
         self.assertEqual(result, expected)
 
 

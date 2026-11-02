@@ -9,6 +9,10 @@ from typing import List, Optional, Union
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.sampling.watermarking.core import (
+    WATERMARK_CONTAINER_FIELD_NAMES,
+    redact_watermark_secrets,
+)
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,11 @@ class RequestMetricsExporter(ABC):
                 value = getattr(obj, field_name)
                 # Convert to serializable format
                 if value is not None:
+                    if field_name in WATERMARK_CONTAINER_FIELD_NAMES:
+                        # A client watermark config may carry its key.
+                        value = redact_watermark_secrets(
+                            value, in_watermark_config=field_name == "watermark"
+                        )
                     request_params[field_name] = value
 
         meta_info = out_dict.get("meta_info", {})
