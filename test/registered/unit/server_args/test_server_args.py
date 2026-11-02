@@ -2172,6 +2172,23 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
 
+    def test_sharded_padded_cp_kv_layout_refuses_unified_memory(self):
+        for unified in (False, True):
+            with (
+                self.subTest(unified=unified),
+                patch(
+                    "sglang.srt.layers.cp.base.is_cp_sharded_padded", return_value=True
+                ),
+            ):
+                server_args = self._new_cp_args(enable_unified_memory=unified)
+                if unified:
+                    with self.assertRaisesRegex(
+                        ValueError, "--enable-unified-memory does not support"
+                    ):
+                        handle_context_parallelism(server_args)
+                else:
+                    handle_context_parallelism(server_args)
+
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
             ("--enable-prefill-context-parallel", []),

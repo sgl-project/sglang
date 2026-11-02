@@ -61,6 +61,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     moe_dp_size=1,
                     cp_strategy=None,
                     cp_kv_layout=None,
+                    enable_unified_memory=False,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
