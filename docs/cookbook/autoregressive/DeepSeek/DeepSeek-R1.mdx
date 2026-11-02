@@ -1,7 +1,7 @@
 ---
 title: DeepSeek-R1
 metatags:
-    description: "Deploy DeepSeek-R1 reasoning model with SGLang - advanced step-by-step reasoning with FP8/FP4 quantization for NVIDIA and AMD GPUs."
+    description: "Deploy DeepSeek-R1 with SGLang on NVIDIA, AMD, CPU, and Ascend A3 hardware, including single-node and disaggregated ModelSlim W4A8 recipes."
 ---
 
 import { DeepSeekR1BasicDeployment } from '/src/snippets/autoregressive/deepseek-r1-basic-deployment.jsx';
@@ -15,11 +15,12 @@ import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deeps
 
 - **Advanced Reasoning**: Built-in reasoning capabilities for complex problem-solving
 - **Multiple Quantizations**: FP8 and FP4 variants for different performance/memory trade-offs
-- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, AMD MI300X, MI325X and MI355X GPUs, as well as Intel Xeon CPUs
+- **Hardware Optimization**: Specifically tuned for NVIDIA B200 (Blackwell) and H200 (Hopper) GPUs, AMD MI300X, MI325X and MI355X GPUs, as well as Intel Xeon CPUs and Ascend A3 NPUs
 - **High Performance**: Optimized for both throughput and latency scenarios
 
 **Available Models:**
 
+- **Ascend A3 ModelSlim W4A8**: [Modelers_Park/DeepSeek-R1-0528-w4a8](https://modelers.cn/Modelers_Park/DeepSeek-R1-0528-w4a8) — use the Ascend A3 selection below; this checkpoint uses a different format from the W4AFP8 checkpoint listed below.
 - **FP8 (8-bit quantized)**: [deepseek-ai/DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528) - Recommended for H200 and MI300X
 - **FP4 (4-bit quantized)**: [nvidia/DeepSeek-R1-0528-FP4-v2](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2) - Recommended for B200 and MI355X
 - **BF16 (upcast from FP8)**: [unsloth/DeepSeek-R1-0528-BF16](https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16)
@@ -80,6 +81,10 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Ascend A3 Series</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 (ModelSlim)</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ascend A3: 1 server (8 cards, 16 devices) for PD co-located; 2 servers for PD disaggregated</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 / AWQ / MXFP4 / NVFP4</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8× H20/H100, 4× H200; 8× H100/A100; 8/4× MI355X/MI350X; 8/4× B200</td>
     </tr>
@@ -98,6 +103,28 @@ python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --tru
 **NCCL timeout:** If model loading is slow, increase: `--dist-timeout 3600`.
 
 **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+### 3.4 Ascend A3 deployment
+
+Select **Ascend A3** in the Basic Configuration selector above. Then choose **1×A3 · PD co-located**, or choose **2×A3 · PD disaggregated** and a **Prefill**, **Decode**, or **Router** role. An A3 server has 8 cards (16 logical devices), and in the disaggregated recipe each node runs a full TP16 copy of the model. The generated commands follow the [official R1 W4A8 best practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) and use the same `python3 -m sglang.launch_server` entry point as the other commands on this page.
+
+Before launching:
+
+1. Use an SGLang build that includes the grouped ModelSlim W4A8 loading fix. Without it, this checkpoint produces invalid output.
+2. Pull the A3 image with `docker pull quay.io/ascend/sglang:main-cann9.1.0-a3`. Set up a container with a matched driver, CANN, TorchNPU, and MemFabric by following the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation). Mount all 16 devices and the model directory.
+3. Download the [ModelSlim W4A8 checkpoint](https://modelers.cn/Modelers_Park/DeepSeek-R1-0528-w4a8) (about 403 GB) on every node. It includes the NextN/MTP weights used by the speculative-decoding settings.
+4. Apply the host tuning from the best practice on each host:
+
+   ```bash
+   echo performance | tee \
+     /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+   sysctl -w vm.swappiness=0 kernel.numa_balancing=0 \
+     kernel.sched_migration_cost_ns=50000
+   ```
+
+5. Replace the placeholders in the command. Use your host network interface for `<network-interface>`. For disaggregation, use the Prefill host address for `<prefill-ip>` and the Decode host address for `<decode-ip>`. Prefill creates the MemFabric store at `<prefill-ip>:24670`, so start Prefill and Decode first and the Router last. The Router listens on port `6688`. The `8998` after `--prefill` in the Router command is the Prefill bootstrap port, so keep it equal to the Prefill `--disaggregation-bootstrap-port`.
+
+After the service starts, [verify it](#4-3-verify-the-ascend-a3-service) and [run the benchmarks](#5-3-ascend-a3-benchmarks).
 
 ## 4. Model Invocation
 
@@ -372,6 +399,37 @@ response = client.chat.completions.create(
 )
 print(response)
 ```
+
+### 4.3 Verify the Ascend A3 service
+
+Wait for the server to finish loading the weights and capturing graphs. Then check the service from another terminal in the same container. For the disaggregated recipe, the Router listens on port `6688`, and its `/workers` endpoint must list one healthy `prefill` and one healthy `decode` worker:
+
+```bash Command
+curl --fail --silent --show-error --max-time 30 \
+  http://127.0.0.1:6688/workers
+```
+
+Send a request through the OpenAI-compatible endpoint:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:6688/v1", api_key="EMPTY",
+)
+model = client.models.list().data[0].id
+response = client.chat.completions.create(
+    model=model,
+    messages=[
+        {"role": "user", "content": "What is 7 multiplied by 8?"},
+    ],
+    temperature=0,
+    max_tokens=1024,
+)
+print(response.choices[0].message.content)
+```
+
+For the co-located recipe, use `http://127.0.0.1:30000/v1` instead.
 
 ## 5. Benchmark
 
@@ -990,4 +1048,48 @@ Accuracy: 0.959
 Invalid: 0.000
 Latency: 29.185 s
 Output throughput: 4854.672 token/s
+```
+
+### 5.3 Ascend A3 benchmarks
+
+Use the generated A3 commands for both the performance and the accuracy runs.
+
+#### 5.3.1 Performance
+
+The [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) lists 50 ms TPOT for both deployments. Run the benchmark against the running service, and add `--dataset-path` with a local ShareGPT file if the host is offline.
+
+```bash Command
+# 1×A3, PD co-located
+python3 -m sglang.bench_serving \
+  --dataset-name random --backend sglang \
+  --host 127.0.0.1 --port 30000 \
+  --max-concurrency 224 --num-prompts 896 \
+  --random-input-len 3500 --random-output-len 1500 \
+  --random-range-ratio 1 --seed 1
+```
+
+```bash Command
+# 2×A3, PD disaggregated (through the Router)
+python3 -m sglang.bench_serving \
+  --dataset-name random --backend sglang \
+  --host 127.0.0.1 --port 6688 \
+  --max-concurrency 416 --num-prompts 1664 --request-rate 24 \
+  --random-input-len 3584 --random-output-len 1536 \
+  --random-range-ratio 1 --seed 1
+```
+
+Compare the mean TPOT with the reference. The two deployments use different workloads, so do not compare their throughput with each other. If you need to reach the reference value, tune the host and scheduling settings for your own system.
+
+#### 5.3.2 GSM8K accuracy
+
+Restart the generated command with `--context-length 32768`, then run the full test set. Set `MODEL_ID` to the name returned by `/v1/models`, set `GSM8K_TEST_JSONL` to the GSM8K test set in the `sgl-eval` input format, set `EVAL_OUTPUT` to a directory for the results, and use the Router URL (`http://127.0.0.1:6688/v1`) for the disaggregated deployment.
+
+```bash Command
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --model "$MODEL_ID" \
+  --from-dataset "$GSM8K_TEST_JSONL" \
+  --num-examples 1319 --num-threads 64 --n-repeats 1 \
+  --temperature 0.6 --top-p 0.95 --seed 1 --thinking \
+  --max-tokens 16384 --out-dir "$EVAL_OUTPUT"
 ```
