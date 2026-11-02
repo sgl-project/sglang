@@ -147,11 +147,12 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "HiDream-O1-Image",
       modelIds: [
-        "hidream-ai/HiDream-O1-Image-Dev-2604",
-        "hidream-ai/HiDream-O1-Image-Dev",
-        "hidream-ai/HiDream-O1-Image",
+        "HiDream-ai/HiDream-O1-Image-Dev-2604",
+        "HiDream-ai/HiDream-O1-Image-Dev",
+        "HiDream-ai/HiDream-O1-Image",
       ],
       cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+      note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
     },
     {
       name: "Hunyuan3D 2",
@@ -257,6 +258,16 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
+      name: "FastH3 Omni",
+      modelIds: ["FastVideo/FastVideo-FastH3-Omni-8-Step-V1"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#fasth3-omni-ref2va-8-step-pdd",
+    },
+    {
+      name: "Pika H3 Flex",
+      modelIds: ["Pika-Labs/Pika-H3-Flex"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pika-h3-flex-six-step-adapters",
+    },
+    {
       name: "VDN-H3",
       modelIds: ["OpenVDN/vdn-minimax-h3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
@@ -298,6 +309,11 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
   ],
   world: [
+    {
+      name: "HY-Nomas",
+      modelIds: ["tencent/Hy-Nomas"],
+      cookbook: "/cookbook/diffusion/HY-Nomas/HY-Nomas",
+    },
     {
       name: "Cosmos 3",
       modelIds: [

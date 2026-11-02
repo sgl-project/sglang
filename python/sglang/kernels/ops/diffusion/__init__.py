@@ -196,6 +196,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.aten_head_rmsnorm",
+        KernelBackend.TRITON,
+        "norm.aten_head_rmsnorm_triton:aten_head_rmsnorm",
+        _HIP,
+    ),
+    (
         "diffusion.rmsnorm_scale",
         KernelBackend.TRITON,
         "norm.native_bf16_rmsnorm_triton:rmsnorm_scale",
@@ -730,6 +736,9 @@ _EXPORTS: dict[str, str] = {
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
+    "aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "can_use_aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "can_use_aten_head_rmsnorm_rope": "norm.aten_head_rmsnorm_triton",
     "can_use_rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "can_use_rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",

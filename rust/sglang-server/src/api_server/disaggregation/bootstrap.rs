@@ -46,6 +46,7 @@ struct PrefillServerInfo {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    stores_to_linker: bool,
     prefill_http_port: Option<i64>,
 }
 
@@ -114,6 +115,7 @@ struct Topology {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    stores_to_linker: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -169,6 +171,8 @@ struct Route {
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    stores_to_linker: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -217,6 +221,8 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        topo.stores_to_linker
+            .get_or_insert(body.stores_to_linker.unwrap_or(false));
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -293,6 +299,7 @@ async fn route_get(
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
+            stores_to_linker: topo.stores_to_linker.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -531,6 +538,7 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "stores_to_linker": false,
                 "prefill_http_port": 30000,
             })
         );

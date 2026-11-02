@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
 )
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -25,10 +26,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RecoverSWAWithLockedFull,
@@ -96,6 +99,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, index_slots, tree_slots_of
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
@@ -113,14 +117,18 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=True,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
         )
 
         cache = UnifiedRadixCache(params=params)
 
         self.assertIsInstance(cache.components[ComponentType.FULL], FakeFullComponent)
-        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], FakeFullComponent)
+        self.assertIsNot(
+            COMPONENT_REGISTRY[FAMILY_OF[ComponentType.FULL]], FakeFullComponent
+        )
 
 
 class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
@@ -129,7 +137,9 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
         not len(value), or the ledger drifts from sanity_check's recount."""
         cache, allocator, _ = build_fixture(
             CacheConfig(),
-            component_registry_override={ComponentType.FULL: PagedFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: PagedFullComponent
+            },
             tree_core_backend="python",
         )
         component = cache.components[ComponentType.FULL]
@@ -872,7 +882,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(swa_value)
         self.assertTrue(
             torch.equal(
-                allocator.translate_loc_from_full_to_swa(old_full_value),
+                allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(old_full_value),
                 swa_value,
             )
         )
@@ -1864,7 +1874,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
 
 
 def _component_with_cache(component_type, cache):
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
@@ -1874,6 +1884,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_retraction_uses_engine_transfer_index_domains(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.is_swa_enabled = True
+        index_slots(cache, (ComponentType.FULL, ComponentType.SWA))
         cache._sliding_window_size = 3
         cache.tree_core = mock.Mock(page_size=2)
         cache.page_size = 2
@@ -1920,10 +1931,12 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
+        alloc.hands_out_virtual_ids = False
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
         swa_value = torch.tensor([7, 8], dtype=torch.int64)
         alloc.translate_swa_indices_for_transfer.return_value = swa_value
+        cache.kv_storage = lambda: StaticKVStorage(None, alloc)
         component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -1991,11 +2004,13 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         order = mock.Mock()
         cache.linker = order.linker
         cache.token_to_kv_pool_allocator = order.allocator
+        cache.kv_storage = lambda: StaticKVStorage(None, order.allocator)
         cache.components = {
             ComponentType.SWA: order.swa,
             ComponentType.FULL: order.full,
             ComponentType.MAMBA: order.mamba,
         }
+        index_slots(cache, cache.components)
 
         def complete_match(params, result):
             return UnifiedRadixCache._finalize_match_result(cache, params, finalized)
@@ -2160,7 +2175,7 @@ class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
 
         # Decode advances past the last recurrent checkpoint. Its complete
         # draft history must remain until a newer checkpoint replaces it.
-        cache.evict_sliding_windows(req, 1040)
+        retire_window(req, 1040, cache)
         torch.testing.assert_close(mapping[needed], before)
         cache.sanity_check()
 
@@ -2216,7 +2231,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         tokens = list(range(1, seq_len + 1))
         req.origin_input_ids = tokens
         req.output_ids = []
@@ -2269,7 +2284,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
                 temperature=0, max_new_tokens=owned - prompt_len
             ),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
         req.extend_end = prompt_len
@@ -2285,7 +2300,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
 
         req.output_ids = tokens[prompt_len:]
         req.kv.kv_committed_len = owned
-        cache.evict_sliding_windows(req, owned - 1)
+        retire_window(req, owned - 1, cache)
         insert_boundary = (owned - 1) // page_size * page_size
         self.assertGreaterEqual(
             insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
