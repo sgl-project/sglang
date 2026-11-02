@@ -157,3 +157,20 @@ def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
         # Bit copy: lets the int32 top-k take the float-only custom all-gather.
         out = out.view(torch.float32)
     group.all_gather_into_tensor(out, out[slot : slot + per])
+
+
+_row_consumer = None
+
+
+def set_dcp_row_consumer(consumer) -> None:
+    """Hand the next owned-slot attention a consumer of its row chunks (an
+    object with ``rows`` and ``run(attend)``, where ``attend(lo, hi)`` returns
+    the partials and LSE of rows ``lo:hi``)."""
+    global _row_consumer
+    _row_consumer = consumer
+
+
+def take_dcp_row_consumer(rows: int):
+    global _row_consumer
+    consumer, _row_consumer = _row_consumer, None
+    return consumer if consumer is not None and consumer.rows == rows else None

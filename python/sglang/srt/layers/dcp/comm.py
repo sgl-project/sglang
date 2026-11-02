@@ -20,7 +20,9 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-from typing import Optional
+import statistics
+import time
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -554,6 +556,303 @@ def dcp_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
     return combined
+
+
+_side_stream: Optional[torch.cuda.Stream] = None
+
+
+def dcp_side_stream() -> torch.cuda.Stream:
+    """The one stream DCP collectives overlap compute on. A single stream: ROCm
+    multiplexes streams over a few hardware queues, and an extra stream can land
+    on the compute stream's queue and serialize behind it."""
+    global _side_stream
+    if _side_stream is None:
+        _side_stream = torch.cuda.Stream()
+    return _side_stream
+
+
+class DcpA2aChunkPipeline:
+    """``dcp_a2a_lse_reduce`` over row chunks of one batch.
+
+    ``run`` attends one row chunk at a time and V-projects and packs it; its
+    exchange runs on a side stream while the next chunk attends. The combine of
+    every chunk then writes straight into ``[rows, H // N, D]``. Every DCP rank
+    must run the same chunks in the same order.
+    """
+
+    def __init__(
+        self,
+        chunks: List[Tuple[int, int]],
+        cp_group: GroupCoordinator,
+        project: Callable[[torch.Tensor], torch.Tensor],
+        is_lse_base_on_e: bool,
+        timed: bool = False,
+    ):
+        self.chunks = chunks
+        self.rows = chunks[-1][1]
+        self.cp_group = cp_group
+        self.project = project
+        self.is_lse_base_on_e = is_lse_base_on_e
+        self.consumed = False
+        self.timing = _ChunkTiming() if timed else None
+        self._pending = []
+
+    def run(
+        self, attend: Callable[[int, int], Tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        for lo, hi in self.chunks:
+            if self.timing is not None:
+                self.timing.start_chunk()
+            self.submit(lo, hi, *attend(lo, hi))
+            if self.timing is not None:
+                # Timed chunks run one after another, so each stage is timed
+                # without the other stream contending for the GPU.
+                torch.cuda.current_stream().wait_event(self._pending[-1][4])
+        if self.timing is not None:
+            self.timing.host.append(time.perf_counter())
+        return self.finish()
+
+    def submit(
+        self, lo: int, hi: int, attn_out: torch.Tensor, attn_lse: torch.Tensor
+    ) -> None:
+        projected = self.project(attn_out)
+        B, H, D = projected.shape
+        N = self.cp_group.world_size
+        lpd = _lse_pack_dim(projected.dtype)
+        send = torch.empty(
+            (N, B, H // N, D + lpd), dtype=projected.dtype, device=projected.device
+        )
+        recv = torch.empty_like(send)
+        dcp_pack_a2a_send(
+            projected,
+            attn_lse,
+            send[:, :, :, :D],
+            send.view(torch.float32)[:, :, :, D // lpd],
+        )
+        timed = self.timing is not None
+        if timed:
+            self.timing.end_compute()
+        stream = dcp_side_stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            start = _timing_event() if timed else None
+            self.cp_group.all_to_all_single(
+                recv.view(-1).view(torch.uint8), send.view(-1).view(torch.uint8)
+            )
+            done = torch.cuda.Event(enable_timing=timed)
+            done.record()
+        if timed:
+            self.timing.a2a.append((start, done))
+        # send/recv stay referenced until finish() has ordered this stream
+        # after the exchange, so the allocator cannot hand them out early.
+        self._pending.append((lo, hi, send, recv, done))
+
+    def finish(self) -> torch.Tensor:
+        self.consumed = True
+        recv0 = self._pending[0][3]
+        _, _, H_local, row = recv0.shape
+        lpd = _lse_pack_dim(recv0.dtype)
+        D = row - lpd
+        out = torch.empty(
+            (self.rows, H_local, D), dtype=recv0.dtype, device=recv0.device
+        )
+        stream = torch.cuda.current_stream()
+        timed = self.timing is not None
+        for lo, hi, _send, recv, done in self._pending:
+            stream.wait_event(done)
+            start = _timing_event() if timed else None
+            dcp_lse_combine_triton(
+                recv[:, :, :, :D],
+                recv.view(torch.float32)[:, :, :, D // lpd],
+                is_lse_base_on_e=self.is_lse_base_on_e,
+                out=out[lo:hi],
+            )
+            if timed:
+                self.timing.combine.append((start, _timing_event()))
+        self._pending.clear()
+        return out
+
+
+def _timing_event() -> torch.cuda.Event:
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+class _ChunkTiming:
+    """Per-chunk GPU time of each pipeline stage and host time to issue a chunk."""
+
+    def __init__(self):
+        self.host: List[float] = []
+        self.compute: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.a2a: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.combine: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+    def start_chunk(self) -> None:
+        self.host.append(time.perf_counter())
+        self._compute_start = _timing_event()
+
+    def end_compute(self) -> None:
+        self.compute.append((self._compute_start, _timing_event()))
+
+    def stage_us(self) -> List[List[float]]:
+        """GPU time (us) of each chunk on the compute, a2a and combine stage."""
+        self.combine[-1][1].synchronize()
+        return [
+            [start.elapsed_time(end) * 1e3 for start, end in stage]
+            for stage in (self.compute, self.a2a, self.combine)
+        ]
+
+    def host_us(self) -> List[float]:
+        return [(b - a) * 1e6 for a, b in zip(self.host, self.host[1:])]
+
+
+def _median_costs(
+    timings: List["_ChunkTiming"], chunks: List[Tuple[int, int]]
+) -> List[float]:
+    """``plan_pipeline_chunks`` costs from the median over layers of each chunk's
+    stage times; the first and last chunk must differ in size."""
+    rows = [hi - lo for lo, hi in chunks]
+    stages = [t.stage_us() for t in timings]
+    costs = []
+    for s in range(3):
+        us = [statistics.median(st[s][i] for st in stages) for i in range(len(rows))]
+        costs += _fit_line(rows, us)
+    return costs + [statistics.median(h for t in timings for h in t.host_us())]
+
+
+def _fit_line(rows: List[int], us: List[float]) -> List[float]:
+    """(fixed, per-row) cost through the first and last chunk, clamped at 0."""
+    per_row = max(0.0, (us[-1] - us[0]) / (rows[-1] - rows[0]))
+    return [max(0.0, us[0] - per_row * rows[0]), per_row]
+
+
+def _even_chunks(rows: int, n: int) -> List[Tuple[int, int]]:
+    per = -(-rows // n)
+    return [(lo, min(rows, lo + per)) for lo in range(0, rows, per)]
+
+
+def modeled_pipeline_us(costs: List[float], chunks: List[Tuple[int, int]]) -> float:
+    """Finish time of the pipeline schedule under ``costs``.
+
+    The compute stream attends, projects and packs chunk i once the host has
+    issued it; the side stream exchanges it after both the chunk and the
+    previous exchange; the compute stream then combines each chunk after its
+    exchange. One chunk is the unpipelined reduce.
+    """
+    c0, c1, x0, x1, m0, m1, host = costs
+    compute = side = 0.0
+    exchanged = []
+    for i, (lo, hi) in enumerate(chunks):
+        compute = max(compute, (i + 1) * host) + c0 + c1 * (hi - lo)
+        side = max(side, compute) + x0 + x1 * (hi - lo)
+        exchanged.append(side)
+    for done, (lo, hi) in zip(exchanged, chunks):
+        compute = max(compute, done) + m0 + m1 * (hi - lo)
+    return compute
+
+
+def plan_pipeline_chunks(costs: List[float], rows: int) -> List[Tuple[int, int]]:
+    """The even row chunking whose modeled schedule finishes first."""
+    best = _even_chunks(rows, 1)
+    best_us = modeled_pipeline_us(costs, best)
+    host = costs[-1]
+    for n in range(2, rows + 1):
+        if n * host >= best_us:
+            # Issuing n chunks alone takes longer than the best schedule.
+            break
+        chunks = _even_chunks(rows, n)
+        us = modeled_pipeline_us(costs, chunks)
+        if us >= best_us:
+            break
+        best, best_us = chunks, us
+    return best
+
+
+class DcpA2aChunkPlanner:
+    """Row chunks for ``DcpA2aChunkPipeline`` from the measured cost of its stages.
+
+    Each stage of a chunk costs a fixed part plus a per-row part: attention,
+    projection and pack on the compute stream, the a2a on the side stream, the
+    combine back on the compute stream, and the host time to issue the chunk.
+    The planner times every layer of one prefill run as two unequal chunks and
+    takes the median over the layers after the first, which takes the
+    first-use costs. It then picks the chunk count whose modeled schedule
+    finishes first; one chunk means no pipeline. A prefill larger than the
+    measured one is measured again, so the per-row costs come from where they
+    dominate.
+
+    Every DCP rank must plan the same chunks, so the ranks agree on each cost:
+    the slowest rank's compute, combine and host time, and the fastest rank's
+    a2a, which on the others also holds the wait for the last rank to arrive.
+    """
+
+    def __init__(self, cp_group: GroupCoordinator):
+        self.cp_group = cp_group
+        self.costs: Optional[List[float]] = None
+        self.measured_rows = 0
+        self._measuring: List[Tuple[int, DcpA2aChunkPipeline]] = []
+        self._num_chunks: Dict[int, int] = {}
+
+    def settle(self, layer_id: int) -> None:
+        """Take the costs measured from ``layer_id`` on in an earlier forward."""
+        if not self._measuring or self._measuring[0][0] != layer_id:
+            return
+        rows = self._measuring[0][1].rows
+        measured = [p for _, p in self._measuring[1:] if p.consumed]
+        self._measuring = []
+        # Not measured again at these rows, whether or not it took.
+        self.measured_rows = rows
+        if not measured:
+            return
+        costs = torch.tensor(
+            _median_costs([p.timing for p in measured], measured[0].chunks)
+        )
+        a2a = slice(2, 4)
+        if self.cp_group.world_size > 1:
+            costs[a2a] = -costs[a2a]
+            torch.distributed.all_reduce(
+                costs, op=torch.distributed.ReduceOp.MAX, group=self.cp_group.cpu_group
+            )
+            costs[a2a] = -costs[a2a]
+        self.costs = costs.tolist()
+        self._num_chunks.clear()
+
+    def pipeline(
+        self,
+        layer_id: int,
+        rows: int,
+        project: Callable[[torch.Tensor], torch.Tensor],
+        is_lse_base_on_e: bool,
+    ) -> Optional[DcpA2aChunkPipeline]:
+        if self._measuring:
+            measuring = self._measuring[0][1].rows == rows
+        else:
+            # Two chunks of at least one row each and unequal size.
+            measuring = rows > self.measured_rows and rows >= 3
+        if measuring:
+            # Two chunks, one twice the other: the fixed and per-row costs
+            # separate, and neither chunk includes the attention set-up.
+            pipeline = DcpA2aChunkPipeline(
+                [(0, rows // 3), (rows // 3, rows)],
+                self.cp_group,
+                project,
+                is_lse_base_on_e,
+                timed=True,
+            )
+            self._measuring.append((layer_id, pipeline))
+            return pipeline
+        if self.costs is None or rows < 2:
+            return None
+        n = self._num_chunks.get(rows)
+        if n is None:
+            n = len(plan_pipeline_chunks(self.costs, rows))
+            self._num_chunks[rows] = n
+        if n == 1:
+            return None
+        return DcpA2aChunkPipeline(
+            _even_chunks(rows, n), self.cp_group, project, is_lse_base_on_e
+        )
 
 
 def _dcp_fi_a2a_lse_reduce(

@@ -1,18 +1,22 @@
-"""Owned DSA DCP route on ROCm: the aiter FP8 asm sparse MLA and the decode
-indexer row split.
+"""Owned DSA DCP route on ROCm: the aiter FP8 asm sparse MLA, the decode
+indexer row split, and the row-chunked prefill a2a.
 
 Covers:
 1. ``build_dcp_csr`` packs exactly the owned slots of the localized page table.
 2. ``asm_sparse_mla_dcp`` matches the Triton owned-count sparse MLA (output, and
-   its natural-log LSE against the Triton base-2 one), and a row that owns no
-   slot drops out of the merge.
+   its natural-log LSE against the Triton base-2 one), a row that owns no slot
+   drops out of the merge, and CSR row slices match.
 3. The AITER fused RoPE + fp8 query row + KV write at this rank's owned locs
    writes what the pool's DCP-widened write does.
 4. A row slice of the packed top-k with ``row_to_batch`` gives the same rows as
    the whole batch, which is what the per-rank decode indexer split relies on.
+5. ``DcpA2aChunkPipeline`` over row chunks equals one ``dcp_a2a_lse_reduce``.
+6. ``DcpA2aChunkPlanner`` measures the stage costs on one layer, then plans the
+   chunk count its schedule model finishes first with.
 """
 
 import math
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -142,6 +146,20 @@ def test_asm_sparse_mla_matches_triton(T):
         is_lse_base_on_e=True,
     )
     torch.testing.assert_close(merged, other_out, rtol=0, atol=0)
+
+    # Row chunks of the batch read their slice of the same CSR.
+    lo, hi = T // 3, T
+    out_c, lse_c = asm_sparse_mla_dcp(
+        q8[lo:hi].contiguous(),
+        kv,
+        indptr[lo : hi + 1],
+        indices,
+        sm_scale,
+        KV_LORA_RANK,
+        one,
+    )
+    torch.testing.assert_close(out_c, out[lo:hi], rtol=0, atol=0)
+    torch.testing.assert_close(lse_c, lse[lo:hi], rtol=0, atol=0)
 
 
 def _rope_interleaved(x, cos, sin):
@@ -282,6 +300,125 @@ def test_packed_topk_row_slice_matches_whole_batch(rows):
         pos = torch.topk(scores[r, :n], TOPK).indices
         expect = page_table[r, pos // page_size] * page_size + pos % page_size
         assert set(whole[r].tolist()) == set(expect.int().tolist())
+
+
+def _mock_group(world_size: int):
+    group = MagicMock()
+    group.world_size = world_size
+    group.all_to_all_single = MagicMock(side_effect=lambda out, inp: out.copy_(inp))
+    return group
+
+
+def _partials(rows: int, D: int):
+    partial = torch.randn(rows, H, KV_LORA_RANK, device="cuda").bfloat16()
+    lse = torch.randn(rows, H, device="cuda") * 3
+    w_vc = (torch.randn(H, KV_LORA_RANK, D, device="cuda") * 0.04).bfloat16()
+
+    def project(x):
+        return torch.bmm(x.transpose(0, 1), w_vc).transpose(0, 1).contiguous()
+
+    def attend(lo, hi):
+        return partial[lo:hi], lse[lo:hi].contiguous()
+
+    return partial, lse, project, attend
+
+
+@pytest.mark.parametrize("rows,chunk", [(4096, 1024), (5000, 1250), (300, 128)])
+@pytest.mark.parametrize("timed", [False, True])
+def test_a2a_chunk_pipeline_matches_reduce(rows, chunk, timed):
+    from sglang.srt.layers.dcp import DcpA2aChunkPipeline, dcp_a2a_lse_reduce
+
+    torch.manual_seed(3)
+    N, D = 2, 256
+    group = _mock_group(N)
+    partial, lse, project, attend = _partials(rows, D)
+    chunks = [(lo, min(rows, lo + chunk)) for lo in range(0, rows, chunk)]
+
+    # Project per chunk for the reference too: bmm rounding depends on the batch.
+    projected = torch.cat([project(partial[lo:hi]) for lo, hi in chunks])
+    ref = dcp_a2a_lse_reduce(projected, lse, group, is_lse_base_on_e=False)
+
+    pipe = DcpA2aChunkPipeline(chunks, group, project, False, timed=timed)
+    out = pipe.run(attend)
+
+    assert pipe.consumed and pipe.rows == rows
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    sizes = [hi - lo for lo, hi in chunks]
+    if timed and sizes[0] != sizes[-1]:
+        from sglang.srt.layers.dcp.comm import _median_costs
+
+        costs = _median_costs([pipe.timing], chunks)
+        assert len(costs) == 7 and min(costs) >= 0 and costs[-1] > 0
+
+
+# Stage costs (us): compute, a2a and combine as (fixed, per row), then the host
+# time per chunk, in the range measured at GLM-5.2 DCP4 shapes on MI355X.
+_COSTS = [20.0, 0.11, 33.0, 0.152, 10.0, 0.038, 240.0]
+
+
+def test_plan_pipeline_chunks_follows_costs():
+    from sglang.srt.layers.dcp.comm import modeled_pipeline_us, plan_pipeline_chunks
+
+    plans = {rows: plan_pipeline_chunks(_COSTS, rows) for rows in (512, 4096, 32768)}
+    for rows, chunks in plans.items():
+        assert chunks[0][0] == 0 and chunks[-1][1] == rows
+        assert all(a[1] == b[0] for a, b in zip(chunks, chunks[1:]))
+        # No even chunking with one chunk more or less models faster.
+        n = len(chunks)
+        for m in (n - 1, n + 1):
+            if 1 <= m <= rows:
+                per = -(-rows // m)
+                other = [(lo, min(rows, lo + per)) for lo in range(0, rows, per)]
+                assert modeled_pipeline_us(_COSTS, other) >= modeled_pipeline_us(
+                    _COSTS, chunks
+                )
+    # Issuing a chunk costs more than a small batch's exchange hides: no split.
+    assert len(plans[512]) == 1
+    # The hidden compute grows with the rows, the per-chunk cost does not.
+    assert 1 < len(plans[4096]) < len(plans[32768])
+    # Free per-chunk costs leave nothing to stop the split but the host.
+    cheap = _COSTS[:-1] + [_COSTS[-1] / 8]
+    assert len(plan_pipeline_chunks(cheap, 4096)) > len(plans[4096])
+
+
+def test_planner_measures_then_plans():
+    from sglang.srt.layers.dcp import DcpA2aChunkPlanner
+    from sglang.srt.layers.dcp.comm import plan_pipeline_chunks
+
+    torch.manual_seed(5)
+    rows, D = 3000, 256
+    group = _mock_group(1)
+    _, _, project, attend = _partials(2 * rows, D)
+    planner = DcpA2aChunkPlanner(group)
+
+    # The first prefill measures on every layer it reaches with those rows.
+    for layer in range(3):
+        p = planner.pipeline(layer, rows, project, False)
+        assert p is not None and p.timing is not None
+        assert len(p.chunks) == 2 and p.chunks[-1][1] == rows
+        p.run(attend)
+    assert planner.pipeline(3, rows // 2, project, False) is None
+    torch.cuda.synchronize()
+
+    # A later forward reaching the first of them takes the costs.
+    planner.settle(1)
+    assert planner.costs is None
+    planner.settle(0)
+    assert planner.measured_rows == rows and min(planner.costs) >= 0
+    want = plan_pipeline_chunks(planner.costs, rows)
+    got = planner.pipeline(0, rows, project, False)
+    assert (got.chunks if got is not None else [(0, rows)]) == want
+    assert got is None or got.timing is None
+
+    # A larger prefill is measured again.
+    again = planner.pipeline(0, 2 * rows, project, False)
+    assert again.timing is not None
+    # One that never reached a second layer keeps the costs, and is not retried.
+    costs = list(planner.costs)
+    planner.settle(0)
+    assert planner.costs == costs and planner.measured_rows == 2 * rows
+    retry = planner.pipeline(0, 2 * rows, project, False)
+    assert retry is None or retry.timing is None
 
 
 if __name__ == "__main__":

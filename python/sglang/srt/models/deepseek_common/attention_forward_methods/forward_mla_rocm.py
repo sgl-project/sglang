@@ -20,7 +20,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.dsa_dcp import set_dcp_row_consumer
 from sglang.srt.layers.dcp import (
+    DcpA2aChunkPipeline,
+    DcpA2aChunkPlanner,
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
@@ -79,6 +82,8 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# One per owned attention kernel (asm or Triton), whose costs differ.
+_dcp_a2a_planners: dict[bool, DcpA2aChunkPlanner] = {}
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -990,6 +995,7 @@ class DeepseekMLARocmForwardMixin:
         q_nope_unabsorbed=None,
     ):
         save_kv_cache = True
+        a2a_pipeline = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -1073,6 +1079,10 @@ class DeepseekMLARocmForwardMixin:
                         "llama_4_scaling": llama_4_scaling,
                     }
                 if self.is_dcp_mla_decode_phase(forward_batch):
+                    a2a_pipeline = self._dcp_a2a_pipeline(
+                        forward_batch, q_nope_out, q_pe
+                    )
+                    set_dcp_row_consumer(a2a_pipeline)
                     from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
                         is_asm_q8,
                     )
@@ -1094,6 +1104,7 @@ class DeepseekMLARocmForwardMixin:
                             else {}
                         ),
                     )
+                    set_dcp_row_consumer(None)
                 else:
                     attn_output = self.attn_mqa(
                         q_nope_out,
@@ -1171,6 +1182,13 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
+        if a2a_pipeline is not None and a2a_pipeline.consumed:
+            output, _ = self.o_proj(attn_output.flatten(1, 2))
+            if self.next_skip_topk is None:
+                return output
+            if not self.next_skip_topk:
+                return output, None
+            return output, topk_indices
         if self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
@@ -1320,6 +1338,38 @@ class DeepseekMLARocmForwardMixin:
             attn_output.transpose(0, 1), self.w_vc_qrep, out=projected.transpose(0, 1)
         )
         return projected
+
+    def _dcp_a2a_pipeline(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> Optional[DcpA2aChunkPipeline]:
+        """Row-chunk the prefill partial exchange so each chunk's a2a overlaps
+        the next chunk's attention, as far as the measured costs say it pays."""
+        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode() or not self._dcp_project_before_merge():
+            return None
+        asm = is_asm_q8(q_nope_out, q_pe)
+        planner = _dcp_a2a_planners.get(asm)
+        if planner is None:
+            planner = DcpA2aChunkPlanner(get_parallel().dcp_group)
+            _dcp_a2a_planners[asm] = planner
+        layer_id = self.attn_mqa.layer_id
+        planner.settle(layer_id)
+        if not (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and not get_in_autotune_dummy_run()
+        ):
+            return None
+        return planner.pipeline(
+            layer_id,
+            q_nope_out.shape[0],
+            self._dcp_project_partials,
+            is_lse_base_on_e=self._dcp_lse_base_on_e(q_nope_out, q_pe),
+        )
 
     def _dcp_lse_base_on_e(
         self: DeepseekV2AttentionMLA, q_nope_out: torch.Tensor, q_pe: torch.Tensor

@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
+    take_dcp_row_consumer,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
@@ -3602,30 +3603,40 @@ class DeepseekSparseAttnBackend(
                 self._asm_one_scale = torch.ones(
                     1, dtype=torch.float32, device=q_nope.device
                 )
-            return asm_sparse_mla_dcp(
-                q8,
-                kv_cache,
-                indptr,
-                indices,
-                sm_scale,
-                v_head_dim,
-                self._asm_one_scale,
-            )
 
-        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
-        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
-        out, lse = triton_sparse_mla_decode_splitk(
-            q_nope=q_nope,
-            q_rope=q_rope,
-            kv=kv_cache,
-            indices=local_page_table.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            workspace=workspace,
-            return_lse=True,
-            lengths=owned_counts,
-        )
-        return out.view(rows, heads, v_head_dim), lse
+            def attend(lo: int, hi: int):
+                return asm_sparse_mla_dcp(
+                    q8[lo:hi],
+                    kv_cache,
+                    indptr[lo : hi + 1],
+                    indices,
+                    sm_scale,
+                    v_head_dim,
+                    self._asm_one_scale,
+                )
+
+        else:
+            stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+            workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+
+            def attend(lo: int, hi: int):
+                out, lse = triton_sparse_mla_decode_splitk(
+                    q_nope=q_nope[lo:hi],
+                    q_rope=q_rope[lo:hi],
+                    kv=kv_cache,
+                    indices=local_page_table[lo:hi].unsqueeze(1),
+                    sm_scale=sm_scale,
+                    d_v=v_head_dim,
+                    workspace=workspace,
+                    return_lse=True,
+                    lengths=owned_counts[lo:hi],
+                )
+                return out.view(hi - lo, heads, v_head_dim), lse
+
+        consumer = take_dcp_row_consumer(rows)
+        if consumer is None:
+            return attend(0, rows)
+        return consumer.run(attend), None
 
     def _forward_intel_xpu_sparse_decode(
         self,
