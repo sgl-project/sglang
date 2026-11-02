@@ -71,6 +71,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    RequestCancelledError,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
     DiffusionMetrics,
@@ -263,6 +267,10 @@ def _probe_workload_units(req: Req) -> int:
 
 class _FatalDistributedForward(SystemExit):
     """Escape request-level recovery when ranks can no longer run in lockstep."""
+
+
+class _FatalDeviceError(SystemExit):
+    """Escape request-level recovery when the device can no longer be trusted."""
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -636,12 +644,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
         ):
             request_gc.collect_after_warmup()
-        results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
+        # Check before the group starts, so a cancelled request does not run.
+        # Each rank checks the same requests, so the check stays a collective.
+        cancel_errors = [self._cancel_error(req) for req in batch]
+        live_reqs = [req for req, e in zip(batch, cancel_errors) if e is None]
+        results = (
+            self.pipeline.forward_batch_sequentially(live_reqs, self.server_args)
+            if live_reqs
+            else iter(())
+        )
         group_start_time = time.monotonic()
         failed = False
 
         try:
-            for req in batch:
+            for req, cancel_error in zip(batch, cancel_errors):
+                if cancel_error is not None:
+                    logger.info(
+                        "Stopped grouped request %s: %s", req.request_id, cancel_error
+                    )
+                    yield OutputBatch(error=str(cancel_error), cancelled=True)
+                    continue
                 warming_up = req.is_warmup or bool(
                     req.extra.get("server_internal_prewarm")
                 )
@@ -665,6 +687,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
                     propagate_forward_errors=True,
+                    # checked above; the group already runs this request, so a
+                    # skipped request would leave its output to the next one
+                    check_cancelled=False,
                 )
                 assert isinstance(output_batch, OutputBatch)
                 if warming_up and (
@@ -682,6 +707,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 close()
             if failed:
                 request_gc.collect_after_warmup()
+
+    @staticmethod
+    def _cancel_error(req: Req) -> RequestCancelledError | None:
+        try:
+            raise_if_cancelled([req])
+        except RequestCancelledError as e:
+            return e
+        return None
 
     def _collect_sequential_outputs(
         self,
@@ -725,10 +758,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         execution_start_time: float | None = None,
         propagate_forward_errors: bool = False,
         defer_finalize: bool = False,
+        check_cancelled: bool = True,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
+            check_cancelled: skip the forward when the client cancelled log_reqs
         """
         output_batch = None
         forward_failed = False
@@ -790,6 +825,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             for item in log_reqs:
                 item.log(server_args=self.server_args)
+            if check_cancelled:
+                raise_if_cancelled(log_reqs)
             with ExitStack() as stack:
                 for item in log_reqs:
                     stack.enter_context(
@@ -800,6 +837,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 except Exception:
                     forward_failed = True
                     raise
+
+            # still on the scheduler thread, before saving or handing off to a thread
+            raise_if_cancelled(log_reqs)
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -837,6 +877,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     output_metrics=output_metrics,
                     deferred=False,
                 )
+        except RequestCancelledError as e:
+            if propagate_forward_errors and forward_failed:
+                raise
+            # every rank of the replica stops at the same step, so it stays in sync
+            logger.info("Stopped %s: %s", error_context, e)
+            if output_batch is None:
+                output_batch = OutputBatch()
+            output_batch.error = str(e)
+            output_batch.cancelled = True
         except Exception as e:
             if (
                 forward_failed
@@ -849,6 +898,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 measure_server_warmup = False
                 raise _FatalDistributedForward(
                     "Multi-rank forward ran out of memory; restart the server."
+                ) from e
+            if _is_unrecoverable_device_error(e):
+                # The device can no longer be trusted and even empty_cache() may
+                # fail; exit so the HTTP backend monitor fails pending requests.
+                measure_server_warmup = False
+                logger.error(
+                    UNRECOVERABLE_DEVICE_ERROR_MSG.format(error=f"{error_context}: {e}")
+                )
+                raise _FatalDeviceError(
+                    "Unrecoverable device error; restart the server."
                 ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
@@ -1512,6 +1571,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+            merged.cancelled = output_batch.cancelled
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
         if output_batch.usage is not None:
             if merged.usage is None:
@@ -1775,6 +1835,47 @@ def _oom_exceptions():
     return (torch.OutOfMemoryError,)
 
 
+UNRECOVERABLE_DEVICE_ERROR_MSG = """
+Unrecoverable device error in {error}
+The device or its memory allocator is in an unknown state, so this worker
+exits and the server stops accepting requests. Restart it.
+  - "CUDA driver error" or "!handles_.at(i) INTERNAL ASSERT FAILED" with
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: a non-OOM driver failure
+    while mapping memory leaves the allocator inconsistent
+    (https://github.com/pytorch/pytorch/issues/188008). It is most common on
+    WSL2/Windows near the memory limit; lower the resolution or memory use, or
+    run without expandable_segments.
+"""
+
+# Non-OOM device errors after which the CUDA context or the caching allocator
+# cannot be trusted, matched in the message because C10_CUDA_DRIVER_CHECK and
+# allocator asserts surface as plain RuntimeErrors.
+_UNRECOVERABLE_DEVICE_ERROR_MARKERS = (
+    "CUDA driver error:",
+    "CUDA error:",
+    "HIP error:",
+    "CUDACachingAllocator.cpp",
+)
+
+
+# An OOM stays recoverable: the allocator releases what it mapped, and the
+# cache is emptied after the request.
+def _is_unrecoverable_device_error(error: BaseException) -> bool:
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, _oom_exceptions()):
+            return False
+        message = str(error)
+        if "out of memory" not in message and (
+            isinstance(error, torch.AcceleratorError)
+            or any(marker in message for marker in _UNRECOVERABLE_DEVICE_ERROR_MARKERS)
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -1817,12 +1918,10 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except _FatalDistributedForward:
-        logger.exception(
-            "Worker %d cannot safely continue after a multi-rank OOM", rank
-        )
-        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
-        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+    except (_FatalDistributedForward, _FatalDeviceError) as e:
+        logger.exception("Worker %d cannot safely continue: %s", rank, e)
+        # CUDA/NCCL teardown can hang on a peer's collective and a broken
+        # allocator can fail in cleanup; the HTTP worker monitor rejects new work.
         os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)

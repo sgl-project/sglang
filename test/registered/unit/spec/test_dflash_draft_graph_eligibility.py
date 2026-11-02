@@ -27,11 +27,11 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         target_model = SimpleNamespace(
             get_input_embeddings=lambda: embedding, lm_head=torch.nn.Linear(4, 16)
         )
-        kv_loc_plan = SimpleNamespace(bind=Mock())
-        target_translator = SimpleNamespace(plan=Mock(return_value=kv_loc_plan))
+        iteration_ids = SimpleNamespace(bind=Mock())
+        target_translator = SimpleNamespace(plan=Mock(return_value=iteration_ids))
         draft_translator = SimpleNamespace()
         worker.model_runner = SimpleNamespace(
-            kv_index_translator=target_translator,
+            runner_ids=target_translator,
             model=target_model,
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(16).view(1, 16)
@@ -40,7 +40,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._target_worker = SimpleNamespace(model_runner=worker.model_runner)
         # Stop at the actual runner boundary, before target verification.
         worker.draft_model_runner = SimpleNamespace(
-            kv_index_translator=draft_translator,
+            runner_ids=draft_translator,
             forward=Mock(side_effect=StopIteration),
         )
         worker.draft_owns_attention = False
@@ -89,7 +89,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             ):
                 worker.forward_batch_generation(batch)
             forward_batch = worker.draft_model_runner.forward.call_args.args[0]
-            kv_loc_plan.bind.assert_called_with(forward_batch, draft_translator)
+            iteration_ids.bind.assert_called_with(forward_batch, draft_translator)
             self.assertIs(forward_batch.can_run_decode_cuda_graph, allowed)
             self.assertEqual(forward_batch.forward_mode, ForwardMode.TARGET_VERIFY)
             torch.testing.assert_close(forward_batch.input_ids, torch.tensor([1, 2]))

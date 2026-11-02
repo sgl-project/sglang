@@ -221,6 +221,22 @@ class TestUnifiedKeyGrid(CustomTestCase):
         self.assertEqual(stage1.layer_ranges, [(0, 20), (20, 40)])
         self.assertTrue(stage1.suffixes[0].endswith("_L40-60_H0"))
 
+    def test_attention_cp_preserves_head_shards_and_namespace(self):
+        for rank_replicated in (False, True):
+            for tp_rank in range(2):
+                with self.subTest(rank_replicated=rank_replicated, tp_rank=tp_rank):
+                    shard = dict(
+                        rank_replicated=rank_replicated,
+                        local_kv_heads=4,
+                        attn_tp_rank=tp_rank,
+                        attn_tp_size=2,
+                        head_group=4,
+                    )
+                    self.assertEqual(
+                        _plan(**shard, attn_cp_size=4),
+                        _plan(**shard, attn_cp_size=1),
+                    )
+
 
 class TestNamespaceIdentity(CustomTestCase):
     def test_identity_fields_partition_the_keyspace(self):
@@ -332,16 +348,6 @@ class TestUnifiedKeySchemeRejections(CustomTestCase):
         """
         with self.assertRaises(NotImplementedError):
             _plan(local_kv_heads=1, attn_tp_rank=0, attn_tp_size=8)
-
-    def test_attention_cp_is_refused(self):
-        with self.assertRaises(NotImplementedError):
-            _plan(
-                local_kv_heads=8,
-                attn_tp_rank=0,
-                attn_tp_size=1,
-                head_group=8,
-                attn_cp_size=2,
-            )
 
     def test_empty_model_id_is_refused(self):
         with self.assertRaisesRegex(ValueError, "non-empty model_id"):

@@ -6,6 +6,7 @@ context length, GGUF detection, etc.) that don't require actual model files.
 
 import inspect
 import io
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -32,7 +33,10 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
+from sglang.srt.utils.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+    get_config,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -174,6 +178,41 @@ class TestGetProcessor(CustomTestCase):
             trust_remote_code=False,
             revision=None,
         )
+
+    def test_unlimited_ocr_loads_for_both_model_type_spellings(self):
+        """baidu/Unlimited-OCR was re-saved with model_type "unlimited_ocr"; that
+        checkpoint must still build its sub-configs and get SGLang's processor,
+        not a bare tokenizer."""
+        from sglang.srt.configs.unlimited_ocr import UnlimitedOCRHFProcessor
+
+        for model_type in ("unlimited-ocr", "unlimited_ocr"):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as d,
+            ):
+                with open(f"{d}/config.json", "w") as f:
+                    json.dump(
+                        {
+                            "model_type": model_type,
+                            "architectures": ["UnlimitedOCRForCausalLM"],
+                            "language_config": {"vocab_size": 1234},
+                        },
+                        f,
+                    )
+                config = get_config(d, trust_remote_code=False)
+                self.assertEqual(config.text_config.vocab_size, 1234)
+
+                loaded_processor = MagicMock()
+                loaded_processor.tokenizer.chat_template = "template"
+                with patch.object(
+                    UnlimitedOCRHFProcessor,
+                    "from_pretrained",
+                    return_value=loaded_processor,
+                ) as from_pretrained:
+                    processor = processor_utils.get_processor(d)
+
+                self.assertIs(processor, loaded_processor)
+                from_pretrained.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
