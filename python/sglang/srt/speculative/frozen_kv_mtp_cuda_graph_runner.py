@@ -445,11 +445,16 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_expanded_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:expanded_bs]
 
+        padded_seq_lens_sum = (
+            None
+            if forward_batch.seq_lens_sum is None
+            else forward_batch.seq_lens_sum
+            + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value
+        )
         self.frozen_kv_mtp_worker._init_frozen_kv_metadata_replay_cuda_graph(
             forward_batch,
             expanded_bs,
-            forward_batch.seq_lens_sum
-            + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value,
+            padded_seq_lens_sum,
         )
 
         self.raw_bs = raw_bs
