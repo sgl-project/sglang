@@ -2244,8 +2244,8 @@ class Envs:
     # Only honored on ROCm gfx95 without two-batch overlap; elsewhere the
     # backend pins 1.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(1)
-    # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
-    # cache replicated; gathers Q and exchanges local top-k candidates.
+    # Opt-in decode indexer context partitioning (gfx950 TP4, SM90 TP4/TP8). Keeps
+    # the index cache replicated; gathers Q and exchanges local top-k candidates.
     SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
