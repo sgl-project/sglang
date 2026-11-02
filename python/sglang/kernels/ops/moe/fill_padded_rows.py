@@ -110,3 +110,61 @@ def _fill_padded_rows(
         BLOCK_COLS=triton.next_power_of_2(n_cols),
         STRIDED=strided,
     )
+
+
+@triton.jit
+def _fill_dp_pad_rows_kernel(
+    out_ptr,
+    dp_real_rows_ptr,
+    rows_per_rank,
+    n_cols,
+    fill_value,
+    stride_row,
+    BLOCK_COLS: tl.constexpr,
+):
+    # One program per row. DP rank r owns rows [r * rows_per_rank,
+    # (r + 1) * rows_per_rank); the first dp_real_rows[r] of them are real.
+    row = tl.program_id(0)
+    rank = row // rows_per_rank
+    if row - rank * rows_per_rank >= tl.load(dp_real_rows_ptr + rank):
+        cols = tl.arange(0, BLOCK_COLS)
+        ptrs = out_ptr + row.to(tl.int64) * stride_row + cols
+        fill = tl.full((BLOCK_COLS,), fill_value, dtype=out_ptr.dtype.element_ty)
+        tl.store(ptrs, fill, mask=cols < n_cols)
+
+
+def _fill_dp_pad_rows(
+    x: torch.Tensor,
+    dp_real_rows: torch.Tensor,
+    fill_value,
+) -> None:
+    """Set ``x[row, :] = fill_value`` for the padding rows of a MAX_LEN DP gather.
+
+    ``x`` holds one equal slot per DP rank, in rank order, and slot ``r`` starts
+    with ``dp_real_rows[r]`` real rows. The counts are read from device memory,
+    so this is safe to capture inside a CUDA graph.
+    """
+    if not isinstance(dp_real_rows, torch.Tensor):
+        raise TypeError("dp_real_rows must be a torch.Tensor")
+    if dp_real_rows.dim() != 1 or dp_real_rows.dtype.is_floating_point:
+        raise TypeError(
+            "dp_real_rows must be a 1-D integer tensor, got "
+            f"{dp_real_rows.dtype} {tuple(dp_real_rows.shape)}"
+        )
+    if dp_real_rows.device != x.device:
+        raise ValueError("dp_real_rows and x must be on the same device")
+    n_rows, n_cols = x.shape
+    num_ranks = dp_real_rows.numel()
+    if num_ranks == 0 or n_rows % num_ranks != 0:
+        raise ValueError(f"{n_rows} rows do not split into {num_ranks} equal DP slots")
+    if n_rows == 0:
+        return
+    _fill_dp_pad_rows_kernel[(n_rows,)](
+        x,
+        dp_real_rows,
+        n_rows // num_ranks,
+        n_cols,
+        fill_value,
+        x.stride(0),
+        BLOCK_COLS=triton.next_power_of_2(n_cols),
+    )
