@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool  # noqa: E402
 from sglang.srt.mem_cache import kv_cache_configurator as kcc  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReachedTokenPool(Exception):

@@ -16,7 +16,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 NUM_ROWS = 4
 

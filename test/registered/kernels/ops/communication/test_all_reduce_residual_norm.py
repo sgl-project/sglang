@@ -25,7 +25,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=67, stage="extra-b", runner_config="4-gpu-b200")
 
 H = 6144
 TOP_K = 8

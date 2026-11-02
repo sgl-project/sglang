@@ -11,7 +11,7 @@ from sglang.srt.model_executor.encoder_swa_replay import FoldedExtend, drop_fold
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(

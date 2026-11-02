@@ -26,7 +26,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _norm(dtype=torch.bfloat16):

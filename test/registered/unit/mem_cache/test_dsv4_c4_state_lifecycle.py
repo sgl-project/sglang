@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _storage(req_pool):

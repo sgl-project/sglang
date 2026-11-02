@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.managers.schedule_batch import Req
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 NOW = 1000.0
 LORA_DRAIN_WAIT_THRESHOLD = 3.0

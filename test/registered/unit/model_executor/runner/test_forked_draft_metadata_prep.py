@@ -9,7 +9,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_kv_store_location_joins_before_the_deferred_commit_hook(monkeypatch):

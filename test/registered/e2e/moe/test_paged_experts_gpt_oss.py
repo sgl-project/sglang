@@ -7,7 +7,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=427, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestPagedExpertsMxfp4(_PagedMatchesUnpaged, CustomTestCase):

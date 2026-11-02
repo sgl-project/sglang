@@ -17,7 +17,7 @@ from sglang.srt.mem_cache import memory_pool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 HEAD_NUM = 2
 HEAD_DIM = 128

@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=275, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=237, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):

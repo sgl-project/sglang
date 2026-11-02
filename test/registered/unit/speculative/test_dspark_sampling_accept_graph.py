@@ -18,8 +18,8 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWork
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 STRIDE = 6
 GAMMA = STRIDE - 1

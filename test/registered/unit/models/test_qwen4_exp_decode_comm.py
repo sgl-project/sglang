@@ -13,7 +13,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
 
 _DECODE_MODULE = "sglang.srt.layers.moe.qwen4_decode"

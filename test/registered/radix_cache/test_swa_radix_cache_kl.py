@@ -6,7 +6,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "openai/gpt-oss-20b"
 
-register_cuda_ci(est_time=135, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=131, stage="extra-a", runner_config="1-gpu-large")
 register_cpu_ci(est_time=1602, suite="extra-test-cpu-intel")
 
 

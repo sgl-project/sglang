@@ -18,7 +18,7 @@ from sglang.srt.managers.io_struct import HealthCheckOutput  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHealthCheckSignal(CustomTestCase):

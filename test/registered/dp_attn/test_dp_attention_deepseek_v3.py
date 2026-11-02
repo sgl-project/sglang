@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=78, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=90, stage="extra-a", runner_config="2-gpu-large")
 
 
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")

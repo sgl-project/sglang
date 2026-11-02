@@ -26,7 +26,7 @@ from sglang.srt.model_executor.model_runner_components import (  # noqa: E402
 from sglang.srt.speculative import ragged_verify  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _hybrid(prefill_cls, decode_cls, mode):

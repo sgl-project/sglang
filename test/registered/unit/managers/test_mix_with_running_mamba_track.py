@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 GRID = 128
 STATE_CHUNK = 64
