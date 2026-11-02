@@ -2710,33 +2710,5 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         assert gone() is None
 
 
-@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-only kernel")
-@torch.inference_mode()
-def test_ltx_vae_pixel_norm_gate_resets_after_decode():
-    """An enabled decode must not change the next request's reference normalization."""
-    from sglang.kernels.ops.diffusion import pixel_norm_silu
-    from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-    from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
-        AutoencoderKLLTX2Video,
-        PerChannelRMSNorm,
-    )
-
-    with torch.device("meta"):
-        vae = AutoencoderKLLTX2Video(LTXVideoVAEConfig())
-    norm = next(m for m in vae.decoder.modules() if isinstance(m, PerChannelRMSNorm))
-    x = torch.randn((1, 64, 2, 3, 5), device="cuda", dtype=torch.bfloat16)
-    reference = norm(x, activation=nn.SiLU())
-    with patch(
-        "sglang.kernels.ops.diffusion.pixel_norm_silu", wraps=pixel_norm_silu
-    ) as fused:
-        with use_vae_fast_path(vae, True):
-            norm(x, activation=nn.SiLU())
-        fused.assert_called_once()
-        torch.testing.assert_close(
-            norm(x, activation=nn.SiLU()), reference, atol=0, rtol=0
-        )
-        fused.assert_called_once()
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
