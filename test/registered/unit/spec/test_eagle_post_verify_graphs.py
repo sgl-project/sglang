@@ -362,7 +362,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
     def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
-        """With SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING a verify samples on the
+        """With SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING a verify samples on the
         top-k support when every request has a finite top-k within the compact
         limit, in the post-verify graphs (keyed apart from the dense branch, whose
         sampling differs) and the eager verify alike; without it nothing changes."""
@@ -425,7 +425,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(len(keys), 2)
 
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
-        """With SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST a sampled verify result goes to
+        """With SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST a sampled verify result goes to
         the TP group in one broadcast: predict, accept_index and num_correct_drafts
         must be views of one buffer, in order, starting from the values the
         unpacked tensors start from."""
@@ -442,7 +442,7 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(offset, buffer.numel())
 
     def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
-        """With SGLANG_Q35MF_MKH_N3C a round's inputs and its forced length go to
+        """With SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD a round's inputs and its forced length go to
         one copy plan; without it, or when the plan refuses the layout, the
         per-dtype copies stage the same values."""
         inputs = {
@@ -546,7 +546,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         self._check(sim_acc_len=4.8)
 
     def test_forced_acceptance_with_one_launch_load(self):
-        # SGLANG_Q35MF_MKH_N3C: inputs and the pinned forced length in one launch
+        # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: inputs and the pinned forced length in one launch
         with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
             self._check(sim_acc_len=4.8)
 

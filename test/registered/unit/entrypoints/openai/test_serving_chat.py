@@ -471,6 +471,17 @@ class ServingChatTestCase(CustomTestCase):
         user = {"role": "user", "content": "Hi?"}
         cases = {
             "thinking unknown": {"messages": [user], "thinking": {"type": "off"}},
+            "effort none": {"messages": [user], "reasoning_effort": "none"},
+            "effort minimal": {"messages": [user], "reasoning_effort": "minimal"},
+            "effort numeric": {"messages": [user], "reasoning_effort": 0.5},
+            "effort none via reasoning": {
+                "messages": [user],
+                "reasoning": {"effort": "none"},
+            },
+            "effort none via template kwargs": {
+                "messages": [user],
+                "chat_template_kwargs": {"reasoning_effort": "none"},
+            },
             "root not first": {
                 "messages": [user, {"role": "root", "content": "You are A."}]
             },
@@ -499,8 +510,8 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertEqual(error is not None, is_m3)
 
     def test_m3_request_contract_accepts_valid_requests(self):
-        """Disabled thinking, a trailing tool call, a leading root and answered calls
-        in any order are valid M3 requests."""
+        """Disabled thinking, every listed effort, a trailing tool call, a leading root
+        and answered calls in any order are valid M3 requests."""
         self.chat.is_minimax_m3 = True
         weather = {"name": "get_weather", "arguments": "{}"}
         calls = [
@@ -510,6 +521,10 @@ class ServingChatTestCase(CustomTestCase):
         user = {"role": "user", "content": "Hi?"}
         for fields in (
             {"messages": [user], "thinking": {"type": "disabled"}},
+            *(
+                {"messages": [user], "reasoning_effort": effort}
+                for effort in ("low", "medium", "high", "xhigh", "max")
+            ),
             {
                 "messages": [
                     user,
@@ -532,8 +547,8 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertIsNone(self.chat._validate_request(request))
 
     def test_m3_thinking_mode_follows_request_intent(self):
-        """thinking outranks reasoning_effort, an effort only ever turns thinking off,
-        and values the template cannot use are dropped."""
+        """thinking outranks reasoning_effort, an effort never changes the thinking
+        mode, and the effort is dropped once thinking is off."""
         from sglang.srt.entrypoints.openai.serving_chat import (
             _normalize_minimax_m3_request,
         )
@@ -541,9 +556,6 @@ class ServingChatTestCase(CustomTestCase):
         user = [{"role": "user", "content": "Hi?"}]
         for fields, mode, effort in (
             ({"reasoning_effort": "high"}, None, "high"),
-            ({"reasoning_effort": "minimal"}, "disabled", None),
-            ({"reasoning_effort": "none"}, "disabled", None),
-            ({"reasoning_effort": 0.5}, None, None),
             (
                 {"reasoning_effort": "high", "thinking": {"type": "adaptive"}},
                 "adaptive",
@@ -573,8 +585,9 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_m3_effort_from_template_kwargs_is_normalized(self):
         """An effort sent in chat_template_kwargs or set by the server is normalized
-        like the top-level one, and a server default never overrides thinking the
-        request turned off."""
+        like the top-level one, a server default outside the enum is dropped rather
+        than rejected, and a server default never overrides thinking the request
+        turned off."""
         self.chat.is_minimax_m3 = True
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
@@ -584,16 +597,9 @@ class ServingChatTestCase(CustomTestCase):
         # (request fields, server defaults, rendered effort, rendered thinking_mode):
         # the request's own settings outrank the server defaults, which fill gaps.
         cases = (
-            (
-                {"chat_template_kwargs": {"reasoning_effort": "none"}},
-                {},
-                None,
-                "disabled",
-            ),
-            ({}, {"reasoning_effort": "none"}, None, "disabled"),
+            ({}, {"reasoning_effort": "none"}, None, None),
             ({"chat_template_kwargs": {"reasoning_effort": "high"}}, {}, "high", None),
             ({"thinking": {"type": "disabled"}}, enabled, None, "disabled"),
-            ({"reasoning_effort": "none"}, enabled, None, "disabled"),
             ({}, {**enabled, "reasoning_effort": "high"}, "high", "enabled"),
         )
         for fields, server_defaults, effort, mode in cases:

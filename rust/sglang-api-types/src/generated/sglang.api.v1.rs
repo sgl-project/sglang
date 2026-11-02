@@ -597,6 +597,10 @@ pub struct GenerateMetaInfo {
     pub audio_tokens: ::core::option::Option<u32>,
     #[prost(uint32, optional, tag = "20")]
     pub video_tokens: ::core::option::Option<u32>,
+    /// `cached_tokens` by cache tier, on every frame; null without cached
+    /// tokens.
+    #[prost(message, optional, tag = "21")]
+    pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {
@@ -606,6 +610,21 @@ pub struct WeightVersionSpan {
     pub start: i64,
     #[prost(int64, tag = "3")]
     pub end: i64,
+}
+/// A request's cached prompt tokens by the cache tier that served them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CachedTokensDetails {
+    /// GPU memory, and a hierarchical cache's host-memory tier.
+    #[prost(uint32, tag = "1")]
+    pub device: u32,
+    #[prost(uint32, tag = "2")]
+    pub host: u32,
+    /// A storage tier: present when nonzero or while one is attached.
+    #[prost(uint32, optional, tag = "3")]
+    pub storage: ::core::option::Option<u32>,
+    /// The attached storage tier's backend.
+    #[prost(string, optional, tag = "4")]
+    pub storage_backend: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

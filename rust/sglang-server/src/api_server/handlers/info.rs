@@ -4,7 +4,7 @@
 use sglang_api_types::api::v1 as api;
 
 use crate::message::ids::Rid;
-use crate::message::info::{InternalState, ModelInfo, ServerInfo};
+use crate::message::info::{DpListener, InternalState, ModelInfo, ServerInfo};
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
 
 use super::handle::CoreHandle;
@@ -25,6 +25,7 @@ impl CoreHandle {
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
             disaggregation_mode: metadata.disaggregation_mode,
+            launch_fields: metadata.launch_model_info.clone(),
         }
     }
 
@@ -51,6 +52,22 @@ impl CoreHandle {
             .iter_mut()
             .find_map(|state| state.rust_server_startup_time.take());
         let metadata = &self.inner.metadata;
+        // The listener serving the deployment's base URL, DP rank 0's,
+        // publishes every rank's listener (`rust_server_endpoints`), by rank.
+        let mut dp_listeners: Vec<DpListener> = if self.inner.dp_rank == 0 {
+            metadata
+                .deployment_info
+                .rust_server_endpoints
+                .iter()
+                .map(|endpoint| DpListener {
+                    dp_rank: endpoint.dp_rank,
+                    url: endpoint.endpoint.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        dp_listeners.sort_by_key(|listener| listener.dp_rank);
         Ok(ServerInfo {
             launch_fields: metadata.launch_server_info.clone(),
             model_path: metadata.model_path.clone(),
@@ -67,6 +84,7 @@ impl CoreHandle {
             incremental_streaming_output: metadata.incremental_streaming_output,
             disaggregation_mode: metadata.disaggregation_mode,
             deployment_info: metadata.deployment_info.clone(),
+            dp_listeners,
         })
     }
 
@@ -115,6 +133,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata {
@@ -162,6 +181,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata {
                     deployment_info: crate::message::config::DeploymentInfo {

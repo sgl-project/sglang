@@ -13,7 +13,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarRow,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
@@ -196,10 +199,15 @@ class SamplingBatchInfo:
                 )
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
+            )
+            for r in reqs
+        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"

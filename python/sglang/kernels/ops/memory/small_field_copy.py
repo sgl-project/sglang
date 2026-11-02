@@ -24,9 +24,9 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
-# The 16-byte launch with a block per field (SGLANG_Q35MF_BK_VEC_COPY), else the
+# The 16-byte launch with a block per field (SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED), else the
 # per-element launch, its bitwise reference; read once, fixed per process.
-_VEC = envs.SGLANG_Q35MF_BK_VEC_COPY.get()
+_VEC = envs.SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED.get()
 
 
 @cache_once

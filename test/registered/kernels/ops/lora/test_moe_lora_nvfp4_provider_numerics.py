@@ -21,7 +21,11 @@ from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The H100 pool skips the sm100 shared-outer NVFP4 decode plan row (skipped elsewhere); the B200 pool runs it per PR.
+# The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
+# its four GPUs are allocation granularity, not multi-GPU coverage.
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _E = 4
 _H = 256
