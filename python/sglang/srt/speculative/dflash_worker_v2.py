@@ -210,6 +210,53 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+class _XPressDraftSampler:
+    """Run the XPress head inside the DFlash draft graph."""
+
+    def __init__(self, *, draft_model, lm_head, block_size, max_bs, device):
+        _validate_xpress_lm_head(lm_head, draft_model.xpress_head, draft_model.config)
+        self.draft_model = draft_model
+        self.weight = lm_head.weight[: int(draft_model.config.vocab_size)]
+        self.logit_scale = float(getattr(draft_model.config, "logit_scale", 1.0))
+        self.block_size = int(block_size)
+        self.out = torch.empty(
+            (int(max_bs) * (self.block_size - 1),),
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def __call__(self, hidden_states, input_ids):
+        b = self.block_size
+        n = hidden_states.shape[0] // b
+        hidden = hidden_states.view(n, b, -1)
+        base = torch.matmul(hidden.to(self.weight.dtype), self.weight.T)
+        if self.logit_scale != 1.0:
+            base.mul_(self.logit_scale)
+        anchor = input_ids.view(n, b)[:, 0]
+        tokens = self.draft_model.xpress_head.jacobi_refine_greedy(
+            base, hidden, anchor, self.draft_model.num_jacobi_passes
+        )
+        self.out[: n * (b - 1)].copy_(tokens.reshape(-1))
+
+
+def _validate_xpress_lm_head(lm_head, xpress_head, draft_config):
+    weight = getattr(lm_head, "weight", None)
+    if not is_dense_head_weight(weight) or should_apply_lm_head_quant_method(
+        lm_head, getattr(lm_head, "quant_method", None)
+    ):
+        raise ValueError("XPress requires an unquantized, dense target LM head.")
+    if (
+        weight.ndim != 2
+        or weight.shape[0] < xpress_head.vocab_size
+        or weight.shape[1] != int(draft_config.hidden_size)
+    ):
+        raise ValueError(
+            "XPress target LM head shape must match the draft vocabulary and hidden size."
+        )
+    if weight.dtype != xpress_head.w2.weight.dtype:
+        raise ValueError("XPress refiner and target LM head must use the same dtype.")
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -439,7 +486,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
+        self._xpress_eager_sampler = None
         self.draft_model = bundle.draft_model
+        self.xpress = getattr(self.draft_model, "xpress_head", None)
+        if self.xpress is not None:
+            if not is_cuda() or is_hip():
+                raise ValueError("XPress currently requires CUDA.")
+            if int(get_parallel().tp_group.world_size) != 1:
+                raise ValueError("XPress currently requires tensor parallel size 1.")
+            target_vocab = int(self.model_runner.model_config.vocab_size)
+            if target_vocab != self.xpress.vocab_size:
+                raise ValueError(
+                    "XPress draft and target vocabularies must have the same size."
+                )
+            target_head = unwrap_lora_layer(
+                getattr(self._target_worker.model_runner.model, "lm_head", None)
+            )
+            _validate_xpress_lm_head(target_head, self.xpress, self.draft_model.config)
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -522,6 +585,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.draft_model.set_block_size(self.block_size)
+        if self.xpress is not None and self.block_size <= 1:
+            raise ValueError("XPress block size must be greater than 1.")
         self.speculative_num_draft_tokens = int(self.block_size)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -896,6 +961,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
             return _eager("no target lm_head")
+
+        if self.xpress is not None:
+            return _XPressDraftSampler(
+                draft_model=self.draft_model,
+                lm_head=lm_head,
+                block_size=self.block_size,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                device=self.device,
+            )
 
         # A gate-admitted quantized head is capture-safe: the target's own
         # logits path already runs the same kernel under CUDA graphs.
@@ -2771,6 +2845,34 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
+                )
+        elif self.xpress is not None:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("XPress draft model returned no hidden states.")
+            with draft_tp_context(self.draft_parallel_layout):
+                sampler = self._draft_sampler
+                if sampler is not None and sampler.out.numel() < bs * (
+                    self.block_size - 1
+                ):
+                    sampler = None
+                if sampler is None:
+                    if (
+                        self._xpress_eager_sampler is None
+                        or self._xpress_eager_sampler.out.numel()
+                        < bs * (self.block_size - 1)
+                    ):
+                        self._xpress_eager_sampler = _XPressDraftSampler(
+                            draft_model=self.draft_model,
+                            lm_head=lm_head,
+                            block_size=self.block_size,
+                            max_bs=bs,
+                            device=self.device,
+                        )
+                    sampler = self._xpress_eager_sampler
+                sampler(draft_hidden, block_ids.reshape(-1))
+                draft_next = sampler.out[: bs * (self.block_size - 1)].view(
+                    bs, self.block_size - 1
                 )
         elif self.selector is not None:
             with draft_tp_context(self.draft_parallel_layout):
