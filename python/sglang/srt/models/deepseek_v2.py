@@ -1049,7 +1049,7 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)
             and not is_expert_remapping_enabled()
-            and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
+            and get_exec().moe.ep_dispatch_algorithm != "fake"
         )
 
     def forward(

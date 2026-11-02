@@ -23,6 +23,7 @@ def fused_topk_npu(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
+    defer_expert_recording: bool = False,
 ) -> "TopKOutput":
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
@@ -109,6 +110,7 @@ def fused_topk_npu(
             topk_config=topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            defer_expert_recording=defer_expert_recording,
         )
 
     return _finalize_topk_npu(
@@ -119,6 +121,7 @@ def fused_topk_npu(
         num_token_non_padded=num_token_non_padded,
         expert_location_dispatch_info=expert_location_dispatch_info,
         layer_id=layer_id,
+        defer_expert_recording=defer_expert_recording,
     )
 
 
@@ -131,10 +134,12 @@ def _finalize_topk_npu(
     num_token_non_padded,
     expert_location_dispatch_info,
     layer_id,
+    defer_expert_recording=False,
 ):
     num_shared = topk_config.num_shared_topk_slots
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
-    capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
+    if not defer_expert_recording:
+        capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
     routed_ids = topk_ids_logical_to_physical(routed_ids, expert_location_dispatch_info)
     topk_ids = (
         torch.cat([routed_ids, topk_ids[:, -num_shared:]], dim=-1)
@@ -150,5 +155,9 @@ def _finalize_topk_npu(
         recorder_ids = routed_ids.masked_fill(
             (rows >= num_token_non_padded)[:, None], -1
         )
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=recorder_ids)
+    if not defer_expert_recording:
+        # The MoE load balancer records physical ids after its own routing.
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_ids
+        )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

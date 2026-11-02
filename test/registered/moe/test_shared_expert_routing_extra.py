@@ -215,7 +215,12 @@ class TestSharedExpertsCompiledContext(CustomTestCase):
         compiled = torch.compile(compute, backend="eager", fullgraph=True)
         for config, expected in (
             (SharedExpertsConfig(num_fused_shared_experts=2), 7),
-            (SharedExpertsConfig(num_fused_shared_experts=1, use_waterfill=True), 4),
+            (
+                SharedExpertsConfig(
+                    num_fused_shared_experts=1, routed_by_load_balancer=True
+                ),
+                4,
+            ),
             (SharedExpertsConfig(), 3),
         ):
             with get_model().override(shared_experts=config):
