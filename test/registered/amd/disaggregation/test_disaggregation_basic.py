@@ -20,6 +20,10 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
+# Mooncake registers the KV pool through HIP dma-buf, which MI355X charges against free
+# GPU memory a second time, so keep the pool small enough to fit.
+PD_MEM_FRACTION_STATIC = "0.4"
+
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
@@ -61,6 +65,8 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "1",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
@@ -87,7 +93,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
             "--mem-fraction-static",
-            "0.8",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
@@ -266,6 +272,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "1",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
@@ -292,7 +300,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
             "--mem-fraction-static",
-            "0.8",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
@@ -378,6 +386,8 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "1",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
@@ -404,7 +414,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "--attention-backend",
             "aiter",
             "--mem-fraction-static",
-            "0.8",
+            PD_MEM_FRACTION_STATIC,
             "--log-level",
             "debug",
         ]
