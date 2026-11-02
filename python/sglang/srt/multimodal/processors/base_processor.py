@@ -1277,6 +1277,100 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
+    # Images of a pre-tokenized prompt are located by the
+    # placeholder id in the ids; the decoded text is never scanned.
+    @staticmethod
+    def _ids_for_media(
+        prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+    ):
+        """The prompt's token ids when its images are to be located by id:
+        the prompt arrived as ids, the request carries images (none of them
+        precomputed) and no video or audio, and the processor knows its
+        image placeholder id and token. Else None, and the text path runs."""
+        ids = (
+            input_ids
+            if input_ids is not None
+            else (prompt if isinstance(prompt, list) else None)
+        )
+        if ids is None or not image_data or video_data or audio_data:
+            return None
+        if any(isinstance(item, dict) for item in image_data):
+            return None
+        if (
+            multimodal_tokens.image_token_id is None
+            or not multimodal_tokens.image_token
+        ):
+            return None
+        return ids.tolist() if hasattr(ids, "tolist") else list(ids)
+
+    @staticmethod
+    def _placeholder_runs(input_ids, token_id):
+        """Runs of consecutive ``token_id`` in the ids."""
+        runs = 0
+        previous = None
+        for token in input_ids:
+            if token == token_id and previous != token_id:
+                runs += 1
+            previous = token
+        return runs
+
+    @staticmethod
+    def _collapse_placeholder_runs(input_ids, token_id):
+        """``input_ids`` with every run of ``token_id`` reduced to one id,
+        the form ``_expand_input_ids`` expands."""
+        out = []
+        previous = None
+        for token in input_ids:
+            if token == token_id and previous == token_id:
+                continue
+            out.append(token)
+            previous = token
+        return out
+
+    @classmethod
+    def _placeholder_layout(cls, input_ids, token_id, n_images):
+        """The ids with one placeholder id per image. One id per image is the
+        wire form (the count of ids equals the images, adjacent ids allowed:
+        a GLM prompt has no marker between two images); else each run of
+        the id is one expanded image and is collapsed; else the request is a
+        client error."""
+        singles = sum(1 for token in input_ids if token == token_id)
+        if singles == n_images:
+            return list(input_ids)
+        runs = cls._placeholder_runs(input_ids, token_id)
+        if runs == n_images:
+            return cls._collapse_placeholder_runs(input_ids, token_id)
+        raise ValueError(
+            f"prompt ids carry {singles} image placeholder id(s) in {runs} run(s) but "
+            f"{n_images} image(s) were provided"
+        )
+
+    async def _load_mm_data_by_ids(
+        self, input_ids, multimodal_tokens, image_data, discard_alpha_channel=True
+    ):
+        """Images of a pre-tokenized prompt, located by the image placeholder
+        id in the ids. The HF processor receives a synthetic text of one
+        image token per image (it only counts and expands them; the request
+        ids are the prompt), the images in request order, and the ids with
+        one placeholder id per image, which ``process_and_combine_mm_data``
+        expands in place. Ordinary tokens that spell an image token stay
+        text. The output is marked ``synthetic_text``: its text is not a
+        prompt, so a failed expansion must raise, never fall back to it."""
+        token_id = multimodal_tokens.image_token_id
+        ids = self._placeholder_layout(input_ids, token_id, len(image_data))
+        image_token = multimodal_tokens.image_token
+        if isinstance(image_token, list):
+            image_token = image_token[0]
+        output = await self.fast_load_mm_data(
+            prompt=image_token * len(image_data),
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            discard_alpha_channel=discard_alpha_channel,
+            input_ids=ids,
+        )
+        output.synthetic_text = True
+        return output
+
     async def load_mm_data(
         self,
         prompt: str,
@@ -1303,6 +1397,19 @@ class BaseMultimodalProcessor(ABC):
                 audios=list(audio_data or []),
             )
 
+        # A prompt that arrives as ids locates its images by the
+        # placeholder id in the ids; its decoded text is never scanned.
+        ids_for_media = self._ids_for_media(
+            prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+        )
+        if (
+            ids_for_media is not None
+            and envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+            and not self.preserve_processor_input_ids
+        ):
+            return await self._load_mm_data_by_ids(
+                ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
+            )
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -1476,6 +1583,19 @@ class BaseMultimodalProcessor(ABC):
 
         """
 
+        # A prompt that arrives as ids locates its images by the
+        # placeholder id in the ids; its decoded text is never scanned.
+        ids_for_media = self._ids_for_media(
+            prompt, input_ids, multimodal_tokens, image_data, video_data, audio_data
+        )
+        if (
+            ids_for_media is not None
+            and envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+            and not self.preserve_processor_input_ids
+        ):
+            return await self._load_mm_data_by_ids(
+                ids_for_media, multimodal_tokens, image_data, discard_alpha_channel
+            )
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
@@ -1945,6 +2065,12 @@ class BaseMultimodalProcessor(ABC):
                         dtype=input_ids.dtype,
                     )
                 except Exception as e:
+                    # An ids prompt's text is synthetic
+                    # (one image token per image), not a prompt to fall back to.
+                    if getattr(base_output, "synthetic_text", False):
+                        raise ValueError(
+                            f"exact-token expansion failed for a pre-tokenized prompt: {e}"
+                        ) from e
                     logger.warning(
                         f"Due to {e}, falling back to decode+retokenize, which may change prompt length (token drift)."
                     )
