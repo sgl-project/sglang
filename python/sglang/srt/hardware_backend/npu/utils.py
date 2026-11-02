@@ -216,14 +216,17 @@ def _patch_npu_seed_trace_rules():
     changed = False
     for name in ("manual_seed", "manual_seed_all"):
         npu_name = f"torch.npu.random.{name}"
-        if (
-            trace_rules.manual_torch_name_rule_map.get(f"torch.cuda.{name}")
+        if npu_rules.get(npu_name) is TorchInGraphFunctionVariable and any(
+            trace_rules.manual_torch_name_rule_map.get(f"{prefix}.{name}")
             is SkipFunctionVariable
-            and npu_rules.get(npu_name) is TorchInGraphFunctionVariable
-            and getattr(torch.cuda, name) is getattr(torch.npu.random, name)
+            and getattr(module, name) is getattr(torch.npu.random, name)
+            for prefix, module in (
+                ("torch.cuda", torch.cuda),
+                ("torch.cuda.random", torch.cuda.random),
+            )
         ):
-            # transfer_to_npu aliases these functions. Patch the source dict
-            # so this also works when torch_npu registers its rules lazily.
+            # CUDA's top-level and random entries may alias different functions.
+            # Patch the source dict to also cover lazy NPU rule registration.
             npu_rules[npu_name] = SkipFunctionVariable
             changed = True
     if changed:

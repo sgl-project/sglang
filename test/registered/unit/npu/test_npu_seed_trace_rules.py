@@ -83,6 +83,11 @@ class TestNpuSeedTraceRules(unittest.TestCase):
         self.addCleanup(trace_rules.clear_lru_cache)
 
     def test_registered_alias_conflict_is_fixed_without_disabling_compile(self):
+        for name in ("manual_seed", "manual_seed_all"):
+            self.enterContext(patch.object(torch.cuda.random, name, lambda seed: None))
+            self.assertIsNot(
+                getattr(torch.cuda.random, name), getattr(self.npu.random, name)
+            )
         self.maps.append(self.npu_rules)
         with self.assertRaisesRegex(AssertionError, "Duplicate torch object"):
             trace_rules.get_torch_obj_rule_map()
@@ -93,6 +98,46 @@ class TestNpuSeedTraceRules(unittest.TestCase):
             self.assertIs(getattr(torch.cuda, name), getattr(self.npu.random, name))
         compiled = torch.compile(lambda x: x + 1, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(torch.ones(2)), torch.full((2,), 2.0))
+
+    def test_random_submodule_alias_conflict_is_fixed(self):
+        # transfer_to_npu can alias cuda.random while the top-level CUDA
+        # functions remain distinct from the NPU random functions.
+        for name in ("manual_seed", "manual_seed_all"):
+
+            def function(seed):
+                pass
+
+            setattr(self.npu.random, name, function)
+            self.enterContext(patch.object(torch.cuda.random, name, function))
+            self.assertIsNot(getattr(torch.cuda, name), function)
+        self.maps.append(self.npu_rules)
+        with self.assertRaisesRegex(AssertionError, "Duplicate torch object"):
+            trace_rules.get_torch_obj_rule_map()
+
+        self.patch_rules()
+
+        rules = trace_rules.get_torch_obj_rule_map()
+        for name in ("manual_seed", "manual_seed_all"):
+            self.assertIs(rules[getattr(self.npu.random, name)], SkipFunctionVariable)
+            self.assertIs(
+                getattr(torch.cuda.random, name), getattr(self.npu.random, name)
+            )
+            self.assertIsNot(getattr(torch.cuda, name), getattr(self.npu.random, name))
+
+    def test_skip_rule_must_belong_to_the_aliased_entry(self):
+        for name in ("manual_seed", "manual_seed_all"):
+
+            def function(seed):
+                pass
+
+            setattr(self.npu.random, name, function)
+            self.enterContext(patch.object(torch.cuda.random, name, function))
+            self.cuda_rules[f"torch.cuda.random.{name}"] = TorchInGraphFunctionVariable
+        before = self.npu_rules.copy()
+        with patch.object(trace_rules, "clear_lru_cache") as clear:
+            self.patch_rules()
+        self.assertEqual(self.npu_rules, before)
+        clear.assert_not_called()
 
     def test_lazy_registration_uses_patched_source_rules(self):
         self.patch_rules()
@@ -119,12 +164,13 @@ class TestNpuSeedTraceRules(unittest.TestCase):
     def test_older_torch_rules_are_unchanged(self):
         for old_rule in (TorchInGraphFunctionVariable, None):
             with self.subTest(old_rule=old_rule):
-                for name in ("manual_seed", "manual_seed_all"):
-                    key = f"torch.cuda.{name}"
-                    if old_rule is None:
-                        self.cuda_rules.pop(key)
-                    else:
-                        self.cuda_rules[key] = old_rule
+                for prefix in ("torch.cuda", "torch.cuda.random"):
+                    for name in ("manual_seed", "manual_seed_all"):
+                        key = f"{prefix}.{name}"
+                        if old_rule is None:
+                            self.cuda_rules.pop(key)
+                        else:
+                            self.cuda_rules[key] = old_rule
                 before = self.npu_rules.copy()
                 with patch.object(trace_rules, "clear_lru_cache") as clear:
                     self.patch_rules()
