@@ -5,6 +5,7 @@ on CPU torch only. The four ``sgl_kernel_npu.tree`` operators are never executed
 here: their absence is exactly what the no-fallback tests exercise.
 """
 
+import os
 import sys
 import types
 import unittest
@@ -58,12 +59,10 @@ REQUIRED_PUBLIC_NAMES = (
     "move_swa_kv",
 )
 
-FORBIDDEN_TOKENS = (
+REQUIRED_BACKEND_TOKENS = (
     "_C_ascend",
     "SGLANG_DSPARK_TREE_BACKEND",
-    "tree.backend",
-    "tree.torch_ops",
-    "os.environ",
+    "SGLANG_DSPARK_TREE_OPS",
 )
 
 
@@ -122,11 +121,11 @@ class PublicSurfaceTest(CustomTestCase):
                 hasattr(tree_ops, name), f"missing public name {name!r}"
             )
 
-    def test_source_has_no_vendor_backend_fallbacks(self) -> None:
-        """The module is the single NPU boundary: no _C_ascend / env switch."""
+    def test_source_has_vendor_and_triton_backends(self) -> None:
+        """The module owns both vendor bindings and the in-tree Triton path."""
         src = _module_source()
-        for token in FORBIDDEN_TOKENS:
-            self.assertNotIn(token, src, f"forbidden token {token!r} present")
+        for token in REQUIRED_BACKEND_TOKENS:
+            self.assertIn(token, src, f"missing backend token {token!r}")
 
     def test_source_uses_the_four_direct_sgl_kernel_imports(self) -> None:
         src = _module_source()
@@ -153,6 +152,8 @@ class PublicSurfaceTest(CustomTestCase):
                 "sgl_kernel_npu": fake_package,
                 "sgl_kernel_npu.tree": fake_tree,
             },
+        ), mock.patch.dict(
+            os.environ, {"SGLANG_DSPARK_TREE_BACKEND": "sgl_kernel_npu"}
         ):
             project, tree = tree_ops._load_compressor_ops()
 
@@ -361,7 +362,9 @@ class NoFallbackTest(CustomTestCase):
             norm=SimpleNamespace(variance_epsilon=1e-5),
         )
         plan = _make_plan()
-        with mock.patch.dict(sys.modules, {"sgl_kernel_npu": None}):
+        with mock.patch.dict(sys.modules, {"sgl_kernel_npu": None}), mock.patch.dict(
+            os.environ, {"SGLANG_DSPARK_TREE_BACKEND": "sgl_kernel_npu"}
+        ):
             with self.assertRaises(RuntimeError):
                 tree_ops.compress_nodes(
                     module,
@@ -374,11 +377,13 @@ class NoFallbackTest(CustomTestCase):
                 )
 
     def test_op_loaders_raise_runtime_error_not_import_error(self):
-        with mock.patch.dict(sys.modules, {"sgl_kernel_npu": None}):
+        with mock.patch.dict(sys.modules, {"sgl_kernel_npu": None}), mock.patch.dict(
+            os.environ, {"SGLANG_DSPARK_TREE_BACKEND": "sgl_kernel_npu"}
+        ):
             with self.assertRaises(RuntimeError):
                 tree_ops._load_compressor_ops()
             with self.assertRaises(RuntimeError):
-                tree_ops._load_indexer_op()
+                tree_ops._load_sgl_kernel_indexer_op()
             with self.assertRaises(RuntimeError):
                 tree_ops._load_attention_op()
 

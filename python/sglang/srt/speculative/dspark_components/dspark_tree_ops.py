@@ -1,16 +1,22 @@
 """NPU tree-op adapter layer for the DSV4 DSpark speculative path.
 
 This module is the single NPU device boundary for the DSpark tree algorithm: it
-owns the per-step node plan, the four ``sgl_kernel_npu.tree`` operators
-(``compressor_tree_project``, ``compressor_tree``, ``quant_lightning_indexer_tree``,
+owns the per-step node plan, the four tree operators (``compressor_tree_project``,
+``compressor_tree``, ``quant_lightning_indexer_tree``,
 ``sparse_attn_sharedkv_tree``), the proven node-page commit kernels, and the SWA
 KV move. A GPU implementation may replace this module with the same public
 signatures and the same invariants; the rest of the speculative stack must not
 contain any other device-specific tree code.
 
-Unlike the vllm-ascend reference (which routes through a backend switch), this
-module always uses ``sgl_kernel_npu.tree`` and never falls back to the vendor
-AscendC op namespace: if an operator is unavailable it raises ``RuntimeError``.
+The four device operators follow the vllm-ascend reference backend switch:
+
+* ``vendor`` (default): load the vllm-ascend ``_C_ascend`` bindings listed in
+  ``SGLANG_DSPARK_TREE_OPS`` and call the AscendC operators.
+* ``sgl_kernel_npu``: use the in-tree Triton package.
+
+The public functions keep the same signatures for every backend. If an
+operator is unavailable the selected backend raises ``RuntimeError`` instead of
+silently falling through to a different implementation.
 
 Invariants (mirroring the reference ``tree/`` package):
 
@@ -43,9 +49,21 @@ Invariants (mirroring the reference ``tree/`` package):
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import torch
+
+_TREE_BACKEND_ENV = "SGLANG_DSPARK_TREE_BACKEND"
+_TREE_OPS_ENV = "SGLANG_DSPARK_TREE_OPS"
+_TREE_BACKENDS = ("vendor", "sgl_kernel_npu")
+_TREE_BACKEND_ALIASES = {
+    "native": "vendor",
+    "vllm": "vendor",
+    "triton": "sgl_kernel_npu",
+    "sgl": "sgl_kernel_npu",
+}
+_TREE_OPS_LOADED = False
 
 __all__ = [
     "NodePlan",
@@ -144,11 +162,70 @@ def get_node_plan(pre) -> NodePlan:
 
 
 # ---------------------------------------------------------------------------
-# sgl_kernel_npu.tree operator resolution (never falls back to the vendor ops)
+# Backend selection and operator resolution
 # ---------------------------------------------------------------------------
 
 
+def _tree_backend() -> str:
+    """Return the selected tree backend (vendor / sgl_kernel_npu)."""
+    raw = os.environ.get(_TREE_BACKEND_ENV, "vendor").strip().lower()
+    backend = _TREE_BACKEND_ALIASES.get(raw, raw)
+    if backend not in _TREE_BACKENDS:
+        raise ValueError(
+            f"{_TREE_BACKEND_ENV} must be one of {_TREE_BACKENDS}, got {raw!r}"
+        )
+    return backend
+
+
+def _ensure_vendor_ops() -> None:
+    """Load the vllm-ascend tree bindings from SGLANG_DSPARK_TREE_OPS once."""
+    global _TREE_OPS_LOADED
+    if _TREE_OPS_LOADED:
+        return
+    raw_paths = os.environ.get(_TREE_OPS_ENV, "")
+    loaded: list[str] = []
+    for raw in raw_paths.split(os.pathsep):
+        if not raw:
+            continue
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(path):
+            continue
+        try:
+            torch.ops.load_library(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to load DSpark tree op binding {path!r}: {exc}"
+            ) from exc
+        loaded.append(path)
+    _TREE_OPS_LOADED = True
+    if not loaded and _tree_backend() == "vendor":
+        raise RuntimeError(
+            f"{_TREE_BACKEND_ENV}=vendor requires at least one tree binding in "
+            f"{_TREE_OPS_ENV}; no existing .so was found."
+        )
+
+
+def _vendor_namespace():
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    if namespace is None:
+        raise RuntimeError(
+            "torch.ops._C_ascend is unavailable; set SGLANG_DSPARK_TREE_OPS "
+            "to the vllm-ascend tree binding .so files."
+        )
+    return namespace
+
+
 def _load_compressor_ops():
+    if _tree_backend() != "sgl_kernel_npu":
+        _ensure_vendor_ops()
+        namespace = _vendor_namespace()
+        try:
+            return namespace.compressor_tree_project, namespace.compressor_tree
+        except AttributeError as exc:
+            raise RuntimeError(
+                "the loaded vllm-ascend binding does not expose "
+                "compressor_tree_project / compressor_tree"
+            ) from exc
     try:
         from sgl_kernel_npu.tree import compressor_tree
         from sgl_kernel_npu.tree import compressor_tree_project
@@ -161,7 +238,7 @@ def _load_compressor_ops():
     return compressor_tree_project, compressor_tree
 
 
-def _load_indexer_op():
+def _load_sgl_kernel_indexer_op():
     try:
         from sgl_kernel_npu.tree import quant_lightning_indexer_tree
     except Exception as exc:
@@ -173,7 +250,29 @@ def _load_indexer_op():
     return quant_lightning_indexer_tree
 
 
+def _load_vendor_indexer_op():
+    _ensure_vendor_ops()
+    namespace = _vendor_namespace()
+    try:
+        return namespace.quant_lightning_indexer_tree
+    except AttributeError as exc:
+        raise RuntimeError(
+            "the loaded vllm-ascend binding does not expose "
+            "quant_lightning_indexer_tree"
+        ) from exc
+
+
 def _load_attention_op():
+    if _tree_backend() != "sgl_kernel_npu":
+        _ensure_vendor_ops()
+        namespace = _vendor_namespace()
+        try:
+            return namespace.npu_sparse_attn_sharedkv_tree
+        except AttributeError as exc:
+            raise RuntimeError(
+                "the loaded vllm-ascend binding does not expose "
+                "npu_sparse_attn_sharedkv_tree"
+            ) from exc
     try:
         from sgl_kernel_npu.tree import sparse_attn_sharedkv_tree
     except Exception as exc:
@@ -308,6 +407,50 @@ def build_tree_attn_metadata(
     cu_cmp = torch.cat(
         (seq.new_zeros(1), (seq // int(ratio)).cumsum(0, dtype=torch.int32))
     )
+    if _tree_backend() != "sgl_kernel_npu":
+        _ensure_vendor_ops()
+        cmp_topk = (
+            int(cmp_sparse_indices.shape[-1])
+            if cmp_sparse_indices is not None and int(ratio) == 4
+            else 0
+        )
+        kwargs = dict(
+            num_heads_q=query.shape[1],
+            num_heads_kv=1,
+            head_dim=query.shape[2],
+            seqused_q=seq.new_empty(0),
+            batch_size=plan.n,
+            max_seqlen_q=1,
+            max_seqlen_kv=max(1, int(seq.max().item()) if seq.numel() else 0),
+            cmp_topk=cmp_topk,
+            has_ori_kv=True,
+            has_cmp_kv=compressed is not None,
+            device=str(query.device),
+            cu_seqlens_q=plan.query_cu,
+            cu_seqlens_ori_kv=cu_ori,
+            cu_seqlens_cmp_kv=cu_cmp,
+            seqused_kv=seq,
+            cmp_ratio=int(ratio),
+            ori_mask_mode=4,
+            cmp_mask_mode=3,
+            ori_win_left=int(window) - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+        )
+        custom = getattr(torch.ops, "custom", None)
+        op = getattr(custom, "npu_sparse_attn_sharedkv_metadata", None)
+        if op is None:
+            op = getattr(
+                _vendor_namespace(), "npu_sparse_attn_sharedkv_metadata", None
+            )
+        if op is None:
+            raise RuntimeError(
+                "DSpark tree attention requires "
+                "torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata or "
+                "torch.ops.custom.npu_sparse_attn_sharedkv_metadata"
+            )
+        return op(**kwargs), cu_ori, cu_cmp
     metadata_tensor = torch.zeros(1024, dtype=torch.int32, device=query.device)
     return metadata_tensor, cu_ori, cu_cmp
 
@@ -484,29 +627,62 @@ def _tree_indexer_lengths(plan: NodePlan):
     return seq // 4, seq % 4
 
 
-def tree_indexer(
+def _tree_indexer_metadata(
+    *, query: torch.Tensor, plan: NodePlan, topk: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the vendor candidate-block schedule for the tree indexer."""
+    lengths, residual = _tree_indexer_lengths(plan)
+    max_kv = int(plan.start.max().item() + plan.depths.max().item() + 1)
+    _ensure_vendor_ops()
+    namespace = _vendor_namespace()
+    op = getattr(namespace, "npu_quant_lightning_indexer_v2_metadata", None)
+    if op is None:
+        custom = getattr(torch.ops, "custom", None)
+        op = getattr(custom, "npu_quant_lightning_indexer_v2_metadata", None)
+    if op is None:
+        raise RuntimeError(
+            "DSpark tree indexer requires "
+            "npu_quant_lightning_indexer_v2_metadata from the vllm-ascend "
+            "binding"
+        )
+    schedule = op(
+        num_heads_q=query.shape[1],
+        num_heads_k=1,
+        head_dim=query.shape[2],
+        topk=topk,
+        quant_mode=2,
+        cu_seqlens_q=plan.query_cu,
+        seqused_k=lengths,
+        cmp_residual_k=residual,
+        batch_size=plan.n,
+        max_seqlen_q=1,
+        max_seqlen_k=max(1, max_kv // 4),
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=3,
+        cmp_ratio=4,
+        device=str(query.device),
+    )
+    return lengths, residual, schedule
+
+
+def _invoke_tree_indexer(
+    op,
     *,
-    query: torch.Tensor,
-    weights: torch.Tensor,
-    query_scale: torch.Tensor,
-    history: torch.Tensor,
-    history_scale: torch.Tensor,
-    nodes: torch.Tensor,
-    node_scale: torch.Tensor,
-    table: torch.Tensor,
-    plan: NodePlan,
-    topk: int,
-    lengths: torch.Tensor | None = None,
-    residual: torch.Tensor | None = None,
-    schedule: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return the TopK compressed-KV indices for every tree node, ``[n, 1, topk]``."""
-    op = _load_indexer_op()
-    if lengths is None or residual is None:
-        lengths, residual = _tree_indexer_lengths(plan)
-    if schedule is None:
-        # The Triton op validates the metadata ABI and ignores its contents.
-        schedule = torch.zeros(1024, dtype=torch.int32, device=query.device)
+    query,
+    weights,
+    query_scale,
+    history,
+    history_scale,
+    nodes,
+    node_scale,
+    table,
+    plan,
+    topk,
+    lengths,
+    residual,
+    schedule,
+):
     return op(
         query,
         history,
@@ -525,6 +701,76 @@ def tree_indexer(
         schedule,
         topk,
     )
+
+
+def _sgl_kernel_tree_indexer(**kwargs) -> torch.Tensor:
+    op = _load_sgl_kernel_indexer_op()
+    plan = kwargs["plan"]
+    query = kwargs["query"]
+    if kwargs["lengths"] is None or kwargs["residual"] is None:
+        kwargs["lengths"], kwargs["residual"] = _tree_indexer_lengths(plan)
+    if kwargs["schedule"] is None:
+        # The Triton op validates the metadata ABI and ignores its contents.
+        kwargs["schedule"] = torch.zeros(
+            1024, dtype=torch.int32, device=query.device
+        )
+    return _invoke_tree_indexer(op, **kwargs)
+
+
+def _vendor_tree_indexer(**kwargs) -> torch.Tensor:
+    op = _load_vendor_indexer_op()
+    plan = kwargs["plan"]
+    query = kwargs["query"]
+    if (
+        kwargs["lengths"] is None
+        or kwargs["residual"] is None
+        or kwargs["schedule"] is None
+    ):
+        lengths, residual, schedule = _tree_indexer_metadata(
+            query=query, plan=plan, topk=kwargs["topk"]
+        )
+        kwargs["lengths"] = lengths
+        kwargs["residual"] = residual
+        kwargs["schedule"] = schedule
+    return _invoke_tree_indexer(op, **kwargs)
+
+
+def tree_indexer(
+    *,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    query_scale: torch.Tensor,
+    history: torch.Tensor,
+    history_scale: torch.Tensor,
+    nodes: torch.Tensor,
+    node_scale: torch.Tensor,
+    table: torch.Tensor,
+    plan: NodePlan,
+    topk: int,
+    lengths: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    schedule: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the TopK compressed-KV indices for every tree node, ``[n, 1, topk]``."""
+    backend = _tree_backend()
+    common = dict(
+        query=query,
+        weights=weights,
+        query_scale=query_scale,
+        history=history,
+        history_scale=history_scale,
+        nodes=nodes,
+        node_scale=node_scale,
+        table=table,
+        plan=plan,
+        topk=topk,
+        lengths=lengths,
+        residual=residual,
+        schedule=schedule,
+    )
+    if backend == "sgl_kernel_npu":
+        return _sgl_kernel_tree_indexer(**common)
+    return _vendor_tree_indexer(**common)
 
 
 # ---------------------------------------------------------------------------
