@@ -183,11 +183,12 @@ def retained_target_window(
 
 
 def window_sub_pool_of(allocator) -> str:
-    """The sub-pool the model's sliding-window layers write: a unified
-    pool's target window, else the static pools' window pool."""
-    storage = allocator.storage
-    window = None if storage is None else storage.primary_window_name()
-    return "swa" if window is None else window
+    """The window pool a reader that sizes one window by reads
+    (`target_window_pool`), or the static window pools' name for a pool that
+    keeps none."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    return allocator.target_window_pool() or BaseSWAKVPool.WINDOW_SUB_POOL
 
 
 @dataclasses.dataclass

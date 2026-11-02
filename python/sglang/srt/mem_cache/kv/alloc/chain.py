@@ -605,6 +605,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def window_pool_names(self) -> Tuple[str, ...]:
         return tuple(window.sub_pool_name for window in self._windows)
 
+    def target_window_pool(self) -> Optional[str]:
+        """The target's window (the longest window its layers declare)."""
+        return self.roles.window
+
     def sub_pool_roles(self) -> Tuple[str, Tuple[str, ...], Optional[str]]:
         """The token sub-pool's name, every window sub-pool's, and the state
         sub-pool's (None without one)."""

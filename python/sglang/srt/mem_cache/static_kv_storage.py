@@ -17,6 +17,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.advance import (
     TrackingAdvance,
     advance_tracking,
@@ -38,6 +39,9 @@ from sglang.srt.mem_cache.kv.storage import (
     window_tail_len,
 )
 from sglang.srt.utils import is_npu
+
+# The static pools' one window pool: `BaseSWAKVPool.WINDOW_SUB_POOL`.
+_WINDOW = BaseSWAKVPool.WINDOW_SUB_POOL
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -167,14 +171,14 @@ class StaticKVStorage:
                 token_start=token_boundary,
                 token_boundary=token_boundary,
             )
-        if sub_pool not in (self.owner, "swa"):
+        if sub_pool not in (self.owner, _WINDOW):
             raise KeyError(sub_pool)
         page_size = allocator.page_size
         pool = allocator.get_kvcache()
-        request_window = pool.request_window if sub_pool == "swa" else None
+        request_window = pool.request_window if sub_pool == _WINDOW else None
         begin = token_start
-        if sub_pool == "swa":
-            begin = max(begin, token_boundary - self.retained_window_lengths()["swa"])
+        if sub_pool == _WINDOW:
+            begin = max(begin, token_boundary - self.retained_window_lengths()[_WINDOW])
         begin = begin // page_size * page_size
         if request_window is not None:
             units = torch.as_tensor(
@@ -197,7 +201,7 @@ class StaticKVStorage:
                 tokens = get_cp_sharded_padded_cache_transfer_indices(tokens)
             physical = (
                 allocator.translate_swa_indices_for_transfer(tokens)
-                if sub_pool == "swa"
+                if sub_pool == _WINDOW
                 else allocator.translate_kv_indices_for_transfer(tokens)
             )
             units = physical[::page_size] // page_size
@@ -371,7 +375,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
-            window_sub_pool=window_sub_pool or "swa",
+            window_sub_pool=window_sub_pool or _WINDOW,
         )
 
     def record_forward(
@@ -414,7 +418,11 @@ class StaticKVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    _TREE_SUB_POOLS = {"FULL": "kv", "SWA": "swa", "MAMBA": "mamba"}
+    _TREE_SUB_POOLS = {
+        "FULL": "kv",
+        "SWA": BaseSWAKVPool.WINDOW_SUB_POOL,
+        "MAMBA": "mamba",
+    }
 
     def tree_sub_pool(self, component, *, family: Optional[str] = None) -> str:
         """The sub-pool the tree's ``component`` holds values of. A window
@@ -424,11 +432,11 @@ class StaticKVStorage:
         if name in self._TREE_SUB_POOLS:
             return self._TREE_SUB_POOLS[name]
         if family == "window":
-            return "swa"
+            return _WINDOW
         raise KeyError(f"static storage keeps no sub-pool for tree component {name!r}")
 
     def _band(self, sub_pool: str):
-        if sub_pool == "swa":
+        if sub_pool == _WINDOW:
             return self._allocator.swa_attn_allocator
         if self._allocator.has_window_pool:
             return self._allocator.full_attn_allocator
@@ -444,7 +452,7 @@ class StaticKVStorage:
         self._band(sub_pool).free(ids)
 
     def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
-        if sub_pool == "swa":
+        if sub_pool == _WINDOW:
             self._allocator.free_swa_segment(ids, start_pos=0)
         else:
             self._band(sub_pool).free_segment(ids, start_pos=0)
@@ -594,7 +602,7 @@ class StaticKVStorage:
                 # Published under the name a unified pool's window of this
                 # length goes by.
                 SubPoolUsage(
-                    name="swa",
+                    name=_WINDOW,
                     metrics="window",
                     label=window_sub_pool_name(shape.window),
                     capacity=swa_capacity,
@@ -668,16 +676,12 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def primary_window_name(self) -> Optional[str]:
-        """See `KVStorage.primary_window_name`: the window pool."""
-        return "swa" if self._allocator.window_pool_names() else None
-
     def host_pool_name(self, sub_pool: str) -> str:
         """See `KVStorage.host_pool_name`: a window entry backs up to the
         window host pool."""
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
-        return PoolName.SWA if sub_pool == "swa" else PoolName.KV
+        return PoolName.SWA if sub_pool == _WINDOW else PoolName.KV
 
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
@@ -701,7 +705,7 @@ class StaticKVStorage:
             return {}
         pool = self._allocator.get_kvcache()
         if pool.request_window is not None:
-            return {"swa": pool.sliding_window}
+            return {_WINDOW: pool.sliding_window}
         retention = self._allocator.window_retention
         if retention is None:
             raise ValueError("the window's retention was never bound")
@@ -723,7 +727,7 @@ class StaticKVStorage:
         shape = self._shape
         window = None
         if shape.window is not None:
-            window = (self._allocator.window_retention or {}).get("swa", shape.window)
+            window = (self._allocator.window_retention or {}).get(_WINDOW, shape.window)
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (

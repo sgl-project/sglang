@@ -268,6 +268,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             storage=None,
             # The window pool, keeping the scheduler's window.
             window_pool_names=lambda: ("swa",),
+            target_window_pool=lambda: "swa",
             window_retention={"swa": sliding_window_size},
             get_kvcache=lambda: SimpleNamespace(request_window=None),
             device=torch.device("cpu"),

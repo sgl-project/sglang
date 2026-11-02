@@ -701,12 +701,6 @@ class KVStorage:
         """The key PD peers tell entries of one state type apart by."""
         return entry.key
 
-    def primary_window_name(self) -> Optional[str]:
-        """The target's window sub-pool (the one a single-window reader sizes
-        and retains by), or None without a window."""
-        window = self._plan.primary_window()
-        return None if window is None else window.name
-
     def host_pool_name(self, sub_pool: str) -> str:
         """The host pool a sub-pool's rows back up to and load from."""
         return self._plan.sub_pool(sub_pool).external.host_pool

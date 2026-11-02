@@ -58,10 +58,6 @@ class SWAKVPool(BaseSWAKVPool):
     without adding model-specific behavior to the pool selector.
     """
 
-    # The name its sliding-window sub-pool goes by, in its id spaces and in a
-    # write loc's ``window_locs``.
-    WINDOW_SUB_POOL = "swa"
-
     def __init__(
         self,
         size: int,
