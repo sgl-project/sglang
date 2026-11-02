@@ -12,8 +12,8 @@ from sglang.srt.observability.frontend_request_timing import (
     FrontendTimingGroup,
     bind_frontend_timing,
     current_frontend_timing,
+    measure_frontend_stage,
 )
-from sglang.srt.observability.tokenizer_encode_metrics import measure_tokenizer_encode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,16 +62,12 @@ class TestFrontendRequestTiming(CustomTestCase):
     def test_encode_span_follows_request_into_executor(self):
         request = FrontendRequestTiming(started_at=10.0)
 
-        class Collector:
-            def observe_tokenizer_encode(self, *args, **kwargs):
-                pass
-
         def encode():
-            with measure_tokenizer_encode(Collector(), source="chat"):
+            with measure_frontend_stage(current_frontend_timing.get(), "text"):
                 pass
 
         with patch(
-            "sglang.srt.observability.tokenizer_encode_metrics.time.perf_counter",
+            "sglang.srt.observability.frontend_request_timing.time.perf_counter",
             side_effect=[10.2, 10.4],
         ):
             with (

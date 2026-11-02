@@ -12,7 +12,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.observability.frontend_request_timing import current_frontend_timing
-from sglang.srt.observability.tokenizer_encode_metrics import measure_tokenizer_encode
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +37,6 @@ class AsyncDynamicbatchTokenizer:
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.batch_wait_timeout_s = batch_wait_timeout_s
-        self.metrics_collector = None
 
         # Single queue for all encode requests - initialized lazily
         self._queue: Optional[asyncio.Queue] = None
@@ -137,12 +135,7 @@ class AsyncDynamicbatchTokenizer:
                 def encode_fn():
                     started = time.perf_counter()
                     try:
-                        with measure_tokenizer_encode(
-                            self.metrics_collector,
-                            source="manager",
-                            batch_size=len(prompts),
-                        ):
-                            return self.tokenizer(prompts, **kwargs)
+                        return self.tokenizer(prompts, **kwargs)
                     finally:
                         finished = time.perf_counter()
                         for future in result_futures:
@@ -174,10 +167,7 @@ class AsyncDynamicbatchTokenizer:
                     ):
                         started = time.perf_counter()
                         try:
-                            with measure_tokenizer_encode(
-                                self.metrics_collector, source="manager"
-                            ):
-                                results.append(self.tokenizer(prompt, **kwargs))
+                            results.append(self.tokenizer(prompt, **kwargs))
                         finally:
                             timing = getattr(future, "_frontend_timing", None)
                             if timing is not None:

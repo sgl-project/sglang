@@ -54,7 +54,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
@@ -143,6 +142,7 @@ from sglang.srt.observability.frontend_request_timing import (
     FrontendRequestTiming,
     FrontendTimingGroup,
     bind_frontend_timing,
+    current_frontend_timing,
     measure_frontend_stage,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -162,7 +162,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
-from sglang.srt.observability.tokenizer_encode_metrics import measure_tokenizer_encode
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
@@ -890,11 +889,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
             )
 
-            if self.async_dynamic_batch_tokenizer is not None:
-                self.async_dynamic_batch_tokenizer.metrics_collector = (
-                    self.metrics_collector
-                )
-
             start_cpu_monitor_thread("tokenizer")
 
         if get_observability().gc_warning_threshold_secs > 0.0:
@@ -1128,17 +1122,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
                 input_ids = []
                 for text in tokenizer_input:
-                    with measure_tokenizer_encode(
-                        getattr(self, "metrics_collector", None), source="manager"
-                    ):
+                    with measure_frontend_stage(current_frontend_timing.get(), "text"):
                         input_ids.append(self.tokenizer.encode(text))
                 token_type_ids = None
             else:
-                with measure_tokenizer_encode(
-                    getattr(self, "metrics_collector", None),
-                    source="manager",
-                    batch_size=len(tokenizer_input),
-                ):
+                with measure_frontend_stage(current_frontend_timing.get(), "text"):
                     encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
                 input_ids = encoded["input_ids"]
                 token_type_ids = (

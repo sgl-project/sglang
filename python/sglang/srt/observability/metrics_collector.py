@@ -2067,33 +2067,6 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             ),
         )
 
-        self.histogram_tokenizer_encode = Histogram(
-            name="sglang:tokenizer_encode_seconds",
-            documentation=(
-                "Wall time of tokenizer calls in seconds; one observation per "
-                "invocation, including one for an entire batch. Excludes queue "
-                "waiting and separate template rendering. The chat_template "
-                "operation includes rendering when it cannot be separated."
-            ),
-            labelnames=[*labels.keys(), "source", "input_type", "operation", "result"],
-            buckets=(
-                0.001,
-                0.005,
-                0.010,
-                0.025,
-                0.050,
-                0.100,
-                0.250,
-                0.500,
-                1.000,
-                2.500,
-                5.000,
-                10.000,
-                30.000,
-                60.000,
-            ),
-        )
-
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -2209,27 +2182,10 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
     def observe_frontend_request_timing(self, durations: Dict[str, float]):
-        for stage in ("total", "text", "multimodal", "chat_template"):
+        for stage in ("total", "text", "multimodal"):
             self.histogram_frontend_request.labels(**self.labels, stage=stage).observe(
                 durations.get(stage, 0.0)
             )
-
-    def observe_tokenizer_encode(
-        self,
-        duration: float,
-        *,
-        source: str,
-        input_type: str,
-        operation: str,
-        result: str,
-    ):
-        self.histogram_tokenizer_encode.labels(
-            **self.labels,
-            source=source,
-            input_type=input_type,
-            operation=operation,
-            result=result,
-        ).observe(duration)
 
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool
