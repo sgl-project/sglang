@@ -520,6 +520,9 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
             start_layer=start_layer,
             end_layer=end_layer,
         )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
         self.head_num = head_num
         self.head_dim = head_dim
 

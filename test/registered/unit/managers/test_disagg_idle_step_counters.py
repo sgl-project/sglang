@@ -179,7 +179,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         self.prepare_pp_scheduler(scheduler)
                         if pending_transfer:
                             if name == "prefill":
-                                scheduler.disagg_prefill_inflight_queue = [object()]
+                                scheduler.disagg_prefill_transfer_queue = [object()]
                             else:
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
@@ -568,7 +568,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.last_batch = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -599,7 +599,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
-        scheduler.process_disagg_prefill_inflight_queue = Mock()
+        scheduler.process_disagg_prefill_transfer_queue = Mock()
         scheduler.launch_batch_sample_if_needed = Mock()
         scheduler.on_idle = Mock()
         return scheduler
@@ -611,7 +611,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
         scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
-        scheduler._pp_recv_proxy_tensors = Mock()
+        scheduler._pp_recv_proxy_tensors = Mock(return_value=None)
         scheduler._pp_commit_comm_work = Mock()
         scheduler._pp_prepare_tensor_dict = Mock(return_value={})
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
@@ -628,7 +628,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
 
 
