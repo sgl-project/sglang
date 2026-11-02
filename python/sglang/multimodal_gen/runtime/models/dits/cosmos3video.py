@@ -96,6 +96,34 @@ def _can_enable_t1_fused_qk_norm_rope(
     return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
+def sequence_shard_padding(seq_len: int, world_size: int) -> int:
+    """Tokens appended so a sequence splits evenly over ``world_size`` ranks."""
+    if world_size <= 1:
+        return 0
+    return (-seq_len) % world_size
+
+
+def shard_sequence(
+    tensor: torch.Tensor, world_size: int, rank: int, *, dim: int, pad_last: bool
+) -> torch.Tensor:
+    """This rank's contiguous shard of ``tensor`` along ``dim``.
+
+    The sequence is first padded to a multiple of ``world_size`` by repeating the
+    last entry (``pad_last``, for positions) or with zeros (for tokens).
+    """
+    if world_size <= 1:
+        return tensor
+    pad = sequence_shard_padding(tensor.shape[dim], world_size)
+    if pad:
+        tail = tensor.narrow(dim, tensor.shape[dim] - 1, 1)
+        filler = tail.expand(*[pad if i == dim else -1 for i in range(tensor.ndim)])
+        if not pad_last:
+            filler = torch.zeros_like(filler)
+        tensor = torch.cat([tensor, filler], dim=dim)
+    local = tensor.shape[dim] // world_size
+    return tensor.narrow(dim, rank * local, local).contiguous()
+
+
 # -----------------------------------------------------------------------------
 # mRoPE position ID computation (Qwen3VL-style)
 # -----------------------------------------------------------------------------
@@ -130,6 +158,7 @@ def compute_mrope_position_ids_vision(
     temporal_compression_factor: int = 4,
     base_temporal_compression_factor: int | None = None,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -146,6 +175,11 @@ def compute_mrope_position_ids_vision(
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(
+            "Cosmos3 temporal_position_period must be positive, "
+            f"got {temporal_position_period}."
+        )
     fps_modulation = fps is not None and grid_t > 1
 
     if fps_modulation:
@@ -157,6 +191,10 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32, device=device)
+        if temporal_position_period is not None:
+            # Camera-major multiview packing: frame indexes wrap per view so
+            # matching frames of every camera share one temporal coordinate.
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -164,11 +202,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long, device=device)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(-1, grid_h * grid_w)
-            .flatten()
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten()
             + int(temporal_offset)
             + start_frame_offset
         )
@@ -279,6 +317,8 @@ def _apply_qwen3_qk_norm_rope(
     )
 
 
+# Also writes K/V into one packed buffer in the same launch, which
+# apply_qk_norm_rope cannot.
 def _apply_qwen3_qk_norm_rope_pack_kv(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -780,6 +820,7 @@ class Cosmos3CrossAttention(nn.Module):
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -816,6 +857,7 @@ class Cosmos3CrossAttention(nn.Module):
 
         use_fused_kv_pack = (
             use_fused_qk_norm_rope
+            and multiview_layout is None
             and q.device.type == "cuda"
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
@@ -862,13 +904,34 @@ class Cosmos3CrossAttention(nn.Module):
             q, k = _apply_qwen3_qk_norm_rope_split(
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
-        if not use_fused_kv_pack:
+        if multiview_layout is not None:
+            # Sparse cross-camera attention (Cosmos3 Multiview-AV): the mask
+            # replaces the dense [UND | GEN] key layout; the subclass applies
+            # the Ulysses collectives itself.
+            out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
             # USPAttention applies the configured backend and SP collectives.
             out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
+
+    def _forward_multiview(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        multiview_layout: Any,
+    ) -> torch.Tensor:
+        """Hook for the multiview transformer variant; the base has no sparse path."""
+        del q, k, v, k_und, v_und, multiview_layout
+        raise TypeError(
+            "The base Cosmos3 transformer does not support multiview attention "
+            "layouts; load the checkpoint through Cosmos3MultiviewTransformer."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -965,11 +1028,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
         supported_attention_backends: set | None = None,
+        cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention,
     ):
         super().__init__()
         self.layer_idx = layer_idx
 
-        self.cross_attention = Cosmos3CrossAttention(
+        self.cross_attention = cross_attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -998,6 +1062,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
+        multiview_layout: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -1017,6 +1082,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             rope_cache_positions,
             use_fused_qk_norm_rope,
             round_norm_before_rope,
+            multiview_layout=multiview_layout,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1136,6 +1202,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
     )
     lora_param_names_mapping = Cosmos3VideoConfig().arch_config.lora_param_names_mapping
+
+    # Variants swap the GEN layer / cross-attention implementation (e.g. the
+    # Multiview-AV sparse attention) without redeclaring the weight layout.
+    _gen_layer_cls: type[nn.Module] = Cosmos3GenDecoderLayer
+    _cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention
 
     def __init__(
         self,
@@ -1264,7 +1335,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Generation layers (GEN pathway)
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(
+                self._gen_layer_cls(
                     hidden_size=arch.hidden_size,
                     num_attention_heads=arch.num_attention_heads,
                     num_key_value_heads=arch.num_key_value_heads,
@@ -1276,6 +1347,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     prefix=f"gen_layers.{i}",
                     quant_config=quant_config,
                     supported_attention_backends=self._supported_attention_backends,
+                    cross_attention_cls=self._cross_attention_cls,
                 )
                 for i in range(arch.num_hidden_layers)
             ]
@@ -1350,6 +1422,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_start_frame_offset: int = 1,
         control_frames: int | Sequence[int] = 0,
         share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute mRoPE position IDs for UND text and GEN tokens.
 
@@ -1396,6 +1469,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     fps=effective_fps,
                     base_fps=self.base_fps,
                     temporal_compression_factor=self.temporal_compression_factor,
+                    temporal_position_period=temporal_position_period,
                 )
                 vision_pos_blocks.append(vision_pos)
 
@@ -1489,6 +1563,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_start_frame_offset: int = 1,
         control_latents: torch.Tensor | list[torch.Tensor] | None = None,
         transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
+        multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1524,6 +1600,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 projected with the shared ``proj_in``, prepended to the GEN
                 sequence as clean (noise-free) tokens that share the video's
                 temporal positions, and excluded from the output projection.
+            temporal_position_period: Wrap the vision frame index at this
+                period when computing temporal mRoPE positions. Camera-major
+                multiview packing uses it so frame ``f`` of every camera
+                shares one temporal coordinate. ``None`` keeps consecutive
+                positions.
+            multiview_layout: Opaque attention layout handed to each GEN
+                layer's cross-attention; only the multiview transformer
+                variant accepts it.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1544,10 +1628,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         action_frames = 0
         if action_latents is not None:
-            if self.sp_size > 1:
-                raise NotImplementedError(
-                    "Cosmos3 action generation does not support sequence parallelism yet"
-                )
             action_frames = action_latents.shape[1]
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(
@@ -1622,32 +1702,18 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                    if token_noisy_mask is not None:
-                        mask_pad = torch.zeros(
-                            (batch_size, seq_shard_pad, 1),
-                            dtype=token_noisy_mask.dtype,
-                            device=token_noisy_mask.device,
-                        )
-                        token_noisy_mask = torch.cat(
-                            [token_noisy_mask, mask_pad], dim=1
-                        )
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
                 if token_noisy_mask is not None:
-                    token_noisy_mask = token_noisy_mask.view(
-                        batch_size, self.sp_size, local_seq_len, 1
-                    )[:, self.sp_rank, :, :]
+                    token_noisy_mask = shard_sequence(
+                        token_noisy_mask,
+                        self.sp_size,
+                        self.sp_rank,
+                        dim=1,
+                        pad_last=False,
+                    )
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
@@ -1695,19 +1761,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
             seq_len_orig = hidden_gen.shape[1]
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                # The zero pad lands after the last modality (action or sound)
+                # and is dropped again after the post-loop all-gather.
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
 
         self._ensure_cache_dicts()
 
@@ -1746,6 +1805,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 share_vision_temporal_positions=(
                     transfer_share_vision_temporal_positions
                 ),
+                temporal_position_period=temporal_position_period,
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
@@ -1754,12 +1814,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 text_ids, text_mask, text_pos_ids
             )
             if sequence_shard_enabled:
-                if seq_shard_pad > 0:
-                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
-                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
-                vis_pos_ids = vis_pos_ids.view(
-                    3, batch_size, self.sp_size, local_seq_len
-                )[:, :, self.sp_rank, :]
+                vis_pos_ids = shard_sequence(
+                    vis_pos_ids, self.sp_size, self.sp_rank, dim=2, pad_last=True
+                )
             cos_sin_gen, gen_rope_cache_positions = (
                 self.language_model.rotary_emb.build_rope_cache_inputs(
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
@@ -1809,6 +1866,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 use_fused_qk_norm_rope,
                 round_norm_before_rope,
                 residual=residual,
+                multiview_layout=multiview_layout,
             )
 
         # Collapse the trailing residual carry. RMSNorm and the linear

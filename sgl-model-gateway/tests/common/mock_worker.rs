@@ -308,6 +308,7 @@ async fn generate_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_request_arrival(config.port);
     let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
@@ -1469,6 +1470,27 @@ async fn responses_cancel_handler(
 // Configured via a global map keyed by worker port so that tests
 // can enable slow streaming WITHOUT relying on the request payload
 // (the gateway deserializes/re-serializes the body, dropping unknown fields).
+
+static REQUEST_ARRIVALS: OnceLock<Mutex<HashMap<u16, Vec<std::time::Instant>>>> = OnceLock::new();
+
+fn record_request_arrival(port: u16) {
+    REQUEST_ARRIVALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(port)
+        .or_default()
+        .push(std::time::Instant::now());
+}
+
+pub fn take_request_arrivals(port: u16) -> Vec<std::time::Instant> {
+    REQUEST_ARRIVALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .remove(&port)
+        .unwrap_or_default()
+}
 
 static SLOW_STREAM_CONFIG: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
 

@@ -160,6 +160,8 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
   ```
 Prefill entries accept an optional bootstrap port. PD mode merges prefill metadata with decode outputs and streams results back to the client.
 
+A decode worker picked on arrival only starts decoding once prefill has queued, computed and sent the KV, so with long prefill queues, decode workers (with `--dp-aware`, DP ranks) that hold equal numbers of requests can run unequal batches. `--decode-dispatch-limit N` still sends every request to prefill on arrival, but sends at most N per prefill worker on to decode before decode answers or prefill finishes; the rest wait in arrival order and pick their decode worker when they are sent. Prefill must start a request before decode connects, so prefill engines need `--optimistic-prefill-attempts` above 0.
+
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash

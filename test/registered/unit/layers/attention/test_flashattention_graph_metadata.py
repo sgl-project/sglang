@@ -1,15 +1,203 @@
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.model_executor.model_runner as model_runner_module
+import sglang.srt.speculative.spec_utils as spec_utils
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention import flashattention_backend as flashattention_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+
+class _DraftWidthModelRunner:
+    decode_num_tokens_per_req = ModelRunner.decode_num_tokens_per_req
+
+    def __init__(self, *, algorithm, is_draft_worker, sample_from_anchor):
+        self.is_draft_worker = is_draft_worker
+        self.spec_algorithm = algorithm
+        self.model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            is_local_attention_model=False,
+            context_len=128,
+            attention_arch=AttentionArch.MHA,
+            head_dim=8,
+            hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor),
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=1, attn_logit_softcapping=None
+            ),
+            get_num_kv_heads=lambda _tp_size: 1,
+        )
+        self.device = "cpu"
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((3, 128), dtype=torch.int32)
+        )
+        self.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(routes_to=lambda _kind: False)
+        )
+        self.kv_cache_dtype = torch.float16
+        self.kv_cache_dtype_str = "auto"
+        self.page_size = 1
+        self.sliding_window_size = None
+        self.runner_ids = SimpleNamespace(is_translating=False)
+        self.attention_chunk_size = None
+        self.prefill_aware_swa = False
+        self.server_args = SimpleNamespace()
+
+
+def _fake_attention_module(name, *, with_scheduler_metadata=False):
+    module = ModuleType(name)
+    module.flash_attn_varlen_func = lambda: None
+    module.flash_attn_with_kvcache = lambda: None
+    if with_scheduler_metadata:
+        module.get_scheduler_metadata = lambda: None
+    return module
+
+
+class TestFlashAttentionDraftWidth(CustomTestCase):
+    """FlashAttention must size draft queries to the runner's row contract.
+
+    DSpark without anchor sampling emits gamma+1 rows from the draft forward,
+    while the generic target-verify resolver returns gamma for a draft worker.
+    If the backend stores gamma, FA3/FA4 cumulative query metadata ends before
+    the flattened draft query tensor.
+    """
+
+    def _make_backend(
+        self, *, algorithm, is_draft_worker, sample_from_anchor, fa_impl_ver
+    ):
+        spec = SimpleNamespace(
+            speculative_algorithm=algorithm.name,
+            speculative_eagle_topk=None,
+            speculative_num_draft_tokens=8,
+        )
+        runner = _DraftWidthModelRunner(
+            algorithm=algorithm,
+            is_draft_worker=is_draft_worker,
+            sample_from_anchor=sample_from_anchor,
+        )
+        parallel = SimpleNamespace(
+            attn_cp_size=1,
+            attn_tp_size=1,
+            enable_prefill_cp=False,
+            attn_dp_enabled=False,
+        )
+        execution = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False)
+        )
+        model = SimpleNamespace(is_embedding=False)
+        schedule = SimpleNamespace(
+            chunked_prefill_size=-1, prefill_only_disable_kv_cache=False
+        )
+        memory = SimpleNamespace(disable_radix_cache=False)
+        modules = {
+            "sgl_kernel.flash_attn": _fake_attention_module(
+                "sgl_kernel.flash_attn", with_scheduler_metadata=True
+            ),
+            "sglang.kernels.ops.attention.flash_attention_v4": _fake_attention_module(
+                "sglang.kernels.ops.attention.flash_attention_v4"
+            ),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(flashattention_module, "get_spec", return_value=spec),
+            patch.object(model_runner_module, "get_spec", return_value=spec),
+            patch.object(spec_utils, "get_spec", return_value=spec),
+            patch.object(flashattention_module, "get_parallel", return_value=parallel),
+            patch.object(flashattention_module, "get_exec", return_value=execution),
+            patch.object(flashattention_module, "get_model", return_value=model),
+            patch.object(flashattention_module, "get_schedule", return_value=schedule),
+            patch.object(flashattention_module, "get_memory", return_value=memory),
+            patch.object(flashattention_module, "get_kv_shard_pool", return_value=None),
+            patch.object(
+                flashattention_module, "get_device_capability", return_value=(8, 0)
+            ),
+        ):
+            return FlashAttentionBackend(runner, fa_impl_ver=fa_impl_ver)
+
+    def _make_forward_batch(self, *, actual_query_width):
+        actual_query_token_count = 2 * actual_query_width
+        return ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            input_ids=torch.zeros(actual_query_token_count, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+            seq_lens=torch.tensor([3, 5], dtype=torch.int64),
+            out_cache_loc=torch.arange(actual_query_token_count, dtype=torch.int64),
+            seq_lens_sum=8,
+            seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int64),
+            spec_info=SimpleNamespace(ragged_verify_layout=None),
+            encoder_lens=None,
+        )
+
+    def test_fa3_and_fa4_use_draft_query_width_contract(self):
+        cases = (
+            ("DSpark draft, no anchor", SpeculativeAlgorithm.DSPARK, True, False, 8, 8),
+            ("DSpark draft, anchor", SpeculativeAlgorithm.DSPARK, True, True, 7, 7),
+            ("DSpark target", SpeculativeAlgorithm.DSPARK, False, False, 8, 8),
+            ("non-DSpark draft", SpeculativeAlgorithm.EAGLE, True, False, 8, 8),
+        )
+        for fa_impl_ver in (3, 4):
+            for (
+                name,
+                algorithm,
+                is_draft_worker,
+                sample_from_anchor,
+                expected_width,
+                actual_query_width,
+            ) in cases:
+                with self.subTest(fa_impl_ver=fa_impl_ver, case=name):
+                    backend = self._make_backend(
+                        algorithm=algorithm,
+                        is_draft_worker=is_draft_worker,
+                        sample_from_anchor=sample_from_anchor,
+                        fa_impl_ver=fa_impl_ver,
+                    )
+                    self.assertEqual(
+                        backend.speculative_num_draft_tokens,
+                        expected_width,
+                    )
+
+                    forward_batch = self._make_forward_batch(
+                        actual_query_width=actual_query_width
+                    )
+                    backend.init_forward_metadata(forward_batch)
+
+                    self.assertEqual(
+                        backend.forward_metadata.cu_seqlens_q.tolist(),
+                        [0, expected_width, 2 * expected_width],
+                    )
+                    backend.init_cuda_graph_state(
+                        max_bs=2,
+                        max_num_tokens=2 * expected_width,
+                    )
+                    self.assertEqual(
+                        backend.target_verify_metadata["cu_seqlens_q"].tolist(),
+                        [0, expected_width, 2 * expected_width],
+                    )
+                    if name == "DSpark draft, no anchor":
+                        actual_query_token_count = forward_batch.input_ids.numel()
+                        self.assertEqual(
+                            backend.forward_metadata.cu_seqlens_q[-1].item(),
+                            actual_query_token_count,
+                            "cu_seqlens_q must cover every flattened draft query row",
+                        )
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
@@ -28,10 +216,10 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         # translated block table and the strided one this test covers, so the
         # source has to be real; the stub pools disable translation, which is
         # the static-pool view the assertions below are written against.
-        backend.kv_index_translator = KVIndexTranslator(
+        backend.runner_ids = RunnerIds(
             req_to_token=backend.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=backend.page_size,
             device="cpu",
         )
@@ -60,10 +248,10 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         )
         # A real source over the stub pool: the probe disables it, giving the
         # backend the strict passthrough view it now reads its tables from.
-        backend.kv_index_translator = KVIndexTranslator(
+        backend.runner_ids = RunnerIds(
             req_to_token=backend.req_to_token_pool.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device="cpu",
         )
@@ -75,6 +263,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend._maybe_init_local_attn_metadata = lambda *_: None
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             seq_lens=torch.empty(0, dtype=torch.int64),
             batch_size=0,
             seq_lens_cpu=torch.empty(0, dtype=torch.int64),
@@ -130,7 +319,7 @@ class TestDraftExtendInGraph(CustomTestCase):
 
     def _run(self, *, translating):
         b = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        b.kv_index_translator = SimpleNamespace(is_translating=translating)
+        b.runner_ids = SimpleNamespace(is_translating=translating)
         b.draft_extend_metadata = {}  # any metadata access raises KeyError
         fb = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2, batch_size=2)
         b.init_forward_metadata_in_graph(fb)
@@ -139,6 +328,131 @@ class TestDraftExtendInGraph(CustomTestCase):
         self._run(translating=True)
         with self.assertRaises(KeyError):
             self._run(translating=False)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay requires CUDA")
+class TestUnifiedVerifyGraphMetadata(CustomTestCase):
+    def test_replay_uses_live_mapping_and_request_rows(self):
+        """Captured tables must follow compaction, page reuse and shorter rows.
+
+        A raw req_to_token gather silently uses virtual pages; an eager-only
+        builder leaves stale physical pages after replay. Both violate the
+        expected physical addresses checked after each mapping change.
+        """
+        for page_size in (1, 128):
+            for use_swa in (False, True):
+                with self.subTest(page_size=page_size, use_swa=use_swa):
+                    self._check_replay(page_size, use_swa)
+
+    def _check_replay(self, ps, use_swa):
+        device = "cuda"
+        bs, pages, delta = 3, 6, 3
+        b = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        b.fa_impl_ver = 4
+        b.topk = 1
+        b.page_size = ps
+        b.max_num_pages = pages
+        b.speculative_num_draft_tokens = delta
+        b.use_sliding_window_kv_pool = use_swa
+        # Request zero is the padded sink. Live virtual pages differ from
+        # physical pages, including an unbound SWA page (-1).
+        b.req_to_token = torch.zeros((4, pages * ps), dtype=torch.int64, device=device)
+        for row in range(1, 4):
+            b.req_to_token[row] = torch.arange(
+                row * pages * ps, (row + 1) * pages * ps, device=device
+            )
+        full = torch.arange(24, device=device, dtype=torch.int32).flip(0).contiguous()
+        full[0] = 0
+        swa = torch.arange(24, device=device, dtype=torch.int32)
+        swa[7] = -1
+        runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._spaces = {
+            IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
+        }
+        if use_swa:
+            runner_ids._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+                key="swa", read_v2p=swa
+            )
+        b.runner_ids = runner_ids
+        b.target_verify_metadata = {
+            "cache_seqlens": torch.zeros(bs, dtype=torch.int32, device=device),
+            "cu_seqlens_k": torch.zeros(bs + 1, dtype=torch.int32, device=device),
+            "cu_seqlens_q": torch.arange(
+                0, (bs + 1) * delta, delta, dtype=torch.int32, device=device
+            ),
+            "page_table": torch.full(
+                (bs, pages), -99, dtype=torch.int32, device=device
+            ),
+        }
+        if use_swa:
+            b.target_verify_metadata["swa_page_table"] = torch.full(
+                (bs, pages), -99, dtype=torch.int32, device=device
+            )
+            b.cuda_graph_swa_out_cache_loc = torch.zeros(
+                bs * delta, dtype=torch.int64, device=device
+            )
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
+            batch_size=bs,
+            req_pool_indices=torch.tensor([2, 1, 0], device=device),
+            seq_lens=torch.tensor([ps + 1, 2 * ps - 1, 1], device=device),
+            encoder_lens=None,
+            spec_info=SimpleNamespace(),
+            positions=torch.arange(bs * delta, device=device),
+            out_cache_loc=None,
+        )
+        b.init_forward_metadata_out_graph(fb, in_capture=True)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            b.init_forward_metadata_in_graph(fb)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            b.init_forward_metadata_in_graph(fb)
+        metadata = b.target_verify_metadata[bs]
+        pointer = metadata.page_table.data_ptr()
+        for iteration in range(3):
+            if iteration == 1:
+                # Compaction and request reorder, plus a shorter live prefix.
+                full[6:24] = torch.arange(1, 19, device=device, dtype=torch.int32)
+                swa[7] = 21
+                swa[13] = -1
+                fb.req_pool_indices.copy_(torch.tensor([1, 3, 0], device=device))
+                fb.seq_lens.copy_(torch.tensor([0, 3 * ps, 1], device=device))
+            elif iteration == 2:
+                # Recycle a request row, grow its extent and reuse its pages.
+                b.req_to_token[1].copy_(b.req_to_token[2])
+                full[12:18] = 4
+                fb.seq_lens.copy_(torch.tensor([2 * ps, 0, 1], device=device))
+            b.init_forward_metadata_out_graph(fb)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(metadata.page_table.data_ptr(), pointer)
+            lengths = fb.seq_lens.cpu() + delta
+            torch.testing.assert_close(
+                metadata.cache_seqlens_int32.cpu(), lengths.int()
+            )
+            torch.testing.assert_close(
+                metadata.cu_seqlens_k.cpu(),
+                torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int())),
+            )
+            rows = fb.req_pool_indices.cpu().tolist()
+            for table, mapping in (
+                (metadata.page_table, full),
+                (metadata.swa_page_table, swa),
+            ):
+                if table is None:
+                    continue
+                expected = torch.zeros((bs, pages), dtype=torch.int32)
+                tokens = b.req_to_token.cpu()
+                physical = mapping.cpu()
+                for lane, row in enumerate(rows):
+                    for page in range(min(pages, (int(lengths[lane]) + ps - 1) // ps)):
+                        virtual = int(tokens[row, page * ps]) // ps
+                        expected[lane, page] = max(0, int(physical[virtual]))
+                torch.testing.assert_close(table.cpu(), expected)
 
 
 if __name__ == "__main__":
