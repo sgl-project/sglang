@@ -229,3 +229,9 @@ def test_split_bf16_hc_weight_recovers_the_fp32_projection():
     single_error = (w.bfloat16().double() - wd).abs().max()
     assert split_error < 1e-6, split_error.item()
     assert single_error > 100 * split_error, (split_error.item(), single_error.item())
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
