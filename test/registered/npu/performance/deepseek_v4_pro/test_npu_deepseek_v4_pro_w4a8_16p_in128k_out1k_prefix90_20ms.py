@@ -1,11 +1,10 @@
 import unittest
 
-
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
+    BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
-    BENCHMARK_TOOL_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -129,10 +128,11 @@ DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG = {
     "node_envs": DEEPSEEK_V4_PRO_W4A8_16P_ENVS,
 }
 
+
 class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
-    """Test NPU performance for DeepSeek-V4-Pro W4A8 16p two-node in128k out1k prefix90 """
+    """Test NPU performance for DeepSeek-V4-Pro W4A8 16p two-node in128k out1k prefix90"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG
@@ -151,6 +151,7 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
     def test_npu_deepseek_v4_pro_w4a8_mix_16p_in128k_out1k_prefix_90_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
         self.run_throughput()
+
 
 if __name__ == "__main__":
     unittest.main()
