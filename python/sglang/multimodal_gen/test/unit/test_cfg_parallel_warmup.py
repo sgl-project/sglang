@@ -883,10 +883,10 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(
             resolve("LTX2TwoStageHQPipeline", LTX23HQSamplingParams()), (1920, 1088)
         )
-        # doubling cannot fix this one, so the request stays as written
+        # an unservable default falls back to an aligned representative shape
         self.assertEqual(
             resolve("LTX2TwoStagePipeline", SamplingParams(width=1000, height=600)),
-            (1000, 600),
+            (768, 448),
         )
         # one-stage runs the default resolution as is
         self.assertEqual(resolve("LTX2Pipeline", LTX25SamplingParams()), (960, 544))
