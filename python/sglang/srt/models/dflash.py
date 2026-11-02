@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Iterable, Optional, Tuple
+from types import SimpleNamespace
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -45,8 +46,10 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.dflash_kda import DFlashKDALinearAttention
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -625,6 +628,139 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             )
 
 
+class DFlashKDAAttention(KimiDeltaAttention):
+    """SpecForge KDA draft layer served by the target's KimiDeltaAttention."""
+
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
+        if quant_config is not None:
+            raise ValueError("DFLASH kda layers require unquantized draft weights.")
+        kda = parse_dflash_draft_config(draft_hf_config=config).kda
+        super().__init__(
+            layer_idx=layer_id,
+            hidden_size=int(config.hidden_size),
+            # The fields KimiDeltaAttention reads from a KimiLinearConfig.
+            config=SimpleNamespace(
+                linear_attn_config={
+                    "head_dim": kda.head_dim,
+                    "num_heads": kda.num_heads,
+                    "short_conv_kernel_size": kda.short_conv_kernel_size,
+                },
+                dtype=torch.get_default_dtype(),
+            ),
+            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
+            prefix=prefix,
+            safe_gate=kda.gate_lower_bound is not None,
+            lower_bound=kda.gate_lower_bound,
+            # A full-rank output gate takes the target's no-LoRA fused layout.
+            no_kda_lora=kda.full_rank_output_gate,
+            linear_attention_cls=partial(
+                DFlashKDALinearAttention, scans_context=kda.scans_context
+            ),
+        )
+        # SpecForge stores A_log as [H] and each short conv as [C, K].
+        self._load_target_A_log = self.A_log.weight_loader
+        self.A_log.weight_loader = self._load_A_log
+        self._load_target_conv_shard = self.qkv_conv1d.weight.weight_loader
+        self.qkv_conv1d.weight.weight_loader = self._load_conv_shard
+        # The no-LoRA layout fuses a full-rank decay gate; SpecForge's low-rank
+        # one loads here and fold_decay_gate writes f_b_proj @ f_a_proj into it.
+        self.f_a_proj: Optional[ReplicatedLinear] = None
+        self.f_b_proj: Optional[ColumnParallelLinear] = None
+        if self.no_kda_lora:
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size, self.head_dim, bias=False
+            )
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                self.num_heads * self.head_dim,
+                bias=False,
+                parallel_group="tp",
+            )
+
+    @property
+    def scans_context(self) -> bool:
+        return self.attn.scans_context
+
+    def fold_decay_gate(self) -> None:
+        if self.f_a_proj is None:
+            return
+        decay_gate = self.f_b_proj.weight.float() @ self.f_a_proj.weight.float()
+        # Rows of this rank: q, k, v, beta, decay gate, output gate.
+        self.fused_qkvbfg_proj.weight.data.split(self.split_sizes)[-2].copy_(decay_gate)
+
+    def _load_A_log(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        self._load_target_A_log(param, loaded_weight.reshape(1, 1, -1, 1))
+
+    def _load_conv_shard(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: Optional[int] = None,
+    ) -> None:
+        self._load_target_conv_shard(
+            param, loaded_weight.reshape(loaded_weight.shape[0], 1, -1), shard_id
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: Optional[BumpAllocator] = None,
+    ) -> torch.Tensor:
+        return super().forward(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
+    def allocate_context_state(self, *, num_slots: int, device: torch.device) -> int:
+        """Per-request state of a context-scanning layer; returns its bytes."""
+        return self.attn.allocate_context_state(
+            num_slots=num_slots, dtype=self.o_proj.weight.dtype, device=device
+        )
+
+    def write_context_state(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        commit_lens: Optional[torch.Tensor] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
+        extend_lens_cpu: Optional[List[int]] = None,
+    ) -> None:
+        """Advance a context-scanning layer over committed target rows.
+
+        With commit_lens the rows are dense [bs, block_size] and each request
+        commits its first commit_lens; otherwise they are packed extend segments.
+        """
+        if not self.scans_context:
+            return
+        mixed_qkv, beta, forget_gate, _ = self.forward_qkvbfg_fused(hidden_states)
+        if commit_lens is not None:
+            self.attn.commit_verified(
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta,
+                slots=req_pool_indices,
+                commit_lens=commit_lens,
+            )
+        else:
+            self.attn.commit_extend(
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta,
+                slots=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                extend_lens_cpu=extend_lens_cpu,
+            )
+
+
 class DFlashMLP(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -871,6 +1007,17 @@ class DFlashDraftModel(nn.Module):
             attention_cls = DFlashMLAAttention
             # No fused qkv_proj to slice.
             self.supports_fused_context_kv = False
+        if draft_config.kda is not None:
+            if self.decoder_layer_cls.attention_cls is not DFlashAttention:
+                raise ValueError(
+                    f"{type(self).__name__} does not support kda draft attention."
+                )
+            # The fused materializer writes KV for every layer.
+            self.supports_fused_context_kv = False
+        layer_attention_cls = [
+            DFlashKDAAttention if mode == "kda" else attention_cls
+            for mode in draft_config.attention_modes
+        ]
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
@@ -901,7 +1048,7 @@ class DFlashDraftModel(nn.Module):
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    attention_cls=attention_cls,
+                    attention_cls=layer_attention_cls[i],
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
@@ -988,6 +1135,21 @@ class DFlashDraftModel(nn.Module):
                 if conv is not None:
                     conv.block_size = self.block_size
 
+    @property
+    def scans_kda_context(self) -> bool:
+        return self.draft_config.kda is not None and self.draft_config.kda.scans_context
+
+    def allocate_kda_context_state(
+        self, *, num_slots: int, device: torch.device
+    ) -> int:
+        """Per-request state of the context-scanning KDA layers; returns its bytes."""
+        return sum(
+            layer.self_attn.allocate_context_state(num_slots=num_slots, device=device)
+            for layer in self.layers
+            if isinstance(layer.self_attn, DFlashKDAAttention)
+            and layer.self_attn.scans_context
+        )
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 
@@ -1073,6 +1235,24 @@ class DFlashDraftModel(nn.Module):
             ("gate_up_proj", "up_proj", 1),
             ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
             ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+            # KDA layers have no qkv_proj, so their q/k/v fall through to here.
+            ("fused_qkvbfg_a_proj", "q_proj", 0),
+            ("fused_qkvbfg_a_proj", "k_proj", 1),
+            ("fused_qkvbfg_a_proj", "v_proj", 2),
+            ("fused_qkvbfg_a_proj", "b_proj", 3),
+            ("fused_qkvbfg_a_proj", "f_a_proj", 4),
+            ("fused_qkvbfg_a_proj", "g_a_proj", 5),
+            ("fused_fg_b_proj", "f_b_proj", 0),
+            ("fused_fg_b_proj", "g_b_proj", 1),
+            ("qkv_conv1d", "q_conv1d", 0),
+            ("qkv_conv1d", "k_conv1d", 1),
+            ("qkv_conv1d", "v_conv1d", 2),
+            # KDA layers with a full-rank output gate.
+            ("fused_qkvbfg_proj", "q_proj", 0),
+            ("fused_qkvbfg_proj", "k_proj", 1),
+            ("fused_qkvbfg_proj", "v_proj", 2),
+            ("fused_qkvbfg_proj", "b_proj", 3),
+            ("fused_qkvbfg_proj", "g_proj", 5),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -1186,6 +1366,8 @@ class DFlashDraftModel(nn.Module):
         for layer in self.layers:
             if isinstance(layer.self_attn, DFlashMLAAttention):
                 layer.self_attn.absorb_kv_b_proj()
+            elif isinstance(layer.self_attn, DFlashKDAAttention):
+                layer.self_attn.fold_decay_gate()
 
 
 class DFlashLagunaAttention(DFlashAttention):

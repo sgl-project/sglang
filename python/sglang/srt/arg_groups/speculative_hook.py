@@ -437,6 +437,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+    _disable_radix_cache_for_dflash_kda_scan(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -447,6 +448,51 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
+
+
+def _disable_radix_cache_for_dflash_kda_scan(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.disable_radix_cache:
+        return
+
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    try:
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+        kda = parse_dflash_draft_config(draft_hf_config=draft_hf_config).kda
+    except Exception as e:
+        # The draft worker rejects a scan-kda draft with radix cache enabled.
+        logger.warning(
+            "Failed to read the DFLASH draft config to check for context-scanning "
+            "kda layers. Error: %s",
+            e,
+        )
+        return
+    if kda is None or not kda.scans_context:
+        return
+    # The draft's kda state lives per request slot, so a prefix hit would
+    # start drafting without the cached rows ever reaching it.
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            "DFLASH drafts with context-scanning kda layers "
+            "(linear_attn_config.context_state='scan') do not support "
+            "--enable-hierarchical-cache."
+        )
+    logger.warning(
+        "Radix cache is disabled: the DFLASH draft has context-scanning kda "
+        "layers, whose per-request state the prefix cache does not hold."
+    )
+    declare_resolution(
+        server_args,
+        "_handle_dflash",
+        disable_radix_cache=True,
+    )
 
 
 def _handle_uno(server_args: ServerArgs) -> None:
