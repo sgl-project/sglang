@@ -2549,7 +2549,9 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = block_table[:real_bs]
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
-                mask = None
+                # Banded sparse mode requires the compressed mask even for
+                # bidirectional attention; next_tokens supplies the right bound.
+                mask = self.mtp_mask if is_swa_layer else None
                 # FIA only honours pre_tokens/next_tokens in the banded sparse
                 # modes, so an encoder-only SWA layer needs sparse_mode=4 too.
                 # next_tokens keeps the window symmetric (non-causal).
@@ -2600,6 +2602,12 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     sparse_mode=sparse_mode,
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if is_swa_layer
+                        else FULL_ATTENTION_WINDOW
+                    ),
+                    next_tokens=next_tokens,
                 )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
