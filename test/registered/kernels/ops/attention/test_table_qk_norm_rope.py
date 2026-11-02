@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.rope import apply_rope_inplace
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
@@ -120,6 +121,41 @@ def test_cuda_mode_rejects_invalid_inputs(invalid):
         pos = pos.float()
     with pytest.raises(AssertionError):
         table_qk_norm_rope_(x, pos, qw, kw, cache, 8, 2, 128, 1e-6, match_cuda=True)
+
+
+@pytest.mark.parametrize(
+    "d,dtype,batch",
+    [
+        (64, torch.bfloat16, 17),
+        (128, torch.bfloat16, 17),
+        (256, torch.bfloat16, 17),
+        (64, torch.float16, 17),
+        (128, torch.float16, 17),
+        (256, torch.float16, 17),
+        (128, torch.bfloat16, 0),
+    ],
+)
+def test_hybrid_ownership_and_native_parity(d, dtype, batch):
+    """Only packed K may change; contiguous Q must match separate CUDA norm/RoPE."""
+    storage, x, pos, qw, kw, cache = inputs(d, batch, 7, 2, 19, padded=True)
+    storage = storage.to(dtype)
+    x = storage[:, 8:-8]
+    qw, kw = qw.to(dtype), kw.to(dtype)
+    before = storage.clone()
+    expected = x.clone()
+    if batch:
+        separate(expected, pos, qw, kw, cache, 7, 2, d, 1e-6)
+    q, k, v = x.split([7 * d, 2 * d, 2 * d], dim=-1)
+    out = qk_norm_rope(q, k, qw, kw, cache, pos, d, 1e-6)
+    assert out.is_contiguous()
+    if batch:
+        assert out.untyped_storage().data_ptr() != storage.untyped_storage().data_ptr()
+    assert_same_bits(out, expected[:, : 7 * d])
+    assert_same_bits(k, expected[:, 7 * d : 9 * d])
+    assert_same_bits(q, before[:, 8 : 8 + 7 * d])
+    assert_same_bits(v, before[:, 8 + 9 * d : -8])
+    assert_same_bits(storage[:, :8], before[:, :8])
+    assert_same_bits(storage[:, -8:], before[:, -8:])
 
 
 if __name__ == "__main__":
