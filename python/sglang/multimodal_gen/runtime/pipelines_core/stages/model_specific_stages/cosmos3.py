@@ -2102,9 +2102,12 @@ class Cosmos3DenoisingStage(PipelineStage):
         branch's native length and bounds activation memory with control inputs.
         """
         acc = None
-        for i, branch in enumerate(branches):
-            if i % cfg_world_size != cfg_rank:
-                continue
+        for round_start in range(0, len(branches), cfg_world_size):
+            i = round_start + cfg_rank
+            # FSDP shards span the CFG ranks, so every rank must run the same number
+            # of forwards; a rank with no branch left reruns the round's first one.
+            is_pad = i >= len(branches)
+            branch = branches[round_start] if is_pad else branches[i]
             out = self._run_transformer(
                 latents=latents,
                 timestep=timestep,
@@ -2124,6 +2127,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
             )
+            if is_pad:
+                continue
             coeff = branch["coeff"]
             if isinstance(out, tuple):
                 scaled = tuple(coeff * prediction for prediction in out)
