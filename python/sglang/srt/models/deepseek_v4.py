@@ -3350,15 +3350,6 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
 
-        @compile_in_capture_mode
-        def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
-            rsqrt = torch.rsqrt(
-                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-            )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
-            return x_flat, mixes
-
         shape, dtype = x.size(), x.dtype
 
         if _is_npu:
@@ -3474,6 +3465,16 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
+
+            @compile_in_capture_mode
+            def hc_pre_torch_impl(x, hc_fn):
+                x_flat = x.flatten(1).float()
+                rsqrt = torch.rsqrt(
+                    x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
+                )
+                mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+                return x_flat, mixes
+
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
         pre, post, comb = get_mhc_ops().hc_split_sinkhorn(
