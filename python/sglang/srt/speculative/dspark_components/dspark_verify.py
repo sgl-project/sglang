@@ -200,7 +200,7 @@ class TargetVerifyExecutor:
         """
         if folded_accept:
             self.verify_epilogue.note_static_verify(bs)
-            return self.verify_epilogue.read_accept(bs)
+            return self.verify_epilogue.snapshot_accept(bs)
 
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
@@ -938,6 +938,8 @@ class DsparkVerifyEpilogue:
         self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
 
     def read_accept(self, bs: int) -> AcceptOuts:
+        """Views of the accept buffers: the in-graph accept writes through them
+        (`_accept` passes them as `out`), so they must stay aliases."""
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],
             bonus=self.bonus_buf[:bs],
@@ -947,11 +949,30 @@ class DsparkVerifyEpilogue:
             out_tokens=self.out_tokens_buf[:bs],
         )
 
+    def snapshot_accept(self, bs: int) -> AcceptOuts:
+        """Clones of the accept buffers for readers outside the graph: the overlap
+        readback on copy_stream may run after the next replay rewrites the buffers.
+        Made on the forward stream; `async_d2h`'s `record_stream` keeps them alive."""
+        views = self.read_accept(bs)
+        return AcceptOuts(
+            correct_len=views.correct_len.clone(),
+            bonus=views.bonus.clone(),
+            cap_trim_lens=views.cap_trim_lens.clone(),
+            commit_lens=views.commit_lens.clone(),
+            new_seq_lens=views.new_seq_lens.clone(),
+            out_tokens=views.out_tokens.clone(),
+        )
+
     def read_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
         """commit_lens + cap_trim_lens from the in-graph accept, or None."""
         if self.block_accept_lens_buf is None:
             return None
         return self.block_accept_lens_buf[:bs]
+
+    def snapshot_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
+        # Same hazard as snapshot_accept: the overlap readback copies this late.
+        view = self.read_block_accept_lens(bs)
+        return None if view is None else view.clone()
 
     @property
     def folds_commit(self) -> bool:
