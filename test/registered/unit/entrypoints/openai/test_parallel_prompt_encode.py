@@ -750,19 +750,33 @@ class TestPromptSegments(_EncodeCase):
         self.assertNotIn("hello world " * 30, encoder.cache)
 
     def test_a_rendered_prompt_has_the_ids_of_a_full_encode(self):
+        tokenizer = _tokenizer(chat_template="".join(_SPECIALS))
         for segments in _fuzz_segments():
             text = "".join(segments)
             # The second call reads the ids the first one cached.
             for _ in range(2):
                 self.assertEqual(
-                    ppe.encode_rendered_prompt(self.tokenizer, text, {}),
-                    self.tokenizer.encode(text),
+                    ppe.encode_rendered_prompt(tokenizer, text, {}),
+                    tokenizer.encode(text),
                     repr(text[:200]),
                 )
-        no_plan = _tokenizer(_metaspace)
         text = "<|user|>hello world<|assistant|>"
+        for no_cuts in (_tokenizer(_metaspace), _tokenizer()):
+            self.assertEqual(
+                ppe.encode_rendered_prompt(no_cuts, text, {}), no_cuts.encode(text)
+            )
+
+    def test_a_rendered_prompt_is_cut_only_where_the_template_can_cut_it(self):
+        tokenizer = _tokenizer(
+            lambda b: b.add_tokens(
+                [AddedToken(t, normalized=False) for t in ("\n", "\n\n")]
+            ),
+            chat_template="<|user|>{{ content }}\n",
+        )
+        split = ppe._segment_encoder_for(tokenizer).split_added
         self.assertEqual(
-            ppe.encode_rendered_prompt(no_plan, text, {}), no_plan.encode(text)
+            split("<|user|>a\nb<|assistant|>"),
+            ["", "<|user|>", "a\nb<|assistant|>"],
         )
 
     def test_a_fastokens_backend_keeps_the_original_encode(self):
@@ -781,6 +795,7 @@ class TestPromptSegments(_EncodeCase):
             return "".join(turns) + f"<|assistant|>new text {i} the lazy dog"
 
         prompts = [prompt(i) for i in range(1600)]
+        tokenizer = _tokenizer(chat_template="".join(_SPECIALS))
         # Switch threads often, so that one thread can reach what another evicts.
         self.addCleanup(sys.setswitchinterval, sys.getswitchinterval())
         sys.setswitchinterval(1e-6)
@@ -790,11 +805,11 @@ class TestPromptSegments(_EncodeCase):
         ):
             ids = list(
                 pool.map(
-                    lambda text: ppe.encode_rendered_prompt(self.tokenizer, text, {}),
+                    lambda text: ppe.encode_rendered_prompt(tokenizer, text, {}),
                     prompts,
                 )
             )
-        self.assertEqual(ids, [self.tokenizer.encode(text) for text in prompts])
+        self.assertEqual(ids, [tokenizer.encode(text) for text in prompts])
 
 
 if __name__ == "__main__":

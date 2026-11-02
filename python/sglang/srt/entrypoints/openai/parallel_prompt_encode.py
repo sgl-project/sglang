@@ -317,7 +317,7 @@ def _cuts_at(token, added_tokens):
 
 
 class _SegmentEncoder:
-    def __init__(self, plan):
+    def __init__(self, plan, chat_template):
         (
             self.backend,
             self.specials_added,
@@ -331,11 +331,21 @@ class _SegmentEncoder:
             t.content: i for i, t in added.items() if t.content and not t.normalized
         }
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
+        self.cuts = {}
+        # This regex scans every rendered prompt with the GIL held, so it holds only
+        # the tokens that the chat template writes. Thousands of reserved tokens would
+        # slow it, and added tokens like "\n" would cut normal text into many pieces.
+        cut_tokens = _alternation(
+            [
+                token
+                for token in self.raw_ids
+                if token in chat_template and self.cut_id(token) is not None
+            ]
+        )
         # A capturing group keeps the added tokens in the output of split().
         self.split_added = (
-            re.compile(f"({self.pattern.pattern})").split if self.pattern else None
+            re.compile(f"({cut_tokens.pattern})").split if cut_tokens else None
         )
-        self.cuts = {}
         self.lock = threading.Lock()
         self.cache = OrderedDict()
         self.cached_tokens = 0
@@ -425,7 +435,10 @@ def _segment_encoder_for(tokenizer):
     except TypeError:
         return None
     plan = _plan_for(tokenizer)
-    encoder = None if plan is None else _SegmentEncoder(plan)
+    encoder = None
+    if plan is not None:
+        # str() also covers a dict of named templates.
+        encoder = _SegmentEncoder(plan, str(tokenizer.chat_template))
     _segment_encoders[tokenizer] = encoder
     return encoder
 
@@ -452,9 +465,9 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
 
 def encode_rendered_prompt(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``parallel_prompt_encode(tokenizer, text, encode_kwargs)`` for a
-    prompt that a chat template rendered to text. It cuts the prompt at its added
-    tokens, so the text between them comes from the ``encode_prompt_segments`` cache.
-    An added token that ``_cuts_at`` rejects rejoins the text around it."""
+    prompt that a chat template rendered to text. It cuts the prompt at the added
+    tokens that the template writes, so the text between them comes from the
+    ``encode_prompt_segments`` cache."""
     encoder = (
         _segment_encoder_for(tokenizer)
         if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
