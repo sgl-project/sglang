@@ -153,6 +153,7 @@ from sglang.srt.utils import (
     set_ulimit,
     start_follower_grpc_server,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -940,6 +941,7 @@ class Engine(EngineScoreMixin, EngineBase):
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=get_exec().features.enable_memory_saver
             )
+            foundry_adapter = activate_foundry(server_args)
             scheduler_pipe_readers = []
 
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
@@ -973,6 +975,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
+                            foundry_adapter.configure_subprocess(server_args),
                             numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
@@ -1004,7 +1007,10 @@ class Engine(EngineScoreMixin, EngineBase):
                 ),
             )
             try:
-                proc.start()
+                # The controller inherits the hook preload and passes it on to
+                # the schedulers it spawns.
+                with activate_foundry(server_args).configure_subprocess(server_args):
+                    proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
@@ -1917,6 +1923,9 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
+    # Foundry CUDA graph persistence pins NCCL and SGLang variables that
+    # select state a restored graph cannot replay; children inherit them.
+    activate_foundry(server_args).apply_env_pins(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
