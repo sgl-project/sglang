@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import (
     get_resources,
     get_schedule,
 )
-from sglang.srt.state_capturer.base import BaseTopkCapturer
+from sglang.srt.state_capturer.base import BaseTopkCapturer, device_cache_rows
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -44,6 +44,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         model: torch.nn.Module,
         model_config: ModelConfig,
         num_tokens: int,
+        max_req_len: int,
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
@@ -55,6 +56,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
+            max_req_len=max_req_len,
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
@@ -64,6 +66,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         self,
         model_config: ModelConfig,
         num_tokens: int,
+        max_req_len: int,
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
@@ -77,9 +80,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
-        max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().num_dp_ranks,
-            max_running_requests * get_parallel().num_dp_ranks,
+        max_batch_size = device_cache_rows(
+            chunked_prefill_size=get_schedule().chunked_prefill_size,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+            max_req_len=max_req_len,
+            max_running_requests=max_running_requests,
+            num_dp_ranks=get_parallel().num_dp_ranks,
         )
 
         super().__init__(
