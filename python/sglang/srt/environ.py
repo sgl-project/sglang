@@ -1020,6 +1020,9 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Use AITER block selection for supported gfx950 FP8 index caches.
+    SGLANG_M3_USE_AITER_INDEXER = EnvBool(True)
+    SGLANG_M3_USE_AITER_PREFILL_INDEXER = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
