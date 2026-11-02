@@ -11,29 +11,25 @@ Three open aiter PRs only change *which* existing kernel aiter picks for a shape
 * ROCm/aiter#6030 -- mHC fused post+pre on gfx950: tile_m=16 for the FP32 fn decode
   GEMM (``aiter.ops.mhc.get_mhc_fused_post_pre_config``, Python only, bit-identical).
 
-``install_aiter_intree_tune()`` registers them at DeepSeek-V4 model construction,
+The CSV rows of #6004 and #6029 are in ``utils/aiter_tuned_configs/
+a8w8_blockscale_bpreshuffle/deepseek_v4.csv`` and installed with every other in-tree row.
+
+``install_aiter_intree_tune()`` registers the rest at DeepSeek-V4 model construction,
 before any GEMM / mHC config lookup:
 
-* CSV rows: aiter's own resolution of the a8w8 blockscale bpreshuffle table (default
-  CSV + ``model_configs/`` merge, or the user's ``AITER_CONFIG_*`` list) is read, the
-  in-tree rows *replace* rows with the same (gfx, cu_num, M, N, K) key, and the result
-  is handed back to aiter as a single file through
-  ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE``. A single path skips aiter's merge,
-  and rows are replaced in place, never appended, so the in-tree rows can never create
-  the duplicate keys aiter refuses to load.
 * Triton JSON: ``gemm_config_utils.load_config_json`` answers the three target paths
   with the in-tree JSON (aiter has no search-path override for Triton configs).
 * mHC: ``aiter.ops.mhc.get_mhc_fused_post_pre_config`` is wrapped to force tile_m=16.
 
 Upstream-first: every item applies only while aiter still ships the exact pre-PR
-content (CSV row = the recorded ``base_*`` kernel; JSON = the recorded sha256; mHC =
-the old policy still picks tile_m=32 at decode M). When aiter has merged the PR, or
-re-tuned the shape some other way, the item is skipped and aiter's version is used, so
-upgrading the aiter pin switches over automatically and never fails at startup.
+content (JSON = the recorded sha256; mHC = the old policy still picks tile_m=32 at
+decode M). When aiter has merged the PR, or re-tuned the shape some other way, the item
+is skipped and aiter's version is used, so upgrading the aiter pin switches over
+automatically and never fails at startup.
 
-Switches (default on): ``SGLANG_AITER_INTREE_GEMM_TUNE`` (#6004 + #6029, CSV and
-Triton JSON) and ``SGLANG_AITER_INTREE_MHC_TILE_M16`` (#6030). Set to 0 to use the
-pinned aiter as is. ``AITER_LOG_TUNED_CONFIG=1`` makes aiter log the row it picks.
+Switches (default on): ``SGLANG_AITER_INTREE_GEMM_TUNE`` (#6004 + #6029 Triton JSON, and
+every in-tree CSV row) and ``SGLANG_AITER_INTREE_MHC_TILE_M16`` (#6030). Set to 0 to use
+the pinned aiter as is.
 """
 
 from __future__ import annotations
@@ -44,29 +40,21 @@ import inspect
 import json
 import logging
 import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-import msgspec
+from sglang.srt.utils.aiter_tuned_tables import (
+    APPLIED,
+    MISSING,
+    SUPERSEDED,
+    UPSTREAM,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "aiter_intree_configs"
 )
-
-# TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
-# TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
-# Rows of both PRs (column aiter_pr), with the kernel each replaces (base_* columns,
-# identical in aiter 02575f1c3a and in the PRs' parents).
-INTREE_BPRESHUFFLE_CSV = os.path.join(
-    _CONFIG_DIR, "a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
-)
-BPRESHUFFLE_ENV = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
-_KEY_COLS = ["gfx", "cu_num", "M", "N", "K"]
-_KERNEL_COLS = ["libtype", "kernelId", "splitK", "kernelName"]
-_INTREE_ONLY_COLS = ["aiter_pr"] + ["base_" + c for c in _KERNEL_COLS]
 
 TRITON_CONFIG_NAME = "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED"
 TRITON_ARCH = "gfx950"
@@ -98,23 +86,12 @@ MHC_TILE_M16_MAX_M = 1024
 _MHC_PROBE_HIDDEN = 7168
 _MHC_PROBE_MS = (80, 144, 192, 320, 384, 640)
 
-APPLIED, UPSTREAM, SUPERSEDED, MISSING, ADDED = (
-    "applied",
-    "upstream",
-    "superseded",
-    "missing",
-    "added",
-)
-
 
 @dataclass
 class IntreeReport:
     """Per-item outcome: applied / upstream (aiter has the PR) / superseded (aiter
-    changed it differently) / missing (aiter no longer has the shape or file) / added
-    (a shape aiter has no row for)."""
+    changed it differently) / missing (aiter no longer has the shape or file)."""
 
-    csv_rows: Dict[str, int] = field(default_factory=dict)
-    csv_file: Optional[str] = None
     triton_json: Dict[str, str] = field(default_factory=dict)
     mhc: Optional[str] = None
     notes: List[str] = field(default_factory=list)
@@ -127,218 +104,6 @@ def _env_on(name: str) -> bool:
     from sglang.srt.environ import envs
 
     return getattr(envs, name).get()
-
-
-# ---------------------------------------------------------------- CSV rows
-
-
-def _norm(v):
-    # a column with a missing value reads back as float: 256 and 256.0 are one key
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return str(v).strip()
-
-
-def _norm_kernel(row, kernel_cols=_KERNEL_COLS) -> tuple:
-    return tuple(_norm(row[c]) for c in kernel_cols)
-
-
-def apply_intree_rows(table, intree, key_cols=_KEY_COLS, kernel_cols=_KERNEL_COLS):
-    """Apply the in-tree rows to ``table`` (aiter's resolved table).
-
-    A row with ``base_*`` columns replaces aiter's row for the same key only while that
-    row still selects the recorded kernel. A row without them adds a shape aiter has no
-    row for, and yields to any row aiter has. Returns ``(new_table, {status: count})``;
-    a key never appears twice, which aiter refuses to load.
-    """
-    stats = {APPLIED: 0, UPSTREAM: 0, SUPERSEDED: 0, MISSING: 0, ADDED: 0}
-    if any(c not in table.columns for c in [*key_cols, *kernel_cols]):
-        stats[MISSING] = len(intree)
-        return table, stats
-    table = table.copy()
-    index = {}
-    for i, key in enumerate(zip(*(table[c].map(_norm) for c in key_cols))):
-        index.setdefault(key, []).append(table.index[i])
-    shared = [c for c in table.columns if c in intree.columns]
-    base_cols = ["base_" + c for c in kernel_cols]
-    has_base = all(c in intree.columns for c in base_cols)
-    added = []
-    for _, row in intree.iterrows():
-        key = tuple(_norm(row[c]) for c in key_cols)
-        replaces = has_base and not row[base_cols].isna().any()
-        hits = index.get(key, [])
-        if key not in index and not replaces:
-            added.append(row[shared])
-            index[key] = []  # a second in-tree row for this key counts as missing
-            stats[ADDED] += 1
-            continue
-        if len(hits) != 1:
-            stats[MISSING] += 1
-            continue
-        current = _norm_kernel(table.loc[hits[0]], kernel_cols)
-        if current == _norm_kernel(row, kernel_cols):
-            stats[UPSTREAM] += 1
-        elif replaces and current == _norm_kernel(
-            {c: row["base_" + c] for c in kernel_cols}, kernel_cols
-        ):
-            for c in shared:
-                table.at[hits[0], c] = row[c]
-            stats[APPLIED] += 1
-        else:
-            stats[SUPERSEDED] += 1
-    if added:
-        import pandas as pd
-
-        table = pd.concat([table, pd.DataFrame(added)], ignore_index=True)[
-            table.columns
-        ]
-    return table, stats
-
-
-def _write_atomic(df, out_dir: str, stem: str) -> str:
-    text = df.to_csv(index=False)
-    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{stem}.{digest}.csv")
-    if not os.path.exists(path):
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    return path
-
-
-def intree_out_dir() -> str:
-    return os.path.join(tempfile.gettempdir(), f"sglang_aiter_intree_{os.getuid()}")
-
-
-class IntreeTable(msgspec.Struct, frozen=True):
-    """An aiter tuned-config table that in-tree rows patch: aiter's variable for it, the
-    ``AITER_CONFIGS`` attribute that resolves it, the in-tree CSV, the merged file's name
-    stem, and the table's key and kernel columns. ``hipblaslt_rocm`` is the ROCm (major,
-    minor) whose hipBLASLt numbered the rows' ``solidx``, for a table that has
-    ``libtype == "hipblaslt"`` rows."""
-
-    env: str
-    attr: str
-    csv: str
-    stem: str
-    key_cols: tuple
-    kernel_cols: tuple
-    hipblaslt_rocm: Optional[tuple] = None
-
-
-@functools.cache
-def _aiter_has_flydsl() -> bool:
-    try:
-        import aiter.ops.flydsl  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def _uses_flydsl(rows, kernel_cols):
-    """Rows whose kernel aiter builds with FlyDSL: libtype flydsl, or a flydsl_ kernel name."""
-    flydsl = (
-        rows["libtype"] == "flydsl" if "libtype" in rows.columns else rows.index < 0
-    )
-    for c in kernel_cols:
-        if "kernelName" in c and c in rows.columns:
-            flydsl = flydsl | rows[c].astype(str).str.startswith("flydsl_")
-    return flydsl
-
-
-def read_intree_rows(spec: IntreeTable):
-    """``spec``'s in-tree rows this runtime can use: hipBLASLt solution indices belong to
-    one hipBLASLt build, and another build rejects them, so a ROCm other than
-    ``spec.hipblaslt_rocm`` drops the hipBLASLt rows; an aiter that cannot import its
-    FlyDSL kernels would fail on a FlyDSL row at the first GEMM, so it drops those."""
-    import pandas as pd
-
-    from sglang.srt.utils.common import get_hip_version
-
-    rows = pd.read_csv(spec.csv)
-    if not _aiter_has_flydsl():
-        flydsl = _uses_flydsl(rows, spec.kernel_cols)
-        if flydsl.any():
-            logger.info(
-                "%s: %d FlyDSL rows skipped; this aiter cannot import FlyDSL",
-                spec.stem,
-                int(flydsl.sum()),
-            )
-            rows = rows[~flydsl]
-    rocm = get_hip_version()[:2]
-    if spec.hipblaslt_rocm is None or rocm == tuple(spec.hipblaslt_rocm):
-        return rows
-    hipblaslt = rows["libtype"] == "hipblaslt"
-    if hipblaslt.any():
-        logger.info(
-            "%s: %d hipBLASLt rows skipped; their solution indices are ROCm %s's, "
-            "this runtime is ROCm %s",
-            spec.stem,
-            int(hipblaslt.sum()),
-            ".".join(map(str, spec.hipblaslt_rocm)),
-            ".".join(map(str, rocm)),
-        )
-    return rows[~hipblaslt]
-
-
-def install_intree_table(spec: IntreeTable, out_dir: Optional[str] = None):
-    """Hand aiter its resolved ``spec`` table with the in-tree rows applied, as a single
-    file through ``spec.env`` (a single path skips aiter's merge). Returns
-    ``({status: count}, the file aiter reads)``."""
-    import pandas as pd
-    from aiter.jit.core import AITER_CONFIGS
-
-    out_dir = out_dir or intree_out_dir()
-    base = getattr(AITER_CONFIGS, spec.attr)
-    table, stats = apply_intree_rows(
-        pd.read_csv(base),
-        read_intree_rows(spec),
-        list(spec.key_cols),
-        list(spec.kernel_cols),
-    )
-    if stats[APPLIED] + stats[ADDED] == 0:
-        return stats, base
-    path = _write_atomic(table, out_dir, spec.stem)
-    prev = os.environ.get(spec.env)
-    os.environ[spec.env] = path
-    # get_config_file is lru-cached; drop a resolution made before the env change.
-    cache_clear = getattr(type(AITER_CONFIGS).get_config_file, "cache_clear", None)
-    if cache_clear is not None:
-        cache_clear()
-    resolved = getattr(AITER_CONFIGS, spec.attr)
-    if resolved != path:
-        if prev is None:
-            os.environ.pop(spec.env, None)
-        else:
-            os.environ[spec.env] = prev
-        if cache_clear is not None:
-            cache_clear()
-        raise RuntimeError(f"aiter resolved {resolved}, expected {path}")
-    return stats, path
-
-
-_DSV4_BPRESHUFFLE = IntreeTable(
-    env=BPRESHUFFLE_ENV,
-    attr="AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
-    csv=INTREE_BPRESHUFFLE_CSV,
-    stem="a8w8_blockscale_bpreshuffle_tuned_gemm",
-    key_cols=tuple(_KEY_COLS),
-    kernel_cols=tuple(_KERNEL_COLS),
-)
-
-
-def install_bpreshuffle_rows(report: IntreeReport, out_dir: Optional[str] = None):
-    from aiter.jit.core import AITER_CONFIGS
-
-    out_dir = out_dir or intree_out_dir()
-    base = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    if os.path.dirname(os.path.abspath(base)) == os.path.abspath(out_dir):
-        # env inherited from a parent process that already installed the rows
-        report.notes.append(f"{BPRESHUFFLE_ENV} already points at in-tree table")
-    report.csv_rows, report.csv_file = install_intree_table(_DSV4_BPRESHUFFLE, out_dir)
 
 
 # ---------------------------------------------------------------- Triton JSON
@@ -470,7 +235,7 @@ def install_aiter_intree_tune() -> Optional[IntreeReport]:
     report = IntreeReport()
     steps = []
     if _env_on("SGLANG_AITER_INTREE_GEMM_TUNE"):
-        steps += [install_bpreshuffle_rows, install_triton_json]
+        steps.append(install_triton_json)
     if _env_on("SGLANG_AITER_INTREE_MHC_TILE_M16"):
         steps.append(install_mhc_tile_m16)
     for step in steps:
@@ -481,10 +246,7 @@ def install_aiter_intree_tune() -> Optional[IntreeReport]:
             logger.warning("aiter in-tree tune: %s skipped: %r", step.__name__, err)
     _report = report
     logger.info(
-        "aiter in-tree tune (aiter#6004/#6029/#6030): csv_rows=%s csv=%s "
-        "triton_json=%s mhc_tile_m16=%s",
-        report.csv_rows,
-        report.csv_file,
+        "aiter in-tree tune (aiter#6004/#6029/#6030): triton_json=%s mhc_tile_m16=%s",
         report.triton_json,
         report.mhc,
     )

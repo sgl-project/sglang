@@ -1,7 +1,6 @@
 """ROCm part of the minimax_m3 override declarations: the gfx950 defaults of the M3.1
 NVFP4 and Quark checkpoints, the NVFP4 KV format and the TP guards. minimax_m3 calls it on
-HIP; it is pure Python and never imports aiter. aiter's tuned rows for these checkpoints
-are installed by the model (models/minimax_common/amd/aiter_intree_tune)."""
+HIP; it is pure Python and never imports aiter."""
 
 import logging
 import os
