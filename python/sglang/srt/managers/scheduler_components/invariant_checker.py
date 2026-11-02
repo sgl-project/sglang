@@ -490,19 +490,27 @@ class SchedulerInvariantChecker:
         last_batch: Optional[ScheduleBatch],
     ) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the running batches and the decode steps hold, apart
-        from the chunked request. A launched prefill joins running at its merge."""
+        the unfinished ones the running batches and the steps decode, apart from
+        the chunked request. A launched prefill joins running at its merge."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        step_batches = [
-            b
-            for b in (last_batch, *self.get_pp_mbs())
-            if b is not None and not b.forward_mode.is_extend()
+        held = [
+            req
+            for b in (running_batch, *self.get_pp_running_mbs())
+            if b is not None
+            for req in b.reqs
         ]
-        self.get_running_reqs().check(
-            [running_batch, *self.get_pp_running_mbs(), *step_batches],
-            chunked_req=self.get_chunked_req(),
-        )
+        # An extend step decodes only the rows a mixed step took from a running
+        # batch; its other rows are launched prefills.
+        held += [
+            req
+            for b in (last_batch, *self.get_pp_mbs())
+            if b is not None
+            for req in (
+                (b.decoding_reqs or ()) if b.forward_mode.is_extend() else b.reqs
+            )
+        ]
+        self.get_running_reqs().check(held, chunked_req=self.get_chunked_req())
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with

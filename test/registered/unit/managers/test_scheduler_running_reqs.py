@@ -193,11 +193,28 @@ class TestRunningReqs(CustomTestCase):
         with self.assertRaisesRegex(
             RuntimeError, r"not running: \['b'\].*no batch: \['s'\]"
         ):
-            running.check([batch, None], chunked_req=chunk)
+            running.check(batch.reqs, chunked_req=chunk)
 
         running.leave([stray])
         running.join([b])
-        running.check([batch, None], chunked_req=chunk)
+        running.check(batch.reqs, chunked_req=chunk)
+
+    def test_check_counts_the_decode_rows_of_a_mixed_step(self):
+        # Under PP a mixed step of another microbatch holds its decode rows
+        # until its merge; its prefill rows are not running yet.
+        new, decoding = _req("n"), _req("d")
+        mixed = SimpleNamespace(
+            reqs=[new, decoding],
+            forward_mode=ForwardMode.MIXED,
+            decoding_reqs=[decoding],
+        )
+        s = SimpleNamespace(request_lists=dict, chunked_req=None)
+        s.running_reqs = RunningReqs()
+        s.running_reqs.join([decoding])
+        checker = _invariant_checker(s)
+        checker.get_pp_mbs = lambda: [mixed]
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            checker.maybe_check_running_reqs(ScheduleBatch(reqs=[]), None)
 
 
 class TestRunningReqsHooks(CustomTestCase):

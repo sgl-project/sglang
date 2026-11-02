@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 from sglang.srt.managers.scheduler_components.request_list import RequestList
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class RunningReqs(RequestList):
@@ -16,19 +16,11 @@ class RunningReqs(RequestList):
     leaves when it finishes, is retracted or preempted, or a pause retracts it.
     """
 
-    def check(
-        self,
-        batches: Iterable[Optional[ScheduleBatch]],
-        chunked_req: Optional[Req],
-    ) -> None:
-        """Raise unless the running requests are exactly the unfinished ones the
-        batches hold, apart from the chunked request."""
+    def check(self, held: Iterable[Req], chunked_req: Optional[Req]) -> None:
+        """Raise unless the running requests are exactly the unfinished held ones,
+        apart from the chunked request."""
         expected = {
-            req
-            for batch in batches
-            if batch is not None
-            for req in batch.reqs
-            if not req.finished() and req is not chunked_req
+            req for req in held if not req.finished() and req is not chunked_req
         }
         running = self._reqs.keys()
         if expected == running:
