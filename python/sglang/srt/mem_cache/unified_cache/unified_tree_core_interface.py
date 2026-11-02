@@ -143,6 +143,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import (
         PoolName,
@@ -161,6 +162,31 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
         UnifiedTreeNode,
+    )
+
+
+# The --radix-eviction-policy value that selects joint Full/SWA eviction.
+JOINT_LRU_EVICTION_POLICY = "joint_lru"
+
+
+def uses_joint_lru(
+    params: CacheInitParams, component_types: Sequence[ComponentType]
+) -> bool:
+    """Whether a tree built from ``params`` with ``component_types`` keeps the
+    joint Full/SWA LRU. The joint_lru policy takes effect only on an enabled
+    Full/SWA tree over the two-ended unified allocator, whose allocation-time
+    eviction walks that order; elsewhere it evicts each component as lru."""
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+    allocator = params.token_to_kv_pool_allocator
+    return (
+        params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
+        and not params.disable
+        and ComponentType.SWA in component_types
+        # The chain of two token ends: an owner and a window, no state slots.
+        and isinstance(allocator, ChainAllocator)
+        and allocator.has_window_pool
+        and allocator.mamba_allocator is None
     )
 
 
@@ -236,6 +262,13 @@ class UnifiedTreeCoreInterface(ABC):
         stays constructible, and its None means "sharding is off" -- never
         "sharding is on but unknown", which the constructor gate rules out.
         """
+        return None
+
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base plus the node's first
+        position-page, i.e. the owner of its first page modulo the shard
+        size; None when sharding is off. Concrete for the same reason as
+        ``rotation_base_of``."""
         return None
 
     @abstractmethod
@@ -338,6 +371,29 @@ class UnifiedTreeCoreInterface(ABC):
         raise NotImplementedError("This tree core does not support independent windows")
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
+
+    # Joint LRU: whether this core has the joint Full/SWA eviction walk below.
+    # UnifiedRadixCache.__init__ rejects joint_lru on a core without it.
+    supports_joint_eviction: bool = False
+
+    def start_joint_eviction(self) -> None:
+        """Begin a joint Full/SWA eviction walk; SWA victims are component-only.
+        A TreeCore without the joint walk raises."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
+
+    def next_joint_eviction_victim(self) -> Optional[tuple[ComponentType, NodeId]]:
+        """The oldest eligible Full leaf or SWA entry, or None when none is left.
+        An SWA victim is the SWA walk's next node; a Full victim is a device leaf."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
+
+    def end_joint_eviction(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
 
     @abstractmethod
     def evict_device_start(
@@ -741,7 +797,7 @@ class UnifiedTreeCoreInterface(ABC):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -753,7 +809,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

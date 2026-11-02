@@ -66,13 +66,23 @@ def rust_server_serves_kv_bootstrap(transfer_backend: str) -> bool:
     )
 
 
+def start_disagg_service_for_rust_server():
+    """Rust-server mode has no TokenizerManager to call ``start_disagg_service``.
+    Its prefill server serves the HTTP registry itself, so start only a
+    bootstrap server it cannot stand in for, before the prefill ranks register."""
+    if get_disagg().disaggregation_mode != "prefill" or (
+        rust_server_serves_kv_bootstrap(get_disagg().disaggregation_transfer_backend)
+    ):
+        return None
+    return start_disagg_service()
+
+
 def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     """Also called directly by the rust-server scheduler: there the KV
-    bootstrap registry is served by the embedded rust server's api listener
-    (one rust implementation covers every transfer backend — their
-    bootstrap-server subclasses are all plain ``CommonKVBootstrapServer``,
-    which the rust registry ports verbatim), leaving this store as the only
-    ``start_disagg_service`` duty left to perform."""
+    bootstrap server is either the embedded rust server's registry (see
+    ``rust_server_serves_kv_bootstrap``) or the backend's own server, which
+    ``start_disagg_service_for_rust_server`` starts in the main process, leaving
+    this store as the only ``start_disagg_service`` duty for the scheduler."""
     if not (
         get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
     ):

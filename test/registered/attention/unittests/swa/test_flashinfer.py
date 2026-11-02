@@ -30,7 +30,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(
@@ -266,6 +266,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     extend_seq_lens_cpu=[511],
                     extend_num_tokens=511,
                 )
+                fixture.runner.runner_ids.bind_own_plan(prefix)
                 attend(prefix, 0, 511)
                 for offset, position in enumerate((511, 512, 513)):
                     decode = ForwardBatch(
@@ -279,6 +280,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                         positions=batch.positions[position : position + 1],
                         out_cache_loc=batch.out_cache_loc[position : position + 1],
                     )
+                    fixture.runner.runner_ids.bind_own_plan(decode)
                     actual = attend(decode, position, position + 1)
                     with self.subTest(phase="decode", position=position):
                         torch.testing.assert_close(

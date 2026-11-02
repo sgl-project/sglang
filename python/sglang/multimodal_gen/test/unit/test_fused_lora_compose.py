@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused-layer LoRA groups: stack-vs-compose decision, loader wiring, IPC resolution."""
 
+import os
+import tempfile
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +10,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
@@ -287,6 +290,9 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
+    pipeline.loaded_adapter_configs = {}
+    pipeline.loaded_adapter_fingerprints = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
@@ -309,12 +315,18 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
-    with (
-        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
-        patch(f"{loader_mod}.load_file", return_value=state_dict),
-        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
-    ):
-        pipeline.load_lora_adapter("/adapter", "adapter", rank=0, lora_alpha=lora_alpha)
+    # The loader stats the adapter file, so it must exist on disk.
+    with tempfile.TemporaryDirectory() as tmp:
+        adapter_file = os.path.join(tmp, "adapter.safetensors")
+        save_file({"placeholder": torch.zeros(1)}, adapter_file)
+        with (
+            patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+            patch(f"{loader_mod}.load_file", return_value=state_dict),
+            patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        ):
+            pipeline.load_lora_adapter(
+                "/adapter", "adapter", rank=0, lora_alpha=lora_alpha
+            )
 
 
 def _qkv_state_dict(rank=2):
@@ -339,6 +351,41 @@ def test_loader_composes_unequal_fused_sections():
         "attn.to_qkv.lora_B",
         "attn.to_qkv.alpha",
     }
+
+
+def test_alpha_override_reloads_fused_sections():
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=8)
+    expected = pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"]
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    pipeline.lora_initialized = True
+    for attr in (
+        "cur_adapter_name",
+        "cur_adapter_path",
+        "cur_adapter_strength",
+        "cur_adapter_config",
+        "lora_layers",
+        "lora_layers_critic",
+        "lora_layers_transformer_2",
+        "is_lora_merged",
+        "auto_merge_rounding_loss",
+    ):
+        setattr(pipeline, attr, {})
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
+        patch(f"{loader_mod}.load_file", return_value=_qkv_state_dict()),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.set_lora(
+            "adapter", None, target="transformer", merge_mode="dynamic", lora_alpha=8
+        )
+
+    # the GQA composition bakes alpha into lora_B, so an override must reload
+    torch.testing.assert_close(
+        pipeline.lora_adapters["adapter"]["attn.to_qkv.lora_B"], expected
+    )
 
 
 def test_loader_stacks_equal_fused_sections():
@@ -407,3 +454,65 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_failed_reload_keeps_previous_adapter():
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    before = pipeline.lora_adapters["adapter"]
+    tensors = dict(before)
+
+    replacement = {k: v + 1 for k, v in _qkv_state_dict().items()}
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "_store_fused_lora_groups",
+            side_effect=RuntimeError("boom"),
+        ),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        _load_adapter(pipeline, replacement, lora_alpha=8)
+
+    assert pipeline.lora_adapters["adapter"] is before
+    assert before.keys() == tensors.keys()
+    assert all(before[k] is tensors[k] for k in tensors)
+    assert pipeline.loaded_adapter_alphas["adapter"] == 4
+
+
+@pytest.mark.parametrize(
+    ("prefix", "fused", "sections", "rows"),
+    [
+        ("attn", "attn.to_qkv", ("q", "k", "v"), (8, 2, 2)),
+        ("mlp", "mlp.gate_up", ("gate", "up"), (4, 4)),
+    ],
+)
+def test_loader_folds_distinct_section_alphas(prefix, fused, sections, rows):
+    torch.manual_seed(5)
+    alphas = (0.5, 1.0, 2.0)
+    state = {}
+    for name, out_rows, alpha in zip(sections, rows, alphas):
+        state[f"{prefix}.{name}.lora_A.weight"] = torch.randn(2, IN_DIM)
+        state[f"{prefix}.{name}.lora_B.weight"] = torch.randn(out_rows, 2)
+        state[f"{prefix}.{name}.alpha"] = torch.tensor(alpha)
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, state)
+
+    adapter = pipeline.lora_adapters["adapter"]
+    a, b = adapter[f"{fused}.lora_A"], adapter[f"{fused}.lora_B"]
+    x = torch.randn(3, IN_DIM)
+    scale = adapter[f"{fused}.alpha"].item() / a.shape[-2]
+    if a.ndim == 3:
+        delta = torch.cat([x @ a_i.T @ b_i.T for a_i, b_i in zip(a, b)], dim=-1)
+    else:
+        delta = x @ a.T @ b.T
+    expected = torch.cat(
+        [
+            x
+            @ state[f"{prefix}.{name}.lora_A.weight"].T
+            @ state[f"{prefix}.{name}.lora_B.weight"].T
+            * (alpha / 2)
+            for name, alpha in zip(sections, alphas)
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(delta * scale, expected, rtol=1e-5, atol=1e-5)
