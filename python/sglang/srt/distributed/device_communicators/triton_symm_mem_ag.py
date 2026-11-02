@@ -446,6 +446,35 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
         return floor
 
 
+def _local_gpus_have_peer_access() -> bool:
+    """Whether the local GPUs can reach each other peer-to-peer.
+
+    Multimem needs a multicast fabric between the participating ranks. Being
+    on one node guarantees co-location, not that such a fabric exists: two
+    consumer GPUs on PCIe with no NVLink/P2P are co-located and still have
+    none.
+
+    ``gpu_p2p_access_check`` spawns helper processes, which is too expensive
+    to run whenever a gatherer is constructed, so this uses the driver's own
+    report instead. It is only treated as a *necessary* condition: if it
+    reports "no peer access" we fall back to NCCL, which is always correct.
+    When the capability cannot be established at all we keep the previous
+    behaviour instead of silently changing which path is taken.
+    """
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count < 2:
+            return True
+        return all(
+            torch.cuda.can_device_access_peer(i, j)
+            for i in range(device_count)
+            for j in range(device_count)
+            if i != j
+        )
+    except Exception:
+        return True
+
+
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
     entry point for every caller. Owns one symmetric buffer built lazily on the
@@ -489,6 +518,13 @@ class MultimemAllGatherer:
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
                     "across nodes."
+                )
+                self._state = None
+            elif tp_group.world_size > 1 and not _local_gpus_have_peer_access():
+                logger.warning(
+                    "multimem all-gather disabled because the local GPUs have no "
+                    "peer-to-peer access, so no multicast fabric is available "
+                    "between the TP ranks."
                 )
                 self._state = None
 
