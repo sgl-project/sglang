@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     import torch
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 1
+MEGAKERNEL_API_VERSION = 2
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
@@ -110,12 +110,34 @@ class BuiltMegakernel(Protocol):
     noise.offset once per sampled block.
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
-    step as Step.view (sglang.srt.kernel_plugins.nvidia.binding, which also lists what else may be
-    called, written or read).
+    step as Step.view (sglang.srt.kernel_plugins.nvidia.binding, which also lists
+    what else may be called, written or read). The binding is MegakernelBinding
+    unless SGLang has one for the model's architecture.
+
+    A built object may also offer the EAGLE entries ENTRIES names (None means
+    SGLang's own path). A draft model's draft_loop and draft_extend are factories an
+    SGLang component calls once with its own buffers: like draft_sampler, they return
+    bs -> None (SGLang's code at that batch size) or the step to run there, and every
+    rank must serve the same sizes. A draft's begin_draft_round is called as it is.
+    The entries a built object offers must agree on every rank.
+
+    A built object may also offer graph_variants: None, or a mapping from a
+    graph runner GRAPH_VARIANT_RUNNERS names to an AttentionGraphVariants
+    (layers/attention/graph_variants.py), with the same runners and capture labels
+    on every rank. At each batch size whose graph runs the megakernel, that runner
+    then captures one graph per label, in order, the label readable through
+    capture_mode.get_capture_attention_variant() during the capture, and replays the
+    one select picks. select reads host state only, such as
+    ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
+    runners and batch sizes capture as they would without these variants.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
     draft_sampler: Optional[Callable[..., Callable[[int], Optional[Callable]]]]
+    draft_loop: Optional[Callable]
+    draft_extend: Optional[Callable]
+    begin_draft_round: Optional[Callable]
+    graph_variants: Optional[Mapping[str, Any]]
 
     def summary(self) -> str:
         """What was built, for the startup line."""
@@ -129,6 +151,18 @@ class BuiltMegakernel(Protocol):
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
         returning what it does; capturable in a CUDA graph."""
+
+
+# The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones
+ENTRIES = (
+    "draft_sampler",
+    "draft_loop",
+    "draft_extend",
+    "begin_draft_round",
+)
+# The graph runners a built object's graph_variants may key: the target's verify
+# graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
+GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):

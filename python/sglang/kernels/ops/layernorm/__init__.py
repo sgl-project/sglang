@@ -55,14 +55,18 @@ del _fn
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
-register_kernel(
-    KernelSpec(
-        op="layernorm.rmsnorm_hf",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.layernorm.rmsnorm_hf:rmsnorm_hf",
-        capabilities=CUDA_ONLY,
+# The rmsnorm family: one JIT template for plain / fused residual-add / fp8 per-tensor quant.
+for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.norm:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
     )
-)
+del _fn
+
 register_kernel(
     KernelSpec(
         op="layernorm.grouped_gemma_rmsnorm",
@@ -83,8 +87,8 @@ register_kernel(
     )
 )
 
-# Muse Spark fused norms. The per-layer ops are inventoried through their class
-# methods; the NVFP4 quant op through its module-level instance.
+# Muse Spark and Beam fused norms. The per-layer ops are inventoried through
+# their class methods; the NVFP4 quant op through its module-level instance.
 for _op, _target, _backends in (
     (
         "muse_spark_norm_gate",
@@ -100,6 +104,11 @@ for _op, _target, _backends in (
         "muse_spark_rmsnorm_nvfp4_quant",
         "muse_spark_rmsnorm_nvfp4_quant:_FUSED_NORM_FP4_QUANT",
         ("torch", "jit", "helion"),
+    ),
+    (
+        "beam_sandwich_residual_rmsnorm",
+        "beam_fused:BeamSandwichResidualRMSNormOp",
+        ("torch", "triton"),
     ),
 ):
     for _bk in _backends:

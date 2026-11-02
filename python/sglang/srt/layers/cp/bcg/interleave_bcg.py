@@ -55,12 +55,7 @@ def _indexer_with_kv(
     output[logical:].fill_(-1)
 
 
-def _capture_stub(indexer, x, q_lora, positions, output, layer_id, kv_local, kv_output):
-    output.fill_(-1)
-    kv_output.zero_()
-
-
-bcg_indexer_with_kv = eager_on_graph(True, capture_stub=_capture_stub)(_indexer_with_kv)
+bcg_indexer_with_kv = eager_on_graph(True)(_indexer_with_kv)
 
 
 class InterleaveCPBCGInput(PrefillCPBCGInput):

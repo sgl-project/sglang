@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -121,6 +122,15 @@ else:
     dynamic_mxfp4_quant = None
 
 OCP_MX_BLOCK_SIZE = 32
+
+# gfx1151 (Strix Halo) has neither FP4 hardware nor an AITER FP4 MoE kernel, so
+# the AITER path cannot run there: its scales are laid out for gfx950 and its
+# kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
+# weights and upcast them inside triton_kernels' matmul, with bf16 activations.
+# SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 opts out.
+_is_gfx1151 = _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
+_use_triton_w4a16 = _is_gfx1151 and envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.get()
+_TRITON_W4A16_NUM_WARPS = 8
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
@@ -259,7 +269,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # 512 (256 packed), adding 33% zero work and preventing the native-shape
         # MXMoE tuning table from binding. The K3 FlyDSL path supports 128-wide
         # alignment in the unpacked dimension, so retain the checkpoint shape.
-        pad_for_aiter = _use_aiter and not _aiter_k3_opt
+        pad_for_aiter = _use_aiter and not (_aiter_k3_opt or _use_triton_w4a16)
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=pad_for_aiter,
@@ -684,6 +694,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:
                 raise ValueError("Expected w13 or w2.")
 
+            if copy_numel_counter.copied_numel == 0:
+                return
+
             assert current_loaded <= target_loaded_numel, (
                 f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
             )
@@ -959,6 +972,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            build_dispatcher_quant_config,
+        )
+
+        if _use_triton_w4a16:
+            self._process_weights_triton_w4a16(layer)
+            return
         if not getattr(self, "_owns_moe_runner", False):
             raise RuntimeError(
                 "Quark MXFP4 weight preshuffling requires an owned AITER runner."
@@ -989,7 +1010,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             self._shuffle_gu_interleaved(layer)
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
-                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                    build_dispatcher_quant_config(
+                        layer,
+                        torch.float4_e2m1fn_x2,
+                        AiterQuantType.PER_1X32,
+                        gate_up_interleaved=_is_gfx1250,
+                    )
                 )
             return
 
@@ -1039,7 +1065,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         if hasattr(layer, "dispatcher"):
             # Weights are stored as torch.uint8 but semantically MXFP4
-            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+            layer.dispatcher.set_quant_config(
+                build_dispatcher_quant_config(
+                    layer,
+                    torch.float4_e2m1fn_x2,
+                    AiterQuantType.PER_1X32,
+                    gate_up_interleaved=_is_gfx1250,
+                )
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1051,6 +1084,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         self._owns_moe_runner = False
+        if _use_triton_w4a16:
+            return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
@@ -1069,6 +1104,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _use_triton_w4a16:
+            return self._apply_triton_w4a16(layer, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
@@ -1116,3 +1154,117 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    def _process_weights_triton_w4a16(self, layer: torch.nn.Module) -> None:
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
+
+        from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
+
+        assert (
+            self.is_checkpoint_mxfp4_serialized and self.dequantization_config is None
+        ), "The W4A16 triton path only supports serialized MXFP4 checkpoints."
+        assert self.moe_runner_config.activation == "silu", (
+            f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
+        )
+        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
+        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
+        cfg = self.moe_runner_config
+        unsupported = {
+            name: value
+            for name, value in (
+                ("gemm1_alpha", cfg.gemm1_alpha),
+                ("gemm1_beta", cfg.gemm1_beta),
+                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
+                ("swiglu_limit", cfg.swiglu_limit or None),
+            )
+            if value is not None
+        }
+        if unsupported:
+            raise NotImplementedError(
+                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+            )
+        logger.info_once(
+            "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
+            "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
+            "triton_kernels). Set SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 to disable."
+        )
+        self.num_experts = layer.w13_weight.shape[0]
+        self.intermediate_size = layer.w13_weight.shape[1] // 2
+        precision_configs = []
+        for name in ("w13", "w2"):
+            weight, flex, scale = _swizzle_mxfp4(
+                getattr(layer, f"{name}_weight").data,
+                getattr(layer, f"{name}_weight_scale").data,
+                _TRITON_W4A16_NUM_WARPS,
+            )
+            setattr(self, f"{name}_triton_weight", weight)
+            precision_configs.append(
+                PrecisionConfig(
+                    b_mx_scale=scale,
+                    b_microblock_size=OCP_MX_BLOCK_SIZE,
+                    flex_ctx=FlexCtx(rhs_data=flex),
+                    # w2's scattered rows are summed over top_k below; keep them
+                    # in fp32 until then.
+                    out_dtype=torch.float32 if name == "w2" else None,
+                )
+            )
+        self.w13_precision_config, self.w2_precision_config = precision_configs
+        # The swizzled copies above own the data now; drop the loaded tensors.
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            delattr(layer, name)
+        torch.cuda.empty_cache()
+
+    def _apply_triton_w4a16(
+        self, layer: torch.nn.Module, dispatch_output: StandardDispatchOutput
+    ) -> CombineInput:
+        from sgl_kernel import silu_and_mul
+        from triton_kernels.matmul import matmul
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        num_tokens, top_k = topk_ids.shape
+
+        # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
+        # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
+        # stays on device (no bincount) so this is CUDA-graph capturable.
+        # -1 ids (experts on other EP ranks) go to an extra bucket that sorts last,
+        # gets no GEMM rows, and is zeroed before the top_k reduction.
+        flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        valid = flat_ids >= 0
+        flat_ids = torch.where(valid, flat_ids, self.num_experts)
+        combine = torch.argsort(flat_ids, stable=True).to(torch.int32)
+        gather = torch.div(combine, top_k, rounding_mode="trunc")
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.int32, device=x.device)
+        counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32))
+        ragged = make_ragged_tensor_metadata(counts[:-1], num_tokens * top_k)
+        gammas = topk_weights.reshape(-1).to(torch.float32)[combine]
+
+        gate_up = matmul(
+            x,
+            self.w13_triton_weight,
+            None,
+            a_ragged_metadata=ragged,
+            gather_indx=gather,
+            precision_config=self.w13_precision_config,
+        )
+        act = torch.empty(
+            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
+        )
+        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+        out = matmul(
+            act,
+            self.w2_triton_weight,
+            None,
+            a_ragged_metadata=ragged,
+            scatter_indx=combine,
+            gammas=gammas,
+            precision_config=self.w2_precision_config,
+        )
+        # The scatter writes row i to flat slot combine[i] (num_tokens * top_k
+        # rows) without reducing over top_k, so do the reduction here.
+        out = out.view(num_tokens, top_k, -1)
+        out = out.masked_fill(~valid.view(num_tokens, top_k, 1), 0).sum(dim=1)
+        return StandardCombineInput(hidden_states=out.to(x.dtype))

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -602,7 +603,7 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda:
             # Save latent cache
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
                 kv_a.unsqueeze(1),
@@ -610,7 +611,7 @@ class DeepseekMHAForwardMixin:
             )
         elif _is_npu:
             # To reduce a time-costing split operation
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
                 kv_a.unsqueeze(1),
@@ -621,7 +622,7 @@ class DeepseekMHAForwardMixin:
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
                 self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
@@ -632,14 +633,14 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, dst_dtype)
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
 
             kv_a, k_pe = latent_cache.split(
@@ -673,21 +674,23 @@ class DeepseekMHAForwardMixin:
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             # Read door: the pool never translates, so the production site does.
-            # Only the FlashAttention/FlashInfer backends bind a translator; the
+            # Only the FlashAttention/FlashInfer backends bind a `RunnerIds`; the
             # base class documents its None default as "no translate", and the DSA
             # backend the EAGLE draft model runs on keeps that default. With no
-            # translator the ids never went VIRTUAL, so there is nothing to
+            # `RunnerIds` the ids never went VIRTUAL, so there is nothing to
             # collapse.
-            translator = get_attn_backend().kv_index_translator
-            if translator is not None:
-                kv_indices = translator.translate_dcp_read_ids(kv_indices)
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, torch.bfloat16
+            runner_ids = get_attn_backend().runner_ids
+            if runner_ids is not None:
+                kv_indices = runner_ids.translate_dcp_read_ids(kv_indices)
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, torch.bfloat16)
             )
             kv_a = kv_a.squeeze(1).contiguous()
             return kv_a, k_pe
 
-        kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
+        kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 
