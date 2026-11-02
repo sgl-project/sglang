@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax8_varlen,
     amax_topk_blocks,
@@ -20,6 +19,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_table import (
     sort_candidate_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import (
+    FLAT_LOGITS_WIDTH_ALIGN,
     deep_gemm_fp4_paged_mqa_logits,
     sparse_logits,
 )
@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, ceil_align
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -518,7 +518,9 @@ def publish_prefill_table(
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
     # the block keys read the score rows through 32-byte vectors
-    for tile, logits in score_tiles(data, kv):
+    width = ceil_align(max(data.lens_per_request, default=0), FLAT_LOGITS_WIDTH_ALIGN)
+    scratch_row_bytes = 4 * ceil_align(-(-width // CANDIDATE_BLOCK_SIZE), 4) + 8
+    for tile, logits in score_tiles(data, kv, scratch_row_bytes=scratch_row_bytes):
         lens = data.compress_lens[tile]
         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
         # keys past a row's block count stay unset; the top-k reads a row
@@ -536,6 +538,8 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
+        # Neither tensor may overlap allocation of the next score tile.
+        del logits, keys
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

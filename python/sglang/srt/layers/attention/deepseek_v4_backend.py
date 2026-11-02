@@ -90,6 +90,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     make_full_topk_indexer,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillIndexerBudget
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
 )
@@ -1067,6 +1068,7 @@ class DSV4Metadata:
     # The indexer's batch-only plan per low ratio, filled by its first layer
     # (scoring.prefill_index_plan); one per metadata, as the rows differ.
     low_ratio_index_plans: Optional[Dict[int, object]] = None
+    low_ratio_logits_budget: Optional[PrefillIndexerBudget] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1120,6 +1122,7 @@ class DSV4Metadata:
         )
         self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
         self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
+        self.low_ratio_logits_budget = static_metadata.low_ratio_logits_budget
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -2003,6 +2006,7 @@ class DeepseekV4AttnBackend(
         if self.low_ratios and self.forward_metadata.low_ratio_k_slots is not None:
             metadata.low_ratio_k_slots = self.forward_metadata.low_ratio_k_slots
             metadata.low_ratio_index_plans = {}
+            metadata.low_ratio_logits_budget = self.forward_metadata.low_ratio_logits_budget
         return metadata
 
     def _late_layer_tail_cp_layout(
@@ -2897,6 +2901,7 @@ class DeepseekV4AttnBackend(
         }
         metadata.low_ratio_k_slots = k_slots
         metadata.low_ratio_index_plans = {}
+        metadata.low_ratio_logits_budget = PrefillIndexerBudget()
         if publish_rows:
             # Every source layer would rebuild these rows; the tail and the
             # prefill graph publish theirs at metadata init the same way.
@@ -4021,6 +4026,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             k_slots=k_slots,
             index_plans=self.forward_metadata.low_ratio_index_plans,
+            budget=self.forward_metadata.low_ratio_logits_budget,
             kv_page_table=core.page_table,
             seq_lens_cpu=seq_lens_cpu,
             rows_per_request=rows_per_request,

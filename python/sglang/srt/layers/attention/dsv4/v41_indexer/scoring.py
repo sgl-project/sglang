@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     flat_selection_slots,
@@ -17,23 +16,26 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_paged,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
-from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    FLAT_LOGITS_WIDTH_ALIGN,
+    flat_index_logits_tiles,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
+    mqa_logits_row_bytes,
+)
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, ceil_align
 
-from .types import DecodeInputs, PrefillInputs
+from .types import DecodeInputs, PrefillIndexerBudget, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
-_DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -70,6 +72,8 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
     q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
     weights: torch.Tensor  # [rows, heads] fp32 head weights
+
+    budget: PrefillIndexerBudget = msgspec.field(default_factory=PrefillIndexerBudget)
 
     @property
     def num_rows(self) -> int:
@@ -264,10 +268,31 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
+        budget=inputs.budget if inputs.budget is not None else PrefillIndexerBudget(),
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scratch_row_bytes: int = 0,
+    scratch_bytes: int = 0,
+):
+    width = ceil_align(max(data.lens_per_request, default=0), FLAT_LOGITS_WIDTH_ALIGN)
+    if not data.num_rows or not width:
+        return
+    # Keep small batches free of a synchronizing free-memory query. Use the
+    # same allowance once a larger layer has resolved it for this forward.
+    budget = data.budget
+    if budget.bytes is None and not mqa_logits_needs_budget_check(
+        num_rows=data.num_rows, num_cols=width
+    ):
+        budget_bytes = ceil_align(data.num_rows, 128 // data.q_fp4.shape[1]) * (
+            mqa_logits_row_bytes(width) + scratch_row_bytes
+        )
+    else:
+        budget_bytes = max(1, budget.resolve(data.weights.device) - scratch_bytes)
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -275,7 +300,8 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=budget_bytes,
+        scratch_row_bytes=scratch_row_bytes,
     )
 
 

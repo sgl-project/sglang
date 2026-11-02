@@ -64,15 +64,17 @@ def flat_index_logits_rows_per_tile(
     *,
     heads: int,
     budget_bytes: int,
+    scratch_row_bytes: int = 0,
 ) -> int:
     """Rows per logits tile within ``budget_bytes``, at the kernel's row alignment.
     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
     half the budget, which leaves room for the per-row selection scratch that
-    grows with the tile."""
+    grows with the tile. ``scratch_row_bytes`` reserves any additional per-row
+    storage the caller keeps alongside the scores."""
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
+        row_bytes=mqa_logits_row_bytes(width) + scratch_row_bytes,
         budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
@@ -96,6 +98,7 @@ def flat_index_logits_tiles(
     lengths: torch.Tensor,
     context_lengths: list[int],
     budget_bytes: int,
+    scratch_row_bytes: int = 0,
 ) -> Iterator[tuple[slice, torch.Tensor]]:
     """``(rows, logits)`` per row tile, each tile within ``budget_bytes``:
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
@@ -108,7 +111,11 @@ def flat_index_logits_tiles(
     if rows == 0 or width == 0:
         return
     rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+        rows,
+        width,
+        heads=q[0].shape[1],
+        budget_bytes=budget_bytes,
+        scratch_row_bytes=scratch_row_bytes,
     )
     weights = weights.to(index_weights_dtype())
     logits_dtype = index_logits_dtype()
