@@ -19,13 +19,14 @@ import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.device_pool_info import (
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
+)
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host.dsa import (
-    DSAIndexerPoolHost,
-    make_dsa_indexer_pool_decl,
-)
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -575,10 +576,30 @@ class TestDsaIndexerHostUnderDcp(CustomTestCase):
         anchor = _make_host_pool(dcp_rank=5)
         self.addCleanup(anchor.destroy)
         device_pool = _fake_widened_index_pool()
+        # Packed draft layers follow the target layers in both the buffer list
+        # and the device layer ids, which is how the host pool tells them apart.
+        buffers = list(device_pool.index_k_with_scale_buffer)
+        layer_mapping = {layer: layer for layer in range(device_pool.layer_num)}
+        for draft in packed_drafts:
+            for buffer in draft.index_k_with_scale_buffer:
+                layer_mapping[len(buffers)] = len(buffers)
+                buffers.append(buffer)
         host = DSAIndexerPoolHost(
-            decl=make_dsa_indexer_pool_decl(device_pool),
-            anchor_host=anchor,
-            packed_draft_device_pools=packed_drafts,
+            IndexKeyBufferInfo(
+                page_size=PHYSICAL_PAGE,
+                compress_ratio=1,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                buffers=tuple(buffers),
+            ),
+            layer_mapping=layer_mapping,
+            target_device_layer_num=device_pool.layer_num,
+            # The host mirror spans every rank's slots, so it pages the widened
+            # transfer indices untranslated. This is what the assembler passes.
+            num_host_pages=anchor.page_num * anchor.dcp_size,
+            transfer_page_size=anchor.page_size,
+            layout=anchor.layout,
+            buffer_device=device_pool.device,
+            dtype=device_pool.store_dtype,
             pin_memory=False,
         )
         self.addCleanup(host.destroy)
