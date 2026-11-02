@@ -11,6 +11,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -51,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 # Number of recent busy-check messages buffered for the level-1 dump-on-leak path.
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
+
+
+def _raise_if_any(reqs: Set[Req], message: str) -> None:
+    if reqs:
+        raise RuntimeError(f"{message}: {sorted(req.rid for req in reqs)}")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -490,52 +496,39 @@ class SchedulerInvariantChecker:
                 owners[req] = name
 
         chunked_req = self.get_chunked_req()
-        running_batches = [b for b in self.get_running_batches() if b is not None]
-        steps = [b for b in (batch, *self.get_pp_mbs()) if b is not None]
-        in_running_batch = {req for b in running_batches for req in b.reqs}
-        held = {req for b in steps for req in b.reqs} | in_running_batch
-        not_listed = sorted(
-            req.rid
-            for req in held
-            if not req.finished() and req not in owners and req is not chunked_req
-        )
-        if not_listed:
-            raise RuntimeError(
-                f"Requests held by a running batch or a step but in no list: "
-                f"{not_listed}"
-            )
 
-        merged = sorted(
-            req.rid
-            for req in self.get_prefill_launched_reqs()
-            if req in in_running_batch
+        def live(reqs: Iterable[Req]) -> Set[Req]:
+            return {
+                req for req in reqs if not req.finished() and req is not chunked_req
+            }
+
+        in_running_batch = {
+            req for b in self.get_running_batches() if b is not None for req in b.reqs
+        }
+        in_step = {
+            req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
+        }
+        running = set(self.get_running_reqs())
+
+        _raise_if_any(
+            live(in_running_batch | in_step) - owners.keys(),
+            "Requests held by a running batch or a step but in no list",
         )
-        if merged:
-            raise RuntimeError(
-                f"Requests in prefill_launched but in a running batch: {merged}"
-            )
-        running = self.get_running_reqs()
-        not_running = sorted(
-            req.rid
-            for req in in_running_batch
-            if not req.finished() and req is not chunked_req and req not in running
+        _raise_if_any(
+            in_running_batch & set(self.get_prefill_launched_reqs()),
+            "Requests in prefill_launched but in a running batch",
         )
-        if not_running:
-            raise RuntimeError(
-                f"Requests in a running batch but not in running: {not_running}"
-            )
+        _raise_if_any(
+            live(in_running_batch) - running,
+            "Requests in a running batch but not in running",
+        )
         # A running request is out of every running batch only with a step in
         # flight: a mixed step took its decode row, or under overlap a queued
         # result finishes it.
-        not_held = sorted(
-            req.rid
-            for req in running
-            if req not in in_running_batch and req.inflight_steps <= 0
+        _raise_if_any(
+            {req for req in running - in_running_batch if req.inflight_steps <= 0},
+            "Requests in running but in no running batch or step",
         )
-        if not_held:
-            raise RuntimeError(
-                f"Requests in running but in no running batch or step: {not_held}"
-            )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
