@@ -99,7 +99,7 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 # DeepGEMM's BLOCK_M -> (BLOCK_M, store BLOCK_M) for decode-graph calls.
-_MEGA_MOE_DECODE_BLOCK_M = {16: (64, 16), 32: (64, 16), 64: (96, 16)}
+_MEGA_MOE_DECODE_BLOCK_M = {16: (64, 16), 32: (64, 16)}
 
 
 @functools.lru_cache(maxsize=None)
