@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest import mock
@@ -22,6 +24,7 @@ from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -476,21 +479,62 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
         _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
 
 
-def test_fused_kda_backend_is_opt_in(monkeypatch):
+def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
-    assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
-    assert kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
+        assert not kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
+        assert kda_fused_decode_aiter_hip.enabled()
 
 
-def _select_fused_backend(monkeypatch, source: str):
+@pytest.mark.parametrize(
+    "new_name, old_name, old_value, new_value",
+    [
+        (
+            "SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
+            "SGLANG_ROCM_K3_KDA_FUSED_BACKEND",
+            "aiter",
+            "gfx950",
+        ),
+        (
+            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+            "SGLANG_K3_FLYDSL_SOURCE",
+            "sglang",
+            "aiter",
+        ),
+    ],
+)
+def test_pre_rename_names_still_select(new_name, old_name, old_value, new_value):
+    """Launch scripts and the cookbook's pinned image still set the old names;
+    each must reach its descriptor, and the new name must win over it."""
+    field = getattr(envs, new_name)
+    # patch.dict also drops the copy the alias fallback writes to the new name.
+    with mock.patch.dict(os.environ):
+        field.clear()
+        os.environ[old_name] = old_value
+        with pytest.warns(DeprecationWarning, match=old_name):
+            assert field.get() == old_value
+    with mock.patch.dict(os.environ), field.override(new_value):
+        os.environ[old_name] = old_value
+        assert field.get() == new_value
+
+
+@pytest.fixture
+def select_fused_backend():
+    """Select the aiter fused KDA backend over FlyDSL ``source`` for one test."""
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
-    monkeypatch.setenv("SGLANG_K3_FLYDSL_SOURCE", source)
-    return kda_fused_decode_aiter_hip
+    with ExitStack() as stack:
+
+        def select(source: str):
+            stack.enter_context(
+                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter")
+            )
+            stack.enter_context(envs.SGLANG_USE_HIP_K3_FLYDSL_SOURCE.override(source))
+            return kda_fused_decode_aiter_hip
+
+        yield select
 
 
 def _adapter_covers(adapter, f_a, f_b_weight, inputs: Inputs) -> bool:
@@ -548,11 +592,11 @@ def _bf16_state(inputs: Inputs) -> None:
         ),
     ],
 )
-def test_source_binds_its_kda_decode(monkeypatch, source, names) -> None:
-    """SGLANG_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
+def test_source_binds_its_kda_decode(select_fused_backend, source, names) -> None:
+    """SGLANG_USE_HIP_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
     import importlib
 
-    adapter = _select_fused_backend(monkeypatch, source)
+    adapter = select_fused_backend(source)
     module = importlib.import_module(
         adapter._AITER_MODULE if source == "aiter" else adapter._SGLANG_MODULE
     )
@@ -560,11 +604,13 @@ def test_source_binds_its_kda_decode(monkeypatch, source, names) -> None:
     assert (run, supported) == tuple(getattr(module, name) for name in names)
 
 
-def test_aiter_module_without_kda_decode_fails_closed(monkeypatch) -> None:
+def test_aiter_module_without_kda_decode_fails_closed(
+    monkeypatch, select_fused_backend
+) -> None:
     """AITER builds before ROCm/aiter#6026 ship the module with only GDR ops."""
     from sglang.kernels.ops.attention.kda_flydsl import source
 
-    adapter = _select_fused_backend(monkeypatch, "aiter")
+    adapter = select_fused_backend("aiter")
     monkeypatch.setattr(
         source,
         "load_module",
@@ -579,8 +625,8 @@ def test_aiter_module_without_kda_decode_fails_closed(monkeypatch) -> None:
 
 @_requires_aiter_bf16_state
 @pytest.mark.parametrize("batch", [1, 2, 8])
-def test_aiter_bf16_state_matches_reference(monkeypatch, batch: int) -> None:
-    adapter = _select_fused_backend(monkeypatch, "aiter")
+def test_aiter_bf16_state_matches_reference(select_fused_backend, batch: int) -> None:
+    adapter = select_fused_backend("aiter")
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     _bf16_state(seed)
     reference_inputs = _copy_inputs(seed)
@@ -604,9 +650,9 @@ def test_aiter_bf16_state_matches_reference(monkeypatch, batch: int) -> None:
 
 
 @_requires_aiter_bf16_state
-def test_aiter_covers_sglang_cache_pool_layouts(monkeypatch) -> None:
+def test_aiter_covers_sglang_cache_pool_layouts(select_fused_backend) -> None:
     """covered() must accept the pools SGLang allocates, not only test tensors."""
-    adapter = _select_fused_backend(monkeypatch, "aiter")
+    adapter = select_fused_backend("aiter")
     cache = 673
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
     inputs.state = torch.empty(
@@ -622,9 +668,9 @@ def test_aiter_covers_sglang_cache_pool_layouts(monkeypatch) -> None:
     assert not _adapter_covers(adapter, f_a, f_b_weight, fp16_state)
 
 
-def test_sglang_source_does_not_cover_bf16_state(monkeypatch) -> None:
+def test_sglang_source_does_not_cover_bf16_state(select_fused_backend) -> None:
     """The vendored kernel takes an FP32 state only; BF16 must fall back."""
-    adapter = _select_fused_backend(monkeypatch, "sglang")
+    adapter = select_fused_backend("sglang")
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
 
     assert _adapter_covers(adapter, f_a, f_b_weight, inputs)
@@ -634,10 +680,12 @@ def test_sglang_source_does_not_cover_bf16_state(monkeypatch) -> None:
         _run_with_f_b(f_a, f_b_weight, inputs)
 
 
-def test_sglang_source_is_not_armed_for_a_bf16_pool(monkeypatch) -> None:
+def test_sglang_source_is_not_armed_for_a_bf16_pool(
+    monkeypatch, select_fused_backend
+) -> None:
     """A BF16 pool never reaches the FP32-only vendored kernel,
     so the layer must not arm (or log armed) and must warn that decode stays unfused."""
-    adapter = _select_fused_backend(monkeypatch, "sglang")
+    adapter = select_fused_backend("sglang")
     warn = mock.Mock()
     monkeypatch.setattr(adapter, "print_warning_once", warn)
 
@@ -649,9 +697,11 @@ def test_sglang_source_is_not_armed_for_a_bf16_pool(monkeypatch) -> None:
 
 @_requires_aiter_bf16_state
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_aiter_warmup_builds_the_pool_state_dtype(monkeypatch, state_dtype) -> None:
+def test_aiter_warmup_builds_the_pool_state_dtype(
+    monkeypatch, select_fused_backend, state_dtype
+) -> None:
     """A pool state dtype left cold would compile during CUDA graph capture."""
-    adapter = _select_fused_backend(monkeypatch, "aiter")
+    adapter = select_fused_backend("aiter")
     _, f_b_weight, inputs = _make_fb_inputs(batch=1)
     warmed = []
     real_run = adapter.run
@@ -677,8 +727,8 @@ def test_aiter_warmup_builds_the_pool_state_dtype(monkeypatch, state_dtype) -> N
 
 @_requires_aiter_kda
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_vendored_and_aiter_kda_decode_agree(monkeypatch, batch: int) -> None:
-    adapter = _select_fused_backend(monkeypatch, "aiter")
+def test_vendored_and_aiter_kda_decode_agree(select_fused_backend, batch: int) -> None:
+    adapter = select_fused_backend("aiter")
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     vendored_inputs = _copy_inputs(seed)
     aiter_inputs = _copy_inputs(seed)

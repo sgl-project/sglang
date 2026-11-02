@@ -1105,6 +1105,16 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP kernel) or "aiter"
+    # (AITER FlyDSL boundary); any other value keeps the unfused KDA decode.
+    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # FlyDSL module behind the "aiter" fused KDA decode: "auto" prefers SGLang's
+    # vendored copy and falls back to AITER, "sglang" or "aiter" pin one.
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, print_warning_once
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ _WARMED: set[tuple[int, float, float, torch.dtype]] = set()
 
 
 def enabled() -> bool:
-    return os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower() == "aiter"
+    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
 
 
 def _ops():
