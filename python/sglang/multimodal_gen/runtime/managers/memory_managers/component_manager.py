@@ -935,14 +935,14 @@ class ComponentResidencyManager:
             return
         if self._keep_ready_component_on_cuda():
             return
+        # Layerwise buffers are re-reserved by the next use of the same component;
+        # returning them to the driver only adds cudaFree/cudaMalloc to every request.
+        if isinstance(strategy, LayerwiseOffloadStrategy):
+            return
         released_device_storage = (
             was_on_supported_device and not self._module_on_supported_device(module)
         )
-        released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
-        should_empty_component_cache = (
-            released_device_storage and not current_platform.is_npu()
-        )
-        if not (should_empty_component_cache or released_layerwise_storage):
+        if not (released_device_storage and not current_platform.is_npu()):
             return
         if not torch.get_device_module().is_available():
             return

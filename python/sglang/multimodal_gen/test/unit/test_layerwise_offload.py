@@ -3139,3 +3139,35 @@ def test_finish_offload_writeback_is_noop_when_idle():
     )
 
     finish_offload_writeback()
+
+
+@pytest.mark.parametrize(
+    "strategy, was_on_device, still_on_device, expected_calls",
+    [
+        (LayerwiseOffloadStrategy(), True, True, 0),
+        (LayerwiseOffloadStrategy(), True, False, 0),
+        (ComponentOffloadStrategy(), True, False, 1),
+        (ComponentOffloadStrategy(), True, True, 0),
+    ],
+    ids=["layerwise", "layerwise-moved", "component-moved", "component-resident"],
+)
+def test_large_release_keeps_layerwise_buffers_cached(
+    monkeypatch, strategy, was_on_device, still_on_device, expected_calls
+):
+    device_module = SimpleNamespace(is_available=lambda: True, empty_cache=Mock())
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    manager = SimpleNamespace(
+        _keep_ready_component_on_cuda=lambda: False,
+        _module_on_supported_device=lambda module: still_on_device,
+    )
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        memory_intensive=True,
+    )
+
+    ComponentResidencyManager._empty_cache_after_large_release(
+        manager, use, strategy, torch.nn.Linear(2, 2), was_on_device
+    )
+
+    assert device_module.empty_cache.call_count == expected_calls
