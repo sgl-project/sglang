@@ -35,6 +35,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -144,6 +145,17 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
+        # A3 W8A8 checkpoints retain DSV4's clip-before-SiLU semantics.
+        # Leave the A5 MX and existing unclipped activation paths unchanged.
+        swiglu_limit = (
+            config.swiglu_limit
+            if not is_npu_arch35()
+            and isinstance(kernel, NPUW8A8Int8MoEMethod)
+            and config.activation == "silu"
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+            else None
+        )
 
         # W13 decides fusion; W2 determines the separate activation's format.
         if _uses_fused_gmm1(config.layer.w13_kernel, config):
@@ -198,12 +210,13 @@ class AscendRunnerCore(MoeRunnerCore):
                     need_quant=is_quant_kernel,
                     alpha=config.gemm1_alpha,
                     limit=config.gemm1_clamp_limit,
+                    swiglu_limit=swiglu_limit,
                 )
         else:
             # Non-DeepEP, no-A2A routing path
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
-                inner = NPUSwigluQuant()
+                inner = NPUSwigluQuant(swiglu_limit=swiglu_limit)
             elif config.activation == "situ":
                 # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
                 # gmm2 requantizes the activations itself, so no quant is

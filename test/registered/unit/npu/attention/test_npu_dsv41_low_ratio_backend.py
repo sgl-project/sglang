@@ -91,6 +91,23 @@ DS41 = _Ds41Stub()
 dsv4_backend._ds41_ops = lambda: DS41
 
 
+def setUpModule():
+    # This suite describes the original A5 packed path. A3 has separate BF16
+    # contract tests; do not let the host running this suite select its ABI.
+    global _arch_patches
+    _arch_patches = [
+        patch.object(module, "is_npu_arch35", return_value=True)
+        for module in (dsv4_backend, dsv4_memory_pool)
+    ]
+    for arch_patch in _arch_patches:
+        arch_patch.start()
+
+
+def tearDownModule():
+    for arch_patch in reversed(_arch_patches):
+        arch_patch.stop()
+
+
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
     backend._dsv4_compress_ratios = (0,) + tuple(ratios)
@@ -1551,9 +1568,9 @@ class TestVerifyGraphGuard(unittest.TestCase):
         backend = _low_ratio_backend()
         backend._dsv4_has_low_ratio = has_low_ratio
         ctx = SimpleNamespace(
-            fm=SimpleNamespace(),
+            fm=SimpleNamespace(dsv4_cycle_state_block_table=torch.zeros(1)),
             bs=1,
-            forward_batch=SimpleNamespace(),
+            forward_batch=SimpleNamespace(req_pool_indices=torch.zeros(1)),
             graph_mode=self._GraphMode(target_verify),
             is_idle_replay=is_idle_replay,
             # c4/c128 are absent for V4.1, so both verify sub-arms are skipped.

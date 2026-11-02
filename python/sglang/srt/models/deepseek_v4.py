@@ -1224,6 +1224,14 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
+        if _is_npu and self.is_dsv41:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
+            # The A5 mixed-quant kernel retains its existing 64-head padding.
+            if not is_npu_arch35():
+                return self.n_local_heads
+
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:

@@ -359,6 +359,10 @@ def mix_stats(
 
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    if _is_npu and not is_npu_arch35() and hc.cfg.pre_from_prev:
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        return mix_stats_torch(hc, x)
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -521,6 +525,12 @@ def _npu_combine_premix(
             x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
         )
         return hc.norm(x[:, 0, :])
+    if not is_npu_arch35():
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
+
+        state.stats = mix_stats_torch(hc, x)
+        mixed = x[:, 0, :] if apply_pre is None else combine_premix(x, apply_pre)
+        return hc.norm(mixed)
     if apply_pre is None:
         # The first sublayer of the forward has no previous pre-mix to fold;
         # recipes seeds it with the identity one-hot (make_identity_pre_mix),
@@ -624,6 +634,10 @@ def post(
 
     if _is_npu:
         if cfg.pre_from_prev:
+            if not is_npu_arch35():
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import post_torch
+
+                return post_torch(x, residual, post_mix, comb)
             # V4.1 (A5): the CANN mhc_post op, following the op schema
             # mhc_post(x, hRes, hOut, hPost) -- the residual is the base stream,
             # comb its res-mixing matrix, x the sublayer output and post its
