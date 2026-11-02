@@ -38,6 +38,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -422,8 +423,8 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         # Standalone MTP checkpoints can supply a differently quantized head.
         # Share only the input embeddings; retain the entire loaded head module.
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
         if self.config.tie_word_embeddings or self._owns_lm_head:
