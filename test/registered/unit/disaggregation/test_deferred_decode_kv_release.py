@@ -530,6 +530,8 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         hicache_restore_lock=None,
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        awaiting_publish=False,
+        pending_metadata=None,
     )
 
 
@@ -545,6 +547,21 @@ class TestResolveDeferredReleases(CustomTestCase):
     def setUp(self):
         super().setUp()
         _run_as_single_rank(self)
+
+    def test_unpublished_rank_holds_for_peer_without_waiting_for_acks(self):
+        mgr = _make_manager()
+        queue = _make_queue()
+        entry = _make_decode_req(201, 7, mgr, n_prefill_ranks=2)
+        entry.pending_metadata = (SimpleNamespace(query=lambda: False), (), {})
+        # ABORT was sent before metadata, so this rank has no ack generation.
+        # A peer that already published still makes every rank retain capacity.
+        queue._defer_release(entry)
+        self.assertEqual(queue._deferred_releases[0][-1], 0)
+        with patch.object(decode_mod, "release_kv_cache") as release:
+            queue.resolve_deferred_releases()
+        release.assert_called_once_with(entry.req, queue.tree_cache, checkpoint=False)
+        self.assertEqual(queue._deferred_releases, [])
+        self.assertEqual(queue.req_to_metadata_buffer_idx_allocator.freed, [7])
 
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
@@ -854,6 +871,9 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         metadata_buffer_index=idx,
         hicache_restore_status=None,
         host_staged=False,
+        awaiting_publish=False,
+        pending_metadata=None,
+        is_rebootstrap=False,
     )
 
 
@@ -910,6 +930,114 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
+
+    def test_failure_before_deferred_publish_releases_immediately(self):
+        # A request can join the transfer queue before its destination is sent;
+        # an abort in that window leaves nothing for prefill to drain.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=10, idx=6, abort_notified=False)
+        entry.awaiting_publish = True
+        q.queue = [entry]
+        # Under prefill_complete, clear() of a failed receiver that decode did not
+        # abort notifies prefill and arms drain tracking no ACK will resolve.
+        entry.kv_receiver.clear = lambda: mgr.register_deferred_abort_room(10)
+
+        released = self._pop(q)
+
+        self.assertEqual(released, [entry])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [6])
+        self.assertNotIn(10, mgr._deferred_abort_ack_tracker)
+
+    def test_held_destination_is_sent_only_by_queued_requests(self):
+        # Without the deferred publish, overlap holds a destination until the
+        # forward in flight at allocation is done. A request that fails meanwhile
+        # never sends it and is released at once; one that already sent it is
+        # deferred and awaits its drain acks.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        ready = SimpleNamespace(query=lambda: True)
+        held = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        held.pending_metadata = (ready, ("held",), {})
+        sent = _make_failed_req(mgr, room=8, idx=4, abort_notified=False)
+        queued = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
+        queued.pending_metadata = (ready, ("queued",), {})
+        for entry in (held, sent, queued):
+            entry.kv_receiver.send_metadata = MagicMock()
+        held_receiver = held.kv_receiver  # the release path nulls entry.kv_receiver
+        q.queue = [held, sent, queued]
+        q._poll_with_metadata_gate = lambda: [
+            KVPoll.Failed,
+            KVPoll.Failed,
+            KVPoll.WaitingForInput,
+        ]
+
+        released = self._pop(q)
+
+        held_receiver.send_metadata.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
+        self.assertIsNone(queued.pending_metadata)
+        self.assertEqual(q.queue, [queued])
+        self.assertEqual(released, [held])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
+        required_acks = {
+            entry.req.bootstrap_room: acks
+            for entry, _, _, _, acks in q._deferred_releases
+        }
+        self.assertEqual(required_acks, {8: 2})
+
+    def test_failed_held_destination_respects_delayed_conclusion(self):
+        # Defensive coverage: PP currently disables overlap, so it does not
+        # create held metadata, but a delayed conclusion must still respect it.
+        mgr = _make_manager()
+        q = _make_pop_queue(mgr)
+        released = []
+        q._release_request = released.append
+        ready = SimpleNamespace(query=lambda: True)
+        concluded = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        concluded.awaiting_publish = True
+        # An abort before send_metadata has no generation that prefill can ack.
+        aborted = _make_failed_req(mgr, room=8, idx=4, abort_notified=True)
+        aborted.pending_metadata = (ready, ("aborted",), {})
+        queued = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
+        queued.pending_metadata = (ready, ("queued",), {})
+        for entry in (aborted, queued):
+            entry.kv_receiver.send_metadata = MagicMock()
+        aborted_receiver = aborted.kv_receiver
+        pending = aborted.pending_metadata
+        q.queue = [concluded, aborted, queued]
+        q._poll_with_metadata_gate = lambda: [
+            KVPoll.Failed,
+            KVPoll.Failed,
+            KVPoll.WaitingForInput,
+        ]
+
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred_with_outcomes({concluded.req.rid: True})
+
+        self.assertEqual(q.queue, [aborted, queued])
+        self.assertEqual(released, [concluded])
+        aborted_receiver.send_metadata.assert_not_called()
+        self.assertIs(aborted.pending_metadata, pending)
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
+        self.assertIsNone(queued.pending_metadata)
+
+        # PP now agrees to release the abort. Its unsent destination needs no
+        # drain acknowledgements, even though the receiver already sent ABORT.
+        q._poll_with_metadata_gate = lambda: [KVPoll.Failed, KVPoll.WaitingForInput]
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred_with_outcomes({aborted.req.rid: True})
+
+        self.assertEqual(released, [concluded, aborted])
+        self.assertEqual(q.queue, [queued])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3, 4])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(mgr._deferred_abort_ack_tracker, {})
+        aborted_receiver.send_metadata.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
 
     def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
         mgr = _make_manager()

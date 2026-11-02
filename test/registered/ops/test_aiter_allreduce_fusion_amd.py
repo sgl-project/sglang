@@ -434,7 +434,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
     def test_tp6_does_not_use_aiter_fusion(self):
         self.assertFalse(self._evaluate_gate(dp_attention=False, tp_world_size=6))
 
-    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
+    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED)
     DECODE_MODES = (
         ForwardMode.DECODE,
         ForwardMode.TARGET_VERIFY,

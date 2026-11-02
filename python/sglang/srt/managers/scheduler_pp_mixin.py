@@ -129,6 +129,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -258,6 +259,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -342,7 +344,7 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -361,7 +363,7 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
+                if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
 
     @DynamicGradMode()
@@ -385,6 +387,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.increment_scheduler_iterations()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -519,6 +522,9 @@ class SchedulerPPMixin:
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
+                    else:
+                        # No result to process, but its launch was counted.
+                        self._on_step_processed(self.mbs[next_mb_id])
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
@@ -622,7 +628,7 @@ class SchedulerPPMixin:
         step with the others.
         """
         succeeded, failed = self.get_rids(
-            self.disagg_prefill_inflight_queue,
+            self.disagg_prefill_transfer_queue,
             True,
             [KVPoll.Success],
             [KVPoll.Failed],
