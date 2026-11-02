@@ -52,6 +52,23 @@ def folded_replay_rows(batch) -> int:
     )
 
 
+def decoder_swa_trim_rows(batch, *, folds_encoder: bool) -> int:
+    """Rows removed by a plain extend's decoder tail; -1 requests the backend
+    exchange when prompt outputs require whole-extend rows."""
+    if not batch.forward_mode.is_extend_without_speculative():
+        return 0
+    if batch.return_logprob or batch.return_hidden_states:
+        return -1
+    lens = list(batch.extend_lens)
+    if folds_encoder and batch.encoder_swa_reset is not None:
+        for i, (reset, prefix) in enumerate(
+            zip(batch.encoder_swa_reset, batch.prefix_lens)
+        ):
+            if reset:
+                lens[i] += replay_len(prefix)
+    return sum(max(0, n - 128) for n in lens)
+
+
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_row_floor = folded.row_floor
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
