@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingStateDType,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _require_single_row_dsv4_swa_pages,
     _SwaStrategy,
     build_full_draft_pools,
+    build_hicache_draft_sidecars,
     build_host_pool_group,
     build_hybrid_swa_group,
     build_unified_host_stack,
@@ -66,6 +68,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -1552,6 +1555,9 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
                 draft = DraftMHAView(
                     arena=bundle.arena,
                     host_spec=bundle.storage.plan.sub_pool(host).spec,
+                    pool_name=PoolName(
+                        bundle.storage.plan.sub_pool(host).external.host_pool
+                    ),
                     layer_lanes={0: 0},
                     page_size=bundle.token_to_kv_pool.page_size,
                 )
@@ -1643,6 +1649,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         draft = DraftMHAView(
             arena=bundle.arena,
             host_spec=bundle.storage.plan.sub_pool("full").spec,
+            pool_name=PoolName(bundle.storage.plan.sub_pool("full").external.host_pool),
             layer_lanes={0: 0},
             page_size=bundle.token_to_kv_pool.page_size,
         )
@@ -2003,6 +2010,143 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 ),
             ):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
+
+
+def _swa_kv_pool(full: list[int], swa: list[int], *, full_indices: bool = False):
+    pool = SWAKVPool(
+        size=16,
+        size_swa=16,
+        page_size=1,
+        dtype=torch.float16,
+        head_num=1,
+        head_dim=4,
+        full_attention_layer_ids=full,
+        swa_attention_layer_ids=swa,
+        device="cpu",
+        token_to_kv_pool_class=MHATokenToKVPool,
+        swa_kv_pool_kwargs={
+            "head_num": 1,
+            "head_dim": 4,
+            "page_size": 1,
+            "device": "cpu",
+            "enable_memory_saver": False,
+        },
+    )
+    pool.swa_uses_full_indices = full_indices
+    return pool
+
+
+class TestPoolRolesInInfos(CustomTestCase):
+    def test_swa_pool_reports_each_side_in_model_layers(self):
+        """Window KV is named SWA and keeps the model layer IDs of layers_mapping."""
+        for full_indices in (False, True):
+            with self.subTest(full_indices=full_indices):
+                pool = _swa_kv_pool([1, 3], [0, 2], full_indices=full_indices)
+                full, swa = pool.get_device_pool_infos()
+                self.assertEqual(
+                    (full.pool_name, full.indices_from_pool),
+                    (PoolName.KV, PoolName.KV),
+                )
+                self.assertEqual(swa.pool_name, PoolName.SWA)
+                self.assertEqual(
+                    swa.indices_from_pool,
+                    PoolName.KV if full_indices else PoolName.SWA,
+                )
+                for info, is_swa_layer in ((full, False), (swa, True)):
+                    expected = sorted(
+                        (index, layer_id)
+                        for layer_id, (index, side) in pool.layers_mapping.items()
+                        if side == is_swa_layer
+                    )
+                    self.assertEqual(
+                        info.layer_ids, tuple(layer for _, layer in expected)
+                    )
+
+    def test_unified_views_report_their_sub_pool(self):
+        pool = _build_unified_swa_pool().token_to_kv_pool
+        for sub_pool, name in (("full", PoolName.KV), ("swa", PoolName.SWA)):
+            (info,) = pool.layer_router.view(sub_pool).get_device_pool_infos()
+            self.assertEqual((info.pool_name, info.indices_from_pool), (name, name))
+
+
+class TestDraftSidecarDispatchByInfos(CustomTestCase):
+    def _dispatch(self, draft):
+        with (
+            patch.object(
+                hybrid_pool_assembler, "build_swa_draft_pools", return_value="swa"
+            ),
+            patch.object(
+                hybrid_pool_assembler, "build_full_draft_pools", return_value="full"
+            ),
+        ):
+            return build_hicache_draft_sidecars(
+                draft_device_pools=(draft,), tree_cache=None
+            )
+
+    def _stub(self, *infos):
+        return SimpleNamespace(get_device_pool_infos=lambda: infos)
+
+    def test_window_kv_selects_the_swa_builder(self):
+        self.assertEqual(self._dispatch(_swa_kv_pool([1], [0])), "swa")
+        dsv4_swa = SimpleNamespace(
+            pool_name=PoolName.SWA, buffer_info=MagicMock(spec=DSV4PagedBufferInfo)
+        )
+        self.assertEqual(self._dispatch(self._stub(dsv4_swa)), "swa")
+
+    def test_full_kv_selects_the_full_builder(self):
+        kv = SimpleNamespace(pool_name=PoolName.KV, buffer_info=object())
+        self.assertEqual(self._dispatch(self._stub(kv)), "full")
+        # Hybrid linear drafts describe their KV through the wrapped child.
+        self.assertEqual(self._dispatch(self._stub()), "full")
+
+    def test_paged_draft_without_window_kv_is_rejected(self):
+        compressed = SimpleNamespace(
+            pool_name=PoolName.DEEPSEEK_V4_C4,
+            buffer_info=MagicMock(spec=DSV4PagedBufferInfo),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "non-unified draft SWA"):
+            self._dispatch(self._stub(compressed))
+
+
+class TestFusedDraftStorageIdentity(CustomTestCase):
+    def _tree_cache(self, bundle):
+        host = MagicMock(spec=UnifiedPageEnvelopeHostPool)
+        entries = {
+            PoolName.KV: SimpleNamespace(
+                device_pool=bundle.token_to_kv_pool.layer_router.view("full"),
+                host_pool=host,
+            ),
+            PoolName.SWA: SimpleNamespace(device_pool=None, host_pool=host),
+        }
+        return SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(entry_map=entries)
+            )
+        )
+
+    def test_draft_must_share_the_target_arena(self):
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = _build_unified_swa_pool(fused_draft=placement)
+        other = _build_unified_swa_pool(fused_draft=placement)
+        draft = DraftMHAView(
+            arena=bundle.arena,
+            host_spec=bundle.storage.plan.sub_pool("full").spec,
+            pool_name=PoolName.KV,
+            layer_lanes={0: 0},
+            page_size=bundle.token_to_kv_pool.page_size,
+        )
+        validate_fused_hicache_draft(
+            draft_device_pools=(draft,), tree_cache=self._tree_cache(bundle)
+        )
+        with self.assertRaisesRegex(ValueError, "share the target FULL pool"):
+            validate_fused_hicache_draft(
+                draft_device_pools=(draft,), tree_cache=self._tree_cache(other)
+            )
 
 
 if __name__ == "__main__":

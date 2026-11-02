@@ -12,6 +12,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.decl import (
     KVLayerDecl,
@@ -161,12 +162,14 @@ def _build_token_view(
         return MLAView(
             arena=arena,
             spec=sub_pool.spec,
+            pool_name=PoolName(sub_pool.external.host_pool),
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
             page_size=plan.page_size,
         )
     return MHAView(
         arena=arena,
         spec=sub_pool.spec,
+        pool_name=PoolName(sub_pool.external.host_pool),
         page_size=plan.page_size,
         model_layer_ids=tuple(sub_pool.layer_ids),
         start_layer=ctx.start_layer,

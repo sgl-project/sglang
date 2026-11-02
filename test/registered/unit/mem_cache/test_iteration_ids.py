@@ -39,6 +39,7 @@ from unittest.mock import patch
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc import runner_ids
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
@@ -202,6 +203,7 @@ class TestIterationIds(CustomTestCase):
         draft_pool = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             layer_lanes={0: 0},
             page_size=_PS,
         )

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         DevicePoolInfo,
         PageEnvelopeBufferInfo,
     )
+    from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.kv.memory.arena import KVArena
 
 
@@ -210,6 +211,7 @@ class MHAView(MHAKVView):
         *,
         arena: "KVArena",
         spec: MHASubPoolSpec,
+        pool_name: "PoolName",
         page_size: int,
         model_layer_ids: Tuple[int, ...],
         start_layer: int = 0,
@@ -220,6 +222,7 @@ class MHAView(MHAKVView):
         self._bind(
             arena=arena,
             sub_pool=spec.name,
+            pool_name=pool_name,
             k_buffer=k_buffer,
             v_buffer=v_buffer,
             head_num=spec.head_num,
@@ -239,6 +242,7 @@ class MHAView(MHAKVView):
         *,
         arena: "KVArena",
         sub_pool: str,
+        pool_name: "PoolName",
         k_buffer: List[torch.Tensor],
         v_buffer: List[torch.Tensor],
         head_num: int,
@@ -254,6 +258,8 @@ class MHAView(MHAKVView):
     ) -> None:
         self._arena = arena
         self._sub_pool_name = sub_pool
+        # The host pool this view's sub-pool mirrors, e.g. SWA for a window sub-pool.
+        self.pool_name = pool_name
         self.k_buffer, self.v_buffer = k_buffer, v_buffer
         # The pages the view spans, and one page envelope's bytes (all layers).
         self.num_pages = arena.extent_entries(sub_pool) // page_size
@@ -474,7 +480,6 @@ class MHAView(MHAKVView):
             KVBuffers,
             MHABufferInfo,
         )
-        from sglang.srt.mem_cache.hicache_storage import PoolName
 
         buffers = KVBuffers(
             k=tuple(self.k_buffer),
@@ -485,8 +490,8 @@ class MHAView(MHAKVView):
         )
         return (
             DevicePoolInfo(
-                pool_name=PoolName.KV,
-                indices_from_pool=PoolName.KV,
+                pool_name=self.pool_name,
+                indices_from_pool=self.pool_name,
                 layer_ids=self.model_layer_ids,
                 buffer_info=MHABufferInfo(
                     buffers=buffers,
@@ -581,6 +586,7 @@ class DraftMHAView(MHAView):
         *,
         arena: "KVArena",
         host_spec: SubPoolSpec,
+        pool_name: "PoolName",
         layer_lanes: "dict[int, int]",
         page_size: int,
     ):
@@ -603,6 +609,7 @@ class DraftMHAView(MHAView):
         self._bind(
             arena=arena,
             sub_pool=host_spec.name,
+            pool_name=pool_name,
             k_buffer=[k_views[lane] for lane in lanes],
             v_buffer=[v_views[lane] for lane in lanes],
             head_num=region.head_num,

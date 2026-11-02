@@ -21,6 +21,7 @@ GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
 `test_unified_mla_gpu_parity.py`.
 """
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import arena_of
 
@@ -179,6 +180,7 @@ class TestMLAView(unittest.TestCase):
         kv_pool = MLAView(
             arena=pool,
             spec=pool.spec("full"),
+            pool_name=PoolName.KV,
             kv_cache_dtype=_DTYPE,
             page_size=ps,
         )

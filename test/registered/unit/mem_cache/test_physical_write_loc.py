@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
@@ -108,6 +109,7 @@ def _unified_mha_pool(ps=1):
     return MHAView(
         arena=kv,
         spec=kv.spec("full"),
+        pool_name=PoolName.KV,
         page_size=ps,
         model_layer_ids=tuple(range(full.layer_num)),
         enable_alt_stream=False,

@@ -1,3 +1,4 @@
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
@@ -59,6 +60,7 @@ def _build(device, page_size=1):
     kvcache = MLAView(
         arena=buf,
         spec=buf.spec("full"),
+        pool_name=PoolName.KV,
         kv_cache_dtype=torch.bfloat16,
         page_size=page_size,
     )
@@ -102,6 +104,7 @@ def _build_mha(device, page_size=8):
     kvcache = MHAView(
         arena=buf,
         spec=buf.spec("full"),
+        pool_name=PoolName.KV,
         page_size=page_size,
         model_layer_ids=tuple(range(buf.spec("full").layer_num)),
     )
@@ -157,12 +160,14 @@ def _build_tri(device, page_size=4):
         full_kv_pool=MHAView(
             arena=buf,
             spec=buf.spec("full"),
+            pool_name=PoolName.KV,
             page_size=page_size,
             model_layer_ids=tuple(range(buf.spec("full").layer_num)),
         ),
         swa_kv_pool=MHAView(
             arena=buf,
             spec=buf.spec("swa"),
+            pool_name=PoolName.SWA,
             page_size=page_size,
             model_layer_ids=tuple(range(buf.spec("swa").layer_num)),
         ),
