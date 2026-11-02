@@ -49,17 +49,23 @@ class DFlashVerifyInput(SpecInput):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
+    @property
+    def num_tokens_per_req(self) -> int:
+        # ForwardBatch uses this when padding target verification for DP sync.
+        return self.draft_token_num
+
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        defer_metadata_init: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. This helper only packages the verify forward and pre-initializes either CUDA-graph replay
-        metadata or eager attention metadata so the actual forward can run with
-        `skip_attn_backend_init=True`.
+        method is called. Pre-plan graph replay; eager attention planning is
+        deferred until ModelRunner has applied DP padding.
         """
         batch.input_ids = self.draft_token
         batch.spec_info = self
@@ -71,6 +77,10 @@ class DFlashVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
+        if defer_metadata_init:
+            # The runner owns the final graph decision and padded attention plan.
+            return verify_forward_batch, False
+
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run(
@@ -81,10 +91,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            verify_forward_batch.mark_forward_metadata_ready()
 
         return verify_forward_batch, can_run_cuda_graph
 

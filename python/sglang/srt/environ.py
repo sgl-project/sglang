@@ -344,6 +344,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
+    # DFLASH's decode clock advances per iteration, while its KV grows by up
+    # to one speculative block. Opt in to evaluate reclamation overhead.
+    SGLANG_DFLASH_SWA_TOKEN_INTERVAL = EnvBool(False)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
@@ -659,6 +662,8 @@ class Envs:
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
     # Fuse compact-window request-table preparation without reading GPU sizes.
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
+    # Keep target graphs enabled while comparing eager and captured DP drafts.
+    SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

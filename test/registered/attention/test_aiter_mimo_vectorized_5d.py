@@ -2658,12 +2658,18 @@ def test_query_fp8_quantization_rejects_prequantized_input():
         aiter_utils.quantize_query_per_tensor_fp8(q)
 
 
-@pytest.mark.parametrize("query_length", [4, 8])
-def test_flydsl_target_verify_accepts_bf16_vectorized_5d(query_length):
+@pytest.mark.parametrize(
+    "configured_query_length,decode",
+    [(1, True), (4, True), (8, True), (4, False), (8, False)],
+)
+def test_flydsl_full_attention_uses_correct_context_lengths(
+    monkeypatch, configured_query_length, decode
+):
+    query_length = 1 if decode else configured_query_length
     batch_size = 2
     partitions = 8
     equivalent_group = query_length * 16
-    scalar_numel = batch_size * partitions * equivalent_group
+    scalar_numel = batch_size * partitions * configured_query_length * 16
     captured = {}
 
     def fake_pa_decode_tile(**kwargs):
@@ -2671,7 +2677,10 @@ def test_flydsl_target_verify_accepts_bf16_vectorized_5d(query_length):
         kwargs["output"].fill_(3.0)
 
     block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    if decode:
+        block_tables = torch.cat((block_tables, torch.zeros_like(block_tables)))
     backend = SimpleNamespace(
+        _use_flydsl_pa_decode=True,
         _flydsl_pa_decode_tile=fake_pa_decode_tile,
         _flydsl_pa_decode_num_partitions=partitions,
         _flydsl_pa_decode_pmax=torch.empty(scalar_numel, dtype=torch.float32),
@@ -2679,7 +2688,7 @@ def test_flydsl_target_verify_accepts_bf16_vectorized_5d(query_length):
         _flydsl_pa_decode_pout=torch.empty(scalar_numel * 128, dtype=torch.bfloat16),
         _flydsl_pa_decode_context_lengths=torch.empty(batch_size, dtype=torch.int32),
         _flydsl_pa_decode_workspace_max_bs=batch_size,
-        _flydsl_pa_decode_query_length=query_length,
+        _flydsl_pa_decode_query_length=configured_query_length,
         forward_metadata=SimpleNamespace(
             max_q_len=query_length,
             kv_indices=block_tables,
@@ -2705,7 +2714,16 @@ def test_flydsl_target_verify_accepts_bf16_vectorized_5d(query_length):
     k_cache = torch.zeros((4, 1, 24, 64, 8), dtype=torch.bfloat16)
     v_cache = torch.zeros((4, 1, 8, 128, 8), dtype=torch.bfloat16)
 
-    aiter_utils.forward_target_verify_flydsl_5d(
+    def unexpected_gluon(**kwargs):
+        pytest.fail("Explicit FlyDSL full decode must not enter Gluon")
+
+    monkeypatch.setattr(aiter_utils, "pa_decode_gluon", unexpected_gluon)
+    forward = (
+        aiter_utils.forward_decode_vectorized_5d
+        if decode
+        else aiter_utils.forward_target_verify_flydsl_5d
+    )
+    forward(
         backend,
         q,
         layer,
@@ -2720,9 +2738,10 @@ def test_flydsl_target_verify_accepts_bf16_vectorized_5d(query_length):
     assert captured["value_cache"] is v_cache
     assert captured["key_scale"] is None
     assert captured["value_scale"] is None
+    assert captured["block_tables"].shape[0] == batch_size
     assert captured["context_lengths"].tolist() == [
-        100 + query_length,
-        120 + query_length,
+        100 + (0 if decode else query_length),
+        120 + (0 if decode else query_length),
     ]
     assert captured["query"].shape == (batch_size * query_length, 16, 192)
     assert captured["output"].shape == (batch_size * query_length, 16, 128)
@@ -3581,9 +3600,11 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
 
     def fake_compile_pa_decode_tile(**kwargs):
         captured["tile"] = kwargs
+        captured.setdefault("tiles", []).append(kwargs)
 
     def fake_compile_pa_decode_reduce(**kwargs):
         captured["reduce"] = kwargs
+        captured.setdefault("reduces", []).append(kwargs)
 
     kernels = SimpleNamespace(
         pa_decode_tile=lambda **kwargs: None,
@@ -3605,6 +3626,11 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
     monkeypatch.setattr(aiter_backend, "get_flydsl_mimo_num_partitions", lambda: 8)
     monkeypatch.setattr(aiter_backend, "load_flydsl_pa_decode_kernels", lambda: kernels)
     monkeypatch.setattr(
+        aiter_backend,
+        "warmup_flydsl_full_decode",
+        lambda backend: captured.setdefault("warmups", []).append(backend),
+    )
+    monkeypatch.setattr(
         aiter_backend.AiterAttnBackend,
         "_ensure_flydsl_pa_decode_workspace",
         lambda self, max_bs: None,
@@ -3612,7 +3638,7 @@ def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
     return captured
 
 
-@pytest.mark.parametrize("query_length", [4, 8])
+@pytest.mark.parametrize("query_length", [1, 4, 8])
 @pytest.mark.parametrize(
     "gfx942,gfx950",
     [(True, False), (False, True)],
@@ -3636,9 +3662,17 @@ def test_flydsl_bf16_decode_configuration_accepts_supported_arches(
     assert captured["tile"]["head_dim"] == 192
     assert captured["tile"]["v_head_dim"] == 128
     assert captured["tile"]["query_length"] == query_length
+    assert [item["query_length"] for item in captured["tiles"]] == sorted(
+        {1, query_length}
+    )
     assert captured["reduce"]["head_size"] == 128
     assert captured["reduce"]["query_group_size"] == 16
     assert "query_seq_len" not in captured["reduce"]
+    # The prepared flag prevents duplicate work on subsequent graph setup calls.
+    count = len(captured["tiles"])
+    backend._compile_flydsl_pa_decode()
+    assert len(captured["tiles"]) == count
+    assert captured["warmups"] == [backend]
 
 
 def test_flydsl_fp8_decode_compile_disables_bf16_kv(monkeypatch):

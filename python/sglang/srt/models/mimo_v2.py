@@ -96,6 +96,7 @@ from sglang.srt.models.mimo_v2_utils import (
     supports_native_mimo_vectorized_v_cache,
 )
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -1506,6 +1507,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        if self.visual.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
         return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -1515,6 +1520,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         video_grid_thw = torch.cat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        if self.visual.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+            )
         return self.visual(pixel_values, grid_thw=video_grid_thw)
 
     @torch.inference_mode()

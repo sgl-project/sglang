@@ -27,6 +27,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.draft_kv_budget import DFlashKVCacheBudget
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
@@ -120,6 +121,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+        draft_budget = getattr(mr, "dflash_draft_kv_budget", None)
+        if not isinstance(draft_budget, DFlashKVCacheBudget):
+            draft_budget = None
+        self._draft_fixed_bytes = draft_budget.fixed_bytes if draft_budget else 0
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -146,7 +151,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             draft_num_layers = mr.dflash_draft_num_layers
-            if (
+            if draft_budget is not None:
+                self._cell_size += draft_budget.cell_size
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -217,7 +224,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            available_bytes - self._draft_fixed_bytes
+        ) // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -248,6 +257,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+        draft_budget = getattr(mr, "dflash_draft_kv_budget", None)
+        if not isinstance(draft_budget, DFlashKVCacheBudget):
+            draft_budget = None
+        self._draft_fixed_bytes = draft_budget.fixed_bytes if draft_budget else 0
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -281,6 +294,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * self._swa_per_token
                 * self._swa_layers_num
             )
+        # The DFlash pool is indexed by full target slots even when its own
+        # attention window is compact. Charge every row, not the SWA ratio.
+        if draft_budget is not None:
+            self._cell_size += draft_budget.cell_size
 
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
@@ -322,7 +339,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = int(available_bytes // self._cell_size)
+        max_total_num_tokens = int(
+            (available_bytes - self._draft_fixed_bytes) // self._cell_size
+        )
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(

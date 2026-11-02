@@ -130,9 +130,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DFLASH with DP attention requires --enable-dp-lm-head.")
+        if server_args.attn_cp_size != 1:
+            raise ValueError("DFLASH with DP attention requires attention CP size 1.")
+        if (
+            server_args.enable_two_batch_overlap
+            or server_args.enable_single_batch_overlap
+        ):
+            raise ValueError("DFLASH with DP attention does not support TBO yet.")
 
     if server_args.pp_size != 1:
         raise ValueError(

@@ -696,6 +696,8 @@ class VisionAiterAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            window_size=kwargs.get("window_size", (-1, -1)),
+            sink_ptr=kwargs.get("s_aux"),
         )
 
 

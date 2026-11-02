@@ -296,7 +296,7 @@ class TpModelWorker(BaseTpWorker):
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
+            self.world_group.rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
         )[0]

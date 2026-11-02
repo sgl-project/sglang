@@ -2,8 +2,13 @@
 set -euo pipefail
 
 # Standalone MiMo-V2.6-Flash fake-prefill decode launcher for gfx942:
-# Convert checkpoint MXFP4 experts once at load time to FP8 128x128 blockscale
-# weights; activations remain dynamically quantized.
+# Default: convert checkpoint MXFP4 experts at load time to FP8 blockscale.
+# Native MXFP4 A16W4/A8W4: set SGLANG_MXFP4_TO_FP8_128BLOCK=0 and
+# AITER_CONFIG_FMOE=/path/to/flash_tp4_mxfp4_tuned_fmoe.csv. The CSV selects
+# A16W4/A8W4 kernels per token count; a mixed recipe need not use A8W4 in decode.
+# Requires AITER's gfx942 MXFP4 kernels (aiter PR #16) alongside Flash attention
+# support. Recipes must match Flash TP4: model_dim=4096, inter_dim=512,
+# expert=256, topk=8; Pro TP8 recipes have different shapes.
 # Match the validated accuracy launcher's FlyDSL and fusion defaults. Fused
 # MoE RMSNorm requires AITER's N=4096/6144 kernel and a rebuilt RMS module.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,8 +40,32 @@ if [[ -n "${AITER_ROOT:-}" ]]; then
 fi
 export PYTHONPATH="${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK=1
+export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-1}"
 export SGLANG_INT4_WEIGHT=0
+case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
+  1)
+    moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
+    ;;
+  0)
+    if [[ -z "${AITER_CONFIG_FMOE:-}" ]]; then
+      echo "Native MXFP4 requires AITER_CONFIG_FMOE with Flash TP4 A16W4/A8W4 recipes" >&2
+      exit 2
+    fi
+    if [[ "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
+      echo "AITER_CONFIG_FMOE is not readable: ${AITER_CONFIG_FMOE}" >&2
+      exit 2
+    fi
+    export AITER_CONFIG_FMOE
+    # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
+    # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
+    export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
+    moe_weight_description="native MXFP4 MoE weights; A16W4/A8W4 selected by AITER_CONFIG_FMOE"
+    ;;
+  *)
+    echo "SGLANG_MXFP4_TO_FP8_128BLOCK must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 # MiMo's encoder otherwise defaults to a CUDA-only attention implementation.
 export MM_ATTENTION_BACKEND=aiter_attn
 # gfx942 CK LINEAR prefill has no single-token generation-health kernel.
@@ -169,7 +198,8 @@ if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
   decode_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
 fi
 
-echo "MiMo-V2.6-Flash: static FP8 blockscale MoE weights converted from MXFP4 at load time"
+echo "MiMo-V2.6-Flash: ${moe_weight_description}"
+echo "MoE recipe file: ${AITER_CONFIG_FMOE:-auto}"
 echo "Configuration: model=${MODEL_PATH}, tp=4, dp=2, ep=1, max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
 echo "Attention: target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, target-swa=${SGLANG_AITER_TARGET_VERIFY_SWA_IMPL}, draft-swa=${SGLANG_AITER_DFLASH_SWA_IMPL}, qlen1=${SGLANG_AITER_VEC5D_TARGET_VERIFY_QLEN1}, decode-graph=${CUDA_GRAPH_BACKEND_DECODE}, decode-graph-bs=${CUDA_GRAPH_BS_DECODE:-default}"
 echo "Speculation: DFLASH, block=${DFLASH_BLOCK_SIZE}, draft=${SPECULATIVE_DRAFT_MODEL_PATH}, draft-attention=aiter/${SGLANG_AITER_DFLASH_SWA_IMPL}, draft-kv=bf16, draft-window=1024, acceptance=simulated"

@@ -128,6 +128,9 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_fuse_stable_router_weights = _is_hip and get_bool_env_var(
+    "SGLANG_MIMO_FUSED_STABLE_ROUTER_WEIGHTS"
+)
 _is_musa = is_musa()
 
 if _is_cuda:
@@ -1650,6 +1653,17 @@ def _stable_noaux_sigmoid_topk_weights(
     """Recompute noaux routed weights from selected ids without sigmoid underflow."""
     if topk_ids.numel() == 0:
         return torch.empty_like(topk_ids, dtype=torch.float32)
+
+    if _fuse_stable_router_weights and router_logits.is_cuda:
+        from sglang.srt.layers.moe.stable_router_weights import stable_router_weights
+
+        return stable_router_weights(
+            router_logits,
+            topk_ids,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
 
     selected_logits = router_logits.float().gather(1, topk_ids.long())
     selected_log_probs = F.logsigmoid(selected_logits)

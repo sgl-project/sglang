@@ -10,8 +10,7 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -37,6 +36,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import is_npu, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
 
 _is_npu = is_npu()
 if _is_npu:
@@ -73,7 +73,7 @@ class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
-        tp_size = int(get_tensor_model_parallel_world_size())
+        tp_size = get_tensor_model_parallel_world_size()
         total_num_heads = int(config.num_attention_heads)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
@@ -347,6 +347,8 @@ class DFlashDraftModel(nn.Module):
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
     """
+
+    draft_parallel_spec = DraftParallelSpec(DraftTPExecution.SINGLE_GROUP)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()

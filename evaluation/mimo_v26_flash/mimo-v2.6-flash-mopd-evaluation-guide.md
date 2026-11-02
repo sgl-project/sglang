@@ -3,7 +3,9 @@
 ### gfx942
 
 ```bash
-docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem  -v $HOME:/root/workspace  -v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510
+docker run -it --name mimo-v26-flash-opt-gfx942 --ipc=host --network=host --privileged --security-opt seccomp=unconfined \
+--cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE --device=/dev/kfd --device=/dev/dri --device=/dev/mem  -v $HOME:/root/workspace  \
+-v /data/models:/models  rocm/sgl-dev:v0.5.11-rocm720-mi30x-20260510
 ```
 
 ## 2. Environment setup
@@ -44,16 +46,15 @@ Install FlyDSL runtime version that compatible with aiter
 pip install flydsl==0.3.2
 ```
 
-## 3. Run baseline single node prefill benchmark
+## 3. Run DP2/TP8 with dp attention baseline single node prefill benchmark
 
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
-
 
 ### Launch TBO-off server
 
 ```bash
 cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
-CHUNKED_PREFILL_SIZE=16384 \
+CHUNKED_PREFILL_SIZE=32768 \
 MEM_FRACTION_STATIC=0.75 \
 SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
@@ -61,7 +62,7 @@ DISABLE_RADIX_CACHE=1 \
 ENABLE_TWO_BATCH_OVERLAP=0 \
 SGLANG_FLYPA_MIMO_PREFILL=1 \
 SGLANG_AITER_PA_DECODE_IMPL=flydsl \
-./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
+./launch_mimo_v26_flash_dp2_tp8_ep1_dpa_accuracy_baseline.sh
 ```
 
 ### Run TBO-off prefill benchmark
@@ -71,35 +72,7 @@ cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
-MiMo-V2.6-Flash-MOPD DP2 x TP4 baseline defaults to `ENABLE_TWO_BATCH_OVERLAP=0`.
-To opt into prefill-only TBO, stop the existing server and launch with:
-
-```bash
-cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
-CHUNKED_PREFILL_SIZE=16384 \
-MEM_FRACTION_STATIC=0.75 \
-SWA_FULL_TOKENS_RATIO=0.03 \
-MAX_RUNNING_REQUESTS=96 \
-DISABLE_RADIX_CACHE=1 \
-ENABLE_TWO_BATCH_OVERLAP=1 \
-SGLANG_FLYPA_MIMO_PREFILL=1 \
-SGLANG_AITER_PA_DECODE_IMPL=flydsl \
-./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
-```
-
-### Run TBO-on prefill benchmark
-
-```bash
-cd /sgl-workspace/sglang/evaluation/
-./run_benchmark_mimo_pro_prefill.sh
-```
-
-Each DP replica overlaps its own TP4 collectives. DP attention remains disabled;
-ordinary prefill can use TBO, while DFlash draft/verify and decode retain their
-existing paths.
-
-
-## 4. Run baseline single node decode benchmark with fake prefill
+## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 
 The standalone fake-prefill launcher defines the Flash baseline settings:
 TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
@@ -139,7 +112,7 @@ SWA_FULL_TOKENS_RATIO=0.03 \
 MAX_RUNNING_REQUESTS=96 \
 SGLANG_FLYPA_MIMO_PREFILL=1 \
 SGLANG_AITER_PA_DECODE_IMPL=flydsl \
-  ./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_decode_fake_prefill_baseline.sh
+./launch_mimo_v26_flash_dp2_tp8_ep1_dpa_decode_fake_prefill_baseline.sh
 ```
 
 Use `DRY_RUN=1` to inspect the command without starting the server.
@@ -176,7 +149,7 @@ python3 analyze_server_output_throughput.py \
 Use the analyzer's filtered server median as the reported output throughput.
 Repeat with `--dp-rank 1` for the other replica. Each scheduler reports its own
 running requests and throughput: at balanced client concurrency 128, use
-`--target-bs 64` per replica. Verify residency in the log before choosing this value. The analyzer requires explicit replica selection for logs containing multiple DP ranks. Report both medians; their sum is an aggregate estimate, not a time-aligned node-wide median. 
+`--target-bs 64` per replica. Verify residency in the log before choosing this value. The analyzer requires explicit replica selection for logs containing multiple DP ranks. Report both medians; their sum is an aggregate estimate, not a time-aligned node-wide median.
 
 The analyzer reports the following median-consistent derived values:
 
@@ -188,7 +161,153 @@ TPOT (ms)   = 1000 * C-per-replica / filtered replica median
 The analyzer also retains `mean_tpot_ms` and `mean_tps_per_request` as explicit
 mean-based reference values.
 
-## 5. Profiling & Analysis
+<details>
+<summary>5. Run DP2/TP4 w/o dp attention baseline single node prefill benchmark</summary>
+The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
+
+### Launch TBO-off server
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+CHUNKED_PREFILL_SIZE=16384 \
+MEM_FRACTION_STATIC=0.75 \
+SWA_FULL_TOKENS_RATIO=0.03 \
+MAX_RUNNING_REQUESTS=96 \
+DISABLE_RADIX_CACHE=1 \
+ENABLE_TWO_BATCH_OVERLAP=0 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
+./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
+```
+
+### Run TBO-off prefill benchmark
+
+```bash
+cd /sgl-workspace/sglang/evaluation/
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+MiMo-V2.6-Flash-MOPD DP2 x TP4 baseline defaults to `ENABLE_TWO_BATCH_OVERLAP=0`.
+To opt into prefill-only TBO, stop the existing server and launch with:
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+CHUNKED_PREFILL_SIZE=16384 \
+MEM_FRACTION_STATIC=0.75 \
+SWA_FULL_TOKENS_RATIO=0.03 \
+MAX_RUNNING_REQUESTS=96 \
+DISABLE_RADIX_CACHE=1 \
+ENABLE_TWO_BATCH_OVERLAP=1 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
+./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_accuracy_baseline.sh
+```
+
+### Run DP2/TP4 w/o dp attention TBO-on prefill benchmark
+
+```bash
+cd /sgl-workspace/sglang/evaluation/
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+Each DP replica overlaps its own TP4 collectives. DP attention remains disabled;
+ordinary prefill can use TBO, while DFlash draft/verify and decode retain their
+existing paths.
+
+</details>
+
+<details>
+<summary> 6. Run DP2/TP4 w/o dp attention baseline single node decode benchmark with fake prefill</summary>
+
+The standalone fake-prefill launcher defines the Flash baseline settings:
+TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
+FlyDSL attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
+It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
+Acceptance is simulated at length 4 using `SGLANG_SIMULATE_ACC_LEN=4` and
+`SGLANG_SIMULATE_ACC_METHOD=match-expected`, matching the Pro fake-prefill
+reference. This gives a controlled acceptance length for decode throughput
+comparisons. Fake prefill skips prompt computation, so these runs measure
+performance; use the accuracy launcher with real prefill to evaluate accuracy.
+
+The fake-prefill decode capacity must fit both the full-token and SWA-token
+pools:
+
+```text
+(C + 1) * (ISL + OSL) <= token_capacity
+(C + 1) * OSL         <= swa_layer_tokens
+```
+
+Apply these bounds per DP replica, using its admitted request count. Read each
+worker's `token_capacity` from
+`/server_info` -> `internal_states[].memory_usage.token_capacity`, and its
+`swa_layer_tokens` from the server initialization log.
+
+If SWA is the smaller bound for a short-ISL
+case, increase `SWA_FULL_TOKENS_RATIO` only until the SWA slot count is at
+least the full-token slot count (or the desired concurrency cap). Allocating
+more than that reduces the full-token pool without increasing concurrency.
+
+### Launch server
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+MEM_FRACTION_STATIC=0.75 \
+DISABLE_RADIX_CACHE=1 \
+SWA_FULL_TOKENS_RATIO=0.03 \
+MAX_RUNNING_REQUESTS=96 \
+SGLANG_FLYPA_MIMO_PREFILL=1 \
+SGLANG_AITER_PA_DECODE_IMPL=flydsl \
+./launch_mimo_v26_flash_dp2_tp4_ep1_dflash_decode_fake_prefill_baseline.sh
+```
+
+Use `DRY_RUN=1` to inspect the command without starting the server.
+
+### Run the matching decode point
+
+```bash
+cd /sgl-workspace/sglang/evaluation
+MODEL=/models/MiMo-V2.6-Flash-MOPD/ \
+CASE_SPECS='65536|65536|64k|128' \
+PROMPT_WAVES=4 \
+WARMUP_REQUESTS=32 \
+./run_benchmark_mimo_pro_decode_fake_prefill_matrix.sh
+```
+
+The client uses explicit token IDs, so no four-token subtraction is needed.
+At the 1M context boundary, reserve additional slots for the scheduler:
+use `CASE_SPECS='1047548|1047548|1m|10'` for 1,024 output tokens. An input
+length of 1,047,552 leaves no scheduler margin and is capped at 1,022 output
+tokens. This margin is separate from tokenizer special tokens.
+
+### Run decode throughput analysis
+
+```bash
+python3 analyze_server_output_throughput.py \
+  <path-to-server-log> \
+  --dp-rank 0 \
+  --target-bs <C-per-replica> \
+  --exact-bs \
+  --min-tps 40 \
+  --max-tpot 25
+```
+
+Use the analyzer's filtered server median as the reported output throughput.
+Repeat with `--dp-rank 1` for the other replica. Each scheduler reports its own
+running requests and throughput: at balanced client concurrency 128, use
+`--target-bs 64` per replica. Verify residency in the log before choosing this value. The analyzer requires explicit replica selection for logs containing multiple DP ranks. Report both medians; their sum is an aggregate estimate, not a time-aligned node-wide median.
+
+The analyzer reports the following median-consistent derived values:
+
+```text
+TPS/request = filtered replica median / C-per-replica
+TPOT (ms)   = 1000 * C-per-replica / filtered replica median
+```
+
+The analyzer also retains `mean_tpot_ms` and `mean_tps_per_request` as explicit mean-based reference values.
+
+</details>
+
+## 7. Profiling & Analysis
 
 ```bash
 cd /sgl-workspace/sglang/evaluation

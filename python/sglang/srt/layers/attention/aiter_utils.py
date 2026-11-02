@@ -2541,10 +2541,9 @@ def forward_decode_vectorized_5d(
 ) -> None:
     """``forward_decode`` specialization for the SHUFFLE 5D KV pool.
 
-    Runs ``pa_decode_gluon`` for both full-attention and sliding-window
-    layers — when SHUFFLE 5D is active the SWA sub-pool is also
-    allocated 5D (see ``SWAKVPool`` ctor), so we keep one decode kernel
-    instead of falling back to ``unified_attention`` for SWA layers.
+    Honors the full-attention FlyDSL selector for ordinary one-token decode.
+    SWA retains its independent selector. The Gluon route handles the
+    explicitly selected Gluon configuration and remaining SWA cases.
 
     The choice between the two layer kinds is purely metadata:
 
@@ -2574,6 +2573,20 @@ def forward_decode_vectorized_5d(
     is_swa_layer = (
         layer.sliding_window_size is not None and layer.sliding_window_size > -1
     )
+    if getattr(backend, "_use_flydsl_pa_decode", False) and not is_swa_layer:
+        _forward_full_flydsl_5d(
+            backend,
+            q,
+            layer,
+            forward_batch,
+            k_cache,
+            v_cache,
+            o,
+            sinks,
+            query_length=1,
+            context_includes_query=True,
+        )
+        return
 
     if is_swa_layer:
         block_tables_pa = (
@@ -2645,9 +2658,9 @@ def _get_flydsl_workspace_views(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_partitions = backend._flydsl_pa_decode_num_partitions
     configured_query_length = int(backend._flydsl_pa_decode_query_length)
-    if query_length != configured_query_length:
+    if query_length not in (1, configured_query_length):
         raise RuntimeError(
-            "FlyDSL PA decode was prepared for query_length="
+            "FlyDSL PA decode was prepared for query_length=1 or "
             f"{configured_query_length}, got {query_length}"
         )
     equivalent_group_size = query_length * (
@@ -2696,12 +2709,39 @@ def forward_target_verify_flydsl_5d(
     output: torch.Tensor,
     sinks,
 ) -> None:
-    """Run the exact MiMo phase-1 full TARGET_VERIFY shape with FlyDSL."""
+    """Run full TARGET_VERIFY; seq_lens excludes the verification queries."""
+    _forward_full_flydsl_5d(
+        backend,
+        q,
+        layer,
+        forward_batch,
+        k_cache,
+        v_cache,
+        output,
+        sinks,
+        query_length=int(backend.forward_metadata.max_q_len),
+        context_includes_query=False,
+    )
+
+
+def _forward_full_flydsl_5d(
+    backend: AiterAttnBackend,
+    q: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    output: torch.Tensor,
+    sinks,
+    *,
+    query_length: int,
+    context_includes_query: bool,
+) -> None:
+    """Shared full-attention transport for decode and causal verification."""
 
     if getattr(backend, "_flydsl_pa_decode_tile", None) is None:
         raise RuntimeError("FlyDSL PA decode was selected but is not initialized")
 
-    query_length = int(backend.forward_metadata.max_q_len)
     batch_size = int(forward_batch.batch_size)
     num_q_heads = int(layer.tp_q_head_num)
     num_kv_heads = int(layer.tp_k_head_num)
@@ -2710,7 +2750,7 @@ def forward_target_verify_flydsl_5d(
 
     if query_length not in FLYDSL_MIMO_QUERY_LENGTHS:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires query_length in "
+            "FlyDSL MiMo full attention requires query_length in "
             f"{FLYDSL_MIMO_QUERY_LENGTHS}; got {query_length}"
         )
     if (num_q_heads, num_kv_heads) != (
@@ -2718,47 +2758,49 @@ def forward_target_verify_flydsl_5d(
         FLYDSL_MIMO_KV_HEADS,
     ):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires 16 Q heads and 1 KV head; "
+            "FlyDSL MiMo full attention requires 16 Q heads and 1 KV head; "
             f"got {num_q_heads}/{num_kv_heads}"
         )
     if head_dim != FLYDSL_MIMO_HEAD_DIM or v_head_dim != FLYDSL_MIMO_VALUE_HEAD_DIM:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires QK/V head dimensions "
+            "FlyDSL MiMo full attention requires QK/V head dimensions "
             f"192/128; got {head_dim}/{v_head_dim}"
         )
     if backend.page_size != FLYDSL_MIMO_PAGE_SIZE:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires page_size=64; "
+            "FlyDSL MiMo full attention requires page_size=64; "
             f"got {backend.page_size}"
         )
     if layer.sliding_window_size is not None and int(layer.sliding_window_size) > -1:
-        raise ValueError("FlyDSL MiMo phase 1 does not support sliding-window layers")
+        raise ValueError(
+            "FlyDSL MiMo full attention does not support sliding-window layers"
+        )
     if sinks is not None:
-        raise ValueError("FlyDSL MiMo phase 1 does not support attention sinks")
+        raise ValueError("FlyDSL MiMo full attention does not support attention sinks")
     if float(layer.logit_cap or 0.0) != 0.0:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY does not support attention logit "
+            "FlyDSL MiMo full attention does not support attention logit "
             f"soft-capping; got logit_cap={layer.logit_cap}"
         )
     if backend.kv_cache_dtype not in (fp8_dtype, torch.bfloat16):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires FP8 E4M3 or BF16 KV cache; "
+            "FlyDSL MiMo full attention requires FP8 E4M3 or BF16 KV cache; "
             f"got {backend.kv_cache_dtype}"
         )
     if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires BF16 query and output; "
+            "FlyDSL MiMo full attention requires BF16 query and output; "
             f"got {q.dtype}/{output.dtype}"
         )
     if q.shape != (batch_size * query_length, num_q_heads * head_dim):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY query shape mismatch: expected "
+            "FlyDSL MiMo full attention query shape mismatch: expected "
             f"{(batch_size * query_length, num_q_heads * head_dim)}, got "
             f"{tuple(q.shape)}"
         )
     if output.shape != (batch_size * query_length, num_q_heads * v_head_dim):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY output shape mismatch: expected "
+            "FlyDSL MiMo full attention output shape mismatch: expected "
             f"{(batch_size * query_length, num_q_heads * v_head_dim)}, got "
             f"{tuple(output.shape)}"
         )
@@ -2778,19 +2820,19 @@ def forward_target_verify_flydsl_5d(
     )
     if k_cache.ndim != 5 or tuple(k_cache.shape[1:]) != expected_k_tail:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY K-cache layout mismatch: expected "
+            "FlyDSL MiMo full attention K-cache layout mismatch: expected "
             f"[blocks, {', '.join(map(str, expected_k_tail))}], got "
             f"{tuple(k_cache.shape)}"
         )
     if v_cache.ndim != 5 or tuple(v_cache.shape[1:]) != expected_v_tail:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY V-cache layout mismatch: expected "
+            "FlyDSL MiMo full attention V-cache layout mismatch: expected "
             f"[blocks, {', '.join(map(str, expected_v_tail))}], got "
             f"{tuple(v_cache.shape)}"
         )
     if k_cache.shape[0] != v_cache.shape[0]:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires K/V caches with the same "
+            "FlyDSL MiMo full attention requires K/V caches with the same "
             f"block count; got {k_cache.shape[0]}/{v_cache.shape[0]}"
         )
     expected_element_size = 2 if backend.kv_cache_dtype == torch.bfloat16 else 1
@@ -2801,30 +2843,34 @@ def forward_target_verify_flydsl_5d(
         or v_cache.element_size() != expected_element_size
     ):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY cache storage does not match the "
+            "FlyDSL MiMo full attention cache storage does not match the "
             f"configured KV dtype; got {k_cache.dtype}/{v_cache.dtype}"
         )
 
     block_tables = backend.forward_metadata.kv_indices
+    # Ordinary decode graph metadata retains the max-BS allocation. A leading
+    # view supplies this capture's active rows without changing its device pointer.
+    if context_includes_query and block_tables.ndim == 2:
+        block_tables = block_tables[:batch_size]
     if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires a two-dimensional int32 "
+            "FlyDSL MiMo full attention requires a two-dimensional int32 "
             f"block table; got shape={tuple(block_tables.shape)}, "
             f"dtype={block_tables.dtype}"
         )
     if block_tables.shape[0] != batch_size:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY block-table batch mismatch: "
+            "FlyDSL MiMo full attention block-table batch mismatch: "
             f"expected {batch_size}, got {block_tables.shape[0]}"
         )
     if forward_batch.seq_lens.dtype not in (torch.int32, torch.int64):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires integral sequence lengths; "
+            "FlyDSL MiMo full attention requires integral sequence lengths; "
             f"got {forward_batch.seq_lens.dtype}"
         )
     if forward_batch.seq_lens.shape != (batch_size,):
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY sequence-length shape mismatch: "
+            "FlyDSL MiMo full attention sequence-length shape mismatch: "
             f"expected {(batch_size,)}, got {tuple(forward_batch.seq_lens.shape)}"
         )
 
@@ -2832,7 +2878,7 @@ def forward_target_verify_flydsl_5d(
     output_view = output.view(-1, num_q_heads, v_head_dim)
     if q_view.stride(-1) != 1:
         raise ValueError(
-            "FlyDSL MiMo TARGET_VERIFY requires a contiguous query head axis"
+            "FlyDSL MiMo full attention requires a contiguous query head axis"
         )
 
     key_scale = None
@@ -2886,11 +2932,13 @@ def forward_target_verify_flydsl_5d(
                 f"FlyDSL MiMo {name} workspace must be {dtype} on {device}; "
                 f"got {workspace.dtype} on {workspace.device}"
             )
-    # SGLang uses int64 sequence lengths on ROCm.  Write the adjusted lengths
-    # directly into the persistent int32 FlyDSL buffer: torch.add's `out=`
-    # conversion is capture-safe and avoids a per-layer temporary allocation.
-    # The phase-1 context limit (1,048,576) is well within int32 range.
-    torch.add(forward_batch.seq_lens, query_length, out=context_lengths)
+    # Decode lengths include the query; verification lengths describe its prefix.
+    # Convert either convention into the persistent int32 buffer without a
+    # temporary allocation or a host/device synchronization.
+    if context_includes_query:
+        context_lengths.copy_(forward_batch.seq_lens)
+    else:
+        torch.add(forward_batch.seq_lens, query_length, out=context_lengths)
 
     backend._flydsl_pa_decode_tile(
         output=output_view,
@@ -2907,6 +2955,60 @@ def forward_target_verify_flydsl_5d(
         psum=psum,
         pout=pout,
     )
+
+
+def warmup_flydsl_full_decode(backend: AiterAttnBackend) -> None:
+    """Materialize the qlen=1 executable on owned scratch before graph capture.
+
+    AITER's compile_pa_decode_tile returns a JIT launcher; the first call with
+    tensor arguments compiles its executable. Preparing only that factory
+    leaves ordinary decode cold when startup captures TARGET_VERIFY instead.
+    """
+    vector = 8 if backend.kv_cache_dtype == torch.bfloat16 else 16
+    q = torch.zeros(
+        (1, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=backend.device,
+    )
+    output = torch.empty(
+        (1, FLYDSL_MIMO_QUERY_HEADS, FLYDSL_MIMO_VALUE_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=backend.device,
+    )
+    k_cache = torch.zeros(
+        (1, 1, FLYDSL_MIMO_HEAD_DIM // vector, FLYDSL_MIMO_PAGE_SIZE, vector),
+        dtype=backend.kv_cache_dtype,
+        device=backend.device,
+    )
+    v_cache = torch.zeros(
+        (1, 1, FLYDSL_MIMO_PAGE_SIZE // vector, FLYDSL_MIMO_VALUE_HEAD_DIM, vector),
+        dtype=backend.kv_cache_dtype,
+        device=backend.device,
+    )
+    table = torch.zeros((1, 1), dtype=torch.int32, device=backend.device)
+    pmax, psum, pout, lengths = _get_flydsl_workspace_views(backend, 1, 1)
+    lengths.fill_(1)
+    scale = (
+        torch.ones(1, dtype=torch.float32, device=backend.device)
+        if backend.kv_cache_dtype == fp8_dtype
+        else None
+    )
+    backend._flydsl_pa_decode_tile(
+        output=output,
+        query=q,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        block_tables=table,
+        context_lengths=lengths,
+        key_scale=scale,
+        value_scale=scale,
+        softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
+        num_partitions=backend._flydsl_pa_decode_num_partitions,
+        pmax=pmax,
+        psum=psum,
+        pout=pout,
+    )
+    torch.cuda.current_stream(backend.device).synchronize()
 
 
 def _split_swa_target_verify_queries() -> bool:

@@ -1667,8 +1667,8 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
         get_pp_group().graph_capture(context),
     ):
         with contextlib.ExitStack() as stack:
-            seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            seen = {id(_TP), id(_PP)}
+            for group in (_ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2022,7 +2022,9 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
+            # DP attention reductions and DP LM-head gathers run during graph
+            # capture even when sampling does not need token-ID synchronization.
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or attn_dp_size > 1,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
@@ -2229,7 +2231,9 @@ _TP_STATE_PATCHED = False
 
 
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
+def patch_tensor_parallel_group(
+    tp_group: GroupCoordinator, *, owns_attention: bool = False
+):
     """Patch the tp group temporarily until this function ends.
 
     This method is for draft workers of speculative decoding to run draft model
@@ -2237,20 +2241,31 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
+        owns_attention: isolate a dense PP1 draft's attention and MoE groups too.
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
-    _TP_STATE_PATCHED = True
+    global _TP, _ATTN_TP, _ATTN_CP, _MOE_TP, _MOE_EP, _MOE_DP
+    old_groups = (_ATTN_TP, _ATTN_CP, _MOE_TP, _MOE_EP, _MOE_DP)
+    if owns_attention:
+        # DFlash requires PP1, whose existing group is one rank per process.
+        singleton = get_pp_group()
+        if singleton.world_size != 1:
+            raise ValueError("An attention-owning draft requires pipeline size 1")
     old_tp_group = get_tp_group()
-    global _TP
+    _TP_STATE_PATCHED = True
     _TP = tp_group
+    if owns_attention:
+        _ATTN_TP = _MOE_TP = tp_group
+        _ATTN_CP = _MOE_EP = _MOE_DP = singleton
     try:
         yield
     finally:
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        _ATTN_TP, _ATTN_CP, _MOE_TP, _MOE_EP, _MOE_DP = old_groups
 
 
 def get_world_size():

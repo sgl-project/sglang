@@ -80,6 +80,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     prepare_flydsl_swa_forward_metadata,
     prepare_flydsl_target_verify_swa,
     prepare_swa_target_verify,
+    warmup_flydsl_full_decode,
 )
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -260,8 +261,8 @@ class AiterAttnBackend(AttentionBackend):
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
         # through `set_kv_buffer` (which dispatches to the 5D Triton writer),
-        # and (b) route the decode attention through pa_decode_gluon (see the
-        # corresponding branch in forward_decode), since unified_attention's
+        # and (b) route decode through the vectorized-5D kernel selector, since
+        # unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
             if isinstance(pool, SWAKVPool):
@@ -505,7 +506,7 @@ class AiterAttnBackend(AttentionBackend):
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
-            "ordinary full decode=AITER; runtime=%s (%s), kernel=%s, "
+            "ordinary full decode=FlyDSL; runtime=%s (%s), kernel=%s, "
             "partitions=%d, workspace_max_bs=%d",
             "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
@@ -574,7 +575,6 @@ class AiterAttnBackend(AttentionBackend):
             compile_kwargs["bf16_kv"] = self.kv_cache_dtype == torch.bfloat16
         else:
             raise RuntimeError("FlyDSL PA decode KV dtype API is not initialized")
-        self._flydsl_compile_pa_decode_tile(**compile_kwargs)
         reduce_kwargs = dict(
             max_context_partition_num=self._flydsl_pa_decode_num_partitions,
             query_group_size=16,
@@ -590,7 +590,16 @@ class AiterAttnBackend(AttentionBackend):
             )
         else:
             reduce_kwargs["query_seq_len"] = self._flydsl_pa_decode_query_length
-        self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
+        # Ordinary decode can run eagerly inside a mixed DP prefill forward,
+        # even when the target's captured phase is multi-token verification.
+        # Prepare qlen=1 as well, so that path does not introduce a cold kernel.
+        for query_length in sorted({1, self._flydsl_pa_decode_query_length}):
+            compile_kwargs["query_length"] = query_length
+            if not self._flydsl_pa_decode_reduce_uses_runtime_query_length:
+                reduce_kwargs["query_seq_len"] = query_length
+            self._flydsl_compile_pa_decode_tile(**compile_kwargs)
+            self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
+        warmup_flydsl_full_decode(self)
         self._flydsl_pa_decode_compiled = True
 
     def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
@@ -3016,7 +3025,7 @@ class AiterAttnBackend(AttentionBackend):
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
             if self.kv_cache_is_vectorized_5d:
-                # SHUFFLE 5D pool: pa_decode_gluon for full + SWA layers
+                # SHUFFLE 5D pool: honor the full/SWA implementation selectors
                 # (see :func:`aiter_utils.forward_decode_vectorized_5d`
                 # for the dispatch rationale).
                 forward_decode_vectorized_5d(

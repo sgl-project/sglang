@@ -239,6 +239,7 @@ class MiMoVisionTransformer(nn.Module):
         spatial_merge_size: int = vision_config.spatial_merge_size
         self.spatial_merge_size = spatial_merge_size
         self.spatial_merge_unit: int = spatial_merge_size * spatial_merge_size
+        self.out_hidden_size = vision_config.out_hidden_size
         in_channels: int = vision_config.in_channels
         hidden_size: int = vision_config.hidden_size
         depth: int = vision_config.depth

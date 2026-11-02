@@ -20,6 +20,48 @@ def _maxnumf(a, b):
     return type(a)(arith.maxnumf(arith.unwrap(a), arith.unwrap(b)))
 
 @flyc.jit
+def _mask_kv_tail_values(frag_v, block_n, kv_len, block_size: fx.Constexpr[int]):
+    """Zero unused V lanes; a zero probability does not suppress 0 * NaN."""
+    block_start = fx.Int32(block_n * block_size)
+    key_length = fx.Int32(kv_len)
+    if block_start + fx.Int32(block_size) > key_length:
+        # create_thr_mma packs two K-lane groups into 128-bit vector loads.
+        # Its register layout is (atom values, M tiles, (packed K, outer K)).
+        shape = frag_v.shape.to_py_value()
+        atom_values = shape[0]
+        head_tiles = shape[1]
+        if fx.const_expr(isinstance(shape[2], tuple)):
+            packed_k, outer_k = shape[2]
+        else:
+            # FP8's wider K atom consumes the whole BN tile in one outer step.
+            packed_k, outer_k = shape[2], 1
+        vector_values = 128 // frag_v.dtype.width
+        assert atom_values * packed_k == vector_values
+        assert 2 * vector_values * outer_k == block_size
+        count = atom_values * head_tiles * packed_k * outer_k
+        # Integer selects preserve valid FP8/BF16 bits and avoid FP8 scalar casts.
+        mask_type = {8: fx.Uint8, 16: fx.Uint16, 32: fx.Uint32}[frag_v.dtype.width]
+        values = Vec(frag_v.load(), (count,), frag_v.dtype).bitcast(mask_type)
+        masked = []
+        # Materialize wave-half bit 5 here. Hoisting these tail-only column
+        # offsets across the persistent loop spills values needed by the fast path.
+        lane_k = fx.Int32(llvm.inline_asm(
+            T.i32, [arith.unwrap(fx.Int32(fx.thread_idx.x))],
+            "v_bfe_u32 $0, $1, 5, 1", "=v,v", has_side_effects=True,
+        ))
+        for i in fx.range_constexpr(count):
+            k_i = i // (atom_values * head_tiles)
+            column = (
+                lane_k * fx.Int32(vector_values)
+                + fx.Int32((k_i % packed_k) * atom_values)
+                + fx.Int32((k_i // packed_k) * 2 * vector_values)
+                + fx.Int32(i % atom_values)
+            )
+            valid = block_start + column < key_length
+            masked.append(valid.select(values[i], mask_type(0)))
+        frag_v.store(Vec.from_elements(masked, mask_type).bitcast(frag_v.dtype))
+
+@flyc.jit
 def online_softmax(fragS, fragO, sm_scale_log2, old_max, l_in,
                    q_pos0, kv_block_n, kv_len, qo_len,
                    is_all_kv_valid: fx.Constexpr[bool],
@@ -166,7 +208,7 @@ def PagedAttention(
                       q_pos0, query_len, kv_len, full_qo_len,
                       ptr_kv_page_table,
                       num_kv_pages, last_page_len,
-                      qk_scale_log2, v_s):
+                      qk_scale_log2, v_s, mask_kv_tail: fx.Constexpr[bool], lds):
         tid = fx.thread_idx.x
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -238,15 +280,9 @@ def PagedAttention(
             else 128
         )
 
-        @fx.union
-        class SharedStorage:
-            k_lds: fx.Array[k_tile.dtype, 2 * BN * head_dim_qk, 16]
-            o_lds: fx.Array[o_tile.dtype, (BM//8) * head_dim_v, 16]
-
         # mask,base,shift, swizzle always in unit of 128b,
         swz_base = ((128 // k_tile.dtype.width) - 1).bit_length()
         swz = fx.SwizzleType.get(3, swz_base, 3)
-        lds = fx.SharedAllocator().allocate(SharedStorage)
         layout_k_lds = fx.make_composed_layout(
             fx.static(swz),
             fx.make_ordered_layout((BN, head_dim_qk, 2), (1, 0, 2)),
@@ -425,6 +461,8 @@ def PagedAttention(
                         prob_operand.store(packed_fp8)
                         probability_operand = prob_operand
                     fxh.s_waitcnt(vmcnt=0)
+                    if fx.const_expr(not is_all_kv_valid and mask_kv_tail):
+                        _mask_kv_tail_values(fragV, block_n, kv_len, BN)
                     fx.gemm(tmma2, fragO, fragV, probability_operand, fragO)
 
                 if fx.const_expr(is_valid_block_n(block_n + 1)):
@@ -601,6 +639,12 @@ def PagedAttention(
         q_row_stride: fx.Int64,
     ):
         tid = fx.thread_idx.x
+        # Both pipeline specializations reuse one workgroup-local LDS allocation.
+        @fx.union
+        class SharedStorage:
+            k_lds: fx.Array[K.dtype, 2 * BN * head_dim_qk, 16]
+            o_lds: fx.Array[O_.dtype, (BM//8) * head_dim_v, 16]
+        lds = fx.SharedAllocator().allocate(SharedStorage)
 
         batch_size = fx.size(cu_seqlens_q.shape).to_py_value() - 1
 
@@ -666,7 +710,10 @@ def PagedAttention(
 
         while batch_i < batch_size:
             # process the work
-            query_pos0 = cur_work_idx * BM
+            # Start later query tiles across heads first, so expensive tail
+            # work does not delay completion of the persistent queue.
+            work_in_batch = head_i * works_per_head + cur_work_idx
+            query_pos0 = (works_per_head - 1 - work_in_batch // num_qo_heads) * BM
             query_start = cu_seqlens_q[batch_i] + query_pos0
             query_end = fx.Int32(arith.minsi(arith.unwrap(query_start + BM), arith.unwrap(cu_seqlens_q[batch_i + 1])))
             query_len = query_end - query_start
@@ -686,7 +733,7 @@ def PagedAttention(
             page_size 是一个在kv-length维度上的天然的分块，因为我们步进 BN 选择了32,
             因此page_size也要求是32的倍数以降低复杂度。
             """
-            head_qo = head_i
+            head_qo = work_in_batch % num_qo_heads
             head_kv = (head_qo * num_kv_heads) // num_qo_heads
 
             # process:
@@ -782,11 +829,25 @@ def PagedAttention(
                                              fx.make_layout(num_kv_pages,1))
             buf_kv_page_table = fx.rocdl.make_buffer_tensor(buf_kv_page_table, max_size=False)
 
-            attn_pipeline(q_tile, k_tile, v_tile, o_tile,
-                          query_pos0, query_len, kv_len, full_qo_len,
-                          buf_kv_page_table,
-                          num_kv_pages,  last_page_len,
-                          qk_scale_log2, v_s)
+            # Compile ordinary tiles without the V mask and its register cost.
+            # A causal tile needs it only if its last query reaches the partial page.
+            needs_tail_mask = last_page_len < page_size
+            if fx.const_expr(is_causal):
+                needs_tail_mask = needs_tail_mask & (
+                    full_qo_len - query_pos0 - query_len < last_page_len
+                )
+            if needs_tail_mask:
+                attn_pipeline(q_tile, k_tile, v_tile, o_tile,
+                              query_pos0, query_len, kv_len, full_qo_len,
+                              buf_kv_page_table,
+                              num_kv_pages, last_page_len,
+                              qk_scale_log2, v_s, True, lds)
+            else:
+                attn_pipeline(q_tile, k_tile, v_tile, o_tile,
+                              query_pos0, query_len, kv_len, full_qo_len,
+                              buf_kv_page_table,
+                              num_kv_pages, last_page_len,
+                              qk_scale_log2, v_s, False, lds)
 
             next_linear_work_idx = fetch_work(work_counter, tid)
             linear_work_delta = next_linear_work_idx - linear_work_idx

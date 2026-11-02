@@ -312,9 +312,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_tbo_cuda_graph = is_tbo_cuda_graph_enabled(
-            model_runner.server_args
-        )
+        self.enable_tbo_cuda_graph = is_tbo_cuda_graph_enabled(model_runner.server_args)
         self.use_ngram_embedding = model_runner.use_ngram_embedding
         if self.use_ngram_embedding:
             hf_config = model_runner.model_config.hf_config

@@ -2857,12 +2857,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ),
             )
             eviction_interval = (eviction_interval // page_size) * page_size
+            use_dflash_token_interval = (
+                envs.SGLANG_DFLASH_SWA_TOKEN_INTERVAL.get()
+                and server_args.speculative_algorithm == "DFLASH"
+            )
+            if use_dflash_token_interval:
+                # decode_batch_idx is an iteration clock, not an accepted-
+                # token count. Bound the tokens accumulated between evictions
+                # by the maximum growth per DFLASH iteration. The committed
+                # sequence frontier passed to _evict_swa remains unchanged.
+                block_size = server_args.speculative_dflash_block_size
+                eviction_interval = max(1, eviction_interval // block_size)
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    # 2. Evict periodically to balance retained KV and reclamation overhead.
+                    should_evict = req.decode_batch_idx % eviction_interval == 1
+                    if use_dflash_token_interval:
+                        should_evict = (
+                            req.decode_batch_idx > 0
+                            and (req.decode_batch_idx - 1) % eviction_interval == 0
+                        )
+                    if should_evict:
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
