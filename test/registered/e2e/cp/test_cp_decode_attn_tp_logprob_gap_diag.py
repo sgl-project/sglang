@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 
 # Run only on demand via /rerun-test; never part of a scheduled suite.
 register_cuda_ci(
-    est_time=1500,
+    est_time=2100,
     stage="extra-b",
     runner_config="8-gpu-b300",
     disabled="diagnostic for test_cp_decode_attn_tp_server.py; run with /rerun-test",
@@ -77,6 +77,9 @@ CP_ARGS = [
     "interleave",
     "--enable-cp-decode-attn-tp",
 ]
+# Control: attention data parallel gives each rank all heads, as CP does, but
+# without CP prefill. A CP-vs-TP gap this server shares is layout noise.
+DP_ATTN_ARGS = ["--attn-dp-size", "8"]
 CASES = [[1], [257], [8193], [257 + 8 * i for i in range(4)]]
 # Prefixes of one 2100-token sequence, scored by prefill alone. Position p has
 # the same context in every prefix, so a CP-vs-TP gap that tracks p points at
@@ -137,7 +140,7 @@ class TestCpDecodeAttnTpLogprobGapDiag(CustomTestCase):
         response.raise_for_status()
         return response.json()
 
-    def _run_server(self, other_args, foreign_tokens=None):
+    def _run_server(self, other_args, foreign_tokens=None, run_cases=True):
         """Generate and rescore every case; optionally rescore foreign tokens."""
         process = popen_launch_server(
             self.model,
@@ -147,7 +150,7 @@ class TestCpDecodeAttnTpLogprobGapDiag(CustomTestCase):
         )
         try:
             out = {}
-            for lengths in CASES:
+            for lengths in CASES if run_cases else []:
                 key = str(lengths)
                 prompts = [self._prompt(n, i) for i, n in enumerate(lengths)]
                 gens = self._generate(prompts, OUTPUT_LEN)
@@ -211,21 +214,41 @@ class TestCpDecodeAttnTpLogprobGapDiag(CustomTestCase):
     def test_report_logprob_gaps(self):
         tp = self._run_server(COMMON_ARGS)
         cp = self._run_server(COMMON_ARGS + CP_ARGS, foreign_tokens=tp)
-        sweep = {}
-        for length in SWEEP_LENGTHS:
-            diff = np.abs(np.array(cp["sweep"][length]) - np.array(tp["sweep"][length]))
-            sweep[length] = {
-                "mean": round(float(diff.mean()), 4),
-                "max": round(float(diff.max()), 4),
-                "argmax": int(diff.argmax()),
-                "first_16": [round(float(x), 4) for x in diff[:16]],
-            }
-            print(
-                f"[sweep] len={length} mean={sweep[length]['mean']} "
-                f"max={sweep[length]['max']} at pos={sweep[length]['argmax']} "
-                f"first_16={sweep[length]['first_16']}"
+        servers = {"tp8": tp, "cp8": cp}
+        try:
+            servers["dpattn8"] = self._run_server(
+                COMMON_ARGS + DP_ATTN_ARGS, run_cases=False
             )
+        except Exception as e:
+            print(f"[sweep] dpattn8 server failed, control skipped: {e!r}")
+        sweep = {}
+        for a, b in (("cp8", "tp8"), ("dpattn8", "tp8"), ("cp8", "dpattn8")):
+            if a not in servers or b not in servers:
+                continue
+            for length in SWEEP_LENGTHS:
+                diff = np.abs(
+                    np.array(servers[a]["sweep"][length])
+                    - np.array(servers[b]["sweep"][length])
+                )
+                row = {
+                    "mean": round(float(diff.mean()), 4),
+                    "max": round(float(diff.max()), 4),
+                    "argmax": int(diff.argmax()),
+                    "first_16": [round(float(x), 4) for x in diff[:16]],
+                }
+                sweep[f"{a}_vs_{b}_{length}"] = row
+                print(
+                    f"[sweep] {a} vs {b} len={length} mean={row['mean']} "
+                    f"max={row['max']} at pos={row['argmax']} "
+                    f"first_16={row['first_16']}"
+                )
+        # Raw logprobs too, so the direction of each gap is visible.
+        raw = {
+            name: {length: s["sweep"][length][:64] for length in (33, 257, 2100)}
+            for name, s in servers.items()
+        }
         print("CP_PREFILL_SWEEP_REPORT " + json.dumps(sweep))
+        print("CP_PREFILL_SWEEP_RAW " + json.dumps(raw))
         report = {}
         for key in tp:
             if key == "sweep":
