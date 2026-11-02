@@ -26,8 +26,11 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
@@ -108,7 +111,11 @@ def _scheduler():
     s.forward_sleep_time = None
     s.enable_staging = False
     # process_batch_result, with the mode-specific processing mocked
-    s._deferred_responses = None
+    s.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     s.publish_load_snapshot = Mock()
     s.load_publisher = MagicMock()
     s.load_inquirer = MagicMock()
@@ -211,6 +218,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_hisparse = False
         s.chunked_req = None
         s.invariant_checker = _invariant_checker(s)
+        s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
         s._engine_paused = False
@@ -292,7 +300,7 @@ class TestRunningReqsHooks(CustomTestCase):
             kv=SimpleNamespace(holds_mamba=False),
         )
 
-        class _Adder:
+        class _Adder(PrefillAdder):
             def __init__(self, page_size, tree_cache, allocator, batch, *_, **__):
                 self.running_batch = batch
                 self.can_run_list = []

@@ -495,8 +495,9 @@ def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
 
 @pytest.mark.parametrize("hosts", [True, False], ids=["host", "non-host"])
 def test_listener_rank_installs_the_sigterm_drain(hosts):
-    # Every rank joins the endpoint gather; only a listener rank launches the
-    # server, and it drains on SIGTERM, reporting to the launcher's socket.
+    # Every rank joins the endpoint and frontend-CPU gathers; only a listener
+    # rank launches the server, with its CPU share, and it drains on SIGTERM,
+    # reporting to the launcher's socket.
     from sglang.test.test_utils import maybe_stub_sgl_kernel
 
     maybe_stub_sgl_kernel()
@@ -506,6 +507,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     server_class = MagicMock()
     server_class.launch.return_value = server
     server_class.gather_server_endpoints.return_value = []
+    server_class.gather_frontend_cpu_share.return_value = (1, 2)
     scheduler = SimpleNamespace(
         _hosts_rust_server=lambda: hosts,
         get_rust_server_class=lambda: server_class,
@@ -520,8 +522,12 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
         )
 
     server_class.gather_server_endpoints.assert_called_once_with(hosts)
+    server_class.gather_frontend_cpu_share.assert_called_once_with(hosts)
     assert server_class.launch.called == hosts
     if hosts:
+        server_class.launch.assert_called_once_with(
+            scheduler, frontend_cpu_share=(1, 2)
+        )
         server.install_sigterm_drain.assert_called_once_with(
             notify=rust_server.drain_notify_name("dp-ports-test")
         )

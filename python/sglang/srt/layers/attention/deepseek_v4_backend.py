@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
+from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import combined_topk_width
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
@@ -123,8 +124,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
     _current_capture_var,
     eager_on_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
     join_in_graph_metadata_prep,
@@ -160,6 +165,41 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
+
+
+def _use_dsv4_cutedsl_h16_forward(
+    dsv4_prefill_backend: str, forward_batch: ForwardBatch
+) -> bool:
+    if dsv4_prefill_backend != DSV4_CUTEDSL_H16_PREFILL_BACKEND:
+        return False
+    if (
+        forward_batch.forward_mode != ForwardMode.EXTEND
+        or forward_batch._original_forward_mode is not None
+        or forward_batch.tbo_parent_token_range is not None
+    ):
+        return False
+
+    piecewise_context = get_tc_piecewise_forward_context()
+    if (
+        is_in_breakable_cuda_graph()
+        or is_in_tc_piecewise_cuda_graph()
+        or (piecewise_context is not None and piecewise_context.full_graph)
+        or (_is_cuda and torch.cuda.is_current_stream_capturing())
+    ):
+        return False
+
+    return True
+
+
+def _validate_dsv4_cutedsl_h16_combined_topk(max_context_len: int, c4_topk: int) -> int:
+    """Validate configured widths and return the fixed C128 JIT bucket."""
+    c128_width = combined_topk_width(max(max_context_len // 128, 1), SWA_WINDOW)
+    if max(c128_width, combined_topk_width(c4_topk, SWA_WINDOW)) > 16384:
+        raise ValueError(
+            "cutedsl_h16 combined TOPK exceeds 16384; reduce context length or index_topk"
+        )
+    return c128_width
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1322,6 +1362,29 @@ class DeepseekV4AttnBackend(
         self._source_proj_bufs: Dict[int, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
+        self._cutedsl_h16_c128_combined_topk: Optional[int] = None
+        if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
+            self._cutedsl_h16_c128_combined_topk = (
+                _validate_dsv4_cutedsl_h16_combined_topk(
+                    self.max_context_len,
+                    self.index_topk,
+                )
+            )
+            local_heads = model_runner.model_config.get_num_attention_heads(
+                get_parallel().attn_tp_size
+            )
+            if (
+                self.is_dsv41
+                or kernel.dsv4_attn_backend not in ("auto", "flashmla")
+                or not get_platform().is_sm90
+                or model_runner.dtype != torch.bfloat16
+                or local_heads != 16
+                or self.head_dim_v != 512
+            ):
+                raise ValueError(
+                    "cutedsl_h16 requires DeepSeek-V4 (not V4.1), SM90, BF16, "
+                    "FlashMLA, and 16 TP-local query heads with width 512."
+                )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:
                 raise ValueError(
@@ -4282,6 +4345,9 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     cos_sin_cache=cos_sin_cache,
+                    use_cutedsl_h16=_use_dsv4_cutedsl_h16_forward(
+                        self.dsv4_prefill_backend, forward_batch
+                    ),
                 )
 
             if cos_sin_cache is not None:
@@ -4413,16 +4479,10 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        use_cutedsl_h16: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
-        if _is_xpu:
-            from sgl_kernel import flash_mla_sparse_fwd
-        else:
-            from sglang.kernels.ops.attention.flash_mla_interface import (
-                flash_mla_sparse_fwd,
-            )
-
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
@@ -4450,6 +4510,10 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if use_cutedsl_h16 and compress_ratio == 128:
+                combined_indices, combined_lens = cache.get_c128_combined(
+                    self._cutedsl_h16_c128_combined_topk
+                )
             n_compressed = flat_token_ids.shape[0]
             # Layers sharing a kv_source reuse its dequant: no later layer writes
             # that cache, and graph replay keeps the layer order.
@@ -4491,6 +4555,28 @@ class DeepseekV4AttnBackend(
                 cos_sin_cache=cos_sin_cache,
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
+            )
+
+        if use_cutedsl_h16:
+            from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
+                cute_sparse_mla_h16_fwd,
+            )
+
+            # H64-padded Q returns compact H16, so o[:, :logical_heads] stays valid.
+            return cute_sparse_mla_h16_fwd(
+                q=q_flat,
+                kv=kv.squeeze(1),
+                indices=combined_indices,
+                topk_length=combined_lens,
+                attn_sink=attn_sink,
+                sm_scale=self.softmax_scale,
+            )
+
+        if _is_xpu:
+            from sgl_kernel import flash_mla_sparse_fwd
+        else:
+            from sglang.kernels.ops.attention.flash_mla_interface import (
+                flash_mla_sparse_fwd,
             )
 
         o, _, _ = flash_mla_sparse_fwd(
