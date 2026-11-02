@@ -30,12 +30,13 @@ Reaching for these is a last resort: a config.json next to the .gguf still wins,
 because the checkpoint author's own config outranks anything reconstructed.
 """
 
+from copy import deepcopy
+from functools import lru_cache
 from typing import Any, Callable, Dict, Optional
 
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
-from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 from sglang.srt.utils.hf_transformers.lilicorr_gguf import build_lilicorr_gguf_config
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
@@ -44,24 +45,29 @@ GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
 }
 
 
+@lru_cache(maxsize=4)
+def _read_gguf_model_info(gguf_path: str):
+    from gguf import GGUFReader
+
+    reader = GGUFReader(gguf_path, mode="r")
+    field = reader.fields.get("general.architecture")
+    value = field.contents() if field is not None else None
+    arch = value if isinstance(value, str) else None
+    return arch, "lilicorr.num_layers" in reader.fields
+
+
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        reader = get_gguf_reader(gguf_path)
-        field = reader.fields.get("general.architecture")
-        if field is None:
-            return None
-        value = field.contents()
-        return value if isinstance(value, str) else None
+        return _read_gguf_model_info(gguf_path)[0]
     except Exception:
         return None
 
 
 def _get_native_config_builder(gguf_path: str):
     arch = read_gguf_architecture(gguf_path)
-    if arch == "dflash":
-        if "lilicorr.num_layers" not in get_gguf_reader(gguf_path).fields:
-            return None
+    if arch == "dflash" and not _read_gguf_model_info(gguf_path)[1]:
+        return None
     return GGUF_NATIVE_CONFIG_BUILDERS.get(arch)
 
 
@@ -109,8 +115,22 @@ def build_gguf_generation_config(gguf_path: str):
     """
     from transformers import GenerationConfig
 
-    reader = get_gguf_reader(gguf_path)
-    meta = {key: field.contents() for key, field in reader.fields.items()}
+    fields = _read_gguf_generation_config(gguf_path)
+    return GenerationConfig(**deepcopy(fields)) if fields is not None else None
+
+
+@lru_cache(maxsize=4)
+def _read_gguf_generation_config(gguf_path: str):
+    from gguf import GGUFReader
+
+    reader = GGUFReader(gguf_path, mode="r")
+    keys = (
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.eot_token_id",
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.padding_token_id",
+    )
+    meta = {key: reader.fields[key].contents() for key in keys if key in reader.fields}
 
     stop_ids = []
     for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"):
@@ -128,7 +148,7 @@ def build_gguf_generation_config(gguf_path: str):
         fields["bos_token_id"] = int(meta["tokenizer.ggml.bos_token_id"])
     if "tokenizer.ggml.padding_token_id" in meta:
         fields["pad_token_id"] = int(meta["tokenizer.ggml.padding_token_id"])
-    return GenerationConfig(**fields)
+    return fields
 
 
 def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
@@ -143,10 +163,11 @@ def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
     """
     import json
 
+    from gguf import GGUFReader
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
 
-    reader = get_gguf_reader(gguf_path)
+    reader = GGUFReader(gguf_path, mode="r")
     meta = {key: field.contents() for key, field in reader.fields.items()}
 
     tokens = list(meta["tokenizer.ggml.tokens"])

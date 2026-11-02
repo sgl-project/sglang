@@ -1,5 +1,8 @@
+import gc
 import tempfile
 import unittest
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,9 +20,10 @@ from sglang.srt.models.lilicorr import LiLiCorrHead
 from sglang.srt.speculative.lilicorr_utils import LiLiCorrConfig
 from sglang.srt.utils.hf_transformers.gguf_native import (
     build_gguf_config,
+    build_gguf_generation_config,
+    build_gguf_tokenizer,
     has_native_gguf_support,
 )
-from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 from sglang.srt.utils.hf_transformers.lilicorr_gguf import (
     build_lilicorr_gguf_config,
     lilicorr_gguf_weights,
@@ -82,18 +86,82 @@ def _write_checkpoint(path, blocks, scale, extra_tensor=None, prec_a4=False):
 
 
 class TestLiLiCorrGGUF(CustomTestCase):
-    def test_model_config_and_weights_parse_checkpoint_once(self):
-        """Repeated config probes must not reparse large tokenizer metadata."""
-        get_gguf_reader.cache_clear()
-        self.addCleanup(get_gguf_reader.cache_clear)
+    @contextmanager
+    def track_readers(self):
+        refs = []
+        reader_class = gguf.GGUFReader
+
+        def track_reader(*args, **kwargs):
+            reader = reader_class(*args, **kwargs)
+            refs.append(weakref.ref(reader))
+            return reader
+
+        with patch("gguf.GGUFReader", side_effect=track_reader) as reader:
+            yield reader, refs
+
+    def test_config_probes_and_weight_loading_release_readers(self):
+        """Config caching must avoid reparsing without keeping readers alive."""
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "draft.gguf"
             _write_checkpoint(path, np.zeros((2, 72), dtype=np.uint8), 0.25)
-            with patch("gguf.GGUFReader", wraps=gguf.GGUFReader) as reader:
+            with self.track_readers() as (reader, refs):
                 config = ModelConfig(model_path=str(path), is_draft_model=True)
+                build_gguf_generation_config(str(path))
+                initial_parses = reader.call_count
+                self.assertGreater(initial_parses, 0)
+                self.assertTrue(has_native_gguf_support(str(path)))
+                build_gguf_config(str(path))
+                build_gguf_generation_config(str(path))
+                self.assertEqual(reader.call_count, initial_parses)
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in refs))
                 weights = dict(lilicorr_gguf_weights(str(path), config.hf_config))
+                self.assertEqual(reader.call_count, initial_parses + 1)
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in refs))
             self.assertEqual(weights["fc.weight_scale_2"].item(), 0.25)
-            self.assertEqual(reader.call_count, 1)
+
+    def test_config_overrides_do_not_change_cached_checkpoint_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "draft.gguf"
+            _write_checkpoint(path, np.zeros((2, 72), dtype=np.uint8), 0.25)
+            config = build_gguf_config(str(path))
+            config.dflash_config["target_layer_ids"].append(99)
+            config.quantization_config["ignore"].clear()
+            fresh = build_gguf_config(str(path))
+            self.assertEqual(fresh.dflash_config["target_layer_ids"], [1, 5])
+            self.assertIn("hidden_norm", fresh.quantization_config["ignore"])
+
+    def test_native_tokenizer_and_generation_config_release_readers(self):
+        """A native tokenizer must not retain a second copy of GGUF metadata."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "native.gguf"
+            writer = gguf.GGUFWriter(path, "muse-glimmer")
+            writer.add_tokenizer_model("gpt2")
+            writer.add_tokenizer_pre("gpt-4o")
+            writer.add_token_list(["a", "b", "ab", "<eos>", "<eot>"])
+            writer.add_token_types([1, 1, 1, 3, 3])
+            writer.add_token_merges(["a b"])
+            writer.add_eos_token_id(3)
+            writer.add_uint32("tokenizer.ggml.eot_token_id", 4)
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            with self.track_readers() as (reader, refs):
+                self.assertTrue(has_native_gguf_support(str(path)))
+                generation = build_gguf_generation_config(str(path))
+                generation.eos_token_id.append(99)
+                initial_parses = reader.call_count
+                fresh = build_gguf_generation_config(str(path))
+                self.assertEqual(fresh.eos_token_id, [3, 4])
+                self.assertEqual(reader.call_count, initial_parses)
+                tokenizer = build_gguf_tokenizer(str(path))
+                self.assertEqual(reader.call_count, initial_parses + 1)
+                self.assertEqual(tokenizer.encode("ab", add_special_tokens=False), [2])
+                self.assertEqual(tokenizer.decode([2]), "ab")
+                gc.collect()
+                self.assertTrue(all(ref() is None for ref in refs))
 
     def test_native_detection_does_not_claim_plain_dflash(self):
         with tempfile.TemporaryDirectory() as temp:
