@@ -38,8 +38,10 @@ if [[ "$mode" = prepare ]]; then
   SGLANG_RUST_BUILD_MODE=never python -c 'from sglang.srt.mem_cache.rust_tree_core.extension import bindings; print("RUST_CACHE_LOAD_OK", bindings.__file__)'
   SGLANG_RUST_BUILD_MODE=never python -c 'from test_per_request_spec_opt_out_e2e import install_probes; install_probes(); print("PROBE_IMPORT_OK")'
   timeout --kill-after=15s 600 python - <<'PY'
+import os
 from huggingface_hub import snapshot_download
-for model in ("Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-0.5B-Instruct"):
+models = os.environ.get("OPT_OUT_MODELS", "Qwen/Qwen2.5-1.5B-Instruct,Qwen/Qwen2.5-0.5B-Instruct").split(",")
+for model in models:
     path = snapshot_download(model, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja"])
     print("MODEL_CACHE_READY", model, path, flush=True)
 PY
