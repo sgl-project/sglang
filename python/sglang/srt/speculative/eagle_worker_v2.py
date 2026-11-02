@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_postprocess,
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
@@ -1380,7 +1381,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        self._adaptive_sync_group: Optional[GroupCoordinator] = None
         if get_spec().speculative_adaptive and self._hosts_draft:
+            # The target TP group, read before any draft context narrows it: the
+            # memory-budget decision must be identical on every rank that captures.
+            self._adaptive_sync_group = get_parallel().tp_group
             self.adaptive_controller = AdaptiveController(
                 self,
                 AdaptiveSpeculativeParams(
@@ -1451,30 +1456,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                draft_tp_context(self._draft_worker.parallel_layout),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
+                ),
+                memory_budget_gb=get_spec().speculative_adaptive_memory_budget_gb,
+            )
 
     def forward_batch_generation(
         self,
@@ -1852,10 +1853,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
-        with self._override_worker_state(
-            speculative_num_steps,
-            speculative_num_draft_tokens,
-            cuda_graph_bs=cuda_graph_bs,
+        with (
+            draft_tp_context(self._draft_worker.parallel_layout),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            self._override_worker_state(
+                speculative_num_steps,
+                speculative_num_draft_tokens,
+                cuda_graph_bs=cuda_graph_bs,
+            ),
         ):
             self._draft_worker.init_attention_backend()
             self._draft_worker._capture_cuda_graphs()
@@ -1915,14 +1921,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        state.gpu_memory_gb = self._max_across_tp(max(before_mem - after_mem, 0.0))
         log_info_on_rank0(
             logger,
             f"Built adaptive runtime state steps={speculative_num_steps}: "
             f"elapsed={time.perf_counter() - tic:.2f}s, "
-            f"mem={(before_mem - after_mem):.2f}GB",
+            f"mem={state.gpu_memory_gb:.2f}GB",
         )
 
         return state
+
+    def _max_across_tp(self, value: float) -> float:
+        group = self._adaptive_sync_group
+        if group is None or group.world_size == 1:
+            return value
+        tensor = torch.tensor([value], dtype=torch.float64)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+        )
+        return tensor.item()
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""

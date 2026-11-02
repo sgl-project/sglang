@@ -239,6 +239,17 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    speculative_adaptive_memory_budget_gb: A[
+        Optional[float],
+        Arg(
+            help="GPU memory (GB) that adaptive speculative decoding may spend at "
+            "startup on CUDA graphs and attention backends for candidate step tiers "
+            "other than the initial one. Tiers are pre-built in ascending step "
+            "order until the budget is spent; the rest are built the first time "
+            "the policy switches to them, which stalls decode for the capture. "
+            "Unset pre-builds every tier.",
+        ),
+    ] = None
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None
