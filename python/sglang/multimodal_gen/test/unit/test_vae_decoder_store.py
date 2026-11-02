@@ -1,10 +1,12 @@
 """The decode-dtype weights live in a file-backed mapping, not anonymous memory.
 
-What matters: the store round-trips the exact rounded bytes, a later start
-adopts it without paying the cast, a mismatched store is discarded rather than
-adopted, and the kill switch keeps everything in memory.
+What matters: the store round-trips the exact rounded bytes, a later host
+start adopts it without paying the cast, a mismatched store is discarded
+rather than adopted, a resident start neither adopts nor writes one, and the
+kill switch keeps everything in memory.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -132,6 +134,57 @@ def test_the_store_kill_switch_keeps_the_copies_in_memory(monkeypatch, tmp_path)
 
     assert not os.path.exists(path)
     assert all(b.weight.dtype == torch.float16 for b in vae.blocks)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "meta",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs a CUDA device"
+            ),
+        ),
+    ],
+)
+def test_a_resident_start_neither_adopts_nor_writes_a_store(tmp_path, device):
+    """The store re-homes host copies. A component that starts on its device
+    casts there (an online-FP8 install needs those device weights), never pulls
+    a host start's mapping back in, and leaves that store for the next host
+    start; without a store on disk it writes none either."""
+    model_path = tmp_path / "ckpt"
+    model_path.mkdir()
+    host = _TinyVAE()
+    _hold_decoder_weights_in_decode_dtype(
+        host, _server_args(), "video_vae", str(model_path)
+    )
+    path = _decode_dtype_store_path(str(model_path), "video_vae", torch.float16, host)
+    with open(path, "rb") as handle:
+        stored = handle.read()
+
+    resident = _TinyVAE().to(device)
+    _hold_decoder_weights_in_decode_dtype(
+        resident, _server_args(), "video_vae", str(model_path)
+    )
+    assert resident.prepare_calls == 1
+    assert all(
+        b.weight.device.type == device and b.weight.dtype == torch.float16
+        for b in resident.blocks
+    )
+    with open(path, "rb") as handle:
+        assert handle.read() == stored
+
+    other_path = tmp_path / "other"
+    other_path.mkdir()
+    fresh = _TinyVAE().to(device)
+    _hold_decoder_weights_in_decode_dtype(
+        fresh, _server_args(), "video_vae", str(other_path)
+    )
+    assert fresh.prepare_calls == 1
+    assert not os.path.exists(
+        _decode_dtype_store_path(str(other_path), "video_vae", torch.float16, fresh)
+    )
 
 
 def test_module_layouts_do_not_share_a_store(tmp_path):

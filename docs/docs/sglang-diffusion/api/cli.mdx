@@ -165,8 +165,8 @@ pipeline's registered module name:
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
 | Select component precision | `--component-precisions.<component> {DTYPE}` | — | Use a loader-supported exact parameter and execution dtype |
 | Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
-| Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
-| Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
+| Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader; the only supported VAE is [MiniMax-H3's online FP8 video decoder](/cookbook/diffusion/MiniMax/MiniMax-H3#advanced-online-fp8-video-vae-decoder-deployment-level-lossy) |
+| Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer; unsupported for MiniMax-H3's video VAE |
 
 For example, pair any replacement text-encoder configuration with a separate
 single-file checkpoint as follows:
