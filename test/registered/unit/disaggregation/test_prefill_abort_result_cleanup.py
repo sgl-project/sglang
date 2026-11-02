@@ -65,9 +65,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
-        self.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=[], pending_chunk_rids={"aborted-prefill"}
-        )
+        self.disagg_prefill_transfer_queue = []
+        self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
         self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
@@ -110,9 +109,7 @@ def _free_req(req, _tree_cache, *, checkpoint):
 )
 def test_customized_info_failure_is_request_local(capacity, customized_info, error):
     scheduler = SchedulerDisaggregationPrefillMixin()
-    scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
-        queue=[], pending_chunk_rids=set()
-    )
+    scheduler.disagg_prefill_pending_chunk_rids = set()
     scheduler.enable_staging = False
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
         page_size=1, translate_kv_indices_for_transfer=lambda indices: indices
@@ -139,7 +136,7 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
         req.disagg_kv_sender = Mock()
         req.disagg_kv_sender.supports_host_tensor_indices = False
         req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
-        scheduler.disagg_prefill_transfer_queue.pending_chunk_rids.add(req.rid)
+        scheduler.disagg_prefill_pending_chunk_rids.add(req.rid)
 
         scheduler._send_kv_chunk(req, last_chunk=True)
 
@@ -158,7 +155,7 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
                 scheduler.disagg_metadata_buffers.get_customized_info(0)
                 == req.customized_info
             )
-        assert req.rid not in scheduler.disagg_prefill_transfer_queue.pending_chunk_rids
+        assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
 
     with (
         patch.object(
@@ -206,7 +203,7 @@ class TestPrefillCompleteResult(CustomTestCase):
                     list(req.output_ids),
                     req.hidden_states_tensor.tolist(),
                     req.output_dsa_topk_indices.tolist(),
-                    req in scheduler.disagg_prefill_transfer_queue.queue,
+                    req in scheduler.disagg_prefill_transfer_queue,
                 )
             )
 
@@ -223,7 +220,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, [])
+        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
         release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
@@ -237,7 +234,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, [])
+        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
 

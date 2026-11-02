@@ -223,9 +223,7 @@ class TestRunningTimeout(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        s.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=[], pending_chunk_rids=set()
-        )
+        s.disagg_prefill_transfer_queue = []
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])

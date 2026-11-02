@@ -179,9 +179,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         self.prepare_pp_scheduler(scheduler)
                         if pending_transfer:
                             if name == "prefill":
-                                scheduler.disagg_prefill_transfer_queue.queue = [
-                                    object()
-                                ]
+                                scheduler.disagg_prefill_transfer_queue = [object()]
                             else:
                                 scheduler.disagg_decode_transfer_queue.queue = [
                                     object()
@@ -570,9 +568,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.last_batch = None
         scheduler.chunked_req = None
         scheduler.waiting_queue = []
-        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=[], pending_chunk_rids=set()
-        )
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -632,9 +628,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=[], pending_chunk_rids=set()
-        )
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
 
 

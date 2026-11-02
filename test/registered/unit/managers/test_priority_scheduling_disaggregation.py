@@ -460,9 +460,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.dllm_config = None
         scheduler.grammar_manager = MagicMock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=[], pending_chunk_rids=set()
-        )
+        scheduler.disagg_prefill_transfer_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 

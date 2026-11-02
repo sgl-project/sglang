@@ -483,9 +483,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SchedulerDisaggregationPrefillMixin()
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
-        scheduler.disagg_prefill_transfer_queue = SimpleNamespace(
-            queue=list(reqs), pending_chunk_rids=set()
-        )
+        scheduler.disagg_prefill_transfer_queue = list(reqs)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
@@ -528,7 +526,7 @@ class TestAllocationIntegration(CustomTestCase):
             finalize_bootstrap=Mock(side_effect=finalize)
         )
         self.assertEqual(scheduler.process_disagg_prefill_transfer_queue(), [])
-        self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, [req])
+        self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
         scheduler.send_kv_chunk.assert_not_called()
         # This is the existing metadata-received transition, not readiness.
         self.prefill.update_status(1, KVPoll.WaitingForInput)
@@ -551,11 +549,11 @@ class TestAllocationIntegration(CustomTestCase):
             disaggregation_decode_allocation_policy="early"
         ):
             scheduler.process_disagg_prefill_transfer_queue()
-            self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, reqs)
+            self.assertEqual(scheduler.disagg_prefill_transfer_queue, reqs)
 
             scheduler.waiting_queue.append(object())
             scheduler.process_disagg_prefill_transfer_queue()
-            self.assertEqual(scheduler.disagg_prefill_transfer_queue.queue, reqs[1:])
+            self.assertEqual(scheduler.disagg_prefill_transfer_queue, reqs[1:])
             self.assertEqual(pool.available_size(), 1)
 
             scheduler.process_disagg_prefill_transfer_queue()

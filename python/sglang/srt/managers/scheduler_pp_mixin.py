@@ -363,7 +363,7 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_transfer_queue.queue) == 0:
+                if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
 
     @DynamicGradMode()
@@ -628,7 +628,7 @@ class SchedulerPPMixin:
         step with the others.
         """
         succeeded, failed = self.get_rids(
-            self.disagg_prefill_transfer_queue.queue,
+            self.disagg_prefill_transfer_queue,
             True,
             [KVPoll.Success],
             [KVPoll.Failed],

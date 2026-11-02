@@ -762,7 +762,9 @@ class SchedulerMetricsReporter:
             msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += f"#inflight-req: {len(self.scheduler.disagg_prefill_transfer_queue.queue)}, "
+            msg += (
+                f"#inflight-req: {len(self.scheduler.disagg_prefill_transfer_queue)}, "
+            )
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
 
@@ -877,7 +879,7 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -1104,7 +1106,7 @@ class SchedulerMetricsReporter:
                     priority_enabled,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
+                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1516,7 +1518,7 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_transfer_queue.queue, priority_enabled
+                self.scheduler.disagg_prefill_transfer_queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)

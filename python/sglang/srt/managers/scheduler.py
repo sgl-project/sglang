@@ -95,7 +95,6 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
-    PrefillTransferQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
 )
@@ -1691,7 +1690,9 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            self.disagg_prefill_transfer_queue = PrefillTransferQueue()
+            self.disagg_prefill_transfer_queue: List[Req] = []
+            # Requests with a sent chunk that are not yet on the transfer queue.
+            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2748,7 +2749,7 @@ class Scheduler(
                 self.disagg_prefill_bootstrap_queue
             ),
             get_disagg_prefill_transfer_queue=lambda: (
-                self.disagg_prefill_transfer_queue.queue
+                self.disagg_prefill_transfer_queue
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
@@ -5715,7 +5716,7 @@ class Scheduler(
                     ignore_waiting=ignore_waiting
                 )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_transfer_queue.queue) == 0
+                idle &= len(self.disagg_prefill_transfer_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6121,7 +6122,7 @@ class Scheduler(
                         prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
-            for req in self.disagg_prefill_transfer_queue.queue:
+            for req in self.disagg_prefill_transfer_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
@@ -6225,7 +6226,7 @@ class Scheduler(
             # last_batch itself; its requests are already listed above.
             and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
-            # already in the transfer queue. Merging them into
+            # already in disagg_prefill_transfer_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL
