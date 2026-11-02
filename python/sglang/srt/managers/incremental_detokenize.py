@@ -41,12 +41,20 @@ class DetokenizeHeader(
     http_worker_ipc: Optional[str]
 
 
-def build_detokenize_header(req: Req) -> DetokenizeHeader:
+def build_detokenize_header(
+    req: Req, *, output_prefix_len: int = 0
+) -> DetokenizeHeader:
     prompt_ids = req.origin_input_ids_unpadded
     surr_offset = max(len(prompt_ids) - PROMPT_TAIL_LEN, 0)
+    prompt_tail_ids = prompt_ids[surr_offset:]
+    if output_prefix_len:
+        # tokens skipped before the first emission still provide decoding
+        # context, but must not become part of the answer
+        prompt_tail_ids = array("q", prompt_tail_ids)
+        prompt_tail_ids.extend(req.output_ids[:output_prefix_len])
     sampling_params = req.sampling_params
     return DetokenizeHeader(
-        prompt_tail_ids=prompt_ids[surr_offset:],
+        prompt_tail_ids=prompt_tail_ids,
         skip_special_tokens=sampling_params.skip_special_tokens,
         spaces_between_special_tokens=sampling_params.spaces_between_special_tokens,
         no_stop_trim=sampling_params.no_stop_trim,
