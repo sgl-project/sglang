@@ -237,7 +237,7 @@ impl TokenizerRegistry {
         let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
-        let ids = if self.stats.backend() == stats::EncodeBackend::Tiktoken {
+        let ids = if self.stats.backend().is_tiktoken() {
             kimi::encode(&tokenizer, &[EncodeSegment::control(text)])
         } else {
             adapter::encode(&tokenizer, text)

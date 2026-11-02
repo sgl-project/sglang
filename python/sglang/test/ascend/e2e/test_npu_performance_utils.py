@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -183,9 +184,12 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 )
+DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Pro-0813-w4a8"
+)
 # DeepSeek-V4-Flash default model for a5 testcase
 DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash"
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -621,6 +625,9 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
+    api_type="chat",
+    warmup_dp=0,
+    warmup_shape=0,
 ):
 
     if dataset_type == "sharegpt":
@@ -658,6 +665,26 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # Identical natural-text rows (one GSM8K QA pool padded past
+        # input_len): every request hits the same ~131072-token radix
+        # prefix, mirroring the dev shared-prefix shape. Emitted as
+        # test.jsonl because GSM8KDataset hardcodes that name inside the
+        # config's path dir; identical rows are not deduped.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        dataset_path = dataset_file
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -706,6 +733,12 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
+    if api_type != "chat":
+        cmd += f" --api-type {api_type}"
+    if warmup_dp:
+        cmd += f" --warmup-dp {warmup_dp}"
+    if warmup_shape:
+        cmd += f" --warmup-shape {warmup_shape}"
 
     logger.info(f"Command: {cmd}")
 
@@ -735,6 +768,12 @@ def run_aisbench(
 
         metrics = {}
         full_output = "\n".join(output_lines)
+
+        # With warmup passes enabled the stdout carries one summarizer
+        # table per invocation; only the last one is the formal run.
+        last_table = full_output.rfind("Performance Parameters")
+        if last_table != -1:
+            full_output = full_output[last_table:]
 
         simplified_output = re.sub(r"[^\w\s.]", " ", full_output)
 
@@ -1002,7 +1041,7 @@ def assert_metrics(self, metrics):
             "--speculative-num-draft-tokens not found in other_args "
             "while accept_rate baseline is set",
         )
-        self.assertGreaterEqual(
+        self.assertGreater(
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
         )
@@ -1222,6 +1261,9 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1355,6 +1397,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1524,6 +1569,9 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
