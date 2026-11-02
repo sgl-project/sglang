@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.utils.common import align_up
 from sglang.srt.utils.cuda_vmm_utils import (
     BumpArenaStub,
     VmmReservation,
-    align_up,
     allocation_handle_type_name,
     get_device_granularity,
     make_device_allocation_prop,
