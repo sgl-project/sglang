@@ -759,10 +759,41 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         get_parallel().tp_group.barrier()
+        self._pin_dsa_logits_budget(before_capture=True)
         self.capture()
+        self._pin_dsa_logits_budget(before_capture=False)
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
+
+    def _pin_dsa_logits_budget(self, *, before_capture: bool) -> None:
+        """The DSA indexer sizes its logits scratch from free memory at its first
+        measurement, which would otherwise come after the graph pool takes its
+        share. Measure it before capture, take the TP minimum, and after capture
+        keep it within half of the memory left free."""
+        indexer_cls = next(
+            (
+                type(indexer)
+                for indexer in self.dsa_indexers or ()
+                if hasattr(indexer, "pin_mqa_logits_budget")
+            ),
+            None,
+        )
+        if indexer_cls is None or not is_cuda():
+            return
+        device_index = torch.cuda.current_device()
+        max_bytes = None
+        if not before_capture:
+            max_bytes = torch.cuda.mem_get_info(device_index)[0] // 2
+        budget = indexer_cls.pin_mqa_logits_budget(
+            device_index, get_parallel().tp_group.cpu_group, max_bytes=max_bytes
+        )
+        logger.info(
+            "DSA indexer logits budget %s prefill CUDA graph capture: %.2f GiB "
+            "per rank (TP minimum).",
+            "before" if before_capture else "after",
+            budget / (1 << 30),
+        )
 
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
