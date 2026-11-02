@@ -152,9 +152,10 @@ def test_gemma_add_rmsnorm_fp8_per_token_writes_the_separate_kernels_bytes(
 @pytest.mark.parametrize("num_tokens", [1000, FOUR_ROW_TOKENS])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("transpose_scale", [True, False])
+@pytest.mark.parametrize("keep_bf16", [True, False])
 @torch.inference_mode()
 def test_gemma_add_rmsnorm_fp8_group_writes_the_separate_kernels_bytes(
-    num_tokens, with_residual, transpose_scale
+    num_tokens, with_residual, transpose_scale, keep_bf16
 ):
     """Per 1 x 128 the fused norm + quant writes what the norm kernels followed by
     aiter's per_1x128 quant write, an all-zero row's 1e-10 amax floor included;
@@ -174,34 +175,15 @@ def test_gemma_add_rmsnorm_fp8_group_writes_the_separate_kernels_bytes(
         EPS,
         group_size=128,
         transpose_scale=transpose_scale,
-        keep_bf16=True,
+        keep_bf16=keep_bf16,
     )
 
     assert torch.equal(_bits(quantized[0]), _bits(q_ref))
     assert torch.equal(_bits(quantized[1]), _bits(scale_ref))
     assert quantized[1].stride() == ((1, num_tokens) if transpose_scale else (48, 1))
     assert torch.equal(_bits(residual_out), _bits(residual_ref))
-    assert torch.equal(_bits(quantized[2]), _bits(normed_ref))
-
-
-@_GFX95_ONLY
-@torch.inference_mode()
-def test_four_rows_without_bf16_write_the_same_fp8():
-    """Four rows per program without the bf16 norm (the prefill attention input) write
-    the fp8, scales and residual of the launch that keeps it."""
-    num_tokens = FOUR_ROW_TOKENS
-    x, residual, weight = _decode_inputs(num_tokens)
-    (q_ref, scale_ref, _), residual_ref = gemma_add_rmsnorm_fp8(
-        x, residual, weight, EPS, group_size=128, transpose_scale=True, keep_bf16=True
-    )
-
-    (q, scale), residual_out = gemma_add_rmsnorm_fp8(
-        x, residual, weight, EPS, group_size=128, transpose_scale=True
-    )
-
-    assert torch.equal(_bits(q), _bits(q_ref))
-    assert torch.equal(_bits(scale), _bits(scale_ref))
-    assert torch.equal(_bits(residual_out), _bits(residual_ref))
+    if keep_bf16:
+        assert torch.equal(_bits(quantized[2]), _bits(normed_ref))
 
 
 @_GFX95_ONLY
