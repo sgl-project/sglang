@@ -20,6 +20,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.state_capturer.base import BaseDeviceCache, BaseTopkCapturer
+from sglang.srt.utils import ceil_align
 
 
 def _is_scattered_a2a_backend() -> bool:
@@ -28,19 +29,14 @@ def _is_scattered_a2a_backend() -> bool:
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
 
 
-def _last_routed_layer_id(model: torch.nn.Module) -> Optional[int]:
-    """Return the highest layer id among this rank's capturing TopK modules."""
+def _routed_layer_ids(model: torch.nn.Module) -> list[int]:
     # Lazy import: ``layers.moe.topk`` imports this module.
     from sglang.srt.layers.moe.topk import TopK
 
-    return max(
-        (
-            module.layer_id
-            for module in model.modules()
-            if isinstance(module, TopK)
-            and module.topk_config.allow_routed_experts_capture
-        ),
-        default=None,
+    return sorted(
+        module.layer_id
+        for module in model.modules()
+        if isinstance(module, TopK) and module.topk_config.allow_routed_experts_capture
     )
 
 
@@ -75,7 +71,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        if not get_exec().features.enable_return_routed_experts:
+        features = get_exec().features
+        if not features.enable_return_routed_experts:
             return None
         # The loader attaches this to every entry model, including wrappers.
         # Size from the owner, independent of which runner is currently active.
@@ -86,7 +83,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
-            gather_layer_id=_last_routed_layer_id(model),
+            # Bounded replay runs late layers on fewer rows; keep per-layer gathers.
+            routed_layer_ids=(
+                None
+                if features.enable_decoder_swa_bounded_replay
+                else _routed_layer_ids(model)
+            ),
         )
 
     def __init__(
@@ -96,7 +98,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
-        gather_layer_id: Optional[int] = None,
+        routed_layer_ids: Optional[list[int]] = None,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
@@ -111,10 +113,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             get_schedule().chunked_prefill_size * get_parallel().num_dp_ranks,
             max_running_requests * get_parallel().num_dp_ranks,
         )
+        if _is_scattered_a2a_backend():
+            # Shares are padded to equal size, so whole shares must fit.
+            max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
 
-        # Other ranks compute the same ids (or contribute their share to the
-        # all-gather below) and send nothing, so they keep no device or host
-        # cache.
+        # Only the output rank sends outputs, so only it keeps the readback caches.
         output_rank = _is_output_rank()
         super().__init__(
             num_tokens=num_tokens,
@@ -128,24 +131,22 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             allocate_device_cache=output_rank,
         )
 
-        # Scattered backends split the tokens across attention-TP ranks, so the
-        # output rank's group rebuilds the full batch. When this rank's last
-        # routed layer is known, each rank keeps its own rows and that layer
-        # all-gathers every layer at once, inside any CUDA graph; otherwise
-        # every layer all-gathers its own rows. Groups that do not hold the
-        # output rank (pp > 0, attn_cp > 0) send nothing.
+        # Scattered backends split tokens across attention-TP ranks; only the
+        # output rank's group (pp0, attn-cp0) rebuilds them for readback.
         parallel = get_parallel()
+        self.first_routed_layer_id: Optional[int] = None
         self.gather_layer_id: Optional[int] = None
+        self._first_layer_rows: Optional[int] = None
         self.local_cache: Optional[BaseDeviceCache] = None
         self.all_gather_scratch: Optional[torch.Tensor] = None
         self._gathers_per_layer = False
         if _is_scattered_a2a_backend():
-            if gather_layer_id is not None and parallel.attn_tp_size > 1:
+            if routed_layer_ids and parallel.attn_tp_size > 1:
                 if parallel.pp_rank == 0 and parallel.attn_cp_rank == 0:
-                    self.gather_layer_id = gather_layer_id
-                    local_rows = -(-max_batch_size // parallel.attn_tp_size)
+                    self.first_routed_layer_id = routed_layer_ids[0]
+                    self.gather_layer_id = routed_layer_ids[-1]
                     self.local_cache = BaseDeviceCache(
-                        local_rows,
+                        max_batch_size // parallel.attn_tp_size,
                         num_layers,
                         self.device_topk_size,
                         device,
@@ -155,11 +156,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                         # The all-gather fills every rank; only the output
                         # rank keeps the rows.
                         self.all_gather_scratch = torch.empty(
-                            (
-                                local_rows * parallel.attn_tp_size,
-                                num_layers,
-                                self.device_topk_size,
-                            ),
+                            (max_batch_size, num_layers, self.device_topk_size),
                             dtype=torch.int32,
                             device=device,
                         )
@@ -206,19 +203,21 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         super().capture(layer_id, topk_indices)
 
     def _capture_local_rows(self, layer_id: int, local_topk: torch.Tensor):
-        """Keep this rank's rows; the last routed layer all-gathers every layer.
-
-        Each attention-TP rank holds an equal, rank-ordered share of the tokens,
-        so one all-gather of all layers yields the row order the per-layer
-        all-gather produced. Its size comes from this capture's rows, so a CUDA
-        graph records it with the shapes it replays.
-        """
+        """Keep this rank's equal, rank-ordered share; the last routed layer
+        all-gathers all layers, sized by the captured rows so graphs replay it."""
         if layer_id > self.gather_layer_id:
             raise RuntimeError(
                 f"Layer {layer_id} captured routed experts after the all-gather "
                 f"layer {self.gather_layer_id}."
             )
         num_rows = local_topk.shape[0]
+        if layer_id == self.first_routed_layer_id:
+            self._first_layer_rows = num_rows
+        elif num_rows != self._first_layer_rows:
+            raise RuntimeError(
+                f"Layer {layer_id} captured {num_rows} routed-expert rows, but layer "
+                f"{self.first_routed_layer_id} captured {self._first_layer_rows}."
+            )
         self.local_cache.capture(layer_id, local_topk)
         if layer_id != self.gather_layer_id:
             return

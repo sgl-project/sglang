@@ -133,7 +133,9 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
         def record(self, model_config, **kwargs):
             seen.update(kwargs)
 
-        features = SimpleNamespace(enable_return_routed_experts=True)
+        features = SimpleNamespace(
+            enable_return_routed_experts=True, enable_decoder_swa_bounded_replay=False
+        )
         with (
             mock.patch.object(
                 re_mod, "get_exec", return_value=SimpleNamespace(features=features)
@@ -243,9 +245,7 @@ class TestOutputRankHostCache(CustomTestCase):
             self._read(other_rank)
 
     def test_scattered_other_rank_only_joins_the_all_gather(self):
-        """Under DeepEP, without a known last routed layer, every rank must join
-        each layer's all-gather, or the output rank hangs; the other ranks still
-        keep no rows."""
+        """Without a known last layer, other ranks still join each layer's all-gather."""
         other_rank = self._capturer(attn_tp_rank=1, backend="deepep")
         self.assertIsNone(other_rank.device_cache)
         gathered_shapes = []
@@ -288,7 +288,12 @@ class TestLastLayerGather(CustomTestCase):
             attn_cp_rank=0,
         )
 
-    def _capturer(self, parallel, gather_layer_id=NUM_LAYERS - 1):
+    def _capturer(
+        self,
+        parallel,
+        routed_layer_ids=tuple(range(NUM_LAYERS)),
+        chunked_prefill_size=8,
+    ):
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
@@ -297,7 +302,7 @@ class TestLastLayerGather(CustomTestCase):
             mock.patch.object(
                 re_mod,
                 "get_schedule",
-                return_value=SimpleNamespace(chunked_prefill_size=8),
+                return_value=SimpleNamespace(chunked_prefill_size=chunked_prefill_size),
             ),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
@@ -314,7 +319,9 @@ class TestLastLayerGather(CustomTestCase):
                 max_running_requests=4,
                 num_fused_shared_experts=0,
                 device="cpu",
-                gather_layer_id=gather_layer_id,
+                routed_layer_ids=None
+                if routed_layer_ids is None
+                else list(routed_layer_ids),
             )
 
     def _capture_layers(self, cap, parallel, local_topk, all_gather, layers=None):
@@ -386,28 +393,82 @@ class TestLastLayerGather(CustomTestCase):
             )
         )
 
+    def test_whole_shares_fit_when_capacity_is_not_a_multiple(self):
+        parallel = self._parallel(0)
+        cap = self._capturer(parallel, chunked_prefill_size=9)
+        self.assertEqual(cap.device_cache.buffer.shape[0], 10)
+        sizes = []
+        self._capture_layers(
+            cap,
+            parallel,
+            torch.zeros((5, self.NUM_LAYERS, self.K), dtype=torch.int32),
+            lambda output, input_: sizes.append((output.shape[0], input_.shape[0])),
+        )
+        self.assertEqual(sizes, [(10, 5)])
+
     def test_capture_after_the_gather_layer_raises(self):
         parallel = self._parallel(0)
-        cap = self._capturer(parallel, gather_layer_id=1)
+        cap = self._capturer(parallel, routed_layer_ids=(0, 1))
         with self.assertRaisesRegex(RuntimeError, "after the all-gather layer 1"):
             self._capture_layers(
                 cap, parallel, self._local_topk(), lambda output, input_: None
             )
 
+    def test_unequal_rows_across_layers_raise(self):
+        parallel = self._parallel(0)
+        cap = self._capturer(parallel)
+        local_topk = self._local_topk()
+        with self.assertRaisesRegex(RuntimeError, "captured 2 routed-expert rows"):
+            with (
+                mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+                mock.patch.object(
+                    re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
+                ),
+            ):
+                cap.capture(layer_id=0, topk_indices=local_topk[:, 0])
+                cap.capture(layer_id=1, topk_indices=local_topk[:2, 1])
+
+    def test_bounded_replay_keeps_per_layer_gathers(self):
+        """Bounded replay runs late layers on fewer rows than early ones."""
+        seen = {}
+        features = SimpleNamespace(
+            enable_return_routed_experts=True, enable_decoder_swa_bounded_replay=True
+        )
+        with (
+            mock.patch.object(
+                re_mod, "get_exec", return_value=SimpleNamespace(features=features)
+            ),
+            mock.patch.object(
+                re_mod.RoutedExpertsCapturer,
+                "__init__",
+                lambda self, model_config, **kwargs: seen.update(kwargs),
+            ),
+        ):
+            re_mod.RoutedExpertsCapturer.create(
+                model=SimpleNamespace(
+                    shared_experts_config=SharedExpertsConfig(
+                        num_fused_shared_experts=0
+                    ),
+                    modules=lambda: iter(()),
+                ),
+                model_config=SimpleNamespace(),
+                num_tokens=8,
+                max_running_requests=2,
+                device="cpu",
+            )
+        self.assertIsNone(seen["routed_layer_ids"])
+
     def test_unknown_last_layer_gathers_per_layer(self):
         parallel = self._parallel(1)
-        cap = self._capturer(parallel, gather_layer_id=None)
+        cap = self._capturer(parallel, routed_layer_ids=None)
         self.assertIsNone(cap.local_cache)
         calls = []
-        with mock.patch.object(
-            re_mod, "get_parallel", return_value=SimpleNamespace(attn_tp_size=2)
-        ):
-            self._capture_layers(
-                cap,
-                SimpleNamespace(attn_tp_size=2),
-                self._local_topk(),
-                lambda output, input_: calls.append(output.shape[0]),
-            )
+        self._capture_layers(
+            cap,
+            parallel,
+            self._local_topk(),
+            lambda output, input_: calls.append(output.shape[0]),
+        )
         self.assertEqual(calls, [2 * self.LOCAL_ROWS] * self.NUM_LAYERS)
 
     def test_later_pipeline_stages_send_nothing(self):
@@ -423,7 +484,7 @@ class TestLastLayerGather(CustomTestCase):
         )
 
 
-class TestLastRoutedLayerId(CustomTestCase):
+class TestRoutedLayerIds(CustomTestCase):
     def _topk(self, layer_id, captures=True):
         module = object.__new__(TopK)
         torch.nn.Module.__init__(module)
@@ -431,7 +492,7 @@ class TestLastRoutedLayerId(CustomTestCase):
         module.topk_config = SimpleNamespace(allow_routed_experts_capture=captures)
         return module
 
-    def test_highest_capturing_topk_layer(self):
+    def test_capturing_topk_layers_in_order(self):
         model = torch.nn.ModuleList(
             [
                 self._topk(3),
@@ -440,11 +501,11 @@ class TestLastRoutedLayerId(CustomTestCase):
                 self._topk(9, captures=False),
             ]
         )
-        self.assertEqual(re_mod._last_routed_layer_id(model), 7)
+        self.assertEqual(re_mod._routed_layer_ids(model), [3, 7])
 
     def test_no_capturing_topk(self):
         model = torch.nn.ModuleList([self._topk(2, captures=False)])
-        self.assertIsNone(re_mod._last_routed_layer_id(model))
+        self.assertEqual(re_mod._routed_layer_ids(model), [])
 
 
 if __name__ == "__main__":
