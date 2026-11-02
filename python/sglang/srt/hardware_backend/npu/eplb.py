@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend expert-weight staging and migration for EPLB.
+"""Ascend EPLB statistics, communication reuse, and expert-weight staging.
 
 Callers select these helpers after NPU distributed initialization.
 Import torch_npu only when an NPU operation actually needs it.
@@ -21,13 +21,80 @@ Import torch_npu only when an NPU operation actually needs it.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
+from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+
+_warmed_group = None
+
+
+def get_eplb_group():
+    """Reuse a WORLD-equivalent TP group for NPU statistics and migration."""
+    if not dist.is_initialized():
+        return None
+    tp_group = get_parallel().tp_group
+    # Collective roots and migration peers use global ranks. Elastic groups and
+    # TP subgroups keep the existing default-WORLD path.
+    if (
+        get_exec().moe.elastic_ep_backend
+        or tp_group is None
+        or tp_group.ranks != list(range(dist.get_world_size()))
+        or dist.get_backend(tp_group.device_group) != dist.get_backend()
+    ):
+        return None
+    return tp_group.device_group
+
+
+def _warmup_eplb_communication(group):
+    """Join all ranks before migration can skip ranks without local transfers."""
+    global _warmed_group
+    if group is None or group is _warmed_group:
+        return
+    world_size = dist.get_world_size(group)
+    if world_size > 1:
+        rank = dist.get_rank()
+        send = torch.zeros(1, dtype=torch.int32, device=get_device().device)
+        recv = torch.empty((world_size, 1), dtype=torch.int32, device=send.device)
+        dist.all_reduce(send, group=group)
+        ops = []
+        for peer in range(world_size):
+            if peer != rank:
+                ops.append(dist.P2POp(dist.isend, send, peer, group=group))
+                ops.append(dist.P2POp(dist.irecv, recv[peer], peer, group=group))
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+        # Keep the startup buffers alive until NPU communication completes.
+        torch.npu.synchronize()
+    _warmed_group = group
+
+
+class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
+    """Keep NPU draft passes out of target statistics and reuse TP communication."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        group = get_eplb_group()
+        if get_exec().moe.enable_eplb:
+            _warmup_eplb_communication(group)
+        self._accumulator._communication_group = group
+
+    @contextmanager
+    def with_forward_pass(self, forward_pass_id, forward_batch, *, is_draft=False):
+        if self._disable_all or is_draft:
+            with self.disable_this_region():
+                yield {}
+            return
+        with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
+            yield outputs
 
 
 def update_expert_weights_with_staging(
@@ -48,6 +115,7 @@ def update_expert_weights_with_staging(
         return {}
 
     _validate_migration_topology()
+    group = get_eplb_group()
     staging = _ExpertWeightStaging(weights_by_layer, changed_layer_ids, rank)
     world_size = dist.get_world_size()
     temp_buffers = []
@@ -70,6 +138,7 @@ def update_expert_weights_with_staging(
             world_size=world_size,
             missing_logical_experts_info=missing_experts,
             log_metrics=log_metrics,
+            group=group,
         )
         # Unchanged local slots may still send, but need no writeback.
         if local_changed:
@@ -82,8 +151,6 @@ def update_expert_weights_with_staging(
 
 
 def _validate_migration_topology() -> None:
-    from sglang.srt.runtime_context import get_parallel
-
     parallel = get_parallel()
     if (
         parallel.tp_size != parallel.moe_ep_size

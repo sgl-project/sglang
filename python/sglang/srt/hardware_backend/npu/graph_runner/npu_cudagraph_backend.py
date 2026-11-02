@@ -29,6 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -372,8 +373,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             self._pool = self._device_module.graph_pool_handle()
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        # Both prefill and decode capture bypass ModelRunner.forward. Apply the
+        # draft guard across warmup and capture, including direct counter writes.
+        recording_context = (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if self._decode_runner.model_runner.is_draft_worker
+            else empty_context()
+        )
         try:
-            yield
+            with recording_context:
+                yield
         finally:
             self._capture_stream = None
 
