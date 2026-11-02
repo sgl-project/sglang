@@ -112,6 +112,31 @@ def hgcc_path() -> str:
     )
 
 
+def ninja_path() -> str:
+    """The ninja that JIT builds run, from PATH or the ``ninja`` package.
+
+    The package's binary is not on PATH when its environment is used without
+    being activated.
+    """
+    searched = ["ninja on PATH"]
+    on_path = shutil.which("ninja")
+    if on_path is not None:
+        return on_path
+    try:
+        import ninja
+    except ImportError:
+        pass
+    else:
+        searched.append(ninja.BIN_DIR)
+        in_package = shutil.which("ninja", path=ninja.BIN_DIR)
+        if in_package is not None:
+            return in_package
+    raise RuntimeError(
+        "JIT builds require ninja, which was not found. Searched: "
+        + ", ".join(searched)
+    )
+
+
 @cache_once
 def ppu_sdk_home() -> str:
     """The PPU SDK root providing the hggc libraries to link against.

@@ -153,7 +153,7 @@ def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathl
             (build_dir / unit.filename).write_text(unit.source)
     (build_dir / _BUILD_FILE).write_text(build_file)
 
-    command = ["ninja", "-f", _BUILD_FILE]
+    command = [toolchain.ninja_path(), "-f", _BUILD_FILE]
     jobs = os.environ.get("MAX_JOBS")
     if jobs:
         command += ["-j", jobs]
