@@ -1990,6 +1990,9 @@ class Envs:
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    # Experimental SM90 CP2/4/8 interleave compressor input-layout optimization.
+    SGLANG_OPT_COMPRESSOR_RANK_MAJOR = EnvBool(False)
+    SGLANG_OPT_COMPRESSOR_RANK_MAJOR_MIN_TOKENS = EnvInt(128)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
