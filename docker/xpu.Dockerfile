@@ -92,7 +92,8 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
             -e "s|^sglang-kernel-xpu = \{ index = [^}]* \}$|sglang-kernel-xpu = { git = \"${SG_LANG_KERNEL_REPO}\", rev = \"${SG_LANG_KERNEL_BRANCH}\" }|" \
             pyproject_xpu.toml && \
         grep -q '"sglang-kernel-xpu",' pyproject_xpu.toml && \
-        grep -q '^sglang-kernel-xpu = { git = ' pyproject_xpu.toml; \
+        grep -q '^sglang-kernel-xpu = { git = ' pyproject_xpu.toml && \
+        export CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)'):${CMAKE_PREFIX_PATH}"; \
     elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
         echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
     fi && \
