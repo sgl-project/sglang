@@ -619,6 +619,7 @@ class DeepseekSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._asm_one_scale: Optional[torch.Tensor] = None
         # Keep graph-captured buffers alive per stream.
         self._triton_sparse_mla_workspaces: dict[
             int, list[tuple[torch.Tensor, torch.Tensor]]
@@ -3582,6 +3583,35 @@ class DeepseekSparseAttnBackend(
             dcp_size=self.dcp_size,
             dcp_rank=self.dcp_rank,
         )
+        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
+
+        if is_asm_q8(q_nope, q_rope):
+            from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
+                asm_sparse_mla_dcp,
+            )
+            from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_owned_csr
+
+            # Only the q-replicate absorb writes [q_nope | q_rope] as one fp8
+            # row; the gathered fp8 Q is [q_pe | q_nope] and stays on Triton.
+            q8 = q_nope.as_strided(
+                (rows, heads, q_nope.shape[2] + q_rope.shape[2]),
+                (q_nope.stride(0), q_nope.stride(1), 1),
+            )
+            indptr, indices = dcp_owned_csr(self._dcp_page_table_cache)
+            if self._asm_one_scale is None:
+                self._asm_one_scale = torch.ones(
+                    1, dtype=torch.float32, device=q_nope.device
+                )
+            return asm_sparse_mla_dcp(
+                q8,
+                kv_cache,
+                indptr,
+                indices,
+                sm_scale,
+                v_head_dim,
+                self._asm_one_scale,
+            )
+
         stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
         workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
         out, lse = triton_sparse_mla_decode_splitk(
