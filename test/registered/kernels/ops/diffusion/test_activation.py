@@ -246,10 +246,12 @@ def test_alias_free_snake_beta_crop_and_replicate_edges(length, param_dtype):
         SnakeBeta,
     )
 
-    module = Activation1d(SnakeBeta(3)).to(device="cuda", dtype=param_dtype)
-    module.act.alpha.copy_(torch.tensor([-1.0, 0.0, 1.0], device="cuda"))
-    module.act.beta.copy_(torch.tensor([0.5, -0.5, 0.0], device="cuda"))
-    x = torch.randn((2, 3, length), device="cuda")
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    module = Activation1d(SnakeBeta(3)).to(device=device, dtype=param_dtype)
+    module.act.alpha.copy_(torch.tensor([-1.0, 0.0, 1.0], device=device))
+    module.act.beta.copy_(torch.tensor([0.5, -0.5, 0.0], device=device))
+    x = torch.randn((2, 3, length), device=device)
     actual = alias_free_snake_beta(
         x,
         module.act.alpha,
@@ -260,6 +262,7 @@ def test_alias_free_snake_beta_crop_and_replicate_edges(length, param_dtype):
     with torch.autocast("cuda", dtype=torch.float32):
         reference = module(x)
     torch.testing.assert_close(actual, reference, atol=2e-6, rtol=3e-6)
+    assert torch.cuda.current_device() == current_device
 
 
 if __name__ == "__main__":

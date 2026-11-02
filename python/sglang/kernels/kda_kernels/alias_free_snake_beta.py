@@ -87,20 +87,21 @@ def alias_free_snake_beta(
     block = 128
     upsampled_block = 2 * block
     outputs = (upsampled_block - 12) // 2 + 1
-    _alias_free_snake_beta[
-        (triton.cdiv(x.shape[-1], outputs), x.shape[0] * x.shape[1])
-    ](
-        x,
-        alpha,
-        beta,
-        up_filter,
-        down_filter,
-        y,
-        x.shape[-1],
-        x.shape[1],
-        eps,
-        block,
-        upsampled_block,
-        enable_fp_fusion=False,
-    )
+    with torch.cuda.device(x.device):
+        _alias_free_snake_beta[
+            (triton.cdiv(x.shape[-1], outputs), x.shape[0] * x.shape[1])
+        ](
+            x,
+            alpha,
+            beta,
+            up_filter,
+            down_filter,
+            y,
+            x.shape[-1],
+            x.shape[1],
+            eps,
+            block,
+            upsampled_block,
+            enable_fp_fusion=False,
+        )
     return y
