@@ -271,7 +271,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        *,
+        staging_resource=None,
     ):
+        self.staging_resource = staging_resource
         enable_custom_mem_pool, custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
@@ -398,6 +401,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+        # Borrow last: a constructor that fails earlier leaves no lease that
+        # only teardown() of the unreachable manager could return.
+        if self.staging_resource is not None:
+            self.staging_resource.acquire(self.disaggregation_mode.value)
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -453,10 +460,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def teardown(self) -> None:
         """Stop worker threads and release transport resources so this
         KVManager can be discarded during a P<->D role switch.
+        Each manager is torn down once; a role switch creates a new manager.
 
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mooncake-side registrations / sockets are released.
         """
+        resource = getattr(self, "staging_resource", None)
         self._stopped = True
 
         # Stop the failed-session probe loop (PREFILL role) if running.
@@ -480,22 +489,53 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "Failed to signal mooncake transfer worker on teardown"
                 )
 
-        # Shutdown thread pool executors (PREFILL role).
-        for executor in getattr(self, "executors", []):
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                # Python < 3.9 does not support cancel_futures
-                executor.shutdown(wait=False)
-            except Exception:
-                logger.exception("Failed to shutdown executor on teardown")
-        self.executors = []
-
         # Join workers before touching their sockets: ZMQ sockets aren't
         # thread-safe, so don't close server_socket while a worker may poll it.
         for t in self._worker_threads:
             t.join(timeout=3.0)
+        if resource is not None and any(t.is_alive() for t in self._worker_threads):
+            resource.poison("Mooncake worker did not stop during role switch")
+            raise RuntimeError(resource.unsafe_reason)
         self._worker_threads = []
+
+        # Workers may still submit transfer tasks until they exit.
+        for executor in getattr(self, "executors", []):
+            if resource is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception as e:
+                    resource.poison(f"Mooncake executor shutdown failed: {e}")
+                    logger.exception(
+                        "Failed to shutdown executor on shared staging teardown"
+                    )
+                    raise
+            else:
+                # Keep the non-shared path's wait and error-handling policy.
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    logger.exception("Failed to shutdown executor on teardown")
+        self.executors = []
+
+        if resource is not None:
+            if reason := self.check_staging_role_switch_ready():
+                resource.poison(reason)
+                raise RuntimeError(reason)
+            resource.synchronize()
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if self._staging_handler is not None:
+                    self._staging_handler.close()
+                    self._staging_handler = None
+            else:
+                # These sockets own separate contexts, unlike _socket_cache.
+                for sock in self._staging_ctx.prefetch_sockets.values():
+                    ctx = sock.context
+                    sock.close(linger=0)
+                    ctx.term()
+                self._staging_ctx.prefetch_sockets.clear()
+                self._staging_ctx.prefetch_endpoints.clear()
 
         # Drop the queues so their buffered tasks/senders are released too.
         self.transfer_queues = []
@@ -533,6 +573,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
 
+        if resource is not None:
+            resource.release(self.disaggregation_mode.value)
+            self._staging_ctx = None
+            self.kv_buffer_tensors = None
+
         logger.info(
             "MooncakeKVManager torn down (was role=%s)",
             self.disaggregation_mode.value,
@@ -541,6 +586,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
     # ------------------------------------------------------------------
+
+    def check_staging_role_switch_ready(self):
+        if reason := self.staging_resource.check_idle():
+            return reason
+        if any(n > 0 for n in self._staging_outstanding.values()):
+            return "staging transfers are still outstanding"
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if any(not q.empty() for q in self.transfer_queues):
+                return "staging transfer queues are not empty"
+        elif self._staging_handler is not None:
+            return self._staging_handler.check_idle()
+        return None
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
@@ -566,6 +623,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.engine.batch_register([ptr], [size])
 
     def _init_staging_buffers(self, count: int):
+        if self.staging_resource is not None:
+            self._staging_ctx.buffers = self.staging_resource.prefill_buffers
+            self.kv_buffer_tensors = None
+            return
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
@@ -580,6 +641,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.kv_buffer_tensors = None
 
     def _init_staging_allocator(self):
+        if self.staging_resource is not None:
+            self._staging_ctx.allocator = self.staging_resource.decode_allocator
+            self.kv_buffer_tensors = None
+            return
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_allocator,
         )
@@ -696,6 +761,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            session_endpoints=(
+                self._staging_ctx.prefetch_endpoints
+                if self.staging_resource is not None
+                else None
+            ),
         )
 
     def send_kvcache_staged(
@@ -2498,6 +2568,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         still running (freeBatchID refuses a busy batch and the handle is
         dropped), so a failed send may still be writing decode's pages; decode
         falls back to its release timeout instead."""
+        if getattr(self, "staging_resource", None) is not None:
+            self.staging_resource.poison(f"unsettled Mooncake send for room {room}")
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
@@ -2904,6 +2976,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                if getattr(self, "staging_resource", None) is not None:
+                    self.staging_resource.poison(
+                        f"Mooncake transfer worker failed: {e}"
+                    )
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
