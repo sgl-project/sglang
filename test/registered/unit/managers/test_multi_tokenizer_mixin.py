@@ -1,6 +1,7 @@
 import pickle
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
