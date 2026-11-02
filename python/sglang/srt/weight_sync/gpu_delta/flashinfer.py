@@ -268,7 +268,7 @@ def _scale_parameter(layer, stem, layout):
             if method == "Mxfp4MoEMethod":
                 suffix = "weight_scale"
             elif method == "Mxfp4FlashinferTrtllmMoEMethod":
-                suffix = "weight_scale_inv_shuffled"
+                suffix = "weight_scale_inv"
             else:
                 raise ValueError(f"unsupported TRTLLM MXFP4 method: {method}")
         elif layout.format in {"mxfp8", "fp8-block128-ue8m0"}:
@@ -283,10 +283,7 @@ def _scale_parameter(layer, stem, layout):
     elif layout.backend == "megamoe":
         if layout.format == "nvfp4":
             suffix = "weight_scale"
-        elif layout.format == "mxfp4":
-            # Retain checkpoint scales separately; target the shuffled consumer.
-            suffix = "weight_scale_inv_shuffled"
-        elif layout.format == "mxfp8":
+        elif layout.format in {"mxfp4", "mxfp8"}:
             suffix = "weight_scale_inv"
         else:
             raise ValueError(f"unsupported MegaMoE scale format: {layout.format}")
@@ -724,7 +721,7 @@ def consumer_objects(layer, layout):
             )
         elif layout.format == "mxfp4":
             if type(method).__name__ == "Mxfp4FlashinferTrtllmMoEMethod":
-                objects.append(layer._gemm1_clamp_limit_tensor)
+                objects.append(method._gemm1_clamp_limit_tensor)
             elif type(method).__name__ == "Mxfp4MoEMethod":
                 pass
             else:

@@ -480,15 +480,13 @@ def test_factored_destinations_match_loader_permutations(fmt, backend, group, up
         scale_name = {
             "nvfp4": "w13_weight_scale",
             "mxfp8": "w13_weight_scale_inv",
-            "mxfp4": "w13_weight_scale_inv_shuffled",
+            "mxfp4": "w13_weight_scale_inv",
         }[fmt]
         setattr(
             layer,
             scale_name,
             scale_transform(scales).unsqueeze(0),
         )
-        if fmt == "mxfp4":
-            layer.w13_weight_scale_inv = torch.ones_like(scales, dtype=torch.float32)
     for projection in ("gate", "up"):
         half = int((projection == "up") != up_first)
         # Tail rows and columns create coarse affine rectangles, never padding writes.
@@ -521,10 +519,6 @@ def test_factored_destinations_match_loader_permutations(fmt, backend, group, up
             scales[half * rows : half * rows + nr, :nc] ^= mask
             target = fi._scale_parameter(layer, "w13", layout)[0]
             assert torch.equal(target.flatten(), scale_transform(scales))
-    if fmt == "mxfp4":
-        assert torch.equal(
-            layer.w13_weight_scale_inv, torch.ones_like(scales, dtype=torch.float32)
-        )
 
 
 def test_block128_complete_scale_view_and_consumer_snapshot():
@@ -573,8 +567,7 @@ def test_megamoe_mxfp4_packed_ue8m0_views():
     actual_scale = transform_scale(scales)
     layer = SimpleNamespace(
         w13_weight=actual_weight.unsqueeze(0),
-        w13_weight_scale_inv=torch.ones_like(scales, dtype=torch.float32),
-        w13_weight_scale_inv_shuffled=actual_scale.unsqueeze(0),
+        w13_weight_scale_inv=actual_scale.unsqueeze(0),
         quant_method=SimpleNamespace(),
     )
     layout = fi.FlashInferLayout("mxfp4", "megamoe", True)
@@ -591,9 +584,6 @@ def test_megamoe_mxfp4_packed_ue8m0_views():
             apply_segments(segments, mask)
             original[half * rows : half * rows + r, :c] ^= mask
             assert torch.equal(live, transform(original))
-    assert torch.equal(
-        layer.w13_weight_scale_inv, torch.ones_like(scales, dtype=torch.float32)
-    )
 
 
 @pytest.mark.parametrize("backend", ["trtllm", "megamoe"])
@@ -609,13 +599,14 @@ def test_consumer_snapshot_tracks_live_scale_and_clamp_storage(backend):
     if backend == "trtllm":
         layer.quant_method = type("Mxfp4FlashinferTrtllmMoEMethod", (), {})()
         layer.quant_method.runner = None
-        layer.w13_weight_scale_inv = scalar()
-        layer.w2_weight_scale_inv = scalar()
-        layer.w13_weight_scale_inv_shuffled = torch.zeros(512, dtype=torch.uint8)
-        layer.w2_weight_scale_inv_shuffled = torch.zeros(512, dtype=torch.uint8)
-        layer._gemm1_clamp_limit_tensor = scalar()
+        layer.w13_weight_scale_inv = torch.zeros(512, dtype=torch.uint8)
+        layer.w2_weight_scale_inv = torch.zeros(512, dtype=torch.uint8)
+        layer.quant_method._gemm1_clamp_limit_tensor = scalar()
         layout = fi.FlashInferLayout("mxfp4", backend, True, up_first=True)
-        changed = ("w13_weight_scale_inv_shuffled", "_gemm1_clamp_limit_tensor")
+        changed = (
+            (layer, "w13_weight_scale_inv"),
+            (layer.quant_method, "_gemm1_clamp_limit_tensor"),
+        )
     else:
         layer.quant_method = SimpleNamespace(runner=None)
         layer.w13_weight_scale = torch.zeros(512, dtype=torch.uint8)
@@ -638,10 +629,12 @@ def test_consumer_snapshot_tracks_live_scale_and_clamp_storage(backend):
         layer._flashinfer_megamoe_forward = object()
         layer._flashinfer_megamoe_input_norm_const = 1.0
         layout = fi.FlashInferLayout("nvfp4", backend, True)
-        changed = ("g1_alphas", "g2_alphas", "w2_input_scale_quant")
-    for name in changed:
+        changed = tuple(
+            (layer, name) for name in ("g1_alphas", "g2_alphas", "w2_input_scale_quant")
+        )
+    for owner, name in changed:
         snapshot = ConsumerSnapshot(lambda: fi.consumer_objects(layer, layout))
         snapshot.check()
-        setattr(layer, name, getattr(layer, name).clone())
+        setattr(owner, name, getattr(owner, name).clone())
         with pytest.raises(RuntimeError, match="consumer storage changed"):
             snapshot.check()
