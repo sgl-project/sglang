@@ -46,8 +46,9 @@ def get_eplb_group():
     if not dist.is_initialized():
         return None
     tp_group = get_parallel().tp_group
-    # Collective roots and migration peers use global ranks. Elastic groups and
-    # TP subgroups keep the existing default-WORLD path.
+    # Layouts, collective roots, and P2P peers use WORLD ranks, so TP membership
+    # must match in order and backend. Elastic groups and TP subgroups retain
+    # default WORLD rather than changing that rank contract.
     if (
         get_exec().moe.elastic_ep_backend
         or tp_group is None
@@ -69,6 +70,8 @@ def _warmup_eplb_communication(group):
         send = torch.zeros(1, dtype=torch.int32, device=get_device().device)
         recv = torch.empty((world_size, 1), dtype=torch.int32, device=send.device)
         dist.all_reduce(send, group=group)
+        # The group's first batch_isend_irecv must involve every rank. Warm all
+        # peer channels here so later migrations can safely skip idle ranks.
         ops = []
         for peer in range(world_size):
             if peer != rank:
@@ -86,6 +89,8 @@ def isolate_draft_expert_recording(forward):
 
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):
+        # Draft and target share a recorder. Use the runner role: a draft forward
+        # can also have TARGET_VERIFY mode, so forward mode alone is insufficient.
         if runner.is_draft_worker:
             with get_global_expert_distribution_recorder().disable_this_region():
                 return forward(runner, *args, **kwargs)
@@ -102,11 +107,13 @@ class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
         group = get_eplb_group()
         if get_exec().moe.enable_eplb:
             _warmup_eplb_communication(group)
+        # Reuse the existing accumulator; only its communication group changes.
         self._accumulator._communication_group = group
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id, forward_batch):
-        # The NPU entry guard disables draft execution before reset and append.
+        # Suppressing hooks alone still appends draft zero rows, evicting target
+        # records from the rolling window. Skip reset and append as well.
         if self._disable_all:
             yield {}
         else:

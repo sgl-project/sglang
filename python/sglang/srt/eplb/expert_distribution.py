@@ -762,6 +762,7 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        # Default WORLD; the NPU recorder may supply a compatible existing TP group.
         self._communication_group = None
 
     def get_single_pass_gatherer_keys(self):

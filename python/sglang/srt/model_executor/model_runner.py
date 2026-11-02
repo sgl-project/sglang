@@ -277,6 +277,7 @@ if _is_npu:
 else:
 
     def isolate_draft_expert_recording(forward):
+        # Preserve the original callable on non-NPU devices, without a wrapper.
         return forward
 
     if current_platform.is_out_of_tree():

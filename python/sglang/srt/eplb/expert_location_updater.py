@@ -215,6 +215,7 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
     group=None,
 ):
+    # Explicit groups must preserve the WORLD rank order used by the slot maps.
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
