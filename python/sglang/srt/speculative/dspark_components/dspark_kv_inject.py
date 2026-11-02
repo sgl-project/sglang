@@ -10,7 +10,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import compute_position
+from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
 
@@ -47,6 +49,14 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        self._write_target_hidden_kv = draft_model.write_target_hidden_kv
+        if isinstance(draft_model, DSparkDraftMixin):
+            self._write_target_hidden_kv = draft_model.bind_context_kv_writer(
+                write_loc_resolver=self._context_kv_write_loc
+            )
+
+    def _context_kv_write_loc(self, loc: torch.Tensor) -> KVWriteLoc:
+        return self.draft_model_runner.runner_ids.context_kv_write_loc(loc)
 
     @property
     def swa_ring_size(self) -> Optional[int]:
@@ -117,6 +127,8 @@ class TargetHiddenKvInjector:
                 state_slot=state_slot,
                 final_pos=final_pos,
             )
+        else:
+            swa_loc = self._context_kv_write_loc(cache_loc).swa_loc
         return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
 
     def inject_prefill(
@@ -223,7 +235,8 @@ class TargetHiddenKvInjector:
             return
 
         with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
+            write_kwargs = {} if swa_loc is None else {"swa_loc": swa_loc}
+            self._write_target_hidden_kv(
                 target_hidden=target_hidden,
                 pool=pool,
                 positions=positions,
@@ -231,6 +244,7 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+                **write_kwargs,
             )
 
     def _inject_mla(

@@ -522,6 +522,11 @@ class DSparkDraftMixin:
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False
 
+    def bind_context_kv_writer(
+        self, *, write_loc_resolver: Callable[[torch.Tensor], KVWriteLoc]
+    ) -> Callable[..., None]:
+        return self.write_target_hidden_kv
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
@@ -981,12 +986,14 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
+    context_kv_output_projection = "o_proj"
+
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
         for layer in self.layers:
             layer.mlp = None
-            layer.self_attn.o_proj = None
+            setattr(layer.self_attn, self.context_kv_output_projection, None)
         torch.cuda.empty_cache()
 
 
