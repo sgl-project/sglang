@@ -2622,6 +2622,7 @@ def _make_dsv4_target(*, unified, mapping=None):
         _buf_infos(12) if unified else ([], [], [])
     )
     pool.get_request_state_buf_infos = lambda: ([], [], [])
+    pool.get_c4_state_buf_infos = lambda: ([], [], [])
     return pool
 
 
@@ -2666,8 +2667,13 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 "unified",
                 _make_dsv4_target(unified=True),
                 _make_dsv4_draft(unified=True),
-                [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
-                [[11], [12]],
+                [
+                    StateType.SWA,
+                    StateType.DSV4_C4_STATE,
+                    StateType.SWA_RING,
+                    StateType.SWA_RING,
+                ],
+                [[11], [], [12]],
             ),
         ]
         mark = torch.zeros(3, dtype=torch.int64)

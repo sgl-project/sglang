@@ -1925,6 +1925,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DSV4_C4_STATE,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
@@ -1937,6 +1938,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DSV4_C4_STATE,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
