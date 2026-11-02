@@ -24,9 +24,14 @@ import torch
 
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
+from sglang.srt.layers.moe.mega_gate import (
+    captures_routed_experts,
+    run_mega_gate,
+    should_use_mega_gate,
+)
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -243,9 +248,23 @@ def forward_mega_moe(
 
     shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
 
-    with mega_stream_ctx:
+    # MegaMoE counts the layer's EPLB load in-kernel; the router must not count it too.
+    eplb_load_row = _local_eplb_load_row(moe)
+    with (
+        mega_stream_ctx,
+        (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if eplb_load_row is not None
+            else nullcontext()
+        ),
+    ):
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            eplb_load_row=eplb_load_row,
         )
 
     if fork_mega_moe:
@@ -366,6 +385,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
     buf = _mega_moe_buffer(moe)
@@ -436,7 +456,33 @@ def _run_mega_routed(
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
         buf=buf,
+        eplb_load_row=eplb_load_row,
     )
+
+
+def _local_eplb_load_row(moe: DeepseekV2MoE) -> Optional[torch.Tensor]:
+    """This rank's slice of the recorder's physical count row, for MegaMoE to add
+    the rows each local expert receives; the cross-rank sum at dump time restores
+    the global counts. None keeps the router's histogram of its own picks."""
+    counts = get_global_expert_distribution_recorder().get_current_pass_count_buffer()
+    if (
+        counts is None
+        # No current layer: the recorder hands out the whole table.
+        or counts.dim() != 1
+        or counts.dtype != torch.int32
+        or _device_sm == 90
+        or _mega_moe_mma_type(moe.experts) != "fp8xfp4"
+        # Per-rank shared slots are physical experts EPLB does not know about.
+        or moe.num_fused_shared_experts > 0
+        or captures_routed_experts(moe)
+    ):
+        return None
+    buf = _mega_moe_buffer(moe)
+    if counts.numel() != buf.num_experts:
+        return None
+    num_local = buf.num_experts // buf.group.size()
+    start = buf.group.rank() * num_local
+    return counts[start : start + num_local]
 
 
 def run_mega_routed_experts(
@@ -457,6 +503,7 @@ def run_mega_routed_experts(
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
     buf: Optional[SymmBuffer] = None,
+    eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -596,6 +643,8 @@ def run_mega_routed_experts(
 
     if global_num_tokens is not None:
         mega_kwargs["global_num_tokens"] = global_num_tokens
+    if eplb_load_row is not None:
+        mega_kwargs["cumulative_local_expert_recv_stats"] = eplb_load_row
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
