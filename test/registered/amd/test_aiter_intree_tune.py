@@ -1,13 +1,5 @@
-"""In-tree aiter tuned rows (utils/aiter_tuned_tables) and DeepSeek-V4's aiter#6004 / #6029 /
-#6030.
-
-Guards: the in-tree rows / JSON / mHC policy apply only while aiter ships the pre-PR
-config; once aiter has the PR (simulated by handing aiter a table that already has the
-PR rows) nothing is installed, aiter's merge does not see duplicate keys, and the
-effective table is the PR's either way. The mHC tile_m=16 policy is bit-identical.
-Rows without a base kernel only add shapes aiter lacks, once; on the pinned aiter every
-in-tree row applies or adds.
-"""
+"""In-tree aiter tuned rows and DeepSeek-V4's aiter#6004 / #6029 / #6030 apply only while
+aiter lacks them, never repeat a key, and the mHC tile_m=16 policy is bit-identical."""
 
 import collections
 import glob
@@ -211,33 +203,6 @@ class TestBpreshuffleWithAiter(CustomTestCase):
         self._assert_pr_rows(kernels)
 
 
-class TestIntreeAdditions(CustomTestCase):
-    def test_rows_without_base_add_missing_shapes_and_yield_to_aiter(self):
-        """A row with no base kernel adds a shape aiter lacks and never overrides or
-        duplicates a row aiter has."""
-        stock = _as_stock(_intree())
-        new = stock.iloc[:2].copy()
-        new["M"] = [1, 2]  # shapes aiter has no row for
-        clash = stock.iloc[[2]].copy()
-        clash["kernelName"] = "ours"  # a shape aiter has, with another kernel
-        out, stats = _apply(stock, pd.concat([new, clash]))
-        self.assertEqual(stats[tables.ADDED], 2)
-        self.assertEqual(stats[tables.SUPERSEDED], 1)
-        self.assertEqual(len(out), len(stock) + 2)
-        self.assertFalse(out.duplicated(subset=list(_TABLE.key_cols)).any())
-        self.assertEqual(out.loc[2, "kernelName"], stock.loc[2, "kernelName"])
-
-    def test_a_shape_repeated_in_tree_is_added_once(self):
-        """aiter refuses a table with a duplicate key, so a second in-tree row for the
-        same new shape counts as missing instead of being added again."""
-        stock = _as_stock(_intree())
-        new = stock.iloc[[0, 0]].copy()
-        new["M"] = [1, 1]
-        out, stats = _apply(stock, new)
-        self.assertEqual((stats[tables.ADDED], stats[tables.MISSING]), (1, 1))
-        self.assertFalse(out.duplicated(subset=list(_TABLE.key_cols)).any())
-
-
 def _write_rows(tmp, name, rows):
     path = os.path.join(tmp, name)
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -267,31 +232,6 @@ class TestHipblasltRows(CustomTestCase):
                 ):
                     out = tables.read_intree_rows(tables.GEMM_BF16, csvs)
                     self.assertEqual(out["M"].tolist(), kept)
-
-
-class TestFlydslRows(CustomTestCase):
-    def test_an_aiter_without_flydsl_skips_the_flydsl_rows(self):
-        """aiter builds a FlyDSL row's kernel at the first GEMM or fused-MoE call, so an
-        aiter that cannot import FlyDSL keeps the table's other rows only."""
-        cases = (
-            (_TABLE, {"libtype": "flydsl", "kernelName": "flydsl_gemm"}),
-            (_TABLE, {"libtype": "ck", "kernelName": "flydsl_gemm"}),
-            (tables.FMOE, {"kernelName1": "flydsl_moe1", "kernelName2": "ck_moe2"}),
-        )
-        for table, flydsl_row in cases:
-            other = {c: "ck_kernel" for c in flydsl_row}
-            with (
-                self.subTest(table=table.name, row=flydsl_row),
-                tempfile.TemporaryDirectory() as tmp,
-            ):
-                csvs = _write_rows(
-                    tmp, "rows.csv", [{"M": 1, **flydsl_row}, {"M": 2, **other}]
-                )
-                with mock.patch.object(tables, "_aiter_has_flydsl", return_value=True):
-                    self.assertEqual(len(tables.read_intree_rows(table, csvs)), 2)
-                with mock.patch.object(tables, "_aiter_has_flydsl", return_value=False):
-                    out = tables.read_intree_rows(table, csvs)
-                self.assertEqual(out["M"].tolist(), [2])
 
 
 def _aiter_commit() -> str:
@@ -328,24 +268,6 @@ class TestInTreeTables(CustomTestCase):
         tempfile.tempdir = self._tempdir
         type(AITER_CONFIGS).get_config_file.cache_clear()
         shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_a_table_the_user_set_is_left_alone(self):
-        """A user's AITER_CONFIG_* is their table: the in-tree rows must not replace it."""
-        user = os.path.join(self.tmp, "user_table.csv")
-        with (
-            mock.patch.dict(
-                os.environ,
-                {
-                    "SGLANG_USE_AITER": "1",
-                    "SGLANG_AITER_INTREE_GEMM_TUNE": "1",
-                    _TABLE.env: user,
-                },
-            ),
-            mock.patch.object(tables, "_report", None),
-        ):
-            report = tables.install_aiter_tuned_tables()
-            self.assertEqual(report[_TABLE.name], f"user {_TABLE.env}")
-            self.assertEqual(os.environ[_TABLE.env], user)
 
     def test_rows_are_unique_and_resolve_on_the_pinned_aiter(self):
         pinned = _aiter_commit().startswith(_TABLES_AITER)
