@@ -39,8 +39,6 @@ class NpuDwdpManager(DwdpManager):
         super().__init__(server_args, device_module=torch.npu)
         parallel = get_parallel()
         self._group = parallel.tp_group
-        self._parallel = parallel
-        self._server_args = server_args
         self.device = torch.device("npu", self.device_id)
         self._transport = None
         self._weight_buffer = None
@@ -49,45 +47,7 @@ class NpuDwdpManager(DwdpManager):
         self._setup_complete = False
         self._imports_started = False
 
-    def _validate(self, model):
-        from sglang.srt.model_executor.cuda_graph_config import (
-            cuda_graph_fully_disabled,
-        )
-
-        parallel = self._parallel
-        if (
-            self.dwdp_size < 2
-            or self.dwdp_size != parallel.tp_size
-            or self._group.world_size != self.dwdp_size
-            or parallel.attn_tp_size != 1
-            or parallel.pp_size != 1
-        ):
-            raise ValueError("NPU DWDP requires DWDP=TP, attention TP1 and PP1")
-        if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
-            raise ValueError("NPU DWDP requires attention CP1 and DCP1")
-        if not cuda_graph_fully_disabled():
-            raise ValueError(
-                "NPU DWDP requires both prefill and decode graphs disabled"
-            )
-        if (
-            self._server_args.enable_lora
-            or (self._server_args.enable_lora is None and self._server_args.lora_paths)
-            or self._server_args.cpu_offload_gb > 0
-            or self._server_args.offload_group_size > 0
-            or self._server_args.enable_memory_saver
-            or self._server_args.enable_pd_role_switch
-        ):
-            raise ValueError(
-                "NPU DWDP does not support LoRA, CPU offload, memory saver or PD role switching"
-            )
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-
-        decoder = model.model if hasattr(model, "model") else model
-        if any(
-            sum(isinstance(m, FusedMoE) for m in layer.modules()) > 1
-            for layer in decoder.layers
-        ):
-            raise ValueError("NPU DWDP requires at most one FusedMoE per decoder layer")
+    def _collect_weight_specs(self, model):
         layers = self._collect_moe_layers(model)
         if not layers:
             raise ValueError("NPU DWDP found no FusedMoE layers")
@@ -97,66 +57,30 @@ class NpuDwdpManager(DwdpManager):
         self.num_experts = counts.pop()
         self._local_experts = self.num_experts // self.dwdp_size
         self.layout = DwdpExpertLayout(self.num_experts, self.dwdp_size, self.dwdp_rank)
-        from sglang.srt.distributed.utils import get_group_rank_size
-        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-            NPUUnquantMoEMethod,
-            NPUW8A8Int8MoEMethod,
-        )
-        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-        # Independent ranks cannot execute residual TP collectives. Models must
-        # construct attention, dense/shared projections and vocabulary locally.
-        for name, module in model.named_modules():
-            if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
-                size = get_group_rank_size(module.tp_group)[1]
-            elif isinstance(module, VocabParallelEmbedding):
-                size = module.tp_size
-            else:
-                continue
-            if size != 1:
-                raise ValueError(
-                    f"NPU DWDP requires local non-expert weights; {name} has TP{size}"
-                )
         specs = {}
-        signature = []
         for li, experts in layers:
-            if experts.layer_id != li:
-                raise ValueError("NPU DWDP MoE layer IDs must match decoder indices")
-            if experts.num_fused_shared_experts:
-                raise ValueError("NPU DWDP requires --disable-shared-experts-fusion")
-            if experts.moe_tp_size != 1 or experts.moe_ep_size != self.dwdp_size:
-                raise ValueError("NPU DWDP requires MoE TP1 and EP equal to DWDP")
             specs[li] = {}
             for name in _WEIGHTS:
-                kernel = getattr(experts, name.replace("_weight", "_kernel"), None)
-                if not isinstance(kernel, (NPUUnquantMoEMethod, NPUW8A8Int8MoEMethod)):
-                    raise ValueError(
-                        f"NPU DWDP unsupported kernel for {name}: {type(kernel).__name__}"
-                    )
                 weight = getattr(experts, name)
                 if weight.dtype not in _DTYPES:
                     raise ValueError(
                         f"NPU DWDP unsupported {name} dtype: {weight.dtype}"
                     )
-                if weight.ndim != 3 or weight.shape[0] != self._local_experts:
+                if (
+                    weight.device != self.device
+                    or weight.ndim != 3
+                    or weight.shape[0] != self._local_experts
+                ):
                     raise ValueError(
-                        f"NPU DWDP invalid expert shard {name}: {weight.shape}"
+                        f"NPU DWDP invalid {name} shard: {weight.shape} on {weight.device}"
                     )
-                if weight.device != self.device:
-                    raise ValueError(
-                        "NPU DWDP weights must already be on the local NPU"
-                    )
-                shape = (self.num_experts, *weight.shape[1:])
                 specs[li][name] = _WeightSpec(
-                    shape, weight.dtype, weight.element_size()
+                    (self.num_experts, *weight.shape[1:]),
+                    weight.dtype,
+                    weight.element_size(),
                 )
-                signature.append((li, name, shape, str(weight.dtype)))
-            for name, value in experts.named_per_expert_tensors(self._local_experts):
-                signature.append((li, name, tuple(value.shape), str(value.dtype)))
         self._moe_layers, self._specs = layers, specs
         self._moe_layer_indices = [li for li, _ in layers]
-        return signature
 
     def _setup_stage(self, operation, function):
         value, error = None, None
@@ -172,10 +96,17 @@ class NpuDwdpManager(DwdpManager):
     def setup(self, model) -> None:
         if self._setup_complete:
             return
-        signature = self._setup_stage("validation", lambda: self._validate(model))
-        signatures = self._group.all_gather_object(signature)
-        if any(peer != signature for peer in signatures):
-            raise ValueError("NPU DWDP weight shapes/dtypes differ across ranks")
+        from sglang.srt.model_executor.cuda_graph_config import (
+            cuda_graph_fully_disabled,
+        )
+
+        # Explicit phase configuration can override the automatic graph-off
+        # flag. DCP would introduce collectives between independent DWDP ranks.
+        if not cuda_graph_fully_disabled():
+            raise ValueError("NPU DWDP requires graphs disabled")
+        if get_parallel().attn_dcp_size != 1:
+            raise ValueError("NPU DWDP requires DCP1")
+        self._setup_stage("weight metadata", lambda: self._collect_weight_specs(model))
         try:
             self._transport = self._setup_stage(
                 "transport initialization", lambda: NpuWeightTransport(self.device)
