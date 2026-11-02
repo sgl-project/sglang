@@ -1498,11 +1498,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_mixed() and not is_linear_attn:
-            # Full-attention layers in a mixed batch must reach the child
-            # backend's own mode dispatch (AttentionBackend.forward), which is
-            # what routes NPU backends to forward_mixed. Delegating straight to
-            # forward_extend here would silently run a mixed batch as a plain
-            # extend and corrupt the KV lengths.
+            # Let the child backend select its platform-specific mixed path.
             return self.full_attn_backend.forward(
                 q,
                 k,
