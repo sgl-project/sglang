@@ -941,6 +941,15 @@ class SchedulerPPMixin:
                 expected_kind="proxy",
                 all_gather_group=(self.attn_tp_group),
             )
+            # Record the forward stream on each received tensor to prevent
+            # the caching allocator from recycling the memory before the
+            # forward pass completes. This fixes a race condition when
+            # pp_async_batch_depth > pp_size / 2 where the next recv can
+            # overwrite tensors while the previous forward is still queued.
+            # See: https://github.com/sgl-project/sglang/issues/47613
+            for t in tensor_dict.values():
+                if isinstance(t, torch.Tensor) and t.is_cuda:
+                    t.record_stream(self.forward_stream)
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
