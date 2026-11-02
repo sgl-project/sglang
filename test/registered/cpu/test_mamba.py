@@ -446,5 +446,134 @@ def test_fused_sigmoid_gating_delta_rule_update(
         )
 
 
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("steps", [1, 4])
+def test_chain_verify_matches_chunk_kernel(batch, steps):
+    """DFlash target-verify replay vs the chunked prefill kernel.
+
+    ``chunk_gated_delta_rule_cpu`` solves the same recurrence in matrix form
+    instead of step by step, and takes each draft block as one variable-length
+    sequence -- so it also pins the ``n * steps + t`` token packing that the
+    replay's ``[:, t::steps]`` slicing assumes.
+    """
+    from sgl_kernel.mamba import fused_sigmoid_gating_delta_rule_update_cpu
+
+    HK, HV, K, V, POOL = 2, 4, 128, 128, 9
+    total = batch * steps
+
+    q = torch.randn(1, total, HK, K, dtype=torch.bfloat16)
+    k = torch.randn(1, total, HK, K, dtype=torch.bfloat16)
+    v = torch.randn(1, total, HV, V, dtype=torch.bfloat16)
+    a = torch.rand(total, HV, dtype=torch.bfloat16)
+    b = torch.rand(total, HV, dtype=torch.bfloat16)
+    A_log = torch.rand(HV, dtype=torch.float32)
+    dt_bias = torch.rand(HV, dtype=torch.bfloat16)
+
+    pool = torch.randn(POOL, HV, K, V, dtype=torch.float32) * 0.1
+    state_indices = torch.tensor([5, 2, 8, 1], dtype=torch.int32)[:batch]
+    cu_seqlens = torch.arange(0, (batch + 1) * steps, steps, dtype=torch.int32)
+    # Pool-sized and rolled: the kernel reads this table positionally per
+    # request, and its slots must not be confused with the state slots.
+    window_indices = torch.roll(torch.arange(POOL, dtype=torch.int32), 3)
+    window = torch.zeros(POOL, steps, HV, K, V, dtype=torch.float32)
+
+    src = pool.clone()
+    out = fused_sigmoid_gating_delta_rule_update_cpu(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        initial_state_source=src,
+        initial_state_indices=state_indices,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+        disable_state_update=True,
+        intermediate_states_buffer=window,
+        intermediate_state_indices=window_indices,
+    )
+
+    g, beta = torch.ops.sgl_kernel.fused_gdn_gating_cpu(A_log, a, b, dt_bias)
+    ref_pool = pool.clone()
+    out_ref, _ = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
+        query=q.clone(),
+        key=k.clone(),
+        value=v.clone(),
+        g=g,
+        beta=beta,
+        initial_state=ref_pool,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens.clone(),
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+        initial_state_indices=state_indices.clone(),
+    )
+
+    atol = rtol = precision[out.dtype]
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+    # The snapshot after the last draft token is the end-of-sequence state.
+    torch.testing.assert_close(
+        window[window_indices[:batch].long(), steps - 1],
+        ref_pool[state_indices.long()],
+        atol=atol,
+        rtol=rtol,
+    )
+    # disable_state_update leaves the committed pool alone.
+    torch.testing.assert_close(src, pool)
+
+
+def test_mamba_state_scatter_cpu_matches_per_request_loop():
+    """CPU scatter fallback vs the contract spelled out one request at a time.
+
+    Out-of-range rows are silently skipped by the fused kernels, which is how
+    requests with nothing to commit are excluded, so the -1 rows are part of
+    the contract rather than bad input.
+    """
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        scatter_mamba_states_after_mtp_verify,
+    )
+
+    layers, cache_size, spec_size, steps = 2, 7, 4, 3
+    ssm = torch.randn(layers, cache_size, 3, 8, dtype=torch.float32)
+    intermediate_ssm = torch.randn(layers, spec_size, steps, 3, 8)
+    conv = torch.randn(layers, cache_size, 5, 3, dtype=torch.bfloat16)
+    window = torch.randn(layers, spec_size, steps, 5, 3, dtype=torch.bfloat16)
+
+    state_indices = torch.tensor([4, -1, 0, 6], dtype=torch.int32)
+    step_indices = torch.tensor([2, 1, -1, 0], dtype=torch.int32)
+    track_indices = torch.tensor([1, 5, -1, -1], dtype=torch.int32)
+    steps_to_track = torch.tensor([0, 2, 1, -1], dtype=torch.int32)
+
+    caches = SimpleNamespace(
+        temporal=ssm.clone(),
+        intermediate_ssm=intermediate_ssm,
+        conv=[conv.clone()],
+        intermediate_conv_window=[window],
+    )
+    scatter_mamba_states_after_mtp_verify(
+        caches, state_indices, step_indices, track_indices, steps_to_track
+    )
+
+    def scatter_ref(dst, src, dst_indices, step_indices):
+        out = dst.clone()
+        for req in range(dst_indices.numel()):
+            slot, step = int(dst_indices[req]), int(step_indices[req])
+            if 0 <= slot < dst.shape[1] and 0 <= step < src.shape[2]:
+                out[:, slot] = src[:, req, step]
+        return out
+
+    ssm_ref = scatter_ref(ssm, intermediate_ssm, state_indices, step_indices)
+    ssm_ref = scatter_ref(ssm_ref, intermediate_ssm, track_indices, steps_to_track)
+    conv_ref = scatter_ref(conv, window, state_indices, step_indices)
+    conv_ref = scatter_ref(conv_ref, window, track_indices, steps_to_track)
+
+    torch.testing.assert_close(caches.temporal, ssm_ref)
+    torch.testing.assert_close(caches.conv[0], conv_ref)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
