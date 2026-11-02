@@ -421,8 +421,9 @@ class KVStorage:
         return self._allocator
 
     def available_units(self, sub_pool: str) -> int:
-        """Rows ``take_units`` can hand out without eviction."""
-        return self._band(sub_pool).available_size()
+        """Units ``take_units`` can hand out without eviction: the planner's
+        answer, which counts the room a relayout makes, as a take does."""
+        return self._allocator.units_available(sub_pool)
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
@@ -699,6 +700,40 @@ class KVStorage:
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
 
+    def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
+        """The sub-pool a transfer entry carries, as peers tell entries of one
+        state type apart."""
+        return entry.sub_pool
+
+    def primary_window_name(self) -> Optional[str]:
+        """The target's window sub-pool (the one a single-window reader sizes
+        and retains by), or None without a window."""
+        window = self._plan.primary_window()
+        return None if window is None else window.name
+
+    def host_pool_name(self, sub_pool: str) -> str:
+        """The host pool a sub-pool's rows back up to and load from."""
+        return self._plan.sub_pool(sub_pool).external.host_pool
+
+    def window_tree_component(self, sub_pool: str):
+        """The prefix-tree slot of a window sub-pool."""
+        allocator = self._allocator
+        return allocator.window_component(allocator.window_allocators[sub_pool])
+
+    def storage_format_tag(self) -> Optional[str]:
+        """The tag a persisted host copy of this storage's layout carries."""
+        return self._plan.storage_format_tag()
+
+    def draft_hosting_sub_pools(self) -> Tuple[str, ...]:
+        """The sub-pools whose entries also hold a fused draft's rows."""
+        return tuple(
+            s.name for s in self._plan.sub_pools if s.spec.draft_region is not None
+        )
+
+    def holds_view(self, pool) -> bool:
+        """Whether ``pool`` views this storage's own memory."""
+        return pool._arena is self._allocator.arena
+
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
     ) -> None:
@@ -825,14 +860,6 @@ class KVStorage:
                 view.kv_cache_layout if isinstance(spec, MHASubPoolSpec) else None
             ),
         )
-
-    def device_room(self, sub_pool: str) -> int:
-        """Free units a host load can take in the sub-pool now."""
-        assert (
-            sub_pool in self._allocator.window_allocators
-            or sub_pool == self._allocator.roles.state
-        ), sub_pool
-        return self._allocator.units_available(sub_pool)
 
     def host_ids(
         self, sub_pool: str
