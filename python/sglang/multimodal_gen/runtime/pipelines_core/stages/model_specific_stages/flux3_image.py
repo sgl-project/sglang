@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding impo
     ConditionEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.target_encoding import (
+    TargetEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -544,6 +547,8 @@ class Flux3ImageTextEncodeStage(PipelineStage):
                         "the FLUX.3 flow-map DiT samples without CFG; drop negative_prompt"
                     )
                 prompts.append(prompt or "")
+            elif server_args.disagg_encode_only:
+                prompts.append(prompt or "")
             else:
                 prompts.extend([batch.negative_prompt or "", prompt or ""])
         with self.use_declared_component(
@@ -553,7 +558,11 @@ class Flux3ImageTextEncodeStage(PipelineStage):
         ):
             with torch.inference_mode():
                 encoded = self.text_encoder.encode_batch(prompts)
-        branches = 1 if self.package_config.dit.flow_map else 2
+        branches = (
+            1
+            if self.package_config.dit.flow_map or server_args.disagg_encode_only
+            else 2
+        )
         for index, batch in enumerate(batches):
             batch.extra["flux3_text"] = encoded[
                 index * branches : (index + 1) * branches
@@ -624,6 +633,53 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                     get_local_torch_device(),
                 )
         return batch
+
+
+class Flux3ImageTargetEncodeStage(TargetEncodingStage):
+    """The target's VAE tokens, with the ids the denoiser gives generated image tokens."""
+
+    def __init__(self, vae, package_config) -> None:
+        super().__init__()
+        self.vae = vae
+        self.package_config = package_config
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "vae",
+                phase="target_encode",
+                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
+                memory_intensive=True,
+                skip_empty_cache_on_release=True,
+            )
+        ]
+
+    def prepare_visual(self, path: str, batch: Req) -> Image.Image:
+        latent_shape(batch.height, batch.width)
+        return super().prepare_visual(path, batch)
+
+    def encode_visual(
+        self, image: Image.Image, batch: Req, server_args: ServerArgs
+    ) -> dict[str, Tensor]:
+        with (
+            self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="target_encode",
+            ),
+            use_vae_fast_path(self.vae, batch.quality != "exact"),
+        ):
+            with torch.inference_mode():
+                tokens, ids = vae_encode(
+                    self.vae, _to_tensor(image).to(get_local_torch_device())
+                )
+        return {
+            "latents": tokens,
+            "latent_ids": scaled_ids(ids, self.package_config.dit.image_rope_scale),
+        }
 
 
 class _CFGParallelModel:

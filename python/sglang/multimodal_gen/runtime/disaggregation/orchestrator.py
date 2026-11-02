@@ -25,11 +25,17 @@ from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
     create_dispatch_policy,
 )
+from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
+    restore_extra_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
     RequestTracker,
 )
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.roles import (
+    RoleType,
+    needs_image_encoder,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     send_tensors,
     unpack_tensors,
@@ -61,6 +67,14 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _inline_local_file(path):
+    if isinstance(path, str) and os.path.isfile(path):
+        return "data:application/octet-stream;base64," + base64.b64encode(
+            Path(path).read_bytes()
+        ).decode("ascii")
+    return path
 
 
 def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
@@ -186,6 +200,7 @@ class DiffusionServer:
         image_encoder_work_endpoints: list[str] | None = None,
         prompt_encoder_result_endpoint: str | None = None,
         image_encoder_result_endpoint: str | None = None,
+        encode_only: bool = False,
     ):
         split_encoding = bool(
             prompt_encoder_work_endpoints or image_encoder_work_endpoints
@@ -214,6 +229,7 @@ class DiffusionServer:
         self._num_denoisers = len(denoiser_work_endpoints)
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
+        self._encode_only = encode_only
 
         self._tracker = RequestTracker(
             init_metrics(server_args, role="server")
@@ -222,7 +238,7 @@ class DiffusionServer:
         )
         self._dispatcher = PoolDispatcher(
             num_encoders=max(1, self._num_encoders),
-            num_denoisers=self._num_denoisers,
+            num_denoisers=max(1, self._num_denoisers),
             num_decoders=max(1, self._num_decoders),
             policy_name=dispatch_policy_name,
         )
@@ -510,8 +526,10 @@ class DiffusionServer:
 
         if self._glm_distributed_state is not None and role == RoleType.DENOISER:
             self._handle_glm_denoiser_result(tensor_fields, scalar_fields)
-        elif role == RoleType.DECODER:
-            self._handle_decoder_result(tensor_fields, scalar_fields)
+        elif role == RoleType.DECODER or (
+            self._encode_only and "_disagg_error" not in scalar_fields
+        ):
+            self._handle_final_result(tensor_fields, scalar_fields, role)
         else:
             # Non-transfer frames from encoder/denoiser are error results
             # sent via send_tensors (e.g., _disagg_error).
@@ -607,25 +625,27 @@ class DiffusionServer:
             )
             return
 
-        if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
+        if self._input_role == RoleType.PROMPT_ENCODER and needs_image_encoder(
+            req.image_path, req.encode_target
+        ):
             # HTTP uploads belong to the head's filesystem, not the GPU workers'.
-            paths = (
-                req.image_path
-                if isinstance(req.image_path, (list, tuple))
-                else [req.image_path]
-            )
             try:
-                req.image_path = [
-                    "data:application/octet-stream;base64,"
-                    + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                    if isinstance(path, str) and os.path.isfile(path)
-                    else path
-                    for path in paths
-                ]
+                if req.image_path:
+                    paths = (
+                        req.image_path
+                        if isinstance(req.image_path, (list, tuple))
+                        else [req.image_path]
+                    )
+                    req.image_path = [_inline_local_file(path) for path in paths]
+                if req.encode_target:
+                    req.encode_target = {
+                        stream: _inline_local_file(path)
+                        for stream, path in req.encode_target.items()
+                    }
                 payload = pickle.dumps(reqs)
             except OSError as error:
                 self._complete_with_error(
-                    request_id, f"Cannot read reference image: {error}"
+                    request_id, f"Cannot read request image: {error}"
                 )
                 return
 
@@ -882,26 +902,40 @@ class DiffusionServer:
             pass
         self._tracker.remove(request.client_request_id)
 
-    def _handle_decoder_result(self, tensor_fields: dict, scalar_fields: dict) -> None:
+    def _handle_final_result(
+        self, tensor_fields: dict, scalar_fields: dict, role: RoleType
+    ) -> None:
         request_id = scalar_fields["request_id"]
-        logger.debug("DiffusionServer: decoder result %s", request_id)
-        self._release_assignment(request_id, RoleType.DECODER)
+        logger.debug("DiffusionServer: %s result %s", role.value, request_id)
+        self._release_assignment(request_id, role)
         self._assignments.pop(request_id, None)
         p2p = self._transfer_state.get(request_id)
-        self._recycle_prealloc_slot(p2p, RoleType.DECODER)
+        self._recycle_prealloc_slot(p2p, role)
 
-        output_batch = OutputBatch(
-            output=tensor_fields.get("output"),
-            audio=tensor_fields.get("audio"),
-            audio_sample_rate=scalar_fields.get("audio_sample_rate"),
-            error=scalar_fields.get("error"),
-        )
+        if role == RoleType.DECODER:
+            output_batch = OutputBatch(
+                output=tensor_fields.get("output"),
+                audio=tensor_fields.get("audio"),
+                audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+                error=scalar_fields.get("error"),
+            )
+        else:
+            encoded = {}
+            restore_extra_tensors(encoded, tensor_fields, scalar_fields)
+            for key in [k for k in scalar_fields if k.startswith("_extra_")]:
+                encoded[key[len("_extra_") :]] = scalar_fields.pop(key)
+            # What remains are Req tensor fields (e.g. prompt_embeds).
+            encoded.update(tensor_fields)
+            output_batch = OutputBatch(
+                encoded=encoded or None, error=scalar_fields.get("error")
+            )
         if (
             output_batch.output is None
             and output_batch.audio is None
+            and output_batch.encoded is None
             and not output_batch.error
         ):
-            output_batch.error = "Decoder returned no output"
+            output_batch.error = f"{role.value} returned no output"
 
         try:
             if output_batch.error:
@@ -918,7 +952,8 @@ class DiffusionServer:
 
         if client_identity is None:
             logger.warning(
-                "DiffusionServer: no pending client for decoder result %s",
+                "DiffusionServer: no pending client for %s result %s",
+                role.value,
                 request_id,
             )
             self._tracker.remove(request_id)
@@ -1165,6 +1200,19 @@ class DiffusionServer:
             )
             return
 
+        if bool(msg.get("encode_only", False)) != self._encode_only:
+            # Mismatched workers would stage for a denoiser that does not exist,
+            # or answer with extras the head treats as errors.
+            logger.error(
+                "DiffusionServer transfer: %s at %s has --disagg-encode-only=%s "
+                "but the head has %s; pass it to both. Dropping registration",
+                role.value,
+                work_endpoint,
+                bool(msg.get("encode_only", False)),
+                self._encode_only,
+            )
+            return
+
         info = {
             "session_id": msg.get("session_id", ""),
             "pool_ptr": msg.get("pool_ptr", 0),
@@ -1203,8 +1251,9 @@ class DiffusionServer:
         if old_transfer is not None:
             self._recycle_prealloc_slot(old_transfer, role)
         next_role = self._role_order[self._role_order.index(role) + 1]
-        if role == RoleType.PROMPT_ENCODER and not msg.get("scalar_fields", {}).get(
-            "image_path"
+        scalar_fields = msg.get("scalar_fields", {})
+        if role == RoleType.PROMPT_ENCODER and not needs_image_encoder(
+            scalar_fields.get("image_path"), scalar_fields.get("encode_target")
         ):
             next_role = RoleType.DENOISER
 

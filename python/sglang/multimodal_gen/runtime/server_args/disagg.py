@@ -112,6 +112,13 @@ class DisaggServerArgsMixin:
             help="Role for disaggregated pipeline.",
         )
         parser.add_argument(
+            "--disagg-encode-only",
+            action="store_true",
+            default=cls.disagg_encode_only,
+            help="Serve encode-only requests: the last encoder role on a request's "
+            "path returns its outputs to the client instead of a denoiser.",
+        )
+        parser.add_argument(
             "--disagg-timeout",
             type=int,
             default=cls.disagg_timeout,

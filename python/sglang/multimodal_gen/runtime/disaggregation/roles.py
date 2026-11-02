@@ -56,6 +56,11 @@ class RoleType(str, Enum):
         return [role.value for role in cls] + sorted(_ROLE_ALIASES)
 
 
+def needs_image_encoder(image_path, encode_target) -> bool:
+    """Whether a request continues from the prompt encoder to the image encoder."""
+    return bool(image_path) or bool(encode_target)
+
+
 def get_module_role(module_name: str) -> "RoleType | None":
     """Classify a module name to its primary role. Returns None for shared modules."""
     encoder_prefixes = (
