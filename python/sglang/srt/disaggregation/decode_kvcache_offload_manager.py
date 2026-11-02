@@ -348,9 +348,7 @@ class DecodeKVCacheOffloadManager:
         self.tree_cache.unlock(req.lock)
         req.lock = None
         kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
         ).release_row(req)
         req.kv.mark_kv_released()
         self.offloaded_state.pop(req, None)

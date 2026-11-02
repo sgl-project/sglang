@@ -76,7 +76,6 @@ def _make_ctx(
     # Static pools: the tree's slots follow the pool shape.
     params.token_to_kv_pool_allocator.storage = None
     params.sliding_window_size = 128
-    params.token_to_kv_pool_allocator.window_retention = None
     return TreeCacheBuildContext(
         server_args=server_args,
         params=params,

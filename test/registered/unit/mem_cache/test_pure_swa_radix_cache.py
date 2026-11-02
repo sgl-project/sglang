@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,10 +36,6 @@ class _FakeAllocator:
 
     device = "cpu"
     storage = None
-    # The one window pool, keeping the cache's 4-token window (as the cache
-    # builder binds it).
-    window_retention = {"swa": 4}
-
     # The pools take their rows from memories of their own.
     pools_share_memory = False
 
@@ -76,13 +73,18 @@ class _FakeAllocator:
 
 
 def _make_cache(*, disable, num_tokens, page_size=1):
+    req_to_token_pool = _FakeReqToTokenPool(
+        torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
+    )
+    allocator = _FakeAllocator(page_size)
+    # The one window pool keeps the cache's 4-token window, as the cache
+    # builder binds it.
+    kv_storage_of(req_to_token_pool, allocator).bind_window_retention(4, None)
     return PureSWARadixCache(
         CacheInitParams(
             disable=disable,
-            req_to_token_pool=_FakeReqToTokenPool(
-                torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
-            ),
-            token_to_kv_pool_allocator=_FakeAllocator(page_size),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=4,
         )

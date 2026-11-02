@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -269,7 +270,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             # The window pool, keeping the scheduler's window.
             window_pool_names=lambda: ("swa",),
             target_window_pool=lambda: "swa",
-            window_retention={"swa": sliding_window_size},
             get_kvcache=lambda: SimpleNamespace(request_window=None),
             device=torch.device("cpu"),
             page_size=256,
@@ -277,6 +277,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
+        )
+        # The window pool keeps the scheduler's window.
+        kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+            sliding_window_size, None
         )
         regular_host_alloc = MagicMock(return_value=host_indices)
         coordinator = SimpleNamespace(

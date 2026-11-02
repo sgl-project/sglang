@@ -272,12 +272,16 @@ class KVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tails: Optional[Mapping[str, int]] = None,
+        tree_cache=None,
+        batch=None,
     ) -> Optional[torch.Tensor]:
         """Owner token ids for ``[prefix_len, seq_len)`` of each request's
         ``rows`` entry, by page, continuing each request's last page from
         ``last_loc``; None when they do not fit. With ``window_tails`` (one
         request whose KV a peer sends; every window, by sub-pool), each
-        window binds pages for its own last tokens only."""
+        window binds pages for its own last tokens only. ``tree_cache`` and
+        ``batch`` are for pools that need the step's context (static ones);
+        a unified pool needs neither."""
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -308,10 +312,12 @@ class KVStorage:
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         make_room: Callable[[int], Any],
+        tree_cache=None,
+        batch=None,
     ) -> Optional[torch.Tensor]:
         """One owner token id per ``rows`` entry, at ``seq_len - 1``, taking a
         page only when that request's last page is full; None when they do not
-        fit."""
+        fit. See `take_extend` for ``tree_cache`` and ``batch``."""
         make_room(len(seq_lens) * self._allocator.page_size)
         return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 

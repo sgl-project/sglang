@@ -401,9 +401,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     tree_cache.on_release(req, checkpointed=checkpoint)
 
     kv_storage_of(
-        tree_cache.req_to_token_pool,
-        tree_cache.token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
     req.kv.mark_kv_released()
 

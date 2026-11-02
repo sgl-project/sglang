@@ -7,6 +7,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -31,7 +32,6 @@ class _SwaCache(RadixCache):
                 "window_pool_names",
                 "target_window_pool",
                 "get_kvcache",
-                "window_retention",
             ]
         )
         allocator = self.token_to_kv_pool_allocator
@@ -41,7 +41,9 @@ class _SwaCache(RadixCache):
         allocator.window_pool_names = lambda: ("swa",)
         allocator.target_window_pool = lambda: "swa"
         allocator.get_kvcache = lambda: SimpleNamespace(request_window=None)
-        allocator.window_retention = {"swa": 128}
+        kv_storage_of(self.req_to_token_pool, allocator).bind_window_retention(
+            128, None
+        )
         self.trim_calls = 0
 
     def supports_swa(self):

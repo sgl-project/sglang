@@ -158,7 +158,6 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
     # A static window pool, as far as its kept tail goes.
     allocator = SimpleNamespace(
         storage=None,
-        window_retention=None,
         window_pool_names=lambda: ("swa",),
         target_window_pool=lambda: "swa",
         get_kvcache=lambda: SimpleNamespace(request_window=None),
