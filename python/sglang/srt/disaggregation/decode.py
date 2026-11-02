@@ -3523,6 +3523,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
+            )
+            if process_last_batch_early:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -3533,13 +3540,6 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
-            # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -3552,7 +3552,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
