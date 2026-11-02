@@ -406,6 +406,11 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+        self._persistent_dp_meta = envs.SGLANG_OPT_DSPARK_PERSISTENT_DP_META.get()
+        self._dp_meta_host: Optional[torch.Tensor] = None
+        self._dp_meta_device: Optional[torch.Tensor] = None
+        self._dp_meta_copied: list = []
+        self._dp_meta_slot = 0
 
     @property
     def noise(self) -> DraftNoise:
@@ -638,8 +643,10 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_num_token_non_padded=_make_num_token_non_padded(
-                draft_num_tokens, device
+            global_num_token_non_padded=(
+                self._num_token_non_padded
+                if self._persistent_dp_meta
+                else _make_num_token_non_padded(draft_num_tokens, device)
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
@@ -732,12 +739,20 @@ class DraftBlockProposer:
             )
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
-        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
-        if num_token_non_padded is not None:
-            forward_batch.global_num_token_non_padded = num_token_non_padded
         forward_batch.global_num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+        if self._persistent_dp_meta:
+            if self._num_token_non_padded is not None:
+                forward_batch.global_num_token_non_padded = self._num_token_non_padded
+            (
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            ) = self._stage_dp_meta(gnt, gnt_logprob, device)
+            return
+        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
+        if num_token_non_padded is not None:
+            forward_batch.global_num_token_non_padded = num_token_non_padded
         pin_memory = is_pin_memory_available(device)
         forward_batch.global_num_tokens_gpu = torch.tensor(
             gnt, dtype=torch.int64, pin_memory=pin_memory
@@ -745,3 +760,35 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)
+
+    def _stage_dp_meta(
+        self, gnt: list, gnt_logprob: list, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dp = len(gnt)
+        if self._dp_meta_host is None or self._dp_meta_host.shape[2] != dp:
+            self._dp_meta_host = torch.empty(
+                (2, 2, dp),
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(device),
+            )
+            self._dp_meta_device = torch.empty(
+                (2, 2, dp), dtype=torch.int64, device=device
+            )
+            self._dp_meta_copied = [None, None]
+        slot = self._dp_meta_slot
+        self._dp_meta_slot ^= 1
+        # Rewrite a pinned slot only after its previous H2D has run.
+        copied = self._dp_meta_copied[slot]
+        if copied is not None:
+            copied.synchronize()
+        host = self._dp_meta_host[slot]
+        rows = host.numpy()
+        rows[0] = gnt
+        rows[1] = gnt_logprob
+        dev = self._dp_meta_device[slot]
+        dev.copy_(host, non_blocking=True)
+        if copied is None:
+            copied = torch.get_device_module(device).Event()
+            self._dp_meta_copied[slot] = copied
+        copied.record()
+        return dev[0], dev[1]

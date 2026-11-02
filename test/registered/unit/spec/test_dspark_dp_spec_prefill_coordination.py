@@ -1,3 +1,4 @@
+import itertools
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -39,9 +40,9 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
         self.assertEqual(output.device, hidden.device)
 
     def test_draft_counts_are_not_scaled_twice(self):
-        for width in (6, 7):
+        for persistent, width in itertools.product((False, True), (6, 7)):
             for rank, local_tokens in ((0, 0), (1, 3 * width), (2, 0)):
-                with self.subTest(width=width, rank=rank):
+                with self.subTest(persistent=persistent, width=width, rank=rank):
                     plan = DPSpecPrefillCoordinationPlan(
                         [8192, 3, 0], [1, 3, 0], torch.tensor([1, 0, 0]), width, 7
                     )
@@ -50,6 +51,11 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     proposer = object.__new__(DraftBlockProposer)
                     proposer._dp_moe_sync = True
                     proposer._num_token_non_padded = None
+                    proposer._persistent_dp_meta = persistent
+                    proposer._dp_meta_host = None
+                    proposer._dp_meta_device = None
+                    proposer._dp_meta_copied = []
+                    proposer._dp_meta_slot = 0
                     proposer.draft_model_runner = SimpleNamespace(device="cpu")
                     proposer._draft_block_spec_info = SimpleNamespace(
                         num_tokens_per_req=width, num_tokens_for_logprob_per_req=1
@@ -63,6 +69,13 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     self.assertEqual(forward.global_num_tokens_cpu, [0, 3 * width, 0])
                     self.assertEqual(
                         forward.global_num_tokens_for_logprob_cpu, [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_gpu.tolist(), [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_for_logprob_gpu.tolist(),
+                        [0, 3 * width, 0],
                     )
                     self.assertTrue(forward.dp_spec_prefill_coordination_applied)
                     self.assertTrue(forward.is_extend_in_batch)

@@ -2074,6 +2074,9 @@ class Envs:
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark draft: reuse the persistent num_token_non_padded buffer, and under DP-MoE
+    # sync stage the per-rank token counts through two pinned / device slots (one H2D).
+    SGLANG_OPT_DSPARK_PERSISTENT_DP_META = EnvBool(True)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
