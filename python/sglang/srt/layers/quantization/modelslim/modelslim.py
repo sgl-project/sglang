@@ -31,6 +31,9 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic_v_mxfp8_per_channel import (
+    ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -237,6 +240,9 @@ class ModelSlimConfig(QuantizationConfig):
         # Map supported ModelSlim KV formats to their scheme classes.
         kv_quant_schemes = {
             "Q_FP8_DYNAMIC_KV_FP8": ModelSlimQFP8DynamicKVFP8Scheme,
+            "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL": (
+                ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme
+            ),
         }
         scheme_class = kv_quant_schemes.get(quant_type)
         if scheme_class is None:

@@ -94,6 +94,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def cache_loc_dtype(self):
         return torch.int32
 
+    @property
+    def _use_qfa(self):
+        cache_layout = self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
+        return cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
+
     def get_update_attr_name(self):
         """Preserve each runner's existing captured attention update protocol."""
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -206,6 +211,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
+            return False
+        if self._use_qfa:
+            # Use the common runner's device input staging, including pre-planned
+            # batches. QFA rebuilds its metadata inside the captured graph.
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
@@ -460,7 +469,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
-        if runner is not None:
+        if runner is not None and not self._use_qfa:
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
             )

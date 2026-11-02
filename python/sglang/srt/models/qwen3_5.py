@@ -113,6 +113,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -310,6 +311,10 @@ if _is_npu:
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        ModelSlimKVCacheMethod,
+    )
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -1387,6 +1392,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            scheme = quant_config.get_modelslim_kv_scheme(prefix)
+            if scheme is not None:
+                self.attn.scheme = scheme
+                self.attn.quant_method = ModelSlimKVCacheMethod()
+                self.attn.quant_method.create_weights(
+                    self.attn,
+                    qkv_proj=self.qkv_proj,
+                    params_dtype=torch.get_default_dtype(),
+                )
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
@@ -2043,6 +2062,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -2240,6 +2263,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             layer_id = get_layer_id(name)
             if (
@@ -2509,6 +2536,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -2807,6 +2838,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
