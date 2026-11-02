@@ -56,6 +56,7 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
+from sglang.srt.hardware_backend.npu.attention import dsv4_prefill_graph
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -75,6 +76,14 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    enable_breakable_cuda_graph,
+)
+from sglang.srt.runtime_context import get_flags
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -1020,6 +1029,126 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
         custom_ops.indexer_compress_epilog.assert_not_called()
+
+
+class TestPrefillGraphCaptureCompressLoc(unittest.TestCase):
+    """The prefill graph capture batch carries no out_cache_loc_dsv4 bundle, so
+    the compressor epilog received loc=None and crashed in set_index_k_scale."""
+
+    @staticmethod
+    def _prefill_metadata(seq_lens, bucket_num_tokens=None):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend._dsv4_unique_compress_ratios = [4, 128]
+        cu = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0).tolist()])
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa=cu.to(torch.int32)
+        )
+        forward_batch = SimpleNamespace(
+            seq_lens=torch.tensor(seq_lens),
+            positions=torch.zeros(
+                bucket_num_tokens if bucket_num_tokens is not None else int(cu[-1]),
+                dtype=torch.int64,
+            ),
+            batch_size=len(seq_lens),
+            extend_prefix_lens=torch.zeros(len(seq_lens), dtype=torch.int64),
+            extend_prefix_lens_cpu=[0] * len(seq_lens),
+            out_cache_loc_dsv4=None,
+        )
+        backend._build_npu_compress_metadata_prefill(forward_batch)
+        return backend.forward_metadata
+
+    def test_capture_routes_every_completed_block_to_slot_zero(self):
+        with get_flags().dp.override(capturing_prefill_graph=True):
+            fm = self._prefill_metadata([130, 7])
+        # 130 // 4 + 7 // 4 c4 blocks; only the first request closes a c128 block.
+        self.assertEqual(fm.c4_loc.tolist(), [0] * 33)
+        self.assertEqual(fm.c128_loc.tolist(), [0])
+        self.assertEqual(fm.c4_loc.dtype, torch.int32)
+
+    def test_missing_bundle_outside_capture_stays_none(self):
+        # A replay or eager prefill without a bundle must not write into slot 0.
+        fm = self._prefill_metadata([130, 7])
+        self.assertIsNone(fm.c4_loc)
+        self.assertIsNone(fm.c128_loc)
+
+    def test_padding_length_follows_cu_not_padded_positions(self):
+        """The fused compressor rejected a rope table built from the bucket-padded
+        positions: it sizes rope_sin from its own cu_seqlens token count, so a
+        64-token request replayed in a 128-token bucket got 33 rows for 17."""
+        fm = self._prefill_metadata([64], bucket_num_tokens=128)
+        self.assertEqual(fm.positions_cmp_padding_c4.numel(), 17)
+        self.assertEqual(fm.positions_cmp_padding_c128.numel(), 1)
+
+
+class TestPrefillGraphSourceBreaks(unittest.TestCase):
+    """The c4 indexer and the compressor read metadata that each prefill graph
+    replay rebuilds, so they must run as eager breaks against the replay batch;
+    captured into a segment, they replay against freed capture-time metadata."""
+
+    @staticmethod
+    def _batch(num_padded, num_real, first_position):
+        return SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            positions=torch.arange(first_position, first_position + num_padded),
+            global_num_token_non_padded_cpu=num_real,
+        )
+
+    def test_sources_run_at_replay_on_live_rows(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.forward_c4_indexer_eager = MagicMock()
+        compressor = MagicMock()
+        c4_indexer = object()
+        capture_batch = self._batch(8, 8, 0)
+        context = SimpleNamespace(forward_batch=capture_batch)
+        x = torch.randn(8, 4)
+        q_lora = torch.randn(8, 2)
+
+        graph = bcg.BreakableCUDAGraph()
+        device_module = SimpleNamespace(
+            Stream=SimpleNamespace(wait_stream=MagicMock()),
+            current_stream=MagicMock(),
+        )
+        with (
+            patch.object(bcg, "get_device_module", return_value=device_module),
+            patch.object(bcg, "_is_xpu", False),
+            patch.object(bcg, "_device_graph_cls", return_value=MagicMock),
+            patch.object(
+                dsv4_prefill_graph,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            enable_breakable_cuda_graph(),
+        ):
+            with bcg.BreakableCUDAGraphCapture(cuda_graph=graph, pool=(0, 0)):
+                backend.forward_c4_indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=capture_batch,
+                    c4_indexer=c4_indexer,
+                    q_lora_ready=object(),
+                )
+                backend.forward_core_compressor(x, capture_batch, 0, compressor)
+
+            backend.forward_c4_indexer_eager.assert_not_called()
+            compressor.assert_not_called()
+            self.assertEqual(len(graph._break_fns), 2)
+
+            replay_batch = self._batch(8, 5, 100)
+            context.forward_batch = replay_batch
+            graph.replay()
+
+        indexer_kwargs = backend.forward_c4_indexer_eager.call_args.kwargs
+        torch.testing.assert_close(indexer_kwargs["x"], x[:5])
+        torch.testing.assert_close(indexer_kwargs["q_lora"], q_lora[:5])
+        self.assertIs(indexer_kwargs["c4_indexer"], c4_indexer)
+        self.assertEqual(
+            indexer_kwargs["forward_batch"].positions.tolist(), list(range(100, 105))
+        )
+        # Later breaks (the sparse attention) read the replay batch unsliced.
+        self.assertEqual(replay_batch.positions.shape[0], 8)
+        compressor_x, compressor_batch = compressor.call_args.args
+        torch.testing.assert_close(compressor_x, x[:5])
+        self.assertIs(compressor_batch, replay_batch)
 
 
 if __name__ == "__main__":

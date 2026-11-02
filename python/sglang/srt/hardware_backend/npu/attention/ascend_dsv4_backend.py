@@ -17,12 +17,17 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
+    bcg_dsv4_c4_indexer,
+    bcg_dsv4_compressor,
+    in_prefill_graph,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -242,15 +247,18 @@ class CompressorAscendBackendMixin:
             self._build_npu_compress_metadata_verify(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
-        # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
+        # Runs outside captured segments (prefill graph breaks read its output
+        # eagerly), so host reads (cu_cpu) are safe here.
         fm = self.forward_metadata
         device = forward_batch.seq_lens.device
-        positions = forward_batch.positions
-        t = positions.shape[0]
         bs = forward_batch.batch_size
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
+        # Token count must come from cu, not positions: the compressor derives
+        # its own tokenSize from cu_seqlens, while prefill graph replay keeps
+        # positions at the bucket-padded length.
+        t = int(cu_cpu[bs])
         fm.dsv4_max_input_capacity = max(
             1,
             max(
@@ -324,6 +332,14 @@ class CompressorAscendBackendMixin:
                 if bundle is not None
                 else None
             )
+            if bundle_loc is None and get_flags().dp.capturing_prefill_graph:
+                # The capture batch has no allocation bundle; route its compressed
+                # writes to padding slot 0, as decode graph capture does.
+                bundle_loc = torch.zeros(
+                    sum(blocks.numel() for blocks in ratio_lists[ratio]),
+                    dtype=torch.int32,
+                    device=device,
+                )
             setattr(
                 fm,
                 f"c{ratio}_loc",
@@ -432,6 +448,9 @@ class CompressorAscendBackendMixin:
         compressor,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
+            return
+        if in_prefill_graph(forward_batch):
+            bcg_dsv4_compressor(x=x, compressor=compressor)
             return
         compressor(x, forward_batch)
 
@@ -903,6 +922,36 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
+        if in_prefill_graph(forward_batch):
+            # A break runs on the replay stream after the preceding segment,
+            # so q_lora is ready without the capture-time event.
+            bcg_dsv4_c4_indexer(
+                backend=self,
+                x=x,
+                q_lora=q_lora,
+                c4_indexer=c4_indexer,
+                skip_compressor=skip_compressor,
+            )
+            return
+        self.forward_c4_indexer_eager(
+            x=x,
+            q_lora=q_lora,
+            forward_batch=forward_batch,
+            c4_indexer=c4_indexer,
+            q_lora_ready=q_lora_ready,
+            skip_compressor=skip_compressor,
+        )
+
+    def forward_c4_indexer_eager(
+        self,
+        *,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        c4_indexer,
+        q_lora_ready=None,
+        skip_compressor: bool = False,
+    ) -> None:
         # skip_compressor=True is the CP full-metadata protocol: the compressor
         # already ran via forward_indexer_compressor.
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
