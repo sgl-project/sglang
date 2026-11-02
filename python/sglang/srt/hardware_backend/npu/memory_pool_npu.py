@@ -166,42 +166,25 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Continuous memory improves the efficiency of Ascend`s transmission backend,
-            # while other backends remain unchanged.
-            # FIA exposes the KV cache as per-layer Python views so graph
-            # capture does not retain the full multi-layer tensor. HiCache's
-            # NPU exchange operator still requires the original contiguous
-            # [layer, page, token, head, dim] allocation.
-            pages = self.size // self.page_size + 1
-            head_token_shape = (
-                (self.head_num, self.page_size)
-                if self.is_modelslim_mxfp8
-                else (self.page_size, self.head_num)
-            )
-            shape = (self.layer_num, pages, *head_token_shape)
-            self._hicache_k_buffer = torch.zeros(
-                (*shape, self.head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._hicache_v_buffer = torch.zeros(
-                (*shape, self.v_head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            # Keep a reference to the contiguous tensor for HiCache
-            # D2H/H2D transfers (transfer_kv_dim_exchange expects a
-            # tensor, not the per-layer list used in FIA mode below).
-            self.k_buffer_tensor = self._hicache_k_buffer
-            self.v_buffer_tensor = self._hicache_v_buffer
-
             if self.is_modelslim_mxfp8:
                 self._mxfp8_scales_initialized = False
+                pages = self.size // self.page_size + 1
+                shape = (self.layer_num, pages, self.head_num, self.page_size)
                 # QFA uses PA_BNBD, with pairs of per-32 UE8M0 scales.
-                self.k_buffer = list(self.k_buffer_tensor.unbind(0))
-                self.v_buffer = list(self.v_buffer_tensor.unbind(0))
+                self.k_buffer = list(
+                    torch.zeros(
+                        (*shape, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    ).unbind(0)
+                )
+                self.v_buffer = list(
+                    torch.zeros(
+                        (*shape, self.v_head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    ).unbind(0)
+                )
                 self.k_scale_buffer = list(
                     torch.full(
                         (*shape, self.head_dim // 64, 2),
@@ -225,6 +208,42 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     ).unbind(0)
                 )
                 return
+
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # Continuous memory improves the efficiency of Ascend`s transmission backend,
+            # while other backends remain unchanged.
+            # FIA exposes the KV cache as per-layer Python views so graph
+            # capture does not retain the full multi-layer tensor. HiCache's
+            # NPU exchange operator still requires the original contiguous
+            # [layer, page, token, head, dim] allocation.
+            self._hicache_k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self._hicache_v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.v_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            # Keep a reference to the contiguous tensor for HiCache
+            # D2H/H2D transfers (transfer_kv_dim_exchange expects a
+            # tensor, not the per-layer list used in FIA mode below).
+            self.k_buffer_tensor = self._hicache_k_buffer
+            self.v_buffer_tensor = self._hicache_v_buffer
 
             self.k_buffer = self._hicache_k_buffer
             self.v_buffer = self._hicache_v_buffer
@@ -282,8 +301,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         self._kv_copy_config = None
 
     def get_kv_scale_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         local_layer = layer_id - self.start_layer
         return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
 
