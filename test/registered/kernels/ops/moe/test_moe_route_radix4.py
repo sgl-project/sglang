@@ -216,6 +216,63 @@ requires_aiter = pytest.mark.skipif(
     aiter_biased_grouped_topk is None, reason="aiter is not installed"
 )
 
+try:
+    from aiter.ops.quant import quant_mxfp4_hip as _aiter_quant_mxfp4_hip
+except ImportError:
+    _aiter_quant_mxfp4_hip = None
+
+requires_aiter_quant = pytest.mark.skipif(
+    _aiter_quant_mxfp4_hip is None, reason="aiter MXFP4 quant is not installed"
+)
+
+_MXFP4_HIDDEN = 3584
+
+
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32])
+def test_route_radix4_quant_matches_route(score_dtype):
+    """Fused launch must match route-only ids/weights for bf16 and fp32 scores."""
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    scores = torch.randn(
+        8, NUM_EXPERTS, dtype=score_dtype, device="cuda", generator=generator
+    )
+    bias = torch.randn(
+        NUM_EXPERTS, dtype=score_dtype, device="cuda", generator=generator
+    )
+    x = torch.randn(
+        8, _MXFP4_HIDDEN, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    wf, idf, fp4, scale = moe_route_radix4.route_radix4_quant(
+        scores, bias, x, TOPK, True, 2.5
+    )
+    assert torch.equal(ids, idf)
+    assert torch.equal(w, wf)
+    assert fp4.shape == (8, _MXFP4_HIDDEN // 2)
+    assert scale.shape == (8, _MXFP4_HIDDEN // 32)
+
+
+@requires_aiter_quant
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32])
+def test_route_radix4_quant_matches_aiter_mxfp4(score_dtype):
+    """Fused MXFP4 bytes must match aiter's token-order quant, including zero rows."""
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    scores = torch.randn(
+        4, NUM_EXPERTS, dtype=score_dtype, device="cuda", generator=generator
+    )
+    bias = torch.zeros(NUM_EXPERTS, dtype=score_dtype, device="cuda")
+    x = torch.randn(
+        4, _MXFP4_HIDDEN, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    # One all-zero row and one row with values on e2m1 boundaries after scale.
+    x[1].zero_()
+    x[2].fill_(6.0)
+    _, _, fp4, scale = moe_route_radix4.route_radix4_quant(
+        scores, bias, x, TOPK, True, 1.0
+    )
+    ref_fp4, ref_scale = _aiter_quant_mxfp4_hip(x)
+    assert torch.equal(fp4, ref_fp4.view(torch.uint8).reshape(4, -1))
+    assert torch.equal(scale, ref_scale.view(torch.uint8).reshape(4, -1))
+
 
 @pytest.mark.parametrize(
     "num_experts,topk,num_groups,topk_group,num_tokens",

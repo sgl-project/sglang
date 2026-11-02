@@ -2213,6 +2213,34 @@ def biased_grouped_topk_gpu(
             if moe_route_radix4.available() and moe_route_radix4.covered(
                 route_logits, route_bias, topk, num_expert_group, topk_group
             ):
+                # Same launch as the route when the staged row is the K3 latent
+                # and the tuned GEMM consumes prequant MXFP4. block_m 16 f16in
+                # keeps the route-only kernel: it reads bf16. Route scores follow
+                # route_logits/route_bias (bf16 or fp32); quant always reads bf16 x.
+                from sglang.srt.layers.moe import route_quant_handoff
+
+                staged = route_quant_handoff.staged_activation()
+                inter_dim, num_experts = route_quant_handoff.staged_moe_shape()
+                # Odd row stride is not 4-byte aligned; the fused kernel
+                # rejects it. Fall through to the route-only kernel.
+                row_aligned = staged is not None and int(staged.stride(0)) % 2 == 0
+                if (
+                    staged is not None
+                    and row_aligned
+                    and staged.dtype == torch.bfloat16
+                    and staged.dim() == 2
+                    and staged.shape[0] == route_logits.shape[0]
+                    and staged.shape[1] == 3584
+                    and staged.stride(1) == 1
+                    and route_quant_handoff.hip_prequant_bucket(
+                        staged.shape[0], inter_dim, num_experts
+                    )
+                ):
+                    weights, ids, fp4, scale = moe_route_radix4.route_radix4_quant(
+                        route_logits, route_bias, staged, topk, renormalize, scaling
+                    )
+                    route_quant_handoff.publish_hip_mxfp4(staged, fp4, scale)
+                    return weights, ids
                 return moe_route_radix4.route_radix4(
                     route_logits, route_bias, topk, renormalize, scaling
                 )
