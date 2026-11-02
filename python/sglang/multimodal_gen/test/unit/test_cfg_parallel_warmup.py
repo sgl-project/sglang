@@ -34,6 +34,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23HQSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -329,6 +333,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_diff_generator_runs_explicit_warmup_through_scheduler_client(self):
         generator = object.__new__(DiffGenerator)
+        generator.local_scheduler_process = None
         server_args = MagicMock()
         server_args.warmup_mode = "request"
         server_args.warmup_resolutions = ["832x480"]
@@ -356,6 +361,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             generator._run_client_warmup_if_needed()
 
         forward.assert_called_once()
+        self.assertEqual(forward.call_args.kwargs, {"replica": 0})
         req = forward.call_args.args[0]
         self.assertTrue(req.is_warmup)
         self.assertEqual((req.width, req.height), (832, 480))
@@ -855,6 +861,35 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ),
             (1280, 720),
         )
+
+    def test_bcg_default_resolution_of_two_stage_is_the_output_resolution(self):
+        def resolve(pipeline_class_name, sampling_defaults):
+            server_args = SimpleNamespace(
+                pipeline_config=LTX25PipelineConfig(),
+                pipeline_class_name=pipeline_class_name,
+                enable_breakable_cuda_graph=True,
+            )
+            return _resolve_default_warmup_resolution(
+                server_args, sampling_defaults, server_based_warmup=True
+            )
+
+        # 960x544 is LTX-2.5's stage-1 size; the halving stage rejects it as a request
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", LTX25SamplingParams()), (1920, 1088)
+        )
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", LTX2SamplingParams()), (768, 512)
+        )
+        self.assertEqual(
+            resolve("LTX2TwoStageHQPipeline", LTX23HQSamplingParams()), (1920, 1088)
+        )
+        # doubling cannot fix this one, so the request stays as written
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", SamplingParams(width=1000, height=600)),
+            (1000, 600),
+        )
+        # one-stage runs the default resolution as is
+        self.assertEqual(resolve("LTX2Pipeline", LTX25SamplingParams()), (960, 544))
 
     def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
         server_args = MagicMock()
