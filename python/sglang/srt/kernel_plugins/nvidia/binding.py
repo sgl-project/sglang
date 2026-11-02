@@ -1093,14 +1093,28 @@ def megakernel_disable_reasons(
         f"{f.value} is in use and {spec.name} does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
     ]
-    one_of = [
-        ("tp_size", cfg.tp_size, req.tp_sizes),
-        (
-            "decode CUDA graphs",
-            cfg.cuda_graph_config.decode.backend,
-            req.decode_graph_backends,
-        ),
-    ] + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
+    one_of = (
+        [
+            ("tp_size", cfg.tp_size, req.tp_sizes),
+            (
+                "decode CUDA graphs",
+                cfg.cuda_graph_config.decode.backend,
+                req.decode_graph_backends,
+            ),
+        ]
+        + (
+            [
+                (
+                    "prefill CUDA graphs",
+                    cfg.cuda_graph_config.prefill.backend,
+                    req.prefill_graph_backends,
+                )
+            ]
+            if req.prefill_graph_backends
+            else []
+        )
+        + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
+    )
     exactly = [
         # another model's config may not have the field at all
         (f"config.{key}", getattr(hf_config, key, None), want)
@@ -1181,6 +1195,7 @@ def install_megakernel(
     model: torch.nn.Module,
     hf_config: PretrainedConfig,
     capture_tail_hooks: list[Callable[..., None]],
+    prefill_capture_tail_hooks: Optional[list[Callable[..., None]]] = None,
     is_draft: bool,
 ) -> None:
     """Build the model's spec and install its forward; runs before KV cache sizing."""
@@ -1201,6 +1216,11 @@ def install_megakernel(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
+        prefill_widths=(
+            _prefill_widths()
+            if spec.requires.prefill_graph_backends
+            else ()
+        ),
         binding=binding,
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
@@ -1259,7 +1279,18 @@ def install_megakernel(
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
     if _decode_graphs_enabled():
-        capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
+        capture_tail_hooks.append(
+            _CaptureCheck(spec=spec, dispatch=dispatch, phase="decode")
+        )
+    # Only a spec that claims prefill coverage is held to its prefill graphs.
+    if (
+        prefill_capture_tail_hooks is not None
+        and spec.requires.prefill_graph_backends
+        and _prefill_graphs_enabled()
+    ):
+        prefill_capture_tail_hooks.append(
+            _CaptureCheck(spec=spec, dispatch=dispatch, phase="prefill")
+        )
 
 
 def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
@@ -1497,6 +1528,10 @@ class _Dispatch:
         # batch size -> the step planned while capturing its decode graphs; plan reads
         # only the mode and rows, so every graph variant of a batch size plans alike
         self.captured: dict[int, Optional[Step]] = {}
+        # token count -> the step planned while capturing the prefill graphs. A
+        # prefill graph is keyed by its token bucket, not by a batch size, so the
+        # two cannot share one dict.
+        self.captured_tokens: dict[int, Optional[Step]] = {}
 
     def wrapped(self) -> Callable:
         # Graph runners and supports_pp inspect the original forward's signature.
@@ -1506,6 +1541,7 @@ class _Dispatch:
             capturing = torch.cuda.is_current_stream_capturing()
             if capturing:
                 self.captured[int(forward_batch.batch_size)] = step
+                self.captured_tokens[int(input_ids.shape[0])] = step
             if step is None:
                 return self.original(
                     input_ids, positions, forward_batch, *args, **kwargs
@@ -1534,37 +1570,57 @@ class _Dispatch:
 
 
 class _CaptureCheck:
-    """Once every decode graph is captured, log the ones that run the megakernel and
-    refuse a runner none of whose graphs do."""
+    """Once every graph of one phase is captured, log the ones that run the
+    megakernel and refuse a runner none of whose graphs do.
 
-    def __init__(self, *, spec: MegakernelSpec, dispatch: _Dispatch):
-        self.spec, self.dispatch = spec, dispatch
+    One instance per phase. The decode phase is keyed by batch size and the
+    prefill phase by token bucket, because that is what each runner captures;
+    a prefill instance is installed only for a spec that declares
+    ``prefill_graph_backends``, so a decode-only spec is refused on its decode
+    graphs alone and is not asked to run a prefill graph it never claimed.
+    """
+
+    def __init__(self, *, spec: MegakernelSpec, dispatch: _Dispatch, phase: str = "decode"):
+        self.spec, self.dispatch, self.phase = spec, dispatch, phase
         self.is_done = False
+
+    def _expected(self, runner: Any) -> Optional[Collection[int]]:
+        if self.phase == "decode":
+            return getattr(runner, "capture_bs", None)
+        return getattr(runner, "capture_num_tokens", None)
 
     def __call__(
         self,
-        runner: DecodeCudaGraphRunner,
+        runner: Any,
         out: Any,
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        captured = self.dispatch.captured
-        if self.is_done or not set(runner.capture_bs) <= set(captured):
+        captured = (
+            self.dispatch.captured
+            if self.phase == "decode"
+            else self.dispatch.captured_tokens
+        )
+        expected = self._expected(runner)
+        if self.is_done or expected is None or not set(expected) <= set(captured):
             return
         self.is_done = True
-        if isinstance(self.dispatch.binding, MegakernelBinding):
+        if self.phase == "decode" and isinstance(self.dispatch.binding, MegakernelBinding):
             self.dispatch.binding.seal_capture_buffers(runner)
         self.dispatch.binding.assert_live()
-        routed = sorted(bs for bs, step in captured.items() if step is not None)
+        shapes = "batch sizes" if self.phase == "decode" else "token counts"
+        routed = sorted(k for k, step in captured.items() if step is not None)
         if not routed:
             raise ValueError(
-                f"{FLAG}: none of the {len(captured)} captured decode graphs "
-                f"(batch sizes {sorted(captured)}) runs {self.spec.name}"
+                f"{FLAG}: none of the {len(captured)} captured {self.phase} graphs "
+                f"({shapes} {sorted(captured)}) runs {self.spec.name}"
             )
         logger.info(
-            "NVIDIA megakernel: %s runs the decode graphs of batch sizes %s (%d of "
-            "%d); every other step runs the standard forward",
+            "NVIDIA megakernel: %s runs the %s graphs of %s %s (%d of %d); every "
+            "other step runs the standard forward",
             self.spec.name,
+            self.phase,
+            shapes,
             routed,
             len(routed),
             len(captured),
@@ -1582,6 +1638,19 @@ def _tokens_per_request() -> int:
 def _decode_graphs_enabled() -> bool:
     graph = get_exec().graph.cuda_graph_config
     return graph is not None and graph.decode.backend != Backend.DISABLED
+
+
+def _prefill_graphs_enabled() -> bool:
+    graph = get_exec().graph.cuda_graph_config
+    return graph is not None and graph.prefill.backend != Backend.DISABLED
+
+
+def _prefill_widths() -> tuple[int, ...]:
+    """The prefill graph buckets a spec may build for, ascending."""
+    graph = get_exec().graph.cuda_graph_config
+    if graph is None or graph.prefill.backend == Backend.DISABLED:
+        return ()
+    return tuple(sorted(graph.prefill.bs or ()))
 
 
 def _gather_tp(obj: Any, group: Any = None) -> list[Any]:
