@@ -1911,8 +1911,11 @@ class KimiK3DeltaAttention(nn.Module):
         # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
         # same pad (both widths are 4 short of a multiple of 8), so the tail
         # view is byte-identical to the wide-only merge.
+        previous = self._qkvgbfa_layer
         merged, sizes = _merge_weights_as_views(
-            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=8
+            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj],
+            pad_rows_to=8,
+            target=None if previous is None else previous.weight,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
         self._bfa_w = merged[sizes[0] :]

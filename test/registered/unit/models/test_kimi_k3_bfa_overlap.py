@@ -245,6 +245,49 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                 torch.testing.assert_close(owner._bfa_w[4:6], owner.b_proj.weight)
                 self.assertEqual(torch.count_nonzero(owner._bfa_w[6:]).item(), 0)
 
+    def test_hip_inproj_reload_preserves_whole_and_tail_views(self):
+        """Reload must update captured whole/tail projections and parameter views."""
+
+        def module(rows):
+            return SimpleNamespace(
+                weight=torch.ones(rows, 16, device="cuda", dtype=torch.bfloat16)
+            )
+
+        owner = SimpleNamespace(
+            _may_fuse_kda_inproj=lambda: True,
+            _qkvgbfa_layer=None,
+            fused_qkvg_proj=module(8),
+            f_a_proj=module(4),
+            b_proj=module(2),
+            split_sizes=[2, 2, 2, 2],
+        )
+
+        def update():
+            owner.fused_qkvg_proj.weight.add_(1)
+            owner.f_a_proj.weight.add_(2)
+            owner.b_proj.weight.add_(3)
+
+        self._check_reload(
+            lambda: KimiK3DeltaAttention._merge_kda_inproj_weights_hip(owner),
+            lambda: (
+                owner._qkvgbfa_layer.weight,
+                owner._bfa_w,
+                owner.fused_qkvg_proj.weight,
+                owner.f_a_proj.weight,
+                owner.b_proj.weight,
+            ),
+            update,
+        )
+        merged = owner._qkvgbfa_layer.weight
+        for view, offset in (
+            (owner.fused_qkvg_proj.weight, 0),
+            (owner.f_a_proj.weight, 8),
+            (owner.b_proj.weight, 12),
+            (owner._bfa_w, 8),
+        ):
+            self.assertEqual(view.data_ptr(), merged[offset:].data_ptr())
+        self.assertEqual(torch.count_nonzero(merged[14:]).item(), 0)
+
     def test_fused_decode_reload_preserves_buffers(self):
         """Captured KDA static tensors must observe subsequent weight loads."""
 
