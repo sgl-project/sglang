@@ -50,10 +50,17 @@
 #error "SGL_TOPK_MODE must be defined: 0 fast, 1 exact, 2 deterministic"
 #endif
 static_assert(SGL_TOPK_MODE >= 0 && SGL_TOPK_MODE <= 2, "SGL_TOPK_MODE must be 0, 1 or 2");
+// Each mode's symbols live in their own inline namespace, so modules built with
+// different modes can be loaded into one process without colliding.
+#define SGL_TOPK_CONCAT_IMPL(a, b) a##b
+#define SGL_TOPK_CONCAT(a, b) SGL_TOPK_CONCAT_IMPL(a, b)
+#define SGL_TOPK_MODE_NAMESPACE SGL_TOPK_CONCAT(topk_mode_, SGL_TOPK_MODE)
 
 namespace sglang {
 
 namespace device::topk {
+
+inline namespace SGL_TOPK_MODE_NAMESPACE {
 
 /// What the selection guarantees beyond the above-threshold set.
 /// - FAST: a threshold bin with more than kMaxNumTie members keeps an arbitrary subset of them.
@@ -2155,6 +2162,8 @@ struct TopKCluster : TopKRadixBase<11> {
 };
 
 #endif  // !USE_ROCM
+
+}  // namespace SGL_TOPK_MODE_NAMESPACE
 
 }  // namespace device::topk
 

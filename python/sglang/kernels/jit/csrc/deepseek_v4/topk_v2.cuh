@@ -37,6 +37,8 @@
 
 namespace sglang {
 
+inline namespace SGL_TOPK_MODE_NAMESPACE {
+
 namespace impl = device::topk;
 using impl::TopKProblem;
 
@@ -1706,5 +1708,7 @@ struct TopKKernel {
         .launch(topk_packed_kernel<kUsePDL>, params);
   }
 };
+
+}  // namespace SGL_TOPK_MODE_NAMESPACE
 
 }  // namespace sglang
