@@ -135,10 +135,6 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
                 return_value=False,
             ),
             patch(
-                "sglang.srt.managers.mm_utils.get_serving",
-                return_value=SimpleNamespace(skip_tokenizer_init=False),
-            ),
-            patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
                 return_value=parallel,
             ),
@@ -166,10 +162,6 @@ def _run_image_receiver(rank, init_file, pipe):
             patch(
                 "sglang.srt.managers.mm_utils._get_is_default_transport",
                 return_value=False,
-            ),
-            patch(
-                "sglang.srt.managers.mm_utils.get_serving",
-                return_value=SimpleNamespace(skip_tokenizer_init=False),
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
@@ -260,10 +252,6 @@ class TestShmStorageOwnership(unittest.TestCase):
                         patch(
                             "sglang.srt.managers.mm_utils._get_is_default_transport",
                             return_value=False,
-                        ),
-                        patch(
-                            "sglang.srt.managers.mm_utils.get_serving",
-                            return_value=SimpleNamespace(skip_tokenizer_init=False),
                         ),
                     ):
                         wrap_shm_features(req)
@@ -578,10 +566,6 @@ class TestShmRequestFailureConsensus(CustomTestCase):
             patch(
                 "sglang.srt.managers.mm_utils._get_is_default_transport",
                 return_value=False,
-            ),
-            patch(
-                "sglang.srt.managers.mm_utils.get_serving",
-                return_value=SimpleNamespace(skip_tokenizer_init=False),
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
