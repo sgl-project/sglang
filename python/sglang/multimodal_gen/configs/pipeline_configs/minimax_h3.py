@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -437,14 +436,6 @@ class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
     """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
 
     def validate_server_args(self, server_args) -> None:
-        if envs.SGLANG_CACHE_DIT_ENABLED:
-            raise ValueError(
-                "Pika H3 Flex requires all six denoiser evaluations; "
-                "disable SGLANG_CACHE_DIT_ENABLED"
-            )
-        variant = server_args.model_variant
-        if variant is not None and variant.strip().lower() not in ("fl2va", "ref2va"):
-            raise ValueError("Pika H3 Flex model_variant must be fl2va or ref2va")
         # A BF16 merge rounds away about a third of the adapters' update (by
         # norm, under auto's 50% cutoff), so keep them unmerged like the
         # reference unless a merge mode is chosen explicitly.

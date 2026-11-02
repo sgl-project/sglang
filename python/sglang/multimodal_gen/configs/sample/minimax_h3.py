@@ -32,7 +32,6 @@ class MiniMaxH3SamplingParams(SamplingParams):
     # Single-partition releases name their partition; None infers it from
     # --model-variant or the model path.
     release_partition: ClassVar[str | None] = None
-    request_policy: ClassVar[str | None] = None
 
     height: int = 512
     width: int = 896
@@ -74,13 +73,13 @@ class MiniMaxH3SamplingParams(SamplingParams):
             }
         )
 
-    @classmethod
-    def _video_hooks(cls):
+    @staticmethod
+    def _video_hooks():
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.video_adapter import (
             MiniMaxH3VideoModelAdapter,
         )
 
-        return MiniMaxH3VideoModelAdapter(request_policy=cls.request_policy)
+        return MiniMaxH3VideoModelAdapter()
 
     @classmethod
     def lower_video_request_kwargs(
@@ -316,7 +315,6 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
             extra["minimax_h3_canonical_request"] = (
                 minimax_h3_validate_canonical_request(
-                    request_policy=self.request_policy,
                     task=self.task,
                     prompt=self.prompt,
                     conditions=self.conditions,
@@ -416,56 +414,8 @@ class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
 class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
     """Pika H3 Flex: six re-noising steps on the adapters' fixed knots."""
 
-    min_num_inference_steps: ClassVar[int] = 6
-    request_policy: ClassVar[str | None] = "pika_h3_flex"
-    width: int = 832
-    height: int = 480
     num_inference_steps: int = 6
     quality: str = "lossless"
-
-    @staticmethod
-    def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
-            minimax_h3_resolve_spatial_shape,
-        )
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
-            PIKA_H3_FLEX_POLICY,
-        )
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
-            minimax_h3_align_frame_count,
-        )
-
-        canvas = (
-            (req.width, req.height) if server_args.warmup_resolutions else (832, 480)
-        )
-        policy = PIKA_H3_FLEX_POLICY
-        frames = server_args.warmup_num_frames
-        duration = frames / 24 if frames else 5.0
-        # Recover whole-second requests from their aligned frame count; otherwise
-        # let the shared H3 duration validation handle the requested frame count.
-        if frames and frames == minimax_h3_align_frame_count((frames // 24) * 24):
-            duration = frames // 24
-        for tier, max_pixels in policy.max_pixels.items():
-            for aspect_ratio in policy.aspect_ratios:
-                width, height = map(int, aspect_ratio.split(":"))
-                shape = minimax_h3_resolve_spatial_shape(
-                    width=width,
-                    height=height,
-                    base_short_edge=tier,
-                    max_pixels=max_pixels,
-                    warn_unverified=False,
-                )
-                if canvas == (shape["width"], shape["height"]):
-                    return {
-                        "short_edge": tier,
-                        "aspect_ratio": aspect_ratio,
-                        "duration_seconds": float(duration),
-                    }
-        return {
-            "short_edge": min(canvas),
-            "aspect_ratio": f"{canvas[0]}:{canvas[1]}",
-            "duration_seconds": float(duration),
-        }
 
     def _validate(self) -> None:
         super()._validate()
@@ -484,12 +434,6 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                     f"Pika H3 Flex adapters were trained at {name}={trained:g}; "
                     f"got {value}"
                 )
-        if self.enable_spectrum or self.enable_cache_dit or self.quality == "high":
-            raise ValueError("Pika H3 Flex requires all six denoiser evaluations")
-        if self.rollout:
-            raise ValueError(
-                "Pika H3 Flex renoise sampling does not support RL rollouts"
-            )
 
 
 __all__ = [
