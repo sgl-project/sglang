@@ -90,8 +90,54 @@ class TestDcpAdmission(unittest.TestCase):
         self.assertTrue(runner.can_run_graph(fresh))
         self.assertFalse(runner.can_run_graph(prefix_hit))
 
+    def test_prefix_hits_replay_when_attention_reads_the_live_batch(self):
+        runner = _runner(dcp_active=True)
+        runner._dcp_attention_on_live_batch = True
+        self.assertTrue(runner.can_run_graph(_batch(8, [0])))
+        self.assertTrue(runner.can_run_graph(_batch(8, [4])))
+
 
 class TestDcpReplayMetadata(unittest.TestCase):
+    def _replay(self, runner, captured, planned_tokens=5):
+        planned = []
+
+        def plan(*args):
+            planned.append(args)
+            return _metadata(num_tokens=planned_tokens)
+
+        attn_backend = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((1, 8))),
+            token_to_kv_pool=SimpleNamespace(
+                get_kv_buffer_shape=lambda: (torch.Size([64, 1, 6]), None)
+            ),
+            init_forward_metadata=lambda batch: None,
+            resolve_prefill_shared_read_ends=lambda batch, **kwargs: None,
+            skips_prefill_metadata_on_idle_dp_rank=False,
+        )
+        runner.model_runner = SimpleNamespace(
+            attn_backend=attn_backend,
+            model=SimpleNamespace(prepare_context_parallel_metadata_for_dcp=plan),
+            kv_cache_dtype=torch.float32,
+            device="cpu",
+        )
+        live = _batch(5, [0])
+        static = _batch(8, [0])
+        runner._prepare_forward_metadata_for_replay(live, static, ShapeKey(size=8))
+        self.assertEqual(len(planned), 1)
+        self.assertIs(static.attn_dcp_metadata, live.attn_dcp_metadata)
+        return static.attn_dcp_metadata
+
+    def test_live_batch_attention_keeps_its_own_gather_buffer(self):
+        # The attention break gathers the cached prefix of the live batch, which
+        # does not fit a bucket-sized buffer.
+        runner = _runner(dcp_active=True)
+        runner._dcp_attention_on_live_batch = True
+        captured = torch.full((8, 1, KV_LORA_RANK + ROPE_DIM), 7.0)
+        runner._dcp_kv_buffers[ShapeKey(size=8)] = captured
+        metadata = self._replay(runner, captured, planned_tokens=13)
+        self.assertIsNot(metadata.dcp_kv_buffer, captured)
+        self.assertEqual(metadata.dcp_kv_buffer.shape[0], 13)
+
     def test_replay_reuses_the_captured_gather_buffer(self):
         runner = _runner(dcp_active=True)
         captured = torch.full((8, 1, KV_LORA_RANK + ROPE_DIM), 7.0)

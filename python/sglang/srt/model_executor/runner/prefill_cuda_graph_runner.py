@@ -336,6 +336,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _dcp_attention_on_live_batch = False
     dllm_attention = None
 
     @property
@@ -739,6 +740,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
+        # A model whose attention runs as one eager break on the live batch
+        # (Kimi-K3) gathers the cached prefix as the eager runner does. Replay
+        # gives it the live batch's own gather buffer, so prefix hits replay too.
+        self._dcp_attention_on_live_batch = self._dcp_extend_active and getattr(
+            model_runner.model, "prefill_graph_attention_on_live_batch", False
+        )
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1343,7 +1350,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # it doubles as the replay buffer for this shape.
             metadata = self._plan_dcp_metadata(forward_batch)
             forward_batch.attn_dcp_metadata = metadata
-            self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
+            if not self._dcp_attention_on_live_batch:
+                self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
         attn_backend = self.model_runner.attn_backend
         with forward_context(
             ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
@@ -1376,7 +1384,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The gather and the attention are breaks reading the live batch: plan
             # live indices, but use the bucket-sized buffer (k_nope/k_pe are padded).
             metadata = self._plan_dcp_metadata(forward_batch)
-            metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
+            if not self._dcp_attention_on_live_batch:
+                metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
             forward_batch.attn_dcp_metadata = metadata
             static_forward_batch.attn_dcp_metadata = metadata
         attn_backend = self.model_runner.attn_backend
@@ -1505,8 +1514,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._has_uncapturable_chunked_prefix(prefix_lens):
             return False
         # Under DCP only fresh prefills replay; a prefix hit needs the cross-rank
-        # prefix KV all-gather with per-batch shapes, which stays eager.
-        if self._dcp_extend_active and prefix_lens is not None and any(prefix_lens):
+        # prefix KV all-gather with per-batch shapes, which stays eager. A model
+        # whose attention break reads the live batch gathers it there.
+        if (
+            self._dcp_extend_active
+            and not self._dcp_attention_on_live_batch
+            and prefix_lens is not None
+            and any(prefix_lens)
+        ):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
@@ -2253,6 +2268,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._zero_stale_cp_pp_proxy_rows(
                 kwargs.get("pp_proxy_tensors"), static_num_tokens
             )
+
+        # Eager breaks that run a whole attention module (Kimi-K3's MLA) need
+        # the unpadded batch the attention metadata is planned on.
+        static_forward_batch.live_forward_batch = forward_batch
 
         shape_key = self._shape_key(static_num_tokens, forward_batch)
         shared_read_ends = self._prepare_forward_metadata_for_replay(

@@ -10,6 +10,7 @@ import logging
 import re
 from array import array
 from collections.abc import Iterable
+from contextlib import contextmanager
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -114,10 +115,26 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    context as _bcg_context,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    context_manager as _tc_piecewise_context,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode as _capture_mode
+from sglang.srt.model_executor.runner_utils import prefill_graph as _prefill_graph
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -164,6 +181,40 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+
+@contextmanager
+def _as_eager_prefill(forward_batch: ForwardBatch):
+    """Run the enclosed code exactly as the eager prefill does.
+
+    Inside a prefill breakable-graph break the graph flags, capture mode, the
+    tc_piecewise forward context and the prefill-graph scope are still set; they
+    make MLA pin absorbed attention, RadixAttention route through split ops, DSA
+    force its sparse path and K3 take graph-only paths, none of which a break
+    that runs a whole attention module needs.
+    """
+    saved = (
+        _bcg_context._in_breakable_cuda_graph,
+        _tc_piecewise_context._in_tc_piecewise_cuda_graph,
+        _tc_piecewise_context._tc_piecewise_forward_context,
+        _capture_mode.is_capture_mode,
+    )
+    _bcg_context._in_breakable_cuda_graph = False
+    _tc_piecewise_context._in_tc_piecewise_cuda_graph = False
+    _tc_piecewise_context._tc_piecewise_forward_context = None
+    _capture_mode.is_capture_mode = False
+    scope_token = _prefill_graph._current.set(None)
+    try:
+        with set_forward_batch(forward_batch):
+            yield
+    finally:
+        _prefill_graph._current.reset(scope_token)
+        (
+            _bcg_context._in_breakable_cuda_graph,
+            _tc_piecewise_context._in_tc_piecewise_cuda_graph,
+            _tc_piecewise_context._tc_piecewise_forward_context,
+            _capture_mode.is_capture_mode,
+        ) = saved
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -2901,6 +2952,14 @@ class KimiK3DecoderLayer(nn.Module):
         # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
+        # Under prefill CUDA graphs an MLA layer's whole attention runs as one
+        # eager break, as vLLM splits its piecewise graphs at the MLA op: MHA
+        # over a cached prefix has per-batch shapes, captured MLA would pin the
+        # absorbed path, and K3.1's DSA layer (indexer, DCP top-k merge, DCP KV
+        # gather, sparse MLA) reads per-batch host metadata.
+        self._mla_eager_under_prefill_graph = not config.is_kda_layer(layer_idx)
+        self._breakable_mla_self_attn = eager_on_graph(self._mla_self_attn_eager)
+
         # MLP / MoE
         if self._is_moe_layer:
             self.mlp = KimiK3MoE(
@@ -3007,6 +3066,72 @@ class KimiK3DecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
+        # Only the prefill breakable runner installs the tc_piecewise context;
+        # decode graphs set the breakable flag alone and run attention inline.
+        if (
+            self._mla_eager_under_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and get_tc_piecewise_forward_context() is not None
+        ):
+            # The fused all-reduce pulls its input from the persistent symmetric
+            # o_proj buffer, which the eager o_proj fills from its start.
+            if self.all_reduce_fusion:
+                out = _k3_symm_o_proj_out(self.self_attn.o_proj, hidden_states)
+            else:
+                out = hidden_states.new_empty(
+                    (hidden_states.shape[0], self.hidden_size)
+                )
+            self._breakable_mla_self_attn(hidden_states, out)
+            return out
+
+        return self._run_self_attn_inner(
+            hidden_states, positions, forward_batch, zero_allocator
+        )
+
+    def _mla_self_attn_eager(
+        self, hidden_states: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Eager break: the MLA attention on the real tokens of the live batch,
+        written into the padded output buffer. The break replays with its
+        capture-time arguments, so the batch comes from the forward context;
+        the runner hands over the unpadded batch the attention metadata was
+        planned on (absent at capture, where the dummy batch is unpadded)."""
+        static_batch = get_tc_piecewise_forward_context().forward_batch
+        live_batch = getattr(static_batch, "live_forward_batch", None)
+        forward_batch = static_batch if live_batch is None else live_batch
+        num_tokens = forward_batch.positions.shape[0]
+        with _as_eager_prefill(forward_batch):
+            # The runner plans attention metadata under the graph flag, where
+            # TRT-LLM-style MLA backends plan their absorbed/FlashInfer
+            # fallback and DSA forces sparse MLA; plan the eager prefill once
+            # per batch instead.
+            if not getattr(forward_batch, "k3_eager_mla_planned", False):
+                backend = get_attn_backend()
+                backend = getattr(backend, "full_attn_backend", backend)
+                backend.init_forward_metadata(forward_batch)
+                forward_batch.k3_eager_mla_planned = True
+            attn_out = self._run_self_attn_inner(
+                hidden_states[:num_tokens],
+                forward_batch.positions,
+                forward_batch,
+                # The model's allocator is a capture-time object here; its
+                # bump pointer would run past the buffer over replays.
+                BumpAllocator(
+                    buffer_size=2, dtype=torch.float32, device=hidden_states.device
+                ),
+            )
+        if attn_out.data_ptr() != out.data_ptr():
+            out[:num_tokens].copy_(attn_out)
+        if out.shape[0] != num_tokens:
+            out[num_tokens:].zero_()
+
+    def _run_self_attn_inner(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         # MLA layers with q_lora_rank read their latent inputs from the
         # attention-TP context.
         from sglang.srt.layers.layer_boundary import (
@@ -3346,6 +3471,10 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
+
+    # Prefill CUDA graphs run each MLA layer's attention as one eager break on
+    # the live batch (KimiK3DecoderLayer._mla_self_attn_eager).
+    prefill_graph_attention_on_live_batch = True
 
     @staticmethod
     def get_model_config_for_expert_location(config):
@@ -3859,6 +3988,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
         )
 
     supports_cuda_vmm_feature_transport = True
+    # Prefill CUDA graphs run each MLA layer's attention as one eager break on
+    # the live batch (KimiK3DecoderLayer._mla_self_attn_eager).
+    prefill_graph_attention_on_live_batch = True
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
     # match fused prefixes against per-shard exclude_modules
