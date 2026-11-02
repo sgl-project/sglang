@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sglang
+description: A Helm chart for SGLang - high-performance serving framework for large language models
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - sglang
+  - llm
+  - ai
+  - inference
+  - gpu
