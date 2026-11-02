@@ -353,6 +353,12 @@ class RunnerIds:
         )
         return pad_with_sink(ids, out_cache_loc.shape[0])
 
+    @property
+    def window_kv_sub_pool(self) -> str:
+        """The sub-pool `window_kv_kind` reads, by its name: the window
+        sub-pool, or the full one for a window draft it hosts."""
+        return self.window_kv_kind.value
+
     def capture_token_capacity(self, max_token_pool_size: int) -> int:
         """Host capture rows are indexed by request-token IDs, not kernel IDs.
 

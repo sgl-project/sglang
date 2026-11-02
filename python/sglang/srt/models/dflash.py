@@ -38,7 +38,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -619,7 +619,13 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                KVWriteLoc(cache_loc, swa_loc=swa_cache_loc, physical=True),
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=layer_window_locs(
+                        pool, self.attn_mqa.layer_id, swa_cache_loc
+                    ),
+                    physical=True,
+                ),
                 k_nope,
                 k_pe,
             )
@@ -628,9 +634,13 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                 self.attn_mqa,
                 KVWriteLoc(
                     cache_loc_2d,
-                    swa_loc=None
-                    if swa_cache_loc is None
-                    else swa_cache_loc.view_as(cache_loc_2d),
+                    window_locs=layer_window_locs(
+                        pool,
+                        self.attn_mqa.layer_id,
+                        None
+                        if swa_cache_loc is None
+                        else swa_cache_loc.view_as(cache_loc_2d),
+                    ),
                     physical=True,
                 ),
                 commit_lens,

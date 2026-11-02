@@ -37,7 +37,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -663,14 +663,13 @@ class TritonAttnBackend(AttentionBackend):
         )
 
     def _window_write_locs(self) -> Optional[Dict[str, torch.Tensor]]:
-        others = self.forward_metadata.other_windows
-        if others is None:
-            return None
-        locs = {
-            name: rail.out_cache_loc
-            for name, rail in others.items()
-            if rail.out_cache_loc is not None
-        }
+        """Every window sub-pool's write ids for this forward, by name: the
+        runner's window storage's, then each other window's rail's."""
+        meta = self.forward_metadata
+        locs = dict(window_write_locs(self.runner_ids, meta.swa_out_cache_loc) or {})
+        for name, rail in (meta.other_windows or {}).items():
+            if rail.out_cache_loc is not None:
+                locs[name] = rail.out_cache_loc
         return locs or None
 
     def _update_decode_kv_buffers(
@@ -1915,12 +1914,6 @@ class TritonAttnBackend(AttentionBackend):
             window_locs = self._window_write_locs()
             if window_locs is not None and sub_pool in window_locs:
                 cache_loc = window_locs[sub_pool]
-            elif sub_pool == IdSpaceKind.SLIDING_WINDOW:
-                assert self.forward_metadata.swa_out_cache_loc is not None, (
-                    "window-layer read-back before the metadata carried a "
-                    "sliding-window write loc"
-                )
-                cache_loc = self.forward_metadata.swa_out_cache_loc
             k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
@@ -1931,7 +1924,6 @@ class TritonAttnBackend(AttentionBackend):
             if save_kv_cache:
                 loc_info = KVWriteLoc.for_batch(
                     forward_batch,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
                     window_locs=self._window_write_locs(),
                 )
                 if layer.k_scale is None:
@@ -2534,7 +2526,7 @@ class TritonAttnBackend(AttentionBackend):
                 and forward_batch.spec_info is not None
                 and swa_loc is not None
             ):
-                # KVWriteLoc keeps a longer swa_loc's prefix, but a draft step's
+                # KVWriteLoc keeps a longer window loc's prefix, but a draft step's
                 # slice of the window is not a prefix of it.
                 assert swa_loc.shape[0] == forward_batch.out_cache_loc.shape[0], (
                     f"draft step swa_out_cache_loc has {swa_loc.shape[0]} "
@@ -2549,7 +2541,6 @@ class TritonAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         window_locs=self._window_write_locs(),
                     ),
                     k,
@@ -2561,7 +2552,6 @@ class TritonAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
                         window_locs=self._window_write_locs(),
                     ),
                     k,

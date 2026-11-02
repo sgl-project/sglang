@@ -40,8 +40,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     # pass it today: a composite's local index, or a plain pool's model layer id.
     view_layer_id: int
     # Whether the layer's sub-pool is the router's owner, whose write ids are the
-    # request's token ids; another token sub-pool writes at the batch's `swa_loc`,
-    # or at its own entry of `window_locs` when the batch carries several.
+    # request's token ids; another token sub-pool writes at its own entry of the
+    # batch's `window_locs`.
     owner: bool = True
     # A plain pool's own layer: the view is the pool, which takes the write loc
     # as the backend hands it and resolves it itself.
@@ -65,8 +65,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
 
     def store(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
         """Writes the layer's K and V at the ids of its sub-pool: the owner's
-        (`full_loc`, else `loc`) or the window's (`swa_loc`), as the attention
-        backend bound them for the batch."""
+        (`full_loc`, else `loc`) or its window sub-pool's entry of
+        `window_locs`, as the attention backend bound them for the batch."""
         if self.plain:
             self.view.set_kv_buffer(layer, loc_info, cache_k, cache_v, *args, **kwargs)
             return
@@ -138,19 +138,17 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             write_loc_is_physical,
         )
 
-        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
-        window_locs = loc_info.window_locs if isinstance(loc_info, KVWriteLoc) else None
+        loc, window_locs, owner_loc = unwrap_write_loc(loc_info)
         if self.owner:
             ids = owner_loc if owner_loc is not None else loc
-        elif window_locs is not None and self.route.sub_pool in window_locs:
-            # One of several window sub-pools: its own write ids.
-            ids = window_locs[self.route.sub_pool]
         else:
-            assert window_loc is not None, (
-                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
-                "but the attention backend bundled no swa_loc for it"
+            # A window layer writes at its own sub-pool's write ids.
+            assert window_locs is not None and self.route.sub_pool in window_locs, (
+                f"layer {layer.layer_id} writes window sub-pool "
+                f"{self.route.sub_pool!r}, but the attention backend bundled "
+                f"write ids for {sorted(window_locs or ())}"
             )
-            ids = window_loc
+            ids = window_locs[self.route.sub_pool]
         return KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
 
     def read_mla(self, layer, loc, dst_dtype=None):

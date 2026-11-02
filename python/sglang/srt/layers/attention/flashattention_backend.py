@@ -45,7 +45,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -848,7 +848,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            # SWA write targets for the new tokens (KVWriteLoc.swa_loc), refilled
+            # SWA write targets for the new tokens (KVWriteLoc.window_locs), refilled
             # into the pointer-stable buffer and bound as a [:num_tokens] view.
             num_out = forward_batch.out_cache_loc.shape[0]
             assert_buffer_fits(
@@ -1464,10 +1464,14 @@ class FlashAttentionBackend(AttentionBackend):
         write_loc = KVWriteLoc.for_layer(
             forward_batch,
             layer,
-            swa_loc=self.forward_metadata.swa_out_cache_loc,
+            window_locs=window_write_locs(
+                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+            ),
         )
         locations = (
-            write_loc.swa_loc
+            (write_loc.window_locs or {}).get(
+                self.kv_layers.route(layer.layer_id).sub_pool
+            )
             if self.use_sliding_window_kv_pool and layer.sliding_window_size >= 0
             else write_loc.loc
         )
@@ -1532,15 +1536,17 @@ class FlashAttentionBackend(AttentionBackend):
                 elif cp_active:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
-                    swa_loc = (
-                        self.forward_metadata.swa_out_cache_loc
+                    window_locs = (
+                        window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        )
                         if self.use_sliding_window_kv_pool
                         else None
                     )
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     cp_strategy.materialize_full_kv(
-                        forward_batch, layer, k, v, swa_loc=swa_loc
+                        forward_batch, layer, k, v, window_locs=window_locs
                     )
                 else:
                     k_scale = k_descale if self.kv_cache_is_mxfp8 else layer.k_scale
@@ -1550,7 +1556,9 @@ class FlashAttentionBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,
@@ -2107,7 +2115,9 @@ class FlashAttentionBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,

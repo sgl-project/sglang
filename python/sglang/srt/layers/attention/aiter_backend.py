@@ -101,7 +101,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_extend_vectorized_5d,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -3827,7 +3827,9 @@ class AiterAttnBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,
@@ -3903,7 +3905,9 @@ class AiterAttnBackend(AttentionBackend):
                         KVWriteLoc.for_layer(
                             forward_batch,
                             layer,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
                         ),
                         k,
                         v,
@@ -4790,7 +4794,9 @@ class AiterAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -4853,7 +4859,9 @@ class AiterAttnBackend(AttentionBackend):
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
