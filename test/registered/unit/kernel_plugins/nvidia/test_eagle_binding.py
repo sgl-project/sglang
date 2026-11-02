@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -139,7 +140,9 @@ def _model(**entries):
         "graph_variants": None,
         **entries,
     }
-    model.__dict__["_megakernel"] = SimpleNamespace(widths=(), **offered)
+    model.__dict__["_megakernel"] = runtime._InstalledMegakernel(
+        built=SimpleNamespace(widths=(), **offered), binding=None, prepare=None
+    )
     return model
 
 
@@ -276,6 +279,48 @@ def _leaves(hint):
 
 
 class TestEagleBinding(CustomTestCase):
+    def test_real_eagle_binding_runs_covered_dispatch_and_capture_tail(self):
+        for arch, backend in (
+            ("Qwen3_5ForCausalLM", _hybrid()),
+            ("Qwen3_5ForCausalLMMTP", _trtllm(KvPool())),
+        ):
+            with self.subTest(architecture=arch):
+                binding = runtime._binding_class([arch])(model=torch.nn.Module())
+                self.assertIsInstance(binding, eb.EagleBinding)
+                built = SimpleNamespace(
+                    plan=MagicMock(return_value=Step(mode="decode", rows=2)),
+                    forward=lambda step, *args, **kwargs: step.view,
+                )
+                original = MagicMock(return_value="standard")
+                dispatch = runtime._Dispatch(
+                    built=built, original=original, binding=binding
+                )
+                forward = dispatch.wrapped()
+                batch = SimpleNamespace(batch_size=2)
+                ids = torch.zeros(2, dtype=torch.int64)
+                check = runtime._CaptureCheck(
+                    spec=SimpleNamespace(name="eagle"), dispatch=dispatch
+                )
+                runner = SimpleNamespace(capture_bs=(2,))
+                with patch.object(eb, "get_attn_backend", return_value=backend):
+                    for capturing in (False, True):
+                        with patch.object(
+                            torch.cuda,
+                            "is_current_stream_capturing",
+                            return_value=capturing,
+                        ):
+                            view = forward(ids, None, batch)
+                        self.assertIsInstance(view, eb.EagleForwardView)
+                    original.assert_not_called()
+                    check(runner, None, batch, 2)
+                    self.assertTrue(check.is_done)
+                    backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
+                    check = runtime._CaptureCheck(
+                        spec=SimpleNamespace(name="eagle"), dispatch=dispatch
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
+                        check(runner, None, batch, 2)
+
     def test_a_qwen3_5_view_is_the_running_forward_and_tolerated_members_exist(self):
         """A covered step is captured once and replays SGLang's refills of the
         backends' metadata, so the view must hold those very tensors."""
