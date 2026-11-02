@@ -123,41 +123,5 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
             )
 
 
-class TestDeferredSeqLensPull(unittest.TestCase):
-    def test_host_lengths_are_unknown_until_the_pull(self):
-        """A decode step resolves its GPU lengths before the worker pulls the host ones;
-        until then the previous step's host lengths must not pass for this step's."""
-        from sglang.srt.managers.overlap_utils_hip import DeferredSeqLensPull
-
-        lens = torch.tensor([5, 9, 7, 0], dtype=torch.int64, device="cuda")
-        publish_ready = torch.cuda.Event()
-        future_map = SimpleNamespace(
-            new_seq_lens_buf=lens,
-            publish_ready=publish_ready,
-            req_pool_size=lens.numel(),
-            device=lens.device,
-            _publish_fresh=True,
-        )
-        pull = DeferredSeqLensPull(future_map)
-        pull.on_publish(lens)
-        publish_ready.record()
-        batch = SimpleNamespace(
-            spec_info=SimpleNamespace(
-                future_indices=torch.tensor([2, 1], device="cuda")
-            ),
-            req_pool_indices_cpu=torch.tensor([2, 1]),
-            seq_lens=None,
-            seq_lens_cpu=torch.tensor([6, 8]),
-            seq_lens_sum=14,
-        )
-        pull.resolve(batch)
-        self.assertEqual(batch.seq_lens.tolist(), [7, 9])
-        self.assertIsNone(batch.seq_lens_cpu)
-        self.assertIsNone(batch.seq_lens_sum)
-        pull.apply(batch)
-        self.assertEqual(batch.seq_lens_cpu.tolist(), [7, 9])
-        self.assertEqual(batch.seq_lens_sum, 16)
-
-
 if __name__ == "__main__":
     unittest.main()

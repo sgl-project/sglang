@@ -255,7 +255,6 @@ class TestRunningReqsHooks(CustomTestCase):
         s.forward_sleep_time = None
         s.enable_overlap = True
         s.future_map = Mock()
-        s.future_map.seq_lens_pull = None
         s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
         # Each launch's rows, and whether each has an earlier step unprocessed.
         launched = []
