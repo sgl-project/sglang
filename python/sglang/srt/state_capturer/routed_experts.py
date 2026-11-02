@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_dp_local_slice_cpu,
@@ -26,6 +27,44 @@ def _is_scattered_a2a_backend() -> bool:
     """Return whether routed tokens are scattered across attention-TP ranks."""
     backend = get_moe_a2a_backend()
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
+
+
+_DTYPES = {"int32": torch.int32, "int16": torch.int16}
+
+
+def _num_routed_experts(hf_text_config) -> Optional[int]:
+    if isinstance(hf_text_config, NemotronHConfig):
+        # Puzzle checkpoints set the count per layer; the model builds the max.
+        return hf_text_config.max_n_routed_experts
+    # Other configs name the routed expert count differently.
+    counts = (
+        getattr(hf_text_config, name, None)
+        for name in ("n_routed_experts", "num_experts", "num_local_experts")
+    )
+    return next((n for n in counts if isinstance(n, int)), None)
+
+
+def _ids_dtype(routed_experts_dtype: str, hf_text_config) -> torch.dtype:
+    dtype = _DTYPES[routed_experts_dtype]
+    if dtype == torch.int32:
+        return dtype
+    num_experts = _num_routed_experts(hf_text_config)
+    if num_experts is None:
+        raise ValueError(
+            f"--routed-experts-dtype {routed_experts_dtype} needs the routed "
+            "expert count, but the model config sets none of n_routed_experts, "
+            "num_experts or num_local_experts. Use int32."
+        )
+    # Captured ids are logical routed ids in [-1, num_experts), taken before
+    # EPLB remapping. Fused shared-expert columns may wrap in the device cache;
+    # _get_local_slice drops them before anything reads the ids.
+    if num_experts - 1 > torch.iinfo(dtype).max:
+        raise ValueError(
+            f"--routed-experts-dtype {routed_experts_dtype} holds expert ids up "
+            f"to {torch.iinfo(dtype).max}, but the model has {num_experts} "
+            "routed experts. Use int32."
+        )
+    return dtype
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -58,6 +97,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
+            dtype=_ids_dtype(
+                get_exec().features.routed_experts_dtype,
+                model_config.hf_text_config,
+            ),
         )
 
     def __init__(
@@ -67,6 +110,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
+        dtype: torch.dtype,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
@@ -90,6 +134,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            dtype=dtype,
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -168,8 +213,10 @@ def extract_routed_experts_from_meta_info(data):
     # We left this function for user to change it back to normal int32
     # See detokenizer_manager::_extract_routed_experts
     routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+    # Servers that predate --routed-experts-dtype send int32 without the tag.
+    dtype = data["meta_info"].get("routed_experts_dtype", "int32")
     routed_experts = np.frombuffer(
-        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=dtype
     )
     return routed_experts
 

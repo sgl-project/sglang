@@ -1,13 +1,20 @@
-"""RoutedExpertsCapturer: DeepEP-family backend recognition and capture width."""
+"""RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
+and storage dtype."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+import pybase64
 import torch
 
+from sglang.srt.configs.nemotron_h import NemotronHPuzzleConfig
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.runtime_context import get_context, get_flags
+from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -119,33 +126,166 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             self._capture(self._capturer(), ids, "none")
 
 
+def _create_kwargs(
+    *, routed_experts_dtype="int32", hf_text_config=None, num_fused_shared_experts=0
+):
+    seen = {}
+
+    def record(self, model_config, **kwargs):
+        seen.update(kwargs)
+
+    with (
+        get_context().override_server_args(
+            enable_return_routed_experts=True,
+            routed_experts_dtype=routed_experts_dtype,
+        ),
+        mock.patch.object(re_mod.RoutedExpertsCapturer, "__init__", record),
+    ):
+        re_mod.RoutedExpertsCapturer.create(
+            model=SimpleNamespace(
+                shared_experts_config=SharedExpertsConfig(
+                    num_fused_shared_experts=num_fused_shared_experts
+                )
+            ),
+            model_config=SimpleNamespace(
+                hf_text_config=hf_text_config or SimpleNamespace()
+            ),
+            num_tokens=8,
+            max_running_requests=2,
+            device="cpu",
+        )
+    return seen
+
+
 class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
     def test_a_wrapper_model_gets_room_for_the_fused_shared_column(self):
         """Capture sizing must use the supplied wrapper model's shared-expert layout."""
-        seen = {}
-
-        def record(self, model_config, **kwargs):
-            seen.update(kwargs)
-
-        features = SimpleNamespace(enable_return_routed_experts=True)
-        with (
-            mock.patch.object(
-                re_mod, "get_exec", return_value=SimpleNamespace(features=features)
-            ),
-            mock.patch.object(re_mod.RoutedExpertsCapturer, "__init__", record),
-        ):
-            re_mod.RoutedExpertsCapturer.create(
-                model=SimpleNamespace(
-                    shared_experts_config=SharedExpertsConfig(
-                        num_fused_shared_experts=1
-                    )
-                ),
-                model_config=SimpleNamespace(),
-                num_tokens=8,
-                max_running_requests=2,
-                device="cpu",
-            )
+        seen = _create_kwargs(num_fused_shared_experts=1)
         self.assertEqual(seen["num_fused_shared_experts"], 1)
+        # int32 never needs the expert count, which this config does not name.
+        self.assertEqual(seen["dtype"], torch.int32)
+
+
+class TestInt16Storage(CustomTestCase):
+    NUM_LAYERS = 3
+    K = 2
+    OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
+
+    def setUp(self):
+        super().setUp()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(get_context().override_server_args(chunked_prefill_size=8))
+        stack.enter_context(get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE))
+        stack.enter_context(get_flags().dp.override(enabled=False))
+        # The real allocator registers host memory with CUDA; CPU tensors suffice.
+        stack.enter_context(
+            mock.patch.dict(
+                base_mod.ALLOC_MEMORY_FUNCS,
+                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
+            )
+        )
+
+    def _capturer(self):
+        hf_text_config = SimpleNamespace(
+            num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
+        )
+        return re_mod.RoutedExpertsCapturer(
+            SimpleNamespace(hf_text_config=hf_text_config),
+            num_tokens=16,
+            max_running_requests=4,
+            num_fused_shared_experts=0,
+            device="cpu",
+            dtype=torch.int16,
+        )
+
+    def test_expert_ids_round_trip_through_int16(self):
+        """The highest expert id and the -1 padding mark survive int16 storage
+        and come back through the response tag."""
+        top_id = torch.iinfo(torch.int16).max
+        topk = torch.tensor(
+            [[0, 1], [top_id, -1], [-1, -1], [17, top_id - 1], [2, 3]],
+            dtype=torch.int32,
+        )
+        forward_batch = SimpleNamespace(
+            out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
+        )
+        pool = SimpleNamespace(req_to_token=self.OUT_CACHE_LOC.unsqueeze(0))
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                cap = self._capturer()
+                # Capture narrows on the device, so the D2H moves int16.
+                self.assertEqual(cap.device_cache.buffer.dtype, torch.int16)
+                self.assertEqual(cap.host_cache.buffer.dtype, torch.int16)
+                for layer_id in range(self.NUM_LAYERS):
+                    cap.capture(layer_id=layer_id, topk_indices=topk)
+                output = cap.on_forward_end(
+                    forward_batch,
+                    can_run_graph=False,
+                    cuda_graph_batch=None,
+                    no_copy_to_cpu=overlap,
+                )
+                if overlap:
+                    output.map_device_tensors(lambda t: t.cpu())
+                    output.finalize()
+                out = cap.get_topk(
+                    req_pool_idx=0, seqlen=5, req_to_token_pool=pool, start_len=1
+                )
+                self.assertEqual(out.dtype, torch.int16)
+                decoded = re_mod.extract_routed_experts_from_meta_info(
+                    {"meta_info": _response_meta_info(out, "int16")}
+                )
+                expected = topk[1:4, None].expand(-1, self.NUM_LAYERS, -1)
+                self.assertTrue(np.array_equal(decoded, expected.flatten().numpy()))
+
+
+def _response_meta_info(ids, dtype=None):
+    # Encoded as the detokenizer does; dtype is the tag the response carries.
+    meta_info = {"routed_experts": pybase64.b64encode(ids.numpy().tobytes()).decode()}
+    if dtype is not None:
+        meta_info["routed_experts_dtype"] = dtype
+    return meta_info
+
+
+class TestIdsDtype(CustomTestCase):
+    def test_untagged_routed_experts_decode_as_int32(self):
+        """Servers that predate --routed-experts-dtype send int32 without a tag."""
+        ids = torch.tensor([0, 70000, -1], dtype=torch.int32)
+        decoded = re_mod.extract_routed_experts_from_meta_info(
+            {"meta_info": _response_meta_info(ids)}
+        )
+        self.assertEqual(decoded.tolist(), [0, 70000, -1])
+
+    def test_create_uses_the_configured_dtype(self):
+        seen = _create_kwargs(
+            routed_experts_dtype="int16",
+            hf_text_config=SimpleNamespace(n_routed_experts=896),
+        )
+        self.assertEqual(seen["dtype"], torch.int16)
+
+    def test_int16_must_hold_the_largest_expert_id(self):
+        """Ids run from -1 to num_experts - 1, so int16 holds 32768 experts."""
+        self.assertEqual(
+            re_mod._ids_dtype("int16", SimpleNamespace(num_experts=32768)),
+            torch.int16,
+        )
+        # A puzzle checkpoint's per-layer count is what the model builds.
+        puzzle = NemotronHPuzzleConfig(
+            hybrid_override_pattern="ME",
+            n_routed_experts=8,
+            block_configs=[
+                {"block_type": "mamba"},
+                {"block_type": "moe", "n_routed_experts": 32769},
+            ],
+        )
+        rejected = {
+            "too many experts": SimpleNamespace(num_local_experts=32769),
+            "too many in a puzzle layer": puzzle,
+            "unknown expert count": SimpleNamespace(),
+        }
+        for case, config in rejected.items():
+            with self.subTest(case), self.assertRaises(ValueError):
+                re_mod._ids_dtype("int16", config)
 
 
 if __name__ == "__main__":
