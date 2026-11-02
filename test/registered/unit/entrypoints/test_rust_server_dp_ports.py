@@ -493,5 +493,40 @@ def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
         assert server is None
 
 
+@pytest.mark.parametrize("hosts", [True, False], ids=["host", "non-host"])
+def test_listener_rank_installs_the_sigterm_drain(hosts):
+    # Every rank joins the endpoint gather; only a listener rank launches the
+    # server, and it drains on SIGTERM, reporting to the launcher's socket.
+    from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+    maybe_stub_sgl_kernel()
+    from sglang.srt.managers import scheduler as scheduler_module
+
+    server = MagicMock()
+    server_class = MagicMock()
+    server_class.launch.return_value = server
+    server_class.gather_server_endpoints.return_value = []
+    scheduler = SimpleNamespace(
+        _hosts_rust_server=lambda: hosts,
+        get_rust_server_class=lambda: server_class,
+        _engine_paused=False,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(scheduler_module, "RustServerIdleSleeper"),
+    ):
+        scheduler_module.Scheduler.maybe_init_rust_server(
+            scheduler, SimpleNamespace(instance_id="dp-ports-test")
+        )
+
+    server_class.gather_server_endpoints.assert_called_once_with(hosts)
+    assert server_class.launch.called == hosts
+    if hosts:
+        server.install_sigterm_drain.assert_called_once_with(
+            notify=rust_server.drain_notify_name("dp-ports-test")
+        )
+    assert scheduler.rust_server is (server if hosts else None)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

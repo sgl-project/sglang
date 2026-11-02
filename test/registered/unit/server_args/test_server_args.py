@@ -7,6 +7,7 @@ import signal
 import socket
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -145,21 +146,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (535, "grpc_response_timeout_secs"),
-            (536, "enable_paged_experts"),
-            (537, "paged_experts_num_resident"),
-            (538, "enable_nvidia_megakernel"),
-            (539, "enable_megamoe_for_layernorm_sp"),
+            (532, "grpc_response_timeout_secs"),
+            (533, "enable_paged_experts"),
+            (534, "paged_experts_num_resident"),
+            (535, "enable_nvidia_megakernel"),
+            (536, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional = [getattr(defaults, field.name) for field in fields[:533]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[535] = 123.0
+        positional[532] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -185,11 +186,270 @@ class TestServerArgsPositionalOrder(CustomTestCase):
                     model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
                 )
                 argv = ["--model-path", "dummy"]
-                if enabled:
-                    argv.append("--enable-megamoe-for-layernorm-sp")
+                argv.append(
+                    "--enable-megamoe-for-layernorm-sp"
+                    if enabled
+                    else "--no-enable-megamoe-for-layernorm-sp"
+                )
                 cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
                 self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
                 self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
+
+
+class TestMuseSparkLaunchDefaults(CustomTestCase):
+    """Minimal recipes must resolve before generic memory/backend defaults."""
+
+    def resolve(
+        self,
+        *,
+        platform="blackwell",
+        checkpoint="modelopt_fp4",
+        arch="MuseSparkForConditionalGeneration",
+        draft_arch="DFlash2DraftModel",
+        **options,
+    ):
+        from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        inputs = dict(
+            model_path="dummy",
+            tp_size=4,
+            ep_size=4,
+            enable_layernorm_sp=True,
+            enable_megamoe_for_layernorm_sp=None,
+            device="cuda",
+        )
+        inputs.update(options)
+        args = ServerArgs(**inputs)
+        args.model_path = "/local/checkpoint"
+        args._quantization_explicitly_unset = checkpoint == "unquant"
+        hf = SimpleNamespace(architectures=[arch])
+        args._model_config = SimpleNamespace(hf_config=hf, quantization=checkpoint)
+        draft = SimpleNamespace(
+            architectures=[draft_arch], dflash_config={"block_size": 16}
+        )
+        with (
+            patch.dict(os.environ),
+            override_platform(
+                is_cuda=platform != "amd",
+                is_hip=platform == "amd",
+                is_sm100=platform == "blackwell",
+                is_sm90=platform == "hopper",
+                is_blackwell=platform == "blackwell",
+            ),
+            patch(
+                "sglang.srt.arg_groups.muse_spark_hook.get_config",
+                side_effect=lambda path, **kw: draft if path == "/local/draft" else hf,
+            ),
+        ):
+            apply_muse_spark_env_defaults(args)
+        return resolving_view(args)
+
+    def test_nvfp4_hardware_defaults_and_explicit_overrides(self):
+        for platform, runner, fraction in (
+            ("blackwell", "flashinfer_trtllm", 0.8),
+            ("hopper", "marlin", 0.85),
+        ):
+            with self.subTest(platform=platform):
+                cfg = self.resolve(platform=platform)
+                self.assertEqual(
+                    (cfg.quantization, cfg.moe_runner_backend, cfg.mem_fraction_static),
+                    ("modelopt_fp4", runner, fraction),
+                )
+                explicit = self.resolve(
+                    platform=platform,
+                    quantization="quark_mxfp4",
+                    moe_runner_backend="triton",
+                    mem_fraction_static=0.72,
+                    enable_megamoe_for_layernorm_sp=False,
+                )
+                self.assertEqual(
+                    (
+                        explicit.quantization,
+                        explicit.moe_runner_backend,
+                        explicit.mem_fraction_static,
+                        explicit.enable_megamoe_for_layernorm_sp,
+                    ),
+                    ("quark_mxfp4", "triton", 0.72, False),
+                )
+
+    def test_megamoe_conditions_and_opt_out(self):
+        self.assertTrue(self.resolve().enable_megamoe_for_layernorm_sp)
+        self.assertTrue(
+            self.resolve(disaggregation_mode="prefill").enable_megamoe_for_layernorm_sp
+        )
+        for options in (
+            {"disaggregation_mode": "decode"},
+            {"enable_layernorm_sp": False},
+            {"ep_size": 1},
+            {"ep_size": 2},
+            {"platform": "hopper"},
+            {"checkpoint": None},
+            {"checkpoint": "unquant"},
+            {"enable_megamoe_for_layernorm_sp": False},
+        ):
+            with self.subTest(options=options):
+                self.assertFalse(
+                    self.resolve(**options).enable_megamoe_for_layernorm_sp
+                )
+
+    def test_other_models_and_amd_keep_existing_defaults(self):
+        for options in (
+            {"platform": "amd", "checkpoint": "quark_mxfp4"},
+            {"arch": "LlamaForCausalLM"},
+        ):
+            with self.subTest(options=options):
+                cfg = self.resolve(**options)
+                self.assertIsNone(cfg.quantization)
+                self.assertEqual(cfg.moe_runner_backend, "auto")
+                self.assertIsNone(cfg.mem_fraction_static)
+                self.assertFalse(cfg.enable_megamoe_for_layernorm_sp)
+
+    def test_dflash2_config_defaults_preserve_explicit_choices(self):
+        inputs = dict(
+            speculative_algorithm="DFLASH", speculative_draft_model_path="/local/draft"
+        )
+        for platform in ("blackwell", "hopper"):
+            with self.subTest(platform=platform):
+                cfg = self.resolve(platform=platform, **inputs)
+                self.assertEqual(
+                    (
+                        cfg.speculative_draft_attention_backend,
+                        cfg.speculative_num_draft_tokens,
+                    ),
+                    ("fa4", 8),
+                )
+        cfg = self.resolve(
+            **inputs,
+            speculative_draft_attention_backend="triton",
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(
+            (cfg.speculative_draft_attention_backend, cfg.speculative_num_draft_tokens),
+            ("triton", 4),
+        )
+        cfg = self.resolve(**inputs, speculative_dflash_block_size=4)
+        self.assertIsNone(cfg.speculative_num_draft_tokens)
+        for options in ({"draft_arch": "DFlashDraftModel"}, {"platform": "amd"}):
+            with self.subTest(options=options):
+                self.assertIsNone(
+                    self.resolve(
+                        **inputs, **options
+                    ).speculative_draft_attention_backend
+                )
+
+    def test_minimal_local_recipe_resolves_through_the_full_pipeline(self):
+        """Omitted flags must reach later validators for both ModelOpt formats."""
+        from sglang.srt.configs.muse_spark import MuseSparkConfig
+
+        for platform in ("blackwell", "hopper"):
+            for standalone_quant_config in (False, True):
+                with (
+                    self.subTest(platform=platform, standalone=standalone_quant_config),
+                    tempfile.TemporaryDirectory() as folder,
+                    patch.dict(os.environ),
+                ):
+                    target, draft = Path(folder) / "target", Path(folder) / "draft"
+                    quant = {
+                        "quant_method": "modelopt",
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                    config = MuseSparkConfig(
+                        architectures=["MuseSparkForConditionalGeneration"]
+                    )
+                    if not standalone_quant_config:
+                        config.quantization_config = quant
+                    config.save_pretrained(target)
+                    if standalone_quant_config:
+                        (target / "hf_quant_config.json").write_text(
+                            json.dumps({"quantization": quant})
+                        )
+                    draft.mkdir()
+                    (draft / "config.json").write_text(
+                        json.dumps(
+                            {
+                                "model_type": "qwen3",
+                                "architectures": ["DFlash2DraftModel"],
+                                "hidden_size": 4096,
+                                "num_hidden_layers": 5,
+                                "num_attention_heads": 32,
+                                "num_key_value_heads": 8,
+                                "head_dim": 128,
+                                "vocab_size": 202048,
+                                "dflash_config": {
+                                    "block_size": 16,
+                                    "selector_rank": 256,
+                                },
+                            }
+                        )
+                    )
+                    with (
+                        override_platform(
+                            is_cuda=True,
+                            is_hip=False,
+                            is_sm100=platform == "blackwell",
+                            is_sm90=platform == "hopper",
+                            is_blackwell=platform == "blackwell",
+                        ),
+                        patch(
+                            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                            return_value=183000,
+                        ),
+                    ):
+                        args = ServerArgs(
+                            model_path=str(target),
+                            device="cuda",
+                            tp_size=4,
+                            ep_size=4,
+                            enable_layernorm_sp=platform == "blackwell",
+                            speculative_algorithm="DFLASH",
+                            speculative_draft_model_path=str(draft),
+                        )
+                        args.resolve_once()
+                        self.assertEqual(
+                            resolution_result(args, "quantization"), "modelopt_fp4"
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "moe_runner_backend"),
+                            "flashinfer_trtllm"
+                            if platform == "blackwell"
+                            else "marlin",
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "mem_fraction_static"),
+                            0.8 if platform == "blackwell" else 0.85,
+                        )
+                        self.assertEqual(
+                            resolution_result(
+                                args, "speculative_draft_attention_backend"
+                            ),
+                            "fa4",
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "speculative_num_draft_tokens"), 8
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "enable_megamoe_for_layernorm_sp"),
+                            platform == "blackwell",
+                        )
+                        self.assertTrue(
+                            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+                        )
+
+    def test_megamoe_cli_distinguishes_auto_from_explicit_disable(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for flags, expected in (
+            ([], None),
+            (["--enable-megamoe-for-layernorm-sp"], True),
+            (["--no-enable-megamoe-for-layernorm-sp"], False),
+        ):
+            with self.subTest(flags=flags):
+                args = ServerArgs.from_cli_args(
+                    parser.parse_args(["--model-path", "dummy", *flags])
+                )
+                self.assertIs(args.enable_megamoe_for_layernorm_sp, expected)
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -1375,23 +1635,19 @@ class TestKV4Compatibility(unittest.TestCase):
 class TestLoraForwardDomains(unittest.TestCase):
     def test_rejects_concurrent_forwards(self):
         for runner in ("auto", "lora_cutedsl"):
-            for options in (
-                {"enable_pdmux": True},
-                {"enable_two_batch_overlap": True},
-            ):
-                with self.subTest(runner=runner, options=options):
-                    args = ServerArgs(
-                        model_path="dummy",
-                        tp_size=2,
-                        enable_lora=True,
-                        lora_backend="triton_v2",
-                        moe_runner_backend=runner,
-                        max_lora_rank=8,
-                        lora_target_modules=["down_proj"],
-                        **options,
-                    )
-                    with self.assertRaises(ValueError):
-                        check_lora_server_args(args)
+            with self.subTest(runner=runner):
+                args = ServerArgs(
+                    model_path="dummy",
+                    tp_size=2,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    moe_runner_backend=runner,
+                    max_lora_rank=8,
+                    lora_target_modules=["down_proj"],
+                    enable_two_batch_overlap=True,
+                )
+                with self.assertRaises(ValueError):
+                    check_lora_server_args(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -5180,7 +5436,6 @@ class TestPrefillWeightVersionCompatibility(CustomTestCase):
             {"enable_encoder_swa_bounded_replay": True},
             {"enable_lmcache": True},
             {"enable_unified_cache_external_linker": True},
-            {"enable_pdmux": True},
             {"dllm_algorithm": "LowConfidence"},
             {"speculative_algorithm": "NGRAM"},
             {"speculative_algorithm": "UNO"},

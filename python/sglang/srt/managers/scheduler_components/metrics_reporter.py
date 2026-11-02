@@ -340,8 +340,6 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
-        # PDMux event polling across green-context streams is not validated;
-        # keep its overlap label at `none` without disabling forward timing.
         self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
             enabled=self.enable_metrics,
             query_forward_active=(
@@ -349,7 +347,6 @@ class SchedulerMetricsReporter:
                 if self.enable_metrics
                 and self.forward_pass_device_timer is not None
                 and self.scheduler.device == "cuda"
-                and not get_disagg().enable_pdmux
                 else None
             ),
         )

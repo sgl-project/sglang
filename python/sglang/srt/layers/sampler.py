@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling import argmax as sampler_argmax
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
@@ -37,7 +38,7 @@ from sglang.srt.utils.common import (
 from sglang.utils import LazyImport
 
 if is_cuda():
-    from sgl_kernel import (
+    from sglang.srt.layers.sampling_renorm import (
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
@@ -54,8 +55,11 @@ if is_cuda():
 if is_musa() or is_xpu():
     from sgl_kernel import (
         min_p_sampling_from_probs,
-        top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+    )
+
+    from sglang.srt.layers.sampling_renorm import (
+        top_k_renorm_prob,
         top_p_renorm_prob,
     )
 
@@ -213,7 +217,7 @@ class Sampler(nn.Module):
                 )
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
-                batch_next_token_ids = torch.argmax(logits, -1)
+                batch_next_token_ids = sampler_argmax(logits)
             _trace_e2e_sampler(
                 "greedy_returned", output_shape=tuple(batch_next_token_ids.shape)
             )
@@ -272,30 +276,26 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
-                # Deterministic inference must derive the returned logprobs
-                # from F.log_softmax — the same kernel prefill rescoring uses —
-                # not log(softmax(x)) below: the two disagree at ~1e-6 despite
-                # being mathematically equivalent, which breaks bitwise
-                # prefill/decode logprob alignment.
-                if (
-                    return_logprob
-                    and self.enable_deterministic
-                    and logprobs_via_logsoftmax_kernel is None
-                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
-                    and target_logprobs is None
-                ):
-                    logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
-                        logits, dim=-1
-                    )
-
-                # In-place op to save memory
-                logits[:] = (
-                    torch.softmax(logits, dim=-1)
-                    if self.enable_deterministic
-                    else sampler_softmax(logits)
-                )
+                if self.enable_deterministic:
+                    logits.div_(sampling_info.temperatures)
+                    # Deterministic inference must derive the returned logprobs
+                    # from F.log_softmax — the same kernel prefill rescoring uses —
+                    # not log(softmax(x)) below: the two disagree at ~1e-6 despite
+                    # being mathematically equivalent, which breaks bitwise
+                    # prefill/decode logprob alignment.
+                    if (
+                        return_logprob
+                        and logprobs_via_logsoftmax_kernel is None
+                        and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                        and target_logprobs is None
+                    ):
+                        logprobs_via_logsoftmax_kernel = (
+                            torch.nn.functional.log_softmax(logits, dim=-1)
+                        )
+                    logits[:] = torch.softmax(logits, dim=-1)
+                else:
+                    # Temperature fused; the probs overwrite the logits in place.
+                    sampler_softmax(logits, sampling_info.temperatures, out=logits)
                 probs = logits
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
@@ -716,12 +716,11 @@ class Sampler(nn.Module):
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
-            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
-            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
-            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            # Off by default to save an all-reduce; correct only while the last all-reduce,
+            # the lm_head matmul and every sampling kernel agree across ranks (the top-p /
+            # top-k renorm kernels run deterministically whenever tp_size > 1, see
+            # sampling_renorm.py). Enable this when TP ranks still desynchronize. Grammar
+            # always syncs: xgrammar makes it likely.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
@@ -1054,16 +1053,27 @@ def apply_custom_logit_processor(
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
 
-        if token_offsets is not None:
-            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
-        selected = logits.index_select(0, indices)
         custom_params = [
             sampling_batch_info.custom_params[i]
             for i in rows
             for _ in range(num_tokens_in_batch)
         ]
-        result = entry.processor(selected, custom_params)
-        logits.index_copy_(0, indices, result.to(logits.dtype))
+        if len(rows) == batch_size:
+            # Rows are ascending and duplicate-free, so every row opted in and
+            # gather and scatter-back are the identity.
+            result = entry.processor(logits, custom_params)
+            if result is not logits:
+                # The gather path scatters the return value back implicitly, so
+                # a processor that builds a fresh tensor must still land here.
+                logits.copy_(result)
+        else:
+            if token_offsets is not None:
+                indices = (
+                    indices[:, None] * num_tokens_in_batch + token_offsets
+                ).flatten()
+            selected = logits.index_select(0, indices)
+            result = entry.processor(selected, custom_params)
+            logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
             f"Custom logit processor {entry.processor.__class__.__name__} is applied."
