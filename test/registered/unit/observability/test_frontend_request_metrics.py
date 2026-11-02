@@ -21,12 +21,14 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.frontend_request_timing import (
     FrontendRequestTiming,
     bind_frontend_timing,
+    current_frontend_timing,
 )
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,6 +93,34 @@ class TestFrontendRequestMetrics(CustomTestCase):
         manager.async_dynamic_batch_tokenizer = None
         manager.model_config = SimpleNamespace(is_embedding_gemma=False)
         return manager
+
+    def test_disabled_metrics_do_not_create_request_timing(self):
+        def convert(*args):
+            self.assertIsNone(current_frontend_timing.get())
+            return None, None
+
+        async def respond(*args):
+            return "ok"
+
+        server = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(
+                enable_metrics=False, request_logger=SimpleNamespace(log_requests=False)
+            ),
+            _validate_request=lambda request: None,
+            _convert_to_internal_request=convert,
+            _handle_non_streaming_request=respond,
+            create_error_response=lambda **kwargs: kwargs,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_base.FrontendRequestTiming",
+            side_effect=AssertionError("disabled metrics created timing"),
+        ):
+            result = asyncio.run(
+                OpenAIServingBase.handle_request(
+                    server, SimpleNamespace(stream=False), SimpleNamespace(scope={})
+                )
+            )
+        self.assertEqual(result, "ok")
 
     def test_only_three_stages_and_one_sample_at_first_submission(self):
         timing = FrontendRequestTiming(started_at=10.0)

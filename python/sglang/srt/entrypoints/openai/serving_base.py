@@ -104,10 +104,14 @@ class OpenAIServingBase(ABC):
             # Convert off-loop: jinja render + full-prompt tokenization blocks
             # the loop on long prompts, and the rust tokenizer releases the GIL.
             loop = asyncio.get_running_loop()
-            timing = FrontendRequestTiming(
-                started_at=raw_request.scope.get(
-                    "frontend_received_time", received_time
+            timing = (
+                FrontendRequestTiming(
+                    started_at=raw_request.scope.get(
+                        "frontend_received_time", received_time
+                    )
                 )
+                if self.tokenizer_manager.enable_metrics
+                else None
             )
             with bind_frontend_timing(timing):
                 context = contextvars.copy_context()
