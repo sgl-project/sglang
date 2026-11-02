@@ -9,10 +9,7 @@ from sglang_simulator.simulation.utils import (
     calc_kv_cache_per_layer_elems,
 )
 from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
-from sglang_simulator.time_predictor import (
-    AIConfiguratorTimePredictor,
-    InferTimePredictor,
-)
+from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -194,6 +191,10 @@ class ConfigManager:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aiconfigurator":
+            from sglang_simulator.time_predictor.aiconfigurator import (
+                AIConfiguratorTimePredictor,
+            )
+
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
