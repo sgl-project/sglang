@@ -68,8 +68,6 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from uvicorn.supervisors.multiprocess import Multiprocess
 
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -82,6 +80,7 @@ from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
+    node_hosts_rust_server,
     run_detokenizer_process,
     run_scheduler_process,
 )
@@ -121,6 +120,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
@@ -189,6 +189,7 @@ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
+    build_model_info_fields,
     build_server_info,
     delete_directory,
     freeze_gc,
@@ -748,7 +749,7 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide and crash the shared DetokenizerManager decode_status).
+    # collide, and colliding rids overwrite each other's detokenize state).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
@@ -810,7 +811,6 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
-    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         # Manager-owned, and moved by a weight update alongside `model_path`:
@@ -832,19 +832,11 @@ async def model_info():
         "disaggregation_mode": _global_state.tokenizer_manager.config_value(
             "disaggregation_mode"
         ),
-        "has_image_understanding": model_config.is_image_understandable_model,
-        "has_audio_understanding": model_config.is_audio_understandable_model,
-        "model_type": getattr(model_config.hf_config, "model_type", None),
-        "architectures": getattr(model_config.hf_config, "architectures", None),
-        # "hf_config": model_config.hf_config.to_dict(),
+        **build_model_info_fields(
+            _global_state.tokenizer_manager.model_config,
+            _global_state.tokenizer_manager.server_args,
+        ),
     }
-    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
-    if embedding_model_spec is not None:
-        result["embedding"] = resolved_embedding_plan(
-            embedding_model_spec,
-            config=resolving_view(_global_state.tokenizer_manager.server_args),
-            model_config=model_config,
-        )
     return msgspec_to_builtins(result)
 
 
@@ -3167,9 +3159,30 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
+        from sglang.srt.rust_server.server import drain_notify_name
+        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+        drain = None
+        # Without a local listener (the DP controller starts the schedulers),
+        # SIGTERM keeps its previous effect. Installed before the sidecar
+        # block, so SIGTERM stops the sidecar first and then reaches the drain.
+        if scheduler_init_result.rust_listener_procs:
+            drain = RustServerSigtermDrain(
+                scheduler_init_result.scheduler_procs,
+                scheduler_init_result.rust_listener_procs,
+                subprocess_watchdog,
+                drain_notify_name(port_args.instance_id),
+            )
+            drain.install()
+        # Every listener is bound before its scheduler reports ready, so the
+        # sidecar can connect at once.
+        with rust_server_sidecar(node_hosts_rust_server()):
+            if launch_callback is not None:
+                launch_callback()
+            if drain is not None:
+                drain.wait()
+            else:
+                scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,

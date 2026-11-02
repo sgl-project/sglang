@@ -440,8 +440,6 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
-        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -565,6 +563,15 @@ def _check_dsa_backend_constraints(
             "ROCm/HIP. Pick an alternative DSA backend for CUDA "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
+
+    if hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
+                "triton with --dcp-size > 1."
+            )
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
@@ -972,7 +979,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
             and not view.encoder_only
-            and not view.enable_pdmux
         ):
             return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
@@ -1095,9 +1101,25 @@ def _deterministic_attention_backend(view: Any) -> dict:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
+    # A per-phase backend takes priority over --attention-backend for its phase,
+    # so it has to be one of the deterministic backends too.
+    for field in ("prefill_attention_backend", "decode_attention_backend"):
+        backend = getattr(view, field, None)
+        if (
+            backend is not None
+            and backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+        ):
+            raise ValueError(
+                f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+                f"but --{field.replace('_', '-')} is '{backend}'."
+            )
+
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if get_platform().is_xpu:
+            # fa3 and flashinfer have no XPU kernels.
+            backend = "intel_xpu"
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
@@ -1321,14 +1343,45 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 
 @register_post_process
+def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
+    if view.disable_hybrid_swa_memory:
+        return {}
+    from sglang.srt.configs.model_config import is_layer_types_hybrid_swa_model
+
+    model_config = model_config_of(view)
+    architectures = model_config.hf_config.architectures
+    if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
+        return {}
+    # aiter: with the SWA pool it serves these models through unified_attention,
+    # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
+    # drop it here once unified_attention retrieves it too.
+    # wave, flex_attention: they never translate full-pool slots into SWA ones.
+    backends = [
+        backend
+        for backend in attention_backends_of(view)
+        if backend in ("aiter", "wave", "flex_attention")
+    ]
+    if not backends:
+        return {}
+    logger.warning(
+        f"Disable hybrid SWA memory for {architectures[0]} on the {backends[0]} attention backend."
+    )
+    return {"disable_hybrid_swa_memory": True}
+
+
+@register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
-        supported_page_sizes = [64, 128]
-        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes.extend([16, 32])
-            msg = msg + " for MLA"
+            # sgl_kernel's mla_decode accepts only these; it has no page_size 1 path.
+            supported_page_sizes = [16, 32, 64, 128]
+            msg = "Intel XPU attention backend for MLA"
+        else:
+            # MHA page_size 1 goes through sgl_kernel's workaround (KV gather +
+            # non-paged varlen attention); the paged kernel accepts only 64/128.
+            supported_page_sizes = [1, 64, 128]
+            msg = "Intel XPU attention backend"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
@@ -1587,6 +1640,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
+        "ascend_ops",
         "deepep_v2",
     }
 )
@@ -1825,10 +1879,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
     if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
+        from sglang.srt.mem_cache.kv.plan import resized_after_capture
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        if not resized_after_capture(declared_lifetime_types(model_config)):
             return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)

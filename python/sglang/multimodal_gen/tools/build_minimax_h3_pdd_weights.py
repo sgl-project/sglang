@@ -37,6 +37,13 @@ def _interleave_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     ).reshape(-1, in_dim)
 
 
+def _diffusers_to_native_fc1(delta: torch.Tensor) -> torch.Tensor:
+    """Diffusers SwiGLU [value, gate] rows -> the native fused fc1 [gate, value] layout,
+    the same swap as the Diffusers checkpoint loader in models/dits/minimax_h3.py."""
+    value, gate = delta.chunk(2, dim=0)
+    return torch.cat((gate, value), dim=0)
+
+
 def _target_of(lora_key: str) -> str | None:
     """LoRA module name -> official weight name. None means "not handled here"."""
     k = lora_key
@@ -99,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         target = _target_of(module)
         if target is None:
             raise SystemExit(f"no mapping rule for {module}")
+        if target.endswith(".mlp.fc1"):
+            delta = _diffusers_to_native_fc1(delta)
         for role in ("to_q", "to_k", "to_v"):
             if target.endswith(f".attn.{role}"):
                 qkv.setdefault(target[: -len(f".attn.{role}")], {})[role[-1]] = delta

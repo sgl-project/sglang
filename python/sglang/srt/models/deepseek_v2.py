@@ -54,6 +54,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -79,19 +80,25 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    configure_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -150,7 +157,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -882,6 +889,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_megamoe()
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -979,6 +987,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -1002,6 +1011,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
             or get_moe_a2a_backend().is_deepep_v2()
+            or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -2036,6 +2046,8 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
+        attn_type: AttentionType = AttentionType.DECODER,
+        sliding_window_size: int = -1,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -2050,9 +2062,19 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
-        self.dcp_size = (
-            1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
+        self.defer_cp_decode_attn_tp = (
+            self.use_dsa
+            and q_lora_rank is not None
+            and not reduce_results
+            and can_defer_cp_decode_attn_tp()
         )
+        self.dcp_size = get_parallel().attn_dcp_size
+        if (
+            is_nextn
+            and self.use_dsa
+            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
+        ):
+            self.dcp_size = 1
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2160,6 +2182,10 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
         )
+        if self.q_lora_rank is not None:
+            configure_cp_decode_attn_tp(
+                self.o_proj, defer_all_reduce=self.defer_cp_decode_attn_tp
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope and qk_rope_head_dim > 0:
@@ -2187,7 +2213,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
@@ -2199,7 +2227,9 @@ class DeepseekV2AttentionMLA(
                 num_kv_heads=1,
                 layer_id=layer_id,
                 v_head_dim=self.kv_lora_rank,
+                sliding_window_size=sliding_window_size,
                 quant_config=quant_config,
+                attn_type=attn_type,
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
@@ -2210,7 +2240,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
 
@@ -2226,6 +2258,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
         self.q_b_proj_qrep = None
+        # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
+        # on every group head before the DCP a2a, so the wire carries v_head_dim.
+        self.w_vc_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2277,6 +2312,7 @@ class DeepseekV2AttentionMLA(
             [self.q_b_proj, self.o_proj],
             tensor_attrs=tensor_attrs,
             radix_attn=self.attn_mqa,
+            defer_all_reduce=self.defer_cp_decode_attn_tp,
         ):
             if ctx.use_decode_attn_tp:
                 orig_num_local_heads = self.num_local_heads
@@ -2705,7 +2741,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         with too (see make_layers). ``attn_output`` and ``output``: the
         attention's and the FFN's output transforms, if any."""
         return (
-            declare_attn(output_transform=attn_output),
+            declare_attn(
+                output_transform=attn_output,
+                ordinary_tp_group=(
+                    SumGroup.TP
+                    if is_deepseek_dsa(config)
+                    and getattr(config, "q_lora_rank", None) is not None
+                    and can_defer_cp_decode_attn_tp()
+                    else None
+                ),
+            ),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
                 next_layer_sparse=cls._is_layer_sparse(
@@ -2739,6 +2784,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn, ffn = self.stage_facts(
             self.config, self.layer_id, is_nextn=self.is_nextn, **modules
         )
+        defer_decode_sum = getattr(self.self_attn, "defer_cp_decode_attn_tp", False)
+        if (attn.ordinary_tp_group is not None) != defer_decode_sum:
+            raise ValueError(
+                "CP decode attention TP deferral disagrees with the stage declaration"
+            )
+        if defer_decode_sum:
+            configure_cp_decode_attn_tp(self.self_attn.o_proj, defer_all_reduce=True)
         attn_boundary, ffn_boundary = append_stages(
             (
                 attn,
@@ -2812,6 +2864,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            if getattr(self.self_attn, "defer_cp_decode_attn_tp", False):
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -3010,19 +3067,19 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and self.embed_tokens.embedding_dim == 7168
+            and getattr(self.embed_tokens, "embedding_dim", None) == 7168
         ):
             num_moe_layers = sum(
                 [
                     1
                     for i in range(len(self.layers))
-                    if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                    if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
                     # Keep the original deepep-class scope here and only add DeepEP v2,
                     # so unrelated backends' allocator sizing is unchanged.
@@ -3045,7 +3102,7 @@ class DeepseekV2Model(nn.Module):
                     config.n_routed_experts,
                     num_moe_layers,
                     allocate_size,
-                    self.embed_tokens.embedding_dim,
+                    getattr(self.embed_tokens, "embedding_dim", 0),
                 )
             )
         self.layers_to_capture = []

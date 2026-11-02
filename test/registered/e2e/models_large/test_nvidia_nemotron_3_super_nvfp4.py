@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1600, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1600, stage="weekly", runner_config="4-gpu-b200")
 
 NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 

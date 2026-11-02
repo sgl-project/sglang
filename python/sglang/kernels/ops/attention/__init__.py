@@ -486,6 +486,40 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
+# Unlimited-OCR v2 DASH block-sparse attention: routing, attend, decode metadata.
+for _mod, _fn, _backend in [
+    ("attend", "dash_sparse_attn", KernelBackend.TRITON),
+    ("route", "route_prefill_triton", KernelBackend.TRITON),
+    ("route", "route_decode_triton", KernelBackend.TRITON),
+    ("route", "win_bounds_decode", KernelBackend.TRITON),
+    ("route", "kbar_refresh_tail_triton", KernelBackend.TRITON),
+    ("route", "kbar_all_plan", KernelBackend.TORCH),
+    ("route", "kbar_tail_plan", KernelBackend.TORCH),
+    ("route", "prefill_row2req", KernelBackend.TORCH),
+    ("decode_meta", "dash_decode_meta", KernelBackend.TRITON),
+    ("decode_meta", "dash_decode_allow", KernelBackend.TRITON),
+    ("decode_meta", "page2d_cos_sin", KernelBackend.TRITON),
+    ("decode_meta", "local_union_fused", KernelBackend.TRITON),
+    ("page2d_rope", "apply_page2d_rope", KernelBackend.TRITON),
+    ("page2d_rope", "apply_page2d_rope_pair", KernelBackend.TRITON),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.unlimited_ocr_dash.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn, _backend
+# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
+register_kernel(
+    KernelSpec(
+        op="attention.dash_sparse_attn_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.unlimited_ocr_dash.attend:dash_sparse_attn_decode",
+        capabilities=CUDA_ONLY,
+    )
+)
 register_kernel(
     KernelSpec(
         op="attention.mtp_verify_attn_fwd_asm",

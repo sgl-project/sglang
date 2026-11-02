@@ -7,19 +7,33 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import LlamaConfig, Qwen3_5Config
+from transformers import (
+    Cohere2Config,
+    Gemma2Config,
+    Gemma3TextConfig,
+    LlamaConfig,
+    Qwen3_5Config,
+)
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
+    is_layer_types_hybrid_swa_model,
     is_multimodal_model,
     load_decision_config,
     register_model_config_factory,
     resolve_spec_hidden_size,
 )
+from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    MAX_PAGE_PROMPT_TOKENS,
+    UocrDocumentConfig,
+)
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,6 +64,61 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+    def test_layer_types_mix_makes_a_model_hybrid_swa(self):
+        exaone4_32b = SimpleNamespace(
+            num_hidden_layers=8,
+            sliding_window=4096,
+            sliding_window_pattern="LLLG",
+            layer_types=(["sliding_attention"] * 3 + ["full_attention"]) * 2,
+        )
+        olmo3 = Olmo3Config(num_hidden_layers=8, sliding_window=4096)
+        # The full-attention layers each model's own code builds.
+        cases = {
+            "Gemma2ForCausalLM": (Gemma2Config(num_hidden_layers=6), [1, 3, 5]),
+            "Gemma3ForCausalLM": (Gemma3TextConfig(num_hidden_layers=12), [5, 11]),
+            "Cohere2ForCausalLM": (Cohere2Config(num_hidden_layers=8), [3, 7]),
+            "Exaone4ForCausalLM": (exaone4_32b, [3, 7]),
+            olmo3.architectures[0]: (olmo3, [3, 7]),
+        }
+        for architecture, (config, full) in cases.items():
+            with self.subTest(architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                self.assertTrue(is_layer_types_hybrid_swa_model([architecture], config))
+                swa = [i for i in range(config.num_hidden_layers) if i not in full]
+                self.assertEqual(
+                    get_hybrid_layer_ids([architecture], config), (swa, full)
+                )
+
+    def test_layer_types_without_a_sliding_full_mix_are_not_hybrid_swa(self):
+        cases = {
+            "no window": (None, ["sliding_attention", "full_attention"]),
+            "all full": (4096, ["full_attention"] * 2),
+            "all sliding": (4096, ["sliding_attention"] * 2),
+            "other kinds": (4096, ["sliding_attention", "linear_attention"]),
+            "fewer than the layers": (4096, ["sliding_attention"]),
+        }
+        for name, (sliding_window, layer_types) in cases.items():
+            with self.subTest(name):
+                config = SimpleNamespace(
+                    num_hidden_layers=2,
+                    sliding_window=sliding_window,
+                    layer_types=layer_types,
+                )
+                self.assertFalse(is_hybrid_swa_model(["LlamaForCausalLM"], config))
+                self.assertEqual(
+                    get_hybrid_layer_ids(["LlamaForCausalLM"], config), (None, None)
+                )
+
+    def test_listed_architectures_keep_their_own_rule(self):
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            sliding_window=4096,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        self.assertTrue(is_hybrid_swa_model(["Gemma4ForCausalLM"], config))
+        self.assertFalse(is_layer_types_hybrid_swa_model(["Gemma4ForCausalLM"], config))
+        self.assertTrue(is_layer_types_hybrid_swa_model(["Gemma3ForCausalLM"], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
@@ -84,6 +153,34 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
+
+    def test_draft_is_hybrid_swa_only_by_the_listed_rules(self):
+        """FROZEN_KV_MTP gives its draft a single-pool dummy config, so a draft
+        whose layer_types mix sliding and full layers keeps one KV pool."""
+        text_config = SimpleNamespace(
+            num_hidden_layers=4,
+            sliding_window=512,
+            layer_types=["sliding_attention"] * 3 + ["full_attention"],
+        )
+        cases = [
+            # (architecture, is_draft_model, is_hybrid_swa, is_layer_types_hybrid_swa)
+            ("Gemma4AssistantForCausalLM", False, True, True),
+            ("Gemma4AssistantForCausalLM", True, False, False),
+            ("Gemma4ForCausalLM", True, True, False),
+        ]
+        for architecture, is_draft_model, hybrid, layer_types_hybrid in cases:
+            with self.subTest(architecture=architecture, is_draft_model=is_draft_model):
+                config = object.__new__(ModelConfig)
+                config.is_draft_model = is_draft_model
+                config.disable_hybrid_swa_memory = False
+                config.hf_config = SimpleNamespace(architectures=[architecture])
+                config.hf_text_config = text_config
+                with mock.patch.object(
+                    ModelConfig, "_detect_attention_sinks", return_value=False
+                ):
+                    config._derive_hybrid_model()
+                self.assertEqual(config.is_hybrid_swa, hybrid)
+                self.assertEqual(config.is_layer_types_hybrid_swa, layer_types_hybrid)
 
     def test_nemotron_h_omni_mtp_uses_language_model_config(self):
         config = object.__new__(ModelConfig)
@@ -266,6 +363,73 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+
+class TestDefaultContextLength(CustomTestCase):
+    """The default context sizes one window, never the document."""
+
+    @staticmethod
+    def _context(window, page_tokens=8000):
+        return UocrDocumentConfig(
+            uocr_doc_split=True,
+            uocr_doc_page_window=window,
+            uocr_max_page_tokens=page_tokens,
+        ).default_context_length()
+
+    def test_longest_window_keeps_its_full_output_budget(self):
+        """A window whose pages all write MAX_PAGE_TOKENS must not be cut short
+        by the derived context (doc_split caps its completion by the context)."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            self.assertGreaterEqual(capacity, window * 8000, window)
+            self.assertLess(context, 131072, window)
+
+    def test_wide_window_is_capped_at_128k(self):
+        """The cap is what saves memory; a wide window must not raise it."""
+        self.assertEqual(self._context(40), 131072)
+
+    def test_window_ask_fits_the_context_with_its_costliest_pages(self):
+        """Input at the per-page worst case plus the asked max_new_tokens must
+        fit the derived context, or the tokenizer truncates the window."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            ask = min(
+                capacity,
+                doc_split.window_output_cap(own_pages=window, max_page_tokens=8000),
+            )
+            worst_input = (window + 1) * MAX_PAGE_PROMPT_TOKENS + 64
+            self.assertLessEqual(ask + worst_input, context, window)
+            self.assertGreaterEqual(ask, window * 8000, window)
+
+    def test_uncapped_pages_fall_back_to_128k(self):
+        """With no per-page cap a window has no bound; the 128K default applies."""
+        self.assertEqual(self._context(1, page_tokens=0), 131072)
+
+    def test_server_args_size_the_widest_window(self):
+        """The model config sizes the context from the launch flags: the unified
+        page window, default lookahead, and no bound when unsplit."""
+
+        def derived(**fields):
+            args = dict(
+                model_path="dummy",
+                uocr_doc_split=True,
+                uocr_doc_page_window=6,
+                uocr_max_page_tokens=8000,
+            )
+            args.update(fields)
+            server_args = ServerArgs(**args)
+            with mock.patch.object(ModelConfig, "__init__", return_value=None) as init:
+                ModelConfig.from_server_args(server_args)
+            return init.call_args.kwargs["uocr_v2_default_context_len"]
+
+        self.assertEqual(derived(), 7 * MAX_PAGE_PROMPT_TOKENS + 6 * 8000 + 1024)
+        self.assertEqual(derived(uocr_doc_split=False), 131072)
 
 
 if __name__ == "__main__":

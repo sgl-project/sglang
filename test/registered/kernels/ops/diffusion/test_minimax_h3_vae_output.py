@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
@@ -21,6 +23,9 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    attention as h3_attention,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     klvae as h3_klvae,
 )
@@ -319,6 +324,20 @@ def test_minimax_h3_revert_tensor_kernel_is_bit_exact(monkeypatch, ndim, runtime
     assert (fast.data_ptr() == decoded.data_ptr()) is runtime_owned
     assert torch.equal(fast, eager)
     assert fast.min().item() >= 0.0 and fast.max().item() <= 1.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("autocast", [False, True])
+def test_minimax_h3_math_sdpa_matches_aten_math_backend(inference, dtype, autocast):
+    # decoder layout: q/k/v are [B, H, S, D] views of a fused [B, S, H, 3 * D] qkv
+    qkv = torch.randn(2, 197, 8, 3 * 64, device="cuda", dtype=dtype)
+    q, k, v = (t.transpose(1, 2) for t in qkv.chunk(3, dim=-1))
+    with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+        with sdpa_kernel([SDPBackend.MATH]):
+            expected = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        actual = h3_attention._math_sdpa(q, k, v)
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":

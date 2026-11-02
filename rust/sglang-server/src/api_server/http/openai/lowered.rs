@@ -185,7 +185,7 @@ pub(super) async fn chat(
     let timing = RequestTiming::new();
     let request_states: Vec<RequestState> = requests
         .iter()
-        .map(|request| RequestState::new(state, request, timing.clone()))
+        .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
     let calls: Vec<_> = match state.core.generate_batch(requests).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
@@ -866,18 +866,16 @@ mod tests {
             default_chat_template_kwargs: [("thinking".into(), Value::Bool(false))].into(),
             ..Default::default()
         };
-        let app = lowered_state_with(args, |rid| chunk(rid, "Hello!", true));
+        // recipe parses the mock's token id 1, which is `!`.
+        let app = lowered_state_with(args, |rid| chunk(rid, "!", true));
         let body = json!({"model":"model", "messages":[{"role":"user","content":"Hi"}]});
         let value =
             body_json(post_json(app.clone(), "/v1/chat/completions", body.clone()).await).await;
-        assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(value["choices"][0]["message"]["content"], "!");
         assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
         let mut override_body = body;
         override_body["chat_template_kwargs"] = json!({"thinking":true});
         let value = body_json(post_json(app, "/v1/chat/completions", override_body).await).await;
-        assert_eq!(
-            value["choices"][0]["message"]["reasoning_content"],
-            "Hello!"
-        );
+        assert_eq!(value["choices"][0]["message"]["reasoning_content"], "!");
     }
 }
