@@ -15,8 +15,11 @@ pub enum EncodeBackend {
     Fast,
     /// `fast` was requested but fastokens could not load the tokenizer.
     FastFallbackHf,
-    /// A tiktoken `.model` tokenizer, which has no fast backend.
+    /// A tiktoken `.model` tokenizer encoded with tiktoken-rs.
     Tiktoken,
+    /// A tiktoken `.model` tokenizer encoded with fastokens; inputs holding U+017F after
+    /// an apostrophe encode on tiktoken-rs, where fastokens diverges from the engine.
+    FastTiktoken,
 }
 
 impl EncodeBackend {
@@ -26,6 +29,7 @@ impl EncodeBackend {
             Self::Fast => "fast",
             Self::FastFallbackHf => "fast_fallback_hf",
             Self::Tiktoken => "tiktoken",
+            Self::FastTiktoken => "fast_tiktoken",
         }
     }
 }
