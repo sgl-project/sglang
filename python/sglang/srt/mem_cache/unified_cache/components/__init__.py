@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     get_and_increase_time_counter,
     next_component_uuid,
     slot_width,
+    windows_stand_alone,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -39,5 +40,6 @@ __all__ = [
     "TreeComponent",
     "next_component_uuid",
     "slot_width",
+    "windows_stand_alone",
     "get_and_increase_time_counter",
 ]
