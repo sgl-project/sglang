@@ -8,6 +8,7 @@
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
+pub(super) use crate::proxy::grpc::BootstrapFields;
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -127,50 +128,6 @@ impl PreparedRequest {
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        Self::openai_inner(
-            ctx,
-            path,
-            model,
-            fields,
-            headers,
-            body,
-            policy_needs_request_tokens,
-            true,
-        )
-    }
-
-    pub(super) fn openai_grpc(
-        ctx: &AppContext,
-        path: &'static str,
-        model: ModelId,
-        fields: RoutingFields,
-        headers: &HeaderMap,
-        body: Bytes,
-        policy_needs_request_tokens: bool,
-    ) -> Result<Self, ApiError> {
-        Self::openai_inner(
-            ctx,
-            path,
-            model,
-            fields,
-            headers,
-            body,
-            policy_needs_request_tokens,
-            false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn openai_inner(
-        ctx: &AppContext,
-        path: &'static str,
-        model: ModelId,
-        fields: RoutingFields,
-        headers: &HeaderMap,
-        body: Bytes,
-        policy_needs_request_tokens: bool,
-        lower: bool,
-    ) -> Result<Self, ApiError> {
         // The fleet's sampling contract applies to the client's body on both routes.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
@@ -179,17 +136,13 @@ impl PreparedRequest {
             .map(|(field, value)| (field.wire_name(), value.to_string()))
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
-        let lowered = if lower {
-            lower_openai(ctx, path, &model, headers, &with_defaults).and_then(
-                |(generate, responder)| {
-                    let generate =
-                        serde_json::to_value(generate).map_err(|_| "generate_serialization")?;
-                    Ok((generate, responder))
-                },
-            )
-        } else {
-            Err("native_grpc")
-        };
+        let lowered = lower_openai(ctx, path, &model, headers, &with_defaults).and_then(
+            |(generate, responder)| {
+                let generate =
+                    serde_json::to_value(generate).map_err(|_| "generate_serialization")?;
+                Ok((generate, responder))
+            },
+        );
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
         if let Ok((mut generate, responder)) = lowered {
@@ -252,67 +205,6 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             responder: None,
-        })
-    }
-
-    /// OpenAI completions: chat's sampling contract, with prompts counted as
-    /// `/generate` counts them (a prompt list is a batch the engine fans out).
-    /// The body is forwarded as sent.
-    pub(super) fn completion(
-        ctx: &AppContext,
-        model: ModelId,
-        fields: RoutingFields,
-        body: Bytes,
-        policy_needs_request_tokens: bool,
-    ) -> Result<Self, ApiError> {
-        let sampling_defaults =
-            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let value: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
-        let prompts = completion_prompts(&value);
-        let needs_tokens = should_tokenize_request(
-            false,
-            policy_needs_request_tokens,
-            ctx.bucket_selector.is_enabled(),
-        );
-        // Text is tokenized per prompt, as `/generate` does, but only for routing.
-        let text_ids = needs_tokens
-            .then(|| tokenize_text(ctx, &model, &prompts))
-            .flatten();
-        let routed = text_ids.map_or(prompts, |ids| json!({ "input_ids": ids }));
-        let batch = batch_prompt_tokens(&routed);
-        let tokens = (batch.is_none() && has_caller_input_ids(&routed))
-            .then(|| request_tokens_for(&ctx.tokenizers, &model, &routed))
-            .flatten();
-        let lengths = batch
-            .clone()
-            .unwrap_or_else(|| vec![input_token_count(tokens.as_ref(), &body)]);
-        let samples = sample_count(&fields, &sampling_defaults);
-        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
-        let output = fields.requested_max_output_tokens();
-        Ok(Self {
-            path: COMPLETIONS_PATH,
-            model,
-            streaming: fields.stream.unwrap_or(false),
-            output_tokens: output
-                .map(|output| output.saturating_mul(lengths.len() as u64 * samples)),
-            body,
-            tokens,
-            input_token_count: lengths
-                .iter()
-                .sum::<usize>()
-                .max(1)
-                .saturating_mul(samples as usize),
-            sequence_token_count: sequence_tokens,
-            expected_peak_sequence_tokens: output
-                .map(|output| (sequence_tokens as u64).saturating_add(output)),
-            caller_set_rid: fields.caller_set_rid,
-            fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
-            input_ids_forwarding: None,
-            forwarding_booked: false,
-            responder: None,
-            cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
-            parsed_body: Some(value),
-            sampling_defaults,
         })
     }
 
@@ -472,17 +364,25 @@ impl PreparedRequest {
         })
     }
 
-    /// A typed gRPC request, prepared from its fields as `path` prepares its body.
-    /// It has no body: the router's additions travel as fields.
+    /// A single native gRPC prompt; additions travel as typed fields.
     pub(super) fn typed(
         ctx: &AppContext,
-        path: &'static str,
         model: ModelId,
         view: &RoutingView,
     ) -> Result<Self, ApiError> {
         let tokens = match (view.input_ids, view.text) {
-            ([], Some(text)) => ctx.tokenizers.encode_prompt(&model.0, text),
-            (ids, _) => Some(ids.iter().map(|&id| id as u32).collect()),
+            (Some(ids), _) => Some(
+                ids.iter()
+                    .map(|&id| u32::try_from(id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        ApiError::BadRequest(
+                            "input_ids must contain unsigned 32-bit token IDs".into(),
+                        )
+                    })?,
+            ),
+            (None, Some(text)) => ctx.tokenizers.encode_prompt(&model.0, text),
+            _ => None,
         };
         let estimate = || estimate_prefill_tokens(view.text.map_or(0, str::len));
         let input = tokens.as_ref().map_or_else(estimate, Vec::len).max(1);
@@ -491,14 +391,6 @@ impl PreparedRequest {
             rendered_from_chat: false,
         });
         let caller_set_rid = view.rid.is_some();
-        if path != GENERATE_PATH {
-            let request = Self::no_output(path, model, Bytes::new(), &[input]);
-            return Ok(Self {
-                tokens,
-                caller_set_rid,
-                ..request
-            });
-        }
         let fields = RoutingFields::typed(view);
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
@@ -509,7 +401,7 @@ impl PreparedRequest {
             .and_then(|params| params.max_new_tokens);
         let output = output.and_then(|output| u64::try_from(output).ok());
         Ok(Self {
-            path,
+            path: GENERATE_PATH,
             model,
             streaming: view.stream,
             output_tokens: output.map(|output| output.saturating_mul(samples)),
@@ -686,23 +578,6 @@ fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAi
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
-}
-
-/// A text prompt as the ids `path` forwards in its place over HTTP: `/generate`
-/// forwards any text, embeddings and classify only a non-blank prompt.
-pub(super) fn forwarded_prompt_ids(
-    ctx: &AppContext,
-    model: &ModelId,
-    path: &str,
-    text: &str,
-) -> Option<Vec<u32>> {
-    if ctx.config.model.disable_input_ids_forwarding {
-        return None;
-    }
-    if path == GENERATE_PATH {
-        return ctx.tokenizers.encode_prompt(&model.0, text);
-    }
-    tokenize_input_text(ctx, model, &Value::from(text))?.pop()
 }
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
@@ -1190,17 +1065,6 @@ fn sample_count(fields: &RoutingFields, sampling_defaults: &[(SamplingField, Num
     n.filter(|n| *n >= 1.0).map_or(1, |n| n as u64)
 }
 
-/// A completions `prompt` in `/generate`'s shape: text or token ids, one or a batch.
-fn completion_prompts(value: &Value) -> Value {
-    let prompt = &value["prompt"];
-    let first = prompt.as_array().and_then(|items| items.first());
-    if first.is_some_and(|first| first.is_number() || first.is_array()) {
-        json!({ "input_ids": prompt })
-    } else {
-        json!({ "text": prompt })
-    }
-}
-
 /// Keep load accounting available even when tokenization is unavailable.
 fn input_token_count(tokens: Option<&RequestTokens>, body: &Bytes) -> usize {
     tokens
@@ -1222,12 +1086,6 @@ pub(super) fn generate_room_id() -> u64 {
 pub(super) fn generate_room_id_for_rank(rank: u32, dp_ranks: u32) -> u64 {
     let dp_ranks = u64::from(dp_ranks);
     (generate_room_id() >> 1) / dp_ranks * dp_ranks + u64::from(rank)
-}
-
-pub(super) struct BootstrapFields {
-    pub(super) host: String,
-    pub(super) port: Option<u16>,
-    pub(super) room: u64,
 }
 
 /// Append JSON-encoded `fields` before the closing brace, so they win over
@@ -1620,48 +1478,13 @@ mod tests {
     }
 
     #[test]
-    fn completions_count_prompts_as_generate_does() {
-        let ctx = tokenizer_ctx();
-        let ids: Vec<u32> = (0..100).collect();
-        // (prompt, fans out, (input total, longest prompt))
-        for (prompt, fans_out, counts) in [
-            (json!(ids), false, (100, 100)),
-            (json!([[1, 2, 3], [4]]), true, (4, 3)),
-            (json!(["abcdefgh", "abcd"]), true, (3, 2)),
-        ] {
-            let body = json!({"model": "stub-model", "prompt": prompt, "max_tokens": 2});
-            let body = Bytes::from(body.to_string());
-            let fields = parse_routing_fields(&body).unwrap();
-            let model = ModelId("stub-model".into());
-            let r = PreparedRequest::completion(&ctx, model, fields, body, false).unwrap();
-            let got = (r.input_token_count, r.sequence_token_count);
-            assert_eq!((r.fans_out, got), (fans_out, counts), "{prompt}");
-        }
-        // With routing on tokens, text is counted by the tokenizer, batched or not.
-        let text = "hi ".repeat(40);
-        let n = ctx
-            .tokenizers
-            .encode_prompt("stub-model", &text)
-            .unwrap()
-            .len();
-        for prompt in [json!(text), json!([text])] {
-            let body = json!({"model": "stub-model", "prompt": prompt});
-            let body = Bytes::from(body.to_string());
-            let fields = parse_routing_fields(&body).unwrap();
-            let model = ModelId("stub-model".into());
-            let r = PreparedRequest::completion(&ctx, model, fields, body, true).unwrap();
-            assert_eq!(r.sequence_token_count, n, "{prompt}");
-        }
-    }
-
-    #[test]
     fn typed_generate_counts_the_contract_default_n() {
         let mut ctx = AppContext::stub();
         ctx.config.model.sampling_overrides = overrides_of(ConflictPolicy::Allow, r#"{"n": 4}"#);
         let view = RoutingView {
-            input_ids: &[1, 2, 3],
+            input_ids: Some(&[1, 2, 3]),
             text: None,
-            sampling_params: Some(&sglang_api_types::runtime::v1::SamplingParams {
+            sampling_params: Some(&sglang_api_types::api::v1::SamplingParams {
                 max_new_tokens: Some(10),
                 ..Default::default()
             }),
@@ -1669,7 +1492,7 @@ mod tests {
             rid: None,
         };
         let model = ModelId("stub-model".into());
-        let r = PreparedRequest::typed(&ctx, GENERATE_PATH, model, &view).unwrap();
+        let r = PreparedRequest::typed(&ctx, model, &view).unwrap();
         assert_eq!((r.input_token_count, r.output_tokens), (12, Some(40)));
         assert!(r.fans_out);
     }

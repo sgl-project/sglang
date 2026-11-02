@@ -126,7 +126,7 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
-    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// Port for the native gRPC server (`sglang.api.v1.SglangService`, which
     /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
     #[arg(long)]
     pub grpc_port: Option<u16>,
