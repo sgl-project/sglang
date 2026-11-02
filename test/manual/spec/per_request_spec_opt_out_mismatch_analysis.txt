@@ -1,3 +1,7 @@
+Follow-up: see per_request_spec_opt_out_prefix_results.txt for the subsequent
+GPU same-prefix BF16/FP16 diagnosis. The text below is the earlier offline
+checkpoint and its then-unresolved evidence limits.
+
 Offline analysis of the 2026-11-02 H100 run
 =========================================
 

@@ -97,3 +97,11 @@ draft; report partial execution accurately if the deadline prevents completion.
 Validation of these resume artifacts
 bash syntax check and source/API review only. The Linux Rust build, model
 downloads, timeout cleanup and complete GPU harness remain execution-unverified.
+
+Same-prefix follow-up
+--------------------
+See per_request_spec_opt_out_prefix_results.txt for the executed BF16/FP16
+diagnosis, raw-evidence hash, precision controls and reproduction commands.
+When reusing the stopped Pod, update OPT_OUT_EXPECTED_COMMIT in its startup
+command to the intended checked-out head before starting; the saved template
+may still pin 9dbdeaaf. The prepared runner deliberately rejects a stale pin.
