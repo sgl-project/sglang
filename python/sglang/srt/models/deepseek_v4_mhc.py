@@ -534,7 +534,7 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        from sgl_kernel_npu.operators.dsv4 import mhc_post
+        from sgl_kernel_npu.operators.norm import mhc_post
 
         return mhc_post(x, residual, post_mix, comb)
 
