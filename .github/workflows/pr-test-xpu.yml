@@ -173,7 +173,7 @@ jobs:
           # falling back to 0.0.0 on a shallow/tag-less checkout.
           docker exec -w /sglang-checkout ci_sglang_xpu git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache .
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
@@ -280,7 +280,7 @@ jobs:
           # falling back to 0.0.0 on a shallow/tag-less checkout.
           docker exec -w /sglang-checkout ci_sglang_xpu git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache .
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
           docker exec ci_sglang_xpu /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Run diffusion server tests (1-GPU)

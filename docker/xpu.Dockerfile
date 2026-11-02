@@ -99,7 +99,7 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     fi && \
     cp pyproject_xpu.toml pyproject.toml && \
     uv pip install --no-cache ".[dev,diffusion]" && \
-    pip install --no-cache-dir --no-deps xgrammar==0.1.33
+    uv pip install --no-cache --no-deps xgrammar==0.1.33
 
 # Install torch_memory_saver for release/resume_memory_occupation ("memory saver").
 # XPU ships no prebuilt wheel: it is built from source against the local oneAPI +
