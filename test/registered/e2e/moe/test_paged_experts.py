@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=337, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=337, stage="extra-a", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
