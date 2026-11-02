@@ -70,11 +70,50 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+    # 128x128 block-FP8 experts may take the W8A16 small-M path; see
+    # _use_small_m_w8a16 for the per-call conditions.
+    small_m_w8a16: bool = False
 
 
 def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
     # only expert parallelism can route a token to an expert this rank does not hold
     return config.num_experts is None or config.num_experts != config.num_local_experts
+
+
+def _use_small_m_w8a16(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_info: TritonMoeQuantInfo,
+    config: MoeRunnerConfig,
+) -> bool:
+    from sglang.kernels.ops.moe.small_m_block_fp8_moe import (
+        use_small_m_block_fp8_moe,
+    )
+
+    # The small-M kernels implement only a plain SiLU-gated expert with the
+    # router weights applied after the down projection.
+    return (
+        quant_info.small_m_w8a16
+        and quant_info.b13 is None
+        and quant_info.b2 is None
+        and not quant_info.fuse_swiglu_interleaved
+        and config.activation == "silu"
+        and config.is_gated
+        and not config.apply_router_weight_on_input
+        and not config.no_combine
+        and config.gemm1_alpha is None
+        and config.gemm1_clamp_limit is None
+        and config.swiglu_limit is None
+        and not _topk_ids_may_be_nonlocal(config)
+        and use_small_m_block_fp8_moe(
+            hidden_states,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.w13_scale,
+            quant_info.w2_scale,
+            topk_ids,
+        )
+    )
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -223,6 +262,28 @@ def fused_experts_none_to_triton(
                 "Triton MoE runner does not support NVIDIA MXFP8; use "
                 "--moe-runner-backend deep_gemm (or flashinfer_trtllm/cutlass)."
             )
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        if _use_small_m_w8a16(
+            dispatch_output.hidden_states, topk_ids, quant_info, runner_config
+        ):
+            from sglang.kernels.ops.moe.small_m_block_fp8_moe import (
+                small_m_block_fp8_moe,
+            )
+
+            hidden_states = dispatch_output.hidden_states
+            output = small_m_block_fp8_moe(
+                hidden_states,
+                w13=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                w13_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                routed_scaling_factor=runner_config.routed_scaling_factor,
+                out=hidden_states if runner_config.inplace else None,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts,
         )
