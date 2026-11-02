@@ -436,6 +436,8 @@ pub struct TreeCoreInitParamsBinding {
     pub tlru_tail_budget: usize,
     pub tlru_float_config: Option<TlruFloatConfigBinding>,
     pub page_size: usize,
+    /// CP storage width passed by the Python constructor; None keeps ordinary storage.
+    pub cp_size: Option<usize>,
     pub is_write_back: bool,
     pub enable_hicache: bool,
     pub write_through_threshold: i64,
@@ -458,6 +460,7 @@ impl TreeCoreInitParamsBinding {
             tlru_tail_budget: self.tlru_tail_budget,
             tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
             page_size: self.page_size,
+            cp_size: self.cp_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
             write_through_threshold: self.write_through_threshold,
@@ -478,7 +481,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, cp_size = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -496,6 +499,7 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        cp_size: Option<usize>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -503,6 +507,7 @@ impl TreeCoreInitParamsBinding {
             tlru_tail_budget,
             tlru_float_config,
             page_size,
+            cp_size,
             is_write_back,
             enable_hicache,
             write_through_threshold,
@@ -983,6 +988,7 @@ struct TreeCoreBinding<Core> {
     device: Device,
     /// The core's page size, kept outside the Mutex for pre-lock validation.
     page_size: usize,
+    cp_size: Option<usize>,
 }
 
 // Send + Sync lets detach release the GIL around core calls.
@@ -1005,6 +1011,7 @@ macro_rules! tree_core_methods {
                     core: Mutex::new($core::new_with_slots(params, slots)),
                     device,
                     page_size,
+                    cp_size: init_params.cp_size,
                 })
             }
 
@@ -1038,7 +1045,13 @@ macro_rules! tree_core_methods {
                         self.device
                     )));
                 }
-                let aligned_key_len = key_atom_len / self.page_size * self.page_size;
+                let mut aligned_key_len = key_atom_len / self.page_size * self.page_size;
+                if self.cp_size.is_some() {
+                    // CP keys span complete groups of physical pages.
+                    let logical_page_size =
+                        crate::unified_tree_core::from_cp_sharded(self.page_size, self.cp_size);
+                    aligned_key_len = aligned_key_len / logical_page_size * logical_page_size;
+                }
                 let value_len = value.size().first().copied().unwrap_or(0);
                 if value_len < aligned_key_len as i64 {
                     return Err(PyValueError::new_err(format!(

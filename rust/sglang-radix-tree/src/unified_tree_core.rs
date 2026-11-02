@@ -527,6 +527,14 @@ pub struct ComponentState {
     pub(crate) evict_device_request_cnt: usize,
 }
 
+/// Convert a local KV count to global tokens; ordinary counts stay unchanged.
+pub(crate) fn from_cp_sharded(value: usize, cp_size: Option<usize>) -> usize {
+    match cp_size {
+        None => value,
+        Some(size) => value * size,
+    }
+}
+
 /// Tree-construction parameters: the tree-consumed slice of the cache's init params.
 pub struct CacheInitParams {
     /// Eviction-policy name resolved into the tree's strategy.
@@ -538,7 +546,11 @@ pub struct CacheInitParams {
     /// Original arithmetic for floating-point T-LRU parameters, when configured.
     pub tlru_float_config: Option<TlruFloatConfig>,
     /// Atoms per radix page; children are keyed by their key's first page.
+    /// With CP KV sharding, page_size stays physical. Child lookup keys use the
+    /// first cp_size * page_size atoms; node key lengths are multiples of that width.
     pub page_size: usize,
+    /// CP size; None preserves the ordinary cache contract.
+    pub cp_size: Option<usize>,
     /// Whether the cache runs the write-back (vs write-through) policy.
     pub is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
@@ -574,6 +586,7 @@ impl Default for CacheInitParams {
             tlru_tail_budget: 0,
             tlru_float_config: None,
             page_size: 1,
+            cp_size: None,
             is_write_back: false,
             enable_hicache: false,
             write_through_threshold: 256,
@@ -642,7 +655,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Keep path depths and branch high-water marks only for T-LRU.
     pub(crate) tlru_bookkeeping: bool,
     /// Atoms per radix page; children are keyed by their key's first page.
+    /// With CP KV sharding, page_size stays physical. Child lookup keys use the
+    /// first cp_size * page_size atoms; node key lengths are multiples of that width.
     pub(crate) page_size: usize,
+    pub(crate) cp_size: Option<usize>,
     /// Whether the cache runs the write-back (vs write-through) policy.
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
@@ -997,7 +1013,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Self {
         let component_types: Vec<_> = components.iter().map(|c| c.component_type()).collect();
         Self::validate_components_(&component_types, params.page_size);
-        let arena = NodeArena::new(component_types.clone(), params.page_size);
+        let arena = NodeArena::new(
+            component_types.clone(),
+            from_cp_sharded(params.page_size, params.cp_size),
+        );
         let mut tree_core = UnifiedTreeCore {
             arena,
             components: Vec::new(),
@@ -1020,6 +1039,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ),
             tlru_bookkeeping: params.eviction_policy.eq_ignore_ascii_case("tlru"),
             page_size: params.page_size,
+            cp_size: params.cp_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
             is_host_memory_buffer_only: false,
@@ -1373,7 +1393,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         device_validators: &mut [MatchValidator<'_, K>],
     ) -> MatchResult {
         // Bigram view conversion happens at the boundary; the key arrives typed.
-        let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
+        let mut aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
+        if self.cp_size.is_some() {
+            // CP keys span complete groups of physical pages.
+            let logical_page_size = from_cp_sharded(self.page_size, self.cp_size);
+            aligned_key_len = aligned_key_len / logical_page_size * logical_page_size;
+        }
         if aligned_key_len == 0 {
             return self.empty_match_result();
         }
@@ -1548,7 +1573,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
                 node_id,
                 namespace,
-                key.page_at(offset, self.page_size),
+                key.page_at(offset, from_cp_sharded(self.page_size, self.cp_size)),
             ) else {
                 break;
             };
@@ -1557,7 +1582,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if child.evicted() && !child.backuped() {
                 break;
             }
-            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            let prefix_len = key.match_len(
+                offset,
+                &child.key,
+                from_cp_sharded(self.page_size, self.cp_size),
+            );
             full_kv_hit_length += prefix_len;
             if prefix_len < child.key.atom_len() {
                 let (split_node_id, split_action) = self.split_node_(child_id, prefix_len);
@@ -1899,7 +1928,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         params: &InsertParams<'_, K>,
     ) -> InsertWalkStart<K> {
         // Bigram view conversion happens at the boundary; the key arrives typed.
-        let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
+        let mut aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
+        if self.cp_size.is_some() {
+            // CP keys span complete groups of physical pages.
+            let logical_page_size = from_cp_sharded(self.page_size, self.cp_size);
+            aligned_key_len = aligned_key_len / logical_page_size * logical_page_size;
+        }
         if aligned_key_len == 0 {
             // An empty insert still touches the root.
             let root_id = self.arena.root();
@@ -2082,7 +2116,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.child_on_page_in_namespace(
                 state.node_id,
                 state.namespace.as_ref(),
-                state.key.page_at(cursor, self.page_size),
+                state
+                    .key
+                    .page_at(cursor, from_cp_sharded(self.page_size, self.cp_size)),
             )
         } else {
             None
@@ -2094,7 +2130,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut node_id = child_id;
         self.touch_node_(node_id);
         let node = self.arena.node(node_id);
-        let prefix_len = state.key.match_len(cursor, &node.key, self.page_size);
+        let prefix_len = state.key.match_len(
+            cursor,
+            &node.key,
+            from_cp_sharded(self.page_size, self.cp_size),
+        );
         if prefix_len < node.key.atom_len() {
             let (split_node_id, action) = self.split_node_(node_id, prefix_len);
             node_id = split_node_id;
@@ -2401,7 +2441,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         split_len: usize,
     ) -> (NodeIdx_, Option<UpdatePendingBackupOnNodeSplit>) {
         assert!(
-            split_len > 0 && split_len.is_multiple_of(self.page_size),
+            split_len > 0
+                && split_len.is_multiple_of(from_cp_sharded(self.page_size, self.cp_size)),
             "split_node_: split_len {split_len} must be a nonzero page multiple"
         );
         let page_size = self.page_size;
@@ -2415,7 +2456,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child_tlru_history_len = child.tlru_history_len;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
-        let parent_map_key = key_head.child_key(page_size);
+        let parent_map_key = key_head.child_key(from_cp_sharded(page_size, self.cp_size));
         let new_node_id = self.new_node_in_namespace_(
             key_head,
             parent_id,
@@ -2425,7 +2466,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             child_namespace.as_ref(),
         );
         self.arena.node_mut(new_node_id).children.insert(
-            (child_namespace.clone(), key_tail.child_key(page_size)),
+            (
+                child_namespace.clone(),
+                key_tail.child_key(from_cp_sharded(page_size, self.cp_size)),
+            ),
             child_id,
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
@@ -2565,7 +2609,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         session_id: Option<&str>,
     ) -> NodeIdx_ {
         let page_size = self.page_size;
-        let child_map_key = key.child_key(page_size);
+        let child_map_key = key.child_key(from_cp_sharded(page_size, self.cp_size));
         let new_node_id = self.new_node_in_namespace_(
             key, parent_id, priority, /* hit_count = */ 0, /* creation_counter = */ None,
             namespace,
@@ -5241,12 +5285,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     errors.push(format!("[Tree] node {child_id} has an empty key"));
                     continue;
                 }
-                if !child.key.atom_len().is_multiple_of(self.page_size) {
+                if !child
+                    .key
+                    .atom_len()
+                    .is_multiple_of(from_cp_sharded(self.page_size, self.cp_size))
+                {
                     errors.push(format!("[Tree] node {child_id} key is not page-aligned"));
                     continue;
                 }
                 // The edge key must be the child's own namespaced child key.
-                if *edge_key != child.key.child_key(self.page_size) {
+                if *edge_key
+                    != child
+                        .key
+                        .child_key(from_cp_sharded(self.page_size, self.cp_size))
+                {
                     errors.push(format!(
                         "[Tree] child {child_id} not mapped under its own child key"
                     ));

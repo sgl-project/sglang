@@ -69,7 +69,10 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
-from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
+from sglang.srt.layers.cp.utils import (
+    from_cp_sharded,
+    get_cp_sharded_padded_cache_transfer_indices,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -213,6 +216,8 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
             * self.scheduler.kv_shard_widening
         )
+        if is_cp_sharded_padded():
+            self.max_total_num_tokens = from_cp_sharded(self.max_total_num_tokens)
         self.max_input_len = max_bootstrap_input_len(
             capacity=self.max_total_num_tokens,
             page_size=self.scheduler.token_to_kv_pool_allocator.page_size,
