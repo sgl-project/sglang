@@ -7,12 +7,12 @@ from dataclasses import dataclass
 
 import torch
 from einops import rearrange
-from kernel.attn.vmoba_attn.vmoba import (
+
+from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import (
     moba_attn_varlen,
     process_moba_input,
     process_moba_output,
 )
-
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -155,6 +155,7 @@ class VMOBAAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
+        self.softmax_scale = softmax_scale
         self.layer_idx = self._get_layer_idx(prefix)
 
         self.pad_input = pad_input
@@ -241,6 +242,7 @@ class VMOBAAttentionImpl(AttentionImpl):
             select_mode=attn_metadata.moba_select_mode,
             simsum_threshold=attn_metadata.moba_threshold,
             threshold_type=attn_metadata.moba_threshold_type,
+            softmax_scale=self.softmax_scale,
         )
         hidden_states = self.pad_input(
             hidden_states, indices_q, batch_size, sequence_length
