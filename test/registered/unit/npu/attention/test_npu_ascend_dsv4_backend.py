@@ -718,6 +718,76 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertEqual(kwargs, {})
 
 
+class TestDsv4BackendPrewarm(unittest.TestCase):
+    _BACKEND = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+
+    def setUp(self):
+        self.runner = SimpleNamespace(
+            server_args=SimpleNamespace(hicache_storage_backend="npu_memcache"),
+            is_draft_worker=False,
+            model_config=SimpleNamespace(
+                num_attention_heads=64,
+                head_dim=512,
+                index_topk=512,
+                index_n_heads=16,
+                index_head_dim=128,
+                compress_ratios=(4, 128),
+                sliding_window_size=128,
+            ),
+            spec_algorithm=None,
+            decode_num_tokens_per_req=lambda: 1,
+        )
+
+        def init_parent(backend, model_runner, speculative_step_id=0):
+            backend.forward_metadata = None
+            backend.token_to_kv_pool = SimpleNamespace(compress_state_pools=[])
+
+        for patcher in (
+            patch(
+                f"{self._BACKEND}.AscendAttnBackend.__init__",
+                autospec=True,
+                side_effect=init_parent,
+            ),
+            patch(
+                f"{self._BACKEND}.get_parallel",
+                return_value=SimpleNamespace(
+                    attn_tp_size=8, tp_group=SimpleNamespace(device="npu:0")
+                ),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_target_prewarm_runs_once_after_metadata_fields_are_ready(self):
+        def prewarm(backend, device):
+            self.assertTrue(backend._dsv4_has_c4)
+            self.assertTrue(backend._dsv4_has_c128)
+            self.assertEqual(backend._dsv4_q_head_num, 8)
+            self.assertEqual(device, "npu:0")
+
+        with patch(f"{self._BACKEND}.prewarm_dsv4_aicpu", side_effect=prewarm) as op:
+            DeepseekV4AscendAttnBackend(self.runner)
+            DeepseekV4AscendAttnBackend(self.runner)
+        op.assert_called_once()
+
+    def test_other_storage_and_draft_backends_do_not_prewarm(self):
+        for storage, draft in ((None, False), ("file", False), ("npu_memcache", True)):
+            with (
+                self.subTest(storage=storage, draft=draft),
+                patch(f"{self._BACKEND}.prewarm_dsv4_aicpu") as op,
+            ):
+                self.runner.server_args.hicache_storage_backend = storage
+                self.runner.is_draft_worker = draft
+                DeepseekV4AscendAttnBackend(self.runner)
+                op.assert_not_called()
+
+    def test_failed_prewarm_is_not_marked_complete(self):
+        with patch(f"{self._BACKEND}.prewarm_dsv4_aicpu", side_effect=RuntimeError):
+            with self.assertRaises(RuntimeError):
+                DeepseekV4AscendAttnBackend(self.runner)
+        self.assertFalse(getattr(self.runner, "_dsv4_aicpu_prewarmed", False))
+
+
 class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
@@ -729,11 +799,20 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
         ):
             events = []
+            tp_group = SimpleNamespace(device_group=object(), device_module=MagicMock())
+            tp_group.device_module.synchronize.side_effect = lambda: events.append(
+                "hccl_sync"
+            )
             with (
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
                 patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
                 patch("torch.npu", MagicMock(), create=True) as npu,
+                patch("torch.distributed.all_reduce") as all_reduce,
+                patch(
+                    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.get_parallel",
+                    return_value=SimpleNamespace(tp_group=tp_group),
+                ),
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
@@ -757,10 +836,17 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     lambda **kw: events.append("indexer")
                 )
                 npu.synchronize.side_effect = lambda device: events.append("sync")
+                all_reduce.side_effect = lambda *a, **kw: events.append("hccl")
 
                 prewarm_dsv4_aicpu(backend, "cpu")
 
-                self.assertEqual(events, [1, 4, "indexer", 128, "sync"])
+                self.assertEqual(
+                    events, ["hccl", "hccl_sync", 1, 4, "indexer", 128, "sync"]
+                )
+                all_reduce.assert_called_once()
+                self.assertIs(
+                    all_reduce.call_args.kwargs["group"], tp_group.device_group
+                )
                 npu.synchronize.assert_called_once_with("cpu")
                 for call in metadata_op.call_args_list:
                     self.assertEqual(call.kwargs["batch_size"], 1)

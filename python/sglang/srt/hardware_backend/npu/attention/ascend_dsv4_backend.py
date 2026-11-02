@@ -84,8 +84,13 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
 
 
 def prewarm_dsv4_aicpu(attn_backend, device) -> None:
-    # Run after the first HCCL collective and before MemFabric maps Host memory.
+    # Start HCCL, then custom AiCPU, before MemFabric maps Host memory.
     # Otherwise custom AiCPU startup can fail in halMemBindSibling.
+    tp_group = get_parallel().tp_group
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=tp_group.device_group)
+    tp_group.device_module.synchronize()
+
     # A single-token request initializes metadata without accessing KV pages.
     attn_backend._kernel_metadata_from_parts(
         bs=1,
@@ -1014,6 +1019,14 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+
+        if (
+            model_runner.server_args.hicache_storage_backend == "npu_memcache"
+            and not model_runner.is_draft_worker
+            and not getattr(model_runner, "_dsv4_aicpu_prewarmed", False)
+        ):
+            prewarm_dsv4_aicpu(self, get_parallel().tp_group.device)
+            model_runner._dsv4_aicpu_prewarmed = True
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm

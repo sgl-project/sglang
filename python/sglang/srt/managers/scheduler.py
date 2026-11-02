@@ -25,18 +25,7 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Deque,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -566,7 +555,8 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
-        self.init_npu(stage="allocator")
+        # Init ZBAL, switch allocator should before any torch alloc action
+        self.init_zbal_on_npu()
 
         bootstrap.init_parallel_runtime(
             server_args=server_args,
@@ -600,8 +590,6 @@ class Scheduler(
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
-
-        self.init_npu(stage="pre_cache")
 
         # Init cache and memory pool
         self.init_kv_event_lora_names()
@@ -668,7 +656,7 @@ class Scheduler(
                     cache_controller.has_inflight_device_transfers,
                 )
         self.emit_metrics_constants()
-        self.init_npu(stage="post_cache")
+        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -835,14 +823,8 @@ class Scheduler(
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
 
-    def init_npu(
-        self, *, stage: Literal["allocator", "pre_cache", "post_cache"]
-    ) -> None:
-        if not _is_npu:
-            return
-
-        if stage == "allocator":
-            # ZBAL must switch the allocator before any torch allocation.
+    def init_zbal_on_npu(self):
+        if _is_npu:
             from sglang.srt.hardware_backend.npu.utils import init_zbal
 
             if get_parallel().pp_size > 1:
@@ -850,25 +832,6 @@ class Scheduler(
             init_zbal(
                 get_parallel().tp_size, get_device().gpu_id, get_parallel().tp_rank
             )  # only switch allocator if is mix mode
-            return
-
-        if not is_deepseek_v4(self.tp_worker.model_runner.model_config.hf_config):
-            return
-
-        use_npu_memcache = self.server_args.hicache_storage_backend == "npu_memcache"
-        if stage == "pre_cache" and use_npu_memcache:
-            # The attention backend is ready now. HCCL and custom AiCPU must
-            # start in this order, before MemCache maps Host memory.
-            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-                prewarm_dsv4_aicpu,
-            )
-
-            self.maybe_init_hccl_dp_prewarm()
-            prewarm_dsv4_aicpu(
-                self.tp_worker.model_runner.attn_backend, self.tp_group.device
-            )
-        elif stage == "post_cache" and not use_npu_memcache:
-            self.maybe_init_hccl_dp_prewarm()
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
