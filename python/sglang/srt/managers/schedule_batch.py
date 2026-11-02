@@ -2276,6 +2276,12 @@ class Req(ReqDllmMixin):
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
+            # Draft pools share the target's slots but not its tensors: once the
+            # slots are reused, the draft would read another request's KV.
+            draft_cpu_tensors=tuple(
+                pool.get_cpu_copy(token_indices, req_pool_index=self.kv.req_pool_idx)
+                for pool in token_to_kv_pool_allocator.retraction_draft_pools
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -2295,6 +2301,13 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
+        draft_pools = token_to_kv_pool_allocator.retraction_draft_pools
+        draft_backups = self.kv.retraction_backup.draft_cpu_tensors
+        assert len(draft_backups) == len(draft_pools)
+        for pool, backup in zip(draft_pools, draft_backups):
+            pool.load_cpu_copy(
+                backup, token_indices, req_pool_index=self.kv.req_pool_idx
+            )
         self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:

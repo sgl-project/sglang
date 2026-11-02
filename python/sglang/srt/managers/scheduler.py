@@ -1161,6 +1161,10 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
+            if get_disagg().disaggregation_decode_retraction_backup == "cpu_tensor":
+                allocator.register_retraction_draft_pools(
+                    self.draft_worker.retraction_draft_pools()
+                )
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""

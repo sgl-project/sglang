@@ -338,6 +338,32 @@ class BaseSpecWorker(ABC):
     def init_hicache_draft_plan(self) -> None:
         self._hicache_draft_plan = self._build_hicache_draft_plan()
 
+    def retraction_draft_pools(self) -> tuple:
+        """Draft KV pools PD CPU retraction backs up with the target KV.
+
+        Only full-slot MHA pools with tensors of their own qualify: a fused
+        draft already lives in the target pool, MLA pools localize token ids to
+        this DCP rank's rows, and the page-major layout has no CPU copy.
+        """
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            PageMajorMHATokenToKVPool,
+        )
+
+        target_pool = self.target_worker.model_runner.token_to_kv_pool
+        pools = []
+        for runner in self._draft_model_runners():
+            pool = runner.token_to_kv_pool
+            if (
+                not runner.runner_ids.is_fused_draft
+                and pool is not target_pool
+                and pool not in pools
+                and isinstance(pool, MHATokenToKVPool)
+                and not isinstance(pool, PageMajorMHATokenToKVPool)
+            ):
+                pools.append(pool)
+        return tuple(pools)
+
     def _wait_for_fused_hicache_load(self, batch) -> None:
         if (
             self.hicache_draft_plan.mode == HiCacheDraftMode.FUSED
