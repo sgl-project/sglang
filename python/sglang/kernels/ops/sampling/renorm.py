@@ -11,7 +11,7 @@ if is_cuda():
     # this module.
     top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
     top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
-elif is_hip() or is_xpu():
+elif is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )
