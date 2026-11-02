@@ -97,6 +97,7 @@ def test_vdn_h3_sampling_defaults_and_rejections() -> None:
 def _server_args(**overrides) -> SimpleNamespace:
     args = dict(
         model_variant=None,
+        performance_mode="speed",
         attention_backend=None,
         component_attention_backends={},
         attention_backend_config=None,

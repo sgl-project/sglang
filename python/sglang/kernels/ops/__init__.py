@@ -30,7 +30,6 @@ _GROUPS = (
     "memory",
     "mm",
     "moe",
-    "muse_spark",
     "quantization",
     "sampling",
     "speculative",

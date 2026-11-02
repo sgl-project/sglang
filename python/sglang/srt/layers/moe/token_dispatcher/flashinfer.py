@@ -36,7 +36,6 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
-    get_moe_runner_backend,
 )
 from sglang.srt.runtime_context import (
     get_flags,
@@ -162,24 +161,33 @@ class FlashinferDispatcher(BaseDispatcher):
                 "Please install the appropriate version of Flashinfer."
             )
 
+        self.runner_backend = (
+            moe_runner_config.runner_backend if moe_runner_config is not None else None
+        )
         self.ep_size = group.size()
         self.ep_rank = group.rank()
         self.router_topk = router_topk
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         self.invalid_token_expert_id = (
             -1
             if (
-                runner_backend.is_deep_gemm()
-                or runner_backend.is_flashinfer_trtllm()
-                or runner_backend.is_flashinfer_trtllm_routed()
+                runner_backend is not None
+                and (
+                    runner_backend.is_deep_gemm()
+                    or runner_backend.is_flashinfer_trtllm()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
             )
             else self.num_experts
         )
         # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.payload_in_workspace = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_cutlass()
+        )
         self.dispatch_type = get_flashinfer_a2a_dispatch_type()
         if moe_runner_config is None:
             from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -389,15 +397,18 @@ class FlashinferDispatcher(BaseDispatcher):
             )
         # Block-wise FP8 runners quantize before GEMM, so keep dispatch/combine BF16;
         # FP4 retains its packed wire path keyed by input_global_scale.
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         weight_dtype = self.quant_config.get("weight_dtype")
         uses_bf16_fp8_payload = weight_dtype in (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ) and (
-            runner_backend.is_deep_gemm()
-            or runner_backend.is_flashinfer_trtllm()
-            or runner_backend.is_flashinfer_trtllm_routed()
+            runner_backend is not None
+            and (
+                runner_backend.is_deep_gemm()
+                or runner_backend.is_flashinfer_trtllm()
+                or runner_backend.is_flashinfer_trtllm_routed()
+            )
         )
         if uses_bf16_fp8_payload and hidden_states.dtype != torch.bfloat16:
             raise TypeError(
@@ -537,9 +548,9 @@ class FlashinferDispatcher(BaseDispatcher):
                 x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
                 x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
                 # TODO: fuse interleave into cutlass moe
-                if (
-                    dispatch_type == FlashinferA2ADispatchType.NVFP4
-                    and get_moe_runner_backend().is_flashinfer_cutlass()
+                if dispatch_type == FlashinferA2ADispatchType.NVFP4 and (
+                    self.runner_backend is not None
+                    and self.runner_backend.is_flashinfer_cutlass()
                 ):
                     x_sf = nvfp4_block_scale_interleave(x_sf)
             else:
@@ -593,13 +604,16 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         weight_dtype = self.quant_config.get("weight_dtype")
-        runner_backend = get_moe_runner_backend()
+        runner_backend = self.runner_backend
         if (
             weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and (
-                runner_backend.is_deep_gemm()
-                or runner_backend.is_flashinfer_trtllm()
-                or runner_backend.is_flashinfer_trtllm_routed()
+                runner_backend is not None
+                and (
+                    runner_backend.is_deep_gemm()
+                    or runner_backend.is_flashinfer_trtllm()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
             )
             and hidden_states.dtype != torch.bfloat16
         ):

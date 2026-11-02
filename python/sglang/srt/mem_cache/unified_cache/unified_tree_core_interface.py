@@ -23,7 +23,7 @@ class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
     returns, plus `tracker` -- the step's per-component evicted counts for the
-    Controller to accumulate."""
+    Controller to accumulate. Free the values, then drain cache actions."""
 
     device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
@@ -34,12 +34,15 @@ class BaseEvictionResult(msgspec.Struct):
     tracker: dict[ComponentType, int] = msgspec.field(
         default_factory=lambda: defaultdict(int)
     )
+    cache_actions: list[CacheAction | ComponentAction] = msgspec.field(
+        default_factory=list
+    )
 
     def __del__(self) -> None:
-        # Drop tripwire: every returned value must be drained before disposal.
-        assert not self.device_frees and not self.host_frees, (
-            "BaseEvictionResult dropped with undrained values"
-        )
+        # Drop tripwire: every returned resource must be drained before disposal.
+        assert (
+            not self.device_frees and not self.host_frees and not self.cache_actions
+        ), "BaseEvictionResult dropped with undrained resources"
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -116,6 +119,7 @@ class TreePathNodeInfo(msgspec.Struct, frozen=True):
     path_end: int
     # Logical FULL device indices; None when the value is absent.
     full_value_len: Optional[int]
+    num_children: int
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -139,6 +143,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import (
         PoolName,
@@ -157,6 +162,31 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
         UnifiedTreeNode,
+    )
+
+
+# The --radix-eviction-policy value that selects joint Full/SWA eviction.
+JOINT_LRU_EVICTION_POLICY = "joint_lru"
+
+
+def uses_joint_lru(
+    params: CacheInitParams, component_types: Sequence[ComponentType]
+) -> bool:
+    """Whether a tree built from ``params`` with ``component_types`` keeps the
+    joint Full/SWA LRU. The joint_lru policy takes effect only on an enabled
+    Full/SWA tree over the two-ended unified allocator, whose allocation-time
+    eviction walks that order; elsewhere it evicts each component as lru."""
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+    allocator = params.token_to_kv_pool_allocator
+    return (
+        params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
+        and not params.disable
+        and ComponentType.SWA in component_types
+        # The chain of two token ends: an owner and a window, no state slots.
+        and isinstance(allocator, ChainAllocator)
+        and allocator.has_window_pool
+        and allocator.mamba_allocator is None
     )
 
 
@@ -232,6 +262,13 @@ class UnifiedTreeCoreInterface(ABC):
         stays constructible, and its None means "sharding is off" -- never
         "sharding is on but unknown", which the constructor gate rules out.
         """
+        return None
+
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base plus the node's first
+        position-page, i.e. the owner of its first page modulo the shard
+        size; None when sharding is off. Concrete for the same reason as
+        ``rotation_base_of``."""
         return None
 
     @abstractmethod
@@ -335,6 +372,29 @@ class UnifiedTreeCoreInterface(ABC):
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
+    # Joint LRU: whether this core has the joint Full/SWA eviction walk below.
+    # UnifiedRadixCache.__init__ rejects joint_lru on a core without it.
+    supports_joint_eviction: bool = False
+
+    def start_joint_eviction(self) -> None:
+        """Begin a joint Full/SWA eviction walk; SWA victims are component-only.
+        A TreeCore without the joint walk raises."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
+
+    def next_joint_eviction_victim(self) -> Optional[tuple[ComponentType, NodeId]]:
+        """The oldest eligible Full leaf or SWA entry, or None when none is left.
+        An SWA victim is the SWA walk's next node; a Full victim is a device leaf."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
+
+    def end_joint_eviction(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} has no joint Full/SWA eviction walk"
+        )
+
     @abstractmethod
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
@@ -430,6 +490,8 @@ class UnifiedTreeCoreInterface(ABC):
 
         Roots and nodes without device values are no-ops. Missing handles raise
         KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
         """
         ...
 
@@ -545,9 +607,11 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values into the caller's dicts."""
+        tail's root path, collecting freed values and actions into the caller's
+        buffers. The caller frees values, then drains actions, even on error."""
         ...
 
     # ==== HiCache ====
@@ -733,7 +797,7 @@ class UnifiedTreeCoreInterface(ABC):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -745,7 +809,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

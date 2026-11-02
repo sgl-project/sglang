@@ -38,3 +38,6 @@ class AWQIntelAMXMoEScheme(AWQMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
         self.kernel.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return None

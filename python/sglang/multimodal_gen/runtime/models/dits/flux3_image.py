@@ -211,21 +211,6 @@ def pack(
     )
 
 
-def pack_cfg(
-    text: list[tuple[Tensor, Tensor]],
-    condition: tuple[Tensor, Tensor] | None,
-    image: tuple[Tensor, Tensor],
-    channels: dict[str, int],
-) -> Packed:
-    return pack(
-        [
-            {TEXT: text_tokens, "image_cond": condition, "image": image}
-            for text_tokens in text
-        ],
-        channels,
-    )
-
-
 def flux3_dit_layer_names(module: nn.Module) -> list[str]:
     """Layerwise ModuleList paths. Expand each ModuleDict group per key."""
     names = ["single_blocks", "txt_mode_blocks"]

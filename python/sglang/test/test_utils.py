@@ -904,6 +904,52 @@ def terminate_and_kill_process_tree(
     wait_for_gpu_release(pids)
 
 
+def _assert_pd_server_gpus_visible(other_args, env: Optional[dict]) -> None:
+    """Fail before launch when the server's GPUs are not all visible here.
+
+    A runner that has lost a GPU otherwise fails a rank deep in startup with
+    `invalid device ordinal`, which reads like a code bug. Counts only TP x PP
+    on one node, a lower bound on what the server uses, so this never rejects
+    a launch that could have started. Runs only on the H20 CI runners, which
+    are the ones seen losing a GPU.
+    """
+    if not os.environ.get("RUNNER_LABELS", "").endswith("-gpu-h20"):
+        return
+    # A server env that remaps devices sees a different set than this process.
+    if env is not None and any(
+        env.get(var, os.environ.get(var)) != os.environ.get(var)
+        for var in (
+            "CUDA_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+        )
+    ):
+        return
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    parser.add_argument("--tp-size", "--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pp-size", "--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--base-gpu-id", type=int, default=0)
+    parser.add_argument("--gpu-id-step", type=int, default=1)
+    parser.add_argument("--nnodes", type=int, default=1)
+    try:
+        args, _ = parser.parse_known_args([str(x) for x in other_args])
+    except (argparse.ArgumentError, SystemExit, ValueError):
+        return
+    if args.nnodes != 1:
+        return
+    world_size = args.tp_size * args.pp_size
+    needed = args.base_gpu_id + (world_size - 1) * args.gpu_id_step + 1
+    visible = torch.cuda.device_count()
+    if 0 < visible < needed:
+        raise RuntimeError(
+            f"PD server needs GPUs up to index {needed - 1} "
+            f"(base_gpu_id={args.base_gpu_id}, tp_size={args.tp_size}, "
+            f"pp_size={args.pp_size}, gpu_id_step={args.gpu_id_step}) but only "
+            f"{visible} GPUs are visible. The machine is short of GPUs; "
+            f"check the runner's hardware rather than the code under test."
+        )
+
+
 def popen_launch_pd_server(
     model: str,
     base_url: str,
@@ -912,16 +958,16 @@ def popen_launch_pd_server(
     other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    launch_module: str = "sglang.launch_server",
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
-
-    command = "sglang.launch_server"
+    _assert_pd_server_gpus_visible(other_args, env)
 
     command = [
         "python3",
         "-m",
-        command,
+        launch_module,
         "--model-path",
         model,
         *[str(x) for x in other_args],
@@ -2152,12 +2198,24 @@ def _visible_gpu_indices(pynvml) -> List[int]:
 
 def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
     self_pid = os.getpid()
+    reserved_by_uuid = {}
+    if torch.cuda.is_initialized():
+        reserved_by_uuid = {
+            str(torch.cuda.get_device_properties(device).uuid).removeprefix(
+                "GPU-"
+            ): torch.cuda.memory_reserved(device)
+            for device in range(torch.cuda.device_count())
+        }
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
         used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
         if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
             continue
+        # NVML reports host PIDs, which may differ from our container PID
+        self_used = reserved_by_uuid.get(
+            pynvml.nvmlDeviceGetUUID(handle).removeprefix("GPU-"), 0
+        )
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         except pynvml.NVMLError:
@@ -2165,11 +2223,10 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
         if procs is not None:
             # Discount our own usage: the caching allocator retains memory
             # across test classes, and waiting on ourselves never succeeds.
-            self_used = sum(
-                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            self_used = max(
+                self_used,
+                sum(proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid),
             )
-            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
-                continue
             proc_info = ", ".join(
                 f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
                 for proc in procs
@@ -2180,6 +2237,8 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
             )
         else:
             proc_info = ""
+        if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
         reports.append(
             f"GPU {index} uses {_format_gib(used_bytes)}"
             f" ({proc_info or 'no compute processes found'})"
@@ -2385,6 +2444,9 @@ def enter_scope(test_case, scope):
 
 
 class CustomTestCase(unittest.TestCase):
+    # Fault-injection tests must inspect the failure after their server exits.
+    expect_server_exit = False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -2417,13 +2479,29 @@ class CustomTestCase(unittest.TestCase):
         cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
+        if self.expect_server_exit:
+            # Retrying would reuse the server that the test intentionally stopped.
+            return super()._callTestMethod(method)
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
             max_retry = 1 if is_in_ci() else 0
-        retry(
-            lambda: super(CustomTestCase, self)._callTestMethod(method),
-            max_retry=max_retry,
+        # A server that dies mid-method fails every later request; abort the
+        # run rather than let clients back off and the method retry against it.
+        # Teardown kills the server only after this window closes.
+        process = getattr(self, "process", None)
+        stop = (
+            start_subprocess_fail_fast_watcher([("server", process)])
+            if isinstance(process, subprocess.Popen)
+            else None
         )
+        try:
+            retry(
+                lambda: super(CustomTestCase, self)._callTestMethod(method),
+                max_retry=max_retry,
+            )
+        finally:
+            if stop is not None:
+                stop.set()
 
     def setUp(self):
         print(

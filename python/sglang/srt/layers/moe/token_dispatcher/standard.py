@@ -24,11 +24,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_lora, get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -44,6 +43,7 @@ _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
 try:
@@ -102,34 +102,47 @@ def _map_topk_ids_to_local_experts(
     )
 
 
+def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
+    return backend is not None and (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_trtllm()
+        or backend.is_flashinfer_trtllm_routed()
+        or backend.is_hpc_ops()
+        or backend.is_flashinfer_megamoe()
+        or backend.is_flashinfer_mxfp4()
+    )
+
+
 class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_parallel().moe_ep_size
-        backend = get_moe_runner_backend()
-        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
-        self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
-        self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
-        # AITER fast paths can be on while the MoE runner stays Triton; only the
-        # AITER runner keeps global expert IDs, so Triton must remap to local range.
-        self.use_aiter_moe_runner = backend.is_aiter() or (
-            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
+        backend = moe_runner_config.runner_backend
+        self.runner_backend = backend
+        self.enable_flashinfer_cutlass_moe = (
+            backend is not None and backend.is_flashinfer_cutlass()
         )
-        # Skip local expert mapping when the backend handles EP with global expert IDs:
-        # - cutlass / cutedsl / trtllm_routed handle EP internally
-        # - mxfp4 dispatcher mapping is already global
-        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
-        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
-        self.skip_local_expert_mapping = (
-            backend.is_flashinfer_cutlass()
-            or backend.is_flashinfer_cutedsl()
-            or backend.is_flashinfer_trtllm()
-            or backend.is_experimental_sgl_trtllm()
-            or backend.is_flashinfer_trtllm_routed()
-            or backend.is_hpc_ops()
-            or backend.is_flashinfer_megamoe()
-            or self.enable_flashinfer_mxfp4_moe
+        self.enable_flashinfer_mxfp4_moe = (
+            backend is not None and backend.is_flashinfer_mxfp4()
         )
+        self.enable_flashinfer_trtllm_routed_moe = (
+            backend is not None and backend.is_flashinfer_trtllm_routed()
+        )
+        self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
+        self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
+        if (
+            self.moe_ep_size > 1
+            and (
+                _keeps_global_expert_ids(get_moe_runner_backend())
+                != self.skip_local_expert_mapping
+            )
+            and (get_lora().enable_lora or get_lora().lora_paths)
+        ):
+            raise ValueError(
+                "LoRA with expert parallelism requires the layer's MoE runner "
+                "to use the requested runner's expert-ID convention."
+            )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
@@ -144,7 +157,24 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        needs_dp_allgather = should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_fp4_payload = (
+            needs_dp_allgather
+            and self.enable_flashinfer_cutlass_moe
+            and self.quant_config.get("input_global_scale") is not None
+        )
+        if needs_dp_allgather and not use_fp4_payload:
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                topk_output = topk_output.to_standard()
+            topk_weights, topk_ids, hidden_states = get_parallel().tp_group.all_gatherv(
+                [topk_output.topk_weights, topk_output.topk_ids, hidden_states],
+                sizes=get_dp_global_num_tokens(),
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights, topk_ids, topk_output.router_logits
+            )
+            hidden_states_scale = None
+        elif needs_dp_allgather:
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None

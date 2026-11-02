@@ -10,13 +10,18 @@ type-specific decisions (the `ExpertWeightPointer` narrowing, the
 
 import dataclasses
 import unittest
+from array import array
 
 import msgspec
 
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BackupDramReq,
+    BatchEmbeddingOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     ChecksumInfo,
     CheckWeightsReqOutput,
     DumperControlReqInput,
@@ -26,18 +31,22 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
+    RequestOutputStats,
     RpcReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     UpdateWeightFromDiskReqInput,
     VertexGenerateReqInput,
+    flatten_output_ids,
     msgpack_decode,
     msgpack_encode,
+    row_output_ids,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
 )
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
@@ -56,6 +65,14 @@ def _double_hop(obj):
     # MultiTokenizerRouter and the DP controller re-encode already-decoded
     # structs, so a single hop cannot catch re-encode bugs.
     return msgpack_decode(msgpack_encode(msgpack_decode(msgpack_encode(obj))))
+
+
+def _batch_output(cls, **fields):
+    """A cls with every required field empty, then fields."""
+    empty = {f.name: [] for f in msgspec.structs.fields(cls) if f.required}
+    if "output_ids_flat" in empty:
+        empty["output_ids_flat"] = array("q")
+    return cls(**{**empty, **fields})
 
 
 def _contains_dataclass(obj) -> bool:
@@ -185,12 +202,13 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         pointer = decoded.weight_pointer_map["experts.0.gate_proj"]
         self.assertEqual((pointer.weight_ptr, pointer.byte_size), (8, 4))
 
-    def test_check_weights_mirrors_match_pydantic_models(self):
+    def test_check_weights_mirrors_match_pydantic_models(self) -> None:
+        """Wire fields preserve checker metadata and add the merged runner role."""
         # Field-parity guard: the msgspec wire structs must not drift from the
         # pydantic source of truth in weight_checker.
         self.assertEqual(
             {f.name for f in msgspec.structs.fields(ParallelismInfo)},
-            set(PydanticParallelismInfo.model_fields),
+            set(PydanticParallelismInfo.model_fields) | {"role"},
         )
         self.assertEqual(
             {f.name for f in msgspec.structs.fields(ChecksumInfo)},
@@ -289,6 +307,102 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
     def test_abort_req_defaults_to_no_spans(self):
         """The field is optional on the wire, so an abort without spans decodes to None."""
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
+        self.assertIsNone(_round_trip(AbortReq(rid="r0")).prefill_weight_versions)
+
+    def test_abort_req_carries_prefill_spans(self):
+        """Prompt-side spans survive the wire independently of the sampling spans."""
+        obj = AbortReq(
+            rid="r0",
+            prefill_weight_versions=[
+                WeightVersionSpan(version="unknown", start=0, end=2),
+                WeightVersionSpan(version="v1", start=2, end=9),
+            ],
+        )
+
+        decoded = _double_hop(obj)
+
+        self.assertIsNone(decoded.weight_versions)
+        self.assertEqual(
+            decoded.prefill_weight_versions,
+            [
+                WeightVersionSpan(version="unknown", start=0, end=2),
+                WeightVersionSpan(version="v1", start=2, end=9),
+            ],
+        )
+
+
+class TestRequestStatsRoundTrip(CustomTestCase):
+    """Per-row request stats, with their time stats, decode back to typed
+    structs, not plain lists."""
+
+    def test_batch_outputs_carry_request_stats(self):
+        time_stats = SchedulerOutputTimeStats(
+            queue_time=0.5, forward_entry_time=1.7e9, storage_staging_wait=0.0
+        )
+        stats = RequestOutputStats(
+            prompt_tokens=7,
+            cached_tokens=3,
+            cached_tokens_details={"device": 3, "host": 0, "storage_backend": "X"},
+            retraction_count=1,
+            image_tokens=4,
+            audio_tokens=0,
+            video_tokens=0,
+            time_stats=time_stats,
+        )
+        for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
+            # Embedding rows always carry their stats.
+            request_stats = [stats, stats if cls is BatchEmbeddingOutput else None]
+            with self.subTest(type=cls.__name__):
+                obj = _batch_output(cls, rids=["a", "b"])
+                obj.request_stats = request_stats
+
+                decoded = _double_hop(obj)
+
+                self.assertEqual(decoded.request_stats, request_stats)
+                self.assertIsInstance(decoded.request_stats[0], RequestOutputStats)
+                self.assertIsInstance(
+                    decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
+                )
+
+
+class TestDetokenizeRoundTrip(CustomTestCase):
+    def test_header_and_row_routes_round_trip(self):
+        header = DetokenizeHeader(
+            prompt_tail_ids=array("q", [151644, 872, 198]),
+            skip_special_tokens=False,
+            spaces_between_special_tokens=True,
+            no_stop_trim=True,
+            http_worker_ipc="ipc:///tmp/tokenizer-0",
+        )
+        obj = _batch_output(BatchTokenIDOutput, rids=["a", "b"])
+        obj.detokenize_headers = [header, None]
+        obj.http_worker_ipcs = [None, "ipc:///tmp/tokenizer-1"]
+
+        decoded = _double_hop(obj)
+
+        self.assertEqual(decoded.detokenize_headers, [header, None])
+        self.assertIsInstance(decoded.detokenize_headers[0], DetokenizeHeader)
+        self.assertIsInstance(decoded.detokenize_headers[0].prompt_tail_ids, array)
+        self.assertEqual(decoded.http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"])
+
+    def test_output_ids_columns_round_trip(self):
+        rows = [[151644, 872], [], [-101, 2**40]]
+        flat, offsets = flatten_output_ids(rows)
+        for cls in (BatchTokenIDOutput, BatchStrOutput):
+            with self.subTest(type=cls.__name__):
+                obj = _batch_output(
+                    cls,
+                    rids=["a", "b", "c"],
+                    output_ids_flat=flat,
+                    output_ids_offsets=offsets,
+                )
+
+                decoded = _double_hop(obj)
+
+                self.assertIsInstance(decoded.output_ids_flat, array)
+                self.assertEqual(
+                    [list(row_output_ids(decoded, i)) for i in range(3)], rows
+                )
 
 
 if __name__ == "__main__":
