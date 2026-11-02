@@ -299,6 +299,17 @@ class ModelSlimConfig(QuantizationConfig):
             ) from error
         return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
 
+    def init_kv_cache(self, layer, prefix, **weight_attrs):
+        scheme = self.get_modelslim_kv_scheme(prefix)
+        if scheme is None:
+            return
+        layer.scheme = scheme
+        layer.quant_method = ModelSlimKVCacheMethod()
+        layer.quant_method.create_weights(
+            layer, params_dtype=torch.get_default_dtype(), **weight_attrs
+        )
+        return scheme
+
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
