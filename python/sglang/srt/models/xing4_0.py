@@ -83,17 +83,16 @@ class mHCModule(nn.Module):
     float32 into non-persistent buffers after weight loading.
     """
 
-    def __init__(self, config, layer_number: int):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer_number = layer_number
         self.n = config.hc_mult
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.hc_sinkhorn_iters
 
         # mHC kernel hyper-parameters
         self.norm_eps = 1e-6
-        self.pre_eps = getattr(config, "hc_eps", 1e-6)
+        self.pre_eps = config.hc_eps
         self.post_mult_value = 2.0
         # splitk GEMM parallelism. hc_hidden_size = n * hidden_size = 4 * 3584
         # = 14336. 14336 / n_splits_pre must be divisible by hidden_block(256).
@@ -253,7 +252,7 @@ class Xing4_0DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
 
-        if getattr(config, "rope_parameters", None) is not None:
+        if config.rope_parameters is not None:
             rope_theta = config.rope_parameters["rope_theta"]
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
@@ -264,10 +263,10 @@ class Xing4_0DecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
-        v_head_dim = getattr(config, "v_head_dim", 0)
-        kv_lora_rank = getattr(config, "kv_lora_rank", 0)
+        qk_nope_head_dim = config.qk_nope_head_dim
+        qk_rope_head_dim = config.qk_rope_head_dim
+        v_head_dim = config.v_head_dim
+        kv_lora_rank = config.kv_lora_rank
         use_mha = all(dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim))
         self.use_mha = use_mha
 
@@ -280,9 +279,7 @@ class Xing4_0DecoderLayer(nn.Module):
             qk_nope_head_dim=qk_nope_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
+            q_lora_rank=config.q_lora_rank,
             kv_lora_rank=kv_lora_rank,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -294,7 +291,7 @@ class Xing4_0DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        moe_layer_freq = config.moe_layer_freq
         if (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
@@ -316,7 +313,6 @@ class Xing4_0DecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
                 parallel_group="replicated" if is_dense_ffn_fully_dp() else "tp",
                 reduce_results=False,
                 allow_fused_down=False,
@@ -326,14 +322,14 @@ class Xing4_0DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.routed_scaling_factor = config.routed_scaling_factor
 
-        self.n = getattr(config, "hc_mult", 1)
+        self.n = config.hc_mult
         self.enable_mhc = self.n > 1
         mhc = None
         if self.enable_mhc:
-            self.attn_hc = mHCModule(config, config.num_hidden_layers)
-            self.ffn_hc = mHCModule(config, config.num_hidden_layers)
+            self.attn_hc = mHCModule(config)
+            self.ffn_hc = mHCModule(config)
             mhc = MHCState(
                 hc_mult=self.n,
                 hc_attn_pre=self.attn_hc.hc_pre,
@@ -467,7 +463,7 @@ class Xing4_0DecoderLayer(nn.Module):
         instead of a plain residual; ``mhc=None`` for a layer that is not
         built falls back to the class-level MHCState facts."""
         residual = mhc
-        if residual is None and getattr(config, "hc_mult", 1) > 1:
+        if residual is None and config.hc_mult > 1:
             residual = MHCState.facts()
         if residual is None:
             return (
@@ -674,9 +670,7 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when
         # q_lora_rank is not None (matches DeepseekV2ForCausalLM behaviour).
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
+        self.fuse_qkv_a_proj = config.q_lora_rank is not None
         if self.fuse_qkv_a_proj:
             self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
                 "q_a_proj",
@@ -716,11 +710,10 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.logits_processor = LogitsProcessor(config)
 
-        q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(
-            q_lora_rank,
+            config.q_lora_rank,
             self.use_dsa,
-            is_mhc=getattr(config, "hc_mult", 1) > 1,
+            is_mhc=config.hc_mult > 1,
         )
 
     @property

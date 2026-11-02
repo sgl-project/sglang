@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from transformers import PretrainedConfig
 
@@ -48,6 +48,9 @@ class Xing4_0Config(PretrainedConfig):
     rope_theta: int = 10000
     # Interleaved RoPE layout (gptj-style) when True; neo-x style when False.
     rope_interleave: bool = True
+    # Nested rope parameters (HF >= 5.9.0 style); None for flat
+    # rope_theta / rope_scaling configs.
+    rope_parameters: Optional[Dict[str, float]] = None
 
     routed_scaling_factor: float = 2.0
     scoring_func: str = "sigmoid"
