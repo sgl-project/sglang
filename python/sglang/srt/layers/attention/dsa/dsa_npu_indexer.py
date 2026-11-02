@@ -54,7 +54,7 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
 
 
 class DSANPUIndexerMixin:
-    def _forward_npu_sink_local_indexer(
+    def _forward_npu_lsa_indexer(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -63,6 +63,7 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_kv: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.Tensor:
+        """Run the LongCat Sparse Attention (LSA) indexer."""
         if actual_seq_lengths_q.numel() == 0 or query.shape[0] == 0:
             return torch.full(
                 (query.shape[0], self.index_topk),
@@ -71,7 +72,7 @@ class DSANPUIndexerMixin:
                 device=query.device,
             )
 
-        # Unlike torch_npu's indexer, this existing operator takes leading-zero
+        # Unlike torch_npu's indexer, the LSA operator takes leading-zero
         # INT64 cumulative lengths for BOTH Q and KV. KV includes cached tokens.
         q_ends = actual_seq_lengths_q.to(device=query.device, dtype=torch.int64)
         kv_lengths = actual_seq_lengths_kv.to(device=query.device, dtype=torch.int64)
@@ -289,7 +290,7 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
-                "NPU DSA with sink/local tokens does not support quantized indexer KV. "
+                "NPU LSA does not support quantized indexer KV. "
                 "Use --kv-cache-dtype bfloat16; INT8 model weights remain supported."
             )
         if use_quant_indexer:
@@ -348,7 +349,7 @@ class DSANPUIndexerMixin:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if self.num_init_tokens or self.num_local_tokens:
-            return self._forward_npu_sink_local_indexer(
+            return self._forward_npu_lsa_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
                 weights,
