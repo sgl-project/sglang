@@ -29,6 +29,13 @@ def _is_sm100() -> bool:
 
 
 @functools.cache
+def _num_sms() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+@functools.cache
 def index_logits_dtype() -> torch.dtype:
     """bf16 on SM100, where the reference kernels score in bf16; fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS, when set, overrides the choice."""
@@ -70,7 +77,14 @@ def flat_index_logits_rows_per_tile(
     )
     if rows_per_chunk is None:
         return rows
-    return max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
+    rows_per_tile = max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
+    # DeepGEMM strides the row blocks over one CTA per SM; past one wave, round the
+    # tile down to whole waves so no tile ends in a partial wave.
+    if torch.version.cuda is not None:
+        rows_per_wave = row_alignment * _num_sms()
+        if rows_per_tile > rows_per_wave:
+            rows_per_tile = rows_per_tile // rows_per_wave * rows_per_wave
+    return rows_per_tile
 
 
 def flat_index_logits_tiles(

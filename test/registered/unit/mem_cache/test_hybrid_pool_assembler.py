@@ -382,7 +382,12 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800, start_layer=0)
+        draft_kv_pool = SimpleNamespace(
+            layer_num=1,
+            size=800,
+            start_layer=0,
+            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=object()),),
+        )
         draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
@@ -474,12 +479,16 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             seen["mapping"] = config.device_to_host_layer
             return SimpleNamespace(layer_num=1)
 
+        infos = draft_kv_pool.get_device_pool_infos()
         with (
+            patch.object(
+                draft_kv_pool, "get_device_pool_infos", return_value=infos
+            ) as provider,
             patch.object(
                 hybrid_pool_assembler,
                 "_build_mha_mla_host_pool",
                 return_value=draft_host_pool,
-            ),
+            ) as primary_builder,
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
@@ -491,6 +500,17 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 draft_kv_pool=draft_kv_pool,
                 tree_cache=tree_cache,
             )
+            self.assertEqual(provider.call_count, 1)
+            self.assertIs(
+                primary_builder.call_args.kwargs["buffer_info"], infos[0].buffer_info
+            )
+            primary_builder.reset_mock()
+            provider.return_value = (infos[0], infos[0])
+            with self.assertRaisesRegex(ValueError, "duplicate device pool names"):
+                build_full_draft_pools(
+                    draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+                )
+            primary_builder.assert_not_called()
 
         self.assertEqual(seen["mapping"], {0: 0})
         self.assertEqual(specs[1], SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))

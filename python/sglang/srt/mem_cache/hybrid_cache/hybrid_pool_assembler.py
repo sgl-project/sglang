@@ -53,7 +53,11 @@ if TYPE_CHECKING:
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
-    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.device_pool_info import (
+        DevicePoolInfo,
+        MHABufferInfo,
+        MLABufferInfo,
+    )
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -115,8 +119,7 @@ def _dsv4_transfer_layer_mapping(
     return {layer - start_layer: index for index, layer in enumerate(layer_ids)}
 
 
-def _mha_host_inputs(pool, drafts=()):
-    info = pool.get_device_pool_infos()[0].buffer_info
+def _mha_host_inputs(pool, info, drafts=()):
     return (
         get_mha_host_pool_cls(info),
         info,
@@ -154,7 +157,9 @@ def build_kv_host_pool(
         mha_kwargs = {}
     else:
         kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
-            kv_pool, mtp_draft_device_pools
+            kv_pool,
+            kv_pool.get_device_pool_infos()[0].buffer_info,
+            mtp_draft_device_pools,
         )
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
@@ -444,7 +449,9 @@ def _draft_swa_entry(
     # from full attention. Use a separate host pool with KV indices instead of
     # packing their bytes into either target pool.
     first, *rest = drafts
-    host_cls, host_input, host_kwargs = _mha_host_inputs(first, tuple(rest))
+    host_cls, host_input, host_kwargs = _mha_host_inputs(
+        first, first.get_device_pool_infos()[0].buffer_info, tuple(rest)
+    )
     draft_host_pool = host_cls(
         host_input,
         host_to_device_ratio=kv_host_pool.size / first.size,
@@ -1737,6 +1744,7 @@ def _build_pool_entries(
 def _build_mha_mla_host_pool(
     *,
     pool: Any,
+    buffer_info: MHABufferInfo | MLABufferInfo,
     host_to_device_ratio: float,
     page_size: int,
     layout: str,
@@ -1762,10 +1770,10 @@ def _build_mha_mla_host_pool(
         host_token_capacity=host_token_capacity,
     )
     if isinstance(pool, MHAKVView):
-        host_cls, host_input, host_kwargs = _mha_host_inputs(pool)
+        host_cls, host_input, host_kwargs = _mha_host_inputs(pool, buffer_info)
         return host_cls(host_input, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
-        pool.get_device_pool_infos()[0].buffer_info,
+        buffer_info,
         device_capacity_tokens=pool.size
         if pool.host_capacity_tokens is None
         else pool.host_capacity_tokens,
@@ -1800,10 +1808,23 @@ def build_full_draft_pools(
     if pool.layer_num > controller.transfer_layer_id_max:
         raise ValueError("Draft HiCache layers exceed the target transfer stages")
 
+    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
+    if isinstance(pool, DSATokenToKVPool):
+        config = prepare_host_pool_config(
+            root=pool,
+            full_layer_mapping=draft_layer_mapping,
+            transfer_layer_id_max=pool.layer_num,
+            transfer_page_size=controller.page_size,
+        )
+        buffer_info = config.pool_infos[PoolName.KV].buffer_info
+    else:
+        buffer_info = pool.get_device_pool_infos()[0].buffer_info
+
     # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
     # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(
         pool=pool,
+        buffer_info=buffer_info,
         host_to_device_ratio=host_pool_group.logical_size / pool.size,
         page_size=controller.page_size,
         layout=get_memory().hicache_mem_layout,
@@ -1811,7 +1832,6 @@ def build_full_draft_pools(
         pool_label="draft",
         host_token_capacity=host_pool_group.logical_size,
     )
-    draft_layer_mapping = {i: i for i in range(pool.layer_num)}
 
     specs = [
         SidecarPoolSpec(
@@ -1830,12 +1850,6 @@ def build_full_draft_pools(
     ]
 
     if isinstance(pool, DSATokenToKVPool):
-        config = prepare_host_pool_config(
-            root=pool,
-            full_layer_mapping=draft_layer_mapping,
-            transfer_layer_id_max=pool.layer_num,
-            transfer_page_size=controller.page_size,
-        )
         for sidecar in config.sidecars:
             indexer_host_pool = _build_sidecar_host_pool(
                 config=sidecar, root=pool, root_host_pool=draft_host_pool
@@ -1898,18 +1912,21 @@ def build_swa_draft_pools(
             physical_page_size=draft_swa_pool.page_size,
             consumer="DeepSeek-V4 MTP SWA HiCache sidecar",
         )
+        draft_swa_info = draft_swa_pool.paged_buffer_info()
         host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DRAFT_SWA),
-            device_buffers=draft_swa_pool.kv_buffer,
-            item_bytes=draft_swa_pool.bytes_per_page_padded,
+            device_buffers=list(draft_swa_info.buffers),
+            item_bytes=draft_swa_info.page_bytes,
             num_host_pages=target_swa_host_pool.num_host_pages,
             slot_page_size=draft_swa_pool.page_size,
             layout=target_swa_host_pool.layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_region_page_aligned_only(draft_swa_info),
         )
     else:
         host_pool = _build_mha_mla_host_pool(
             pool=draft_swa_pool,
+            buffer_info=draft_swa_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=target_swa_host_pool.size / draft_swa_pool.size,
             page_size=target_swa_host_pool.page_size,
             layout=target_swa_host_pool.layout,
