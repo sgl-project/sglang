@@ -309,12 +309,11 @@ def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
     state_types = getattr(kv_args, "state_types", None)
     if state_types is None:
         return None
-    sub_pools = getattr(kv_args, "state_sub_pools", None) or [None] * len(state_types)
+    keys = getattr(kv_args, "state_wire_keys", None) or [None] * len(state_types)
     tails = getattr(kv_args, "state_window_tails", None) or [None] * len(state_types)
     return [
-        [_wire_state_type(state_type).value, sub_pool]
-        + ([] if tail is None else [tail])
-        for state_type, sub_pool, tail in zip(state_types, sub_pools, tails)
+        [_wire_state_type(state_type).value, key] + ([] if tail is None else [tail])
+        for state_type, key, tail in zip(state_types, keys, tails)
     ]
 
 
@@ -1386,11 +1385,13 @@ def append_state_component(
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
     sub_pool: Optional[str] = None,
+    wire_key: Optional[str] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
     kv_args.state_types.append(state_type)
     kv_args.state_sub_pools.append(sub_pool)
+    kv_args.state_wire_keys.append(wire_key)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
@@ -1615,6 +1616,7 @@ def setup_state_kv_args(
 
     kv_args.state_types = []
     kv_args.state_sub_pools = []
+    kv_args.state_wire_keys = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1644,6 +1646,7 @@ def setup_state_kv_args(
             list(region.slice_outer_counts),
             list(region.layer_ids),
             sub_pool=storage.entry_sub_pool(entry),
+            wire_key=storage.entry_wire_key(entry),
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout

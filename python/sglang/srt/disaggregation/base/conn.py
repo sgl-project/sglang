@@ -78,6 +78,9 @@ class KVArgs:
     # The sub-pool each state entry carries, parallel to state_types: entries
     # of one state type (every window travels as SWA) are told apart by it.
     state_sub_pools: List[Optional[str]]
+    # The key PD peers tell entries of one state type apart by, parallel to
+    # state_types (a sub-pool's declared wire key; None for static pools).
+    state_wire_keys: List[Optional[str]]
     # The tail a window entry carries (its window widened by readers reaching
     # further back), parallel to state_types; None for other entries.
     state_window_tails: List[Optional[int]]

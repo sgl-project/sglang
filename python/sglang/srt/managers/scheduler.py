@@ -2519,12 +2519,12 @@ class Scheduler(
         )
 
     def window_token_capacities(self) -> Dict[str, int]:
-        """Each window pool's sized token capacity, by the window's name; every
-        window is sized to the same token count."""
+        """Each window pool's token capacity, by the window's name, as the
+        storage reports it (the same figure its usage gauges divide by)."""
         if self.swa_tokens_per_layer is None:
             return {}
         return {
-            usage.label: self.swa_tokens_per_layer
+            usage.label: usage.capacity
             for usage in self._observed_storage().usage()
             if usage.metrics == "window"
         }

@@ -281,6 +281,7 @@ class TestStateEntryAgreement(CustomTestCase):
                 kv_args=SimpleNamespace(
                     state_types=["swa"] * len(wire),
                     state_sub_pools=[entry[1] for entry in wire],
+                    state_wire_keys=[entry[1] for entry in wire],
                     state_window_tails=[entry[2] for entry in wire],
                 ),
             )

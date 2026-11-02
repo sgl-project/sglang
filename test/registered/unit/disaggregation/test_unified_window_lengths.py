@@ -229,6 +229,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
             kv_args = SimpleNamespace(
                 state_types=["swa"] * 3,
                 state_sub_pools=list(tails),
+                state_wire_keys=list(tails),
                 state_window_tails=list(tails.values()),
             )
             return state_wire(kv_args)

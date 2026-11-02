@@ -622,6 +622,10 @@ class StaticKVStorage:
         of its pools, not sub-pools."""
         return None
 
+    def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
+        """See `KVStorage.entry_wire_key`: none for a static pool's entries."""
+        return None
+
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
