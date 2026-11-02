@@ -298,14 +298,31 @@ def _get(model: nn.Module, alias: TensorAlias) -> Any:
     return get_at(model, alias.place)
 
 
+def _reregister(module: nn.Module, attr: str, tensor: torch.Tensor) -> None:
+    """Put ``tensor`` under ``module``'s parameter or buffer name ``attr``.
+    The name keeps its kind: a buffer stays a buffer, with its persistence,
+    even when ``tensor`` is a parameter (setattr would make it one)."""
+    if attr in module._buffers and isinstance(tensor, nn.Parameter):
+        # nn.Module's own method: a subclass may override register_buffer
+        # without the ``persistent`` argument (setattr allows for that too).
+        nn.Module.register_buffer(
+            module,
+            attr,
+            tensor,
+            persistent=attr not in module._non_persistent_buffers_set,
+        )
+    else:
+        # Registers a parameter as a parameter and a buffer as a buffer.
+        setattr(module, attr, tensor)
+
+
 def _set(model: nn.Module, alias: TensorAlias, new: torch.Tensor) -> None:
     module = model.get_submodule(alias.owner)
     if alias.registered:
         current = getattr(module, alias.path[0])
         if isinstance(current, nn.Parameter) and not isinstance(new, nn.Parameter):
             new = nn.Parameter(new, requires_grad=current.requires_grad)
-        # Registers a parameter as a parameter and a buffer as a buffer.
-        setattr(module, alias.path[0], new)
+        _reregister(module, alias.path[0], new)
         return
     chain = [vars(module)[alias.path[0]]]
     for item in alias.path[1:-1]:
@@ -387,7 +404,7 @@ def _rebase_ties(
         return 0, [f"{target}: changed between parameter and buffer"]
     for name in stale:
         owner, _, attr = name.rpartition(".")
-        setattr(model.get_submodule(owner), attr, new)
+        _reregister(model.get_submodule(owner), attr, new)
     return len(stale), []
 
 
@@ -463,8 +480,11 @@ def rebase_tensor_aliases(
     """Rebuild every alias in ``aliases`` that still holds what it held when
     recorded while its target has been replaced since.
 
-    Names that shared one tensor are rejoined first, since that can replace
-    the target of a view. An alias the loader left valid (it copied into the
+    Registered names come first, in the order they depend on each other:
+    names that shared one tensor are rejoined, since that can replace the
+    target of a view; registered views are rebuilt; names that shared a
+    registered view now rebuilt are rejoined to it. Plain aliases then follow
+    what the names hold. An alias the loader left valid (it copied into the
     target), or that the model or the loader replaced or rebuilt itself, is
     left alone. Returns the number of aliases rebuilt and a description of
     each stale alias that could not be.
@@ -476,14 +496,34 @@ def rebase_tensor_aliases(
     for alias in aliases:
         if alias.registered and alias.same_object:
             ties.setdefault(alias.target, []).append(alias)
+    settled = set()
     for target, members in ties.items():
         count, tie_problems = _rebase_ties(model, registered, target, members)
         rebuilt += count
         problems += tie_problems
+        if count or tie_problems:
+            settled.add(target)
     if rebuilt:
         registered = registered_tensors(model)
+    views_rebuilt = set()
     for alias in aliases:
-        if alias.registered and alias.same_object:
+        if alias.registered and not alias.same_object:
+            count, problem = _rebase_one(model, registered, alias)
+            rebuilt += count
+            if count:
+                views_rebuilt.add(alias.place.name)
+            if problem is not None:
+                problems.append(problem)
+    if views_rebuilt:
+        registered = registered_tensors(model)
+        for target, members in ties.items():
+            if target in views_rebuilt and target not in settled:
+                count, tie_problems = _rebase_ties(model, registered, target, members)
+                rebuilt += count
+                problems += tie_problems
+        registered = registered_tensors(model)
+    for alias in aliases:
+        if alias.registered:
             continue
         count, problem = _rebase_one(model, registered, alias)
         rebuilt += count

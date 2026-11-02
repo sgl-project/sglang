@@ -253,6 +253,63 @@ class TestRebaseTensorAliases(unittest.TestCase):
         self.assertIn("rows", model._buffers)
         torch.testing.assert_close(model.rows, new.squeeze(1)[:2])
 
+    def test_references_to_a_rebuilt_registered_view_follow_it(self):
+        with torch.device("meta"):
+            model = nn.Module()
+            model.w = nn.Parameter(torch.empty(4), requires_grad=False)
+        model.register_buffer("b", model.w[:2])
+        model.register_buffer("c", model.b)  # the view registered again
+        model.cache = [model.b]
+        aliases = find_tensor_aliases(model)
+        replace(model, "w", torch.arange(4.0))
+
+        self.assertEqual(rebase_tensor_aliases(model, aliases), (3, []))
+        self.assertIs(model.c, model.b)
+        self.assertIs(model.cache[0], model.b)
+        torch.testing.assert_close(model.b, torch.arange(2.0))
+
+    def test_a_buffer_that_holds_a_parameter_stays_a_buffer(self):
+        class Legacy(nn.Module):
+            def register_buffer(self, name, tensor):  # before ``persistent``
+                super().register_buffer(name, tensor)
+
+        class PositionalOnly(nn.Module):
+            def register_buffer(self, name, tensor, persistent=True, /):
+                super().register_buffer(name, tensor, persistent)
+
+        for make in (nn.Module, Legacy, PositionalOnly):
+            for persistent in (True, False):
+                with self.subTest(module=make.__name__, persistent=persistent):
+                    model = make()
+                    model.w = nn.Parameter(torch.zeros(4), requires_grad=False)
+                    nn.Module.register_buffer(model, "b", model.w, persistent)
+                    aliases = find_tensor_aliases(model)
+                    replace(model, "w", torch.ones(4))
+
+                    self.assertEqual(rebase_tensor_aliases(model, aliases), (1, []))
+                    self.assertEqual(
+                        (list(model._parameters), list(model._buffers)),
+                        (["w"], ["b"]),
+                    )
+                    self.assertEqual(
+                        "b" in model._non_persistent_buffers_set, not persistent
+                    )
+                    self.assertIs(model.b, model.w)
+
+    def test_an_alias_the_loader_repaired_in_place_is_left_alone(self):
+        model = nn.Module()
+        model.w = nn.Parameter(torch.arange(4.0), requires_grad=False)
+        model.cache = model.w[:2]
+        cache = model.cache
+        aliases = find_tensor_aliases(model)
+        replace(model, "w", torch.full((4,), 9.0))
+        with torch.no_grad():
+            cache.set_(model.w.untyped_storage(), 0, (2,), (1,))
+
+        self.assertEqual(rebase_tensor_aliases(model, aliases), (0, []))
+        self.assertIs(model.cache, cache)
+        torch.testing.assert_close(model.cache, torch.full((2,), 9.0))
+
     def test_dict_subclasses_any_keys_deep_containers_and_empty_views(self):
         with torch.device("meta"):
             model = Convolution()
