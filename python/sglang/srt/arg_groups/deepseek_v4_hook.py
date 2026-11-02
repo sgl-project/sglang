@@ -95,7 +95,9 @@ def _engram_config_from_env(cfg) -> EngramConfig:
 
 
 def _resolve_engram_config(server_args: ServerArgs) -> None:
-    """The only producer of the engram_config the Engram layers read."""
+    """Validate --engram-config and declare it. A `lookup` of `auto` stays as is:
+    the layers resolve it at model construction (`resolve_engram_config`), once the
+    parallel layout and the GPUs are known."""
     cfg = resolving_view(server_args)
     raw = cfg.engram_config
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
@@ -447,7 +449,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -455,8 +457,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."

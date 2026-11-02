@@ -1,11 +1,14 @@
-"""AITER attention paths that read an fp8 KV cache with calibrated KV scales.
+"""AITER attention paths that read an fp8 KV cache with calibrated KV scales, and
+that apply the layer's softmax scale.
 
 Each case stores ``K / k_scale`` and ``V / v_scale`` in an fp8 cache, runs one
 ``AiterAttnBackend`` path with the real aiter kernel, and compares the output with
 fp32 attention over the dequantized cache. With unit scales, mixing up q's scale
 with ``k_scale`` or skipping the cache dequantization does not change the result, so
-the scales are kept far from 1. The unified-attention decode is covered by
-``test_aiter_fp8_q_unified_attention.py``.
+the scales are kept far from 1. For the same reason the softmax scale also runs at
+``1 / head_dim`` (Granite's ``attention_multiplier``), far from ``head_dim**-0.5``.
+The SHUFFLE 5D prefill cases check only the softmax scale, with a bf16 cache. The
+unified-attention decode is covered by ``test_aiter_fp8_q_unified_attention.py``.
 """
 
 import itertools
@@ -16,6 +19,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -24,6 +28,9 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
+    from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+        launch_reshape_and_cache_shuffle_5d,
+    )
     from sglang.kernels.ops.quantization.fp8_kernel import (
         fp8_dtype,
         scaled_fp8_quant,
@@ -38,12 +45,19 @@ _DEVICE = "cuda"
 _NUM_Q_HEADS = 8
 _NUM_KV_HEADS = 2
 _HEAD_DIM = 128
+# The default softmax scale, and Granite's attention_multiplier.
+_SCALINGS = (_HEAD_DIM**-0.5, 1.0 / _HEAD_DIM)
+_BLOCK_SIZE_5D = 16
 
 
 class _FakeKVPool:
     def __init__(self, k_cache, v_cache):
         self.k_cache = k_cache
         self.v_cache = v_cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
 
     def get_kv_buffer(self, _layer_id):
         return self.k_cache, self.v_cache
@@ -53,14 +67,21 @@ def _offsets(lens):
     return [0, *itertools.accumulate(lens)]
 
 
-def _reference_attention(q, k, v, causal):
-    """fp32 attention for one request; q is [Lq, Hq, D], k / v are [Lk, Hkv, D]."""
+def _reference_attention(q, k, v, causal, scaling):
+    """fp32 attention for one request; q is [Lq, Hq, D], k / v are [Lk, Hkv, D].
+
+    With ``causal`` the last query sees every key, so k / v may start with a
+    cached prefix.
+    """
     group = q.shape[1] // k.shape[1]
-    k = k.repeat_interleave(group, dim=1)
-    v = v.repeat_interleave(group, dim=1)
-    scores = torch.einsum("qhd,khd->hqk", q.float(), k) / math.sqrt(q.shape[-1])
+    k = k.float().repeat_interleave(group, dim=1)
+    v = v.float().repeat_interleave(group, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k) * scaling
     if causal:
-        mask = torch.ones(scores.shape[1:], dtype=torch.bool, device=q.device).tril()
+        q_len, k_len = q.shape[0], k.shape[0]
+        mask = torch.ones(q_len, k_len, dtype=torch.bool, device=q.device).tril(
+            k_len - q_len
+        )
         scores = scores.masked_fill(~mask, float("-inf"))
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
@@ -99,7 +120,6 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
         backend.kv_cache_dtype = fp8_dtype
         backend.input_dtype = torch.bfloat16
         backend.page_size = 1
-        backend.scale = _HEAD_DIM**-0.5
         backend.logits_soft_cap = 0.0
         backend.q_scale = torch.ones(1, dtype=torch.float32, device=_DEVICE)
         backend.k_scale = torch.ones(1, dtype=torch.float32, device=_DEVICE)
@@ -107,7 +127,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
         backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
         return backend
 
-    def _make_layer(self, k_scale, v_scale):
+    def _make_layer(self, k_scale, v_scale, scaling=_HEAD_DIM**-0.5):
         return SimpleNamespace(
             layer_id=0,
             tp_q_head_num=_NUM_Q_HEADS,
@@ -119,7 +139,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             k_scale=k_scale,
             v_scale=v_scale,
             sliding_window_size=-1,
-            scaling=_HEAD_DIM**-0.5,
+            scaling=scaling,
             logit_cap=0.0,
             is_cross_attention=False,
         )
@@ -155,22 +175,25 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             kv_indices=torch.arange(offsets[-1], dtype=torch.int32, device=_DEVICE),
         )
 
-        out = backend.forward_decode(
-            q,
-            None,
-            None,
-            self._make_layer(k_scale, v_scale),
-            SimpleNamespace(batch_size=batch),
-            save_kv_cache=False,
-        )
-
-        expected = torch.cat(
-            [
-                _reference_attention(q[b : b + 1], k_deq[s:e], v_deq[s:e], False)
-                for b, (s, e) in enumerate(zip(offsets, offsets[1:]))
-            ]
-        )
-        self._assert_close(out, expected)
+        for scaling in _SCALINGS:
+            with self.subTest(scaling=scaling):
+                out = backend.forward_decode(
+                    q,
+                    None,
+                    None,
+                    self._make_layer(k_scale, v_scale, scaling),
+                    SimpleNamespace(batch_size=batch),
+                    save_kv_cache=False,
+                )
+                expected = torch.cat(
+                    [
+                        _reference_attention(
+                            q[b : b + 1], k_deq[s:e], v_deq[s:e], False, scaling
+                        )
+                        for b, (s, e) in enumerate(zip(offsets, offsets[1:]))
+                    ]
+                )
+                self._assert_close(out, expected)
 
     def test_mha_batch_prefill(self):
         seq_lens = [300, 77, 512]
@@ -211,22 +234,119 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             out_cache_loc=None,
         )
 
-        # Keep gfx950 off the HD128 ASM prefill so the NHD path is exercised on
-        # every architecture.
-        with envs.SGLANG_AITER_ASM_PREFILL_HD128.override(False):
-            out = backend.forward_extend(
-                q_strided,
-                None,
-                None,
-                self._make_layer(k_scale, v_scale),
-                forward_batch,
-                save_kv_cache=False,
-            )
+        for scaling in _SCALINGS:
+            with self.subTest(scaling=scaling):
+                # Keep gfx950 off the HD128 ASM prefill so the NHD path is
+                # exercised on every architecture.
+                with envs.SGLANG_AITER_ASM_PREFILL_HD128.override(False):
+                    out = backend.forward_extend(
+                        q_strided,
+                        None,
+                        None,
+                        self._make_layer(k_scale, v_scale, scaling),
+                        forward_batch,
+                        save_kv_cache=False,
+                    )
+                expected = torch.cat(
+                    [
+                        _reference_attention(
+                            q[s:e], k_deq[s:e], v_deq[s:e], True, scaling
+                        )
+                        for s, e in zip(offsets, offsets[1:])
+                    ]
+                )
+                self._assert_close(out, expected)
+
+    def test_mha_batch_prefill_vectorized_5d(self):
+        # With no cached prefix in the batch the new K / V are read directly;
+        # otherwise every request's K / V are gathered from the SHUFFLE 5D pool.
+        extend_lens = [300, 77, 512]
+        for prefix_lens in ([0, 0, 0], [128, 0, 1000]):
+            with self.subTest(prefix_lens=prefix_lens):
+                self._check_vectorized_5d_prefill(prefix_lens, extend_lens)
+
+    def _check_vectorized_5d_prefill(self, prefix_lens, extend_lens):
+        batch = len(extend_lens)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        qo_offsets, kv_offsets = _offsets(extend_lens), _offsets(seq_lens)
+        num_q, num_kv = qo_offsets[-1], kv_offsets[-1]
+        q = 4 * torch.randn(
+            num_q, _NUM_Q_HEADS, _HEAD_DIM, device=_DEVICE, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            num_kv, _NUM_KV_HEADS, _HEAD_DIM, device=_DEVICE, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+
+        x = 16 // k.element_size()
+        num_blocks = math.ceil(num_kv / _BLOCK_SIZE_5D)
+        k_buffer = torch.zeros(
+            num_blocks,
+            _NUM_KV_HEADS,
+            _HEAD_DIM // x,
+            _BLOCK_SIZE_5D,
+            x,
+            device=_DEVICE,
+            dtype=k.dtype,
+        )
+        v_buffer = torch.zeros(
+            num_blocks,
+            _NUM_KV_HEADS,
+            _BLOCK_SIZE_5D // x,
+            _HEAD_DIM,
+            x,
+            device=_DEVICE,
+            dtype=v.dtype,
+        )
+        slots = torch.randperm(num_blocks * _BLOCK_SIZE_5D, device=_DEVICE)[:num_kv]
+        launch_reshape_and_cache_shuffle_5d(k, v, k_buffer, v_buffer, slots)
+
+        backend = self._make_backend(k_buffer, v_buffer)
+        backend.kv_cache_is_vectorized_5d = True
+        backend.kv_cache_dtype = torch.bfloat16
+        pool = backend.token_to_kv_pool
+        pool.k_buffer, pool.v_buffer = [k_buffer], [v_buffer]
+        pool.store_dtype = pool.dtype = torch.bfloat16
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=torch.tensor(qo_offsets, dtype=torch.int32, device=_DEVICE),
+            kv_indptr=torch.tensor(kv_offsets, dtype=torch.int32, device=_DEVICE),
+            kv_indices=slots.to(torch.int32),
+            swa_page_table=None,
+            paged_kv_view=None,
+            max_q_len=max(extend_lens),
+            max_kv_len=max(seq_lens),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=batch,
+            forward_mode=ForwardMode.EXTEND,
+            attn_attend_prefix_cache=False,
+            extend_prefix_lens_cpu=prefix_lens,
+            seq_lens_sum=num_kv,
+            out_cache_loc=None,
+        )
+        new_tokens = torch.cat(
+            [
+                torch.arange(s + p, e, device=_DEVICE)
+                for s, e, p in zip(kv_offsets, kv_offsets[1:], prefix_lens)
+            ]
+        )
+        layer = self._make_layer(None, None, scaling=1.0 / _HEAD_DIM)
+
+        out = backend.forward_extend(
+            q.view(num_q, -1),
+            k[new_tokens],
+            v[new_tokens],
+            layer,
+            forward_batch,
+            save_kv_cache=False,
+        )
 
         expected = torch.cat(
             [
-                _reference_attention(q[s:e], k_deq[s:e], v_deq[s:e], True)
-                for s, e in zip(offsets, offsets[1:])
+                _reference_attention(q[qs:qe], k[ks:ke], v[ks:ke], True, layer.scaling)
+                for qs, qe, ks, ke in zip(
+                    qo_offsets, qo_offsets[1:], kv_offsets, kv_offsets[1:]
+                )
             ]
         )
         self._assert_close(out, expected)

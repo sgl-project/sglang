@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -31,8 +31,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
@@ -81,6 +85,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
@@ -210,7 +215,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             origin_input_ids=stored + array("q", range(100, 104)),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
         self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
         req.lock = cache.lock(first.last_device_node)
@@ -1047,7 +1052,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
@@ -1174,6 +1181,95 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
+        """A sidecar of a pool staged in several transfers copies and
+        persists every transfer's pages, not only the first one's."""
+        storage_dir = self._make_storage_dir()
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_pool = build_fixture(
+            self.cfg,
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        controller = cache.cache_controller
+        source = controller.mem_pool_host.entry_map[ExtraPoolFullComponent.EXTRA_POOL]
+        sidecar_host = MHATokenToKVPoolHost(
+            buffer_info=source.device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=source.host_pool.size / source.device_pool.size,
+            host_size=0,
+            page_size=self.cfg.page_size,
+            layout=source.host_pool.layout,
+            device_capacity_tokens=source.device_pool.size,
+            start_layer=source.device_pool.start_layer,
+            end_layer=source.device_pool.end_layer,
+        )
+        controller.register_host_pool_entry(
+            PoolEntry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=sidecar_host,
+                device_pool=source.device_pool,
+                layer_mapper=source.layer_mapper,
+            )
+        )
+        cache.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, ExtraPoolFullComponent.EXTRA_POOL)
+        )
+        sidecar_host.kv_buffer.fill_(-1000)
+        tokens = self._make_seq(1, 8)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        # SWA may split the leaf at the window boundary; check a node whose
+        # pool is staged in two transfers.
+        node = next(
+            n
+            for n in self._path_chain(cache, leaf)
+            if len(cache.tree_core.get_hash_values(n)) >= 2
+        )
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.FULL, node, CacheTransferPhase.BACKUP_HOST
+        )
+        self.assertEqual(len(transfers), 2)
+        for segment, transfer in enumerate(transfers):
+            for layer in range(source.device_pool.layer_num):
+                source.device_pool.k_buffer[layer][transfer.device_indices] = (
+                    segment + 7
+                )
+                source.device_pool.v_buffer[layer][transfer.device_indices] = (
+                    segment + 17
+                )
+        torch.cuda.synchronize()
+        self._buffer_backup_and_wait(cache, leaf)
+
+        keys = list(cache.tree_core.get_hash_values(node))
+        indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
+        self.assertIsNotNone(indices)
+        try:
+            source.host_pool.kv_buffer.zero_()
+            sidecar_host.kv_buffer.zero_()
+            reads = [
+                PoolTransfer(name=name, keys=keys, host_indices=indices)
+                for name in (ExtraPoolFullComponent.EXTRA_POOL, PoolName.DRAFT_SWA)
+            ]
+            results = controller.storage_backend.batch_get_v2(reads)
+            self.assertTrue(all(results[ExtraPoolFullComponent.EXTRA_POOL]))
+            self.assertTrue(all(results[PoolName.DRAFT_SWA]))
+            for index in indices[:: self.cfg.page_size].tolist():
+                self.assertTrue(
+                    torch.equal(
+                        source.host_pool.get_data_page(index),
+                        sidecar_host.get_data_page(index),
+                    ),
+                    "Every persisted sidecar page must contain its source's GPU data",
+                )
+        finally:
+            source.host_pool.free(indices)
 
     @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
@@ -1652,7 +1748,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         surfaced_swa_hit = req.swa_host_hit_length

@@ -206,7 +206,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                 custom_mask=None,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
-            runner.kv_index_translator.bind_own_plan(batch)
+            runner.runner_ids.bind_own_plan(batch)
             prefix = [
                 torch.randn(n, HIDDEN, device="cuda", dtype=torch.bfloat16)
                 for n in prefix_lens
@@ -244,7 +244,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             # mask or plan baked in at capture would show up.
             batch, hidden, _ = make_inputs((0, 31))
             backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2 * BLOCK)
-            runner.kv_index_translator.bind_runner_slots(batch)
+            runner.runner_ids.bind_runner_slots(batch)
             backend.init_forward_metadata_out_graph(batch, in_capture=True)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

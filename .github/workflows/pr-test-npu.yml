@@ -866,14 +866,48 @@ jobs:
           name: coverage-outputs-base-a-test-npu
           path: /tmp/base-a-coverage
 
-      - name: Merge base-a coverage into shared run dir
+      - name: Merge base-a coverage and earlier attempts into shared run dir
+        shell: bash
         run: |
+          set -euo pipefail
+
           # Artifact stages {RUN_DIR}/outputs/... — merges 1:1 into the shared layout.
           CACHE_ROOT="/root/.cache/tests/precise-test"
           mkdir -p "${CACHE_ROOT}"
           cp -a /tmp/base-a-coverage/. "${CACHE_ROOT}/"
           echo "Merged base-a coverage into ${CACHE_ROOT}:"
-          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20
+          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20 || true
+
+          # Re-run only re-executes failed jobs; union all attempts of this run
+          # (newest first, current attempt wins) so the report stays complete.
+          RUN_ID="${{ github.run_id }}"
+          CURRENT="${RUN_ID}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match run_tests_with_coverage.sh.
+          COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:-$(date +%Y%m%d)}"
+          COV_DATE_TAG="${COV_DATE_TAG:0:10}"
+          COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          DEST="${CACHE_ROOT}/${CURRENT}/outputs/sglang@${COV_DATE_TAG}"
+          mkdir -p "${DEST}"
+
+          # A single attempt can end up with two date dirs: when the runner
+          # falls back to `date` and the attempt crosses midnight UTC, jobs
+          # started on either side write under different tags. Fold them in,
+          # otherwise everything outside DEST's tag is dropped downstream.
+          for td in "${CACHE_ROOT}/${CURRENT}/outputs/sglang@"*/*; do
+            [ -d "${td}" ] || continue
+            [ -e "${DEST}/${td##*/}" ] || cp -a "${td}" "${DEST}/"
+          done
+
+          find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
+            -name "${RUN_ID}-attempt-*" ! -name "${CURRENT}" -print0 \
+            | sort -zrV \
+            | while IFS= read -r -d '' prev; do
+                for td in "${prev}/outputs/sglang@"*/*; do
+                  [ -d "${td}" ] || continue
+                  [ -e "${DEST}/${td##*/}" ] || cp -a "${td}" "${DEST}/"
+                done
+              done
+          echo "Test dirs in ${DEST}: $(find "${DEST}" -maxdepth 1 -mindepth 1 -type d | wc -l)"
 
       - name: Copy sglang source to covstub
         run: |
@@ -1258,21 +1292,18 @@ jobs:
           ls -lh "${PUBLISH_DIR}" | tail -n +2
 
       - name: Clean up per-run directory
-        # Default success() on purpose: any earlier failure (incl. the OBS
-        # upload) keeps RUN_DIR for manual recovery.
-        # A successful run also sweeps leftovers from earlier failed runs, so
-        # residue does not pile up. Only dirs older than STALE_MINUTES: RUN_DIR
-        # is per-run for a reason, and a bare glob would delete the directory
-        # of a concurrently running job mid-flight.
+        # success() by default: earlier failures keep the run dirs for debugging.
+        # Attempts never overlap and earlier ones are already merged, so drop
+        # all of this run's attempt dirs at once; stale ones from old runs go too.
         shell: bash
         run: |
           set -euo pipefail
           CACHE_ROOT="/root/.cache/tests/precise-test"
-          RUN_DIR="${CACHE_ROOT}/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          RUN_PREFIX="${CACHE_ROOT}/${{ github.run_id }}-attempt-"
           # 8h > the 6h per-job execution limit, so a live run can never match.
           STALE_MINUTES=480
-          rm -rf "${RUN_DIR}"
-          echo "Removed ${RUN_DIR}"
+          rm -rf "${RUN_PREFIX}"*
+          echo "Removed ${RUN_PREFIX}*"
           # -maxdepth 1 keeps the shared coverage/ dir out of reach.
           find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
             -name '*-attempt-*' -mmin +"${STALE_MINUTES}" \
