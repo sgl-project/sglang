@@ -406,19 +406,13 @@ class TokenizerControlMixin:
         return out
 
     async def attach_cache_linker(
-        self: TokenizerManager, obj: AttachCacheLinkerReqInput
+        self: TokenizerManager,
     ) -> AttachCacheLinkerReqOutput:
         self.auto_create_handle_loop()
-        results = await self.attach_cache_linker_communicator(obj)
+        results = await self.attach_cache_linker_communicator(
+            AttachCacheLinkerReqInput()
+        )
         success, message = FanOutCommunicator.merge_results(results)
-        # As with other fan-out admin operations, partial DP success requires
-        # explicit cleanup; update readback only when all schedulers succeeded.
-        if success:
-            self.record_config_updates(
-                "tokenizer.attach_cache_linker",
-                unified_cache_external_linker_backend=obj.backend,
-                unified_cache_external_linker_config=obj.config,
-            )
         return AttachCacheLinkerReqOutput(success=success, message=message)
 
     async def detach_cache_linker(
@@ -429,12 +423,6 @@ class TokenizerControlMixin:
             DetachCacheLinkerReqInput()
         )
         success, message = FanOutCommunicator.merge_results(results)
-        if success:
-            self.record_config_updates(
-                "tokenizer.detach_cache_linker",
-                unified_cache_external_linker_backend=None,
-                unified_cache_external_linker_config=None,
-            )
         return DetachCacheLinkerReqOutput(success=success, message=message)
 
     async def start_profile(

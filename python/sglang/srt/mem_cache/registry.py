@@ -10,6 +10,7 @@ To plug in a custom backend, register it under a string name via
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -223,21 +224,32 @@ def create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif get_memory().enable_unified_cache_external_linker:
+        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
+            create_unified_cache_linker,
             get_startup_linker_config,
         )
 
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+
+        def publish_linker(linker):
+            counter = None if linker is None else linker.layer_done_counter
+            kvcache.register_layer_transfer_counter(counter)
+            if linker is not None and PoolName.MAMBA in linker.pools:
+                kvcache.layer_router.load_parts_layer_wise()
+            ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+
         cache.init_linker_attachment(
-            server_args=server_args,
-            params=params,
-            register_layer_transfer_counter=(
-                ctx.tp_worker.register_hicache_layer_transfer_counter
+            build_linker=functools.partial(
+                create_unified_cache_linker,
+                server_args,
+                params,
+                backend=get_memory().unified_cache_external_linker_backend,
+                config=get_startup_linker_config(),
+                components=set(cache.components),
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
             ),
-            forward_stream=ctx.tp_worker.model_runner.forward_stream,
-        )
-        cache.attach_cache_linker(
-            get_memory().unified_cache_external_linker_backend,
-            get_startup_linker_config(),
+            publish_linker=publish_linker,
         )
     return cache
 

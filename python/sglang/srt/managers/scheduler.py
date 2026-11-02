@@ -320,9 +320,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
-from sglang.srt.mem_cache.unified_cache.linker_attachment import (
-    runtime_change_rejection,
-)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -5933,7 +5930,7 @@ class Scheduler(
                 f"#queue-req={len(self.waiting_queue)} "
                 f"#running-req={len(self.running_batch.reqs)}"
             )
-        return runtime_change_rejection()
+        return None
 
     def attach_cache_linker_wrapped(
         self, recv_req: AttachCacheLinkerReqInput
@@ -5942,18 +5939,11 @@ class Scheduler(
         if rejection is not None:
             return AttachCacheLinkerReqOutput(success=False, message=rejection)
         try:
-            message = self.tree_cache.attach_cache_linker(
-                recv_req.backend, recv_req.config
-            )
+            ok, message = self.tree_cache.attach_cache_linker()
         except Exception as e:
             logger.exception("Attach external linker failed with exception.")
             return AttachCacheLinkerReqOutput(success=False, message=str(e))
-        get_context().override(
-            "scheduler.attach_cache_linker",
-            unified_cache_external_linker_backend=recv_req.backend,
-            unified_cache_external_linker_config=recv_req.config,
-        )
-        return AttachCacheLinkerReqOutput(success=True, message=message)
+        return AttachCacheLinkerReqOutput(success=ok, message=message)
 
     def detach_cache_linker_wrapped(
         self, recv_req: DetachCacheLinkerReqInput
@@ -5963,13 +5953,8 @@ class Scheduler(
             return DetachCacheLinkerReqOutput(success=False, message=rejection)
         # Detach failures are fatal: ranks may now have different linker states.
         # Let run_scheduler_process notify the parent and terminate the workers.
-        message = self.tree_cache.detach_cache_linker()
-        get_context().override(
-            "scheduler.detach_cache_linker",
-            unified_cache_external_linker_backend=None,
-            unified_cache_external_linker_config=None,
-        )
-        return DetachCacheLinkerReqOutput(success=True, message=message)
+        ok, message = self.tree_cache.detach_cache_linker()
+        return DetachCacheLinkerReqOutput(success=ok, message=message)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

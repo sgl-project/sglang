@@ -1982,10 +1982,7 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
 
 
 class AttachCacheLinkerReqInput(BaseReq, kw_only=True):
-    """Attach an external linker using its dedicated configuration schema."""
-
-    backend: str
-    config: Optional[Dict[str, Any]] = None
+    pass
 
 
 class AttachCacheLinkerReqOutput(BaseReq, kw_only=True):

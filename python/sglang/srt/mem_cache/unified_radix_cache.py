@@ -98,7 +98,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
-from sglang.srt.mem_cache.unified_cache.linker_attachment import CacheLinkerAttachment
+from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+    CacheLinkerAttachment,
+    runtime_change_rejection,
+)
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -465,26 +468,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_linker_attachment(
         self,
         *,
-        server_args: ServerArgs,
-        params: CacheInitParams,
-        register_layer_transfer_counter: Callable[[Optional[object]], None],
-        forward_stream: Optional[torch.cuda.Stream] = None,
+        build_linker: Callable[[], UnifiedCacheLinker],
+        publish_linker: Callable[[Optional[UnifiedCacheLinker]], None],
     ) -> None:
         self._linker_attachment = CacheLinkerAttachment(
-            self,
-            server_args=server_args,
-            params=params,
-            register_layer_transfer_counter=register_layer_transfer_counter,
-            forward_stream=forward_stream,
+            self, build_linker=build_linker, publish_linker=publish_linker
         )
+        self._linker_attachment.attach()
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
-
-    def close_cache_linker(self) -> None:
-        self.linker.close()
-        self.linker = None
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -676,7 +670,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
-        self.detach_cache_linker(synchronize=False)
+        if self._linker_attachment is not None:
+            self._linker_attachment.detach(synchronize=False)
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -3598,20 +3593,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
-    def attach_cache_linker(
-        self, linker_backend: str, linker_config: Optional[dict] = None
-    ) -> str:
-        if self._linker_attachment is None:
-            raise RuntimeError(
-                "Launch with --enable-unified-cache-external-linker to attach "
-                "an external linker."
-            )
-        return self._linker_attachment.attach(linker_backend, linker_config)
+    def attach_cache_linker(self) -> tuple[bool, str]:
+        rejection = runtime_change_rejection()
+        if rejection is not None:
+            return False, rejection
+        return True, self._linker_attachment.attach()
 
-    def detach_cache_linker(self, *, synchronize: bool = True) -> str:
-        if self._linker_attachment is None:
-            return "External linker is not enabled."
-        return self._linker_attachment.detach(synchronize=synchronize)
+    def detach_cache_linker(self) -> tuple[bool, str]:
+        rejection = runtime_change_rejection()
+        if rejection is not None:
+            return False, rejection
+        return True, self._linker_attachment.detach()
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""

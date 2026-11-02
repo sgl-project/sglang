@@ -112,27 +112,17 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
 
         response = self._request("DELETE", "/unified-cache/external-linker")
         self.assertEqual(response.status_code, 200, response.text)
-        status = self._request("GET", "/unified-cache/external-linker").json()
-        self.assertIsNone(status["backend"])
-        self.assertIsNone(status["config"])
         self.assertEqual(self._loaded_tokens(stored_ids), 0)
         self._loaded_tokens(detached_ids)
 
-        attach = {
-            "backend": "mooncake",
-            "config": json.loads(EXTRA_CONFIG),
-        }
         response = self._request(
             "PUT",
             "/hicache/storage-backend",
             {"hicache_storage_backend": "mooncake"},
         )
         self.assertEqual(response.status_code, 400, response.text)
-        response = self._request("PUT", "/unified-cache/external-linker", attach)
+        response = self._request("PUT", "/unified-cache/external-linker")
         self.assertEqual(response.status_code, 200, response.text)
-        status = self._request("GET", "/unified-cache/external-linker").json()
-        self.assertEqual(status["backend"], "mooncake")
-        self.assertEqual(status["config"], json.loads(EXTRA_CONFIG))
 
         self._loaded_tokens(detached_ids, flush=False)
         self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)

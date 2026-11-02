@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -651,50 +651,29 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.reset()
         cache.sanity_check()
 
-    def _init_linker_attachment(
-        self, cache, allocator, build_linker, forward_stream=None
-    ):
-        counters = []
-        cache.init_linker_attachment(
-            server_args=SimpleNamespace(),
-            params=SimpleNamespace(token_to_kv_pool_allocator=allocator),
-            register_layer_transfer_counter=counters.append,
-            forward_stream=forward_stream,
-        )
-        patcher = patch.object(
-            linker_attachment, "create_unified_cache_linker", build_linker
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return counters
-
     def test_detach_unlinks_the_tree_and_reattach_offloads_it_again(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
         cache, allocator, req_to_token_pool = build_fixture(cfg)
-        kvcache = allocator.get_kvcache()
         threshold = cache.write_through_threshold
-        forward_stream = object()
         linkers = []
+        published = []
 
-        def build_linker(server_args, params, *, components, **kwargs):
-            self.assertIs(kwargs["forward_stream"], forward_stream)
+        def build_linker():
             linkers.append(_InMemoryUnifiedCacheLinker())
             return linkers[-1]
 
-        counters = self._init_linker_attachment(
-            cache, allocator, build_linker, forward_stream
+        cache.init_linker_attachment(
+            build_linker=build_linker, publish_linker=published.append
         )
         tokens = list(range(1, 9))
-
-        cache.attach_cache_linker("mooncake")
         first = linkers[0]
         self.assertIs(cache.linker.cache_linker, first)
-        self.assertIs(kvcache.layer_transfer_counter, first.layer_done_counter)
-        self.assertEqual(counters, [first.layer_done_counter])
-        self.assertIn("already attached", cache.attach_cache_linker("mooncake"))
-        with self.assertRaisesRegex(RuntimeError, "detach it before"):
-            cache.attach_cache_linker("mori")
+        self.assertEqual(published, [first])
+        ok, message = cache.attach_cache_linker()
+        self.assertTrue(ok)
+        self.assertIn("already attached", message)
+        self.assertEqual(len(linkers), 1)
         node = self._insert(cache, allocator, req_to_token_pool, tokens)
         node = node.last_device_node
         ((first_offload,),) = first.offload_calls
@@ -702,19 +681,19 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.check_hicache_events()
         self.assertTrue(cache.tree_core.is_external_cache_stored(node))
 
-        cache.detach_cache_linker()
+        self.assertEqual(cache.detach_cache_linker()[0], True)
         self.assertIsNone(cache.linker)
         self.assertFalse(cache.tree_core.enable_external_cache_linker)
         self.assertFalse(cache.tree_core.is_external_cache_stored(node))
         self.assertEqual(cache.write_through_threshold, threshold)
-        self.assertIsNone(kvcache.layer_transfer_counter)
-        self.assertIsNone(counters[-1])
+        self.assertIsNone(published[-1])
         tail = self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])
         tail = tail.last_device_node
         cache.check_hicache_events()
 
-        cache.attach_cache_linker("mooncake")
+        self.assertEqual(cache.attach_cache_linker()[0], True)
         second = linkers[1]
+        self.assertIs(published[-1], second)
         self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])
         self.assertEqual(
             [transfer.keys for (transfer,) in second.offload_calls],
@@ -723,16 +702,20 @@ class TestUnifiedCacheLinkerPythonBackend(
         for _ in second.offload_calls:
             second.complete_next_offload(True)
         cache.check_hicache_events()
+        with get_context().override_server_args(enable_linker_mla_dedup=True):
+            self.assertFalse(cache.detach_cache_linker()[0])
+        self.assertIs(cache.linker.cache_linker, second)
         cache.detach_cache_linker()
         cache.sanity_check()
 
     def test_attach_links_no_rank_when_any_rank_fails(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, _ = build_fixture(cfg)
+        cache, _, _ = build_fixture(cfg)
         built = []
+        published = []
 
-        def build_linker(server_args, params, *, components, **kwargs):
+        def build_linker():
             if not built:
                 built.append(None)
                 raise ConnectionError("store unreachable")
@@ -743,23 +726,24 @@ class TestUnifiedCacheLinkerPythonBackend(
         def remote_rank_failed(tensor, op):
             tensor.zero_()
 
-        counters = self._init_linker_attachment(cache, allocator, build_linker)
         with (
             self.assertLogs(linker_attachment.logger, "ERROR"),
             self.assertRaisesRegex(RuntimeError, "store unreachable"),
         ):
-            cache.attach_cache_linker("mooncake")
+            cache.init_linker_attachment(
+                build_linker=build_linker, publish_linker=published.append
+            )
         with (
             patch.object(cache, "_all_reduce_attn_groups", remote_rank_failed),
             self.assertRaisesRegex(RuntimeError, "failed on another rank"),
         ):
-            cache.attach_cache_linker("mooncake")
+            cache.attach_cache_linker()
 
         built[-1].close.assert_called_once_with()
         self.assertIsNone(cache.linker)
         self.assertFalse(cache.tree_core.enable_external_cache_linker)
-        self.assertEqual(counters, [])
-        self.assertIn("not attached", cache.detach_cache_linker())
+        self.assertEqual(published, [])
+        self.assertIn("not attached", cache.detach_cache_linker()[1])
 
     def test_swa_hit_loads_private_tail_and_dedups_on_insert(self):
         self._run_swa_hit(load_landed=True)

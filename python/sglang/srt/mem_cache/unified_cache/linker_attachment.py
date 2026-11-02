@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.unified_cache.linker_factory import (
-    create_unified_cache_linker,
-)
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        UnifiedCacheLinker,
+    )
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
@@ -34,47 +31,23 @@ class CacheLinkerAttachment:
         self,
         cache: UnifiedRadixCache,
         *,
-        server_args: Any,
-        params: CacheInitParams,
-        register_layer_transfer_counter: Callable[[Optional[object]], None],
-        forward_stream: Optional[torch.cuda.Stream] = None,
+        build_linker: Callable[[], UnifiedCacheLinker],
+        publish_linker: Callable[[Optional[UnifiedCacheLinker]], None],
     ):
         self._cache = cache
-        self._server_args = server_args
-        self._params = params
-        self._kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        self._register_layer_transfer_counter = register_layer_transfer_counter
-        self._forward_stream = forward_stream
-        self.linker_backend: Optional[str] = None
-        self.linker_config: Optional[dict[str, Any]] = None
+        self._build_linker = build_linker
+        self._publish_linker = publish_linker
 
-    def attach(
-        self, linker_backend: str, linker_config: Optional[dict[str, Any]] = None
-    ) -> str:
-        if self.linker_backend is not None:
-            if (linker_backend, linker_config) == (
-                self.linker_backend,
-                self.linker_config,
-            ):
-                return f"External linker already attached to {linker_backend!r}."
-            raise RuntimeError(
-                f"External linker is attached to {self.linker_backend!r}; "
-                "detach it before attaching another configuration."
-            )
-
+    def attach(self) -> str:
         cache = self._cache
+        if cache.linker is not None:
+            return "External linker is already attached."
+
         linker, error = None, None
         try:
-            linker = create_unified_cache_linker(
-                self._server_args,
-                self._params,
-                components=set(cache.components),
-                backend=linker_backend,
-                config=linker_config,
-                forward_stream=self._forward_stream,
-            )
+            linker = self._build_linker()
         except Exception as e:
-            logger.exception("Failed to build the %s external linker.", linker_backend)
+            logger.exception("Failed to build the external linker.")
             error = e
         # The linker hooks run collectives, so every rank links or none does.
         linked = torch.tensor([int(error is None)], dtype=torch.int)
@@ -83,7 +56,7 @@ class CacheLinkerAttachment:
             if linker is not None:
                 linker.close()
             raise RuntimeError(
-                f"Failed to attach the {linker_backend!r} external linker: "
+                "Failed to attach the external linker: "
                 f"{error or 'failed on another rank'}"
             ) from error
 
@@ -93,19 +66,11 @@ class CacheLinkerAttachment:
         except BaseException:
             linker.close()
             raise
-        counter = linker.layer_done_counter
-        self._kvcache.register_layer_transfer_counter(counter)
-        if PoolName.MAMBA in linker.pools:
-            self._kvcache.layer_router.load_parts_layer_wise()
-        self._register_layer_transfer_counter(counter)
-        self.linker_backend = linker_backend
-        self.linker_config = deepcopy(linker_config)
+        self._publish_linker(linker)
         logger.info(
-            "Attached the %s external linker; hashed %d existing radix nodes.",
-            linker_backend,
-            filled,
+            "Attached the external linker; hashed %d existing radix nodes.", filled
         )
-        return f"External linker attached to {linker_backend!r}."
+        return "External linker attached."
 
     def detach(self, *, synchronize: bool = True) -> str:
         if not synchronize:
@@ -133,12 +98,11 @@ class CacheLinkerAttachment:
         return message
 
     def _detach_local(self) -> str:
-        if self.linker_backend is None:
+        cache = self._cache
+        if cache.linker is None:
             return "External linker is not attached."
-        self._cache.close_cache_linker()
-        self._kvcache.register_layer_transfer_counter(None)
-        self._register_layer_transfer_counter(None)
-        linker_backend, self.linker_backend = self.linker_backend, None
-        self.linker_config = None
-        logger.info("Detached the %s external linker.", linker_backend)
-        return f"External linker detached from {linker_backend!r}."
+        cache.linker.close()
+        cache.linker = None
+        self._publish_linker(None)
+        logger.info("Detached the external linker.")
+        return "External linker detached."

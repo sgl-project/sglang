@@ -128,7 +128,6 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    AttachCacheLinkerReqInput,
     AttachHiCacheStorageReqInput,
     BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
@@ -1192,11 +1191,11 @@ async def hicache_storage_backend_status():
 
 @app.put("/unified-cache/external-linker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def attach_cache_linker(obj: Annotated[AttachCacheLinkerReqInput, Body()]):
-    """Attach an external linker while all schedulers are idle."""
+async def attach_cache_linker():
+    """Re-attach the launch-time external linker while all schedulers are idle."""
     if not get_serving().admin_api_key:
         return _admin_api_key_missing_response()
-    ret = await _global_state.tokenizer_manager.attach_cache_linker(obj)
+    ret = await _global_state.tokenizer_manager.attach_cache_linker()
     return ORJSONResponse(
         msgspec_to_builtins(ret),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
@@ -1214,21 +1213,6 @@ async def detach_cache_linker():
         msgspec_to_builtins(ret),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
-
-
-@app.get("/unified-cache/external-linker")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def cache_linker_status():
-    """Get the tokenizer-side external linker configuration."""
-    if not get_serving().admin_api_key:
-        return _admin_api_key_missing_response()
-    manager = _global_state.tokenizer_manager
-    if not manager.config_value("enable_unified_cache_external_linker"):
-        return {"backend": None, "config": None}
-    return {
-        "backend": manager.config_value("unified_cache_external_linker_backend"),
-        "config": manager.config_value("unified_cache_external_linker_config"),
-    }
 
 
 # example usage:
