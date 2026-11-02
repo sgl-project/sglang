@@ -156,6 +156,27 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             if cfg.speculative_algorithm is not None
             else None
         )
+        if (
+            cfg.kv_cache_dtype == "nvfp4"
+            and get_platform().is_sm120
+            and speculative_algorithm == "NEXTN"
+            and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+            and not cfg.disable_cuda_graph_padding
+            and "Qwen3_5ForConditionalGeneration"
+            in model_config_of(server_args).hf_config.architectures
+        ):
+            # Padding changes the BF16 in_proj_ba GEMM shape in this hybrid
+            # model. On SM120, the resulting rounding differences can change
+            # greedy output even when the NVFP4 cache is otherwise correct.
+            # Keep the user's capture list: exact matches replay a graph and
+            # missing sizes use the existing eager fallback.
+            raise ValueError(
+                "SM120 Qwen3_5 NEXTN with NVFP4 KV cache requires "
+                "--disable-cuda-graph-padding: padded replay can change model "
+                "outputs. Uncaptured batch sizes fall back to eager; use "
+                "--cuda-graph-bs-decode to select exact capture sizes, or "
+                "--cuda-graph-backend-decode=disabled to disable decode graphs."
+            )
         supported_native_spec_algorithms = {
             "EAGLE",
             "EAGLE3",
