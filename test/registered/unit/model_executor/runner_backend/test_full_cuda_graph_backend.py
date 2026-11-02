@@ -33,7 +33,6 @@ from sglang.srt.model_executor.runner_backend import breakable_cuda_graph_backen
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_utils.pool import GraphPoolPrecarve
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -124,12 +123,16 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
 
-    def test_compiled_shape_finishes_deferred_tuning_before_capture(self):
-        """Both capture backends must finish deferred tuning outside the graph."""
-        for breakable in (False, True):
-            with self.subTest(breakable=breakable):
+    def test_second_warmup_for_compilation_or_precarve(self):
+        for breakable, precarve in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(breakable=breakable, precarve=precarve):
                 runner = _make_runner(enable_profile=False, profiler=None)
-                runner.compile_bs = [4]
+                runner.compile_bs = [] if precarve else [4]
                 backend = _make_backend(runner, breakable=breakable)
                 calls = 0
 
@@ -152,6 +155,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
 
                 runner.device_module.graph.side_effect = capture
                 with (
+                    envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.override(precarve),
                     mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
                     mock.patch.object(bcg, "BreakableCUDAGraph", return_value="GRAPH"),
                     mock.patch.object(
@@ -304,52 +308,6 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
-
-
-class TestPrecarveWarmup(CustomTestCase):
-    def test_precarve_measures_after_persistent_setup(self):
-        for breakable in (False, True):
-            with self.subTest(breakable=breakable):
-                runner = _make_runner(enable_profile=False, profiler=None)
-                backend = _make_backend(runner, breakable=breakable)
-                backend._precarve = GraphPoolPrecarve()
-                persistent = 0
-
-                def forward():
-                    nonlocal persistent
-                    persistent = 256
-                    return torch.ones(4, 2)
-
-                def memory_stats():
-                    return {
-                        "reserved_bytes.all.current": persistent,
-                        "reserved_bytes.all.peak": persistent + 128,
-                    }
-
-                with (
-                    envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.override(True),
-                    mock.patch("torch.cuda.synchronize"),
-                    mock.patch("torch.cuda.empty_cache"),
-                    mock.patch("torch.cuda.reset_peak_memory_stats"),
-                    mock.patch("torch.cuda.memory_stats", side_effect=memory_stats),
-                    mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
-                    mock.patch("torch.empty") as carve,
-                    mock.patch.object(bcg, "BreakableCUDAGraph", return_value="GRAPH"),
-                    mock.patch.object(
-                        bcg,
-                        "BreakableCUDAGraphCapture",
-                        return_value=contextlib.nullcontext(),
-                    ),
-                    mock.patch.object(
-                        bcg.BreakableCudaGraphBackend,
-                        "deduped_cuda_graph",
-                        new_callable=mock.PropertyMock,
-                        return_value=False,
-                    ),
-                ):
-                    backend.capture_one(ShapeKey(size=4), forward)
-                self.assertEqual(backend._precarve.nbytes, 128)
-                carve.assert_called_once_with(128, dtype=torch.uint8, device="cuda")
 
 
 class TestCleanup(CustomTestCase):
