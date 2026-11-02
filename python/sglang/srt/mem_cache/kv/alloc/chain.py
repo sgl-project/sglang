@@ -533,6 +533,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         hi = self._id_bound(self.full_attn_allocator)
         return self._largest_fit("tokens", names, hi) * self.page_size
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self) -> int:
         return self.units_available(self.full_attn_allocator.sub_pool_name)
 

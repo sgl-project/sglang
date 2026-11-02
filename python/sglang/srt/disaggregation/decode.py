@@ -567,9 +567,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _uses_swa_reservation(self) -> bool:
         """Whether the scheduler's window budget prices preallocations: with
         tail preallocation, or when windows share the owner's bytes."""
-        allocator = self.token_to_kv_pool_allocator
-        return self._uses_swa_tail_prealloc() or (
-            allocator.pools_share_memory and bool(allocator.window_pool_names())
+        from sglang.srt.mem_cache.capacity import windows_share_owner_memory
+
+        return self._uses_swa_tail_prealloc() or windows_share_owner_memory(
+            self.token_to_kv_pool_allocator
         )
 
     def _required_admission_tokens(

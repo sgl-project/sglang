@@ -774,17 +774,22 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict so that an allocation of ``demand`` (what it will take, not
         what to evict) can be served.
 
-        Pools sharing their memory reclaim the whole demand at once
-        (`_reclaim`). Pools of their own evict each component's shortfall,
-        and a walk stops once its pool can serve its demand: a FULL leaf
-        cascade can free a window's or a state's entries too.
+        By the pool's reclaim discipline: pools sharing their memory reclaim
+        the whole demand at once (`reclaim_jointly`). Pools of their own evict
+        each component's shortfall (`evict_pool_shortfalls`), and a walk stops
+        once its pool can serve its demand: a FULL leaf cascade can free a
+        window's or a state's entries too.
         """
         if self.disable:
             return EvictResult()
+        return super().evict_for_alloc(demand)
+
+    def reclaim_jointly(self, demand: KVDemand) -> EvictResult:
         allocator = self.token_to_kv_pool_allocator
-        if allocator.pools_share_memory:
-            demand = demand.completed(allocator.window_pool_names())
-            return self._reclaim(allocator.page_demands(demand))
+        demand = demand.completed(allocator.window_pool_names())
+        return self._reclaim(allocator.page_demands(demand))
+
+    def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
         demand_by_type = {
             ct: n for ct, n in self._demand_by_type(demand).items() if n > 0
         }
@@ -934,9 +939,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """What the component's own pool can serve now: the read a cache over
         pools of their own sizes a component's shortfall against."""
         if component_type == self.slot_id(TREE_TOKEN):
-            if self.supports_swa():
-                return self.token_to_kv_pool_allocator.full_available_size()
-            return self.token_to_kv_pool_allocator.available_size()
+            return self.token_to_kv_pool_allocator.owner_available_size()
         if component_type in self.window_slots():
             return self.window_available_size(
                 self.window_sub_pool_of_slot(component_type)

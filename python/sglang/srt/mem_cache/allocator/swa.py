@@ -224,6 +224,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             tree_cache.evict_for_alloc(KVDemand.same_tokens(self, num_tokens))
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
 
@@ -796,6 +800,10 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             num_mixed_decode_tokens=num_mixed_decode_tokens,
             all_swa=True,
         )
+
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
 
     def full_available_size(self):
         return self.swa_attn_allocator.available_size()
