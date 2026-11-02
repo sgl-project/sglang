@@ -295,7 +295,11 @@ class RunnerIds:
         """
         if self.is_translating:
             return self._full_v2p_table.numel() * self._capture_page_size
-        return max_token_pool_size + self.page_size
+        capacity = max_token_pool_size + self.page_size
+        if (allocator := self._token_to_kv_pool_allocator) is not None:
+            # Under DCP the allocator numbers slots over every rank's pool.
+            capacity = max(capacity, allocator.size + allocator.page_size)
+        return capacity
 
     # -- the iteration's plan --------------------------------------------------
 

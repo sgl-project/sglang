@@ -62,17 +62,28 @@ class BaseDeviceCache:
 
 class BaseHostCache:
     def __init__(
-        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+        self,
+        num_tokens: int,
+        num_layers: int,
+        topk_size: int,
+        name: str,
+        device: str,
+        dtype: torch.dtype = torch.int32,
     ):
-        alloc = ALLOC_MEMORY_FUNCS[device]
-        self.buffer = alloc(
-            (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-            allocator=HostTensorAllocator(),
-        )
-        self.buffer.zero_()
+        dims = (num_tokens, num_layers, topk_size)
+        if num_layers == 0:
+            # mmap rejects a zero-byte mapping; an empty buffer has nothing to pin.
+            self.buffer = torch.empty(dims, dtype=dtype)
+        else:
+            alloc = ALLOC_MEMORY_FUNCS[device]
+            self.buffer = alloc(
+                dims,
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+                allocator=HostTensorAllocator(),
+            )
+            self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -82,7 +93,7 @@ class BaseHostCache:
     def destroy(self):
         if self.buffer is None:
             return
-        if _is_cuda or _is_hip:
+        if (_is_cuda or _is_hip) and self.num_layers > 0:
             _cuda_host_unregister(self.buffer)
         self.buffer = None
 
@@ -128,16 +139,32 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        allocate_host_cache: bool = True,
+        host_dtype: torch.dtype = torch.int32,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
+        Without a host cache, forwards copy nothing back; callers must check
+        has_host_cache before get_topk.
+        host_dtype may be narrower than the int32 capture when every id fits;
+        forwards cast on the device before the D2H copy, and get_topk returns
+        int32.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(
-            num_tokens, num_layers, topk_size, name=name, device=device
+        self.host_cache = (
+            BaseHostCache(
+                num_tokens,
+                num_layers,
+                topk_size,
+                name=name,
+                device=device,
+                dtype=host_dtype,
+            )
+            if allocate_host_cache
+            else None
         )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
@@ -147,11 +174,16 @@ class BaseTopkCapturer:
             name=name,
         )
 
+    @property
+    def has_host_cache(self) -> bool:
+        return self.host_cache is not None
+
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
 
     def destroy(self):
-        self.host_cache.destroy()
+        if self.has_host_cache:
+            self.host_cache.destroy()
 
     def _get_local_slice(
         self,
@@ -177,15 +209,34 @@ class BaseTopkCapturer:
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ) -> torch.Tensor:
+        cache_pool_idx = self._get_cache_pool_idx(
+            req_pool_idx=req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=req_to_token_pool,
+            start_len=start_len,
+        )
+        return self.host_cache.buffer[cache_pool_idx].to(torch.int32)
+
+    def _get_cache_pool_idx(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+        start_len: int,
+    ) -> torch.Tensor:
+        if not self.has_host_cache:
+            raise RuntimeError(
+                f"{type(self).__name__} keeps no host cache on this rank; "
+                "check has_host_cache before get_topk."
+            )
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
         start_len = min(start_len, seqlen - 1)
-        cache_pool_idx = (
+        return (
             req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
             .cpu()
             .clone()
         )
-        return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(
         self,
@@ -198,6 +249,8 @@ class BaseTopkCapturer:
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
+        if not self.has_host_cache:
+            return None
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )
@@ -209,13 +262,15 @@ class BaseTopkCapturer:
         else:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
+        # Narrow to the host dtype on the device, so the D2H moves fewer bytes.
+        host_dtype = self.host_cache.buffer.dtype
         if no_copy_to_cpu:
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
                 out_cache_loc=out_cache_loc.clone(),
-                topk=slice_gpu.clone(),
+                topk=slice_gpu.to(host_dtype, copy=True),
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
+        self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.to(host_dtype).cpu()
         return None
