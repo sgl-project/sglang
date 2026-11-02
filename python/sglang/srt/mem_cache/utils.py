@@ -66,6 +66,8 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "priority": PriorityStrategy,
     "slru": SLRUStrategy,
     "tlru": TLRUStrategy,
+    # Each component's own order under joint eviction (uses_joint_lru).
+    "joint_lru": LRUStrategy,
 }
 
 

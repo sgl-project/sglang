@@ -329,6 +329,7 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
+        mgr.customized_info_enabled = False
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -349,6 +350,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=None,
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -371,7 +373,12 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
         mgr.kv_args = SimpleNamespace(
-            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0, gpu_id=3
+            engine_rank=0,
+            kv_data_ptrs=[0],
+            num_draft_entries=0,
+            gpu_id=3,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -416,6 +423,61 @@ class TestNixlTransferWorker(CustomTestCase):
                 return_value=device_module,
             ),
         )
+
+    def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
+        context = get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        )
+        context.install()
+        self.addCleanup(context.restore)
+        mgr = self._make_manager(21)
+        mgr.customized_info_enabled = True
+        healthy = self._make_manager(22)
+        mgr.kv_args.aux_data_ptrs = [0] * 8
+        mgr.kv_args.aux_item_lens = [64] * 6 + [4096, 64]
+        for manager, capacity in ((mgr, 2048), (healthy, 4096)):
+            peer = manager.decode_kv_args_table["agent"]
+            peer.dst_aux_ptrs = [0] * 8
+            peer.dst_aux_item_lens = [64] * 6 + [capacity, 64]
+        healthy_req = healthy.transfer_infos[22]["agent"]
+        healthy_req.agent_name = "healthy"
+        mgr.transfer_infos[22] = {"healthy": healthy_req}
+        mgr.request_status[22] = KVPoll.WaitingForInput
+        mgr.decode_kv_args_table["healthy"] = healthy.decode_kv_args_table["agent"]
+        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.agent.check_remote_metadata = MagicMock(return_value=True)
+        mgr.send_kv_status_message = MagicMock()
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.send_aux = MagicMock(return_value="aux_handle")
+        chunks = [self._make_chunk(room, [1], True) for room in (21, 22)]
+        queue = SimpleNamespace(get=MagicMock(side_effect=[*chunks, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(mgr.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", mgr.failure_records[21])
+        self.assertEqual(mgr.request_status[22], KVPoll.Success)
+        self.assertNotIn(22, mgr.failure_records)
+        mgr.send_kvcache.assert_called_once()
+        self.assertEqual(mgr.send_kvcache.call_args.args[0], "healthy")
+        mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[0], "healthy")
+        self.assertEqual(
+            [
+                (
+                    call.kwargs["bootstrap_room"],
+                    call.kwargs["status"],
+                    call.kwargs["failure_reason"],
+                )
+                for call in mgr.send_kv_status_message.call_args_list
+            ],
+            [
+                (21, KVPoll.Failed, mgr.failure_records[21]),
+                (22, KVPoll.Success, None),
+            ],
+        )
+        self.assertEqual(mgr._staging_outstanding.get(21, 0), 0)
 
     def test_given_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
@@ -470,6 +532,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=None,
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -488,6 +551,8 @@ class TestNixlTransferWorker(CustomTestCase):
             kv_data_ptrs=[0x1000],
             page_size=4,
             num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 
@@ -805,6 +870,7 @@ class TestNixlNodeFailure(CustomTestCase):
             "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1"}],
             "10.0.0.1:8998_0_0_1": [{"rank_ip": "10.0.0.1"}],
             "10.0.0.2:8998_0_0_0": [{"rank_ip": "10.0.0.2"}],
+            "10.0.0.1:89981_0_0_0": [{"rank_ip": "10.0.0.1"}],
         }
         mgr.prefill_info_table = {
             "10.0.0.1:8998": object(),
@@ -835,6 +901,7 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool)
         self.assertIn("10.0.0.2:8998_0_0_0", mgr.connection_pool)
+        self.assertIn("10.0.0.1:89981_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998", mgr.prefill_info_table)
         self.assertNotIn("10.0.0.1:8998", mgr.addr_to_rooms_tracker)
         self.assertEqual(mgr.request_status[3], KVPoll.Failed)
@@ -887,6 +954,7 @@ class TestNixlNodeFailure(CustomTestCase):
 class TestNixlStaging(CustomTestCase):
     def _make_manager(self, agent=None):
         mgr = object.__new__(NixlKVManager)
+        mgr.customized_info_enabled = False
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
@@ -899,6 +967,56 @@ class TestNixlStaging(CustomTestCase):
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
+
+    def test_send_aux_uses_destination_row_stride(self):
+        context = get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        )
+        context.install()
+        self.addCleanup(context.restore)
+        for enabled in (False, True):
+            with self.subTest(customized_info=enabled):
+                agent = StagingFakeAgent()
+                mgr = self._make_manager(agent)
+                mgr.customized_info_enabled = enabled
+                src_ptrs = [0x1000 + i * 0x10000 for i in range(8)]
+                dst_ptrs = [0x2000 + i * 0x10000 for i in range(8)]
+                mgr.kv_args.aux_data_ptrs = src_ptrs
+                mgr.kv_args.aux_item_lens = [64] * 8
+                dst_lens = [128] * 6 + [64, 64] if enabled else None
+
+                mgr.send_aux("peer", 2, dst_ptrs, dst_lens, 1)
+
+                self.assertEqual(
+                    agent.get_xfer_descs_calls,
+                    [
+                        ([(ptr + 128, 64, 0) for ptr in src_ptrs], "DRAM"),
+                        (
+                            [
+                                (ptr + (128 if enabled and i < 6 else 64), 64, 0)
+                                for i, ptr in enumerate(dst_ptrs)
+                            ],
+                            "DRAM",
+                        ),
+                    ],
+                )
+
+    def test_send_aux_rejects_metadata_buffer_count_mismatch(self):
+        context = get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        )
+        context.install()
+        self.addCleanup(context.restore)
+        agent = StagingFakeAgent()
+        mgr = self._make_manager(agent)
+        mgr.customized_info_enabled = True
+        mgr.kv_args.aux_data_ptrs = [0x1000] * 8
+        mgr.kv_args.aux_item_lens = [64] * 8
+
+        with self.assertRaisesRegex(ValueError, "metadata buffer layout mismatch"):
+            mgr.send_aux("peer", 0, [0x2000] * 9, [64] * 8, 0)
+
+        self.assertEqual(agent.get_xfer_descs_calls, [])
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
@@ -1133,6 +1251,7 @@ class ReloadFakeAgent:
 class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
+        mgr.customized_info_enabled = False
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False
@@ -1156,6 +1275,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             kv_data_ptrs=[0x1000, 0x2000],
             kv_data_lens=[64, 64],
             kv_item_lens=[16, 16],
+            aux_data_ptrs=[0],
+            aux_item_lens=[16],
         )
         mgr.decode_kv_args_table = {}
         for name in peers:
@@ -1168,6 +1289,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 dst_kv_ptrs=[0x3000, 0x4000],
                 dst_kv_mem_kinds=["VRAM", "VRAM"],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=None,
                 dst_state_data_ptrs=[],
                 gpu_id=0,
                 decode_tp_size=1,

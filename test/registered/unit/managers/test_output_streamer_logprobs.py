@@ -1,15 +1,29 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
+    OutputSink,
     _GenerationStreamAccumulator,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 
 class _FakeReq:
@@ -31,16 +45,18 @@ class _FakeReq:
         self.output_ids_through_stop = []
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
+        self.detokenize_header_sent = False
         self.origin_input_ids = []
+        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
+        self.request_stats_retraction_count = None
         self.time_stats = SimpleNamespace(
             prefill_finished_time=0.0, enable_metrics=False
         )
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -63,15 +79,15 @@ class _FakeReq:
     def finished(self):
         return False
 
+    take_request_stats_due = Req.take_request_stats_due
+    take_detokenize_header_due = Req.take_detokenize_header_due
+
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
-
 
 def _make_accumulator(
-    *, rust_server_mode: bool = False
+    *, output_sink: OutputSink = OutputSink.DETOKENIZER
 ) -> _GenerationStreamAccumulator:
     return _GenerationStreamAccumulator(
         return_logprob=True,
@@ -82,9 +98,8 @@ def _make_accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        get_cached_tokens_details=lambda req: None,
-        rust_server_mode=rust_server_mode,
-        enable_metrics=False,
+        build_request_stats=lambda req: _REQUEST_STATS,
+        output_sink=output_sink,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )
@@ -105,7 +120,7 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
         """The Rust frontend rejects a batch whose cached_tokens column is shorter than rids."""
         req = _FakeReq(is_retracted=False, max_new_tokens=16)
         req.cached_tokens = 7
-        accumulator = _make_accumulator(rust_server_mode=True)
+        accumulator = _make_accumulator(output_sink=OutputSink.RUST)
 
         accumulator.accept(req=req)
 
@@ -147,13 +162,17 @@ class TestOutputStreamerReasoningUsage(unittest.TestCase):
                         req.stream = stream
                         # Streaming usage is cumulative, even after a prior emission.
                         req.send_token_offset = 1 if stream else 0
-                        accumulator = _make_accumulator(rust_server_mode=rust)
+                        accumulator = _make_accumulator(
+                            output_sink=(
+                                OutputSink.RUST if rust else OutputSink.DETOKENIZER
+                            )
+                        )
                         accumulator.accept(req=req)
                         self.assertEqual(accumulator.reasoning_tokens, [expected])
                         self.assertEqual(req.reasoning_tokens, original_count)
                         self.assertEqual(
-                            accumulator.output_ids,
-                            [tokens[1 if stream else 0 : retained]],
+                            accumulator.output_ids_flat,
+                            array("q", tokens[1 if stream else 0 : retained]),
                         )
                         if not rust:
                             self.assertEqual(accumulator.completion_tokens, [retained])
