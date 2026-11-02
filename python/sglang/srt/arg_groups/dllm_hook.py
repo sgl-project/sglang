@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     _dllm_attention_backend,
     _dllm_overlap_disable,
     _dllm_page_size,
+    attention_backends_of,
     declare_resolution,
     resolving_view,
     run_post_process_pass,
@@ -28,6 +29,7 @@ def handle_dllm_inference(server_args: Any):
 
     run_post_process_pass(server_args, _dllm_attention_backend)
     get_algorithm_cls(cfg.dllm_algorithm).configure_server_args(server_args)
+    _reject_unsupported_features(cfg)
 
     # DLLM CUDA graphs are disabled on AMD/HIP.
     if get_platform().is_hip:
@@ -120,4 +122,35 @@ def handle_dllm_inference(server_args: Any):
             server_args,
             "_handle_dllm_inference",
             enable_mixed_chunk=False,
+        )
+
+
+# Prefill backends whose deterministic mode makes the scheduler cut prefill
+# chunks at a fixed split tile, see Scheduler.init_deterministic_inference_config.
+_DETERMINISTIC_ALIGNED_PREFILL_BACKENDS = ("flashinfer", "triton")
+
+
+def _reject_unsupported_features(cfg: Any) -> None:
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--speculative-algorithm is not supported with diffusion LLM "
+            "inference (--dllm-algorithm): dLLM decodes a masked block per "
+            "step rather than verifying draft tokens."
+        )
+    prefill_backend, _ = attention_backends_of(cfg)
+    if (
+        cfg.enable_deterministic_inference
+        and prefill_backend in _DETERMINISTIC_ALIGNED_PREFILL_BACKENDS
+    ):
+        raise ValueError(
+            "--enable-deterministic-inference is not supported with diffusion "
+            f"LLM inference (--dllm-algorithm) on the {prefill_backend} "
+            "attention backend: dLLM aligns prefill truncation to the denoising "
+            "block size, which cannot also honour the deterministic split-tile "
+            "alignment."
+        )
+    if cfg.enable_two_batch_overlap:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with diffusion LLM "
+            "inference (--dllm-algorithm)."
         )
