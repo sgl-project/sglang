@@ -1778,7 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn chat_n_uses_one_bootstrap_room_per_choice() {
         use super::super::test_utils::{body_json, post_json};
-        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
         use crate::tokenizer_manager::wiring::TmEvent;
@@ -1798,16 +1798,21 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::from(args.as_ref()),
+                metrics: None,
             },
         );
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
         let state = Arc::new(super::super::AppState {
             core,
+            generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
             server_args: args,
-            chat_formatter: Some(super::super::ChatFormatter::Legacy(Box::new(
-                super::super::template::LegacyFormatter { spec: chatml },
-            ))),
+            chat_formatter: Some(
+                sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap(),
+            ),
+            generate_hook: None,
+            openai_chat: None,
         });
         let responder = tokio::spawn(async move {
             let mut rooms = Vec::new();

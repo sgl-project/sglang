@@ -877,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn completions_scalar_room_fans_one_room_per_choice() {
         use super::super::test_utils::{body_json, post_json};
-        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
         use crate::tokenizer_manager::wiring::TmEvent;
@@ -897,13 +897,19 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::from(args.as_ref()),
+                metrics: None,
             },
         );
         let state = Arc::new(super::super::AppState {
             core,
+            generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
             server_args: args,
             chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
         });
         let responder = tokio::spawn(async move {
             let mut rooms = Vec::new();
