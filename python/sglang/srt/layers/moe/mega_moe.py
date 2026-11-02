@@ -786,17 +786,8 @@ def build_mega_moe_shared_weights(
     return l1, l2
 
 
-@functools.lru_cache(maxsize=1)
 def _is_mega_moe_localization_enabled() -> bool:
-    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get():
-        return False
-    import deep_gemm
-
-    available = hasattr(deep_gemm, "localize") and (
-        deep_gemm.is_localization_available()
-    )
-    logger.info(f"MegaMoE weight localization: {available}")
-    return available
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
