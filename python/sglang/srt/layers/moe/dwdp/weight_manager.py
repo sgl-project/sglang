@@ -1,5 +1,5 @@
 # Adapted from NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM)
-"""Double-buffered async prefetch of peer expert weights into the composite VA."""
+"""Slot-rotated async prefetch of peer expert weights into the composite VA."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PeerRanges, lookup_owner
-from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
+from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
+from sglang.srt.layers.moe.dwdp.weight_buffer import PREFETCH_DEPTH, WeightBuffer
+from sglang.srt.utils.common import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -25,31 +27,34 @@ class DWDPWeightManager:
         weight_names: List[str],
         dwdp_rank: int,
         dwdp_size: int,
-        transport=None,
+        transport: Optional[DWDPTransport] = None,
     ) -> None:
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views
         self._peer_ranges = peer_ranges
         self._moe_layer_indices = sorted(moe_layer_indices)
         self._moe_layer_set = set(self._moe_layer_indices)
+        self._layer_positions = {
+            li: pos for pos, li in enumerate(self._moe_layer_indices)
+        }
         self._weight_names = list(weight_names)
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
         # transport handles underpin the VA mappings; must outlive this manager
         self._transport = transport
 
-        device = torch.device("cuda", weight_buffer.device_id)
-        self._copy_stream = torch.cuda.Stream(device=device)
+        self._device = weight_buffer.device
+        self._device_module = torch.get_device_module(self._device)
+        self._copy_stream = create_device_stream(self._device)
 
-        self._prefetch_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
-        self._consume_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
+        event_type = self._device_module.Event
+        num_slots = weight_buffer.num_slots
+        assert num_slots >= PREFETCH_DEPTH, (num_slots, PREFETCH_DEPTH)
+        self._prefetch_events = [event_type() for _ in range(num_slots)]
+        self._consume_events = [event_type() for _ in range(num_slots)]
 
         # pre-record consume events so the first prefetch doesn't stall
-        current = torch.cuda.current_stream(device)
+        current = self._device_module.current_stream(self._device)
         for ev in self._consume_events:
             ev.record(current)
 
@@ -77,7 +82,16 @@ class DWDPWeightManager:
     def prefetch_layer(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
 
-        with torch.cuda.stream(self._copy_stream):
+        if self._weight_buffer.rebinds_pool_pages and not self._weight_buffer.is_bound(
+            layer_idx
+        ):
+            # Unmapping is a host call that does not wait, so the copy DMA writing
+            # these pages and the compute reading them must both have finished.
+            self._prefetch_events[buf_idx].synchronize()
+            self._consume_events[buf_idx].synchronize()
+            self._weight_buffer.bind_pool_pages(layer_idx)
+
+        with device_stream_context(self._copy_stream):
             # WAR: wait for compute to finish reading this slot before overwriting
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
@@ -108,32 +122,28 @@ class DWDPWeightManager:
 
     def wait_prefetch(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        compute_stream = self._device_module.current_stream(self._device)
         compute_stream.wait_event(self._prefetch_events[buf_idx])
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        compute_stream = self._device_module.current_stream(self._device)
 
         self._consume_events[buf_idx].record(compute_stream)
 
-        # prefetch the layer 2 ahead — it reuses the same buffer slot
-        next_layer = self.next_moe_layer(layer_idx)
-        if next_layer is not None:
-            next_next = self.next_moe_layer(next_layer)
-            if next_next is not None:
-                self.prefetch_layer(next_next)
+        ahead = self._layer_positions[layer_idx] + PREFETCH_DEPTH
+        if ahead < len(self._moe_layer_indices):
+            self.prefetch_layer(self._moe_layer_indices[ahead])
 
     def prefetch_first_layers(self) -> None:
-        if len(self._moe_layer_indices) >= 1:
-            self.prefetch_layer(self._moe_layer_indices[0])
-        if len(self._moe_layer_indices) >= 2:
-            self.prefetch_layer(self._moe_layer_indices[1])
+        for layer_idx in self._moe_layer_indices[:PREFETCH_DEPTH]:
+            self.prefetch_layer(layer_idx)
 
     def release(self) -> None:
         if self._weight_buffer is not None:
+            # copies may still be writing the pages that are about to be unmapped
+            self._copy_stream.synchronize()
+            self._weight_buffer.synchronize()
             self._weight_buffer.release()
             self._weight_buffer = None
         if self._transport is not None:

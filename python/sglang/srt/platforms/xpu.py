@@ -1,6 +1,7 @@
 """XPU device operations for the SRT platform layer."""
 
 import logging
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -13,6 +14,69 @@ from sglang.srt.platforms.device_mixin import (
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 logger = logging.getLogger(__name__)
+
+# The sysman process query counts then fills, so a process starting between the two
+# calls fails one attempt but not the next.
+_XPU_MEMORY_QUERY_ATTEMPTS = 2
+
+
+@lru_cache(maxsize=None)
+def _level_zero_memory_query_works(device_id: int) -> bool:
+    """Probe once per device whether the Level Zero memory query works, retrying a
+    transient failure: an old loader or missing sysman telemetry then degrades to
+    torch's own counter instead of failing a launch, and is not queried again."""
+    last_error: Optional[BaseException] = None
+    try:
+        # lazy: xpu_vmm_utils imports sglang.srt.utils.common, which imports this module
+        from sglang.srt.utils.xpu_vmm_utils import get_device_memory_in_use
+
+        for _ in range(_XPU_MEMORY_QUERY_ATTEMPTS):
+            try:
+                get_device_memory_in_use(device_id)
+                return True
+            except RuntimeError as error:
+                last_error = error
+    except (ImportError, OSError) as error:
+        last_error = error
+    logger.warning(
+        f"Level Zero memory query unavailable for XPU {device_id} ({last_error}); "
+        f"falling back to torch.xpu.memory_allocated, which sees only torch's "
+        f"own allocator."
+    )
+    return False
+
+
+def _device_memory_in_use(device_id: int) -> int:
+    """Device memory in use on an XPU, counting allocations torch cannot see.
+
+    torch.xpu.memory_allocated knows only its own allocator, and mem_get_info
+    forwards a free == total stub, so Level Zero sysman is the only whole-device
+    source.
+    """
+    # lazy: xpu_vmm_utils imports sglang.srt.utils.common, which imports this module
+    from sglang.srt.utils.xpu_vmm_utils import (
+        get_device_memory_in_use,
+        has_physical_memory,
+    )
+
+    torch_in_use = torch.xpu.memory_allocated(device_id)
+    # Only Level Zero physical memory (DWDP's VMM) escapes torch's count, so a process
+    # that never created any keeps torch's number and never starts sysman.
+    if not has_physical_memory() or not _level_zero_memory_query_works(device_id):
+        return torch_in_use
+
+    for _ in range(_XPU_MEMORY_QUERY_ATTEMPTS):
+        try:
+            return max(torch_in_use, get_device_memory_in_use(device_id))
+        except (RuntimeError, OSError) as error:
+            last_error = error
+    logger.warning(
+        f"Level Zero memory query failed {_XPU_MEMORY_QUERY_ATTEMPTS} times for XPU "
+        f"{device_id} ({last_error}); "
+        f"falling back to torch.xpu.memory_allocated, which sees only torch's own "
+        f"allocator, so memory pools may be sized too high."
+    )
+    return torch_in_use
 
 
 class XpuDeviceMixin(DeviceMixin):
@@ -73,7 +137,7 @@ class XpuDeviceMixin(DeviceMixin):
                 current,
             )
 
-        used_memory = torch.xpu.memory_allocated(device_id)
+        used_memory = _device_memory_in_use(device_id)
         total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 

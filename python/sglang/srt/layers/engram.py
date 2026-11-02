@@ -828,9 +828,9 @@ class _PeerShards:
     """
 
     def __init__(self, rows: int, dim: int, group):
+        from sglang.srt.utils.common import align_up
         from sglang.srt.utils.cuda_vmm_utils import (
             VmmReservation,
-            align_up,
             get_device_granularity,
             make_device_allocation_prop,
         )
