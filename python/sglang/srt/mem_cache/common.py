@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -100,7 +99,7 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     supports_prefix_sharing: bool = True,
     retain_floor: int | None = None,
-    component_type: ComponentType = ComponentType.SWA,
+    window_sub_pool: str = "swa",
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
 ) -> None:
@@ -112,14 +111,14 @@ def free_swa_out_of_window_slots(
         "cache_protected_len must be page aligned"
     )
     # Protected rows limit what can be freed, not where the interval starts.
-    evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
+    evicted_seqlen = req.kv.get_evicted_seqlen(window_sub_pool)
     if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
         return
     window_page_size = page_size
     if is_cp_sharded_padded():
         window_page_size = from_cp_sharded(window_page_size)
     evicted_seqlen = max(evicted_seqlen, req.kv.window_dead_lo(window_page_size))
-    req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
+    req.kv.set_evicted_seqlen(window_sub_pool, evicted_seqlen)
 
     if not supports_prefix_sharing:
         # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
@@ -152,13 +151,12 @@ def free_swa_out_of_window_slots(
             req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
         ]
         if free_segment is None:
-            assert component_type == ComponentType.SWA
             free_segment = token_to_kv_pool_allocator.free_swa_segment
         if is_cp_sharded_padded():
             free_slots = get_cp_sharded_padded_cache_indices(free_slots)
             evicted_seqlen = get_cp_sharded_padded(evicted_seqlen)
         free_segment(free_slots, start_pos=evicted_seqlen)
-        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
+        req.kv.set_evicted_seqlen(window_sub_pool, new_evicted_seqlen)
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:

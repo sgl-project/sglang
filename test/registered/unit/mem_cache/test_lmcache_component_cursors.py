@@ -17,7 +17,9 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# A further window slot, named by its sub-pool.
+# The window LMCache keeps (the tree's one native window slot) and a further
+# window, each by its sub-pool name and its tree slot.
+FIRST, SECOND = "window_4", "window_64"
 SECOND_WINDOW = ComponentType.of("WINDOW_64")
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -45,6 +47,11 @@ def cache_class():
 def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache = cache_class.__new__(cache_class)
     cache.is_swa_enabled = swa_enabled
+    cache.components = {ComponentType.SWA: SimpleNamespace(window_sub_pool=FIRST)}
+    cache.__dict__["_window_slot_sub_pools"] = {
+        ComponentType.SWA: FIRST,
+        SECOND_WINDOW: SECOND,
+    }
     cache.lmcache_connector = SimpleNamespace(aligned_swa_window_size=lambda: 4)
     flow = SimpleNamespace(
         load=SimpleNamespace(local_hit_tokens=2, device_indices=torch.arange(2, 8)),
@@ -65,14 +72,14 @@ def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
             req_pool_idx=0,
             kv_allocated_len=12,
             cache_protected_len=8,
-            component_evicted_seqlens={SECOND_WINDOW: 6},
+            window_evicted_seqlens={SECOND: 6},
         ),
         priority=0,
         last_node=None,
         lock=None,
     )
     if swa_enabled:
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_cursor)
+        req.kv.set_evicted_seqlen(FIRST, swa_cursor)
     return cache, req, flow
 
 
@@ -86,10 +93,7 @@ def test_external_swa_load_preserves_independent_cursors(cache_class, swa_cursor
 
     assert flow.prefix_published
     assert req.kv.cache_protected_len == 2
-    assert req.kv.component_evicted_seqlens == {
-        ComponentType.SWA: max(swa_cursor, 4),
-        SECOND_WINDOW: 6,
-    }
+    assert req.kv.window_evicted_seqlens == {FIRST: max(swa_cursor, 4), SECOND: 6}
 
 
 @pytest.mark.parametrize("swa_enabled", [False, True])
@@ -118,10 +122,7 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     if swa_enabled:
         expected[ComponentType.SWA] = 4
     assert insert_params.component_evicted_seqlens == expected
-    assert (
-        insert_params.component_evicted_seqlens is not req.kv.component_evicted_seqlens
-    )
-    req.kv.set_evicted_seqlen(SECOND_WINDOW, 99)
+    req.kv.set_evicted_seqlen(SECOND, 99)
     assert insert_params.get_evicted_seqlen(SECOND_WINDOW) == 6
     assert req.kv.cache_protected_len == 8
     assert req.lock.receipt.node_id == 42

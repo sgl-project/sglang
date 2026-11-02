@@ -376,7 +376,6 @@ class TestIndependentWindowFree(unittest.TestCase):
             DraftBand,
             FusedDraftPlacement,
         )
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.addCleanup(reset_context)
@@ -411,15 +410,11 @@ class TestIndependentWindowFree(unittest.TestCase):
                     ids = a.alloc(32)
                     kv = ReqKvInfo(req_pool_idx=0, window_evict_floor=8)
                     storage.requests.req_to_token[0, :32] = ids
-                    for name, ct, end in zip(
-                        ("window_16", "draft_swa"),
-                        (ComponentType.of("WINDOW_16"), ComponentType.of("DRAFT_SWA")),
-                        cursors,
-                    ):
+                    for name, end in zip(("window_16", "draft_swa"), cursors):
                         # Every window frees from the request's shield up.
                         start = 8 if end else 0
                         a.free_window_segment(name, ids[start:end], start_pos=start)
-                        kv.set_evicted_seqlen(ct, end)
+                        kv.set_evicted_seqlen(name, end)
                     recorder = _ShapeSyncRecorder()
                     with (
                         envs.SGLANG_INVARIANT_CHECK.override(

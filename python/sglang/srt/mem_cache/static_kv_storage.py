@@ -349,7 +349,7 @@ class StaticKVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
-        component_type=None,
+        window_sub_pool: Optional[str] = None,
     ) -> None:
         if tracking is not None:
             advance_tracking(self, req, tracking)
@@ -359,9 +359,7 @@ class StaticKVStorage:
             raise ValueError("window retirement needs a token frontier")
 
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-        component_type = ComponentType.SWA if component_type is None else component_type
         free_swa_out_of_window_slots(
             req,
             frontier,
@@ -372,7 +370,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
-            component_type=component_type,
+            window_sub_pool=window_sub_pool or "swa",
         )
 
     def set_network_waiter(self, waiter) -> None:
@@ -662,12 +660,6 @@ class StaticKVStorage:
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
         return PoolName.SWA if sub_pool == "swa" else PoolName.KV
-
-    def window_tree_component(self, sub_pool: str):
-        """See `KVStorage.window_tree_component`: the one window slot."""
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        return ComponentType.SWA
 
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]

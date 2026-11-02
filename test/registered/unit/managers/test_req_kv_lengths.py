@@ -22,14 +22,14 @@ _LENGTH_FIELDS = {
     "kv_committed_len",
     "kv_allocated_len",
     "window_evict_floor",
-    "component_evicted_seqlens",
+    "window_evicted_seqlens",
 }
 _SCAN = dict(
     owner_scopes={"ReqKvInfo"},
     # The constructor and dataclasses.replace set fields by keyword.
     kwarg_funcs={"ReqKvInfo", "replace"},
     # A mutable field: any use outside ReqKvInfo can change it through an alias.
-    owned_only_fields={"component_evicted_seqlens"},
+    owned_only_fields={"window_evicted_seqlens"},
 )
 
 

@@ -279,11 +279,9 @@ class ReqKvInfo:
     kv_allocated_len: int = 0
 
     # Each window's slots in [window_dead_lo(page_size), get_evicted_seqlen(its
-    # tree slot)) are freed; every window keeps its own cursor.
+    # sub-pool)) are freed; every window keeps its own cursor, by sub-pool name.
     window_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
-    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
-        default_factory=dict
-    )
+    window_evicted_seqlens: dict[str, int] = dataclasses.field(default_factory=dict)
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
@@ -335,24 +333,25 @@ class ReqKvInfo:
 
     @property
     def max_evicted_seqlen(self) -> int:
-        return max(self.component_evicted_seqlens.values(), default=0)
+        return max(self.window_evicted_seqlens.values(), default=0)
 
-    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
-        return self.component_evicted_seqlens.get(component_type, 0)
+    def get_evicted_seqlen(self, sub_pool: str) -> int:
+        return self.window_evicted_seqlens.get(sub_pool, 0)
 
-    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
-        self.component_evicted_seqlens[component_type] = length
+    def set_evicted_seqlen(self, sub_pool: str, length: int) -> None:
+        self.window_evicted_seqlens[sub_pool] = length
 
-    def copy_evicted_seqlens(self) -> dict[ComponentType, int]:
-        return self.component_evicted_seqlens.copy()
+    def evicted_seqlens(self) -> dict[str, int]:
+        """Every window's cursor by sub-pool name, as a copy."""
+        return dict(self.window_evicted_seqlens)
 
     def clamp_evicted_seqlens(self, length: int) -> None:
-        for component, cursor in self.component_evicted_seqlens.items():
-            self.component_evicted_seqlens[component] = min(cursor, length)
+        for sub_pool, cursor in self.window_evicted_seqlens.items():
+            self.window_evicted_seqlens[sub_pool] = min(cursor, length)
 
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
-        self.component_evicted_seqlens.clear()
+        self.window_evicted_seqlens.clear()
 
     def set_row_len(self, end: int) -> None:
         """The row holds exactly [0, end), all of it committed."""
@@ -3518,8 +3517,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return (
             lambda req: any(
                 req.seqlen - 1 - window
-                >= req.kv.get_evicted_seqlen(component) + eviction_interval
-                for component, window in windows
+                >= req.kv.get_evicted_seqlen(sub_pool) + eviction_interval
+                for sub_pool, window in windows
             )
         ), eviction_interval
 
@@ -3527,7 +3526,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.tree_cache.supports_swa():
             retain_window = self.tree_cache.swa_retain_window
             # With several windows each checks its own cursors and prefix locks.
-            several_windows = len(self.tree_cache.window_slots()) > 1
+            several_windows = len(self.tree_cache.window_sub_pools()) > 1
 
             release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
                 self.tree_cache, "release_swa_prefix_lock"

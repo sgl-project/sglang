@@ -13,7 +13,6 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.mem_cache.kv.storage import SubPoolUsage
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolShape
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
@@ -23,13 +22,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# Three window slots of the prefix tree and the sub-pool behind each, the
-# tree's first window first.
-_SLOTS = {
-    ComponentType.SWA: "window_128",
-    "second window slot": "window_64",
-    "third window slot": "window_32",
-}
+# The three window sub-pools the prefix tree keeps, in its window order,
+# each with the history it retains.
+_WINDOWS = (("window_128", 128), ("window_64", 64), ("window_32", 32))
 
 
 def _usage(name, metrics, capacity, available):
@@ -47,12 +42,11 @@ def _three_window_observer():
             _usage("window_64", "window", 200, 120),
             _usage("window_128", "window", 400, 100),
         ),
-        tree_sub_pool=lambda slot: _SLOTS[slot],
     )
     evictable = {"window_128": 100, "window_64": 30, "window_32": 10}
     tree_cache = SimpleNamespace(
-        window_slots=lambda: tuple(_SLOTS),
-        window_evictable_size=lambda slot: evictable[_SLOTS[slot]],
+        window_sub_pools=lambda: _WINDOWS,
+        window_evictable_size=lambda name: evictable[name],
         full_evictable_size=lambda: 150,
     )
     return SchedulerPoolStatsObserver(
