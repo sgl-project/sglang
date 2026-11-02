@@ -2357,10 +2357,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (
-            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100)
+            or (_is_hip and _is_gfx95_supported)
+            or _is_xpu
         ):
             raise RuntimeError(
-                "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
+                "MXFP8 MoE quantization requires SM100, ROCm gfx95, or Intel XPU "
                 "(gfx942 converts MXFP8 to block-fp8 at load instead)."
             )
 
@@ -2502,7 +2504,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return _pack_moe_scale_for_deepgemm(scale_fp32)
 
         if quantize:
-            if _is_hip:
+            if _is_hip or _is_xpu:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
                     layer.w13_weight.data.contiguous().view(
                         -1, layer.w13_weight.data.shape[-1]
@@ -2552,7 +2554,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data
                 )
         else:
-            if _is_hip:
+            if _is_hip or _is_xpu:
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -3229,6 +3231,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv
                     if self.block_quant
                     else layer.w2_weight_scale
+                ),
+                block_shape=(
+                    self.weight_block_size
+                    if self.block_quant and use_fp8_w8a8
+                    else None
                 ),
                 activation=moe_runner_config.activation,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
