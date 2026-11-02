@@ -1313,6 +1313,7 @@ jobs:
   pr-test-npu-finish:
     needs:
       [
+        pr-gate,
         check-changes,
 
         base-a-test-npu,
