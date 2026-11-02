@@ -15,14 +15,22 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.deferred_responses import (  # noqa: E402
+    DeferredResponses,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
     """Minimal stand-in for Req: only the fields the abort paths touch."""
+
+    request_finish = Req.request_finish
+    clear_requested_finish = Req.clear_requested_finish
+    finish_outside_step = Req.finish_outside_step
 
     def __init__(self, rid: str):
         self.rid = rid
@@ -34,6 +42,7 @@ class _FakeReq:
         self.return_logprob = False
         self.output_ids = []
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.time_stats = Mock()
 
     def finished(self):
@@ -55,6 +64,13 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.rust_server = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
+    sched.beam_coordinator = Mock()
+    sched.output_streamer = Mock()
+    sched.deferred_responses = DeferredResponses(
+        disaggregation_mode=DisaggregationMode.NULL,
+        output_streamer=None,
+        send_abort=None,
+    )
     return sched
 
 
@@ -85,6 +101,18 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
+
+    def test_aborted_chunked_beam_leader_retires_its_group(self):
+        req = _FakeReq("beam_leader")
+        sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
+        sched._release_aborted_request = Mock()
+        sched.tree_cache = None
+        sched.ipc_channels = Mock()
+
+        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+            sched.process_pending_chunked_abort()
+
+        sched.beam_coordinator.retire_group.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

@@ -105,7 +105,10 @@ def test_partial_budget_preserves_shared_storage_and_strided_views():
 
 def test_lora_replacement_and_dtype_change_return_pin_allowance():
     module = torch.nn.Linear(4, 4, bias=False)
-    pipeline = SimpleNamespace(modules={"transformer": module})
+    modules = {"transformer": module}
+    pipeline = SimpleNamespace(
+        modules=modules, _lora_module=lambda name: modules.get(name)
+    )
     budget = HostPinBudget(available_bytes=MIN_HOST_RESERVE_BYTES + 128)
     for value in (2.0, 3.0):
         capture_weight_snapshot(module, pin_budget=budget)

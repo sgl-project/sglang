@@ -208,8 +208,8 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
     attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
     if cfg.tp_size != attn_dp_size:
         unsupported.append("attention tensor parallelism greater than one")
-    if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
-        unsupported.append("PD multiplexing or decoupled speculation")
+    if cfg.decoupled_spec_role != "null":
+        unsupported.append("decoupled speculation")
     if cfg.enable_pd_role_switch:
         unsupported.append("runtime PD role switching")
     if cfg.encoder_only or cfg.language_only:
