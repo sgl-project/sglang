@@ -102,7 +102,6 @@ def _gemma_add_rmsnorm_fp8_kernel(
     res_out_ptr,
     q_ptr,
     scale_ptr,
-    zeros_ptr,
     n_rows,
     n_cols,
     stride_xrow,
@@ -115,8 +114,6 @@ def _gemma_add_rmsnorm_fp8_kernel(
     GROUP: tl.constexpr,
     TRANSPOSE_SCALE: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    ZERO_COLS: tl.constexpr,
-    BLOCK_ZERO: tl.constexpr,
 ):
     # The norm is the code of the two kernels above, launched the same way, so the
     # quantized values are those of the separate norm and aiter quant kernels.
@@ -154,13 +151,6 @@ def _gemma_add_rmsnorm_fp8_kernel(
             scale_offs = row * (n_cols // GROUP) + g
         tl.store(scale_ptr + scale_offs, scale, mask=g < n_cols // GROUP)
     tl.store(q_ptr + row * n_cols + cols, q, mask=mask)
-    if ZERO_COLS > 0:
-        zcols = tl.arange(0, BLOCK_ZERO)
-        tl.store(
-            zeros_ptr + row * ZERO_COLS + zcols,
-            tl.zeros((BLOCK_ZERO,), zeros_ptr.dtype.element_ty),
-            mask=zcols < ZERO_COLS,
-        )
 
 
 @triton.jit
@@ -172,7 +162,6 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
     res_out_ptr,
     q_ptr,
     scale_ptr,
-    zeros_ptr,
     n_rows,
     n_cols,
     stride_xrow,
@@ -185,8 +174,6 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
     GROUP: tl.constexpr,
     TRANSPOSE_SCALE: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    ZERO_COLS: tl.constexpr,
-    BLOCK_ZERO: tl.constexpr,
 ):
     # The row code of _gemma_add_rmsnorm_fp8_kernel (same layout, same bytes) over four
     # rows: one weight load, and one layout conversion for the four rows' group scales.
@@ -229,13 +216,6 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
             else:
                 scale3 = scale
         tl.store(q_ptr + row * n_cols + cols, q, mask=mask)
-        if ZERO_COLS > 0:
-            zcols = tl.arange(0, BLOCK_ZERO)
-            tl.store(
-                zeros_ptr + row * ZERO_COLS + zcols,
-                tl.zeros((BLOCK_ZERO,), zeros_ptr.dtype.element_ty),
-                mask=(zcols < ZERO_COLS) & in_rows,
-            )
     if GROUP != 0:
         # Column k holds the scales of row base + k.
         scales = tl.reshape(
@@ -330,7 +310,6 @@ def gemma_add_rmsnorm_fp8(
     group_size: Optional[int] = None,
     transpose_scale: bool = False,
     keep_bf16: bool = False,
-    zeros: Optional[torch.Tensor] = None,
 ):
     """Gemma RMSNorm of ``x`` (plus ``residual`` when given) quantized to FP8 as aiter does.
 
@@ -339,8 +318,7 @@ def gemma_add_rmsnorm_fp8(
     ``transpose_scale``) like ``get_hip_quant(QuantType.per_1x128)``. Returns
     ``((fp8 [m, n], fp32 scale), residual_out)``, with the bf16 norm as a third element of
     the tuple when ``keep_bf16``; ``residual_out`` is the pre-norm sum, or ``x`` itself
-    without a residual. ``zeros``, a contiguous ``[m, *]`` tensor, is zero-filled by the
-    same launch.
+    without a residual.
     """
     n = x.shape[-1]
     x2 = x.reshape(-1, n)
@@ -359,11 +337,6 @@ def gemma_add_rmsnorm_fp8(
     else:
         r2 = residual.reshape(-1, n)
         res_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    zero_cols = 0
-    if zeros is not None:
-        assert zeros.is_contiguous() and zeros.shape[0] == m
-        # An idle DP-attention rank runs its layers on no tokens.
-        zero_cols = zeros.numel() // m if m else 0
     block_n = triton.next_power_of_2(n)
     kernel, grid = _gemma_add_rmsnorm_fp8_kernel, m
     if m >= _FOUR_ROWS_MIN_ROWS:
@@ -376,7 +349,6 @@ def gemma_add_rmsnorm_fp8(
         res_out,
         q,
         scale,
-        q if zeros is None else zeros,
         m,
         n,
         x2.stride(0),
@@ -389,8 +361,6 @@ def gemma_add_rmsnorm_fp8(
         GROUP=group,
         TRANSPOSE_SCALE=transpose_scale,
         BLOCK_N=block_n,
-        ZERO_COLS=zero_cols,
-        BLOCK_ZERO=triton.next_power_of_2(max(zero_cols, 1)),
         num_warps=_num_warps(block_n),
     )
     if group and transpose_scale:

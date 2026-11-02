@@ -20,9 +20,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel.kvcacheio import transfer_embedding_ranges_direct
 
@@ -161,7 +162,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
     def _init_page_row_transfer(self) -> None:
         self._page_row_tables = None
         device = self.device_rows[0].device
-        if not _is_cuda or device.type != "cuda" or not self.pin_memory:
+        if not (_is_cuda or _is_hip) or device.type != "cuda" or not self.pin_memory:
             return
         from sglang.kernels.ops.kvcache.nvfp4_hicache import warmup_page_row_transfer
 
@@ -200,7 +201,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
     def _page_indices(self, host_indices, device_indices):
         if (
-            _is_cuda
+            (_is_cuda or _is_hip)
             and self.page_size == 128
             and host_indices.is_cuda
             and host_indices.device == device_indices.device
