@@ -2232,23 +2232,23 @@ class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # `comm` is platform-gated and implies CUDA graph drop + recapture.
     tags: Optional[List[str]] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    # Client-caused rejection; the tokenizer layer turns it into a 400.
+    error: Optional[str] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # If `comm` was released, resume must include `comm` too.
     tags: Optional[List[str]] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    # Client-caused rejection; the tokenizer layer turns it into a 400.
+    error: Optional[str] = None
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
