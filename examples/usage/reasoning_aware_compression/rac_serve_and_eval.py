@@ -209,7 +209,7 @@ def report(results: List[EvalResult]) -> None:
             f"{result.model_path:<{width}}  "
             f"{result.accuracy:>7.3f}  "
             f"{result.mean_completion_tokens:>16.0f}  "
-            f"{result.elapsed_seconds/60:>10.1f}m"
+            f"{result.elapsed_seconds / 60:>10.1f}m"
         )
 
     if len(results) > 1:

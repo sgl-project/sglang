@@ -13,6 +13,7 @@ import zmq
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -117,7 +118,6 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
 
 
 class ScriptedSchedulerHook:
-
     def __init__(
         self,
         *,
@@ -126,9 +126,9 @@ class ScriptedSchedulerHook:
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
-            scheduler.ps.pp_rank == 0
-            and scheduler.ps.tp_rank == 0
-            and scheduler.ps.attn_cp_rank == 0
+            get_parallel().pp_rank == 0
+            and get_parallel().tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
         )
         self._batch_log: List[ScriptedBatchRecord] = []
 

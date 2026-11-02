@@ -8,8 +8,8 @@ on:
         required: true
         type: string
         default: 'pr-test.yml pr-test-extra.yml'
-      include_high_priority:
-        description: 'Also cancel runs from high-priority PRs'
+      include_highest_priority:
+        description: 'Also cancel runs from PRs labelled highest-priority'
         required: false
         type: boolean
         default: false
@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           WORKFLOWS: ${{ github.event.inputs.workflows }}
-          INCLUDE_HIGH_PRIORITY: ${{ github.event.inputs.include_high_priority }}
+          INCLUDE_HIGHEST_PRIORITY: ${{ github.event.inputs.include_highest_priority }}
           INCLUDE_RERUN_TEST: ${{ github.event.inputs.include_rerun_test }}
         shell: bash
         run: |
@@ -49,7 +49,7 @@ jobs:
           fi
 
           echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${WORKFLOW_FILES[*]}"
-          echo "include_high_priority=$INCLUDE_HIGH_PRIORITY, include_rerun_test=$INCLUDE_RERUN_TEST"
+          echo "include_highest_priority=$INCLUDE_HIGHEST_PRIORITY, include_rerun_test=$INCLUDE_RERUN_TEST"
           echo ""
 
           # Decide whether to cancel run_id given a PR-lookup endpoint.
@@ -99,12 +99,12 @@ jobs:
               return
             fi
 
-            if echo "$labels" | grep -Fxq "high priority"; then
-              if [ "$INCLUDE_HIGH_PRIORITY" != "true" ]; then
-                echo "  🛑 Skipping (high priority label)"
+            if echo "$labels" | grep -Fxq "highest-priority"; then
+              if [ "$INCLUDE_HIGHEST_PRIORITY" != "true" ]; then
+                echo "  🛑 Skipping (highest-priority label)"
                 return
               fi
-              echo "  ⚠️  High priority PR, but include_high_priority is enabled"
+              echo "  ⚠️  highest-priority PR, but include_highest_priority is enabled"
             fi
 
             echo "  🚫 Cancelling..."

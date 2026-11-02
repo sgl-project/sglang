@@ -112,7 +112,6 @@ class GSM8KEval(Eval):
 
 
 class MixedPrefixGSM8KEval(GSM8KEval):
-
     def __init__(
         self,
         num_examples: Optional[int],

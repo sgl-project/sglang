@@ -36,9 +36,8 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
-from . import parity_probe
 from .base import (
     _SANA_WM_DEFAULT_ROTATION_SPEED_DEG,
     _SANA_WM_DEFAULT_TRANSLATION_SPEED,
@@ -254,11 +253,6 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
                 )
                 buf[:, :, :1] = first_latent
                 noise.noise_buffer = buf
-                parity_probe.dump_tensor(  # parity harness (no-op in prod)
-                    parity_probe.probe_dir(parity_probe.ENV_RT_DUMP),
-                    "noise_buffer",
-                    buf,
-                )
 
         # Chunk plan: enough stage-1 chunks for >=1 refiner block.
         stage1_cur = cache.chunk_indices[-1]

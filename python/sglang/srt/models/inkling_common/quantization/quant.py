@@ -50,9 +50,9 @@ class InklingNvfp4MoEMethod(InklingMoEMethodBase):
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
-        assert isinstance(
-            layer, InklingBatchDenseMLP
-        ), "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        assert isinstance(layer, InklingBatchDenseMLP), (
+            "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        )
 
         w13_up_dim = 2 * intermediate_size_per_partition
 

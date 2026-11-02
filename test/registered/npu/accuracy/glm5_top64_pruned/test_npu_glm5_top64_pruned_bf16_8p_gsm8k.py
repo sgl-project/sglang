@@ -12,13 +12,16 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 register_npu_ci(est_time=4800, suite="nightly-acc-16-npu-a3", nightly=True)
 
 ENVS = {
+    "PYTORCH_NPU_ALLOC_CONF": (
+        "expandable_segments:True,pin_memory_expandable_segments:True"
+    ),
     "SGLANG_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "HCCL_BUFFSIZE": "1000",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -40,13 +43,12 @@ OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     16,
 ]
 
 
 class TestNPUGLM5_Top64_Pruned_GSM8K(TestNpuAccuracyTestCaseBase):
-
     model = GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

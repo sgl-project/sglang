@@ -16,6 +16,14 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    # smg-grpc-servicer reads the raw `server_args.tokenizer_path`, which
+    # resolution defaults into the stash but never writes back. Seed it here,
+    # before resolve_once() seals the record.
+    if (
+        server_args.smg_grpc_mode or server_args.grpc_mode
+    ) and server_args.tokenizer_path is None:
+        server_args.tokenizer_path = server_args.model_path
+
     # The flags dispatched on below are decided by resolution (`--grpc-mode`
     # folds into `smg_grpc_mode`), and `prepare_server_args` returns raw input.
     server_args.resolve_once()

@@ -12,6 +12,7 @@ from sglang.srt.models import kimi_k3_vl
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
     MoonViT3dEncoder,
+    MoonViTEncoderLayer,
     _resolve_mm_attention_backend,
     interpolate_pos_emb,
     sdpa_varlen_attention,
@@ -24,7 +25,57 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class _RecordingVisionAttention(torch.nn.Module):
+    def __init__(self, **_kwargs):
+        super().__init__()
+        self.call_count = 0
+
+    def forward(self, q, _k, _v, **_kwargs):
+        self.call_count += 1
+        return q
+
+
+def _make_kimi_k3_encoder_layer(attention_backend):
+    return MoonViTEncoderLayer(
+        num_heads=1,
+        hidden_dim=8,
+        qkv_hidden_size=8,
+        mlp_dim=16,
+        norm_type="rmsnorm",
+        activation=F.gelu,
+        attn_bias=False,
+        linear_bias=False,
+        attention_backend=attention_backend,
+    )
+
+
+def test_kimi_k3_vision_backend_label_can_overlap_module_name(monkeypatch):
+    """Backend labels may overlap with nn.Module APIs without blocking startup."""
+    backend = "cuda"
+    monkeypatch.setitem(
+        kimi_k3_vl.QKV_BACKEND_IMPL,
+        backend,
+        _RecordingVisionAttention,
+    )
+
+    layer = _make_kimi_k3_encoder_layer(backend)
+    implementation = layer.attention_backend_impls[backend]
+
+    output = layer._attention(
+        torch.randn(2, 8),
+        torch.tensor([0, 2], dtype=torch.int32),
+        ((0, 2),),
+        torch.ones(2, 4, dtype=torch.complex64),
+        SimpleNamespace(),
+        use_fused_rope=False,
+        selected_attention_backend=backend,
+    )
+
+    assert output.shape == (2, 8)
+    assert implementation.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -467,11 +518,13 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so publish it; the live topology the
     # sharding helper reads is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=sharded_embeddings,
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=sharded_embeddings,
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
     ):
         output = model.get_image_feature(items)
         # Exercise the loader while the runtime topology is forced.
@@ -558,14 +611,17 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=torch.zeros(1, 2),
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
-    ), mock_patch(
-        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-        side_effect=fake_preprocess,
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=torch.zeros(1, 2),
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
+        mock_patch(
+            "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+            side_effect=fake_preprocess,
+        ),
     ):
         model.get_image_feature(items)
         loader = run_dp.call_args.kwargs["load_local_pixel_values"]

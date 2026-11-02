@@ -92,7 +92,7 @@ def parity_b():
         if torch.equal(
             ref.contiguous().view(torch.uint16), got2.contiguous().view(torch.uint16)
         ):
-            print(f"  {fmt}: bit-exact=True ({len(data)/1e6:.2f}MB)")
+            print(f"  {fmt}: bit-exact=True ({len(data) / 1e6:.2f}MB)")
         else:
             d = (ref.float() - got2.float()).abs()
             print(

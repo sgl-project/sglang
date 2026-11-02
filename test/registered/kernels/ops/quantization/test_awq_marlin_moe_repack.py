@@ -1,6 +1,5 @@
 import sys
 
-import numpy as np
 import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
@@ -8,8 +7,9 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.kernels.ops.quantization.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
-from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
+from sglang.srt.layers.quantization.utils import quantize_weights
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_marlin_utils import awq_pack
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -21,27 +21,6 @@ def _has_aot_awq_marlin_moe_repack() -> bool:
 
 
 AOT_AVAILABLE = _has_aot_awq_marlin_moe_repack()
-
-
-def awq_pack(
-    q_w: torch.Tensor,
-    num_bits: int,
-    size_k: int,
-    size_n: int,
-):
-    assert q_w.shape == (size_k, size_n)
-
-    if num_bits == 4:
-        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    elif num_bits == 8:
-        interleave = np.array([0, 2, 1, 3])
-    else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
-
-    q_w = q_w.reshape((-1, len(interleave)))[:, interleave].ravel()
-    q_w = q_w.reshape((-1, size_n)).contiguous()
-
-    return pack_cols(q_w, num_bits, size_k, size_n)
 
 
 @pytest.mark.parametrize("num_bits", [4])

@@ -2,7 +2,7 @@ import signal
 import unittest
 from unittest.mock import Mock, patch
 
-from sglang.multimodal_gen import utils
+from sglang.multimodal_gen.runtime.utils import process as utils
 
 
 class TestKillItselfWhenParentDied(unittest.TestCase):

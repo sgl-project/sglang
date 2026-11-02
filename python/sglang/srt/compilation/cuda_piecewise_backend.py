@@ -17,7 +17,9 @@ from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
     is_in_torch_compile_warmup,
 )
-from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
+    weak_ref_tensors,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
@@ -45,7 +47,6 @@ class ConcreteSizeEntry:
 
 
 class CUDAPiecewiseBackend:
-
     def __init__(
         self,
         graph: fx.GraphModule,
@@ -190,8 +191,9 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                with graph_pool_capture_scope(), torch.cuda.graph(
-                    cudagraph, pool=self.graph_pool, stream=stream
+                with (
+                    graph_pool_capture_scope(),
+                    torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream),
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)

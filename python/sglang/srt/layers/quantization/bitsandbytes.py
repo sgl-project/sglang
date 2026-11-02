@@ -320,9 +320,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 matmul_states[i].CB = qweight[offsets[i] : offsets[i + 1]]
                 matmul_states[i].SCB = quant_states[i].to(x.device)
                 matmul_states[i].threshold = self.quant_config.llm_int8_threshold
-                matmul_states[i].has_fp16_weights = (
-                    self.quant_config.llm_int8_has_fp16_weight
-                )
+                matmul_states[
+                    i
+                ].has_fp16_weights = self.quant_config.llm_int8_has_fp16_weight
                 matmul_states[i].is_training = False
                 if (
                     matmul_states[i].threshold > 0.0

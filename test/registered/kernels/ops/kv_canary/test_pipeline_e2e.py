@@ -529,9 +529,9 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
     )
 
     write_violations = int(log_real.write_index[0].item())
-    assert (
-        write_violations == n_tokens
-    ), f"expected {n_tokens} write violations, got {write_violations}"
+    assert write_violations == n_tokens, (
+        f"expected {n_tokens} write violations, got {write_violations}"
+    )
 
 
 def test_pipeline_empty_batch() -> None:
@@ -779,9 +779,9 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
         fail_bits = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
-        assert fail_bits & int(
-            consts.FailReason.VERIFY_TOKEN_MISMATCH
-        ), f"row {row_idx}: VERIFY_TOKEN_MISMATCH bit missing in {fail_bits:#b}"
+        assert fail_bits & int(consts.FailReason.VERIFY_TOKEN_MISMATCH), (
+            f"row {row_idx}: VERIFY_TOKEN_MISMATCH bit missing in {fail_bits:#b}"
+        )
         stored = int(log_real.ring[row_idx, consts.VIOLATION_FIELD_STORED_TOKEN].item())
         expected = int(
             log_real.ring[row_idx, consts.VIOLATION_FIELD_EXPECTED_TOKEN].item()

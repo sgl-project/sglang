@@ -38,7 +38,6 @@ class TestTokenizerBatchEncode(unittest.TestCase):
                 "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
             ) as mock_tokenizer,
         ):
-
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             publish(self.server_args, role="tokenizer")
             self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)

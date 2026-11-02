@@ -41,13 +41,12 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
 # CPU marker is AST-parsed "this test exists"; actual CPU-side execution is
 # gated by the @skipUnless guard below. MLX marker runs for real on the MLX
 # lane's stage-a (model-free: mocks the runner, loads no model).
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_mlx_ci(est_time=10, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -65,6 +64,7 @@ class _FakeRunner:
         # (op, rid) -> needs_logits as received; guards the worker's
         # chunk-finality derivation reaching the runner intact.
         self.logits_flags: dict[tuple[str, str], bool] = {}
+        self.prefix_slot_ids: dict[str, list[int]] = {}
         self._req_caches: dict[str, list] = {}
         self._counter = 0
 
@@ -72,8 +72,9 @@ class _FakeRunner:
     def has_request(self, rid):
         return rid in self._known
 
-    def flush_all_decode_kv(self):
-        pass
+    def remove_request(self, rid):
+        self.calls.append(("remove_request", rid))
+        self._known.discard(rid)
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -123,6 +124,7 @@ class _FakeRunner:
 
         self.calls.append(("prefill_start", req_id))
         self.logits_flags[("prefill_start", req_id)] = needs_logits
+        self.prefix_slot_ids[req_id] = list(prefix_slot_ids)
         return SimpleNamespace(
             lazy_token=mx.array([0], dtype=mx.int32),
             cache=[self._fake_cache_layer()],
@@ -168,13 +170,14 @@ class _FakeRunner:
 class _FakeReq:
     def __init__(self, rid, req_pool_idx=0):
         self.rid = rid
-        self.prefix_indices = torch.empty(0, dtype=torch.long)
+        self.retraction_count = 0
+        self.prefix_len = 0
         self.fill_ids = [0]
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
-        # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
+        # MlxTpModelWorker._chunk_needs_logits: extend_end=None means
         # "not truncated" (final chunk / plain prefill).
-        self.extend_range = None
+        self.extend_end = None
         self.full_untruncated_fill_ids = self.fill_ids
 
     def get_fill_ids(self):
@@ -215,6 +218,7 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
         worker._mlx_runner = _FakeRunner(known_rids)
         worker._mlx_active_rids = set()
+        worker._req_retraction_count = {}
         # The sync entry point delegates to the async launch, which guards
         # pool creation behind this flag; forward_batch_generation has
         # already run it for real by the time either path is reached.
@@ -226,14 +230,18 @@ class TestMlxExtendRouting(CustomTestCase):
             MlxModelRunnerStub,
         )
         from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from sglang.srt.runtime_context import get_context
 
         worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker.server_args = SimpleNamespace(is_startup_weight_load_overlap=True)
 
-        with self.assertRaisesRegex(ValueError, "CUDA only"):
-            MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)
-        with self.assertRaisesRegex(ValueError, "CUDA only"):
-            worker._init_model_runner()
+        # The guard reads `get_model().is_startup_weight_load_overlap`, which is
+        # derived from `startup_weight_load_mode`. Stating it on a `server_args`
+        # of the worker's own no longer reaches it.
+        with get_context().override_server_args(startup_weight_load_mode="overlap"):
+            with self.assertRaisesRegex(ValueError, "CUDA only"):
+                MlxModelRunnerStub.validate_startup_weight_load_mode()
+            with self.assertRaisesRegex(ValueError, "CUDA only"):
+                worker._init_model_runner()
 
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token
@@ -251,6 +259,23 @@ class TestMlxExtendRouting(CustomTestCase):
         worker = self._worker(known_rids={"r1"})
         self.assertEqual(worker._route_extend_request("r1", {"r1"}), "decode")
 
+    # ---------- retraction ----------
+
+    def test_retracted_request_reprefills_from_scratch(self):
+        """A request retracted after its MLX state was made drops that state,
+        so its re-prefill routes as a fresh prefill."""
+        worker = self._worker(known_rids=set())
+        req = _FakeReq("r1")
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        worker._mlx_runner._known.add("r1")
+
+        req.retraction_count += 1
+        worker._async_extend_batch(_FakeBatch(ForwardMode.EXTEND, [req], [4]))
+        self.assertEqual(
+            worker._mlx_runner.ops_for("r1"),
+            ["prefill_start", "remove_request", "prefill_start"],
+        )
+
     # ---------- sync path: _forward_batch_generation_mlx ----------
 
     def _run_sync(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
@@ -264,18 +289,18 @@ class TestMlxExtendRouting(CustomTestCase):
         """THE REGRESSION (sync): a 1-token continuation must extend, not decode."""
         runner = self._run_sync([_FakeReq("r1")], [1], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
-        # Untruncated (extend_range None) => final chunk => logits required.
+        # Untruncated (extend_end None) => final chunk => logits required.
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
 
     def test_sync_non_final_chunk_skips_logits(self):
-        """Head-skip derivation: a scheduler-truncated chunk (extend_range.end
+        """Head-skip derivation: a scheduler-truncated chunk (extend_end
         below the request's full untruncated length) reaches the runner with
         needs_logits=False; its next-token output is popped as the stale
         intermediate token, so computing the vocab head for it is pure waste.
         Everything else about routing is unchanged."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)  # 4 < 8: non-final
+        req.extend_end = 4  # 4 < 8: non-final
         runner = self._run_sync([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
@@ -289,10 +314,7 @@ class TestMlxExtendRouting(CustomTestCase):
     # ---------- async path: _async_extend_batch ----------
 
     def _run_async(self, reqs, extend_lens, known_rids, decoding_reqs, forward_mode):
-        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
-
-        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
-        worker._mlx_runner = _FakeRunner(known_rids)
+        worker = self._worker(known_rids)
         batch = _FakeBatch(forward_mode, reqs, extend_lens, decoding_reqs)
         launch = worker._async_extend_batch(batch)
         return worker._mlx_runner, launch
@@ -311,10 +333,26 @@ class TestMlxExtendRouting(CustomTestCase):
         """Async twin of the head-skip derivation guard."""
         req = _FakeReq("r1")
         req.full_untruncated_fill_ids = list(range(8))
-        req.extend_range = SimpleNamespace(start=0, end=4)
+        req.extend_end = 4
         runner, _ = self._run_async([req], [4], {"r1"}, None, ForwardMode.EXTEND)
         self.assertEqual(runner.ops_for("r1"), ["extend_start"])
         self.assertIs(runner.logits_flags[("extend_start", "r1")], False)
+
+    def test_async_prefix_hit_reads_slots_from_runner_pool(self):
+        """A radix prefix hit takes its slots from the stub runner's pool:
+        the worker's own req_to_token_pool is None on MLX."""
+        req_to_token = torch.zeros(2, 8, dtype=torch.int32)
+        req_to_token[1, :5] = torch.tensor([11, 12, 13, 14, 15])
+        worker = self._worker(known_rids=set())
+        worker.req_to_token_pool = None
+        worker._model_runner = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        req = _FakeReq("r1", req_pool_idx=1)
+        req.prefix_len = 3
+        batch = _FakeBatch(ForwardMode.EXTEND, [req], [2])
+        worker._async_extend_batch(batch)
+        self.assertEqual(worker._mlx_runner.prefix_slot_ids["r1"], [11, 12, 13])
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")

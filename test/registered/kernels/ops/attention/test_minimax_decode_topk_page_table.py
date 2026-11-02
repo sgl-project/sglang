@@ -57,7 +57,7 @@ def _effective_kv_from_selection(ti, seq_lens, block):
         (16, 8000),
         (2, 40000),  # num_blocks=313 -> medium radix path
         (1, 90000),  # num_blocks=704 -> large compaction path
-        (1, 480000),  # num_blocks=3750 -> large path near kMaxNumBlocks
+        (1, 480000),  # num_blocks=3750 -> large path near the 4096 bucket
     ],
 )
 @pytest.mark.parametrize("nqh", [8, 16])
@@ -119,7 +119,16 @@ def test_fused_page_table_matches_custom(bs, seq_len, nqh):
     assert cos > 0.999, f"cos={cos}"
 
 
-@pytest.mark.parametrize("seq_len", [300, 5000, 90000])
+@pytest.mark.parametrize(
+    "seq_len",
+    [
+        300,
+        5000,
+        90000,
+        600000,  # num_blocks=4688 -> 8192 bucket
+        1048577,  # num_blocks=8193 -> 16384 bucket
+    ],
+)
 @pytest.mark.parametrize("bs", [1, 3])
 @pytest.mark.parametrize("nkv", [2, 4])
 def test_dp_flattened_page_table(nkv, bs, seq_len):
@@ -159,9 +168,9 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
             row = b * nkv + h
             # effective KV length = sum of valid tokens over selected blocks
             exp_kv = sum(min(block, seq_len - c * block) for c in blocks)
-            assert (
-                int(cache[row]) == exp_kv
-            ), f"row {row}: {int(cache[row])} != {exp_kv}"
+            assert int(cache[row]) == exp_kv, (
+                f"row {row}: {int(cache[row])} != {exp_kv}"
+            )
             # page table: each block -> ppb pages via req_to_token, head-minor encoded
             for e in range(len(blocks) * ppb):
                 c = blocks[e // ppb]
@@ -169,9 +178,9 @@ def test_dp_flattened_page_table(nkv, bs, seq_len):
                 if tok >= max_kv:
                     tok = max_kv - 1
                 exp = int(r2t_cpu[b, tok]) // ps * nkv + h
-                assert (
-                    int(pt[row, e]) == exp
-                ), f"row {row} e {e}: {int(pt[row,e])} != {exp}"
+                assert int(pt[row, e]) == exp, (
+                    f"row {row} e {e}: {int(pt[row, e])} != {exp}"
+                )
 
 
 if __name__ == "__main__":

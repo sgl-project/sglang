@@ -12,8 +12,9 @@ ENV_PATH = (
 def _backend(env_value, *, sm120):
     CudaPlatform.get_modelopt_flashinfer_fp4_backend.cache_clear()
     try:
-        with patch(ENV_PATH, env_value), patch.object(
-            CudaPlatform, "is_sm120", classmethod(lambda cls: sm120)
+        with (
+            patch(ENV_PATH, env_value),
+            patch.object(CudaPlatform, "is_sm120", classmethod(lambda cls: sm120)),
         ):
             return CudaPlatform.get_modelopt_flashinfer_fp4_backend()
     finally:

@@ -20,6 +20,7 @@ LFM2-VL is a vision-language model that combines:
 """
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -31,8 +32,8 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -170,15 +171,20 @@ class Lfm2VlForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        result = pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        result = pad_mm_tokens(input_ids, mm_inputs)
         return result
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.model.embed_tokens
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        # Lfm2ForCausalLM applies the HF-layer-k -> "before layer k+1" shift.
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process images through vision tower and projector.

@@ -24,17 +24,19 @@ Usage:
 """
 
 import multiprocessing as mp
-import os
 import unittest
 
 import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.lora_utils import assert_lora_matches_trainer_logprobs
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=107, stage="weekly", runner_config="4-gpu-b200")
+register_amd_ci(est_time=180, suite="extra-b-test-4-gpu-amd")
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
@@ -43,31 +45,14 @@ MAX_LORA_RANK = 32
 TP_SIZE = 4
 MOE_RUNNER_BACKEND = "triton"
 EXPERTS_SHARED_OUTER_LORAS = True
-PREFILL_ATTENTION_BACKEND = "fa4"
-DECODE_ATTENTION_BACKEND = "fa4"
+ATTENTION_BACKEND = "triton" if is_hip() else "flashinfer"
+PREFILL_ATTENTION_BACKEND = "triton" if is_hip() else "fa4"
+DECODE_ATTENTION_BACKEND = "triton" if is_hip() else "fa4"
 
 KL_THRESHOLD = 5e-3
 
 
-def kl_v2(a, b):
-    a = torch.tensor(a) if not torch.is_tensor(a) else a
-    b = torch.tensor(b) if not torch.is_tensor(b) else b
-    return (((a - b) ** 2) * 0.5).mean().item()
-
-
-def get_prompt_logprobs(engine, input_ids, lora_path):
-    out = engine.generate(
-        input_ids=input_ids,
-        sampling_params={"max_new_tokens": 0, "temperature": 0.0},
-        return_logprob=True,
-        logprob_start_len=0,
-        lora_path=lora_path,
-    )
-    return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
-
-
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
-
     def test_lora_gpt_oss_20b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,
@@ -81,7 +66,7 @@ class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
             max_lora_rank=MAX_LORA_RANK,
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
-            attention_backend="flashinfer",
+            attention_backend=ATTENTION_BACKEND,
             moe_runner_backend=MOE_RUNNER_BACKEND,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
@@ -89,45 +74,9 @@ class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
         )
 
         try:
-            cdata = torch.load(
-                os.path.join(adapter_path, "compare_sample_train_data.pt"),
-                weights_only=False,
+            assert_lora_matches_trainer_logprobs(
+                self, engine, adapter_path, KL_THRESHOLD
             )
-
-            base_logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=None)
-            logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path="my_lora")
-
-            base_t = torch.tensor(base_logprobs)
-            lora_t = torch.tensor(logprobs)
-            diff = (base_t - lora_t).abs()
-            print(
-                f"[VERIFY] base vs lora: mean_diff={diff.mean().item():.6f}, "
-                f"max_diff={diff.max().item():.6f}, "
-                f"identical={torch.equal(base_t, lora_t)}"
-            )
-
-            self.assertFalse(
-                torch.equal(base_t, lora_t),
-                "LoRA logprobs should differ from base model logprobs",
-            )
-
-            kl_sglang_trainer = kl_v2(cdata["training_logprobs"], logprobs)
-            kl_orig_trainer = kl_v2(
-                cdata["training_logprobs"], cdata["sampling_logprobs"]
-            )
-            kl_sglang_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
-
-            print(f"KL(orig_sampler, trainer) = {kl_orig_trainer:.6e}")
-            print(f"KL(sglang, trainer)       = {kl_sglang_trainer:.6e}")
-            print(f"KL(sglang, orig_sampler)  = {kl_sglang_orig:.6e}")
-
-            self.assertLessEqual(
-                kl_sglang_trainer,
-                KL_THRESHOLD,
-                f"KL(sglang, trainer) = {kl_sglang_trainer:.6e} exceeds "
-                f"threshold {KL_THRESHOLD}",
-            )
-
         finally:
             engine.shutdown()
 

@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
+from sglang.srt.distributed.communication_op import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
@@ -31,10 +31,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend, post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -44,7 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -128,6 +125,7 @@ class HYV3MoEFused(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
             use_grouped_topk=True,
             num_expert_group=1,
             topk_group=1,
@@ -161,6 +159,7 @@ class HYV3MoEFused(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -209,17 +208,7 @@ class HYV3MoEFused(nn.Module):
                 hidden_states=hidden_states, topk_output=topk_output
             )
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
@@ -246,17 +235,7 @@ class HYV3MoEFused(nn.Module):
             shared_output = self._reduce_mori_shared_output(shared_output)
         final_hidden_states = final_hidden_states + shared_output
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False,
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 

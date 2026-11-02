@@ -7,18 +7,13 @@ Compares three providers across a batch-size sweep:
   - ``triton``:    the BLOCK-tiled Triton kernel (SM<90 fallback path).
 """
 
-import itertools
-from typing import Tuple
-
 import torch
 import triton
-import triton.testing
 
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
-    DEFAULT_QUANTILES,
-    get_benchmark_range,
 )
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
@@ -50,62 +45,38 @@ def _triton_baseline(kv_buffer, loc, cache_k_nope, cache_k_rope):
         cache_k_rope.stride(0),
         nope_dim,
         rope_dim,
-        BLOCK=BLOCK,
-        DCP_RANK=0,
-        DCP_WORLD_SIZE=1,
-        **pdl_kwargs,
+        BLOCK=BLOCK,  # type: ignore
+        DCP_RANK=0,  # type: ignore
+        DCP_WORLD_SIZE=1,  # type: ignore
+        **pdl_kwargs,  # type: ignore
     )
 
 
-NUM_LAYERS = 8
-CACHE_SIZE = (2 * 1024 * 1024) // NUM_LAYERS
-
+# 2M elements
+CACHE_SIZE = 2 * 1024 * 1024
 NOPE_DIM = 512
 ROPE_DIM = 64
 
-BS_RANGE = get_benchmark_range(
-    full_range=[1, 8, 32, 128, 512, 1024, 2048, 4096, 8192, 16384],
-    ci_range=[1, 128, 2048, 4096, 8192],
-)
 
-LINE_VALS = ["wrapper", "jit_tma", "triton"]
-LINE_NAMES = ["Wrapper (auto)", "JIT TMA bulk-store", "Triton (BLOCK=128 baseline)"]
-STYLES = [("blue", "-"), ("green", "--"), ("red", "-.")]
-X_NAMES = ["batch_size"]
-CONFIGS = list(itertools.product(BS_RANGE))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=X_NAMES,
-        x_vals=CONFIGS,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="set-mla-kv-buffer-performance",
-        args={},
-    )
-)
-def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
+@marker.parametrize("batch_size", marker.range(15, pattern="pow2"), [1, 128, 8192])
+@marker.benchmark("provider", ["wrapper", "jit_tma", "triton"])
+def benchmark(batch_size: int, provider: str):
     cache_k_nope = torch.randn(
-        (NUM_LAYERS, batch_size, 1, NOPE_DIM),
+        (batch_size, 1, NOPE_DIM),
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
     cache_k_rope = torch.randn(
-        (NUM_LAYERS, batch_size, 1, ROPE_DIM),
+        (batch_size, 1, ROPE_DIM),
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
     kv_buffer = torch.randn(
-        (NUM_LAYERS, CACHE_SIZE, 1, NOPE_DIM + ROPE_DIM),
+        (CACHE_SIZE, 1, NOPE_DIM + ROPE_DIM),
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
     loc = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
-    torch.cuda.synchronize()
 
     FN_MAP = {
         "wrapper": sglang_wrapper,
@@ -113,20 +84,14 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
         "triton": _triton_baseline,
     }
 
-    def fn():
-        impl = FN_MAP[provider]
-        for i in range(NUM_LAYERS):
-            impl(kv_buffer[i], loc, cache_k_nope[i], cache_k_rope[i])
-
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-        fn, quantiles=DEFAULT_QUANTILES
-    )
-    return (
-        1000 * ms / NUM_LAYERS,
-        1000 * max_ms / NUM_LAYERS,
-        1000 * min_ms / NUM_LAYERS,
+    return marker.do_bench(
+        FN_MAP[provider],
+        input_args=(kv_buffer, loc, cache_k_nope, cache_k_rope),
+        graph_clone_args=(1, 2, 3),
+        memory_args=(loc, cache_k_nope, cache_k_rope),
+        memory_output=(cache_k_nope, cache_k_rope),
     )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()

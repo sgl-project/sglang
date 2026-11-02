@@ -7,6 +7,9 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
@@ -16,11 +19,16 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -279,11 +287,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
-        uses = [
+        # forward decodes the audio first so the MP4 encoder can start with it
+        return [
+            ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype),
             ComponentUse(stage_name, "video_vae", target_dtype=video_vae_dtype),
         ]
-        uses.append(ComponentUse(stage_name, "audio_vae", target_dtype=audio_vae_dtype))
-        return uses
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -299,7 +307,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self, batch: OutputBatch, server_args: ServerArgs
     ) -> VerificationResult:
         result = VerificationResult()
-        result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
+        if not batch.output_file_paths:
+            result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         result.add_check("audio", batch.audio, [V.is_tensor, V.with_dims(3)])
         result.add_check("audio_sample_rate", batch.audio_sample_rate, V.positive_int)
         return result
@@ -354,6 +363,64 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 "sample_rate": int(audio_vae.sample_rate),
             }
 
+    def _decode_replica_audio(
+        self, audio_latent: torch.Tensor, server_args: ServerArgs
+    ) -> tuple[torch.Tensor, int]:
+        # Audio VAE weights are replicated. Decode on replica rank 0 and broadcast
+        # only within the request's replica, excluding independent DP replicas.
+        replica_group = get_replica_group() if model_parallel_is_initialized() else None
+        is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
+        owner_exception = None
+        owner_error = None
+        audio_payload = None
+        if is_audio_owner:
+            try:
+                audio_payload = self._decode_audio(audio_latent, server_args)
+            except Exception as exc:
+                owner_exception = exc
+                owner_error = f"{type(exc).__name__}: {exc}"
+        if replica_group is not None:
+            owner_error = replica_group.broadcast_object(owner_error, src=0)
+        if owner_error is not None:
+            if owner_exception is not None:
+                raise owner_exception
+            raise RuntimeError(
+                f"MiniMax H3 audio decode failed on rank 0: {owner_error}"
+            )
+        if replica_group is not None:
+            audio_payload = replica_group.broadcast_tensor_dict(audio_payload, src=0)
+        if not isinstance(audio_payload, dict):
+            raise RuntimeError("MiniMax H3 audio decode produced no output payload")
+        audio_waveform = _required_tensor(
+            audio_payload.get("waveform"), "audio_vae.decode"
+        )
+        return audio_waveform, int(audio_payload["sample_rate"])
+
+    @staticmethod
+    def _finish_visual_frames(
+        batch: Req,
+        video_vae,
+        frames: torch.Tensor,
+        *,
+        batch_size: int,
+        runtime_owned: bool = False,
+    ) -> torch.Tensor:
+        frames = _required_tensor(
+            video_vae.processor.revert_tensor(frames, runtime_owned=runtime_owned),
+            "video_vae.processor.revert_tensor",
+        )
+        frames = _canonical_visual_video_frames(frames, batch_size=batch_size)
+        frames = _crop_to_target_canvas(batch, frames)
+        if frames.dtype != torch.float32 or not frames.is_contiguous():
+            canonical_frames = torch.empty_like(
+                frames,
+                dtype=torch.float32,
+                memory_format=torch.contiguous_format,
+            )
+            canonical_frames.copy_(frames)
+            frames = canonical_frames
+        return frames
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         _minimax_h3_decoder_task(batch)
@@ -368,6 +435,19 @@ class MiniMaxH3DecodingStage(DecodingStage):
 
         if self.video_vae is None:
             raise RuntimeError("MiniMax H3 tasks require the video_vae output decoder")
+        batch_size = int(visual_latent.shape[0])
+        audio_waveform, audio_sample_rate = self._decode_replica_audio(
+            audio_latent, server_args
+        )
+        output_audio_waveform = _canonical_output_audio_waveform(
+            audio_waveform, batch_size=batch_size
+        )
+        streamed_output_path = streamed_video_output_path(
+            batch, server_args, batch_size
+        )
+
+        visual_frames = None
+        output_file_paths = None
         with self.use_declared_component(
             component_name="video_vae",
             module=self.video_vae,
@@ -400,69 +480,50 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
-                with set_forward_context(current_timestep=0, attn_metadata=None):
-                    visual_frames = video_decode(visual_decode_latent)
-                visual_frames = selected_video_vae.processor.revert_tensor(
-                    visual_frames
+                finish_frames = functools.partial(
+                    self._finish_visual_frames,
+                    batch,
+                    selected_video_vae,
+                    batch_size=batch_size,
                 )
-                visual_frames = _required_tensor(
-                    visual_frames,
-                    "video_vae.processor.revert_tensor",
-                )
-                visual_frames = _canonical_visual_video_frames(
-                    visual_frames, batch_size=int(visual_latent.shape[0])
-                )
-                visual_frames = _crop_to_target_canvas(batch, visual_frames)
-                if (
-                    visual_frames.dtype != torch.float32
-                    or not visual_frames.is_contiguous()
-                ):
-                    canonical_frames = torch.empty_like(
-                        visual_frames,
-                        dtype=torch.float32,
-                        memory_format=torch.contiguous_format,
+                stream = None
+                decode_kwargs = {}
+                if streamed_output_path is not None:
+                    stream = EncodeWhileDecoding(
+                        streamed_output_path,
+                        batch,
+                        finish_frames,
+                        output_audio_waveform[0],
+                        audio_sample_rate,
                     )
-                    canonical_frames.copy_(visual_frames)
-                    visual_frames = canonical_frames
+                    decode_kwargs["on_frames"] = stream
+                try:
+                    with (
+                        use_vae_fast_path(
+                            selected_video_vae,
+                            quality_allows(batch.sampling_params.quality, "lossless"),
+                        ),
+                        set_forward_context(current_timestep=0, attn_metadata=None),
+                    ):
+                        decoded = video_decode(visual_decode_latent, **decode_kwargs)
+                    if stream is not None:
+                        output_file_paths = stream.finish()
+                except BaseException:
+                    if stream is not None:
+                        stream.abort()
+                    raise
+                if output_file_paths is None:
+                    # callbacks borrow slices of decoded; only the final output owns it
+                    visual_frames = finish_frames(decoded, runtime_owned=True)
+                del decoded
 
-        # Audio VAE weights are replicated. Decode on replica rank 0 and broadcast
-        # only within the request's replica, excluding independent DP replicas.
-        replica_group = get_replica_group() if model_parallel_is_initialized() else None
-        is_audio_owner = replica_group is None or replica_group.rank_in_group == 0
-        owner_exception = None
-        owner_error = None
-        audio_payload = None
-        if is_audio_owner:
-            try:
-                audio_payload = self._decode_audio(audio_latent, server_args)
-            except Exception as exc:
-                owner_exception = exc
-                owner_error = f"{type(exc).__name__}: {exc}"
-        if replica_group is not None:
-            owner_error = replica_group.broadcast_object(owner_error, src=0)
-        if owner_error is not None:
-            if owner_exception is not None:
-                raise owner_exception
-            raise RuntimeError(
-                f"MiniMax H3 audio decode failed on rank 0: {owner_error}"
+        if visual_frames is not None:
+            visual_frames = server_args.pipeline_config.post_decoding(
+                visual_frames, server_args
             )
-        if replica_group is not None:
-            audio_payload = replica_group.broadcast_tensor_dict(audio_payload, src=0)
-        if not isinstance(audio_payload, dict):
-            raise RuntimeError("MiniMax H3 audio decode produced no output payload")
-        audio_waveform = _required_tensor(
-            audio_payload.get("waveform"), "audio_vae.decode"
-        )
-        audio_sample_rate = int(audio_payload["sample_rate"])
-
-        visual_frames = server_args.pipeline_config.post_decoding(
-            visual_frames, server_args
-        )
-        output_audio_waveform = _canonical_output_audio_waveform(
-            audio_waveform, batch_size=int(visual_frames.shape[0])
-        )
         return OutputBatch(
             output=visual_frames,
+            output_file_paths=output_file_paths,
             audio=output_audio_waveform,
             audio_sample_rate=audio_sample_rate,
             trajectory_timesteps=batch.trajectory_timesteps,

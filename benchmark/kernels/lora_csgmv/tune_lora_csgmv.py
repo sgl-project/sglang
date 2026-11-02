@@ -58,9 +58,13 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.gemm.chunked_sgmv_expand import _chunked_lora_expand_kernel
-from sglang.kernels.ops.gemm.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
-from sglang.kernels.ops.gemm.lora_tuning_config import (
+from sglang.kernels.ops.lora.dense.chunked_sgmv_expand import (
+    _chunked_lora_expand_kernel,
+)
+from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
+    _chunked_lora_shrink_kernel,
+)
+from sglang.kernels.ops.lora.dense.lora_tuning_config import (
     DEFAULT_EXPAND_CONFIG,
     DEFAULT_SHRINK_CONFIG,
     get_lora_config_file_name,
@@ -286,6 +290,8 @@ def benchmark_expand_config(
             x=x,
             weights=weights,
             output=output,
+            output_stride_0=output.stride(0),
+            output_stride_1=output.stride(1),
             seg_indptr=batch_info.seg_indptr,
             weight_indices=batch_info.weight_indices,
             lora_ranks=batch_info.lora_ranks,
@@ -298,6 +304,7 @@ def benchmark_expand_config(
             MAX_RANK=max_rank,
             BLOCK_M=batch_info.max_len,
             BLOCK_N=config["BLOCK_N"],
+            SLICE_OFFSETS=(),
             BLOCK_K=config["BLOCK_K"],
             **extra_kwargs,
         )
@@ -311,6 +318,8 @@ def benchmark_expand_config(
             x=x,
             weights=weights,
             output=output,
+            output_stride_0=output.stride(0),
+            output_stride_1=output.stride(1),
             seg_indptr=batch_info.seg_indptr,
             weight_indices=batch_info.weight_indices,
             lora_ranks=batch_info.lora_ranks,
@@ -323,6 +332,7 @@ def benchmark_expand_config(
             MAX_RANK=max_rank,
             BLOCK_M=batch_info.max_len,
             BLOCK_N=config["BLOCK_N"],
+            SLICE_OFFSETS=(),
             BLOCK_K=config["BLOCK_K"],
             **extra_kwargs,
         )
@@ -364,7 +374,8 @@ def save_config(
         "sglang",
         "kernels",
         "ops",
-        "gemm",
+        "lora",
+        "dense",
         "csgmv_configs",
         version_dir,
     )
@@ -470,9 +481,9 @@ def _tune_shrink(
     device: torch.device,
 ) -> tuple:
     """Tune shrink kernel for one layer type. Returns (best_configs, results)."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Tuning SHRINK — {label} (K={K}, N={N}, slices={num_slices})")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     search = get_shrink_search_space()
     print(f"Search space: {len(search)} configs")
@@ -508,7 +519,7 @@ def _tune_shrink(
                 best_config = config
             if (i + 1) % 20 == 0:
                 print(
-                    f"  chunk={chunk_size}: {i+1}/{len(search)} tested, best={best_time:.3f}ms"
+                    f"  chunk={chunk_size}: {i + 1}/{len(search)} tested, best={best_time:.3f}ms"
                 )
 
         best_configs[chunk_size] = sort_config(best_config)
@@ -533,9 +544,9 @@ def _tune_expand(
     device: torch.device,
 ) -> tuple:
     """Tune expand kernel for one layer type. Returns (best_configs, results)."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Tuning EXPAND — {label} (output_dim={output_dim}, slices={num_slices})")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     search = get_expand_search_space()
     print(f"Search space: {len(search)} configs")
@@ -584,7 +595,7 @@ def _tune_expand(
                 best_config = config
             if (i + 1) % 50 == 0:
                 print(
-                    f"  chunk={chunk_size}: {i+1}/{len(search)} tested, best={best_time:.3f}ms"
+                    f"  chunk={chunk_size}: {i + 1}/{len(search)} tested, best={best_time:.3f}ms"
                 )
 
         best_configs[chunk_size] = sort_config(best_config)
@@ -673,9 +684,9 @@ def main(args: argparse.Namespace):
             )
 
     # --- Summary ---
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"SUMMARY")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(
         f"\n{'layer':<10} {'kernel':<8} {'K/dim':>6} {'chunk':>6}"
         f" {'baseline':>10} {'tuned':>10} {'speedup':>8}  config"

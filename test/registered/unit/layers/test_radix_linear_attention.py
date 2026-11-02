@@ -6,10 +6,12 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.radix_linear_attention as radix_linear_attention
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
@@ -66,6 +68,125 @@ class _PhysicalAttentionBackend:
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
+    def test_graph_dispatch_distinguishes_prefill_decode_and_verify(self):
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        for mode, extend, verify in (
+            ("prefill", True, False),
+            ("decode", False, False),
+            ("verify", True, True),
+        ):
+            for breakable, full in ((False, False), (True, False), (False, True)):
+                batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(
+                        is_extend=lambda: extend,
+                        is_target_verify=lambda: verify,
+                        is_extend_without_speculative=lambda: extend and not verify,
+                    ),
+                    global_num_token_non_padded_cpu=3,
+                    out_cache_loc=torch.arange(3),
+                )
+                with (
+                    self.subTest(mode=mode, breakable=breakable, full=full),
+                    prefill_graph_scope(full_graph=full),
+                    patch.object(
+                        radix_linear_attention,
+                        "is_in_breakable_cuda_graph",
+                        return_value=breakable,
+                    ),
+                    patch.object(
+                        radix_linear_attention,
+                        "is_in_full_prefill_graph",
+                        return_value=full,
+                    ),
+                    patch.object(
+                        radix_linear_attention,
+                        "get_attn_backend",
+                        return_value=_FakeAttentionBackend(),
+                    ),
+                    patch.object(
+                        radix_linear_attention,
+                        "_linear_extend_in_graph",
+                        return_value=False,
+                    ),
+                    patch.object(layer, "_eager_linear_attention") as eager,
+                ):
+                    layer.forward(
+                        batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2)
+                    )
+                    self.assertEqual(
+                        eager.called, extend and (full or (breakable and not verify))
+                    )
+
+    def test_decode_bcg_without_prefill_scope_uses_backend(self):
+
+        layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DLLM_EXTEND,
+        ):
+            batch = SimpleNamespace(
+                forward_mode=mode,
+                global_num_token_non_padded_cpu=3,
+                out_cache_loc=torch.arange(3),
+            )
+            with (
+                self.subTest(mode=mode),
+                patch.object(
+                    radix_linear_attention,
+                    "is_in_breakable_cuda_graph",
+                    return_value=True,
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "get_attn_backend",
+                    return_value=_FakeAttentionBackend(),
+                ),
+                patch.object(layer, "_eager_linear_attention") as eager,
+            ):
+                out = layer(
+                    batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2)
+                )
+                eager.assert_not_called()
+                torch.testing.assert_close(out, torch.full((1, 3, 2, 4), 5.0))
+
+    def test_linear_extend_in_graph_does_not_create_an_eager_break(self):
+        layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_extend_without_speculative=lambda: True,
+            ),
+            global_num_token_non_padded_cpu=3,
+            out_cache_loc=torch.arange(3),
+        )
+        with (
+            prefill_graph_scope(full_graph=False),
+            patch.object(
+                radix_linear_attention, "is_in_breakable_cuda_graph", return_value=True
+            ),
+            patch.object(
+                radix_linear_attention, "_linear_extend_in_graph", return_value=True
+            ),
+            patch.object(
+                radix_linear_attention,
+                "get_attn_backend",
+                return_value=_FakeAttentionBackend(),
+            ),
+            patch.object(layer, "_eager_linear_attention") as eager,
+        ):
+            out = layer(batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2))
+        eager.assert_not_called()
+        torch.testing.assert_close(out, torch.full((1, 3, 2, 4), 5.0))
+
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
             layer_id=0,
@@ -79,15 +200,15 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -119,15 +240,15 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_TargetVerifyMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -158,15 +279,15 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
         original_out_cache_loc = torch.arange(5)
         forward_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
-            num_token_non_padded_cpu=3,
+            global_num_token_non_padded_cpu=3,
             out_cache_loc=original_out_cache_loc,
         )
 
         with (
             patch.object(
                 radix_linear_attention,
-                "get_tc_piecewise_forward_context",
-                return_value=None,
+                "is_in_full_prefill_graph",
+                return_value=False,
             ),
             patch.object(
                 radix_linear_attention,
@@ -189,7 +310,7 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             with self.subTest(padded_num_tokens=padded_num_tokens):
                 original_out_cache_loc = torch.arange(padded_num_tokens)
                 forward_batch = SimpleNamespace(
-                    num_token_non_padded_cpu=3,
+                    global_num_token_non_padded_cpu=3,
                     out_cache_loc=original_out_cache_loc,
                 )
                 context = SimpleNamespace(
@@ -201,8 +322,8 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                 with (
                     patch.object(
                         radix_linear_attention,
-                        "get_tc_piecewise_forward_context",
-                        return_value=context,
+                        "is_in_full_prefill_graph",
+                        return_value=True,
                     ),
                     patch.object(
                         radix_linear_attention,
@@ -210,12 +331,13 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                         return_value=_FakeAttentionBackend(),
                     ),
                 ):
-                    radix_linear_attention._unified_linear_attention_with_output_impl(
+                    radix_linear_attention._linear_attention_with_output_impl(
                         mixed_qkv=torch.zeros((padded_num_tokens, 8)),
                         a=torch.zeros((padded_num_tokens, 2)),
                         b=torch.zeros((padded_num_tokens, 2)),
                         output=output,
-                        layer_id=0,
+                        attention_layer=context.attention_layers[0],
+                        forward_batch=forward_batch,
                     )
 
                 torch.testing.assert_close(output[:, :3], torch.full((1, 3, 2, 4), 5.0))

@@ -13,6 +13,40 @@
 
 export const popularModels = [
   {
+    name: "Muse Spark Open",
+    vendor: "Meta",
+    href: "/cookbook/autoregressive/Meta/MuseSparkOpen",
+    logo: "/cards/logos/meta.png",
+    badge: "New",
+    tags: ["6 platforms", "SWA + full attention", "NVFP4 / MXFP4 / BF16 / INT4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Muse Spark Open on SGLang",
+      blurb:
+        "Meta's open Muse Spark model \u2014 a hybrid of 46 sliding-window (2,048-token) and 16 full-attention layers, with image and video input, DFlash V2 speculative decoding, and EPD / PD disaggregation. Recipes cover B300, GB300, B200, H200, AMD MI355X, and Intel Xeon, plus an SWA-ratio calculator for sizing the KV pools.",
+      tags: ["46 SWA + 16 full-attn layers", "Up to 1M context", "NVIDIA + AMD + Xeon"],
+      cta: "Open the Muse Spark Open cookbook",
+      caption: "Muse Spark Open deployment guide",
+    },
+  },
+  {
+    name: "DeepSeek-V4.1-Flash",
+    vendor: "DeepSeek",
+    href: "/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
+    logo: "/cards/logos/deepseek.png",
+    badge: "New",
+    tags: ["5 platforms", "Engram + DSpark", "FP8 dense / FP4 MoE"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet DeepSeek-V4.1 Flash on SGLang",
+      blurb:
+        "DeepSeek's sparse-attention Mixture-of-Experts model, served through SGLang's `dsv4` backend \u2014 pairing multi-ratio compressed KV pools behind FlashMLA with a learned sparse index that picks a top-512 candidate set per query, an mHC mixing stage, and Engram, an n-gram hash memory whose two fp8 tables are roughly 40% of the checkpoint. It ships DSpark, its own three-stage speculative draft. Recipes cover GB300, H200, B200, B300 and AMD MI350X.",
+      tags: ["384 experts / top-6", "Sparse index + Engram", "NVIDIA + AMD"],
+      cta: "Open the DeepSeek-V4.1 Flash cookbook",
+      caption: "DeepSeek-V4.1 Flash deployment guide",
+    },
+  },
+  {
     name: "Qwen3.8-Flash-Next",
     vendor: "Qwen",
     href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
@@ -61,23 +95,6 @@ export const popularModels = [
       tags: ["Video + synced audio", "4–15 s at 24 fps", "8× B200 → 2× RTX 5090"],
       cta: "Open the MiniMax-H3 cookbook",
       caption: "MiniMax-H3 deployment guide",
-    },
-  },
-  {
-    name: "Kimi-K3",
-    vendor: "Moonshot AI",
-    href: "/cookbook/autoregressive/Moonshotai/Kimi-K3",
-    logo: "/cards/logos/moonshotai.png",
-    badge: "New",
-    tags: ["8 platforms", "PD disagg", "DSPARK"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet Kimi-K3 on SGLang",
-      blurb:
-        "SGLang natively implements and deeply optimizes K3's new architecture with fused KDA decode kernels, DP attention, MTP, PD disaggregation, and KDA-aware prefix caching. Kimi-K3 is supported on both NVIDIA and AMD GPUs.",
-      tags: ["2.8T parameters", "Fused KDA decode", "NVIDIA + AMD"],
-      cta: "Open the Kimi-K3 cookbook",
-      caption: "Kimi-K3 deployment guide",
     },
   },
 ];

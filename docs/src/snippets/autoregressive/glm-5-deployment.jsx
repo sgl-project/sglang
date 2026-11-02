@@ -199,7 +199,7 @@ export const GLM5Deployment = () => {
     }
 
     if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
       if (hardware === 'b300') {
         cmd += ' \\\n  --cuda-graph-max-bs-decode 256';
       }

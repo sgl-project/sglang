@@ -18,13 +18,16 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=360,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="Temporarily disabled until Triton-XPU upgrade",
+    suite="nightly-xpu-kernel-main-1-gpu",
+    nightly=True,
+)
+register_xpu_ci(
+    est_time=360,
+    suite="nightly-xpu-kernel-wheel-1-gpu",
+    nightly=True,
 )
 
 
-# TODO: Temporarily disable this test and re-enable it after Triton-XPU is upgraded.
-@unittest.skip("Temporarily disabled until Triton-XPU upgrade")
 class TestDeepSeekOCRTriton(TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):

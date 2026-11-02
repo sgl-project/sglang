@@ -47,7 +47,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.mm_utils import (
     get_anyres_image_grid_shape,
@@ -473,14 +472,15 @@ class LlavaBaseForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
+        device = next(self.language_model.parameters()).device
         if "clip" in vision_path:
             self.vision_tower = CLIPVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(device)
         elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(device)
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()
@@ -603,6 +603,9 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # mistral.py subclasses LlavaForConditionalGeneration from this module
+        from sglang.srt.models.mistral import MistralForCausalLM
+
         super().__init__()
 
         self.config = config
@@ -649,7 +652,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     def dtype(self):
         return self.torch_dtype
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
         else:
@@ -803,16 +806,22 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        # Requesting hidden states materialises one tensor per layer (~1.8 GiB per
+        # 1540px image); the plain forward returns the same tensor as the last entry.
+        last_layer_only = self.vision_feature_layer == -1
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = item.feature, item.image_sizes
-            image_outputs = self.vision_tower(
-                pixel_values, image_sizes, output_hidden_states=True
-            )
-            selected_image_feature = image_outputs.hidden_states[
-                self.vision_feature_layer
-            ]
+            if last_layer_only:
+                selected_image_feature = self.vision_tower(pixel_values, image_sizes)
+            else:
+                image_outputs = self.vision_tower(
+                    pixel_values, image_sizes, output_hidden_states=True
+                )
+                selected_image_feature = image_outputs.hidden_states[
+                    self.vision_feature_layer
+                ]
 
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]

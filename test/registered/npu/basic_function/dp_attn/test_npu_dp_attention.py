@@ -4,9 +4,11 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.e2e.test_npu_performance_utils import (
+    MOONLIGHT_16B_A3B_MODEL_PATH,
+)
 from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
-    DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH,
     IMAGES_EXAMPLE_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
@@ -23,8 +25,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="base-b-test-4-npu-a3",
+)
+register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -40,9 +45,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
-            True
-        )
+        cls._env_override = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True)
         cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
@@ -52,15 +55,11 @@ class TestDPAttentionDP2TP2(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--attention-backend",
                 "ascend",
                 "--disable-cuda-graph",
-                "--enable-torch-compile",
-                "--torch-compile-max-bs",
-                "2",
             ],
         )
 
@@ -74,11 +73,16 @@ class TestDPAttentionMixedChunk(
     CustomTestCase,
     NPUGSM8KMixin,
 ):
-    gsm8k_accuracy_thres = 0.34
+    # Use full GSM8K dataset to avoid sampling variance.
+    gsm8k_num_examples = 1319
+    # evalscope is the harness the 0.83 Moonlight bf16 baseline was calibrated
+    # with (4-shot chat, temperature 1.0).
+    gsm8k_accuracy_thres = 0.83
+    gsm8k_backend = "evalscope"
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH
+        cls.model = MOONLIGHT_16B_A3B_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -88,8 +92,7 @@ class TestDPAttentionMixedChunk(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--enable-mixed-chunk",
                 "--chunked-prefill-size",
@@ -112,7 +115,7 @@ class TestDPRetract(
 ):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH
+        cls.model = MOONLIGHT_16B_A3B_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -122,8 +125,7 @@ class TestDPRetract(
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--max-total-tokens",
                 "4500",
@@ -160,8 +162,7 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--attention-backend",
                 "ascend",

@@ -26,7 +26,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendGGUF(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -61,7 +60,7 @@ class TestAscendGGUF(CustomTestCase):
                         num_questions=1319,
                         max_new_tokens=512,
                         parallel=128,
-                        host=f"http://{self.url.hostname}",
+                        host=self.url.hostname,
                         port=int(self.url.port),
                     )
 

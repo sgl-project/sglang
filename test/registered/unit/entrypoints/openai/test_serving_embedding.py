@@ -59,7 +59,7 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 # Mock TokenizerManager for embedding tests
@@ -97,6 +97,7 @@ class _MockTemplateManager:
         self.chat_template_name = None  # None for embeddings usually
         self.jinja_template_content_format = "openai"
         self.completion_template_name = None
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingEmbeddingTestCase(unittest.TestCase):

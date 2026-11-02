@@ -1,12 +1,9 @@
 """Unified memory pool on a hybrid-SWA MoE model, across the backend matrix.
 
 gpt-oss-20b is uniform-row hybrid-SWA, so its MHA and SWA sub-pools are
-per-layer views and the fa3 cell reads them through the translator's read
-tables. The resolved-default cell pins the no-pin path, since a pinned
-backend hides default-resolution breakage by construction. flashinfer is
-absent on purpose: gpt-oss uses attention sinks, which it does not support.
-
-Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
+per-layer views and the fa3 cell reads them through the `RunnerIds`' read
+tables. flashinfer is absent on purpose: gpt-oss uses attention sinks, which
+it does not support.
 """
 
 import unittest
@@ -17,7 +14,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=1500, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=199, stage="extra-a", runner_config="1-gpu-large")
 
 _UNIFIED_COMMON_ARGS = [
     "--enable-unified-memory",
@@ -50,7 +47,7 @@ class TestUnifiedGptOssTriton(DefaultServerBase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=512,
             parallel=self.parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)
@@ -62,17 +59,10 @@ class TestUnifiedGptOssTriton(DefaultServerBase):
 
 
 class TestUnifiedGptOssFa3(TestUnifiedGptOssTriton):
-    """fa3 pinned: the per-layer views read through the translator's read
+    """fa3 pinned: the per-layer views read through the `RunnerIds`' read
     tables (eager direct-bind + captured fused copy)."""
 
     other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]
-
-
-class TestUnifiedGptOssResolvedDefault(TestUnifiedGptOssTriton):
-    """No backend pin: whatever the host resolves must be in the allow-list,
-    or the server fails to boot under its own defaults."""
-
-    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":

@@ -77,13 +77,19 @@ class DSV4ReqToTokenTablesMixin:
         release C128 KV pages."""
         self._dsv4_allocator = allocator
 
+    def get_dsv4_c4_state_ring_size(self) -> int:
+        """Return the local C4 state-ring size used by the NPU KV pool."""
+        if self._dsv4_allocator is None:
+            raise RuntimeError("DSV4 allocator is not registered")
+        return self._dsv4_allocator.get_kvcache().get_ring_size(4)
+
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
         """Install pages returned by a Radix match.
 
         Prefix matching can happen before a request slot is allocated, so the
         page ids are temporarily carried by ``Req`` and installed by ``alloc``.
         """
-        if req.kv.req_pool_idx is None:
+        if not req.kv.holds_kv:
             req.c128_prefix_page_ids = page_ids
             return
         self._dsv4_allocator.replace_req_c128_prefix(
@@ -91,7 +97,7 @@ class DSV4ReqToTokenTablesMixin:
         )
 
     def alloc(self, reqs):
-        fresh = [req.kv.req_pool_idx is None for req in reqs]
+        fresh = [not req.kv.holds_kv for req in reqs]
         indices = super().alloc(reqs)
         if indices is None:
             return None

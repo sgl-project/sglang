@@ -8,9 +8,12 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
+    SamplingParams,
     _sanitize_filename,
 )
-from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.utils import expand_path_fields
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -21,6 +24,7 @@ class ActionSamplingParams:
     """Sampling parameters for policies that generate continuous actions."""
 
     data_type: DataType = DataType.ACTION
+    task_type: ModelTaskType = ModelTaskType.VLA_ACTION
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
     prompt: str | list[str] | None = field(
         default="", metadata={"batch_sig_exclude": True}
@@ -62,15 +66,7 @@ class ActionSamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
-    def build_request_extra(self) -> dict[str, Any]:
-        extra = {}
-        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
-        if diffusers_kwargs:
-            extra["diffusers_kwargs"] = diffusers_kwargs
-        explicit_fields = getattr(self, "_explicit_fields", None)
-        if explicit_fields is not None:
-            extra["explicit_fields"] = sorted(explicit_fields)
-        return extra
+    build_request_extra = SamplingParams.build_request_extra
 
     def apply_request_extra(self, req: Any) -> None:
         req.extra.update(self.build_request_extra())
@@ -118,13 +114,15 @@ class ActionSamplingParams:
             )
 
     def _validate_with_pipeline_config(self, pipeline_config):
-        if not pipeline_config.task_type.is_action_gen():
+        task_type = pipeline_config.resolve_task_type(self.task_type)
+        if not task_type.is_action_gen():
             raise ValueError(
-                f"ActionSamplingParams requires an ACTION pipeline, got {pipeline_config.task_type.name}"
+                f"ActionSamplingParams requires an ACTION pipeline, got {task_type.name}"
             )
 
     def _adjust(self, server_args: "ServerArgs"):
         expand_path_fields(self)
+        self._validate_with_pipeline_config(server_args.pipeline_config)
         self.data_type = DataType.ACTION
         self.return_file_paths_only = False
         if self.output_path is None and server_args.output_path is not None:

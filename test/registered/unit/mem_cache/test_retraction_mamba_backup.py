@@ -3,10 +3,11 @@ import unittest
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MAMBA_STATE = object()
 
@@ -23,17 +24,17 @@ class _MambaPool:
 
 
 class _Allocator:
-    def __init__(self, carries_mamba: bool):
-        self._kv = type("_KV", (), {"cpu_copy_carries_mamba": carries_mamba})()
+    def __init__(self, carries_mamba: bool, state):
+        self.cpu_copy_carries_mamba = carries_mamba
+        self.state = state
         self.loaded_kv = None
 
-    def get_kvcache(self):
-        return self._kv
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return "kv"
 
-    def load_cpu_copy(self, cpu_tensors, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cpu_tensors, indices, mamba_indices=None, req_pool_index=None
+    ):
         self.loaded_kv = cpu_tensors
 
 
@@ -46,6 +47,7 @@ def _req_and_pool():
 
     pool = object.__new__(HybridReqToTokenPool)
     pool.req_to_token = torch.zeros(1, 8, dtype=torch.int64)
+    pool.state = StateStorage.empty("mamba")
     pool.mamba_pool = _MambaPool()
     return req, pool
 
@@ -56,7 +58,7 @@ class TestRetractionMambaBackup(unittest.TestCase):
         retracted request whose recurrent state is not backed up separately
         resumes on whatever state the reused slot happens to hold."""
         req, pool = _req_and_pool()
-        allocator = _Allocator(carries_mamba=False)
+        allocator = _Allocator(carries_mamba=False, state=pool.state)
 
         req.offload_kv_cache(pool, allocator)
         self.assertIs(req.kv.retraction_backup.mamba_cpu, MAMBA_STATE)
@@ -66,7 +68,7 @@ class TestRetractionMambaBackup(unittest.TestCase):
 
     def test_state_is_not_copied_twice_when_the_kv_pool_carries_it(self):
         req, pool = _req_and_pool()
-        allocator = _Allocator(carries_mamba=True)
+        allocator = _Allocator(carries_mamba=True, state=pool.state)
 
         req.offload_kv_cache(pool, allocator)
         self.assertIsNone(req.kv.retraction_backup.mamba_cpu)
