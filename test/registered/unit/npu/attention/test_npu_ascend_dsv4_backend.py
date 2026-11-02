@@ -17,8 +17,9 @@ register_npu_ci(est_time=4, suite="base-a-test-npu")
 for mod in (
     "torch_npu",
     "torch_npu.contrib",
-    "cann_ops_transformer",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.dsv4",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.kvcacheio",
@@ -58,6 +59,8 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
+# Pin the kernel layout descriptor so the tests stay hermetic.
+from sglang.srt.hardware_backend.npu.attention import ascend_dsv4_backend as _backend
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -80,12 +83,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
 
-# Pin the op probes so the tests stay hermetic.
-_NPU_UTILS_ARCH35 = "sglang.srt.hardware_backend.npu.utils.is_npu_arch35"
-_MQSMLA_PRESENT = (MagicMock(), MagicMock(), MagicMock())
-_BACKEND_CANN_OPS = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.require_cann_transformer_ops"
-_SMLA_METADATA = MagicMock()
-_SMLA_ATTN = MagicMock()
+_backend.NPU_KV_QUANT_PATH.reader_quant_mode = 1
+
+_BACKEND_NPU_OPS = (
+    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.dsv4_ops"
+)
 
 
 class TestVerifyCompressPositions(unittest.TestCase):
@@ -679,7 +681,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
                 return_value=rope,
             ),
             patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
-            patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
+            patch(_BACKEND_NPU_OPS) as npu_ops,
         ):
             npu_ops.compressor.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
@@ -699,24 +701,22 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
 
-    @patch(_BACKEND_CANN_OPS, return_value=_MQSMLA_PRESENT)
-    @patch(_NPU_UTILS_ARCH35, return_value=True)
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, *_, **__):
+    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _, ops):
         metadata_op, attn_op = _sparse_attn_ops()
-        self.assertIs(metadata_op, _MQSMLA_PRESENT[0])
-        self.assertIs(attn_op, _MQSMLA_PRESENT[1])
+        self.assertIs(metadata_op, ops.mixed_quant_sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.mixed_quant_sparse_flash_mla)
         self.assertEqual(
             _sparse_attn_kv_quant_kwargs(), {"quant_mode": 1, "rope_head_dim": 64}
         )
 
-    @patch(_BACKEND_CANN_OPS, return_value=(_SMLA_METADATA, _SMLA_ATTN))
-    @patch(_NPU_UTILS_ARCH35, return_value=False)
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
-    def test_pre_arch35_uses_the_smla_pair_without_quant_kwargs(self, *_, **__):
+    def test_pre_arch35_uses_the_smla_pair_without_quant_kwargs(self, _, ops):
         metadata_op, attn_op = _sparse_attn_ops()
-        self.assertIs(metadata_op, _SMLA_METADATA)
-        self.assertIs(attn_op, _SMLA_ATTN)
+        self.assertIs(metadata_op, ops.sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.sparse_flash_mla)
         self.assertEqual(_sparse_attn_kv_quant_kwargs(), {})
 
 
@@ -730,22 +730,10 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
 
         for is_arch35 in (False, True):
-            mqsmla_ops = (MagicMock(), MagicMock(), MagicMock())
-            smla_ops = (MagicMock(), MagicMock())
-            qli_ops = (MagicMock(), MagicMock())
             with (
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
-                patch(
-                    _BACKEND_CANN_OPS,
-                    side_effect=lambda *names: (
-                        mqsmla_ops
-                        if names[0] == "mixed_quant_sparse_flash_mla_metadata"
-                        else smla_ops
-                        if names[0] == "sparse_flash_mla_metadata"
-                        else qli_ops
-                    ),
-                ),
+                patch(_BACKEND_NPU_OPS) as ops,
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
@@ -773,7 +761,11 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     actual_seq_lengths_kv=seqused_kv,
                 )
 
-                metadata_op = mqsmla_ops[0] if is_arch35 else smla_ops[0]
+                metadata_op = (
+                    ops.mixed_quant_sparse_flash_mla_metadata
+                    if is_arch35
+                    else ops.sparse_flash_mla_metadata
+                )
                 self.assertEqual(metadata_op.call_count, 3)
                 for call in metadata_op.call_args_list:
                     self.assertIs(call.kwargs["seqused_ori_kv"], seqused_kv)
@@ -982,6 +974,14 @@ class TestStepOutCacheLoc(unittest.TestCase):
 
 
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    def setUp(self):
+        probe = patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+            return_value=False,
+        )
+        probe.start()
+        self.addCleanup(probe.stop)
+
     @staticmethod
     def _backend(*, loc, graph_mode=False):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
@@ -1035,11 +1035,23 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
         self.assertEqual(written_kv.shape[0], 3)
         self.assertEqual(written_kv.abs().sum().item(), 0.0)
 
+    def test_arch35_keeps_slot_zero_and_skips_minus_one(self):
+        backend = self._backend(loc=torch.tensor([-1, 0, -1], dtype=torch.int32))
+        kv = torch.arange(12, dtype=torch.float32).view(3, 4)
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+            return_value=True,
+        ):
+            backend._compressor_epilog_npu(self._compressor(), kv, self._verify_batch())
+        args = backend.token_to_kv_pool.set_compress_buffer.call_args.args
+        self.assertEqual(args[1].tolist(), [0])
+        torch.testing.assert_close(args[2], kv[1:2])
+
     def test_all_slots_masked_skips_fused_indexer_write(self):
         backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
         compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
         quant_cache = MagicMock()
-        with patch(_BACKEND_CANN_OPS, return_value=(quant_cache,)):
+        with patch(_BACKEND_NPU_OPS + ".indexer_quant_cache", quant_cache):
             backend._compressor_epilog_npu(
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
