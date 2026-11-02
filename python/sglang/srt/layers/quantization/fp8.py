@@ -3014,8 +3014,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner = create_ascend_moe_runner(
                 layer,
                 moe_runner_config,
-                w13_kernel=NPUW4A8MXFP4MoEMethod(),
-                w2_kernel=NPUW4A8MXFP4MoEMethod(),
+                w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+                w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
             )
             return
 
