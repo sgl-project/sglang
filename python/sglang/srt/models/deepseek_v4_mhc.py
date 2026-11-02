@@ -534,13 +534,9 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        from sglang.srt.hardware_backend.npu.utils import (
-            require_cann_transformer_ops,
-        )
+        from sgl_kernel_npu.operators.dsv4 import mhc_post
 
-        post_op = require_cann_transformer_ops("mhc_post")[0]
-        # TND form: y[i] = post[i] * x + sum_j comb[j, i] * residual[j].
-        return post_op(residual, comb, x, post_mix)
+        return mhc_post(x, residual, post_mix, comb)
 
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops
