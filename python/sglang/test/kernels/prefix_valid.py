@@ -29,21 +29,18 @@ def assert_bytes_equal(actual, expected, label):
 
 
 @contextmanager
-def assert_prefix_commit(
-    k, v, k_cache, v_cache, loc, lengths, k_scale, v_scale, *, inputs_mutated=False
-):
+def assert_prefix_commit(k, v, k_cache, v_cache, loc, lengths, k_scale, v_scale):
     """Check the whole cache (including untouched slots) against eager division."""
     rows = torch.arange(loc.shape[1], device=loc.device)
     valid = (rows[None, :] < lengths[:, None]).reshape(-1)
     src = torch.nonzero(valid, as_tuple=False).flatten()
     dst = loc.reshape(-1)[src].long()
     before = (k.clone(), v.clone())
-    scaled, expected = [], []
+    expected = []
     for source, cache, scale in zip(before, (k_cache, v_cache), (k_scale, v_scale)):
         value = source.clone()
         if scale is not None:
             value.div_(scale)
-        scaled.append(value)
         target = cache.contiguous().view(torch.uint8).clone()
         # The commit path saturates out-of-range values rather than reproducing
         # the eager cast, which returns NaN on float8_e4m3fnuz. See #42981.
@@ -61,7 +58,5 @@ def assert_prefix_commit(
         ("K cache", "V cache"), (k_cache, v_cache), expected
     ):
         assert_bytes_equal(cache, reference, label)
-    for label, source, reference in zip(
-        ("K input", "V input"), (k, v), scaled if inputs_mutated else before
-    ):
+    for label, source, reference in zip(("K input", "V input"), (k, v), before):
         assert_bytes_equal(source, reference, label)
