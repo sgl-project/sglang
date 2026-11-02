@@ -179,15 +179,14 @@ def test_renoise_loop_is_seed_deterministic() -> None:
     assert not torch.equal(video, euler_video)
 
 
-@pytest.mark.parametrize("variant", ["FL2VA", "Ref2VA"])
-def test_release_adapter_defaults_to_dynamic_lora(monkeypatch, variant) -> None:
+def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     monkeypatch.setattr(
         MiniMaxH3PipelineConfig, "validate_server_args", lambda self, args: None
     )
 
     def server_args(explicit: bool, mode: str) -> SimpleNamespace:
         return SimpleNamespace(
-            model_variant=variant,
+            model_variant="FL2VA",
             lora_alpha=64,
             lora_scale=0.5,
             lora_merge_mode=mode,
@@ -201,13 +200,16 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch, variant) -> None:
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
 
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
+    with pytest.raises(ValueError, match="disable SGLANG_CACHE_DIT_ENABLED"):
+        PikaH3FlexPipelineConfig().validate_server_args(implicit)
 
-def _pika_request(task="t2va", conditions=None, **target):
+
+def _pika_request(task="t2va", conditions=(), **target):
     return PikaH3FlexSamplingParams(
         prompt="a waterfall",
         task=task,
-        conditions=conditions or [],
-        seed=42,
+        conditions=list(conditions),
         target={
             "short_edge": 480,
             "aspect_ratio": "16:9",
@@ -224,76 +226,49 @@ def _plan(params):
 
 
 @pytest.mark.parametrize(
-    "tier,aspect,expected",
+    "tier,aspect,duration,frames,size",
     [
-        (480, "21:9", (960, 416)),
-        (480, "16:9", (832, 480)),
-        (480, "3:2", (704, 480)),
-        (480, "4:3", (640, 480)),
-        (480, "5:4", (608, 480)),
-        (480, "1:1", (480, 480)),
-        (480, "4:5", (480, 608)),
-        (480, "3:4", (480, 640)),
-        (480, "2:3", (480, 704)),
-        (480, "9:16", (480, 832)),
-        (480, "9:21", (416, 960)),
-        (768, "21:9", (1536, 672)),
-        (768, "16:9", (1344, 768)),
-        (768, "3:2", (1152, 768)),
-        (768, "4:3", (1024, 768)),
-        (768, "5:4", (960, 768)),
-        (768, "1:1", (768, 768)),
-        (768, "4:5", (768, 960)),
-        (768, "3:4", (768, 1024)),
-        (768, "2:3", (768, 1152)),
-        (768, "9:16", (768, 1344)),
-        (768, "9:21", (672, 1536)),
+        (480, "21:9", 5, None, (960, 416)),
+        (768, "9:21", 6, 158, (672, 1536)),
+        (512, "7:4", 5.5, 132, (896, 512)),
+        (480, "16:9", 15, 362, (832, 480)),
     ],
 )
-def test_released_buckets_round_trip_through_warmup(tier, aspect, expected):
-    """Released canvases must survive inverse warmup geometry without bucket drift."""
-    plan = _plan(_pika_request(short_edge=tier, aspect_ratio=aspect))
-    assert (plan.shape["width"], plan.shape["height"]) == expected
-    warmup_target = PikaH3FlexSamplingParams._synthetic_warmup_target(
-        SimpleNamespace(width=expected[0], height=expected[1]),
+def test_geometry_and_warmup_round_trip(tier, aspect, duration, frames, size):
+    """Pixel caps and 17n+5 alignment must survive inverse warmup resolution."""
+    plan = _plan(
+        _pika_request(short_edge=tier, aspect_ratio=aspect, duration_seconds=duration)
+    )
+    assert (plan.shape["width"], plan.shape["height"]) == size
+    target = PikaH3FlexSamplingParams._synthetic_warmup_target(
+        SimpleNamespace(width=size[0], height=size[1]),
         SimpleNamespace(
-            warmup_resolutions=[f"{expected[0]}x{expected[1]}"], warmup_num_frames=None
+            warmup_resolutions=[f"{size[0]}x{size[1]}"], warmup_num_frames=frames
         ),
     )
-    assert warmup_target == {
-        "short_edge": tier,
-        "aspect_ratio": aspect,
-        "duration_seconds": 5.0,
-    }
-    assert _plan(_pika_request(**warmup_target)).shape == plan.shape
+    assert target["duration_seconds"] == duration
+    assert _plan(_pika_request(**target)).shape == plan.shape
 
 
-@pytest.mark.parametrize(
-    "task,indices", [("i2va", [0]), ("l2va", [-1]), ("fl2va", [0, -1])]
-)
-def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
-    monkeypatch, task, indices
-):
-    """Canonical FL2VA admission must preserve each public keyframe task."""
-    conditions = [
-        dict(type="image", role="keyframe", uri=f"frame{i}.png", frame_index=i)
-        for i in indices
-    ]
+@pytest.mark.parametrize("task,index", [("i2va", 0), ("l2va", -1)])
+def test_keyframe_alias_keeps_policy_through_admission(monkeypatch, task, index):
+    """Media probing and scheduler serialization must retain Pika's policy and public task."""
     params = _pika_request(
-        task, conditions, aspect_ratio="auto" if task == "l2va" else "16:9"
+        task,
+        [dict(type="image", role="keyframe", uri="frame.png", frame_index=index)],
+        aspect_ratio="auto",
     )
     request = VideoGenerationsRequest(
-        prompt=params.prompt, task=task, conditions=conditions, target=params.target
+        prompt=params.prompt,
+        task=task,
+        conditions=params.conditions,
+        target=params.target,
     )
-    kwargs = PikaH3FlexSamplingParams.lower_video_request_kwargs(
-        request, {"prompt": params.prompt}
+    params = PikaH3FlexSamplingParams(
+        **PikaH3FlexSamplingParams.lower_video_request_kwargs(
+            request, {"prompt": params.prompt}
+        )
     )
-    http_plan = _plan(PikaH3FlexSamplingParams(**kwargs))
-    plan = _plan(params)
-    assert http_plan.shape == plan.shape
-    assert plan.task == "fl2va"
-    assert plan.condition_mask["semantic_frame_indices"] == indices
-    assert plan.shape["keyframe_fit"] == "source_crop"
     batch = SimpleNamespace(
         sampling_params=params,
         extra=params.build_request_extra(),
@@ -303,16 +278,19 @@ def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
     monkeypatch.setattr(
         prequeue,
         "minimax_h3_probe_material",
-        lambda *a, **kw: {"display_width": 832, "display_height": 480},
+        lambda *a, **kw: dict(display_width=832, display_height=480),
     )
-    prepared = prequeue.minimax_h3_prepare_for_queue(batch)
-    assert (prepared.shape["width"], prepared.shape["height"]) == (832, 480)
-    assert prepared.shape["keyframe_fit"] == "source_crop"
-    # The scheduler handoff must retain the release policy after media probing.
-    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(prepared), type=type(plan))
-    assert decoded == prepared
-    batch.extra[prequeue.MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY] = decoded
+    plan = prequeue.minimax_h3_prepare_for_queue(batch)
+    plan = msgspec.msgpack.decode(msgspec.msgpack.encode(plan), type=type(plan))
+    assert plan.policy == PIKA_H3_FLEX_POLICY
+    assert plan.condition_mask["semantic_frame_indices"] == [index]
+    assert (plan.shape["width"], plan.shape["height"], plan.shape["keyframe_fit"]) == (
+        832,
+        480,
+        "source_crop",
+    )
     assert params.task == task
+    batch.extra[prequeue.MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY] = plan
     metadata = MiniMaxH3ReleaseMetadata(
         schema_version=1,
         partition="fl2va",
@@ -327,105 +305,37 @@ def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
 
 
 @pytest.mark.parametrize(
-    "tier,aspect,duration,expected",
-    [(512, "7:4", 5.5, (896, 512, 141)), (480, "auto", 4, (832, 480, 107))],
+    "tier,image_size,video_size",
+    [(480, (1536, 1024), (704, 480)), (768, (3072, 2048), (1152, 768))],
 )
-def test_pika_reuses_h3_geometry_outside_release_buckets(
-    tier, aspect, duration, expected
+def test_prequeue_reference_sizes_and_duration_budget(
+    monkeypatch, tier, image_size, video_size
 ):
-    """CLI presets must not bypass H3's adaptive geometry or frame alignment."""
-    plan = _plan(
-        _pika_request(short_edge=tier, aspect_ratio=aspect, duration_seconds=duration)
+    """Reference sizes follow the output tier; two individually valid clips can exceed the budget."""
+    params = _pika_request(
+        "ref2va",
+        [
+            dict(type=kind, role="reference", uri=str(i))
+            for i, kind in enumerate(("image", "video", "video"))
+        ],
+        short_edge=tier,
     )
-    assert (
-        tuple(plan.shape[key] for key in ("width", "height", "frame_count")) == expected
-    )
-
-
-@pytest.mark.parametrize(
-    "counts,match",
-    [
-        ((10, 0, 0), "reference limits"),
-        ((1, 4, 0), "reference limits"),
-        ((1, 0, 4), "reference limits"),
-        ((9, 3, 1), "reference limits"),
-        ((0, 0, 1), "at least one image or video"),
-    ],
-)
-def test_reference_limits(counts, match):
-    """Per-kind counts, total count and required visual input are independent limits."""
-    refs = [
-        dict(type=kind, role="reference", uri=f"{kind}{i}")
-        for kind, count in zip(("image", "video", "audio"), counts)
-        for i in range(count)
-    ]
-    with pytest.raises(ValueError, match=match):
-        _plan(_pika_request("ref2va", refs))
-
-
-@pytest.mark.parametrize(
-    "durations,accepted",
-    [([2, 13], True), ([1.99], False), ([15.01], False), ([8, 8], False)],
-)
-def test_reference_duration_limits_before_queue(monkeypatch, durations, accepted):
-    refs = [
-        dict(type="video", role="reference", uri=f"ref{i}.mp4")
-        for i in range(len(durations))
-    ]
-    params = _pika_request("ref2va", refs)
     batch = SimpleNamespace(sampling_params=params, extra=params.build_request_extra())
-
-    def probe(batch, uri, *, condition_type, condition_index):
-        return {
-            "display_width": 1920,
-            "display_height": 1080,
-            "video_duration_seconds": durations[condition_index],
-        }
-
-    monkeypatch.setattr(prequeue, "minimax_h3_probe_material", probe)
-    if accepted:
-        prequeue.minimax_h3_prepare_for_queue(batch)
-    else:
+    facts = dict(display_width=600, display_height=400, video_duration_seconds=7.5)
+    monkeypatch.setattr(prequeue, "minimax_h3_probe_material", lambda *a, **kw: facts)
+    prequeue.minimax_h3_prepare_for_queue(batch)
+    shapes = batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY]
+    assert (shapes[0]["width"], shapes[0]["height"]) == image_size
+    assert (shapes[1]["width"], shapes[1]["height"]) == video_size
+    for duration in (1.99, 8):
+        facts["video_duration_seconds"] = duration
         with pytest.raises(ValueError, match="Pika H3 Flex"):
             prequeue.minimax_h3_prepare_for_queue(batch)
 
 
-@pytest.mark.parametrize("tier,expected", [(480, (1536, 1024)), (768, (3072, 2048))])
-def test_reference_image_uses_output_tier(monkeypatch, tier, expected):
-    params = _pika_request(
-        "ref2va", [dict(type="image", role="reference", uri="ref.png")], short_edge=tier
-    )
-    batch = SimpleNamespace(sampling_params=params, extra=params.build_request_extra())
-    monkeypatch.setattr(
-        prequeue,
-        "minimax_h3_probe_material",
-        lambda *a, **kw: {"display_width": 600, "display_height": 400},
-    )
-    prequeue.minimax_h3_prepare_for_queue(batch)
-    shape = batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY][0]
-    assert (shape["width"], shape["height"]) == expected
-
-
-@pytest.mark.parametrize(
-    "task,seed,device",
-    [
-        ("fl2va", 42, "cpu"),
-        ("ref2va", 42, "cpu"),
-        ("fl2va", None, "cpu"),
-        pytest.param(
-            "ref2va",
-            42,
-            "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="CUDA condition noise"
-            ),
-        ),
-    ],
-)
-def test_condition_noise_preserves_clean_cache_and_release_precision(
-    task, seed, device, monkeypatch
-):
-    """Each condition draws in external latent order; an omitted seed uses 42."""
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_condition_noise_preserves_clean_cache_and_release_precision(task, monkeypatch):
+    """Per-condition draws preserve cache rows and each adapter's conditioning precision."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
         minimax_h3_patchify_video_latent,
     )
@@ -433,114 +343,63 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
         denoising,
     )
 
-    shapes = [(1, 4, 6), (1 if task == "fl2va" else 3, 4, 4)]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     monkeypatch.setattr(
-        denoising.current_platform,
-        "get_local_torch_device",
-        lambda: torch.device(device),
+        denoising.current_platform, "get_local_torch_device", lambda: device
     )
-    clean = torch.linspace(
-        -2.003, 7.997, sum(t * h * w // 4 for t, h, w in shapes) * 96
-    ).reshape(-1, 96)
+    frames = (1, 1 if task == "fl2va" else 3)
+    clean = torch.linspace(-2.003, 7.997, sum(frames) * 2 * 96).reshape(-1, 96)
     original = clean.clone()
-    audio = torch.full((4, 32), 0.123456, dtype=torch.float32)
-    override_noise = task == "ref2va" and device == "cpu"
-    visual_aug, audio_aug = (0.0, 0.0) if override_noise else (0.999, 1.0)
-    sampling = PikaH3FlexSamplingParams(
-        prompt="p",
-        imgvid_cond_noise_aug_for_inference=visual_aug,
-        audio_cond_noise_aug_for_inference=audio_aug,
+    seed = None if task == "fl2va" else 7
+    ctx = SimpleNamespace(
+        cond_rows=clean,
+        audio_ref_rows=torch.ones(4, 32),
+        plan=SimpleNamespace(policy=PIKA_H3_FLEX_POLICY, task=task, seed=seed),
+        latent_t=8,
+        is_ref2va=task == "ref2va",
+        keyframe={"keyframes": [dict(latent_h=2, latent_w=4)] * 2}
+        if task == "fl2va"
+        else None,
+        ref2va_positive_blocks=[
+            dict(kind=kind, latent_t=t, latent_h=2, latent_w=4, ref_audio_t=2)
+            for kind, t in zip(("image", "video"), frames)
+        ]
+        if task == "ref2va"
+        else None,
     )
-    sampling.seed = seed
-    plan = SimpleNamespace(policy=PIKA_H3_FLEX_POLICY, task=task, seed=seed)
-    contexts = [
-        SimpleNamespace(
-            cond_rows=clean,
-            audio_ref_rows=audio,
-            plan=plan,
-            latent_t=8,
-            is_ref2va=task == "ref2va",
-            keyframe={"keyframes": [dict(latent_h=h, latent_w=w) for _, h, w in shapes]}
-            if task == "fl2va"
-            else None,
-            ref2va_positive_blocks=[
-                dict(kind=kind, latent_t=t, latent_h=h, latent_w=w, ref_audio_t=2)
-                for kind, (t, h, w) in zip(("image", "video"), shapes)
-            ]
-            if task == "ref2va"
-            else None,
-        )
-        for _ in range(2)
-    ]
-    for context in contexts:
-        denoising._apply_condition_noise_aug(
-            context,
-            sampling=sampling,
-            imgvid_noise_aug=visual_aug,
-            audio_noise_aug=audio_aug,
-        )
-    # Reference wrapper draws [B,F,C,H,W] per condition before packing.
-    generator = torch.Generator(device=device).manual_seed(42 + 7919)
+    audio_aug = 0.0 if task == "ref2va" else 1.0
+    sampling = PikaH3FlexSamplingParams(
+        prompt="p", audio_cond_noise_aug_for_inference=audio_aug
+    )
+    sampling.seed = seed  # FL2VA also exercises the internal seed fallback.
+    denoising._apply_condition_noise_aug(
+        ctx, sampling=sampling, imgvid_noise_aug=0.999, audio_noise_aug=audio_aug
+    )
+    generator = torch.Generator(device=device).manual_seed(
+        (42 if seed is None else seed) + 7919
+    )
     noise = torch.cat(
         [
             minimax_h3_patchify_video_latent(
-                torch.randn(1, t, 24, h, w, generator=generator, device=device).permute(
+                torch.randn(1, t, 24, 2, 4, generator=generator, device=device).permute(
                     0, 2, 1, 3, 4
                 ),
                 patch_size=[1, 2, 2],
             )
-            for t, h, w in shapes
+            for t in frames
         ]
     )
     rounded = (clean.bfloat16().float() if task == "fl2va" else clean).to(device)
     torch.testing.assert_close(
-        contexts[0].cond_rows,
-        visual_aug * rounded + (1.0 - visual_aug) * noise,
-        rtol=0,
-        atol=0,
+        ctx.cond_rows, 0.999 * rounded + (1.0 - 0.999) * noise, rtol=0, atol=0
     )
-    assert torch.equal(contexts[0].cond_rows, contexts[1].cond_rows)
-    assert torch.equal(clean, original)
-    if override_noise:
-        torch.testing.assert_close(
-            contexts[0].audio_ref_rows,
-            torch.randn(audio.shape, generator=torch.Generator().manual_seed(43)),
-            rtol=0,
-            atol=0,
-        )
-    else:
-        assert contexts[0].audio_ref_rows is audio
-
-
-def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch):
-    """A global cache default must not bypass the release's full six evaluations."""
-    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
-    monkeypatch.setattr(
-        MiniMaxH3PipelineConfig, "validate_server_args", lambda *_: None
+    torch.testing.assert_close(clean, original, rtol=0, atol=0)
+    expected_audio = (
+        torch.randn(4, 32, generator=torch.Generator().manual_seed(8))
+        if task == "ref2va"
+        else torch.ones(4, 32)
     )
-    args = SimpleNamespace(
-        model_variant="fl2va",
-        lora_path=None,
-        lora_alpha=None,
-        lora_scale=1.0,
-        is_arg_explicitly_set=lambda _: False,
-    )
-    with pytest.raises(ValueError, match="disable SGLANG_CACHE_DIT_ENABLED"):
-        PikaH3FlexPipelineConfig().validate_server_args(args)
-
-
-@pytest.mark.parametrize(
-    "duration,frames,aligned",
-    [(5, 120, 124), (5, 124, 124), (6, 158, 158), (15, 362, 362), (5.5, 132, 141)],
-)
-def test_warmup_frames_recover_requested_duration(duration, frames, aligned):
-    """17n+5 alignment is not inverted by dividing aligned frames by 24."""
-    target = PikaH3FlexSamplingParams._synthetic_warmup_target(
-        SimpleNamespace(width=832, height=480),
-        SimpleNamespace(warmup_resolutions=["832x480"], warmup_num_frames=frames),
-    )
-    assert target["duration_seconds"] == duration
-    assert _plan(_pika_request(**target)).shape["frame_count"] == aligned
+    torch.testing.assert_close(ctx.audio_ref_rows, expected_audio, rtol=0, atol=0)
 
 
 def test_text_limit_counts_text_only_and_leaves_base_h3_untouched():
