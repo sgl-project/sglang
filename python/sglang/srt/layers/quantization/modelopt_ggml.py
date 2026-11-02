@@ -11,7 +11,8 @@ Supported formats:
 Weights use [N, K / block_size, block_bytes] per linear layer or expert.
 Gated experts store gate/up in separate w13 halves. TP keeps blocks intact.
 Large expert batches are split to stay within the CUDA vector-kernel grid limit.
-EP, EPLB, fused shared experts and presharded expert weights are unsupported.
+Expert placement must be trivial. EP, EPLB, redundant experts, fused shared
+experts and presharded expert weights are unsupported.
 Q8_0 experts are rejected. Other GGML codecs are not enabled by this adapter.
 """
 
@@ -26,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
 )
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -129,17 +131,18 @@ class ModelOptGGMLMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
-        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-
+        moe = get_exec().moe
         if (
             layer.moe_ep_size != 1
-            or get_global_expert_location_metadata() is not None
+            or moe.enable_eplb
+            or moe.init_expert_location != "trivial"
+            or moe.ep_num_redundant_experts > 0
             or layer.num_fused_shared_experts
             or layer.use_presharded_weights
         ):
             raise ValueError(
-                "ModelOpt GGML experts require TP without EP, EPLB, fused shared "
-                "experts, or presharded weights"
+                "ModelOpt GGML experts require trivial expert placement without EP, "
+                "EPLB, redundant experts, fused shared experts, or presharded weights"
             )
         if extra_weight_attrs.get("with_bias", False):
             raise ValueError("ModelOpt GGML experts do not support bias")
