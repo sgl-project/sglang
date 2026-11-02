@@ -257,7 +257,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
         # The target's KV storage, as far as draft binding reads it.
-        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        alloc.plan = plan_stand_in(pool, placement)
         return alloc
 
     def _run(

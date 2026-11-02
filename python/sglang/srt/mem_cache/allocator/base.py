@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Mapping, Optional, Tuple
 
 import torch
 
@@ -324,10 +324,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
-
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        """Record an asynchronous HiCache transfer completion event if needed."""
-        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

@@ -99,6 +99,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
         controller.write_fence_stream = forward
         controller.l2_transfer_engine = engine
         controller.mem_pool_device_allocator = Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         # A tick's queued backup and the eviction victim share one drain.
         controller.write_queue = [

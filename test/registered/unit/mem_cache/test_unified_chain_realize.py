@@ -382,7 +382,7 @@ class TestChainRealize(CustomTestCase):
             )
         window.cancel_physical_reservation(tokens[:1])
         self.assertEqual(window.fixed_pages(), reserved - {int(tokens[0])})
-        window.set_hicache_transfer_done_event("load", object())
+        window.end_load_reservation()
         self.assertEqual(window.fixed_pages(), set())
 
     def _check_answers_are_takes(self, device, seed, count):

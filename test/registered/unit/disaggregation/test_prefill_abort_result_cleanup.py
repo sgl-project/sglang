@@ -119,7 +119,9 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
     scheduler.disagg_prefill_pending_chunk_rids = set()
     scheduler.enable_staging = False
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        page_size=1, translate_kv_indices_for_transfer=lambda indices: indices
+        page_size=1,
+        translate_kv_indices_for_transfer=lambda indices: indices,
+        storage=None,
     )
     scheduler.req_to_token_pool = SimpleNamespace(req_to_token=torch.tensor([[0]]))
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(

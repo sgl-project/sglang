@@ -744,7 +744,7 @@ class KVCacheConfigurator:
                         placement=placement,
                         runner=runner,
                         arena=alloc.arena,
-                        plan=alloc.storage.plan,
+                        plan=alloc.plan,
                         owner=alloc.roles.owner,
                         target_state=alloc.state,
                         model=self.model,
@@ -899,7 +899,7 @@ class KVCacheConfigurator:
             self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
             return None
-        placement = alloc.storage.plan.fused_draft
+        placement = alloc.plan.fused_draft
         if placement is None:
             raise ValueError(
                 "The unified target storage plan must declare the draft payload "

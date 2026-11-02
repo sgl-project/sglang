@@ -154,15 +154,13 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-def end_network_transfer(token_to_kv_pool_allocator, req) -> None:
+def end_network_transfer(storage, req) -> None:
     """The request's transfers ended: the rows they addressed may be reused."""
-    storage = token_to_kv_pool_allocator.storage
-    if storage is not None:
-        storage.end_network_transfer(req)
+    storage.end_network_transfer(req)
 
 
 def record_network_transfer(
-    token_to_kv_pool_allocator,
+    storage,
     req,
     *,
     peer,
@@ -179,9 +177,6 @@ def record_network_transfer(
     with ``state_types``. The rows may still move; a move that cannot avoid
     them waits on the host until the engine is done with ``peer``'s transfer
     (`NetworkTransferWaiter`)."""
-    storage = token_to_kv_pool_allocator.storage
-    if storage is None:
-        return
     storage.record_network_transfer(
         req,
         pages=page_indices,

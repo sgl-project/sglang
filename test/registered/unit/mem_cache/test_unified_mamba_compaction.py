@@ -219,7 +219,8 @@ class TestMambaCompaction(CustomTestCase):
                     f.alloc.set_inflight_forward(done, f.ids)
                 else:
                     # A load writes every slot; a backup reads the moved ones.
-                    f.alloc.set_hicache_transfer_done_event(writer, done)
+                    if writer == "load":
+                        f.alloc.end_load_reservation()
                     f.alloc.record_transfer(done, f.ids, writes=writer == "load")
                 self.assertEqual(f.alloc.flush_for_allocation(), 8)
                 if writer == "write":

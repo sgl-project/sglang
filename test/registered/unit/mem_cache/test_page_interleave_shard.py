@@ -2130,6 +2130,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
+            kv_storage=None,
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,

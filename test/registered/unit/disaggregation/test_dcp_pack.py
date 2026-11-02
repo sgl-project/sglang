@@ -93,6 +93,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
                         state_ids=lambda sub_pool: IdSpace(key=(sub_pool, None)),
+                        storage=None,
                     ),
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=torch.arange(total).reshape(1, -1),
@@ -170,6 +171,7 @@ class TestHostTensorIndicesEvent(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=page_size,
                 translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
             ),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(total).reshape(1, -1)

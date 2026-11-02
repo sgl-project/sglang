@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
@@ -317,9 +318,13 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
+        # A unified pool's storage: copies are recorded on it, so a page move
+        # waits for the copies that touch its pages.
+        self.kv_storage = kv_storage
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -1004,12 +1009,8 @@ class HiCacheController:
         transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
         completion = self.l2_transfer_engine.submit_device_to_host(transfers)
 
-        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
-            (id(self), "write"), completion.finish_event
-        )
-        storage = self.mem_pool_device_allocator.storage
-        if storage is not None:
-            storage.record_host_transfer(
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
                 completion.finish_event, transfers, writes=False
             )
 
@@ -1160,14 +1161,12 @@ class HiCacheController:
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
-        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
-            (id(self), "load"), completion.finish_event
-        )
-        storage = self.mem_pool_device_allocator.storage
-        if storage is not None:
-            storage.record_host_transfer(
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
                 completion.finish_event, transfers, writes=True
             )
+            # The submitted copy now orders moves of the rows it loads into.
+            self.kv_storage.end_load_reservations()
 
         self.ack_load_queue.append(
             HiCacheAck(

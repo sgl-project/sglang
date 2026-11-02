@@ -272,6 +272,7 @@ def _build_cache_controller(
     model_name: Optional[str],
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
+    kv_storage=None,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -292,19 +293,13 @@ def _build_cache_controller(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
+        kv_storage=kv_storage,
     )
 
 
 def _swa_allocation_callbacks(allocator) -> dict:
-    """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.kv.alloc.band import Band
-
-    if isinstance(allocator, Band):
-        # Unified SWA loads into physical reservations, bound before the H2D.
-        return dict(
-            device_alloc_fn=allocator.alloc_physical,
-            device_free_fn=allocator.cancel_physical_reservation,
-        )
+    """Keep allocation and rollback in the same ID space for every static SWA
+    stack (a unified pool's loads go through its storage, `host_load_alloc`)."""
     if allocator is None:
         return {}
     return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
@@ -1474,6 +1469,7 @@ def build_unified_host_stack(
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
+        kv_storage=storage,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,
@@ -2432,10 +2428,15 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        storage = params.token_to_kv_pool_allocator.storage
-        if storage is not None:
+        storage = kv_storage_of(
+            params.req_to_token_pool, params.token_to_kv_pool_allocator
+        )
+        if isinstance(storage, KVStorage):
             # A unified pool: one host pool per sub-pool of its plan.
             result = build_unified_host_stack(
                 storage=storage,

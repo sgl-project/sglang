@@ -214,7 +214,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
             pool.raw[stamped_page * epp : (stamped_page + 1) * epp].fill_(55)
             done.record()
         # Registered as the host-cache controller does on submission.
-        alloc.set_hicache_transfer_done_event(("test", "load"), done)
+        alloc.end_load_reservations()
         full.record_transfer(done, kept, writes=True)
 
         with torch.cuda.stream(schedule):

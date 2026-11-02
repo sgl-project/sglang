@@ -167,6 +167,14 @@ class KVStorage:
                 )
             )
         self._sub_pools = tuple(sub_pools)
+        # The allocator prices each window by the tail a request keeps of it;
+        # a window the model does not state has none until it is bound.
+        if all(
+            s.lifetime.window is not None
+            for s in plan.sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        ):
+            allocator.retained_windows = self.retained_window_lengths()
 
     def host_layout(self, name: str):
         """The sub-pool's host layout and persistent device buffers."""
@@ -526,6 +534,12 @@ class KVStorage:
         they may move before the copy is submitted."""
         self._band(sub_pool).end_load_reservation()
 
+    def end_load_reservations(self) -> None:
+        """Host loads were submitted: their copies, recorded on the rows they
+        write (`record_host_transfer`), order moves of those rows from here
+        on, so no row stays reserved for a load."""
+        self._allocator.end_load_reservations()
+
     def bind_window(
         self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
     ) -> None:
@@ -718,6 +732,10 @@ class KVStorage:
         """The sub-pool a transfer entry carries here."""
         return entry.sub_pool
 
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """The sub-pool each transfer entry carries, in wire order."""
+        return tuple(self.entry_sub_pool(entry) for entry in self.wire_entries())
+
     def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
         """The key PD peers tell entries of one state type apart by."""
         return entry.key
@@ -754,6 +772,7 @@ class KVStorage:
         the model does not state (``sliding_window``)."""
         self._window_reaches = dict(reaches or {})
         self._unstated_window = sliding_window
+        self._allocator.retained_windows = self.retained_window_lengths()
 
     def retained_window_lengths(self) -> Dict[str, int]:
         """The tail a running request keeps of each window sub-pool, by name:
@@ -1038,6 +1057,13 @@ class KVStorage:
         ``forward_done``: it and every forward recorded before it retire. Page
         moves decide from retirement, the same point on every rank."""
         self._allocator.retire_forward(forward_done)
+
+    def owner_load_alloc(self) -> Tuple[Callable[[int], Any], Callable[[Any], Any]]:
+        """How a host load takes the owner's token ids it loads into, and gives
+        back the ones it did not use: from the owner's band, where the tree
+        made room for the load before it."""
+        owner = self._allocator.full_attn_allocator
+        return owner.alloc, owner.free
 
     def host_load_alloc(
         self, sub_pool: str

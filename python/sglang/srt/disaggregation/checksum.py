@@ -63,20 +63,26 @@ def state_indices_for_request(
     """The state rows the transfer of ``req`` digests: one tensor for every
     state entry, or, for a unified pool of several windows, one per state
     entry in entry order, each window's from its own sub-pool and kept tail."""
-    storage = scheduler.token_to_kv_pool_allocator.storage
-    if storage is not None and storage.retained_window_lengths():
-        windows = storage.retained_window_lengths()
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    storage = kv_storage_of(
+        scheduler.req_to_token_pool, scheduler.token_to_kv_pool_allocator
+    )
+    sub_pools = storage.entry_sub_pools()
+    # Only a storage whose entries are sub-pools keeps a tail per window.
+    windows = storage.retained_window_lengths() if sub_pools else {}
+    if any(name in windows for name in sub_pools):
         shared = _state_indices(scheduler, req, seq_len, start_idx)
         # Each window entry digests the units the transfer sends of it.
         return [
             (
                 storage.resume_units(
-                    entry.sub_pool, req, token_start=start_idx, token_boundary=seq_len
+                    name, req, token_start=start_idx, token_boundary=seq_len
                 ).unit_ids
-                if entry.sub_pool in windows
+                if name in windows
                 else shared
             )
-            for entry in storage.wire_entries()
+            for name in sub_pools
         ]
     return _state_indices(scheduler, req, seq_len, start_idx)
 

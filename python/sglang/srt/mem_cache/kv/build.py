@@ -320,6 +320,8 @@ def build_kv_storage(
             device=ctx.device,
         )
         allocator.state = state_storage
+    allocator.plan = plan
+    allocator.request_memory = request_memory
     allocator.storage = KVStorage(
         plan=plan,
         sized=sized,

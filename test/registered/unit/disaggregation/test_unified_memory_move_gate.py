@@ -63,7 +63,7 @@ def _physical_pages(band, ids) -> list:
 
 def _record(allocator, req, pages, *, writes, peer="peer"):
     record_network_transfer(
-        allocator,
+        allocator.storage,
         req,
         peer=peer,
         writes=writes,
@@ -95,7 +95,7 @@ class TestNetworkTransfers(CustomTestCase):
         req = SimpleNamespace(rid="r0", bootstrap_room=1)
         _record(allocator, req, _physical_pages(owner, ids[-1:]), writes=True)
         record_network_transfer(
-            allocator,
+            allocator.storage,
             req,
             peer="peer",
             writes=True,
@@ -107,7 +107,7 @@ class TestNetworkTransfers(CustomTestCase):
         self.assertEqual(chain_snapshot(allocator), before)
         self.assertFalse(any(m.moves_blocked() for m in allocator.members))
         self.assertFalse(any(m.fixed_pages() for m in allocator.members))
-        end_network_transfer(allocator, req)
+        end_network_transfer(allocator.storage, req)
         self.assertEqual(chain_snapshot(allocator), before)
 
     def test_a_read_page_moves_and_its_old_row_waits_for_the_transfer(self):
@@ -126,7 +126,7 @@ class TestNetworkTransfers(CustomTestCase):
         self.assertNotEqual(_physical_pages(owner, ids[:1]), top, "it moved")
         self.assertIn(top[0], owner.usage.pending_pages)
         self.assertNotIn(top[0], owner._free_pages_snapshot())
-        end_network_transfer(allocator, req)
+        end_network_transfer(allocator.storage, req)
         owner.flush_opportunistic()
         self.assertNotIn(top[0], owner.usage.pending_pages)
 
@@ -236,7 +236,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 _record(alloc, req, pages.tolist(), writes=True)
                 self.assertFalse(any(m.moves_blocked() for m in alloc.members))
                 self.assertEqual(capacity_keys(), keys)
-                end_network_transfer(alloc, req)
+                end_network_transfer(alloc.storage, req)
                 self.assertEqual(capacity_keys(), keys)
                 hold_every_band(alloc)
                 # A hold fixes live pages: a band with none has nothing to keep.
@@ -249,8 +249,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves
-        wait on: a member that misses a HiCache copy's event may move a page the
-        copy still reads or writes. Recurrent state is written by its own
+        wait on: a member that misses a forward's event may move a page the
+        forward still reads or writes. Recurrent state is written by its own
         kernels, so its member gets the state slots, not the token ids."""
         for chain in self._CHAINS:
             alloc = self._chain(chain)
@@ -259,7 +259,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 for member in alloc.members:
                     got = received[member.sub_pool_name]
                     for name, hook in (
-                        ("set_hicache_transfer_done_event", "hicache"),
                         ("set_latest_forward_done_event", "forward_done"),
                         ("set_inflight_forward", "inflight"),
                     ):
@@ -273,10 +272,9 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                             )
                         )
                 event, ids = object(), torch.tensor([5, 6])
-                alloc.set_hicache_transfer_done_event("load", event)
                 alloc.set_latest_forward_done_event(event)
                 alloc.set_inflight_forward(event, ids, torch.tensor([3]))
-            for hook in ("hicache", "forward_done", "inflight"):
+            for hook in ("forward_done", "inflight"):
                 with self.subTest(chain=chain, hook=hook):
                     self.assertEqual(
                         {name for name, got in received.items() if hook in got},

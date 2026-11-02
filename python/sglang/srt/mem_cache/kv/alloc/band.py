@@ -2226,16 +2226,6 @@ class Band:
         self.size = num_pages * self.page_size
         self.clear()
 
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        """A HiCache copy was submitted. Its pages are ordered by the transfer
-        recorded on them (`record_transfer`), which carries its own signal, so
-        ``event`` is not kept here; a load's submission ends its reservation,
-        as the copy now resolves the reserved rows."""
-        if transfer_key == "load" or (
-            isinstance(transfer_key, tuple) and transfer_key[-1] == "load"
-        ):
-            self.unfix_pages(_LOAD_RESERVATION)
-
     def end_load_reservation(self) -> None:
         """The tree bound the reserved rows to owner ids and the queued load now
         names them by those ids, which it translates at submission: the rows

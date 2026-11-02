@@ -2227,7 +2227,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """The peer writes these rows by physical id from now on; a failed
         transfer is done with them at its deferred release."""
         record_network_transfer(
-            self.token_to_kv_pool_allocator,
+            self._storage(),
             decode_req.req,
             peer=decode_req,
             writes=True,
@@ -2246,8 +2246,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return args
         decode_req.pending_receive = None
         page_indices, metadata_index, state_indices = args
-        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
-        if storage.move_epoch() != receive.move_epoch:
+        if self._storage().move_epoch() != receive.move_epoch:
             kv_indices, state_indices = receive.refresh()
             page_indices = self._transfer_page_indices(
                 decode_req, kv_indices, receive.page_size
@@ -2280,9 +2279,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         held = self.scheduler.enable_overlap and not self._defer_publish and to_device
         if held and refresh is not None:
             decode_req.pending_receive = _PendingReceive(
-                move_epoch=kv_storage_of(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                ).move_epoch(),
+                move_epoch=self._storage().move_epoch(),
                 page_size=page_size,
                 refresh=refresh,
             )
@@ -3585,7 +3582,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 # The peer wrote its last byte.
                 end_network_transfer(
-                    self.tree_cache.token_to_kv_pool_allocator, decode_req.req
+                    kv_storage_of(
+                        self.tree_cache.req_to_token_pool,
+                        self.tree_cache.token_to_kv_pool_allocator,
+                    ),
+                    decode_req.req,
                 )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

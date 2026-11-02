@@ -252,7 +252,7 @@ class TestTransferBookkeeping(CustomTestCase):
         )
         for _ in range(2):
             record_network_transfer(
-                allocator,
+                storage,
                 req,
                 peer=None,
                 writes=True,
@@ -274,6 +274,44 @@ class TestTransferBookkeeping(CustomTestCase):
         release_kv_cache(req, tree_cache, checkpoint=True)
         self.assertTrue(all(t.released for t in transfers))
         self.assertFalse(storage._network_transfers)
+
+    def test_a_one_slot_state_entry_is_recorded_as_rows(self):
+        """REGRESSION: a recurrent state's transfer payload is its one slot, a
+        0-d array, and the page-move ledger took its length, so a unified PD
+        prefill of a hybrid model raised on its first finished request."""
+        setup_allocator_context()
+        bundle = build_unified_bundle(
+            UnifiedGeometry(
+                chain="tri",
+                full_layer_ids=(0,),
+                swa_layer_ids=(1,),
+                state_layer_ids=(2,),
+                lazy=True,
+                device="cpu",
+            )
+        )
+        allocator = bundle.token_to_kv_pool_allocator
+        storage = allocator.storage
+        entries = storage.wire_entries()
+        state_name = allocator.roles.state
+        self.assertIn(state_name, [entry.sub_pool for entry in entries])
+        slot = np.array(3, dtype=np.int64)
+        self.assertEqual(slot.ndim, 0)
+        req = SimpleNamespace(rid="r1", bootstrap_room=2)
+        record_network_transfer(
+            storage,
+            req,
+            peer=None,
+            writes=False,
+            page_indices=np.array([], dtype=np.int32),
+            page_size=allocator.page_size,
+            state_types=[entry.state_type for entry in entries],
+            state_indices=[
+                [slot] if entry.sub_pool == state_name else None for entry in entries
+            ],
+        )
+        (use,) = allocator.mamba_allocator.usage.transfers()
+        self.assertEqual(np.asarray(use.ids).tolist(), [3])
 
     def test_the_ledger_takes_device_rows_the_send_copies(self):
         """REGRESSION: under host-tensor indices the prefill handed the

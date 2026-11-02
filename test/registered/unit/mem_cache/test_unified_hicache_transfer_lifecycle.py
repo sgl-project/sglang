@@ -43,13 +43,11 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    _swa_allocation_callbacks,
-)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -66,8 +64,6 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 PAGE = 4
-D2H = ("controller", "write")
-H2D = ("controller", "load")
 FULL, SWA = ComponentType.FULL, ComponentType.SWA
 
 
@@ -234,7 +230,7 @@ class TestPhysicalReservation(_ConfigCase):
             self.assertEqual(moves, [])
 
             load_done = _Copy()
-            allocator.set_hicache_transfer_done_event(H2D, load_done)
+            allocator.end_load_reservations()
             # Submitted: the load names the rows it writes by the owner's ids.
             swa.record_transfer(load_done, target, writes=True)
             # Queued: compaction waits on the copy, then relocates rows.
@@ -270,12 +266,16 @@ class TestFloatSwaReservation(_ConfigCase):
         # Only what `HybridCacheController.load` reads, with production callbacks.
         controller = object.__new__(HybridCacheController)
         controller.mem_pool_device_allocator = allocator
+        controller.kv_storage = kv_storage_of(None, allocator)
         controller.device = "cpu"
         controller.load_queue, controller.ack_load_queue = [], []
+        swa_alloc, swa_free = controller.kv_storage.host_load_alloc(swa.sub_pool_name)
         controller.mem_pool_host = SimpleNamespace(
             entry_map={
                 PoolName.SWA: SimpleNamespace(
-                    device_evict_fn=None, **_swa_allocation_callbacks(swa)
+                    device_evict_fn=None,
+                    device_alloc_fn=swa_alloc,
+                    device_free_fn=swa_free,
                 ),
                 PoolName.MAMBA: SimpleNamespace(
                     device_alloc_fn=states.alloc,
@@ -325,6 +325,7 @@ class TestCallerOwnedLoadDestination(_ConfigCase):
 
         controller = object.__new__(HybridCacheController)
         controller.mem_pool_device_allocator = allocator
+        controller.kv_storage = kv_storage_of(None, allocator)
         controller.device = "cpu"
         controller.load_queue, controller.ack_load_queue = [], []
         controller.mem_pool_host = SimpleNamespace(
@@ -379,8 +380,7 @@ class TestAllocationAndTransferOrder(_ConfigCase):
         expected_source = rows.seed(source, 100)
         expected_target = rows.seed(target, 200)
         allocator.free(gap)
-        allocator.set_hicache_transfer_done_event(D2H, _Copy())
-        allocator.set_hicache_transfer_done_event(H2D, _Copy())
+        allocator.end_load_reservations()
 
         with _recorded_stream() as waits:
             fresh = allocator.alloc(2 * PAGE)

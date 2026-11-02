@@ -208,6 +208,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     # State slots acquire allocates for a fresh request (its working slot and
     # initial tracking slots); the storage binds it from the state policy.
     fresh_request_state_slots = 1
+    # Bound at construction: the plan the chain's sub-pools come from, the
+    # request rows' memory a snapshot copies, and (once the storage binds
+    # them) the tail a running request keeps of each window, by sub-pool.
+    plan = None
+    request_memory = None
+    retained_windows: Optional[Dict[str, int]] = None
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -826,8 +832,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cap this pool applies."""
         # Each window is charged the tail a running request keeps of it.
         windows = (
-            self.storage.retained_window_lengths()
-            if self.storage is not None
+            self.retained_windows
+            if self.retained_windows is not None
             else {window.sub_pool_name: sliding_window_size for window in self._windows}
         )
         state_slots = (
@@ -1122,10 +1128,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ``pages``."""
         self.bands[self._band_positions[sub_pool]].unfix_pages(key, pages)
 
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        # Every member a pin covers must also order its moves after the copy.
+    def end_load_reservations(self) -> None:
+        """Submitted host loads order moves of the rows they write through
+        their recorded copies: no member keeps rows reserved for a load."""
         for member in self.members:
-            member.set_hicache_transfer_done_event(transfer_key, event)
+            member.end_load_reservation()
 
     def prewarm_compaction(self) -> None:
         """Prewarm the page-move path of every member that compacts."""
