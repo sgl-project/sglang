@@ -56,7 +56,19 @@ All examples require:
 - Rust toolchain (latest stable)
 - `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - `wasm-tools`: `cargo install wasm-tools`
-- sgl-model-gateway running with WASM enabled (`--enable-wasm`)
+- sgl-model-gateway running with WASM enabled, and told which directory modules
+  may be loaded from:
+
+  ```bash
+  smg launch --enable-wasm --wasm-module-root /srv/wasm-modules
+  ```
+
+  Registration accepts a caller-supplied path, so `--wasm-module-root` is what
+  confines it: a module is only accepted if it resolves to a location inside one
+  of the roots. Pass the flag more than once, or give it several directories, to
+  allow more than one. Enabling WASM without a root is refused at startup rather
+  than defaulting to "anywhere on the filesystem", so place the built
+  `.component.wasm` files under a root before registering them.
 
 ## Building All Examples
 
@@ -79,19 +91,19 @@ curl -X POST http://localhost:3000/wasm \
     "modules": [
       {
         "name": "auth-middleware",
-        "file_path": "/path/to/wasm_guest_auth.component.wasm",
+        "file_path": "/srv/wasm-modules/wasm_guest_auth.component.wasm",
         "module_type": "Middleware",
         "attach_points": [{"Middleware": "OnRequest"}]
       },
       {
         "name": "logging-middleware",
-        "file_path": "/path/to/wasm_guest_logging.component.wasm",
+        "file_path": "/srv/wasm-modules/wasm_guest_logging.component.wasm",
         "module_type": "Middleware",
         "attach_points": [{"Middleware": "OnRequest"}, {"Middleware": "OnResponse"}]
       },
       {
         "name": "ratelimit-middleware",
-        "file_path": "/path/to/wasm_guest_ratelimit.component.wasm",
+        "file_path": "/srv/wasm-modules/wasm_guest_ratelimit.component.wasm",
         "module_type": "Middleware",
         "attach_points": [{"Middleware": "OnRequest"}]
       }

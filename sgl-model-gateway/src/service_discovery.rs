@@ -877,6 +877,7 @@ mod tests {
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             tokenizer_registry: Arc::new(crate::tokenizer::registry::TokenizerRegistry::new()),
             wasm_manager: None,
+            wasm_module_roots: None,
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 worker_job_queue,
