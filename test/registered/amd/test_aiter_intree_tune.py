@@ -238,50 +238,60 @@ class TestIntreeAdditions(CustomTestCase):
         self.assertFalse(out.duplicated(subset=list(_TABLE.key_cols)).any())
 
 
+def _write_rows(tmp, name, rows):
+    path = os.path.join(tmp, name)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return [path]
+
+
 class TestHipblasltRows(CustomTestCase):
     def test_another_rocm_skips_the_hipblaslt_rows(self):
         """hipBLASLt solution indices belong to one hipBLASLt build and another rejects
         them, so a hipBLASLt row applies only on the ROCm in its rocm column."""
-        csvs = tables.GEMM_BF16.csvs()
-        rows = pd.concat([pd.read_csv(p, dtype={"rocm": str}) for p in csvs])
-        hipblaslt = rows["libtype"] == "hipblaslt"
-        self.assertGreater(int(hipblaslt.sum()), 0)
-        self.assertTrue(rows.loc[hipblaslt, "rocm"].notna().all())
-        for rocm, kept in (
-            ((7, 2, 26015), len(rows)),
-            ((10, 0, 0), int((~hipblaslt).sum())),
-        ):
-            with (
-                self.subTest(rocm=rocm),
-                mock.patch(
-                    "sglang.srt.utils.common.get_hip_version", return_value=rocm
-                ),
-            ):
-                out = tables.read_intree_rows(tables.GEMM_BF16, csvs)
-                self.assertEqual(len(out), kept)
+        row = {"M": 1, "N": 50016, "K": 6144, "splitK": 0, "kernelName": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            csvs = _write_rows(
+                tmp,
+                "bf16.csv",
+                [
+                    {**row, "libtype": "hipblaslt", "solidx": 7, "rocm": "7.2"},
+                    {**row, "M": 2, "libtype": "torch", "solidx": 0, "rocm": None},
+                ],
+            )
+            for rocm, kept in (((7, 2, 26015), [1, 2]), ((10, 0, 0), [2])):
+                with (
+                    self.subTest(rocm=rocm),
+                    mock.patch(
+                        "sglang.srt.utils.common.get_hip_version", return_value=rocm
+                    ),
+                ):
+                    out = tables.read_intree_rows(tables.GEMM_BF16, csvs)
+                    self.assertEqual(out["M"].tolist(), kept)
 
 
 class TestFlydslRows(CustomTestCase):
     def test_an_aiter_without_flydsl_skips_the_flydsl_rows(self):
         """aiter builds a FlyDSL row's kernel at the first GEMM or fused-MoE call, so an
-        aiter that cannot import FlyDSL keeps every table's other rows only."""
-        saw_flydsl = False
-        for table in tables.TABLES:
-            csvs = table.csvs()
-            if not csvs:
-                continue
-            with mock.patch(
-                "sglang.srt.utils.common.get_hip_version", return_value=(7, 2, 0)
+        aiter that cannot import FlyDSL keeps the table's other rows only."""
+        cases = (
+            (_TABLE, {"libtype": "flydsl", "kernelName": "flydsl_gemm"}),
+            (_TABLE, {"libtype": "ck", "kernelName": "flydsl_gemm"}),
+            (tables.FMOE, {"kernelName1": "flydsl_moe1", "kernelName2": "ck_moe2"}),
+        )
+        for table, flydsl_row in cases:
+            other = {c: "ck_kernel" for c in flydsl_row}
+            with (
+                self.subTest(table=table.name, row=flydsl_row),
+                tempfile.TemporaryDirectory() as tmp,
             ):
-                rows = tables.read_intree_rows(table, csvs)
-                flydsl = tables.uses_flydsl(rows, table.kernel_cols)
-                saw_flydsl |= bool(flydsl.any())
+                csvs = _write_rows(
+                    tmp, "rows.csv", [{"M": 1, **flydsl_row}, {"M": 2, **other}]
+                )
+                with mock.patch.object(tables, "_aiter_has_flydsl", return_value=True):
+                    self.assertEqual(len(tables.read_intree_rows(table, csvs)), 2)
                 with mock.patch.object(tables, "_aiter_has_flydsl", return_value=False):
                     out = tables.read_intree_rows(table, csvs)
-            with self.subTest(table=table.name):
-                self.assertEqual(len(out), int((~flydsl).sum()))
-                self.assertFalse(tables.uses_flydsl(out, table.kernel_cols).any())
-        self.assertTrue(saw_flydsl)
+                self.assertEqual(out["M"].tolist(), [2])
 
 
 def _aiter_commit() -> str:
