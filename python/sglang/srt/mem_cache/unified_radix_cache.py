@@ -4070,6 +4070,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
+    def retained_window_tokens(self) -> int:
+        return 0 if self.uocr_doc_reuse is None else self.uocr_doc_reuse.held_tokens()
+
+    def retained_window_req_count(self) -> int:
+        return (
+            0 if self.uocr_doc_reuse is None else len(self.uocr_doc_reuse.held_slots())
+        )
+
     def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
         """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""
         self.uocr_doc_reuse = doc_reuse
