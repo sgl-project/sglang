@@ -12,10 +12,10 @@ llm-d is a [CNCF Sandbox project](https://www.cncf.io/blog/2026/03/24/welcome-ll
 
 A single SGLang server is fast, and RadixAttention already maximizes cache reuse within each replica. But at scale the picture changes: across many replicas, cache locality breaks under round-robin load balancing as related requests scatter and radix-cache hit rates collapse, long prompts inflate time-to-first-token, and accelerators sit underused. llm-d adds the cluster-level layer that the engine does not aim to provide on its own:
 
-- **[Prefix-aware routing](https://llm-d.ai/docs/guides/precise-prefix-cache-aware).** Instead of round-robin, the llm-d Router scores each replica on prefix-cache locality and current load, routing each request to the replica most likely to already hold its prefix — raising RadixAttention hit rates on multi-turn and shared-prefix workloads while avoiding saturated servers.
-- **[Distributed KV-cache management](https://llm-d.ai/docs/guides#advanced-kv-cache-management).** A global index tracks which token blocks live on which replica, and tiered offloading spills cache to CPU memory or local SSD, extending the working set beyond accelerator HBM.
-- **[Prefill/decode disaggregation](https://llm-d.ai/docs/guides/pd-disaggregation).** Prompt processing and token generation run on separate workers, with KV-cache moved over high-speed interconnects, lowering TTFT and steadying per-token latency on long prompts.
-- **[SLO-aware autoscaling](https://llm-d.ai/docs/guides/workload-autoscaling) and [flow control](https://llm-d.ai/docs/guides/flow-control).** Scale SGLang pools on real inference signals (queue depth, true demand) rather than raw GPU utilization, with multi-tenant fairness and priority dispatch.
+- **[Prefix-aware routing](https://llm-d.ai/docs/0.7/architecture/advanced/kv-management/prefix-cache-aware-routing).** Instead of round-robin, the llm-d Router scores each replica on prefix-cache locality and current load, routing each request to the replica most likely to already hold its prefix — raising RadixAttention hit rates on multi-turn and shared-prefix workloads while avoiding saturated servers.
+- **[Distributed KV-cache management](https://llm-d.ai/docs/0.7/architecture/advanced/kv-management).** A global index tracks which token blocks live on which replica, and tiered offloading spills cache to CPU memory or local SSD, extending the working set beyond accelerator HBM.
+- **[Prefill/decode disaggregation](https://llm-d.ai/docs/0.7/architecture/advanced/disaggregation).** Prompt processing and token generation run on separate workers, with KV-cache moved over high-speed interconnects, lowering TTFT and steadying per-token latency on long prompts.
+- **[SLO-aware autoscaling](https://llm-d.ai/docs/0.7/architecture/advanced/autoscaling) and [flow control](https://llm-d.ai/docs/0.7/architecture/core/router/epp/flow-control).** Scale SGLang pools on real inference signals (queue depth, true demand) rather than raw GPU utilization, with multi-tenant fairness and priority dispatch.
 - **One control plane for mixed fleets.** llm-d schedules across engines, so platform teams can serve SGLang and vLLM pools behind the same gateway, policies, and observability instead of running parallel stacks.
 
 These capabilities are composable. Most teams start by adding prefix-aware routing over an existing SGLang pool, then layer in the rest as specific bottlenecks appear.
@@ -31,8 +31,8 @@ llm-d publishes reproducible benchmarks from production-scale deployments on [Pr
 ## Get started
 
 - **Deploy the optimized baseline with the [Quickstart](https://llm-d.ai/docs/getting-started/quickstart), selecting SGLang as the inference server.** It stands up an intelligent router (the llm-d Router) over an SGLang pool on Kubernetes in a tested configuration.
-- Browse the [well-lit path guides](https://llm-d.ai/docs/guides), each a tested recipe for one of the capabilities above, and add the optimization that fits your workload.
-- Read the [Introduction](https://llm-d.ai/docs/getting-started) and [Architecture overview](https://llm-d.ai/docs/architecture) to see how the scheduler, gateway, and model servers wrap your SGLang deployment.
+- Browse the [well-lit path guides](https://github.com/llm-d/llm-d/tree/main/guides), each a tested recipe for one of the capabilities above, and add the optimization that fits your workload.
+- Read the [Introduction](https://llm-d.ai/docs/0.7) and [Architecture overview](https://llm-d.ai/docs/architecture) to see how the scheduler, gateway, and model servers wrap your SGLang deployment.
 
 Questions and contributions are welcome on [GitHub](https://github.com/llm-d/llm-d) and [Slack](https://llm-d.ai/slack).
 
