@@ -29,15 +29,12 @@ import contextlib
 import dataclasses
 import inspect
 import logging
-import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
-from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
@@ -96,6 +93,9 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.capture_profile import (
+    CaptureProfileOptions,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FAILED_MSG
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
@@ -125,10 +125,6 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.utils.profile_utils import (
-    export_cuda_graph_capture_trace,
-    graph_capture_profile_dir,
-)
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -488,6 +484,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
+        # Select device capabilities before allocating static inputs.
+        self.backend = resolve_decode_backend(self)
+
         # --- buffers ---------------------------------------------------
         logits_buffer_rows = self._next_token_logits_buffer_capacity_rows(
             self.max_num_token
@@ -623,9 +622,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 sorted(DSV41_EARLY_VERIFY_VARIANTS),
             )
 
-        # --- backend ---------------------------------------------------
-        self.backend = resolve_decode_backend(self)
-
         # --- capture --------------------------------------------------
         try:
             with model_capture_mode():
@@ -684,6 +680,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         fork_in_graph_metadata_prep(stream=stream, done=done, prep=prep)
 
     def _record_in_graph_metadata_prep_done(self):
+        if not self.backend.supports_shared_read_events:
+            return
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
         if not self.device_module.is_current_stream_capturing():
@@ -741,7 +739,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.buffers, self.max_bs
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
     def _make_graph_key(self, size, variant_label=None, attention_variant=None):
         return ShapeKey(
@@ -1032,86 +1030,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return f"Draft{name}"
         return name
 
-    def _init_profile_context_and_memory_record(self):
-        if self._graph_batch_capture_active():
-            # SGLANG_GRAPH_BATCH_CAPTURE: the profiler is stepped once per
-            # captured shape (see FullCudaGraphBackend.capture_one), so
-            # on_trace_ready writes one chrome trace per shape.
-            rank = get_parallel().tp_rank
-            runner_name = self._profile_runner_name()
-            trace_dir = graph_capture_profile_dir()
-            os.makedirs(trace_dir, exist_ok=True)
-
-            self._profile_trace_tag = None
-
-            def on_trace_ready(prof):
-                tag = self._profile_trace_tag
-                if tag is None:
-                    # Reachable only if a subclass overrides _capture_one_stream
-                    # without tagging; exporting would collide every flush on
-                    # one name.
-                    logger.warning(
-                        "%s: capture trace flushed with no shape tag; skipping "
-                        "export. A subclass likely overrides _capture_one_stream "
-                        "without calling _set_profile_trace_tag.",
-                        runner_name,
-                    )
-                    return
-                trace_file = os.path.join(
-                    trace_dir, f"{runner_name}_{tag}_rank{rank}.json.gz"
-                )
-                prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for {tag} to {trace_file}")
-
-            profile_context = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1
-                # (capture run); repeat=0 repeats the cycle so each captured
-                # shape gets its own trace.
-                schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
-                record_shapes=True,
-                with_stack=True,
-                with_flops=True,
-                profile_memory=True,
-                on_trace_ready=on_trace_ready,
-            )
-        else:
-            # a single unscheduled pass over the whole
-            # capture. The combined trace (if any) is exported in
-            # _post_process_after_profile via export_cuda_graph_capture_trace,
-            # gated by SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.
-            profile_context = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-            )
-        torch.cuda.memory._record_memory_history()
-        return profile_context
-
-    def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
-        torch.cuda.memory._record_memory_history(enabled=None)
-        log_message = (
-            "Sorted by CUDA Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="cuda_time_total", row_limit=10
-            )
-            + "\n\nSorted by CPU Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="cpu_time_total", row_limit=10
-            )
-            + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
-        )
-        logger.info(log_message)
-
-        # single-trace export for the whole capture pass; no-op unless
-        # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE is set. In per-bs mode
-        # (SGLANG_GRAPH_BATCH_CAPTURE) that env is unset, so this stays a no-op
-        # and the per-bs on_trace_ready handles export instead.
-        export_cuda_graph_capture_trace(
-            prof_context,
-            runner_name=self._profile_runner_name(),
-        )
-
     def capture_prepare(
         self,
         size: int,
@@ -1301,8 +1219,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the original unscheduled pass leaves this None.
         self._profiler = None
         if self.enable_profile_cuda_graph:
-            profile_context = self._init_profile_context_and_memory_record()
-            if self._graph_batch_capture_active():
+            per_shape = self._graph_batch_capture_active()
+            if per_shape:
+                self._profile_trace_tag = None
+            profile_options = CaptureProfileOptions(
+                runner_name=self._profile_runner_name(),
+                per_shape=per_shape,
+                get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
+            )
+            profile_context = self.backend.capture_profile_context(profile_options)
+            if per_shape:
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
@@ -1333,7 +1259,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_one_stream()
 
         if self.enable_profile_cuda_graph:
-            self._post_process_after_profile(prof)
+            self.backend.finish_capture_profile(profile_options, prof)
         self._profiler = None
 
     def _capture_one_stream(self) -> None:
@@ -1372,9 +1298,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         self._set_profile_trace_tag(
                             bs, variant_label, attention_variant
                         )
-                        with torch_compile_decoration.patch_model(
+                        with self.backend.prepare_capture_forward(
                             self.model_runner.model,
-                            bs in self.compile_bs,
+                            enable_compile=bs in self.compile_bs,
                             num_tokens=bs * self.captured_req_width,
                             tp_group=get_parallel().tp_group,
                         ) as forward:
@@ -2033,11 +1959,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         timer_ctx = device_timer_ctx(
             self.model_runner.device_timer, forward_batch.forward_mode.name.lower()
         )
-        shared_read_ends = self._resolve_shared_read_ends(
-            self.attn_backend, forward_batch.forward_mode
-        )
+        shared_read_ends = SharedReadEnds.UNKNOWN
+        if self.backend.supports_shared_read_events:
+            shared_read_ends = self._resolve_shared_read_ends(
+                self.attn_backend, forward_batch.forward_mode
+            )
         with self.model_context(), timer_ctx, self.backend.replay_session():
-            self.load_batch(forward_batch, pp_proxy_tensors)
+            if not self.backend.prepare_replay(forward_batch):
+                self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d "
