@@ -88,6 +88,62 @@ def npu_wrapper_rmsnorm_forward(func):
     return _rmsnorm_forward_oot
 
 
+def remap_dspark_weight_name_npu(
+    name: str, *, for_quant_config: bool = False
+) -> Optional[str]:
+    """Map a checkpoint name without consulting model state.
+
+    The loader selects vocabulary stages and filters disabled confidence-head
+    weights. ModelSlim uses the same names to add quantization-config aliases.
+    Config aliases retain scale suffixes and rotary entries and omit vocabulary
+    weights, matching the original ModelSlim configuration semantics.
+    """
+    if not name.startswith("mtp."):
+        return None
+    if not for_quant_config and "rotary_emb.inv_freq" in name:
+        return None
+    parts = name.split(".", 2)
+    if len(parts) < 3:
+        return None
+    stage_id, rest = parts[1], parts[2]
+    if not stage_id.isdigit():
+        return None
+    if not for_quant_config:
+        # Preserve the loader's integer-stage validation; isdigit() alone also
+        # accepts characters such as superscript digits that int() rejects.
+        int(stage_id)
+
+    if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if not for_quant_config:
+            if rest in ("embed.weight", "embed_tokens.weight"):
+                return "embed_tokens.weight"
+            if rest in ("head.weight", "lm_head.weight"):
+                return "lm_head.weight"
+        return None
+    if rest.startswith(("markov_head.", "confidence_head.")):
+        return rest
+
+    mapped_rest = rest
+    if mapped_rest.startswith("attn."):
+        mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
+    elif mapped_rest.startswith("ffn."):
+        mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+    elif mapped_rest.startswith("attn_norm."):
+        mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
+    elif mapped_rest.startswith("ffn_norm."):
+        mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
+            "ffn_norm."
+        )
+    mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+    mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+    mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+    mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+    mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+    if not for_quant_config and mapped_rest.endswith(".scale"):
+        mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
+    return f"stages.{stage_id}.{mapped_rest}"
+
+
 class ModelSlimConfig(QuantizationConfig):
     """
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
@@ -140,59 +196,18 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
-        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime draft
-        # model constructs canonical modules under stages.<stage>.*.  Keep
-        # this transformation in sync with
-        # DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name.  Merely
-        # replacing ``mtp`` with ``stages`` is insufficient: it silently
-        # misses ModelSlim lookups such as stages.0.mlp.experts and
-        # stages.0.self_attn.
+        # Share DSpark path remapping while retaining config-specific suffixes,
+        # checkpoint keys, and the precedence of explicitly configured aliases.
         dspark_quant_aliases = {}
-        for name, scheme in quant_config.items():
-            if not isinstance(name, str) or not name.startswith("mtp."):
-                continue
-
-            parts = name.split(".", 2)
-            if len(parts) != 3:
-                continue
-
-            stage_id, rest = parts[1], parts[2]
-            if not stage_id.isdigit():
-                continue
-
-            # The draft model attaches the target model's shared embedding and
-            # LM head; mtp-local copies are not runtime draft modules.
-            if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-                continue
-            if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.') :]}"
-            elif rest.startswith("confidence_head."):
-                alias = f"confidence_head.{rest[len('confidence_head.') :]}"
-            else:
-                mapped_rest = rest
-                if mapped_rest.startswith("attn."):
-                    mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-                elif mapped_rest.startswith("ffn."):
-                    mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
-                elif mapped_rest.startswith("attn_norm."):
-                    mapped_rest = "input_layernorm." + mapped_rest.removeprefix(
-                        "attn_norm."
-                    )
-                elif mapped_rest.startswith("ffn_norm."):
-                    mapped_rest = (
-                        "post_attention_layernorm."
-                        + mapped_rest.removeprefix("ffn_norm.")
-                    )
-                mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-                mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-                mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-                mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-                mapped_rest = mapped_rest.replace(
-                    ".gate.bias", ".gate.e_score_correction_bias"
-                )
-                alias = f"stages.{stage_id}.{mapped_rest}"
-
-            dspark_quant_aliases[alias] = scheme
+        if any(
+            isinstance(name, str) and name.startswith("mtp.") for name in quant_config
+        ):
+            for name, scheme in quant_config.items():
+                if not isinstance(name, str):
+                    continue
+                alias = remap_dspark_weight_name_npu(name, for_quant_config=True)
+                if alias is not None:
+                    dspark_quant_aliases[alias] = scheme
 
         quant_config = {
             **dspark_quant_aliases,
