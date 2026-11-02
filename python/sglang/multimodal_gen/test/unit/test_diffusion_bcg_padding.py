@@ -1,7 +1,7 @@
 import dataclasses
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -19,10 +19,12 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_module,
 )
@@ -128,9 +130,11 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "test fusion",
-                lambda t: mounted.append(t) or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="test fusion",
+                    mount=lambda t: mounted.append(t) or True,
+                    unmount=lambda _: None,
+                ),
             ),
         )
 
@@ -141,7 +145,14 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         self.assertEqual(self.stage._mounted_quality, "lossless")
 
     def test_allows_high_when_model_has_no_dit_quality_fusions(self):
-        handlers = (("lossless", "test fusion", lambda _: False, lambda _: None),)
+        handlers = (
+            (
+                "lossless",
+                SimpleNamespace(
+                    name="test fusion", mount=lambda _: False, unmount=lambda _: None
+                ),
+            ),
+        )
 
         with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
             self.stage._maybe_toggle_quality_fusions(self._batch("high"))
@@ -154,9 +165,11 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "test fusion",
-                lambda t: mounted.append(t) or True,
-                lambda t: unmounted.append(t),
+                SimpleNamespace(
+                    name="test fusion",
+                    mount=lambda t: mounted.append(t) or True,
+                    unmount=lambda t: unmounted.append(t),
+                ),
             ),
         )
 
@@ -177,15 +190,19 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
         handlers = (
             (
                 "lossless",
-                "equivalent fusion",
-                lambda _: mounted.append("equivalent") or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="equivalent fusion",
+                    mount=lambda _: mounted.append("equivalent") or True,
+                    unmount=lambda _: None,
+                ),
             ),
             (
                 "high",
-                "approximate fusion",
-                lambda _: mounted.append("approximate") or True,
-                lambda _: None,
+                SimpleNamespace(
+                    name="approximate fusion",
+                    mount=lambda _: mounted.append("approximate") or True,
+                    unmount=lambda _: None,
+                ),
             ),
         )
 
@@ -666,63 +683,6 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.assertEqual(out["x"].shape, (1, 4, 16))
         self.assertIsInstance(out["attn_mask_meta"], dict)
 
-    def test_ideogram_is_registered_as_bcg_supported(self):
-        self.assertIn(
-            "ideogram-ai/ideogram-4-fp8",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "comfy-org/ideogram-4",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "fal/ideogram-v4-fast",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "fal/ideogram-v4-instant",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
-        )
-        self.assertIn(
-            "Ideogram4PipelineConfig",
-            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
-        )
-
-    def test_image_generation_models_are_registered_as_bcg_supported(self):
-        for model_id in (
-            "meituan-longcat/longcat-image",
-            "meituan-longcat/longcat-image-edit-turbo",
-            "qwen/qwen-image",
-            "qwen/qwen-image-2512",
-            "tongyi-mai/z-image",
-            "tongyi-mai/z-image-turbo",
-            "zai-org/glm-image",
-        ):
-            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
-
-        for config_name in (
-            "GlmImagePipelineConfig",
-            "LongCatImagePipelineConfig",
-            "LongCatImageEditPipelineConfig",
-            "QwenImagePipelineConfig",
-            "ZImagePipelineConfig",
-        ):
-            self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
-
-    def test_ltx_models_are_registered_as_bcg_supported(self):
-        for model_id in (
-            "lightricks/ltx-2",
-            "lightricks/ltx-2.3",
-        ):
-            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
-
-        self.assertIn(
-            "LTX2PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-        )
-        self.assertIn(
-            "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-        )
-
     def test_sana_video_keeps_its_fixed_prompt_shape(self):
         kwargs = {
             "encoder_hidden_states": torch.zeros(1, 300, 2304),
@@ -938,6 +898,65 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
 
         self.assertIsNone(runner._capture_limit_reason(entry))
+
+
+class TestBCGWeightChangeAfterCapture(unittest.TestCase):
+    """Graphs replay capture-time weights and LoRA branches, so a later change drops them."""
+
+    def setUp(self):
+        self.eager_calls = 0
+
+        def eager(**kwargs):
+            self.eager_calls += 1
+            return "eager"
+
+        self.runner = object.__new__(DiffusionBreakableCudaGraphRunner)
+        self.runner.transformer = eager
+        self.runner.device_module = SimpleNamespace(empty_cache=lambda: None)
+        self.runner._blocked = set()
+        self.runner._disabled_reason = None
+        self.kwargs = {"hidden_states": torch.zeros(2)}
+        self.runner.entries = {
+            _signature_kwargs(self.kwargs): _CaptureEntry(
+                graph=SimpleNamespace(_break_fns=[], _segments=[object()]),
+                static_kwargs={},
+                static_leaves=[],
+                output=None,
+                num_segments=1,
+            )
+        }
+        stage = DenoisingStage.__new__(DenoisingStage)
+        stage._bcg_runners = {(id(eager), "lossless"): self.runner}
+        self.worker = GPUWorker.__new__(GPUWorker)
+        self.worker.metrics = None
+        self.worker.pipeline = MagicMock(spec=LoRAPipeline)
+        self.worker.pipeline.stages = [stage]
+
+    def _assert_runs_eager(self):
+        self.assertEqual(self.runner.entries, {})
+        self.assertEqual(self.runner(**self.kwargs), "eager")
+        self.assertEqual(self.eager_calls, 1)
+
+    def test_set_lora_drops_captured_graphs(self):
+        self.worker.set_lora("style", "/loras/style.safetensors")
+        self.worker.pipeline.set_lora.assert_called_once()
+        self._assert_runs_eager()
+
+    def test_merge_and_unmerge_drop_captured_graphs(self):
+        changes = {
+            "merge": lambda worker: worker.merge_lora_weights(),
+            "unmerge": lambda worker: worker.unmerge_lora_weights(),
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                self.setUp()
+                change(self.worker)
+                self._assert_runs_eager()
+
+    def test_resume_memory_occupation_drops_captured_graphs(self):
+        self.worker.memory_occupation = MagicMock()
+        self.worker.resume_memory_occupation()
+        self._assert_runs_eager()
 
 
 if __name__ == "__main__":

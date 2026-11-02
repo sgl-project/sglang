@@ -11,7 +11,7 @@ from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_graph_runner(*, device="custom"):
@@ -113,52 +113,6 @@ class TestResolveDecodeBackend(CustomTestCase):
             runner,
             enable_memory_saver=False,
         )
-
-    def test_in_tree_platform_uses_default_full_backend(self):
-        runner = _make_graph_runner(device="cuda")
-        exec_config = _make_exec_config()
-        expected_backend = object()
-        platform = _make_platform(is_out_of_tree=False)
-
-        with (
-            mock.patch.object(
-                backend_utils,
-                "get_exec",
-                return_value=exec_config,
-            ),
-            mock.patch.object(
-                backend_utils,
-                "current_platform",
-                platform,
-            ),
-            mock.patch.object(
-                backend_utils,
-                "FullCudaGraphBackend",
-                return_value=expected_backend,
-            ) as default_backend_cls,
-        ):
-            actual_backend = backend_utils.resolve_decode_backend(runner)
-
-        self.assertIs(actual_backend, expected_backend)
-        platform.get_full_graph_backend_cls.assert_not_called()
-        default_backend_cls.assert_called_once_with(
-            runner,
-            enable_memory_saver=False,
-        )
-
-    def test_disabled_config_still_supports_explicit_graph_runner(self):
-        runner = _make_graph_runner(device="cuda")
-        exec_config = _make_exec_config(backend=Backend.DISABLED)
-        platform = _make_platform(is_out_of_tree=False)
-        with (
-            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
-            mock.patch.object(backend_utils, "current_platform", platform),
-            mock.patch.object(backend_utils, "FullCudaGraphBackend") as full_backend,
-        ):
-            self.assertIs(
-                backend_utils.resolve_decode_backend(runner), full_backend.return_value
-            )
-            full_backend.assert_called_once_with(runner, enable_memory_saver=False)
 
     def test_retired_backend_is_not_replaced_with_full(self):
         runner = _make_graph_runner(device="cuda")

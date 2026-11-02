@@ -96,8 +96,9 @@ class WanAnimate2ArchConfig(WanVideoArchConfig):
         -1
     )  # <0: resolved to the gen grid width in tokens at runtime (official convention)
     refer_stride: int = 1
-    # Additive attention-score bias on the keys of generation frame 1 (official name);
-    # 0.0 disables it. Read from transformer/config.json when present; the base weights omit it.
+    # Additive attention-score bias on the keys of generation frame 1 (official name); 0.0
+    # disables it. Neither published transformer/config.json carries the key, so the distilled
+    # default comes from WanAnimate2DistilledArchConfig; a checkpoint key wins via update_model_arch.
     log_scale: float = 0.0
     # The image-embedding cross-attention (added_kv_proj_dim) is always built, as in the
     # official model; the checkpoint config states the same and nothing else reads this.
@@ -128,3 +129,17 @@ class WanAnimate2ArchConfig(WanVideoArchConfig):
 class WanAnimate2Config(DiTConfig):
     arch_config: WanAnimate2ArchConfig = field(default_factory=WanAnimate2ArchConfig)
     prefix: str = "WanAnimate2"
+
+
+@dataclass
+class WanAnimate2DistilledArchConfig(WanAnimate2ArchConfig):
+    # Value of the official wan_animate_2_distillation.yaml; the published transformer/config.json
+    # omits the key, so a checkpoint value still wins through update_model_arch.
+    log_scale: float = -1.3
+
+
+@dataclass
+class WanAnimate2DistilledConfig(WanAnimate2Config):
+    arch_config: WanAnimate2ArchConfig = field(
+        default_factory=WanAnimate2DistilledArchConfig
+    )

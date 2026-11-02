@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -787,9 +787,12 @@ class WaitingMMRequestStatus(IntEnum):
 
 def _select_mm_processor_prompt(recv_req, mm_processor):
     """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
-    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
-        return list(recv_req.input_ids)
-    return recv_req.input_text or recv_req.input_ids
+    # The scheduler holds input_ids as array("q"); processors accept str or
+    # list[int], not array.
+    input_ids = None if recv_req.input_ids is None else list(recv_req.input_ids)
+    if mm_processor.prefer_tokenized_input and input_ids is not None:
+        return input_ids
+    return recv_req.input_text or input_ids
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
@@ -2611,7 +2614,7 @@ class MMReceiverBase(ABC):
             return flat
 
         def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
+            if isinstance(mm_item, (ImageData, VideoData)):
                 return mm_item.url
             if isinstance(mm_item, dict):
                 # tolerate {"url": ...} shaped payloads

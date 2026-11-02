@@ -41,9 +41,12 @@ struct PrefillServerInfo {
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    kv_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    stores_to_linker: bool,
     prefill_http_port: Option<i64>,
 }
 
@@ -108,9 +111,11 @@ struct Topology {
     pp_size: Option<i64>,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    kv_layout: Option<String>,
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    stores_to_linker: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -157,6 +162,8 @@ struct Route {
     #[serde(default)]
     kv_cache_dtype: Option<String>,
     #[serde(default)]
+    kv_layout: Option<String>,
+    #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
@@ -164,6 +171,8 @@ struct Route {
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    stores_to_linker: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -198,6 +207,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         if topo.kv_cache_dtype.is_none() {
             topo.kv_cache_dtype = body.kv_cache_dtype.clone();
         }
+        if topo.kv_layout.is_none() {
+            topo.kv_layout = body.kv_layout.clone();
+        }
         if topo.prefill_http_port.is_none() {
             topo.prefill_http_port = body.prefill_http_port;
         }
@@ -209,6 +221,8 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        topo.stores_to_linker
+            .get_or_insert(body.stores_to_linker.unwrap_or(false));
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -281,9 +295,11 @@ async fn route_get(
             pp_size: topo.pp_size.unwrap(),
             page_size: topo.page_size,
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
+            kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
+            stores_to_linker: topo.stores_to_linker.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -470,6 +486,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         (
             crate::runtime::start(cfg, None).expect("start runtime"),
@@ -521,6 +538,7 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "stores_to_linker": false,
                 "prefill_http_port": 30000,
             })
         );

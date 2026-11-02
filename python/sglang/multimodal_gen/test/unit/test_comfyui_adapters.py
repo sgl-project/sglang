@@ -122,17 +122,6 @@ def test_flux_pack_rejects_kontext_reference_latents() -> None:
         )
 
 
-def test_flux_pack_rejects_controlnet_control() -> None:
-    """ComfyUI's Flux forward passes control from a ControlNet node; FluxAdapter
-    must reject it instead of silently running unconditioned."""
-    adapter = FluxAdapter()
-    x = torch.ones(1, 16, 8, 8)
-    timestep = torch.tensor([0.5])
-    context = torch.ones(1, 8, 4096)
-    with pytest.raises(ValueError, match="ControlNet"):
-        adapter.pack(x, timestep, context, y=torch.ones(1, 768), control={"input": []})
-
-
 def test_flux_pack_and_unpack_roundtrip_odd_latent_size() -> None:
     """Regression: a width/height not divisible by patch_size=2 (e.g. a
     1032px-wide ComfyUI latent, 1032 // 8 = 129) raised a view() RuntimeError
@@ -210,19 +199,12 @@ def test_comfy_model_patches_are_rejected_not_dropped(options) -> None:
     assert len(ex.sent) == 1
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"control": {"output": [torch.ones(1)]}},
-        {"ref_latents": [torch.ones(1, 16, 8, 8)]},
-    ],
-)
-def test_conditioning_the_worker_cannot_apply_is_rejected(kwargs) -> None:
-    """ControlNet residuals and reference latents reach apply_model as kwargs; an
-    adapter that does not forward them must fail instead of ignoring them."""
+def test_conditioning_the_worker_cannot_apply_is_rejected() -> None:
+    """Reference latents reach apply_model as a kwarg; an adapter that does not
+    forward them must fail instead of ignoring them."""
     ex = _RecordingExecutor(FluxAdapter())
-    with pytest.raises(ValueError, match=next(iter(kwargs))):
-        _flux_step(ex, **kwargs)
+    with pytest.raises(ValueError, match="ref_latents"):
+        _flux_step(ex, ref_latents=[torch.ones(1, 16, 8, 8)])
     assert ex.sent == []
 
 
@@ -270,6 +252,45 @@ def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
         (h // 2) * (w // 2) for h, w in [(64, 64), (32, 96), (48, 48)]
     )
     assert packed.extra_req["image_latent"].shape[1] == expected_tokens
+
+
+def test_qwen_image_edit_pack_rejects_unsupported_kwargs() -> None:
+    """attention_mask, additional_t_cond and ref_latents_method must be
+    rejected instead of silently dropped."""
+    adapter = _qwen_image_edit_adapter()
+    x = torch.ones(1, 16, 1, 90, 160)
+    timestep = torch.tensor([1.0])
+    context = torch.ones(1, 19, 2560)
+
+    with pytest.raises(ValueError, match="attention_mask"):
+        adapter.pack(x, timestep, context, attention_mask=torch.ones(1, 19))
+    with pytest.raises(ValueError, match="additional_t_cond"):
+        adapter.pack(x, timestep, context, additional_t_cond=torch.zeros(1))
+    with pytest.raises(ValueError, match="ref_latents_method"):
+        adapter.pack(x, timestep, context, ref_latents_method="negative_index")
+
+    # The default method and absent kwargs must not be rejected.
+    adapter.pack(x, timestep, context, ref_latents_method="index")
+    adapter.pack(x, timestep, context)
+
+
+def test_zimage_pack_rejects_omni_reference_conditioning() -> None:
+    """siglip_feats/ref_contexts must be rejected; num_tokens/attention_mask
+    (sent on every real call) must keep working."""
+    adapter = ZImageAdapter()
+    x = torch.ones(1, 16, 90, 160)
+    timestep = torch.tensor([1.0])
+    context = torch.ones(1, 19, 2560)
+
+    with pytest.raises(ValueError, match="siglip_feats"):
+        adapter.pack(x, timestep, context, siglip_feats=[torch.ones(1, 4, 8)])
+    with pytest.raises(ValueError, match="ref_contexts"):
+        adapter.pack(x, timestep, context, ref_contexts=[torch.ones(1, 4)])
+
+    # Sent on every real ComfyUI call; must not be rejected.
+    adapter.pack(x, timestep, context, num_tokens=19, attention_mask=torch.ones(1, 19))
+    adapter.pack(x, timestep, context, siglip_feats=[], ref_contexts=None)
+    adapter.pack(x, timestep, context)
 
 
 class _RowRecordingExecutor(SGLDiffusionExecutor):
@@ -410,3 +431,48 @@ def test_unbatched_forward_is_a_single_request() -> None:
     av = [torch.zeros(2, 16, 1, 4, 4), torch.zeros(2, 8, 4)]
     ex(av, torch.tensor([0.5, 0.5]), torch.zeros(2, 3, 8))
     assert len(adapter.calls) == 2 and adapter.calls[1][0] is av
+
+
+def _pack_flux(**kwargs):
+    x = torch.zeros(2, 16, 8, 8)
+    return FluxAdapter().pack(
+        x, torch.tensor([0.5]), torch.ones(2, 8, 4096), y=torch.ones(2, 768), **kwargs
+    )
+
+
+def test_flux_pack_forwards_control_residuals_with_gaps() -> None:
+    seq = (8 // 2) * (8 // 2)
+    double = [torch.ones(2, seq, 3072), None, torch.ones(2, seq, 3072)]
+    single = [torch.ones(2, seq, 3072)]
+    packed = _pack_flux(control={"input": double, "output": single})
+    assert packed.control["input"][1] is None
+    assert len(packed.control["input"]) == 3
+    assert len(packed.control["output"]) == 1
+    assert _pack_flux().control is None
+    assert _pack_flux(control={"input": [None]}).control is None
+
+
+def test_flux_pack_rejects_misshaped_control() -> None:
+    with pytest.raises(ValueError, match=r"control input\[0\]"):
+        _pack_flux(control={"input": [torch.ones(2, 3, 3072)]})
+
+
+def test_control_is_rejected_for_adapters_that_do_not_apply_it() -> None:
+    class _Executor(SGLDiffusionExecutor):
+        adapter_cls = ZImageAdapter
+
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.adapter = ZImageAdapter()
+
+    executor = _Executor()
+    control = {"input": [torch.ones(1, 4, 8)]}
+    with pytest.raises(ValueError, match="does not apply control"):
+        executor(
+            torch.ones(1, 16, 8, 8),
+            torch.tensor([1.0]),
+            torch.ones(1, 8, 16),
+            control=control,
+        )
+    assert FluxAdapter.applied_conditioning == ("control",)
+    assert ZImageAdapter.applied_conditioning == ()

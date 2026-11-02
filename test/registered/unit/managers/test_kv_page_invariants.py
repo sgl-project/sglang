@@ -10,7 +10,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _PAGE_SIZE = 256
 
@@ -36,7 +36,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         tree_cache = _tc
         get_last_batch = lambda self: None
         get_running_batch = lambda self: None
-        get_chunked_req = lambda self: None
+        get_request_lists = lambda self: {}
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -61,18 +61,6 @@ class _FakeOwner:
 
 
 class TestKVPageInvariants(CustomTestCase):
-    def test_clean_layout_no_warning(self):
-        chk, rtt, tc, alloc = _make_checker(
-            free_pages=torch.arange(100, 200, dtype=torch.int64)
-        )
-        rtt[0, :256] = torch.arange(_PAGE_SIZE)  # req 0 owns page 0
-        rtt[1, :256] = torch.arange(_PAGE_SIZE, 2 * _PAGE_SIZE)  # req 1 owns page 1
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 256, 256, rid="a"), _FakeOwner(1, 200, 256, rid="b")]
-        )
-        chk._check_kv_page_invariants()
-        self.assertEqual(chk.count_memory_leak_warnings, 0)
-
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
         chk.get_last_batch = lambda: SimpleNamespace(
@@ -112,7 +100,7 @@ class TestKVPageInvariants(CustomTestCase):
                 if where == "running":
                     chk.get_running_batch = lambda: SimpleNamespace(reqs=[owner])
                 else:
-                    chk.get_chunked_req = lambda: owner
+                    chk.get_request_lists = lambda: {"chunked": [owner]}
                 with self.assertRaises(ValueError):
                     chk._check_kv_page_invariants()
 

@@ -8,13 +8,14 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
     rmsnorm_fake_quant_row,
     rmsnorm_row_chunk,
     row_major_2d,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
@@ -26,6 +27,17 @@ _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
+# From this many rows a 32-row tile is faster (MI355X). Both tiles compile with FMA contraction off: that keeps
+# them bitwise each other and the gfx950 kernel (-ffp-contract=off).
+_HC_BOUNDARY_WIDE_MIN_M = 96
+_HC_BOUNDARY_WIDE = dict(
+    BLOCK_M=32,
+    num_warps=4,
+    num_stages=2,
+    kpack=2,
+    matrix_instr_nonkdim=16,
+    enable_fp_fusion=False,
+)
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
 
@@ -489,7 +501,7 @@ def _hc_boundary_partial_kernel(
     """Grid (cdiv(M, BLOCK_M), H // BLOCK_K), one hidden slice of every copy per program. HAS_POST:
     res_out[k] = post[k]*x + sum_j comb[j,k]*res[j] in aiter::mhc_post's order, read back as bf16
     for the statistics; HAS_COMBINE: y = sum_k pre_prev[k] * copy_k in _hc_combine_kernel's order."""
-    tl.static_assert(HC == 4, "the weight tiles are prefetched by name")
+    tl.static_assert(HC == 4)
     pid_m = tl.program_id(0)
     pid_t = tl.program_id(1)
     # int64: offs_m * (HC * H) passes 2**31 at ~105k rows of H=5120
@@ -500,11 +512,6 @@ def _hc_boundary_partial_kernel(
     mask_n = offs_n < MIX
     m2 = mask_m[:, None]
     w_off = offs_n[None, :] * w_stride_n + offs_h[:, None]
-    # Prefetching only reorders memory issue; each tile still feeds its own dot.
-    w0 = tl.load(w_ptr + w_off + 0 * H, mask=mask_n[None, :], other=0.0)
-    w1 = tl.load(w_ptr + w_off + 1 * H, mask=mask_n[None, :], other=0.0)
-    w2 = tl.load(w_ptr + w_off + 2 * H, mask=mask_n[None, :], other=0.0)
-    w3 = tl.load(w_ptr + w_off + 3 * H, mask=mask_n[None, :], other=0.0)
     if HAS_POST:
         xa = tl.load(
             x_ptr + offs_m[:, None] * x_stride_m + offs_h[None, :], mask=m2, other=0.0
@@ -559,14 +566,8 @@ def _hc_boundary_partial_kernel(
         if HAS_COMBINE:
             pp = tl.sum(tl.where((pj == k)[None, :], pre_tile, 0.0), axis=1)
             y += pp[:, None] * xt
-        if k == 0:
-            w_tile = w0
-        elif k == 1:
-            w_tile = w1
-        elif k == 2:
-            w_tile = w2
-        else:
-            w_tile = w3
+        # loading each copy's tile where it is used keeps fewer live registers than prefetching all four
+        w_tile = tl.load(w_ptr + w_off + k * H, mask=mask_n[None, :], other=0.0)
         acc += tl.dot(xt, w_tile, input_precision=DOT_PRECISION)
         sq += tl.sum(xt * xt, axis=1)
     tl.store(
@@ -666,7 +667,20 @@ def _hc_boundary_partials(
         )
         return part_mix, part_sq
     mix_pad = max(16, triton.next_power_of_2(mix))
-    block_m = _HC_BOUNDARY_BLOCK_M
+    # below 2x the minimum, a row count off the 32-row grid pads too much for the wide tile to win
+    wide = m >= 2 * _HC_BOUNDARY_WIDE_MIN_M or (
+        m >= _HC_BOUNDARY_WIDE_MIN_M and m % 32 == 0
+    )
+    if wide and envs.SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE.get():
+        launch = dict(_HC_BOUNDARY_WIDE)
+    else:
+        launch = dict(
+            BLOCK_M=_HC_BOUNDARY_BLOCK_M,
+            num_warps=_HC_BOUNDARY_NUM_WARPS,
+            num_stages=_HC_BOUNDARY_NUM_STAGES,
+            enable_fp_fusion=False,
+        )
+    block_m = launch["BLOCK_M"]
     grid_m = triton.cdiv(m, block_m)
     _hc_boundary_partial_kernel[(grid_m, num_slices)](
         x if has_post else residual,
@@ -687,13 +701,11 @@ def _hc_boundary_partials(
         HC=hc_mult,
         MIX=mix,
         MIX_PAD=mix_pad,
-        BLOCK_M=block_m,
         BLOCK_K=_HC_BOUNDARY_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         HAS_POST=has_post,
         HAS_COMBINE=has_combine,
-        num_warps=_HC_BOUNDARY_NUM_WARPS,
-        num_stages=_HC_BOUNDARY_NUM_STAGES,
+        **launch,
     )
     return part_mix, part_sq
 

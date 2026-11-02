@@ -8,6 +8,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
+from sglang.srt.hardware_backend.npu.utils import (
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -24,7 +27,10 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_num_fused_shared_experts,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -264,7 +270,8 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
-        self.determine_num_fused_shared_experts()
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

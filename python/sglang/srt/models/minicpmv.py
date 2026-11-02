@@ -51,9 +51,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -1003,11 +1003,12 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
         # Only increment data_idx on im_start (not slice_start) so all slices
         # within one image share the same pad_value for per-image caching.
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            media_token_pairs, data_start_token_ids=[im_start_id]
+        return pad_mm_token_pairs(
+            input_ids,
+            image_inputs,
+            data_token_pairs=media_token_pairs,
+            data_start_token_ids=[im_start_id],
         )
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
 class MiniCPMV4_0(MiniCPMBaseModel):
@@ -1169,11 +1170,12 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
         # Only increment data_idx on im_start (not slice_start) so all slices
         # within one image share the same pad_value for per-image caching.
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            media_token_pairs, data_start_token_ids=[im_start_id]
+        return pad_mm_token_pairs(
+            input_ids,
+            image_inputs,
+            data_token_pairs=media_token_pairs,
+            data_start_token_ids=[im_start_id],
         )
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
 class MiniCPMV4_5(MiniCPMBaseModel):
@@ -1339,11 +1341,12 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
         # Only increment data_idx on im_start (not slice_start) so all slices
         # within one image share the same pad_value for per-image caching.
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            media_token_pairs, data_start_token_ids=[im_start_id]
+        return pad_mm_token_pairs(
+            input_ids,
+            image_inputs,
+            data_token_pairs=media_token_pairs,
+            data_start_token_ids=[im_start_id],
         )
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
 
     def eval(self):
         super().eval()
@@ -1587,8 +1590,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
 
     def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Every thumbnail / slice is its own item; pad each span with its own value.
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, image_inputs)
+        return pad_mm_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Remap 4.6 prefixes (``model.{vision_tower,merger,language_model}``)
