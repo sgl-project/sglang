@@ -72,15 +72,13 @@ pub(super) fn generate_stream(
             let mut failed = None;
             for event in events {
                 match event {
-                    CoreEvent::Delta(mut delta) => {
+                    CoreEvent::Delta(delta) => {
                         acc.append_delta(&delta);
                         if !options.stream {
                             continue;
                         }
                         if options.incremental {
-                            // Python's incremental stream still reports the
-                            // cumulative completion-token count in every frame.
-                            delta.completion_tokens = acc.completion_tokens;
+                            let delta = delta.with_cumulative_counts(acc);
                             yield Ok(frame_item(delta, &public_ids[i], index(i), None));
                         } else {
                             coalesced = true;
@@ -96,14 +94,13 @@ pub(super) fn generate_stream(
 
             if let Some(error) = failed {
                 yield Ok(error_item(&error, index(i)));
-            } else if let Some(mut delta) = terminal {
+            } else if let Some(delta) = terminal {
                 let e2e_latency = Some(options.created_at.elapsed().as_secs_f64());
                 // A unary reply is the cumulative result whatever the stream
                 // policy. The terminal frame is the accumulated output's last
                 // use, so it moves out instead of cloning.
                 let output = if options.stream && options.incremental {
-                    delta.completion_tokens = acc.completion_tokens;
-                    delta
+                    delta.with_cumulative_counts(acc)
                 } else {
                     std::mem::take(acc)
                 };
