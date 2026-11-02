@@ -1057,6 +1057,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return True
         return False
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_prealloc": [decode_req.req for decode_req in self.queue],
+            "decode_retracted": self.retracted_queue,
+            "decode_held": self.held_rebootstrap_reqs,
+        }
+
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
@@ -2833,6 +2840,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_transfer": [decode_req.req for decode_req in self.queue],
+            # Aborted, with KV held until the transfer drains.
+            "decode_releasing": [
+                decode_req.req for decode_req, *_ in self._deferred_releases
+            ],
+        }
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
