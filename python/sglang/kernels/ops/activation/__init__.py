@@ -153,6 +153,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="activation.xielu",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation.xielu:xielu",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
     KernelSpec(
