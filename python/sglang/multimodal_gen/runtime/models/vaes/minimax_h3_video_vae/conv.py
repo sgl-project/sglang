@@ -59,11 +59,19 @@ class BaseConv3d(nn.Conv3d):
         if sum(self.padding) == 0:
             return x
 
-        x = F.pad(
-            x,
-            (self.padding[2], self.padding[2], self.padding[1], self.padding[1], 0, 0),
-            mode=self.pad_mode,
-        )
+        if self.padding[1] or self.padding[2]:
+            x = F.pad(
+                x,
+                (
+                    self.padding[2],
+                    self.padding[2],
+                    self.padding[1],
+                    self.padding[1],
+                    0,
+                    0,
+                ),
+                mode=self.pad_mode,
+            )
 
         x = self._apply_temporal_padding(x)
         return x
