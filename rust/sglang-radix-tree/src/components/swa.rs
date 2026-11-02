@@ -12,7 +12,7 @@ use crate::cache_action::{
     SwaRebuild,
 };
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, SWA};
+use crate::components::{ComponentType, FULL, Family, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -342,6 +342,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        Family::Window
     }
 
     fn refresh_lru(

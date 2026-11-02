@@ -252,17 +252,20 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def _init_layer_broadcast_comm(self) -> None:
         cp_group = get_parallel().attn_cp_group
-        if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
+        if cp_group.world_size <= 1 or cp_group.get_available_pynccl_comm() is None:
             return
 
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
 
-        self.layer_broadcast_comm = PyNcclCommunicator(
+        layer_broadcast_comm = PyNcclCommunicator(
             group=cp_group.cpu_group,
             device=cp_group.device,
         )
+        if not layer_broadcast_comm.available:
+            return
+        self.layer_broadcast_comm = layer_broadcast_comm
         logger.info(
             "Initialized dedicated layer-shard broadcast NCCL communicator: "
             f"rank={cp_group.rank_in_group}, world_size={cp_group.world_size}"
@@ -285,7 +288,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         comm = (
             self.layer_broadcast_comm
             if use_layer_broadcast_comm and self.layer_broadcast_comm is not None
-            else cp_group.pynccl_comm
+            else cp_group.get_available_pynccl_comm()
         )
         if comm is not None:
             # PyNcclCommunicator defaults to disabled=True (it is only enabled
@@ -425,10 +428,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
