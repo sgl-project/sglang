@@ -151,6 +151,9 @@ def compare(width, graph):
     return dict(
         query_width=width,
         graph=graph,
+        bitwise_equal=torch.equal(
+            out.cpu().view(torch.int16), reference.cpu().view(torch.int16)
+        ),
         lengths=length_values,
         heads=heads,
         max_abs_sglang_vllm=max_pair,

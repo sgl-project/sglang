@@ -53,6 +53,8 @@ The mixed-row fixture checks FP32 attention, both KV layers, request/TP padding,
 L=1, page/K/C boundaries, sparse-to-dense rollback, radix-prefix attachment,
 ragged chunk prefill and exact persistent HBM accounting. Graph capture starts
 with all padding and then replays cold real requests.
+The separate prefill test checks vendor SFA against FP32 attention after
+page-permuted prefix reuse and checks continuous HBM KV bitwise.
 
 ```bash
 python3 benchmark/hisparse/bench_lim_framework.py \

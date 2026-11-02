@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +49,129 @@ def _reference(query, rope, payload, ids, scale):
     kv = payload[ids].float()
     scores = (query.float() @ kv[:, :512].T + rope.float() @ kv[:, 512:].T) * scale
     return scores.softmax(-1) @ kv[:, :512]
+
+
+def test_prefill_attention_and_short_residency():
+    torch.npu.set_device(0)
+    torch.manual_seed(8117)
+    context, capacity, heads = 8448, 8192, 4
+    key = torch.zeros(
+        2 * context // 128, 128, 1, 128, device="npu", dtype=torch.bfloat16
+    )
+    index_pool = _IndexPool(key)
+    pool = ReqToTokenPool(2, context, "npu", False)
+    pages = torch.randperm(2 * context // 128).view(2, -1)
+    mapping = (pages[..., None] * 128 + torch.arange(128)).view(2, context)
+    pool.req_to_token[1:3] = mapping.to("npu")
+    budget = resolve_sparse_kv_budget(
+        request_rows=3,
+        graph_batch_capacity=3,
+        context_len=context,
+        num_layers=2,
+        top_k=2048,
+        kv_bytes_per_token=1152,
+        cache_tokens=capacity,
+        copy_sfa_query_heads=heads,
+    )
+    prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager."
+    manager = None
+    with ExitStack() as stack:
+        stack.enter_context(get_parallel().override(attn_cp_size=1))
+        stack.enter_context(patch(prefix + "get_sparse_kv_budget", return_value=budget))
+        stack.enter_context(
+            patch(prefix + "get_sparse_kv_max_query_width", return_value=1)
+        )
+        stack.enter_context(patch(prefix + "get_eager_max_batch_size", return_value=3))
+        try:
+            manager = SparseKVCacheManager(
+                pool,
+                SimpleNamespace(get_kvcache=lambda: index_pool),
+                2048,
+                copy_sfa_padded_query_heads=heads,
+                paged_kv_cache=index_pool,
+            )
+            lengths, positions = [129, 65, 0], [127, 128, 63, 64]
+            physical = torch.cat((mapping[0, 127:129], mapping[1, 63:65]))
+            inputs = SimpleNamespace(
+                batch_size=3,
+                forward_mode=ForwardMode.EXTEND,
+                req_pool_indices=torch.tensor(
+                    [1, 2, 0], device="npu", dtype=torch.int32
+                ),
+                req_pool_indices_cpu=torch.tensor([1, 2, 0]),
+                seq_lens=torch.tensor(lengths, device="npu", dtype=torch.int32),
+                seq_lens_cpu=torch.tensor(lengths),
+                extend_seq_lens=torch.tensor(
+                    [2, 2, 0], device="npu", dtype=torch.int32
+                ),
+                extend_prefix_lens=torch.tensor(
+                    [127, 63, 0], device="npu", dtype=torch.int32
+                ),
+                extend_seq_lens_cpu=[2, 2, 0],
+                out_cache_loc=physical.to("npu"),
+                attn_cp_metadata=None,
+            )
+            backend = SimpleNamespace(
+                device="npu",
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                sparse_kv_manager=manager,
+                forward_metadata=SimpleNamespace(
+                    actual_seq_lengths_q=None, actual_seq_lengths_kv=None
+                ),
+            )
+            query = torch.randn(4, heads, 512, device="npu", dtype=torch.bfloat16)
+            rope = torch.randn(4, heads, 64, device="npu", dtype=torch.bfloat16)
+            sources = torch.arange(2048, device="npu", dtype=torch.int32).expand(4, -1)
+            sources = sources.masked_fill(
+                sources > torch.tensor(positions, device="npu")[:, None], -1
+            )
+            for layer_id, host in enumerate(manager.host_kv_buffer):
+                payload = torch.randn(2 * context, 576, dtype=torch.bfloat16)
+                fresh = torch.randn(4, 1, 576, device="npu", dtype=torch.bfloat16)
+                host.view(-1, 576).copy_(payload)
+                payload[physical] = fresh.cpu().view(4, 576)
+                layer = SimpleNamespace(
+                    layer_id=layer_id,
+                    tp_k_head_num=1,
+                    tp_q_head_num=heads,
+                    scaling=576**-0.5,
+                )
+                output = forward_sparsity_driven_kv_offload(
+                    backend,
+                    query,
+                    fresh[..., :512].contiguous(),
+                    None,
+                    layer,
+                    inputs,
+                    q_rope=rope,
+                    k_rope=fresh[..., 512:].contiguous(),
+                    topk_indices=sources,
+                )
+                torch.npu.synchronize()
+                for token, pos in enumerate(positions):
+                    row = token // 2
+                    expected = _reference(
+                        query[token].cpu(),
+                        rope[token].cpu(),
+                        payload,
+                        mapping[row, : pos + 1],
+                        layer.scaling,
+                    )
+                    torch.testing.assert_close(
+                        output[token].cpu().float(), expected, rtol=0.025, atol=0.025
+                    )
+                for row, length in enumerate(lengths[:2]):
+                    torch.testing.assert_close(
+                        manager.device_kv_buffer[layer_id][row + 1, :length, 0].cpu(),
+                        payload[mapping[row, :length]],
+                        rtol=0,
+                        atol=0,
+                    )
+        finally:
+            if manager is not None:
+                torch.npu.synchronize()
+                free_shm(torch.npu.current_device())
 
 
 @pytest.mark.parametrize(
