@@ -72,6 +72,8 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+        "KimiK31ForConditionalGeneration",
+        "KimiK31LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
         raise ValueError("Nemotron-H does not support --attn-cp-size > 1")
@@ -222,7 +224,10 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",

@@ -2734,6 +2734,20 @@ class KimiK3DecoderLayer(nn.Module):
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
+def _ensure_sglang_kimi_linear_config(config) -> KimiLinearConfig:
+    """Convert a remote-code KimiLinearConfig to SGLang's version.
+
+    K3.1 ships ``configuration_kimi_k3.py`` via ``auto_map`` which defines its
+    own ``KimiLinearConfig``.  That remote class lacks attributes SGLang relies
+    on (e.g. ``n_routed_experts``).  Re-create the config from its dict form so
+    SGLang's ``KimiLinearConfig.__init__`` runs and sets every alias.
+    """
+    if isinstance(config, KimiLinearConfig):
+        return config
+    config_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+    return KimiLinearConfig(**config_dict)
+
+
 class KimiK3LinearModel(nn.Module):
     """K3 language-model backbone."""
 
@@ -2744,6 +2758,7 @@ class KimiK3LinearModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        config = _ensure_sglang_kimi_linear_config(config)
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
@@ -3017,6 +3032,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        config = _ensure_sglang_kimi_linear_config(config)
         self.config = config
         self.quant_config = quant_config
         if quant_config is not None:
@@ -3891,4 +3907,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+class KimiK31LinearForCausalLM(KimiK3LinearForCausalLM):
+    """K3.1 text-only entry point — same architecture, DSA-enabled full-attention layers."""
+
+    pass
+
+
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """K3.1 multimodal entry point — MoonViT3d tower + DSA-enabled KimiLinear backbone."""
+
+    pass
+
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+    KimiK31ForConditionalGeneration,
+    KimiK31LinearForCausalLM,
+]

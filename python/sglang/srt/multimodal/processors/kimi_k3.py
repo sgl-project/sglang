@@ -23,7 +23,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+)
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
@@ -374,7 +377,7 @@ class KimiK3ImageProcessor(
     MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
-    models = [KimiK3ForConditionalGeneration]
+    models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3

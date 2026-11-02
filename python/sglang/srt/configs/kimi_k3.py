@@ -113,6 +113,14 @@ class KimiK3Config(PretrainedConfig):
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
 
+        if getattr(self.text_config, "dsa_config", None) is not None:
+            self.text_config.architectures = ["KimiK31LinearForCausalLM"]
+            self.index_topk = self.text_config.index_topk
+            self.index_head_dim = self.text_config.index_head_dim
+            self.index_n_heads = self.text_config.index_n_heads
+            self.index_topk_freq = self.text_config.index_topk_freq
+            self.index_skip_topk_offset = self.text_config.index_skip_topk_offset
+
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
     @property

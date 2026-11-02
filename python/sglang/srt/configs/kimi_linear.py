@@ -54,6 +54,7 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        dsa_config: dict | None = None,
         attn_res_block_size: int | None = None,
         routed_expert_hidden_size: int | None = None,
         latent_moe_use_norm: bool = False,
@@ -120,6 +121,18 @@ class KimiLinearConfig(PretrainedConfig):
             assert linear_attn_config["kda_layers"] is not None
             assert linear_attn_config["full_attn_layers"] is not None
         self.linear_attn_config = linear_attn_config
+
+        self.dsa_config = dsa_config
+        if dsa_config is not None:
+            self.index_topk = dsa_config.get("index_topk")
+            self.index_head_dim = dsa_config.get("index_head_dim")
+            self.index_n_heads = dsa_config.get("index_num_heads")
+            self.index_rope_dim = dsa_config.get("index_rope_dim", 0)
+            self.index_k_norm_type = dsa_config.get("index_k_norm_type")
+            self.indexer_use_fp8 = dsa_config.get("indexer_use_fp8", False)
+            self.index_topk_freq = dsa_config.get("index_topk_freq", 1)
+            self.index_skip_topk_offset = dsa_config.get("index_skip_topk_offset")
+            self.dsa_layers = dsa_config.get("dsa_layers", [])
 
         super().__init__(
             pad_token_id=pad_token_id,

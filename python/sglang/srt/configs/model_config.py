@@ -207,6 +207,8 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "KimiK31ForConditionalGeneration",
+            "KimiK31LinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -233,6 +235,8 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+        "KimiK31ForConditionalGeneration",
+        "KimiK31LinearForCausalLM",
     )
 
 
@@ -635,6 +639,10 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        # Remote Kimi K3.1 configs define their own KimiLinearConfig class.
+        # Normalize it before deriving hf_text_config and model shapes so all
+        # downstream config consumers see SGLang's complete implementation.
+        self._normalize_remote_kimi_linear_config()
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -1219,6 +1227,45 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+    def _normalize_remote_kimi_linear_config(self):
+        """Replace a remote-code KimiLinearConfig text_config with SGLang's version.
+
+        K3.1 ships ``configuration_kimi_k3.py`` via ``auto_map`` whose
+        ``KimiLinearConfig`` lacks SGLang-specific properties
+        (``mamba2_cache_params``, ``full_attention_layer_ids``,
+        ``n_routed_experts`` …).  Re-create from its dict so every subsystem
+        (attention backend selection, KV-cache configurator, MoE gate) sees the
+        SGLang class.
+        """
+        from sglang.srt.configs.kimi_linear import KimiLinearConfig
+
+        text_config = getattr(self.hf_config, "text_config", None)
+        if text_config is not None:
+            if isinstance(text_config, KimiLinearConfig):
+                return
+            if getattr(text_config, "model_type", None) != "kimi_linear":
+                return
+            config_dict = (
+                text_config.to_dict()
+                if hasattr(text_config, "to_dict")
+                else dict(text_config)
+            )
+            self.hf_config.text_config = KimiLinearConfig(**config_dict)
+            return
+
+        # Text-only Kimi K3.1 checkpoints expose KimiLinearConfig as the
+        # top-level config rather than under ``text_config``.
+        if isinstance(self.hf_config, KimiLinearConfig):
+            return
+        if getattr(self.hf_config, "model_type", None) != "kimi_linear":
+            return
+        config_dict = (
+            self.hf_config.to_dict()
+            if hasattr(self.hf_config, "to_dict")
+            else dict(self.hf_config)
+        )
+        self.hf_config = KimiLinearConfig(**config_dict)
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -1491,6 +1538,8 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31LinearForCausalLM" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -2537,6 +2586,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
