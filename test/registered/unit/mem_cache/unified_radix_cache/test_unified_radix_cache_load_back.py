@@ -1183,6 +1183,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
         self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+        # Admission sizes a load-back by the rows this transfer copies.
+        self.assertEqual(cache.full_load_back_tokens(leaf), kv_tokens)
 
         swa_xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
