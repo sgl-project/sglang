@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import threading
-import warnings
 from dataclasses import dataclass
 from io import BytesIO
 
@@ -32,6 +31,46 @@ class ACLFailure(RuntimeError):
 def check(ret, operation):
     if ret != 0:
         raise ACLFailure(f"{operation}: ACL error {ret}")
+
+
+def synchronize_or_poison(decoder, operation):
+    try:
+        check(decoder.acl.rt.synchronize_stream(decoder.stream), operation)
+    except BaseException:
+        decoder.poisoned = True
+        raise
+
+
+def drain_submitted(decoder, original):
+    """Do not let a failed drain hide an error already being propagated."""
+    try:
+        synchronize_or_poison(decoder, "synchronize_stream during cleanup")
+    except BaseException as error:
+        if original is None:
+            raise
+        original.add_note(f"Device synchronization failed during cleanup: {error}")
+
+
+def cleanup_resources(resources, original):
+    """Attempt every release and preserve an already propagating exception."""
+    errors = []
+    for function, resource in resources:
+        if resource:
+            try:
+                ret = function(resource)
+                if ret:
+                    name = getattr(function, "__name__", type(function).__name__)
+                    check(ret, f"cleanup {name}")
+            except Exception as error:
+                errors.append(error)
+    if errors:
+        if original is not None:
+            for error in errors:
+                original.add_note(f"Device resource cleanup failed: {error}")
+        else:
+            for error in errors[1:]:
+                errors[0].add_note(f"Additional cleanup failure: {error}")
+            raise errors[0]
 
 
 def align_up(value, alignment):
@@ -109,7 +148,13 @@ class DeviceFrame:
         if exc_type is not None and self.decoder.poisoned:
             # Keep potentially active DMA memory and preserve the original error.
             return
-        self.close()
+        if exc_value is None:
+            self.close()
+        else:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                exc_value.add_note(f"Frame cleanup failed: {cleanup_error}")
 
 
 class JPEGDecoder:
@@ -143,8 +188,11 @@ class JPEGDecoder:
                 raise ACLFailure("dvpp_create_channel_desc returned null")
             check(acl.media.dvpp_create_channel(self.channel), "dvpp_create_channel")
             self.channel_created = True
-        except Exception:
-            self.close()
+        except Exception as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                error.add_note(f"JPEG decoder cleanup failed: {cleanup_error}")
             raise
 
     def _activate(self):
@@ -178,6 +226,7 @@ class JPEGDecoder:
             size = max(size, info.nv12_bytes)
             inp = out = desc = None
             submitted = False
+            failure = None
             try:
                 inp, ret = a.media.dvpp_malloc(len(data))
                 check(ret, "dvpp_malloc input")
@@ -211,10 +260,7 @@ class JPEGDecoder:
                     ),
                     "dvpp_jpeg_decode_async",
                 )
-                ret = a.rt.synchronize_stream(self.stream)
-                if ret:
-                    self.poisoned = True
-                    check(ret, "synchronize_stream")
+                synchronize_or_poison(self, "synchronize_stream")
                 submitted = False
                 check(
                     a.media.dvpp_get_pic_desc_ret_code(desc), "JPEGD completion status"
@@ -230,26 +276,32 @@ class JPEGDecoder:
                     info.height_stride,
                 ):
                     raise ACLFailure(f"unexpected JPEGD layout: {actual}")
-                frame = DeviceFrame(self, out, size, info)
-                self.frames.add(frame)
-                out = None  # ownership moves to frame
-                return frame
+            except BaseException as error:
+                failure = error
+                raise
             finally:
                 if submitted and not self.poisoned:
-                    if a.rt.synchronize_stream(self.stream) != 0:
-                        self.poisoned = True
+                    drain_submitted(self, failure)
                 # If synchronization failed, DMA may still use these addresses.
                 # Leave them to process teardown rather than freeing live memory.
                 if not self.poisoned:
-                    for function, resource in (
-                        (a.media.dvpp_destroy_pic_desc, desc),
-                        (a.media.dvpp_free, inp),
-                        (a.media.dvpp_free, out),
-                    ):
-                        if resource:
-                            ret = function(resource)
-                            if ret:
-                                warnings.warn(f"cleanup {function.__name__}: {ret}")
+                    try:
+                        cleanup_resources(
+                            (
+                                (a.media.dvpp_destroy_pic_desc, desc),
+                                (a.media.dvpp_free, inp),
+                            ),
+                            failure,
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_resources(((a.media.dvpp_free, out),), cleanup_error)
+                        raise
+                    if failure is not None:
+                        cleanup_resources(((a.media.dvpp_free, out),), failure)
+            # Transfer the output only after intermediate resources are released.
+            frame = DeviceFrame(self, out, size, info)
+            self.frames.add(frame)
+            return frame
 
     def close(self):
         with self.lock:

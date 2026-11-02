@@ -2082,7 +2082,7 @@ def is_jpeg_with_cuda(
     2. whether input is recognized as JPEG.
     3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
     """
-    if not gpu_image_decode or not is_cuda():
+    if not is_cuda() or not gpu_image_decode:
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
@@ -2125,7 +2125,8 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    backend = _image_decode_backend()
+    # Avoid an additional backend lookup when both policies are off.
+    backend = _image_decode_backend() if gpu_image_decode or npu_image_decode else "cpu"
     if backend == "npu":
         # NPU and GPU policies are independent. Unsupported NPU inputs use PIL;
         # execution errors propagate, and never try a different accelerator.

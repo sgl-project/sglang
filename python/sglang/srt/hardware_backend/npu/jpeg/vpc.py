@@ -1,12 +1,13 @@
 """DVPP JPEGD and VPC color conversion to an owned NPU RGB tensor."""
 
-import warnings
-
 from sglang.srt.hardware_backend.npu.jpeg.dvpp import (
     ACLFailure,
     JPEGDecoder,
     align_up,
     check,
+    cleanup_resources,
+    drain_submitted,
+    synchronize_or_poison,
 )
 
 
@@ -41,8 +42,11 @@ class VPCJPEGDecoder:
                 self.channel = channel
                 check(a.media.dvpp_create_channel(self.channel), "VPC create channel")
                 self.channel_created = True
-        except Exception:
-            self.close()
+        except Exception as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                error.add_note(f"VPC decoder cleanup failed: {cleanup_error}")
             raise
 
     def _description(self, pointer, size, fmt, width, height, ws, hs):
@@ -65,8 +69,11 @@ class VPCJPEGDecoder:
                     "dvpp_set_pic_desc_" + name,
                 )
             return desc
-        except Exception:
-            a.media.dvpp_destroy_pic_desc(desc)
+        except Exception as error:
+            try:
+                check(a.media.dvpp_destroy_pic_desc(desc), "destroy pic descriptor")
+            except Exception as cleanup_error:
+                error.add_note(f"Picture descriptor cleanup failed: {cleanup_error}")
             raise
 
     def _convert_frame(self, frame):
@@ -78,6 +85,7 @@ class VPCJPEGDecoder:
         rgb_size = rgb_ws * dh
         output = source_desc = output_desc = None
         submitted = False
+        failure = None
         try:
             output, ret = a.media.dvpp_malloc(rgb_size)
             check(ret, "dvpp_malloc VPC RGB888")
@@ -109,10 +117,7 @@ class VPCJPEGDecoder:
                 ),
                 "dvpp_vpc_convert_color_async",
             )
-            ret = a.rt.synchronize_stream(d.stream)
-            if ret:
-                d.poisoned = True
-                check(ret, "synchronize_stream VPC")
+            synchronize_or_poison(d, "synchronize_stream VPC")
             submitted = False
             check(a.media.dvpp_get_pic_desc_ret_code(output_desc), "VPC completion")
             actual = tuple(
@@ -135,22 +140,23 @@ class VPCJPEGDecoder:
             )
             t.npu.synchronize(self.device)
             return result
+        except BaseException as error:
+            failure = error
+            raise
         finally:
             if submitted and not d.poisoned:
-                if a.rt.synchronize_stream(d.stream):
-                    d.poisoned = True
+                drain_submitted(d, failure)
             # Failed synchronization may leave DMA in flight; process teardown
             # must reclaim those allocations, as in JPEGDecoder.
             if not d.poisoned:
-                for function, resource in (
-                    (a.media.dvpp_destroy_pic_desc, output_desc),
-                    (a.media.dvpp_destroy_pic_desc, source_desc),
-                    (a.media.dvpp_free, output),
-                ):
-                    if resource:
-                        ret = function(resource)
-                        if ret:
-                            warnings.warn(f"cleanup {function.__name__}: {ret}")
+                cleanup_resources(
+                    (
+                        (a.media.dvpp_destroy_pic_desc, output_desc),
+                        (a.media.dvpp_destroy_pic_desc, source_desc),
+                        (a.media.dvpp_free, output),
+                    ),
+                    failure,
+                )
 
     def decode(self, data: bytes):
         d = self.decoder
@@ -183,7 +189,16 @@ class VPCJPEGDecoder:
                     )
                     self.channel = None
                 d.close()
-            finally:
+            except Exception as error:
+                try:
+                    check(
+                        d.acl.rt.set_context(context),
+                        "restore caller context after close",
+                    )
+                except Exception as cleanup_error:
+                    error.add_note(f"Context restore failed: {cleanup_error}")
+                raise
+            else:
                 check(
                     d.acl.rt.set_context(context), "restore caller context after close"
                 )

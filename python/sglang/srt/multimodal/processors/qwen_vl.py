@@ -374,7 +374,13 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             and isinstance(std, (list, tuple))
             and tuple(std) == (0.26862954, 0.26130258, 0.27577711)
             and getattr(image_processor, "rescale_factor", None) == 1 / 255
-            and not self.image_config
+            and (
+                not self.image_config
+                or (
+                    self.image_config == {"max_pixels": 1003520}
+                    and type(self.image_config["max_pixels"]) is int
+                )
+            )
         ):
             return True
         return mode

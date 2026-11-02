@@ -6,13 +6,38 @@ import threading
 import weakref
 from dataclasses import dataclass
 
-from sglang.srt.hardware_backend.npu.jpeg.dvpp import UnsupportedJPEG, inspect_jpeg
+from sglang.srt.hardware_backend.npu.jpeg.dvpp import (
+    ACLFailure,
+    UnsupportedJPEG,
+    check,
+    inspect_jpeg,
+)
 
 _local = threading.local()
 _live = {}
 _guard = threading.Lock()
 _pid = os.getpid()
 _closed = False
+
+# Known A2/A3 device names. Older Atlas training devices and 950 do not
+# support the V1 VPC color conversion; unknown names keep the PIL path.
+_V1_DEVICE_NAMES = frozenset(
+    {
+        "Ascend910B1",
+        "Ascend910B2",
+        "Ascend910B2C",
+        "Ascend910B3",
+        "Ascend910B4",
+        "Ascend910B4_1",
+        "Ascend910_9362",
+        "Ascend910_9363",
+        "Ascend910_9372",
+        "Ascend910_9381",
+        "Ascend910_9382",
+        "Ascend910_9391",
+        "Ascend910_9392",
+    }
+)
 
 
 @dataclass
@@ -27,11 +52,29 @@ def _check_process():
         raise RuntimeError("NPU JPEG decoders must be initialized after worker spawn")
 
 
-def _reap_locked():
+def _ensure_cleanup_context(device):
+    """Initialize the current thread on its selected device only if needed."""
+    import acl
+    import torch
+
+    context, ret = acl.rt.get_context()
+    if ret == 107002:  # ACL_ERROR_RT_CONTEXT_NULL
+        torch.npu.set_device(device)
+        context, ret = acl.rt.get_context()
+    check(ret, "get caller context for decoder cleanup")
+    if not context:
+        raise ACLFailure("decoder cleanup requires an active caller context")
+
+
+def _reap_locked(device):
+    context_ready = False
     for token, entry in list(_live.items()):
         owner = entry.owner()
         if entry.retiring or owner is None or not owner.is_alive():
             entry.retiring = True
+            if not context_ready:
+                _ensure_cleanup_context(device)
+                context_ready = True
             entry.decoder.close()
             del _live[token]
 
@@ -42,13 +85,14 @@ def _decoder(device):
     with _guard:
         if _closed:
             raise RuntimeError("NPU JPEG decoder pool has been closed")
-        _reap_locked()
+        _reap_locked(device)
         previous = getattr(_local, "slot", None)
         if previous and previous[0] == key:
             return previous[1]
         if previous:
             _local.slot = None
             _live[id(previous[1])].retiring = True
+            _ensure_cleanup_context(device)
             previous[1].close()
             del _live[id(previous[1])]
         from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
@@ -60,13 +104,22 @@ def _decoder(device):
 
 
 def close_decoders():
-    """Terminal cleanup, after request workers have joined; never reset NPU."""
+    """Terminal cleanup after workers join; initialize a missing thread context.
+
+    An existing caller context is restored by each decoder; if the caller has
+    no current context, cleanup initializes the current NPU's default context.
+    The NPU device is never reset.
+    """
     global _closed
     if os.getpid() != _pid:
         return
     first_error = None
     with _guard:
         _closed = True
+        if _live:
+            import torch
+
+            _ensure_cleanup_context(torch.npu.current_device())
         for token, entry in list(_live.items()):
             try:
                 entry.retiring = True
@@ -100,8 +153,7 @@ def decode_jpeg(data: bytes):
     import torch_npu  # noqa: F401 - registers the NPU device backend
 
     device = torch.npu.current_device()
-    # CANN's VPC color-conversion API does not support Ascend 950PR/950DT.
-    # Inspect the actual worker device before constructing any DVPP resources.
-    if torch.npu.get_device_name(device).startswith("Ascend950"):
+    # Check the actual worker before constructing any DVPP resources.
+    if torch.npu.get_device_name(device) not in _V1_DEVICE_NAMES:
         return None
     return _decoder(device).decode(data)

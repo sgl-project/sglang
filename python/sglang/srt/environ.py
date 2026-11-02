@@ -1743,6 +1743,7 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    SGLANG_DISABLE_NPU_IMAGE_DECODE = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)

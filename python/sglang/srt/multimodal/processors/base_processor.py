@@ -8,7 +8,7 @@ import os
 import re
 import threading
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
@@ -284,6 +284,9 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        # Capture the service setting before the processor fingerprint is built.
+        if envs.SGLANG_DISABLE_NPU_IMAGE_DECODE.get():
+            self.npu_image_decode = False
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -1141,18 +1144,14 @@ class BaseMultimodalProcessor(ABC):
             and self.server_args.device == "npu"
             and not self._is_preprocessed_input(data)
         )
-        context = (
-            torch.npu.device(self.server_args.base_gpu_id)
-            if bind_npu
-            else nullcontext()
-        )
-        with context:
-            return self._load_single_item(
+        if not bind_npu:
+            return self.__class__._load_single_item(data, modality, *args)
+        with torch.npu.device(self.server_args.base_gpu_id):
+            return self.__class__._load_single_item(
                 data,
                 modality,
                 *args,
-                gpu_image_decode=self.gpu_image_decode,
-                npu_image_decode=npu_mode,
+                npu_image_decode=True,
             )
 
     def _submit_mm_data_loading_tasks_simple(

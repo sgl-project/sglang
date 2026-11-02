@@ -49,6 +49,8 @@ This document provides a list of commonly used environment variables and aims to
 
 On Linux Ascend systems, verified image processors can decode eligible JPEGs with DVPP JPEGD and convert them to RGB with DVPP VPC. The independent `npu_image_decode` processor policy defaults to `False`. Qwen2.5-VL, Gemma3, and GLM4v opt in only for their verified Hugging Face processor types and image configurations. Other NPU paths use CPU/PIL. The existing `gpu_image_decode` policy continues to control CUDA decoding.
 
+For Qwen2.5-VL, the verified image configurations include the default and the exact single override `max_pixels=1003520`. Other image overrides continue to use PIL on NPU.
+
 ### Install and run
 
 Follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for a compatible CANN, `torch`, and `torch_npu` environment. CANN must expose the Python `acl.media` JPEGD and VPC color-conversion APIs. This path was validated on Ascend910_9362 with CANN 9.1.0. With those runtime and build dependencies installed, install your source checkout from the repository root:
@@ -66,22 +68,21 @@ python -m sglang.launch_server \
   --dtype bfloat16 --host 127.0.0.1 --port 30000
 ```
 
-Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. Model processors can set `npu_image_decode = False` to require PIL inputs on NPU. CUDA keeps its existing model opt-outs and `nvjpeg_fancy` mode; changing the NPU policy does not select or disable CUDA decoding.
+Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_vision), with `model` set to `jpeg-study`. To disable NPU image decoding for the service, set `SGLANG_DISABLE_NPU_IMAGE_DECODE=1` before starting it. The default is `false`; restart the service to change the setting. This controls image decoding, not the model's inference device. Model processors can also set `npu_image_decode = False` to require PIL inputs on NPU. CUDA keeps its existing model opt-outs and `nvjpeg_fancy` mode; changing the NPU policy does not select or disable CUDA decoding.
 
-Custom processors keep their existing `gpu_image_decode` overrides and loader keyword arguments. The low-level `load_image` and `_load_image` APIs accept a separate keyword-only `npu_image_decode=False` argument; callers opting in must handle device tensors. SGLang processors additionally validate their actual preprocessing chain before opting in. This policy is a Python strategy variable, not an environment variable. `SGLANG_ENABLE_NPU_IMAGE_DECODE` from earlier revisions is no longer used.
+Custom processors keep their existing `gpu_image_decode` overrides and loader keyword arguments. The low-level `load_image` and `_load_image` APIs accept a separate keyword-only `npu_image_decode=False` argument; callers opting in must handle device tensors and explicitly select their policy. The service environment variable controls SGLang processors; it does not intercept direct low-level calls. SGLang processors additionally validate their actual preprocessing chain before opting in. `SGLANG_ENABLE_NPU_IMAGE_DECODE` from earlier revisions is no longer used.
 
 ### Supported inputs and quality
 
 - The device path accepts 8-bit baseline SOF0, three-component YCbCr 4:2:0 JPEGs with width and height from 32 through 4096, and at most 32 MiB of encoded data. Inputs outside these device-path limits retain CPU/PIL decoding.
 - For odd dimensions, an internal JPEGD input copy rounds the SOF0 width or height up by one within the existing MCU grid. Compressed scan data is unchanged, and the RGB output is cropped to the original dimensions.
 - PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
-- Ascend 950PR/950DT retain PIL decoding because the required [VPC color-conversion API](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/acce/dvpp/aclpythondevg_01_0307.html) does not support these products. The loader checks the actual worker device before creating DVPP resources.
-- Ascend 950PR/950DT retain PIL decoding because the required [VPC color-conversion API](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/acce/dvpp/aclpythondevg_01_0307.html) does not support these products. The loader checks the actual worker device before creating DVPP resources.
+- The loader checks the actual worker device before creating DVPP resources. It enables this path for the known A2/A3 device names listed in the implementation; unknown names retain PIL. The required [VPC color-conversion API](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/acce/dvpp/aclpythondevg_01_0307.html) does not support Ascend 950PR/950DT or the earlier Atlas training series. The A3 Ascend910_9362 is the device tested here; the other listed names have not been tested in this change.
 - NPU processor paths without verified tensor compatibility retain PIL inputs. CUDA-specific `nvjpeg_fancy` is independent of the NPU policy.
 - The HF `Glm4vProcessor` keeps image preprocessing on CPU because its patch reshapes exceed Ascend's dimension limit. Device JPEG decoding and the placement of later preprocessing are separate choices.
 - When the actual image-processing backend is PIL, including when selected through `auto`, the base processor transfers NPU-decoded image tensors to CPU before calling the HF processor.
 - JPEGD produces NV12; VPC converts it to RGB888 with full-range BT.601. A device copy and Torch layout conversion produce an owned contiguous `uint8` CHW RGB tensor on the worker's current NPU.
-- Device execution failures are surfaced as request errors. The decoder borrows the caller's NPU context and releases its own stream, channel, and buffers.
+- Device execution failures are surfaced as request errors. The decoder uses the caller's NPU context and normally releases its own stream, channel, and buffers. If stream synchronization fails, resources that the device may still access are retained rather than freed prematurely. Terminal cleanup from a thread without an ACL context initializes and leaves the current device's default context.
 
 The matching JPEGD/VPC experiment with Qwen2.5-VL-3B-Instruct/BF16 gave identical answers to CPU/PIL on 1,292 original MMBench DEV EN v1.1 base questions: both scored 1,077/1,292. This fixed-order check is not official CircularEval or a guarantee for every image. The component benchmark favored CPU on the small synthetic image and VPC on the larger two; full-model tests did not establish a stable end-to-end speedup. See the [PR evaluation](https://github.com/sgl-project/sglang/pull/45792) for conditions and results.
 

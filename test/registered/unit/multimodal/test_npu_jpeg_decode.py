@@ -10,6 +10,7 @@ import sys
 import threading
 import types
 import unittest
+import warnings
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -108,8 +109,39 @@ class TestNpuJpegDispatch(unittest.TestCase):
 
 
 class TestNpuJpegEligibility(unittest.TestCase):
-    def test_950_uses_pil_without_constructing_dvpp_resources(self):
-        for name in ("Ascend950PR", "Ascend950DT"):
+    def test_known_a2_a3_devices_use_the_actual_worker(self):
+        for name in (
+            "Ascend910B1",
+            "Ascend910B4",
+            "Ascend910B4_1",
+            "Ascend910_9362",
+            "Ascend910_9392",
+        ):
+            decoder = Mock()
+            expected = object()
+            decoder.decode.return_value = expected
+            get_name = Mock(return_value=name)
+            with (
+                self.subTest(name=name),
+                patch.object(
+                    torch,
+                    "npu",
+                    types.SimpleNamespace(
+                        current_device=lambda: 5, get_device_name=get_name
+                    ),
+                    create=True,
+                ),
+                patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
+                patch.object(jpeg, "_decoder", return_value=decoder) as construct,
+            ):
+                data = image_bytes()
+                self.assertIs(jpeg.decode_jpeg(data), expected)
+                get_name.assert_called_once_with(5)
+                construct.assert_called_once_with(5)
+                decoder.decode.assert_called_once_with(data)
+
+    def test_unsupported_and_unknown_use_pil_without_constructing_dvpp(self):
+        for name in ("Ascend950PR", "Ascend950DT", "Ascend910", "Unknown"):
             get_name = Mock(return_value=name)
             with (
                 self.subTest(name=name),
@@ -117,7 +149,9 @@ class TestNpuJpegEligibility(unittest.TestCase):
                 patch.object(
                     torch,
                     "npu",
-                    types.SimpleNamespace(current_device=lambda: 5, get_device_name=get_name),
+                    types.SimpleNamespace(
+                        current_device=lambda: 5, get_device_name=get_name
+                    ),
                     create=True,
                 ),
                 patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
@@ -139,7 +173,9 @@ class TestNpuJpegEligibility(unittest.TestCase):
                 "npu",
                 types.SimpleNamespace(
                     current_device=lambda: 5,
-                    get_device_name=Mock(side_effect=RuntimeError("device unavailable")),
+                    get_device_name=Mock(
+                        side_effect=RuntimeError("device unavailable")
+                    ),
                 ),
                 create=True,
             ),
@@ -305,6 +341,133 @@ class TestOddJpegAdaptation(unittest.TestCase):
 
 
 class TestVpcCleanup(unittest.TestCase):
+    def test_sync_python_error_poisons_and_keeps_frame_buffers(self):
+        decoder = VPCJPEGDecoder.__new__(VPCJPEGDecoder)
+        acl = Mock()
+        acl.media.dvpp_malloc.return_value = (17, 0)
+        acl.media.dvpp_vpc_convert_color_async.return_value = 0
+        failure = RuntimeError("sync raised")
+        acl.rt.synchronize_stream.side_effect = failure
+        owner = types.SimpleNamespace(acl=acl, stream=1, poisoned=False)
+        decoder.decoder, decoder.channel = owner, 2
+        decoder.torch = Mock()
+        decoder._description = Mock(side_effect=[101, 102])
+        frame = types.SimpleNamespace(
+            ptr=7, size=3072, info=dvpp.JPEGInfo(64, 32, 64, 32)
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            decoder._convert_frame(frame)
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(owner.poisoned)
+        acl.media.dvpp_destroy_pic_desc.assert_not_called()
+        acl.media.dvpp_free.assert_not_called()
+
+    def test_cleanup_attempts_all_resources_without_masking_original(self):
+        original = RuntimeError("original error")
+        release_one = Mock(side_effect=RuntimeError("release one"))
+        release_two = Mock(return_value=0)
+        with self.assertRaises(RuntimeError) as caught:
+            try:
+                raise original
+            finally:
+                dvpp.cleanup_resources(((release_one, 1), (release_two, 2)), original)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(any("release one" in x for x in original.__notes__))
+        release_two.assert_called_once_with(2)
+
+    def test_cleanup_warning_as_error_does_not_skip_other_resources(self):
+        original = RuntimeError("original error")
+        release_one = Mock(side_effect=lambda _: warnings.warn("release_one"))
+        release_two = Mock(return_value=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with self.assertRaises(RuntimeError) as caught:
+                try:
+                    raise original
+                finally:
+                    dvpp.cleanup_resources(
+                        ((release_one, 1), (release_two, 2)), original
+                    )
+        self.assertIs(caught.exception, original)
+        self.assertTrue(any("release_one" in x for x in original.__notes__))
+        release_two.assert_called_once_with(2)
+
+    def test_cleanup_error_is_not_suppressed_by_caller_exception_context(self):
+        release = Mock(return_value=9)
+        release.__name__ = "release"
+        try:
+            raise ValueError("unrelated caller error")
+        except ValueError:
+            with self.assertRaisesRegex(dvpp.ACLFailure, "cleanup release"):
+                dvpp.cleanup_resources(((release, 1),), None)
+
+    def test_failed_cleanup_sync_preserves_original_and_poisons(self):
+        original = RuntimeError("submit failed")
+        acl = Mock()
+        acl.rt.synchronize_stream.side_effect = RuntimeError("sync raised")
+        owner = types.SimpleNamespace(acl=acl, stream=1, poisoned=False)
+        with self.assertRaises(RuntimeError) as caught:
+            try:
+                raise original
+            finally:
+                dvpp.drain_submitted(owner, original)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(owner.poisoned)
+        self.assertTrue(any("sync raised" in x for x in original.__notes__))
+
+    def test_constructor_cleanup_does_not_mask_channel_error(self):
+        acl = Mock()
+        acl.rt.get_context.return_value = (101, 0)
+        acl.rt.set_context.return_value = 0
+        acl.media.dvpp_create_channel_desc.return_value = None
+        owner = types.SimpleNamespace(acl=acl, context=202, lock=threading.RLock())
+        owner._activate = Mock()
+        owner.close = Mock(side_effect=RuntimeError("JPEG cleanup failed"))
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.jpeg.vpc.JPEGDecoder",
+                return_value=owner,
+            ),
+            patch.dict(sys.modules, {"torch_npu": types.ModuleType("torch_npu")}),
+            patch.object(
+                torch, "npu", types.SimpleNamespace(set_device=Mock()), create=True
+            ),
+            patch.object(torch, "device", return_value=object()),
+            patch.object(torch, "empty"),
+            self.assertRaisesRegex(dvpp.ACLFailure, "VPC returned null") as caught,
+        ):
+            VPCJPEGDecoder(0)
+        self.assertTrue(
+            any("JPEG cleanup failed" in x for x in caught.exception.__notes__)
+        )
+
+    def test_descriptor_cleanup_failure_keeps_setter_error(self):
+        decoder = VPCJPEGDecoder.__new__(VPCJPEGDecoder)
+        acl = Mock()
+        acl.media.dvpp_create_pic_desc.return_value = 17
+        acl.media.dvpp_set_pic_desc_data.return_value = 9
+        acl.media.dvpp_destroy_pic_desc.return_value = 8
+        decoder.decoder = types.SimpleNamespace(acl=acl)
+        with self.assertRaisesRegex(dvpp.ACLFailure, "set_pic_desc_data") as caught:
+            decoder._description(1, 1, 1, 1, 1, 1, 1)
+        self.assertTrue(
+            any("destroy pic descriptor" in x for x in caught.exception.__notes__)
+        )
+
+    def test_close_restore_failure_does_not_mask_release_error(self):
+        decoder = VPCJPEGDecoder.__new__(VPCJPEGDecoder)
+        acl = Mock()
+        acl.rt.get_context.return_value = (101, 0)
+        acl.rt.set_context.return_value = 9
+        owner = types.SimpleNamespace(acl=acl, context=202, lock=threading.RLock())
+        original = RuntimeError("release failed")
+        owner.close = Mock(side_effect=original)
+        decoder.channel, decoder.decoder = None, owner
+        with self.assertRaises(RuntimeError) as caught:
+            decoder.close()
+        self.assertIs(caught.exception, original)
+        self.assertTrue(any("restore" in x for x in original.__notes__))
+
     def test_close_restores_exact_context_after_success_or_failure(self):
         for fail in (False, True):
             with self.subTest(fail=fail):
@@ -364,11 +527,11 @@ class TestVpcCleanup(unittest.TestCase):
         frame = types.SimpleNamespace(
             ptr=7, size=3072, info=dvpp.JPEGInfo(64, 32, 64, 32)
         )
-        with (
-            self.assertWarns(UserWarning),
-            self.assertRaisesRegex(RuntimeError, "allocation failure"),
-        ):
+        with self.assertRaisesRegex(RuntimeError, "allocation failure") as caught:
             decoder._convert_frame(frame)
+        self.assertTrue(
+            any("destroy_pic_desc" in x for x in caught.exception.__notes__)
+        )
         self.assertEqual(
             [c.args for c in a.media.dvpp_destroy_pic_desc.call_args_list],
             [(102,), (101,)],
@@ -397,6 +560,99 @@ class TestDeviceFrameOwnership(unittest.TestCase):
         self.assertEqual(self.frame.ptr, 0)
         self.assertNotIn(self.frame, self.decoder.frames)
 
+    def test_frame_free_failure_does_not_mask_conversion_error(self):
+        original = RuntimeError("conversion failed")
+        self.decoder.acl.media.dvpp_free.return_value = 9
+        with self.assertRaises(RuntimeError) as caught:
+            with self.frame:
+                raise original
+        self.assertIs(caught.exception, original)
+        self.assertTrue(any("dvpp_free" in x for x in original.__notes__))
+        self.assertEqual(self.frame.ptr, 17)
+
+    def test_jpeg_constructor_cleanup_does_not_mask_channel_error(self):
+        acl = types.ModuleType("acl")
+        acl.rt, acl.media = Mock(), Mock()
+        acl.rt.get_device.return_value = (0, 0)
+        acl.rt.get_context.return_value = (101, 0)
+        acl.rt.create_stream.return_value = (201, 0)
+        acl.rt.set_context.return_value = 0
+        acl.rt.destroy_stream.return_value = 9
+        acl.media.dvpp_create_channel_desc.return_value = None
+        with (
+            patch.dict(sys.modules, {"acl": acl}),
+            self.assertRaisesRegex(dvpp.ACLFailure, "returned null") as caught,
+        ):
+            dvpp.JPEGDecoder(0)
+        self.assertTrue(any("destroy_stream" in x for x in caught.exception.__notes__))
+
+    def test_jpeg_sync_exception_poisons_and_retains_allocations(self):
+        d = self.decoder
+        d.stream, d.channel = 3, 4
+        d.acl.util.bytes_to_ptr.return_value = 9
+        d.acl.media.dvpp_jpeg_get_image_info_v2.return_value = (64, 32, 3, 0, 0)
+        d.acl.media.dvpp_jpeg_predict_dec_size.return_value = (3072, 0)
+        d.acl.media.dvpp_malloc.side_effect = [(11, 0), (12, 0)]
+        d.acl.rt.memcpy.return_value = 0
+        d.acl.media.dvpp_create_pic_desc.return_value = 13
+        for name in (
+            "data",
+            "size",
+            "format",
+            "width",
+            "height",
+            "width_stride",
+            "height_stride",
+        ):
+            getattr(d.acl.media, "dvpp_set_pic_desc_" + name).return_value = 0
+        d.acl.media.dvpp_jpeg_decode_async.return_value = 0
+        original = RuntimeError("JPEG stream sync failed")
+        d.acl.rt.synchronize_stream.side_effect = original
+        with self.assertRaises(RuntimeError) as caught:
+            d.decode(image_bytes())
+        self.assertIs(caught.exception, original)
+        self.assertTrue(d.poisoned)
+        d.acl.media.dvpp_free.assert_not_called()
+        d.acl.media.dvpp_destroy_pic_desc.assert_not_called()
+
+    def test_jpeg_cleanup_failure_does_not_leave_unreturned_frame(self):
+        d = self.decoder
+        d.stream, d.channel = 3, 4
+        d.acl.util.bytes_to_ptr.return_value = 9
+        d.acl.media.dvpp_jpeg_get_image_info_v2.return_value = (64, 32, 3, 0, 0)
+        d.acl.media.dvpp_jpeg_predict_dec_size.return_value = (3072, 0)
+        d.acl.media.dvpp_malloc.side_effect = [(11, 0), (12, 0)]
+        d.acl.rt.memcpy.return_value = 0
+        d.acl.media.dvpp_create_pic_desc.return_value = 13
+        for name in (
+            "data",
+            "size",
+            "format",
+            "width",
+            "height",
+            "width_stride",
+            "height_stride",
+        ):
+            getattr(d.acl.media, "dvpp_set_pic_desc_" + name).return_value = 0
+        d.acl.media.dvpp_jpeg_decode_async.return_value = 0
+        d.acl.rt.synchronize_stream.return_value = 0
+        d.acl.media.dvpp_get_pic_desc_ret_code.return_value = 0
+        for name, value in (
+            ("width", 64),
+            ("height", 32),
+            ("width_stride", 64),
+            ("height_stride", 32),
+        ):
+            getattr(d.acl.media, "dvpp_get_pic_desc_" + name).return_value = value
+        d.acl.media.dvpp_destroy_pic_desc.return_value = 9
+        d.acl.media.dvpp_destroy_pic_desc.__name__ = "destroy_pic_desc"
+        with self.assertRaisesRegex(dvpp.ACLFailure, "destroy_pic_desc"):
+            d.decode(image_bytes())
+        self.assertEqual(d.frames, {self.frame})
+        self.assertEqual(
+            [c.args for c in d.acl.media.dvpp_free.call_args_list], [(11,), (12,)]
+        )
+
     def test_poisoned_unwind_preserves_sync_error_and_retains_dma_memory(self):
         original = dvpp.ACLFailure("synchronize_stream VPC: ACL error 9")
         with self.assertRaises(dvpp.ACLFailure) as caught:
@@ -417,6 +673,45 @@ class TestDeviceFrameOwnership(unittest.TestCase):
         self.decoder.acl.media.dvpp_free.assert_not_called()
 
 
+class TestCleanupContext(unittest.TestCase):
+    def test_missing_context_is_initialized_on_selected_device(self):
+        acl = types.ModuleType("acl")
+        acl.rt = Mock()
+        acl.rt.get_context.side_effect = [(0, 107002), (123, 0)]
+        npu = types.SimpleNamespace(set_device=Mock())
+        with (
+            patch.dict(sys.modules, {"acl": acl}),
+            patch.object(torch, "npu", npu, create=True),
+        ):
+            jpeg._ensure_cleanup_context(5)
+        npu.set_device.assert_called_once_with(5)
+
+    def test_existing_context_is_not_replaced(self):
+        acl = types.ModuleType("acl")
+        acl.rt = Mock()
+        acl.rt.get_context.return_value = (123, 0)
+        npu = types.SimpleNamespace(set_device=Mock())
+        with (
+            patch.dict(sys.modules, {"acl": acl}),
+            patch.object(torch, "npu", npu, create=True),
+        ):
+            jpeg._ensure_cleanup_context(5)
+        npu.set_device.assert_not_called()
+
+    def test_other_context_error_is_not_hidden(self):
+        acl = types.ModuleType("acl")
+        acl.rt = Mock()
+        acl.rt.get_context.return_value = (0, 42)
+        npu = types.SimpleNamespace(set_device=Mock())
+        with (
+            patch.dict(sys.modules, {"acl": acl}),
+            patch.object(torch, "npu", npu, create=True),
+        ):
+            with self.assertRaisesRegex(dvpp.ACLFailure, "42"):
+                jpeg._ensure_cleanup_context(5)
+        npu.set_device.assert_not_called()
+
+
 class TestNpuJpegOwnership(unittest.TestCase):
     def setUp(self):
         self.patches = [
@@ -424,6 +719,13 @@ class TestNpuJpegOwnership(unittest.TestCase):
             patch.object(jpeg, "_live", {}),
             patch.object(jpeg, "_closed", False),
             patch.object(jpeg, "_pid", os.getpid()),
+            patch.object(jpeg, "_ensure_cleanup_context"),
+            patch.object(
+                torch,
+                "npu",
+                types.SimpleNamespace(current_device=lambda: 0),
+                create=True,
+            ),
             patch(
                 "sglang.srt.hardware_backend.npu.jpeg.vpc.VPCJPEGDecoder",
                 side_effect=lambda device: Mock(),
@@ -445,6 +747,18 @@ class TestNpuJpegOwnership(unittest.TestCase):
         first.close.assert_called_once()
         self.assertEqual(self.factory.call_count, 2)
 
+    def test_same_worker_switch_context_failure_keeps_old_decoder(self):
+        first = jpeg._decoder(3)
+        with patch.object(
+            jpeg, "_ensure_cleanup_context", side_effect=RuntimeError("context failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "context failed"):
+                jpeg._decoder(4)
+        first.close.assert_not_called()
+        self.assertEqual(len(jpeg._live), 1)
+        jpeg._decoder(4)
+        first.close.assert_called_once()
+
     def test_terminated_worker_is_reclaimed_on_next_request(self):
         old = []
         worker = threading.Thread(target=lambda: old.append(jpeg._decoder(0)))
@@ -454,6 +768,21 @@ class TestNpuJpegOwnership(unittest.TestCase):
         jpeg._decoder(0)
         old[0].close.assert_called_once()
         self.assertEqual(len(jpeg._live), 1)
+
+    def test_context_failure_keeps_retired_decoder_for_retry(self):
+        old = []
+        worker = threading.Thread(target=lambda: old.append(jpeg._decoder(0)))
+        worker.start()
+        worker.join()
+        with patch.object(
+            jpeg, "_ensure_cleanup_context", side_effect=RuntimeError("context failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "context failed"):
+                jpeg._decoder(0)
+        old[0].close.assert_not_called()
+        self.assertEqual(len(jpeg._live), 1)
+        jpeg._decoder(0)
+        old[0].close.assert_called_once()
 
     def test_close_failure_keeps_reference_for_retry(self):
         decoder = jpeg._decoder(0)

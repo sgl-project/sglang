@@ -6,6 +6,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import importlib
 import io
+import os
 import threading
 import types
 import unittest
@@ -34,6 +35,36 @@ def jpeg_bytes():
 
 
 class TestImageDecodeBackend(unittest.TestCase):
+    def test_service_disable_is_sampled_before_processor_initialization(self):
+        class VerifiedProcessor(BaseMultimodalProcessor):
+            npu_image_decode = True
+
+            async def process_mm_data_async(self, *args, **kwargs):
+                raise NotImplementedError
+
+        class StopInitialization(Exception):
+            pass
+
+        processors = []
+        for value, expected in ((None, True), ("0", True), ("1", False)):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SGLANG_DISABLE_NPU_IMAGE_DECODE", None)
+                if value is not None:
+                    os.environ["SGLANG_DISABLE_NPU_IMAGE_DECODE"] = value
+                processor = object.__new__(VerifiedProcessor)
+                with (
+                    patch(
+                        "sglang.srt.multimodal.processors.base_processor.get_mm",
+                        side_effect=StopInitialization,
+                    ),
+                    self.assertRaises(StopInitialization),
+                ):
+                    BaseMultimodalProcessor.__init__(processor, None, None, None, "cpu")
+                self.assertIs(processor.npu_image_decode, expected)
+                processors.append(processor)
+        self.assertIs(processors[0].npu_image_decode, True)
+        self.assertIs(processors[2].npu_image_decode, False)
+
     def test_published_runtime_device_takes_priority_over_available_hardware(self):
         context = Mock()
         context.is_config_namespace_published.return_value = True
@@ -136,8 +167,12 @@ class TestDeviceImageDecodeDispatch(unittest.TestCase):
 
     def test_both_disabled_do_not_call_a_decoder(self):
         with (
-            patch.object(common, "_image_decode_backend", return_value="npu"),
-            patch.object(common, "is_cuda", side_effect=AssertionError("CUDA probe")),
+            patch.object(
+                common,
+                "_image_decode_backend",
+                side_effect=AssertionError("backend probe"),
+            ),
+            patch.object(common, "is_cuda", return_value=False) as cuda_probe,
             patch.object(jpeg, "decode_jpeg") as decode,
         ):
             result, _ = common.load_image(
@@ -145,6 +180,7 @@ class TestDeviceImageDecodeDispatch(unittest.TestCase):
             )
         self.assertIsInstance(result, Image.Image)
         self.assertEqual(result.size, (64, 32))
+        cuda_probe.assert_called_once_with()
         decode.assert_not_called()
 
     def test_backend_and_independent_policy_matrix(self):
@@ -208,9 +244,7 @@ class TestDeviceImageDecodeDispatch(unittest.TestCase):
                 with (
                     self.subTest(gpu=gpu_mode, npu=npu_mode),
                     patch.object(common, "_image_decode_backend", return_value="npu"),
-                    patch.object(
-                        common, "is_cuda", side_effect=AssertionError("CUDA probe")
-                    ),
+                    patch.object(common, "is_cuda", return_value=True) as cuda_probe,
                     patch.object(jpeg, "decode_jpeg", return_value=None) as decode,
                 ):
                     result, _ = common.load_image(
@@ -218,6 +252,9 @@ class TestDeviceImageDecodeDispatch(unittest.TestCase):
                     )
                 self.assertIsInstance(result, Image.Image)
                 self.assertEqual(decode.call_count, int(npu_mode))
+                self.assertEqual(
+                    cuda_probe.call_count, int(not gpu_mode and not npu_mode)
+                )
                 with Image.open(io.BytesIO(self.data)) as reference:
                     self.assertEqual(result.tobytes(), reference.tobytes())
 
@@ -359,7 +396,6 @@ class TestProcessorIoDevice(unittest.TestCase):
 
             @classmethod
             def _load_single_item(cls, data, modality, *args, **kwargs):
-                assert kwargs["gpu_image_decode"] is True
                 assert kwargs["npu_image_decode"] is True
                 return getattr(state, "device", 0)
 
@@ -434,6 +470,26 @@ class TestProcessorIoDevice(unittest.TestCase):
 
 
 class TestIndependentProcessorPolicies(unittest.TestCase):
+    def test_legacy_classmethod_override_works_when_npu_is_inactive(self):
+        class Processor(BaseMultimodalProcessor):
+            @classmethod
+            def _load_single_item(cls, data, modality, *args):
+                return cls.gpu_image_decode
+
+            async def process_mm_data_async(self, *args, **kwargs):
+                raise NotImplementedError
+
+        for mode in (False, True, "nvjpeg_fancy"):
+            subclass = type("LegacyProcessor", (Processor,), {"gpu_image_decode": mode})
+            processor = object.__new__(subclass)
+            processor.gpu_image_decode = "ignored instance value"
+            for backend in ("cpu", "cuda", "npu"):
+                processor.server_args = types.SimpleNamespace(device=backend)
+                self.assertEqual(
+                    processor._load_single_item_for_processor(b"jpeg", Modality.IMAGE),
+                    mode,
+                )
+
     def test_unknown_product_loaders_preserve_gpu_and_disable_npu(self):
         from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
         from sglang.srt.multimodal.cache import snapshot_media
@@ -466,7 +522,7 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                             b"jpeg", Modality.IMAGE
                         )
                         load.assert_called_once_with(
-                            b"jpeg", gpu_mode, npu_image_decode=False
+                            b"jpeg", Processor.gpu_image_decode, npu_image_decode=False
                         )
                     with patch(
                         "sglang.srt.multimodal.media_artifacts.base.load_image",
@@ -487,7 +543,7 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                     ) as load:
                         generic._load_images([b"jpeg"])
                         load.assert_called_once_with(
-                            b"jpeg", gpu_mode, npu_image_decode=False
+                            b"jpeg", True, npu_image_decode=False
                         )
                     encoder = object.__new__(EncoderPreprocessor)
                     encoder.device = backend
@@ -642,7 +698,9 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
                 ) as load:
                     processor._load_single_item_for_processor(b"jpeg", Modality.IMAGE)
                     load.assert_called_once_with(
-                        b"jpeg", gpu_mode, npu_image_decode=True
+                        b"jpeg",
+                        QwenVLImageProcessor.gpu_image_decode,
+                        npu_image_decode=True,
                     )
                 with patch(
                     "sglang.srt.multimodal.media_artifacts.base.load_image",
@@ -661,6 +719,15 @@ class TestIndependentProcessorPolicies(unittest.TestCase):
             processor.hf_config.model_type = model_type
             self.assertIs(processor._get_npu_image_decode_mode(), False)
         processor.hf_config.model_type = "qwen2_5_vl"
+        processor.image_config = {"max_pixels": 1003520}
+        self.assertIs(processor._get_npu_image_decode_mode(), True)
+        for config in (
+            {"max_pixels": 1003521},
+            {"max_pixels": 1003520.0},
+            {"max_pixels": 1003520, "patch_size": 14},
+        ):
+            processor.image_config = config
+            self.assertIs(processor._get_npu_image_decode_mode(), False)
         processor.image_config = {"patch_size": 16}
         self.assertIs(processor._get_npu_image_decode_mode(), False)
         processor.image_config = {}

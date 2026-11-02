@@ -103,7 +103,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         for data in image_data:
             img, _ = load_image(
                 data,
-                self.gpu_image_decode,
+                True,
                 npu_image_decode=self._get_npu_image_decode_mode(),
             )
             if img.mode != "RGB":
