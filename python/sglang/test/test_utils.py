@@ -1616,7 +1616,7 @@ def run_bench_one_batch_server(
     other_server_args,
     simulate_spec_acc_lens=None,
 ):
-    from sglang.bench_one_batch_server import run_benchmark
+    from sglang.benchmark.one_batch_server import run_benchmark
 
     if simulate_spec_acc_lens is not None:
         env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}

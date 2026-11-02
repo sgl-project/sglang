@@ -20,8 +20,8 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
-from sglang.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
+from sglang.benchmark.one_batch_server import BenchArgs as OneBatchBenchArgs
+from sglang.benchmark.one_batch_server import run_benchmark as run_one_batch_benchmark
 from sglang.benchmark.serving import run_benchmark as run_serving_benchmark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
