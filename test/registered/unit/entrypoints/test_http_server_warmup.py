@@ -6,6 +6,7 @@ from unittest.mock import patch
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import (
     _send_disaggregation_warmup_requests,
+    _serving_url,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -82,6 +83,35 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
+
+
+class TestWarmupProbeAddress(unittest.TestCase):
+    """The warmup has to reach the server this process actually runs.
+
+    The listener binds the resolved serving config, which a restore that
+    redirects the listen address changes without touching the startup record.
+    """
+
+    def serving(self, host):
+        return patch(
+            "sglang.srt.entrypoints.http_server.get_serving",
+            return_value=SimpleNamespace(host=host, port=30184),
+        )
+
+    def test_probes_follow_the_resolved_address(self):
+        cases = (
+            ("127.0.0.1", "http://127.0.0.1:30184"),
+            ("0.0.0.0", "http://127.0.0.1:30184"),
+            ("::", "http://[::1]:30184"),
+            ("::1", "http://[::1]:30184"),
+            ("my-server", "http://my-server:30184"),
+        )
+        for host, expected in cases:
+            with self.subTest(host=host):
+                with self.serving(host):
+                    self.assertEqual(
+                        _serving_url(SimpleNamespace(ssl_certfile=None)), expected
+                    )
 
 
 if __name__ == "__main__":
