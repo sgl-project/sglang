@@ -1700,6 +1700,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Split the unquantized DFLASH draft fc GEMM over TP ranks (each reads 1/TP of the
+    # replicated weight) and multicast all-gather the slices; needs CustomAllReduceV2 multicast.
+    SGLANG_OPT_DFLASH_SPLIT_FC = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
