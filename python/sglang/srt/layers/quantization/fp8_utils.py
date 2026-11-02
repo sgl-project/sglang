@@ -1487,6 +1487,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
     deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
@@ -1526,7 +1527,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-        return triton_w8a8_block_fp8_linear(
+        result = triton_w8a8_block_fp8_linear(
             input,
             weight,
             block_size,
@@ -1536,22 +1537,29 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             act_scale_ue8m0=act_scale_ue8m0,
             weight_bf16=weight_bf16,
         )
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
     if input_scale is not None:
         # Pre-quantized activations retain their group size and scale format.
         # DeepGEMM aligns fp32 scale storage for TMA when needed.
         input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
+        result = w8a8_block_fp8_matmul_deepgemm(
             input_2d,
             weight,
             input_scale,
             weight_scale,
             block_size,
             output_dtype=output_dtype,
+            output=None if output is None else output.view(-1, weight.shape[0]),
         )
         if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
+            result += bias
+        if output is not None:
+            return output
+        return result.view(*input.shape[:-1], weight.shape[0])
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -1576,12 +1584,20 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             block_size[1],
         )
 
-    output = w8a8_block_fp8_matmul_deepgemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
+    result = w8a8_block_fp8_matmul_deepgemm(
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        block_size,
+        output_dtype=output_dtype,
+        output=None if output is None else output.view(-1, weight.shape[0]),
     )
     if bias is not None:
-        output += bias
-    return output.to(dtype=output_dtype).view(*output_shape)
+        result += bias
+    if output is not None:
+        return output
+    return result.to(dtype=output_dtype).view(*output_shape)
 
 
 def _unpack_ue8m0_scale_for_triton(
