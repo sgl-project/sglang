@@ -575,24 +575,6 @@ def w4a16_small_m_gemm(
     return out if split == 1 else out.to(x.dtype)
 
 
-# On gfx11, int4 weight rows read together at power-of-two byte strides land on the same
-# cache channel; a 128 B row pad cuts one 8-row verify step's GEMMs by about 7% on gfx1151
-# (512 B is slower). Same idea as the bf16 row pad of vLLM's cache_aliasing_pad_elems.
-ROW_PAD_WORDS = 32
-
-
-def pad_rows(w: torch.Tensor) -> torch.Tensor:
-    """``w[n, k // 8]`` as a view of rows padded by ``ROW_PAD_WORDS`` int32 words (the pad
-    holds zero-point codes and is never read). Every W4A16 kernel here and
-    ``w4a16_skinny_gemm`` take the row stride from the tensor."""
-    n, k8 = w.shape
-    buf = torch.full(
-        (n, k8 + ROW_PAD_WORDS), -2004318072, dtype=torch.int32, device=w.device
-    )  # 0x88888888
-    buf[:, :k8] = w
-    return buf[:, :k8]
-
-
 _CLIP_RATIOS = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75)
 
 

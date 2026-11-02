@@ -1677,18 +1677,22 @@ class TritonAttnBackend(AttentionBackend):
         ran."""
         from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
 
-        num_tokens_per_req = int(
-            getattr(forward_batch.spec_info, "draft_token_num", 0) or 0
+        # the token count qo_indptr is built from
+        num_tokens_per_req = self._target_verify_num_tokens_per_req(
+            forward_batch.spec_info
         )
         k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
         qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        ov = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         if not (
             num_tokens_per_req > 0
             and qv.shape[0] % num_tokens_per_req == 0
             and layer.qk_head_dim == layer.v_head_dim
             and va.covered(
                 qv,
+                ov,
                 k_buffer,
+                v_buffer,
                 num_tokens_per_req,
                 layer.tp_q_head_num,
                 layer.tp_k_head_num,
@@ -1698,7 +1702,7 @@ class TritonAttnBackend(AttentionBackend):
             return False
         va.verify_attention_gfx1151(
             qv,
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            ov,
             k_buffer,
             v_buffer,
             self.req_to_token,

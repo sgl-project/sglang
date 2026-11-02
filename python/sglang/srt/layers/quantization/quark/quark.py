@@ -851,6 +851,11 @@ class QuarkConfig(QuantizationConfig):
                 weight_quant.get("group_size"),
             )
             return False
+        if weight_quant.get("symmetric") is not True:
+            # asymmetric zero points are neither repacked for nor loaded through the fused
+            # GDN projection loader
+            logger.debug("Quark INT4 W4A16 supports symmetric weights only")
+            return False
         return weight_quant.get("is_dynamic") is not True
 
     def _is_mx_fp4(

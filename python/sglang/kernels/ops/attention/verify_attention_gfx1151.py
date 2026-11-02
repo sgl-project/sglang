@@ -138,9 +138,10 @@ def _verify_combine_kernel(
     )
 
 
-def covered(q, k_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
+def covered(q, o, k_buffer, v_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
     """Whether ``verify_attention_gfx1151`` takes this layer: gfx1151, bf16, at most 8 draft
-    tokens per request and 8 q heads per kv head, int32-addressable contiguous caches."""
+    tokens per request and 8 q heads per kv head, dense ``[B * T, H, D]`` q and o (the
+    kernel addresses them without strides), int32-addressable contiguous caches."""
     return (
         use_gfx1151_kernels()
         and 0 < num_tokens_per_req <= 8
@@ -148,8 +149,12 @@ def covered(q, k_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
         and hq // hkv <= 8
         and d in (64, 128, 256)
         and q.dtype == torch.bfloat16
-        and k_buffer.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and o.is_contiguous()
+        and k_buffer.dtype == v_buffer.dtype == torch.bfloat16
         and k_buffer.is_contiguous()
+        and v_buffer.is_contiguous()
+        and k_buffer.shape == v_buffer.shape
         and k_buffer.numel() < 2**31
     )
 

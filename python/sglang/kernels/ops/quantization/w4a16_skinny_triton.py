@@ -4,8 +4,8 @@
 ROCm.
 
 The GEMM is adapted from vLLM's Triton W4A16 kernel. AWQ checkpoints pack eight codes
-along N in an interleaved nibble order; the weights and zero points are repacked once at
-load time to the ``[N, K / 8]`` layout the GEMM reads.
+along N in an interleaved nibble order; the weights are repacked once at load time to the
+``[N, K / 8]`` layout the GEMM reads.
 """
 
 from __future__ import annotations
@@ -80,6 +80,26 @@ def _gfx1151_w4a16_config(
     return _GFX1151_W4A16_CONFIGS.get((bucket, k, n))
 
 
+# Rows of an int4 weight read together alias onto the same L2/MALL channels on gfx11. A
+# 128 B pad per row speeds up the gfx1151 W4A16 GEMMs on the Qwen3.8 shapes: prefill by
+# 1.10x and an 8-row verify step by 1.06x (summed over the projections), with single-row
+# decode unchanged or faster depending on the stack; 512 B is slower. The int4 counterpart
+# of the bf16 row pad of #46327.
+ROW_PAD_WORDS = 32
+
+
+def pad_rows(w: torch.Tensor) -> torch.Tensor:
+    """``w[n, k // 8]`` as a view of rows padded by ``ROW_PAD_WORDS`` int32 words (the pad
+    holds zero-point codes and is never read). ``w4a16_skinny_gemm`` and the gfx1151 W4A16
+    kernels take the row stride from the tensor."""
+    n, k8 = w.shape
+    buf = torch.full(
+        (n, k8 + ROW_PAD_WORDS), -2004318072, dtype=torch.int32, device=w.device
+    )  # 0x88888888
+    buf[:, :k8] = w
+    return buf[:, :k8]
+
+
 @triton.jit
 def _repack_awq_w4_to_skinny_kernel(
     source,
@@ -141,65 +161,6 @@ def repack_awq_w4_to_skinny(
         SIGNED=signed,
         BLOCK_N=block_n,
         BLOCK_K8=block_k8,
-    )
-    return output
-
-
-@triton.jit
-def _repack_awq_qzeros_to_skinny_kernel(
-    source,
-    destination,
-    NUM_GROUPS,
-    N8,
-    SIGNED: tl.constexpr,
-    BLOCK_GROUPS: tl.constexpr,
-    BLOCK_N8: tl.constexpr,
-):
-    """Undo AWQ's nibble interleave and transpose packed zero points."""
-    offs_group = tl.program_id(0) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
-    offs_n8 = tl.program_id(1) * BLOCK_N8 + tl.arange(0, BLOCK_N8)
-    source_offsets = offs_group[:, None] * N8 + offs_n8[None, :]
-    words = tl.load(
-        source + source_offsets,
-        mask=(offs_group[:, None] < NUM_GROUPS) & (offs_n8[None, :] < N8),
-        other=0,
-    )
-
-    lanes = tl.arange(0, 8)
-    source_nibble = (lanes % 2) * 4 + lanes // 2
-    values = (words[:, :, None] >> (source_nibble[None, None, :] * 4)) & 0xF
-    if SIGNED:
-        values ^= 0x8
-    packed = tl.sum(values << (lanes[None, None, :] * 4), axis=2)
-
-    destination_offsets = offs_n8[None, :] * NUM_GROUPS + offs_group[:, None]
-    mask = (offs_group[:, None] < NUM_GROUPS) & (offs_n8[None, :] < N8)
-    tl.store(destination + destination_offsets, packed, mask=mask)
-
-
-def repack_awq_qzeros_to_skinny(
-    qzeros: torch.Tensor, *, signed: bool = False
-) -> torch.Tensor:
-    """Convert AWQ-packed [groups, N/8] zero points to [N/8, groups]."""
-    if qzeros.dtype != torch.int32 or qzeros.ndim != 2:
-        raise ValueError("AWQ skinny kernels require 2D int32 zero points")
-
-    num_groups, n8 = qzeros.shape
-    output = torch.empty((n8, num_groups), dtype=qzeros.dtype, device=qzeros.device)
-    block_groups = 32
-    block_n8 = 32
-    grid = (
-        triton.cdiv(num_groups, block_groups),
-        triton.cdiv(n8, block_n8),
-    )
-    _repack_awq_qzeros_to_skinny_kernel[grid](
-        qzeros,
-        output,
-        num_groups,
-        n8,
-        SIGNED=signed,
-        BLOCK_GROUPS=block_groups,
-        BLOCK_N8=block_n8,
     )
     return output
 
@@ -381,7 +342,7 @@ def w4a16_skinny_gemm(
 
 
 __all__ = [
-    "repack_awq_qzeros_to_skinny",
+    "pad_rows",
     "repack_awq_w4_to_skinny",
     "w4a16_skinny_gemm",
 ]

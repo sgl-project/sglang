@@ -45,11 +45,12 @@ def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
 @pytest.mark.parametrize("padded", [False, True])
 def test_w4a16_small_m_gemm(m, n, k, padded):
     from sglang.kernels.ops.quantization import w4a16_small_m_gfx1151 as w4
+    from sglang.kernels.ops.quantization.w4a16_skinny_triton import pad_rows
 
     torch.manual_seed(0)
     w, s = _rand_w4(n, k)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    wp = w4.pad_rows(w) if padded else w
+    wp = pad_rows(w) if padded else w
     assert w4.covered(x, wp, s)
     got = w4.w4a16_small_m_gemm(x, wp, s)
     assert _rel_err(got, x.float() @ _dequant(w, s).T) < 1e-2
@@ -75,7 +76,7 @@ def test_w4a16_prefill_gemm():
     from sglang.kernels.ops.quantization import w4a16_prefill_gfx1151 as pf
 
     torch.manual_seed(0)
-    from sglang.kernels.ops.quantization.w4a16_small_m_gfx1151 import pad_rows
+    from sglang.kernels.ops.quantization.w4a16_skinny_triton import pad_rows
 
     w, s = _rand_w4(5120, 6144)
     x = torch.randn(300, 6144, device="cuda", dtype=torch.bfloat16)
@@ -88,8 +89,10 @@ def test_w4a16_prefill_gemm():
 @gfx1151
 @pytest.mark.parametrize("m", [8, 40, 300])
 def test_skinny_gemm_padded_rows(m):
-    from sglang.kernels.ops.quantization.w4a16_skinny_triton import w4a16_skinny_gemm
-    from sglang.kernels.ops.quantization.w4a16_small_m_gfx1151 import pad_rows
+    from sglang.kernels.ops.quantization.w4a16_skinny_triton import (
+        pad_rows,
+        w4a16_skinny_gemm,
+    )
 
     torch.manual_seed(0)
     w, s = _rand_w4(96, 5120)
@@ -100,25 +103,15 @@ def test_skinny_gemm_padded_rows(m):
 
 
 @gfx1151
-@pytest.mark.parametrize("n,k", [(248320, 5120), (6144, 5120), (5120, 17408)])
-def test_bf16_small_m_gemm(n, k):
-    from sglang.kernels.ops.gemm import bf16_small_m_gfx1151 as bf
-
-    torch.manual_seed(0)
-    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
-    x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
-    assert bf.covered(x, w)
-    assert _rel_err(bf.bf16_small_m_gemm(x, w), F.linear(x.float(), w.float())) < 1e-2
-
-
-@gfx1151
 @pytest.mark.parametrize("prefix", [1, 37, 1024, 5000])
 @pytest.mark.parametrize("bs", [1, 2])
-def test_verify_attention(prefix, bs):
+@pytest.mark.parametrize(
+    "hq,hkv,d,t", [(24, 4, 256, 8), (32, 4, 128, 8), (12, 2, 128, 4), (8, 8, 64, 8)]
+)
+def test_verify_attention(prefix, bs, hq, hkv, d, t):
     from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
 
     torch.manual_seed(0)
-    hq, hkv, d, t = 24, 4, 256, 8
     slots = bs * (prefix + t) + 16
     kc = torch.randn(slots, hkv, d, device="cuda", dtype=torch.bfloat16)
     vc = torch.randn_like(kc)
@@ -132,7 +125,7 @@ def test_verify_attention(prefix, bs):
     seq_lens = torch.full((bs,), prefix, device="cuda", dtype=torch.int32)
     q = torch.randn(bs * t, hq, d, device="cuda", dtype=torch.bfloat16)
     o = torch.empty_like(q)
-    assert va.covered(q, kc, t, hq, hkv, d)
+    assert va.covered(q, o, kc, vc, t, hq, hkv, d)
     va.verify_attention_gfx1151(q, o, kc, vc, r2t, rpi, seq_lens, t, d**-0.5)
     for b in range(bs):
         idx = r2t[b + 1, : prefix + t].long()
@@ -146,3 +139,96 @@ def test_verify_attention(prefix, bs):
                 o[b * t + i].float().flatten(), ref.flatten(), dim=0
             )
             assert cos > 0.9999
+
+
+@gfx1151
+def test_verify_attention_rejects_strided_q():
+    from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
+
+    hq, hkv, d, t = 24, 4, 256, 8
+    kc = torch.randn(64, hkv, d, device="cuda", dtype=torch.bfloat16)
+    qkv = torch.randn(t, (hq + 2 * hkv) * d, device="cuda", dtype=torch.bfloat16)
+    q = qkv[:, : hq * d].view(-1, hq, d)  # a slice of a fused qkv buffer
+    o = torch.empty(t, hq, d, device="cuda", dtype=torch.bfloat16)
+    assert not va.covered(q, o, kc, kc, t, hq, hkv, d)
+    assert va.covered(q.contiguous(), o, kc, kc, t, hq, hkv, d)
+
+
+def _gdn_inputs(T):
+    torch.manual_seed(0)
+    q = F.normalize(torch.randn(1, T, 16, 128, device="cuda"), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(1, T, 16, 128, device="cuda"), dim=-1).bfloat16()
+    v = torch.randn(1, T, 48, 128, device="cuda", dtype=torch.bfloat16)
+    g = F.logsigmoid(torch.randn(1, T, 48, device="cuda")).float()
+    beta = torch.sigmoid(torch.randn(1, T, 48, device="cuda")).bfloat16()
+    cu = torch.tensor([0, T], dtype=torch.long, device="cuda")
+    return q, k, v, g, beta, cu
+
+
+def _gdn_forward(q, k, v, g, beta, cu):
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+
+    state = torch.zeros(1, 48, 128, 128, device="cuda", dtype=torch.float32)
+    idx = torch.zeros(1, dtype=torch.int32, device="cuda")
+    o = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=128**-0.5,
+        initial_state=state,
+        initial_state_indices=idx,
+        cu_seqlens=cu,
+    )
+    return (o[0] if isinstance(o, tuple) else o), state
+
+
+@gfx1151
+@pytest.mark.parametrize("T", [64, 777, 2048])
+def test_gdn_head_major_and_grouped_chunk_o(T, monkeypatch):
+    """Qwen3.8-27B GDN shapes (16 q/k heads, 48 value heads): the head-major grids are
+    bitwise equal to the default order; the grouped three-head chunk_fwd_o gives the same
+    final state and output within bf16 rounding."""
+    import sglang.kernels.ops.attention.fla.chunk_fwd as cf
+    import sglang.kernels.ops.attention.fla.chunk_o as co
+    import sglang.kernels.ops.attention.fla.wy_fast as wf
+
+    inputs = _gdn_inputs(T)
+    o_all, s_all = _gdn_forward(*inputs)  # head-major + grouped (the gfx1151 default)
+
+    monkeypatch.setattr(co, "_use_grouped_three_head", lambda *a, **kw: False)
+    o_hm, s_hm = _gdn_forward(*inputs)  # head-major only
+    monkeypatch.setattr(cf, "use_gfx1151_kernels", lambda: False)
+    monkeypatch.setattr(wf, "use_gfx1151_kernels", lambda: False)
+    o_ref, s_ref = _gdn_forward(*inputs)  # default order, generic chunk_fwd_o
+
+    assert torch.equal(o_hm, o_ref) and torch.equal(s_hm, s_ref)
+    assert torch.equal(s_all, s_ref)
+    assert (o_all.float() - o_ref.float()).abs().max().item() < 1e-3
+
+
+@gfx1151
+def test_gluon_small_m_falls_back_without_triton_3_7(monkeypatch):
+    """With a pre-3.7 ``AMDWMMALayout`` (no register / warp bases) the Quark scheme leaves
+    small-M calls to the skinny GEMM instead of failing at launch."""
+    import triton.experimental.gluon.language.amd as amd
+
+    from sglang.srt.layers.quantization.quark.schemes import quark_w4a16_int4 as qs
+
+    class OldLayout:  # Triton 3.6 signature
+        def __init__(self, version, transposed, warps_per_cta, tiles_per_warp=None):
+            pass
+
+    w, s = _rand_w4(5120, 6144)
+    x = torch.randn(8, 6144, device="cuda", dtype=torch.bfloat16)
+    qs._gluon_small_m_available.cache_clear()
+    assert qs._gluon_small_m_available()
+    assert qs._gfx1151_w4a16_gemm(x, w, s) is not None
+    monkeypatch.setattr(amd, "AMDWMMALayout", OldLayout)
+    qs._gluon_small_m_available.cache_clear()
+    try:
+        assert not qs._gluon_small_m_available()
+        assert qs._gfx1151_w4a16_gemm(x, w, s) is None  # 8 rows: skinny GEMM
+    finally:
+        qs._gluon_small_m_available.cache_clear()

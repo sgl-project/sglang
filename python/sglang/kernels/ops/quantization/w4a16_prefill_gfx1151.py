@@ -120,12 +120,13 @@ MIN_ROWS = 256
 
 def covered(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> bool:
     """Whether ``w4a16_prefill_gemm`` should run: gfx1151, at least ``MIN_ROWS`` contiguous
-    bf16/fp16 rows, symmetric group-128 weights in the skinny layout."""
+    bf16 rows, symmetric group-128 weights in the skinny layout."""
     return (
         x.dim() == 2
         and x.shape[0] >= MIN_ROWS
         and use_gfx1151_kernels()
-        and x.dtype in (torch.bfloat16, torch.float16)
+        # the weight operand is built as bf16
+        and x.dtype == torch.bfloat16
         and x.is_contiguous()
         and w.shape[1] * 8 == x.shape[1]
         and w.stride(1) == 1
