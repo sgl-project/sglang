@@ -1084,6 +1084,7 @@ class SchedulerDisaggregationPrefillMixin:
                     i, req, logits_output
                 )
                 self.checkpoint_disagg_prefill(req)
+                self.prefill_launched_reqs.leave([req])
                 self.disagg_prefill_transfer_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -1148,7 +1149,9 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                if req.pending_bootstrap and not still_chunking:
+                # Only a yield leaves the chunked slot before the final chunk; the
+                # yield is not undone by a bootstrap that completes meanwhile.
+                if not still_chunking:
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -1387,6 +1390,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        self.prefill_launched_reqs.leave([req])
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1498,6 +1502,9 @@ class SchedulerDisaggregationPrefillMixin:
                     # Retract may drain every result, leaving no handler to requeue.
                     if not self.enable_overlap or req.inflight_middle_chunks == 0:
                         self.optimistic_release_and_requeue(req)
+                    else:
+                        # Requeued once its chunks in flight are processed.
+                        self.prefill_launched_reqs.join([req])
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
@@ -1937,6 +1944,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self.prefill_launched_reqs.leave([req])
             self.disagg_prefill_bootstrap_queue.queue.append(req)
         else:
             req.prefill_attempt_count += 1
@@ -1948,4 +1956,5 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
+            self.prefill_launched_reqs.leave([req])
             self.waiting_queue.insert(0, req)

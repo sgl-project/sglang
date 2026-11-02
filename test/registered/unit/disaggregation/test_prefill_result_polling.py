@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -179,6 +180,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
+        self.prefill_launched_reqs = RequestList()
         self.invariant_checker = Mock()
         self.uocr_runtime = None
         self.waiting_queue = []
@@ -1250,8 +1252,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _on_step_launch = Scheduler._on_step_launch
-    _join_launched_reqs = Scheduler._join_launched_reqs
-    _prefill_launch_starts_running = Scheduler._prefill_launch_starts_running
+    _join_prefill_launched = Scheduler._join_prefill_launched
 
     def __init__(self):
         self.scheduler_stage_metrics = None
@@ -1264,6 +1265,9 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.dllm_config = None
+        self.running_reqs = RunningReqs()
+        self.prefill_launched_reqs = RequestList()
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
@@ -1274,13 +1278,18 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         raise _ForwardLaunched
 
 
+class _Request(SimpleNamespace):
+    # Requests are tracked by identity.
+    __hash__ = object.__hash__
+
+
 class TestCachedPrefixEarlySend(CustomTestCase):
     def test_batch_that_starts_a_hicache_load_back_does_not_early_send(self):
         """A request can match pages whose HiCache load-back was submitted in the same
         build; early-sending them would read KV the H2D has not written yet (#44070)."""
         for consumer_index, expect_send in ((-1, True), (0, False)):
             scheduler = _EarlySendScheduler()
-            req = SimpleNamespace(
+            req = _Request(
                 prefix_len=128,
                 host_hit_length=0,
                 start_send_idx=0,
@@ -1292,7 +1301,10 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                 add_inflight_step=Mock(),
                 hicache_consumer_index=consumer_index,
                 extend_num_tokens=32,
-                forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+                forward_mode=SimpleNamespace(
+                    is_prebuilt=lambda: False, is_extend=lambda: True
+                ),
+                chunked_req=None,
             )
             with self.subTest(consumer_index=consumer_index):
                 with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
