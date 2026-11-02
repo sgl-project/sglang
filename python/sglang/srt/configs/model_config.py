@@ -390,6 +390,8 @@ def load_pointer_adapter(model_path: str, revision: Optional[str]) -> Optional[d
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5VLForSequenceClassification",
+        "Qwen3_5ForSequenceClassification",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
@@ -2454,6 +2456,8 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
+        or "Qwen3_5VLForSequenceClassification" in model_architectures
+        or "Qwen3_5ForSequenceClassification" in model_architectures
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
@@ -2520,6 +2524,8 @@ multimodal_model_archs = [
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5VLForSequenceClassification",
+    "Qwen3_5ForSequenceClassification",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
@@ -2588,6 +2594,8 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5VLForSequenceClassification",
+    "Qwen3_5ForSequenceClassification",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
@@ -2690,6 +2698,8 @@ _score_and_pool_archs = [
     "LlamaForSequenceClassification",
     "Qwen2ForSequenceClassification",
     "Qwen3ForSequenceClassification",
+    "Qwen3_5VLForSequenceClassification",
+    "Qwen3_5ForSequenceClassification",
 ]
 
 
