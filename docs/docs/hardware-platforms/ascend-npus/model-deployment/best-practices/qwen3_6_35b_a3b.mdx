@@ -14,20 +14,20 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 254k+1k | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k-16-1ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 254k+1k | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k-16-1ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 128k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 2 | PD Mixed | 984k+1k | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k-40-91ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 128k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 64k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-35B-A3B | A3 Series Products | 2 | PD Mixed | 984k+1k | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k-40-91ms) |
 
 ## Optimal Configuration
 
@@ -37,7 +37,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -140,7 +140,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -240,7 +240,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -337,7 +337,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -437,7 +437,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -532,7 +532,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -628,7 +628,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -724,7 +724,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -825,7 +825,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-35B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 

@@ -102,7 +102,9 @@ def _ensure_tensor_decode_output(decode_output):
     return decode_output
 
 
-def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
+def _to_unit_range(image: torch.Tensor, *, in_place: bool = False) -> torch.Tensor:
+    if in_place:
+        return image.div_(2).add_(0.5).clamp_(0, 1)
     return (image / 2 + 0.5).clamp(0, 1)
 
 
@@ -249,7 +251,9 @@ class DecodingStage(PipelineStage):
             vae_dtype=vae_dtype,
             on_frames=normalized_on_frames,
         )
-        image = _to_unit_range(image)
+        # Safe in place: image is decode_raw's fresh output, with no other
+        # live reference to its pre-normalization values.
+        image = _to_unit_range(image, in_place=True)
         if (
             on_frames is not None
             and normalized_on_frames is None

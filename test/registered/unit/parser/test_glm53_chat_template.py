@@ -13,9 +13,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.parser.glm53_chat_template import render_glm53, render_glm53_flash
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.python_chat_template import (
@@ -23,6 +24,7 @@ from sglang.srt.parser.python_chat_template import (
     GLM53_FLASH,
     get_python_chat_template,
     install_python_chat_template,
+    render_chat_segments,
     resolve_python_chat_template,
 )
 from sglang.srt.parser.template_detection import (
@@ -608,6 +610,53 @@ class TestInstallPythonChatTemplate(CustomTestCase):
             expected,
         )
 
+    def test_segments_are_what_apply_chat_template_renders(self):
+        messages = [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Weather?"},
+            {"role": "assistant", "content": "", "tool_calls": CALLS[:1]},
+            {"role": "tool", "tool_call_id": "a", "content": "Sunny"},
+            {"role": "user", "content": "Thanks"},
+        ]
+        segments = render_chat_segments(
+            self.tokenizer,
+            GLM53,
+            messages,
+            tools=[WEATHER],
+            add_generation_prompt=True,
+            template_kwargs={"reasoning_effort": "low"},
+        )
+        self.assertEqual(
+            "".join(segments),
+            self.tokenizer.apply_chat_template(
+                messages,
+                tools=[WEATHER],
+                add_generation_prompt=True,
+                tokenize=False,
+                reasoning_effort="low",
+            ),
+        )
+        turn_tokens = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+        for token in ("[gMASK]", "<sop>", "<think>") + turn_tokens:
+            self.assertIn(token, segments)
+        self.assertFalse(
+            [
+                s
+                for s in segments
+                if s not in turn_tokens and any(t in s for t in turn_tokens)
+            ]
+        )
+
+        for key in ("chat_template", "continue_final_message", "tokenize", "documents"):
+            self.assertIsNone(
+                render_chat_segments(
+                    self.tokenizer, GLM53, self.messages, template_kwargs={key: None}
+                ),
+                key,
+            )
+        with self.assertRaises(ValueError):
+            render_chat_segments(self.tokenizer, GLM53, [])
+
 
 @unittest.skipUnless(
     os.environ.get("SGLANG_TEST_GLM53_CHECKPOINT")
@@ -616,9 +665,9 @@ class TestInstallPythonChatTemplate(CustomTestCase):
 )
 class TestAgainstCheckpointTemplates(CustomTestCase):
     def test_matches_checkpoint_jinja(self):
-        for env, render in (
-            ("SGLANG_TEST_GLM53_CHECKPOINT", render_glm53),
-            ("SGLANG_TEST_GLM53_FLASH_CHECKPOINT", render_glm53_flash),
+        for env, render, template in (
+            ("SGLANG_TEST_GLM53_CHECKPOINT", render_glm53, GLM53),
+            ("SGLANG_TEST_GLM53_FLASH_CHECKPOINT", render_glm53_flash, GLM53_FLASH),
         ):
             model_dir = os.environ.get(env)
             if not model_dir:
@@ -627,6 +676,7 @@ class TestAgainstCheckpointTemplates(CustomTestCase):
                 os.path.join(model_dir, "chat_template.jinja"), encoding="utf-8"
             ) as f:
                 compiled = _compile_jinja_template(f.read())
+            tokenizer = AutoTokenizer.from_pretrained(model_dir)
             for name, (kwargs, _, _) in CASES.items():
                 for add_generation_prompt in (False, True):
                     with self.subTest(
@@ -636,8 +686,22 @@ class TestAgainstCheckpointTemplates(CustomTestCase):
                             **kwargs,
                             "add_generation_prompt": add_generation_prompt,
                         }
+                        prompt = compiled.render(**kwargs)
+                        self.assertEqual(_render(render, kwargs), prompt)
+                        variables = dict(kwargs)
+                        segments = render_chat_segments(
+                            tokenizer,
+                            template,
+                            variables.pop("messages"),
+                            tools=variables.pop("tools", None),
+                            add_generation_prompt=variables.pop(
+                                "add_generation_prompt"
+                            ),
+                            template_kwargs=variables,
+                        )
                         self.assertEqual(
-                            _render(render, kwargs), compiled.render(**kwargs)
+                            encode_prompt_segments(tokenizer, segments),
+                            tokenizer.encode(prompt),
                         )
 
 

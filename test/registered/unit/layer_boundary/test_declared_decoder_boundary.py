@@ -58,7 +58,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
     Norm,
@@ -73,7 +73,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import COMMUNICATOR_MODULES, patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 HIDDEN = 4
 

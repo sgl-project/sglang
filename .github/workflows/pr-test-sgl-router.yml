@@ -54,12 +54,13 @@ jobs:
         with:
           filters: |
             sgl_router:
-              - 'experimental/sgl-router/**'
+              - 'sgl-router/**'
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
               - 'rust/sglang-api-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
+              - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       - name: Decide
         id: decide
@@ -137,22 +138,22 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo check --locked --workspace --all-targets
 
       - name: cargo clippy
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: cargo fmt
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt --all -- --check
@@ -162,7 +163,7 @@ jobs:
         run: cargo install --locked cargo-deny@0.19.6
 
       - name: cargo deny check
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: cargo deny check licenses bans sources advisories
 
       - name: Show sccache stats
@@ -210,14 +211,14 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo build (record wall time)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           START=$(date +%s)
           cargo build --locked --release --all-targets
@@ -227,7 +228,7 @@ jobs:
           echo "::notice title=Tier-2 build duration::${BUILD_SECONDS}s"
 
       - name: cargo test
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         # Skip the tokenizer parity_matrix test here: ubuntu-latest has
         # no HuggingFace cache, so the matrix would hard-fail (see the
         # test docstring). The e2e job runs it after pytest populates
@@ -249,13 +250,13 @@ jobs:
       # through to a no-diff "pass" when no fixture was actually
       # regenerated.
       - name: kv_events hash parity fixture (drift check)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           set -euo pipefail
           python3 tests/scripts/generate_kv_events_hash_parity.py
           if ! git diff --exit-code -- tests/fixtures/kv_events_hash_parity.json; then
             echo "::error::kv_events hash parity fixture drifted." \
-              "Re-run experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py" \
+              "Re-run sgl-router/tests/scripts/generate_kv_events_hash_parity.py" \
               "and commit the updated tests/fixtures/kv_events_hash_parity.json."
             exit 1
           fi
@@ -307,20 +308,20 @@ jobs:
           curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
           chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
       - name: Build router image
-        run: docker build -t sgl-router:e2e -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
+        run: docker build -t sgl-router:e2e -f sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
       - name: Build fake_worker image
         run: |
           docker build -t sgl-router-fake-worker:e2e \
-            -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
-            experimental/sgl-router/tests/e2e/k8s_integration/
+            -f sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
+            sgl-router/tests/e2e/k8s_integration/
       - name: Bootstrap kind + deploy
-        run: bash experimental/sgl-router/tests/e2e/k8s_integration/setup.sh
+        run: bash sgl-router/tests/e2e/k8s_integration/setup.sh
       - name: Set up Python
         run: |
           python3 -m venv /tmp/e2e-venv
-          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
+          /tmp/e2e-venv/bin/pip install -r sgl-router/tests/e2e/k8s_integration/requirements.txt
       - name: Run E2E
-        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
+        run: /tmp/e2e-venv/bin/pytest sgl-router/tests/e2e/k8s_integration/ -v --tb=short
       - name: Dump cluster + router diagnostics on failure
         if: failure()
         run: |
@@ -348,10 +349,10 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experimental/sgl-router
+          workspaces: sgl-router
           shared-key: "sgl-router-cache"
       - name: cargo build (release)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         run: |
           source "$HOME/.cargo/env"
           cargo build --locked --release --workspace
@@ -369,7 +370,7 @@ jobs:
 
       - name: Install e2e test dependencies
         run: |
-          python3 -m pip install -r experimental/sgl-router/tests/e2e/requirements.txt
+          python3 -m pip install -r sgl-router/tests/e2e/requirements.txt
 
       # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
       # suite is owned by the `sgl-router-k8s-integration` job which has
@@ -380,7 +381,7 @@ jobs:
       # image pull) must not surface as e2e failures on H100, and e2e
       # flakes (model load, HF auth) must not surface as k8s failures.
       - name: Run e2e
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -388,7 +389,7 @@ jobs:
             --ignore=tests/e2e/k8s_integration
 
       - name: Tokenizer parity matrix (uses HF cache populated by e2e)
-        working-directory: experimental/sgl-router
+        working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |

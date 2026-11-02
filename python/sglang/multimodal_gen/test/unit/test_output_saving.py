@@ -42,17 +42,19 @@ def test_png_output_saving_preserves_pixels(tmp_path, output_compression):
     np.testing.assert_array_equal(np.array(Image.open(output_path)), frame)
 
 
+# compress_level 0 writes stored blocks itself; a compressed PNG goes through Pillow
 @pytest.mark.parametrize(
-    ("output_compression", "expected_compress_level"), [(None, 1), (0, 0), (75, 1)]
+    ("output_compression", "expected_pillow_saves"),
+    [(None, []), (0, []), (75, []), (100, [("PNG", 9)])],
 )
-def test_png_output_saving_uses_fast_pillow_path(
-    tmp_path, monkeypatch, output_compression, expected_compress_level
+def test_png_output_saving_skips_pillow_row_filters_when_uncompressed(
+    tmp_path, monkeypatch, output_compression, expected_pillow_saves
 ):
     frame = _rgb_frame()
     output_path = tmp_path / f"sample_{output_compression}.png"
 
     def fail_imageio_imwrite(*args, **kwargs):
-        raise AssertionError("PNG output should use Pillow's PNG fast path")
+        raise AssertionError("PNG output should not go through imageio")
 
     original_save = Image.Image.save
     save_calls = []
@@ -72,7 +74,8 @@ def test_png_output_saving_uses_fast_pillow_path(
         output_compression=output_compression,
     )
 
-    assert save_calls == [("PNG", expected_compress_level)]
+    assert save_calls == expected_pillow_saves
+    np.testing.assert_array_equal(np.array(Image.open(output_path)), frame)
 
 
 @pytest.mark.parametrize("extension", ["jpg", "jpeg", "JPG"])
@@ -122,17 +125,16 @@ def test_warm_image_writer_takes_the_default_jpeg_path(tmp_path, monkeypatch):
     written = []
     imwrite = output_utils.imageio.imwrite
 
-    def imwrite_spy(path, frame, **kwargs):
-        written.append((path, kwargs))
-        return imwrite(path, frame, **kwargs)
+    def imwrite_spy(uri, frame, **kwargs):
+        written.append((uri, kwargs))
+        return imwrite(uri, frame, **kwargs)
 
     monkeypatch.setattr(output_utils.imageio, "imwrite", imwrite_spy)
-    monkeypatch.setattr(output_utils.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
 
     output_utils.warm_image_writer()
 
-    assert len(written) == 1
-    assert written[0][0].endswith(".jpg") and written[0][1] == {"quality": 75}
+    assert written == [("<bytes>", {"format": ".jpg", "quality": 75})]
     assert list(tmp_path.iterdir()) == []
 
 

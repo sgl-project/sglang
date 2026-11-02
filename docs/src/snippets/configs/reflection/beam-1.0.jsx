@@ -2,7 +2,6 @@ export const config = {
   modelName: "Beam 1.0",
   supportedHardware: ["b300", "gb300", "h200"],
   groupHardware: false,
-  runModes: ["docker"],
   showPlaygroundLink: false,
   accuracyLabels: [["gsm8k_pct", "GSM8K", "%"]],
   matchDims: [

@@ -15,7 +15,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import asyncio
 import unittest
@@ -25,12 +25,9 @@ import torch
 
 from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.cosmos3_edge import Cosmos3EdgeForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,

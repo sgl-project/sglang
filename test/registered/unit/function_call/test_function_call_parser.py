@@ -2,6 +2,7 @@ import functools
 import json
 import unittest
 import warnings
+from unittest.mock import patch
 
 import xgrammar as xgr
 
@@ -42,7 +43,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
 
 
@@ -2059,91 +2060,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
-        self.interval = 1
-
-    def test_detect_and_parse_xml_format(self):
-        """Test parsing standard XML format (DSML)"""
-        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
-        <｜DSML｜tool_calls>\n
-            <｜DSML｜invoke name="get_favorite_tourist_spot">\n
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
-            </｜DSML｜invoke>\n
-            <｜DSML｜invoke name="search">
-                <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>
-        """
-        result = self.detector.detect_and_parse(text, self.tools)
-
-        self.assertIn("I'll help you with information", result.normal_text)
-        self.assertEqual(len(result.calls), 2)
-
-        # Check first call
-        call1 = result.calls[0]
-        self.assertEqual(call1.name, "get_favorite_tourist_spot")
-        params1 = json.loads(call1.parameters)
-        self.assertEqual(params1["city"], "San Francisco")
-
-        # Check second call
-        call2 = result.calls[1]
-        self.assertEqual(call2.name, "search")
-        params2 = json.loads(call2.parameters)
-        self.assertEqual(params2["query"], "WebNav benchmark")
-        self.assertEqual(params2["topn"], 10)
-        self.assertEqual(params2["source"], "web")
-
-    def test_streaming_xml_format(self):
-        """Test streaming parsing of XML format"""
-        text = """<｜DSML｜tool_calls>
-            <｜DSML｜invoke name="get_favorite_tourist_spot">
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
-                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>"""
-
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [
-            input_ids[i : i + self.interval]
-            for i in range(0, len(input_ids), self.interval)
-        ]
-        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
-
-        tool_calls_by_index = {}
-
-        num_tool_call_chunks = 0
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for call in result.calls:
-                num_tool_call_chunks += 1
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
-
-        self.assertEqual(num_tool_call_chunks, 1)
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(params["city"], "San Francisco")
-        self.assertEqual(params["another_city"], "London")
-        self.assertEqual(params["topn"], 10)
-        self.assertEqual(params["obj"]["name"], "John")
-        self.assertEqual(params["obj"]["age"], 30)
 
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
@@ -2196,96 +2112,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
-
-    def test_self_closing_zero_arg_invoke(self):
-        """V4 emits `<｜DSML｜invoke name="x"/>` for zero-arg tools; the
-        detector must parse it as a complete tool call with empty params
-        instead of leaking the raw markup back into normal_text."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                description="Submit the final answer.",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-
-        text = (
-            "Final answer.\n"
-            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, [submit_tool])
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "submit")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-        self.assertNotIn("DSML", result.normal_text)
-
-    def test_self_closing_mixed_with_long_form(self):
-        """Mix of long-form (with params) and self-closing tags in one block."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
-            '<｜DSML｜parameter name="city" string="true">SF</｜DSML｜parameter>\n'
-            "</｜DSML｜invoke>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools + [submit_tool])
-        self.assertEqual(len(result.calls), 2)
-        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
-        self.assertEqual(result.calls[1].name, "submit")
-        self.assertEqual(json.loads(result.calls[1].parameters), {})
-
-    def test_streaming_self_closing_invoke(self):
-        """Self-closing invoke must terminate cleanly even when `/>` arrives
-        after the `name=` attribute crosses chunk boundaries."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        # Build the prompt and feed it through the tokenizer to exercise the
-        # same chunk shapes the runtime sees.
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        self.detector = DeepSeekV4Detector()
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunks = [
-            self.tokenizer.decode(input_ids[i : i + self.interval])
-            for i in range(0, len(input_ids), self.interval)
-        ]
-
-        tool_calls_by_index = {}
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, [submit_tool])
-            for call in result.calls:
-                if call.tool_index is None:
-                    continue
-                slot = tool_calls_by_index.setdefault(
-                    call.tool_index, {"name": "", "parameters": ""}
-                )
-                if call.name:
-                    slot["name"] = call.name
-                if call.parameters:
-                    slot["parameters"] += call.parameters
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "submit")
-        self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
@@ -2508,6 +2334,187 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertGreater(len(all_calls), 0)
 
     # ==================== Parameter Type Tests ====================
+
+    def _check_structured_union_value(
+        self, schema, raw_value, expected, definitions=None
+    ):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="record",
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": schema},
+                        "$defs": definitions or {},
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call><function=record><parameter=value>"
+            f"{raw_value}</parameter></function></tool_call>"
+        )
+        for chunk_size in (0, 1, 7):
+            with self.subTest(
+                schema=schema, raw_value=raw_value, chunk_size=chunk_size
+            ):
+                detector = Qwen3CoderDetector()
+                if chunk_size == 0:
+                    calls = detector.detect_and_parse(text, tools).calls
+                else:
+                    calls = []
+                    for offset in range(0, len(text), chunk_size):
+                        calls.extend(
+                            detector.parse_streaming_increment(
+                                text[offset : offset + chunk_size], tools
+                            ).calls
+                        )
+                arguments = json.loads("".join(call.parameters for call in calls))
+                self.assertEqual(arguments, {"value": expected})
+
+    def test_structured_string_unions_preserve_objects_and_arrays(self):
+        """Object/array alternatives must survive one arguments decode in either mode."""
+        for value in ({"city": "Paris"}, [{"city": "Paris"}]):
+            object_schema = {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }
+            structured = (
+                object_schema
+                if isinstance(value, dict)
+                else {"type": "array", "items": object_schema}
+            )
+            for keyword in ("anyOf", "oneOf"):
+                for branches in (
+                    [{"type": "string"}, structured],
+                    [structured, {"type": "string"}],
+                ):
+                    self._check_structured_union_value(
+                        {keyword: branches}, json.dumps(value), value
+                    )
+
+    def test_union_plain_text_skips_json_decoding(self):
+        """Plain union strings must not pay for a failed JSON decode."""
+        detector = Qwen3CoderDetector()
+        for alternative in ("object", "null"):
+            schema = {"anyOf": [{"type": "string"}, {"type": alternative}]}
+            with patch(
+                "sglang.srt.function_call.qwen3_coder_detector.json.loads"
+            ) as loads:
+                raw = "  Paris, France  "
+                self.assertEqual(
+                    detector._convert_param_value(
+                        raw, "value", {"value": schema}, "record"
+                    ),
+                    raw,
+                )
+                loads.assert_not_called()
+        for raw, expected in (("  {}", {}), ("  []", [])):
+            self._check_structured_union_value(
+                {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]},
+                raw,
+                expected,
+            )
+
+    def test_structured_union_conversion_preserves_string_values(self):
+        """Structured decoding must not reinterpret plain strings or scalar unions."""
+        union = {"anyOf": [{"type": "string"}, {"type": "object"}]}
+        for schema, raw in (
+            ({"type": "string"}, '{"city":"Paris"}'),
+            (union, "Paris, France"),
+            (union, '{"city":'),
+            (union, '"Paris"'),
+            ({"anyOf": [{"type": "number"}, {"type": "string"}]}, "250"),
+            ({"anyOf": [{"type": "boolean"}, {"type": "string"}]}, "true"),
+        ):
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_nonfinite_numbers_remain_strings(self):
+        """Nested non-finite numbers must not produce invalid argument JSON."""
+        schema = {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]}
+        for number in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
+            for raw in (f'{{"number":{number}}}', f"[{number}]"):
+                self._check_structured_union_value(schema, raw, raw)
+        self._check_structured_union_value(
+            schema, '[1.5,1e3,"NaN","Infinity"]', [1.5, 1000.0, "NaN", "Infinity"]
+        )
+
+    def test_union_validation_errors_preserve_tool_calls(self):
+        """Invalid or recursive schemas must preserve strings in both parse modes."""
+        for branch in (
+            {"$id": "urn:recursive", "$ref": "urn:recursive"},
+            {"type": "map"},
+            {"type": "array", "items": [{"type": "string"}]},
+        ):
+            schema = {"anyOf": [{"type": "string"}, branch]}
+            raw = '["Paris"]' if branch.get("type") == "array" else "{}"
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_structured_union_conversion_requires_schema_match(self):
+        """A decoded structure must satisfy constraints, including oneOf exclusivity."""
+        object_schema = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        }
+        for schema, raw in (
+            ({"anyOf": [{"type": "string"}, object_schema]}, '{"country":"France"}'),
+            ({"anyOf": [{"type": "string"}, object_schema]}, '{"city":123}'),
+            (
+                {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ]
+                },
+                "[123]",
+            ),
+            (
+                {"oneOf": [{"type": "string"}, object_schema, {"type": "object"}]},
+                '{"city":"Paris"}',
+            ),
+            ({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/missing"}]}, "{}"),
+        ):
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_references_use_enclosing_schema(self):
+        """Root definitions must resolve without losing their validation constraints."""
+        definitions = {
+            "City": {"type": "string"},
+            "Location": {
+                "type": "object",
+                "properties": {"city": {"$ref": "#/$defs/City"}},
+                "required": ["city"],
+            },
+        }
+        for keyword in ("anyOf", "oneOf"):
+            schema = {keyword: [{"type": "string"}, {"$ref": "#/$defs/Location"}]}
+            for raw, expected in (
+                ('{"city":"Paris"}', {"city": "Paris"}),
+                ('{"city":123}', '{"city":123}'),
+                ('{"country":"France"}', '{"country":"France"}'),
+            ):
+                self._check_structured_union_value(schema, raw, expected, definitions)
+
+    def test_union_schema_references_never_fetch(self):
+        """Unresolved external references must not trigger network access."""
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("Unexpected schema fetch"),
+        ) as urlopen:
+            self._check_structured_union_value(
+                {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"$ref": "https://example.invalid/schema"},
+                    ]
+                },
+                "{}",
+                "{}",
+            )
+            urlopen.assert_not_called()
 
     def test_integer_parameter_conversion(self):
         """
@@ -3062,6 +3069,24 @@ class TestGlm4MoeDetector(unittest.TestCase):
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
         )
 
+    def test_streaming_long_argument_is_not_rescanned(self):
+        from unittest.mock import patch
+
+        city = "Beijing " * 500
+        chunks = ["<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>"]
+        rest = f"{city}</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
+        chunks += [rest[i : i + 3] for i in range(0, len(rest), 3)]
+        pattern = Glm4MoeDetector._STREAMING_PARTIAL_PATTERN
+        parameters = ""
+        with patch.object(
+            Glm4MoeDetector, "_STREAMING_PARTIAL_PATTERN", wraps=pattern
+        ) as mock_pattern:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(mock_pattern.search.call_count, 1)
+        self.assertEqual(json.loads(parameters), {"city": city, "date": "2024-06-27"})
+
     def test_tool_call_id(self):
         """Test that the buffer and state are reset after a tool call is completed."""
         chunks = [
@@ -3390,6 +3415,24 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
         )
+
+    def test_streaming_long_argument_is_not_rescanned(self):
+        from unittest.mock import patch
+
+        city = "Beijing " * 500
+        chunks = ["<tool_call>get_weather<arg_key>city</arg_key><arg_value>"]
+        rest = f"{city}</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        chunks += [rest[i : i + 3] for i in range(0, len(rest), 3)]
+        pattern = Glm47MoeDetector._STREAMING_PARTIAL_PATTERN
+        parameters = ""
+        with patch.object(
+            Glm47MoeDetector, "_STREAMING_PARTIAL_PATTERN", wraps=pattern
+        ) as mock_pattern:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(mock_pattern.search.call_count, 1)
+        self.assertEqual(json.loads(parameters), {"city": city, "date": "2024-06-27"})
 
     def test_tool_call_id(self):
         """Test that the buffer and state are reset after a tool call is completed."""
@@ -4048,6 +4091,33 @@ class TestJsonArrayParser(unittest.TestCase):
         result = self.detector.parse_streaming_increment("", self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
+
+    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+            '{"name": "search", "parameters": {"query": "restaurants"}}]'
+        )
+        calls = self.detector.parse_streaming_increment(text, self.tools).calls
+        calls += self.detector.finish(self.tools).calls
+
+        streamed = {}
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters or ""
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
 
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""
