@@ -49,6 +49,7 @@ class _Req:
         return len(self.origin_input_ids) + len(self.output_ids)
 
     extend_len = Req.extend_len
+    finish_outside_step = Req.finish_outside_step
 
     def is_dllm_prefill(self):
         return self.dllm_phase_prefill

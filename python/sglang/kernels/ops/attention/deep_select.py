@@ -130,6 +130,8 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
+        if page_transform and (value_dtype, max_topk) == (torch.bfloat16, 512):
+            configs = (*configs, _Config(512, 256, 3, 4096, 2048, 2))
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
         # the 512 and 1024 buckets share this module.
