@@ -1860,6 +1860,10 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Largest prefill graph bucket, in tokens, that captures the linear-attention
+    # (KDA/GDN) extend. Larger buckets break the graph at every linear layer and
+    # run the extend eagerly, which is faster on long sequences. 0: no limit.
+    SGLANG_LINEAR_PREFILL_GRAPH_MAX_TOKENS = EnvInt(0)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).

@@ -1392,6 +1392,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             if not forward_batch.forward_mode.is_draft_extend_v2():
                 self.linear_attn_backend.init_forward_metadata(forward_batch)
             return None
+        max_tokens = envs.SGLANG_LINEAR_PREFILL_GRAPH_MAX_TOKENS.get()
+        if 0 < max_tokens < forward_batch.extend_num_tokens:
+            # This bucket runs the linear extend as an eager break; replay plans
+            # its metadata eagerly (no captured tables).
+            self.linear_attn_backend.init_forward_metadata(forward_batch)
+            return None
         return self.linear_attn_backend.init_prefill_graph_metadata(forward_batch)
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
