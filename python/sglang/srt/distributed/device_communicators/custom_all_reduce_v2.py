@@ -51,6 +51,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -69,6 +70,8 @@ from .custom_all_reduce_utils import (
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+
 MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
@@ -86,7 +89,16 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
-def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+def _allocate_symmetric_memory(
+    nbytes: int, device: torch.device, group: ProcessGroup
+) -> Tuple[object, List[torch.Tensor], int]:
+    """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
+
+        buffer = HipSymmetricBuffer(nbytes, device, group)
+        return buffer, buffer.buffers, 0
+
     from torch._C._distributed_c10d import _SymmetricMemory
 
     if torch.__version__ < "2.11.0":
@@ -101,7 +113,11 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
         group.group_name,
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
-    return tensor, symm_mem
+    slabs = [
+        symm_mem.get_buffer(i, [nbytes], torch.uint8)
+        for i in range(dist.get_world_size(group=group))
+    ]
+    return (tensor, symm_mem), slabs, int(symm_mem.multicast_ptr)
 
 
 class AllReduceConfig(NamedTuple):
@@ -203,9 +219,14 @@ class CustomAllReduceV2:
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
         # node-local VMM remap) does not — force eager pull inside graphs.
+        # On ROCm the 2-shot graph path would store into peers' cached input
+        # buffers, which XGMI does not keep coherent; stage through the
+        # uncached workspace inside graphs instead.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._is_graph_mode_supported = (
+            not tms_cudagraph and not is_multinode and not _is_hip
+        )
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -214,7 +235,8 @@ class CustomAllReduceV2:
             device=self.device,
         )
         self._init_workspace()
-        self._ipc_manager = IPCManager()
+        # only graph-input registration opens IPC handles
+        self._ipc_manager = IPCManager() if self._is_graph_mode_supported else None
         self._vmm_graph_input_manager = VmmGraphInputManager(
             obj=self,
             group=self.group,
@@ -283,13 +305,9 @@ class CustomAllReduceV2:
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
 
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
+        self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
         )
-        slabs = [
-            symm_mem.get_buffer(i, [total_bytes], torch.uint8)
-            for i in range(self.world_size)
-        ]
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
         # one-shot memset.
@@ -305,7 +323,6 @@ class CustomAllReduceV2:
             assert offset + nbytes <= total_bytes
             return [slab[offset : offset + nbytes].view(shape) for slab in slabs]
 
-        multicast_ptr = int(symm_mem.multicast_ptr)
         self.has_multicast = multicast_ptr != 0
 
         def mc_at(offset: int) -> Optional[int]:
@@ -569,7 +586,8 @@ class CustomAllReduceV2:
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
-            self._ipc_manager.destroy()
+            if self._ipc_manager is not None:
+                self._ipc_manager.destroy()
             dist.barrier(group=self.group)
             del self.obj  # drop the pointer holder before the workspace tensors
         if hasattr(self, "_vmm_graph_input_manager"):
@@ -583,6 +601,21 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import (
+            MIN_HIP_VERSION,
+            hip_runtime_version,
+        )
+
+        version = hip_runtime_version()
+        if version[:2] < MIN_HIP_VERSION:
+            logger.warning(
+                "CustomAllReduceV2 is disabled: HIP runtime %s is older than %s, "
+                "the oldest it is validated on.",
+                ".".join(map(str, version)),
+                ".".join(map(str, MIN_HIP_VERSION)),
+            )
+            return False
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False

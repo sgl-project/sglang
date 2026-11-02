@@ -322,9 +322,24 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 
 
 @cache
+def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    default = AllReduceConfig(
+        graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        num_push_blocks=num_sm,
+        num_pull_blocks=num_sm,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 9)}
+
+
+@cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
-    cuda_major, cuda_minor = torch.cuda.get_device_capability()
     num_sm = torch.cuda.get_device_properties().multi_processor_count
+    if torch.version.hip:
+        # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
+        return _rocm_configs(num_sm)
+    cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major == 9:
         return _sm90_configs(num_sm)
     if cuda_major == 10:

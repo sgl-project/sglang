@@ -378,6 +378,11 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   }
 
   PDLTriggerSecondary<kUsePDL>();
+#ifdef USE_ROCM
+  // s_barrier does not drain a wave's outstanding stores and the signalling
+  // thread's release covers only its own wave, so each wave publishes its own.
+  ptx::fence_release_sys();
+#endif
   __syncthreads();
   barrier.arrive_rel_acq(/*n=*/1);
 }
