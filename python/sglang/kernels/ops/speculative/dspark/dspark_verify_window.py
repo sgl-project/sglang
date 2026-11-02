@@ -106,35 +106,21 @@ def build_ragged_verify_window(
         prefix_lens.to(torch.int64)[safe_req] + within,
         torch.zeros_like(within),
     )
-    if _is_npu:
-        # npu.cache_loc_update always materializes bs * draft_token_num slots,
-        # which is the uniform verify shape. Compact verify needs exactly the
-        # packed rows described by (req_id, within), so gather them directly
-        # from req_to_token instead.
-        req_to_token = model_runner.req_to_token_pool.req_to_token
-        logical_pos = prefix_lens.to(torch.int64)[safe_req] + within
-        verify_cache_loc = req_to_token[
-            batch.req_pool_indices.to(torch.int64)[safe_req], logical_pos
-        ].to(torch.int32)
-        verify_cache_loc = torch.where(
-            valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
-        )
-    else:
-        real_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
-            end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-            batch_size=bs,
-            draft_token_num=verify_num_draft_tokens,
-            device=device,
-        )
-        verify_cache_loc = torch.nn.functional.pad(
-            real_cache_loc, (0, padded_total - real_cache_loc.shape[0])
-        )
-        verify_cache_loc = torch.where(
-            valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
-        )
+    real_cache_loc = assign_extend_cache_locs_func(
+        req_pool_indices=batch.req_pool_indices,
+        req_to_token=model_runner.req_to_token_pool.req_to_token,
+        start_offset=prefix_lens,
+        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
+        batch_size=bs,
+        draft_token_num=verify_num_draft_tokens,
+        device=device,
+    )
+    verify_cache_loc = torch.nn.functional.pad(
+        real_cache_loc, (0, padded_total - real_cache_loc.shape[0])
+    )
+    verify_cache_loc = torch.where(
+        valid, verify_cache_loc, torch.zeros_like(verify_cache_loc)
+    )
 
     verify_ids = compact_verify_ids(
         draft_block_ids=draft_block_ids,
@@ -200,24 +186,15 @@ def build_ragged_verify_window_triton(
     req_id, within, valid = compact_row_index_triton(
         verify_lens=verify_lens, padded_total=padded_total, device=device
     )
-    if _is_npu:
-        # npu.cache_loc_update always returns the uniform bs * gamma shape.
-        # Gather the packed ragged rows directly instead.
-        safe_req = req_id.clamp(max=bs - 1)
-        logical_pos = prefix_lens.to(torch.int64)[safe_req] + within
-        real_cache_loc = model_runner.req_to_token_pool.req_to_token[
-            batch.req_pool_indices.to(torch.int64)[safe_req], logical_pos
-        ].to(torch.int32)
-    else:
-        real_cache_loc = assign_extend_cache_locs_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=model_runner.req_to_token_pool.req_to_token,
-            start_offset=prefix_lens,
-            end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-            batch_size=bs,
-            draft_token_num=verify_num_draft_tokens,
-            device=device,
-        )
+    real_cache_loc = assign_extend_cache_locs_func(
+        req_pool_indices=batch.req_pool_indices,
+        req_to_token=model_runner.req_to_token_pool.req_to_token,
+        start_offset=prefix_lens,
+        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
+        batch_size=bs,
+        draft_token_num=verify_num_draft_tokens,
+        device=device,
+    )
     prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
     verify_cache_loc = torch.empty(
