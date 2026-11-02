@@ -436,6 +436,26 @@ def _build_dsa_device_pool_group(
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
+    # Shared-topk layers have zero-row indexer placeholders. Compact only the
+    # physical indexer buffers, preserving target/draft transfer-layer ownership.
+    indexer_buffers = []
+    indexer_buffer_mapping = {}
+    for index, buffer in enumerate(
+        [*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]
+    ):
+        if buffer.numel():
+            indexer_buffer_mapping[index] = len(indexer_buffers)
+            indexer_buffers.append(buffer)
+    indexer_layer_mapping = {}
+    for layer, mapped in layer_mapping.items():
+        indices = [mapped] if isinstance(mapped, int) else mapped
+        active = tuple(
+            indexer_buffer_mapping[index]
+            for index in indices
+            if index in indexer_buffer_mapping
+        )
+        if active:
+            indexer_layer_mapping[layer] = active[0] if len(active) == 1 else active
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -446,16 +466,19 @@ def _build_dsa_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
         ),
-        DevicePoolEntry(
-            name=PoolName.INDEXER,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
-            layer_mapping=layer_mapping,
-            page_size=page_size,
-            rows_are_pages=True,
-        ),
     ]
+    if indexer_buffers:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=kvcache,
+                components=[indexer_buffers],
+                layer_mapping=indexer_layer_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
