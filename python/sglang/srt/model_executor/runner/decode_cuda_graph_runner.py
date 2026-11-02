@@ -264,6 +264,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     dllm_input_preparation = None
     dllm_attention = None
+    # Speculative subclasses can bypass this initializer and capture only
+    # ordinary graphs. Preserve their inherited non-trie default.
+    _beam_trie_graph_state = None
     # The attention variants, captured at attention_variant_sizes (None: every batch
     # size); class defaults, since runners built without __init__ set neither
     attention_graph_variants: Optional[AttentionGraphVariants] = None
@@ -451,6 +454,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
+        if (
+            type(self) is DecodeCudaGraphRunner
+            and getattr(model_runner, "beam_trie_compact_enabled", False) is True
+            and self.capture_forward_mode == ForwardMode.DECODE
+            and self.captured_req_width == 1
+            and model_runner.spec_algorithm.is_none()
+        ):
+            from sglang.srt.beam_search.trie_cuda_graph import TrieDecodeGraphState
+
+            self._beam_trie_graph_state = TrieDecodeGraphState(
+                model_runner, self.max_num_token, self.device
+            )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         self.seq_len_fill_value = (
@@ -743,8 +758,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return self.backend.cache_loc_dtype
 
-    def _make_graph_key(self, size, variant_label=None, attention_variant=None):
-        return ShapeKey(
+    def _make_graph_key(
+        self,
+        size,
+        variant_label=None,
+        attention_variant=None,
+        *,
+        beam_trie=False,
+    ):
+        key_type = ShapeKey
+        if beam_trie:
+            from sglang.srt.beam_search.trie_cuda_graph import BeamTrieShapeKey
+
+            key_type = BeamTrieShapeKey
+        return key_type(
             size=size,
             variant_label=variant_label,
             attention_variant=attention_variant,
@@ -904,10 +931,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        beam_trie = forward_batch.beam_trie_levels is not None
+        if beam_trie:
+            trie_state = getattr(self, "_beam_trie_graph_state", None)
+            if trie_state is None:
+                return False
+        elif forward_batch.beam_attention_metadata is not None:
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
+        if beam_trie:
+            if cuda_graph_bs > self.max_bs:
+                return False
+            captured_bs = (
+                cuda_graph_bs
+                if self.disable_padding
+                else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+            )
+            if not trie_state.can_replay(forward_batch, cuda_graph_bs, captured_bs):
+                return False
 
         graph_key = self._make_graph_key(
             cuda_graph_bs,
@@ -917,6 +962,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.disable_padding
                 else None
             ),
+            **({"beam_trie": True} if beam_trie else {}),
         )
 
         is_bs_supported = (
@@ -1277,6 +1323,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else reversed(self.capture_bs)
         )
         lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
+        trie_state = getattr(self, "_beam_trie_graph_state", None)
         for bs in capture_range:
             attention_variants = (
                 self.attention_graph_variants.capture_labels
@@ -1297,21 +1344,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
-                        self._set_profile_trace_tag(
-                            bs, variant_label, attention_variant
+                        trie_variants = (
+                            (False, True)
+                            if trie_state is not None
+                            and trie_state.supports_rows(bs * self.captured_req_width)
+                            else (False,)
                         )
-                        with self.backend.prepare_capture_forward(
-                            self.model_runner.model,
-                            enable_compile=bs in self.compile_bs,
-                            num_tokens=bs * self.captured_req_width,
-                            tp_group=get_parallel().tp_group,
-                        ) as forward:
-                            self.capture_one_shape(
+                        for beam_trie in trie_variants:
+                            self._set_profile_trace_tag(
                                 bs,
-                                forward,
                                 variant_label,
-                                attention_variant,
+                                "beam_trie" if beam_trie else attention_variant,
                             )
+                            with self.backend.prepare_capture_forward(
+                                self.model_runner.model,
+                                enable_compile=bs in self.compile_bs,
+                                num_tokens=bs * self.captured_req_width,
+                                tp_group=get_parallel().tp_group,
+                            ) as forward:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    variant_label,
+                                    attention_variant,
+                                    **({"beam_trie": True} if beam_trie else {}),
+                                )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1320,6 +1377,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        *,
+        beam_trie: bool = False,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1333,6 +1392,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, num_tokens=num_tokens
         )
+        if beam_trie:
+            self._beam_trie_graph_state.prepare_capture(forward_batch, num_tokens)
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1432,6 +1493,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     variant_label,
                     attention_variant,
+                    **({"beam_trie": True} if beam_trie else {}),
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1472,6 +1534,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        beam_trie = getattr(forward_batch, "beam_trie_levels", None) is not None
         if (
             self.dllm_uses_input_embeds
             and self.dllm_input_preparation is None
@@ -1511,6 +1574,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
+            if beam_trie:
+                self._beam_trie_graph_state.stage(
+                    forward_batch,
+                    self.raw_num_token,
+                    self.bs * self.captured_req_width,
+                    graph_size_key,
+                )
             self._copy_replay_inputs(forward_batch)
             if (
                 pp_proxy_tensors is not None
@@ -1542,7 +1612,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label = self._resolve_lora_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, variant_label, attention_variant
+                graph_size_key,
+                variant_label,
+                attention_variant,
+                **({"beam_trie": True} if beam_trie else {}),
             )
             return
 
@@ -1614,6 +1687,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         self._set_dp_real_num_tokens(raw_num_token)
+        beam_metadata = None
+        if beam_trie:
+            beam_metadata = self._beam_trie_graph_state.stage(
+                forward_batch, raw_num_token, padded_num_tokens, graph_size_key
+            )
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -1636,6 +1714,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             glue_key=glue_key,
             early_staged=early_staged,
             attention_variant=attention_variant,
+            **({"beam_metadata": beam_metadata} if beam_trie else {}),
         )
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
@@ -1655,7 +1734,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 attention_variant, taken=early_staged
             )
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, variant_label, attention_variant
+            graph_size_key,
+            variant_label,
+            attention_variant,
+            **({"beam_trie": True} if beam_trie else {}),
         )
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
@@ -1711,8 +1793,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         glue_key: tuple,
         early_staged: bool,
         attention_variant,
+        beam_metadata=None,
     ) -> None:
         """The attention backend's out-of-graph metadata prep for this replay."""
+        beam_trie = getattr(forward_batch, "beam_trie_levels", None) is not None
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
@@ -1722,8 +1806,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and raw_bs == bs
             and not self.enable_two_batch_overlap
             and self.model_runner.lora_manager is None
+            and not beam_trie
         )
-        if early_staged:
+        if early_staged and not beam_trie:
             # The side stream already replayed the glue graph for this step's inputs.
             self._metadata_glue.reinstall(glue_key)
         elif (
@@ -1743,6 +1828,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens=num_tokens,
                 glue_key=glue_key if glue_route else None,
                 attention_variant=attention_variant,
+                **({"beam_metadata": beam_metadata} if beam_trie else {}),
             )
 
     def _init_replay_attn_metadata_from_view(
@@ -1754,6 +1840,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         num_tokens: int,
         glue_key: Optional[tuple],
         attention_variant,
+        beam_metadata=None,
     ) -> None:
         """The replay metadata prep through the replay ForwardBatch view: the glue
         graph's warm-ups and capture (``glue_key``), or the eager prep (None)."""
@@ -1769,6 +1856,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if getattr(forward_batch, "beam_trie_levels", None) is not None:
+            fb_view.beam_trie_levels = self._beam_trie_graph_state.levels[:num_tokens]
+            fb_view.beam_attention_metadata = beam_metadata
         if (
             self.model_runner.lora_manager is not None
             and self.model_runner.lora_manager.attn_dp_enabled
@@ -2022,6 +2112,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                beam_normalizer=(
+                    output.beam_normalizer[: self.raw_num_token]
+                    if output.beam_normalizer is not None
                     else None
                 ),
                 last_hidden_states=(

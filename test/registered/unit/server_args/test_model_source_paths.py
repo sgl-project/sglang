@@ -291,7 +291,10 @@ class TestTheRemoteConnectorArm(_ModelSourceCase):
         self.assertEqual(config.model_path, pulled)
         # The weights stay where they are; only the metadata was pulled.
         self.assertEqual(config.model_weights, _REMOTE_URL)
-        self.assertEqual(state["allow_pattern"], ["*config.json"])
+        self.assertEqual(
+            state["allow_pattern"],
+            ["*config.json", "*trie_output_head.safetensors"],
+        )
 
 
 if __name__ == "__main__":
