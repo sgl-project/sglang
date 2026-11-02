@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs import (
+from sglang.srt.configs.all_configs import (
     AfmoeConfig,
     BailingHybridConfig,
     BailingMM2Config,
@@ -41,6 +41,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     FalconMambaConfig,
+    FlintConfig,
     GigaChat35Config,
     Glm5NextConfig,
     Glm5NextTextConfig,
@@ -169,6 +170,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InternS2PreviewConfig,
         IQuestQ1Config,
         IQuestQ1MTPConfig,
+        FlintConfig,
         InternS2MobiusConfig,
         InternS2MobiusTextConfig,
         JetNemotronConfig,
