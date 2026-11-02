@@ -740,7 +740,10 @@ class TestCPUGraph(CustomTestCase):
             spec_algorithm=object(),
         )
 
-        batch = runner._build_prefill_dummy_forward_batch(num_tokens=7, bs=3)
+        with patch.object(
+            cpu_graph_runner_module, "enable_num_token_non_padded", return_value=False
+        ):
+            batch = runner._build_prefill_dummy_forward_batch(num_tokens=7, bs=3)
 
         self.assertEqual(batch.batch_size, 3)
         self.assertEqual(batch.extend_num_tokens, 7)
@@ -750,6 +753,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(batch.positions.tolist(), [0, 1, 0, 1, 0, 1, 2])
         self.assertEqual(batch.extend_seq_lens.dtype, torch.int32)
         self.assertEqual(batch.extend_start_loc.dtype, torch.int32)
+        self.assertIsNone(batch.num_token_non_padded)
 
     def test_dynamic_prefill_axes_use_configured_token_bound(self):
         runner = CPUGraphRunner.__new__(CPUGraphRunner)
@@ -758,6 +762,7 @@ class TestCPUGraph(CustomTestCase):
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.zeros(2, dtype=torch.int64),
             seq_lens=torch.zeros(2, dtype=torch.int64),
+            seq_lens_cpu=torch.zeros(2, dtype=torch.int64),
             extend_seq_lens=torch.zeros(2, dtype=torch.int32),
             extend_prefix_lens=torch.zeros(2, dtype=torch.int32),
             extend_start_loc=torch.zeros(2, dtype=torch.int32),
@@ -775,6 +780,19 @@ class TestCPUGraph(CustomTestCase):
             forward_batch.positions,
             forward_batch.out_cache_loc,
             max_value=1024,
+        )
+
+        with patch.object(cpu_graph_runner_module, "_mark_dynamic") as mark_dynamic:
+            runner._mark_dynamic_request_axis(forward_batch)
+
+        mark_dynamic.assert_called_once_with(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.seq_lens_cpu,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_start_loc,
+            max_value=4,
         )
 
     def test_dynamic_decode_axes_use_request_pool_bound(self):

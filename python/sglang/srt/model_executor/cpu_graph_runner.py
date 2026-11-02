@@ -1756,6 +1756,7 @@ class CPUGraphRunner:
             )
 
         if self.is_encoder_decoder:
+            captured_forward_batch.encoder_lens.fill_(self.encoder_len_fill_value)
             captured_forward_batch.encoder_lens[:raw_bs].copy_(
                 forward_batch.encoder_lens
             )
@@ -1934,7 +1935,11 @@ class CPUGraphRunner:
             mrope_positions = (
                 positions.unsqueeze(0).repeat(3, 1) if self.model_is_mrope else None
             )
-            num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int64)
+            num_token_non_padded = (
+                torch.tensor([num_tokens], dtype=torch.int64)
+                if enable_num_token_non_padded()
+                else None
+            )
 
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -1966,6 +1971,7 @@ class CPUGraphRunner:
         _mark_dynamic(
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
+            forward_batch.seq_lens_cpu,
             forward_batch.extend_seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_start_loc,
