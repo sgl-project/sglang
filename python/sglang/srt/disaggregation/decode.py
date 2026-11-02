@@ -2744,10 +2744,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _alloc_for_decode_prealloc(
         self, allocator: BaseTokenToKVPoolAllocator, **kwargs
     ) -> torch.Tensor:
-        storage = kv_storage_of(
-            self.req_to_token_pool, allocator, tree_cache=self.tree_cache
+        storage = kv_storage_of(self.req_to_token_pool, allocator)
+        return alloc_for_decode_prealloc(
+            storage, allocator, tree_cache=self.tree_cache, **kwargs
         )
-        return alloc_for_decode_prealloc(storage, allocator, **kwargs)
 
     def _transfer_page_indices(
         self, decode_req: DecodeRequest, kv_indices: torch.Tensor, page_size: int
@@ -2776,9 +2776,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_prefix_len = prefix_len
 
         req_pool_indices = kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
         ).acquire([req])
 
         assert req_pool_indices is not None, (
@@ -2979,9 +2977,11 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     window_tails: Dict[str, int],
     req_to_token_pool: Optional[ReqToTokenPool] = None,
+    tree_cache=None,
 ) -> torch.Tensor:
     """``window_tails`` names every window's live tail by window pool; with
-    ``uses_swa_tail`` each window binds only that tail of the new pages."""
+    ``uses_swa_tail`` each window binds only that tail of the new pages.
+    ``tree_cache`` is the step's prefix cache, for pools that need it."""
     req.kv.allocate_prealloc(fill_len)
     if allocator.page_size == 1:
         return storage.take_tokens(delta_len, make_room=_evicted_by_caller)
@@ -3017,6 +3017,7 @@ def alloc_for_decode_prealloc(
         # Full-attention layers reuse prefix KV; window layers allocate only
         # the live tail of their own window.
         window_tails=window_tails if uses_swa_tail else None,
+        tree_cache=tree_cache,
     )
     if uses_swa_tail and kv_loc is not None:
         for name, tail in window_tails.items():
