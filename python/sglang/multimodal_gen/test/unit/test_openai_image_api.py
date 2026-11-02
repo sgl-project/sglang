@@ -84,6 +84,55 @@ def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
         assert response.status_code == 422
 
 
+def test_image_edits_forwards_the_repaint_mask_path(monkeypatch):
+    """The uploaded mask reaches the request as `mask_path`, not as a dead field."""
+    monkeypatch.setattr(
+        image_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(input_save_path=None, output_path=None),
+    )
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda _: SamplingParams
+    )
+    monkeypatch.setattr(image_api, "maybe_enhance_prompt", AsyncMock(return_value="p"))
+    captured = {}
+
+    def capture(request_id, **kwargs):
+        captured.clear()
+        captured.update(kwargs)
+        raise HTTPException(status_code=400, detail="captured before inference")
+
+    monkeypatch.setattr(image_api, "_build_request_sampling_params", capture)
+    app = FastAPI()
+    app.include_router(image_api.router)
+
+    def png(size=(16, 16), color=(0, 0, 0)):
+        buffer = BytesIO()
+        Image.new("RGB", size, color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/images/edits",
+            data={"prompt": "p"},
+            files={
+                "image": ("reference.png", png(), "image/png"),
+                "mask": ("mask.png", png(color=(255, 255, 255)), "image/png"),
+            },
+        )
+        assert response.status_code == 400
+        mask_path = captured["mask_path"]
+        assert mask_path is not None and "_mask_" in mask_path
+
+        response = client.post(
+            "/v1/images/edits",
+            data={"prompt": "p"},
+            files={"image": ("reference.png", png(), "image/png")},
+        )
+        assert response.status_code == 400
+        assert captured["mask_path"] is None
+
+
 def test_image_requests_accept_request_level_profiling():
     request = ImageGenerationsRequest(
         prompt="p", profile=True, num_profiled_timesteps=4, profile_all_stages=True
