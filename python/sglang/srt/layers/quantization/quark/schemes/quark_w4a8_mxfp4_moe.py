@@ -62,6 +62,10 @@ OCP_MX_BLOCK_SIZE = 32
 class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
     """Quark MoE scheme for MXFP4 weights with static FP8 activations."""
 
+    # gfx1250 routes inside apply_weights from the raw router logits (aiter
+    # routing for gluon/triton, torch top-k for FlyDSL), so the model may bypass TopK.
+    routes_from_router_logits = _use_gfx1250_w4a8
+
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.weight_quant = weight_config
         self.input_quant = input_config
@@ -261,7 +265,9 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         gate/up-interleaved layout consumed by aiter's triton ``moe_gemm_a8w4``
         (no CK/ASM shuffle)."""
         from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+            FLYDSL_ENABLED,
             build_ep_expert_map,
+            prepare_w4a8_gfx1250_flydsl_weights,
             prepare_w4a8_gfx1250_weights,
         )
 
@@ -279,30 +285,60 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 device=layer.w13_weight.device,
             )
 
-        (
-            w13_weight,
-            w13_weight_scale,
-            w13_weight_bias,
-            w2_weight,
-            w2_weight_scale,
-            w2_weight_bias,
-        ) = prepare_w4a8_gfx1250_weights(
-            layer.w13_weight.data,
-            layer.w13_weight_scale.data,
-            layer.w13_weight_bias.data,
-            layer.w2_weight.data,
-            layer.w2_weight_scale.data,
-            layer.w2_weight_bias.data,
-        )
+        # FlyDSL's grouped MoE has no expert-parallel form here: EP keeps the
+        # triton path.
+        self.flydsl_weights = None
+        if FLYDSL_ENABLED and self.ep_expert_map is None:
+            fw = prepare_w4a8_gfx1250_flydsl_weights(
+                layer.w13_weight.data,
+                layer.w13_weight_scale.data,
+                layer.w13_weight_bias.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale.data,
+                layer.w2_weight_bias.data,
+            )
+            # One copy: the parameters are FlyDSL's buffers; the gluon views
+            # in self.flydsl_weights share their storage.
+            layer.w13_weight = torch.nn.Parameter(fw.w13, requires_grad=False)
+            layer.w13_weight_scale = torch.nn.Parameter(
+                fw.w13_scale, requires_grad=False
+            )
+            layer.w13_weight_bias = torch.nn.Parameter(fw.w13_bias, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(fw.w2, requires_grad=False)
+            layer.w2_weight_scale = torch.nn.Parameter(fw.w2_scale, requires_grad=False)
+            layer.w2_weight_bias = torch.nn.Parameter(fw.w2_bias, requires_grad=False)
+            self.flydsl_weights = fw
+        else:
+            (
+                w13_weight,
+                w13_weight_scale,
+                w13_weight_bias,
+                w2_weight,
+                w2_weight_scale,
+                w2_weight_bias,
+            ) = prepare_w4a8_gfx1250_weights(
+                layer.w13_weight.data,
+                layer.w13_weight_scale.data,
+                layer.w13_weight_bias.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale.data,
+                layer.w2_weight_bias.data,
+            )
 
-        layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(
-            w13_weight_scale, requires_grad=False
-        )
-        layer.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
-        layer.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+            layer.w13_weight_scale = torch.nn.Parameter(
+                w13_weight_scale, requires_grad=False
+            )
+            layer.w13_weight_bias = torch.nn.Parameter(
+                w13_weight_bias, requires_grad=False
+            )
+            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+            layer.w2_weight_scale = torch.nn.Parameter(
+                w2_weight_scale, requires_grad=False
+            )
+            layer.w2_weight_bias = torch.nn.Parameter(
+                w2_weight_bias, requires_grad=False
+            )
 
         # Static FP8 MoE kernels consume a single activation scale. Use the
         # maximum if expert-local checkpoint scales differ.
@@ -453,11 +489,20 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
     ) -> CombineInput:
         if _use_gfx1250_w4a8:
             from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+                FLYDSL_MIN_TOKENS,
+                aiter_w4a8_gfx1250_flydsl_forward,
                 aiter_w4a8_gfx1250_forward,
             )
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-            topk_weights, topk_ids, router_logits = dispatch_output.topk_output
+            topk_output = dispatch_output.topk_output
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                router_logits = topk_output.router_logits
+                top_k = topk_output.topk_config.top_k
+            else:
+                _, topk_ids, router_logits = topk_output
+                top_k = topk_ids.shape[-1]
             x = dispatch_output.hidden_states
             if x.shape[-1] != self.hidden_size:
                 x = x[..., : self.hidden_size]
@@ -466,17 +511,50 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             alpha = cfg.gemm1_alpha if cfg.gemm1_alpha is not None else 1.702
             limit = cfg.gemm1_clamp_limit or cfg.swiglu_limit or 7.0
 
+            fw = self.flydsl_weights
+            if (
+                fw is not None
+                and x.shape[0] >= FLYDSL_MIN_TOKENS
+                and not cfg.apply_router_weight_on_input
+            ):
+                output = aiter_w4a8_gfx1250_flydsl_forward(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    topk=top_k,
+                    weights=fw,
+                    gemm1_limit=limit,
+                    renormalize=True,
+                )
+                return StandardCombineInput(hidden_states=output)
+
+            if fw is not None:
+                # Gluon over zero-copy views of FlyDSL's weights.
+                weights = dict(
+                    w13_weight=fw.gluon_w13,
+                    w13_weight_scale=fw.gluon_w13_scale,
+                    w13_weight_bias=fw.gluon_w13_bias,
+                    w2_weight=fw.gluon_w2,
+                    w2_weight_scale=fw.gluon_w2_scale,
+                    w2_weight_bias=fw.gluon_w2_bias,
+                    backend="gluon",
+                    preshuffled=True,
+                    swizzle_mx_scale="GFX1250_SCALE",
+                    pad_hidden_to=fw.gluon_hidden,
+                )
+            else:
+                weights = dict(
+                    w13_weight=layer.w13_weight,
+                    w13_weight_scale=layer.w13_weight_scale,
+                    w13_weight_bias=layer.w13_weight_bias,
+                    w2_weight=layer.w2_weight,
+                    w2_weight_scale=layer.w2_weight_scale,
+                    w2_weight_bias=layer.w2_weight_bias,
+                )
             output = aiter_w4a8_gfx1250_forward(
                 hidden_states=x,
                 router_logits=router_logits,
-                topk=topk_ids.shape[-1],
-                w13_weight=layer.w13_weight,
-                w13_weight_scale=layer.w13_weight_scale,
-                w13_weight_bias=layer.w13_weight_bias,
+                topk=top_k,
                 a13_scale=layer.w13_input_scale,
-                w2_weight=layer.w2_weight,
-                w2_weight_scale=layer.w2_weight_scale,
-                w2_weight_bias=layer.w2_weight_bias,
                 a2_scale=layer.w2_input_scale,
                 gemm1_alpha=alpha,
                 gemm1_limit=limit,
@@ -484,6 +562,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 apply_router_weight_on_input=cfg.apply_router_weight_on_input,
                 expert_map=self.ep_expert_map,
                 num_local_experts=self.num_local_experts,
+                **weights,
             )
             return StandardCombineInput(hidden_states=output)
 
