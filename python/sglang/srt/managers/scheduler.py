@@ -6135,35 +6135,22 @@ class Scheduler(
                     # an ack racing back is never dropped.
                     decode_req.kv_receiver.abort()
 
-            # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
-
-            # Abort retracted requests held for rebootstrap until generation
-            # resumes; they hold no KV and no step uses them.
-            remaining_held = []
-            for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    req.finish_outside_step(FINISH_ABORT())
-                    self._release_aborted_request(req)
-                    self.send_abort_output(
-                        _make_abort_req(req, finished_reason=recv_req.finished_reason),
-                        req,
-                    )
-                else:
-                    remaining_held.append(req)
-            self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = remaining_held
+            # Retracted requests have their KV backed up; held ones, retracted
+            # for rebootstrap until generation resumes, hold no KV.
+            retracted, held = self.disagg_decode_prealloc_queue.take_aborted(recv_req)
+            for req in retracted:
+                discard_kv_cache_backup(
+                    req,
+                    self.tree_cache,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
+                self.send_abort_output(_make_abort_req(req), req)
+            for req in held:
+                req.finish_outside_step(FINISH_ABORT())
+                self._release_aborted_request(req)
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():

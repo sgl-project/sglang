@@ -158,6 +158,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -1053,6 +1054,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
+
+    def take_aborted(self, recv_req: AbortReq) -> Tuple[List[Req], List[Req]]:
+        """Remove the retracted and held requests the abort matches."""
+
+        def aborted(req: Req) -> bool:
+            return recv_req.abort_all or req.rid.startswith(recv_req.rid)
+
+        retracted = [req for req in self.retracted_queue if aborted(req)]
+        held = [req for req in self.held_rebootstrap_reqs if aborted(req)]
+        self.retracted_queue = [req for req in self.retracted_queue if not aborted(req)]
+        self.held_rebootstrap_reqs = [
+            req for req in self.held_rebootstrap_reqs if not aborted(req)
+        ]
+        return retracted, held
 
     def request_lists(self) -> Dict[str, List[Req]]:
         return {
