@@ -10,9 +10,10 @@
           chunks; every key >= threshold is appended to the row's candidate
           buffer (CAND entries).
   select  per row, the exact k-th largest key among the candidates, then
-          exactly min(L, topk) slots through the page table.  If a row's
-          candidates overflowed CAND, it selects exactly from the whole row
-          instead (slow, rare), so the result is always an exact top-k.
+          exactly min(L, topk) slots through the page table.  If a row has fewer
+          than min(L, topk) candidates or overflows CAND, it selects exactly from
+          the whole row instead (slow, rare), so the result is always an exact
+          top-k.
 
 Output order is not defined, and when the k-th key has ties the members chosen
 among the tied elements depend on candidate arrival order.  The launch shape
@@ -89,8 +90,9 @@ def _topk_est(
     thr = 0
     if tl.sum((key >= 0).to(tl.int32), 0) < t:
         thr = -2147483648
-    # bits 30..15 only: the threshold rounds down by < 2**15 key units (< 0.4 % of the
-    # value), which can only add candidates -- every true top-k key stays above it.
+    # bits 30..15 only: rounding the sampled threshold down can only add
+    # candidates. Sampling can still overestimate the full-row k-th key;
+    # the selector handles that case with its exact underflow fallback.
     for i in tl.static_range(0, 16):
         cand = thr + (1 << (30 - i))
         if tl.sum((key >= cand).to(tl.int32), 0) >= t:
@@ -223,9 +225,9 @@ def _topk_select(
     k = tl.minimum(L, TOPK)
     pt = page_ptr + r.to(tl.int64) * stride_p
     out_cols = tl.arange(0, TOPK)
-    if n_all > CAND:
-        # The candidate buffer overflowed (the sampled threshold was too low for
-        # this row): select exactly from the whole row instead.  Rare and slow.
+    if (n_all < k) | (n_all > CAND):
+        # The sampled threshold was too high (underflow) or too low (overflow):
+        # select exactly from the whole row instead. Rare and slow.
         row = logits_ptr + r.to(tl.int64) * stride_l
         thr = _row_threshold(row, L, k, BLOCK)
         base = 0
