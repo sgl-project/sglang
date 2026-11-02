@@ -362,6 +362,37 @@ _DSA_IMPL_T: TypeAlias = Literal[
 _TRITON_SPARSE_MLA_MAX_HEADS = 32
 
 
+def _load_gluon_sparse_mla_decode(
+    *,
+    decode_impl: str,
+    kv_cache_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    num_q_heads: int,
+    dcp_size: int,
+):
+    """The gfx950 Gluon module replacing the "triton" decode impl's sparse MLA, or None."""
+    if not (
+        _IS_GFX95
+        and decode_impl == "triton"
+        and kv_cache_dtype == torch.float8_e4m3fn
+        # GLM-5 MLA shapes only, as the gfx950 decode kernels in forward_mla_rocm require.
+        and (kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim)
+        == (512, 192, 64, 256)
+        and num_q_heads in (8, 16)
+        and dcp_size == 1
+    ):
+        return None
+    try:
+        from sglang.kernels.ops.attention.dsa import gluon_sparse_mla_decode_gfx950
+    except ImportError:
+        # Triton without Gluon's gfx950 (cdna4) dialect or a Gluon CTA barrier.
+        return None
+    return gluon_sparse_mla_decode_gfx950
+
+
 def _validate_triton_sparse_mla_backend(
     *,
     device_sm_major: int,
@@ -700,6 +731,16 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.gluon_sparse_mla_decode = _load_gluon_sparse_mla_decode(
+            decode_impl=self.dsa_decode_impl,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=model_runner.model_config.v_head_dim,
+            num_q_heads=self.num_q_heads,
+            dcp_size=self.dcp_size,
+        )
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
@@ -2398,6 +2439,12 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
+            if forward_batch.forward_mode.is_target_verify() and (
+                self._use_gluon_sparse_mla_decode(q_all, kv_cache, page_table_1)
+            ):
+                return self.gluon_sparse_mla_decode.gluon_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer.scaling
+                ).squeeze(0)
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -2751,6 +2798,10 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
+            if self._use_gluon_sparse_mla_decode(q_all, kv_cache, page_table_1):
+                return self.gluon_sparse_mla_decode.gluon_sparse_mla_decode(
+                    q_all, kv_cache, page_table_1, layer.scaling
+                ).squeeze(0)
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3525,6 +3576,21 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         ).squeeze(0)
+
+    def _use_gluon_sparse_mla_decode(
+        self,
+        q_all: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+    ) -> bool:
+        # q_all is set only when the caller passed q already concatenated.
+        return (
+            self.gluon_sparse_mla_decode is not None
+            and q_all is not None
+            and self.gluon_sparse_mla_decode.gluon_sparse_mla_decode_supported(
+                q_all, kv_cache, page_table_1
+            )
+        )
 
     def _forward_triton_decode(
         self,
