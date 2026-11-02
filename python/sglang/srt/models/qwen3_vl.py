@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
+    is_pin_memory_available,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -1482,9 +1483,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         device = self.visual.device
         device_index = device.index
-        if device.type == "cuda" and device_index is None:
+        dest_device_type = "npu" if _is_npu else "cuda"
+        if device.type == dest_device_type and device_index is None:
             device_index = torch.cuda.current_device()
-        if device.type == "cuda":
+        if device.type == dest_device_type:
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
 
@@ -1493,7 +1495,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         feature_offset = 0
         for index in indices:
             item = items[index]
-            if device.type == "cuda":
+            if device.type == dest_device_type:
                 proxy = item.feature
                 model_specific_data = getattr(item, "model_specific_data", {})
                 pending_copy = model_specific_data.pop(
@@ -1570,15 +1572,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         """Preserve inputs for re-prefill without delaying the ViT launch."""
         try:
+            device = self.visual.device
             host_features = torch.empty(
                 materialized.shape,
                 dtype=materialized.dtype,
                 device="cpu",
-                pin_memory=torch.cuda.is_available(),
+                pin_memory=is_pin_memory_available(device),
             )
             copy_stream = getattr(self, "_mm_feature_copy_stream", None)
             if copy_stream is None:
-                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                copy_stream = torch.cuda.Stream(device=device)
                 self._mm_feature_copy_stream = copy_stream
             with torch.cuda.stream(copy_stream):
                 copy_stream.wait_event(packed_ready)
@@ -1591,9 +1594,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 item.feature = host_features.narrow(0, offset, length)
                 item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
         except Exception:
-            # The generic multimodal path will offload the owned CUDA slices.
+            # The generic multimodal path will offload the owned device slices.
             logger.warning(
-                "Failed to preserve CUDA IPC features on the copy stream; "
+                "Failed to preserve IPC features on the copy stream; "
                 "falling back to the generic offload path",
                 exc_info=True,
             )
