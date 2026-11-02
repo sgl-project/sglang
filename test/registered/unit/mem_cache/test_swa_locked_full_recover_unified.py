@@ -32,7 +32,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW, tree_slot_ids
 from sglang.srt.mem_cache.kv.storage import _page_pairs
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -226,9 +225,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) == 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) == 0).all()),
             "precondition: a tombstoned range translates to the sink",
         )
         # Snapshot AFTER the setup traffic: the invariant under test is that
@@ -261,9 +258,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
             "the incoming ids' FULL side must come back",
         )
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "after recovery the node's ids must address live swa pages",
         )
 
@@ -324,9 +319,7 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
         )
 
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(

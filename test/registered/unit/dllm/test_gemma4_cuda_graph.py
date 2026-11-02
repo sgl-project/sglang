@@ -23,7 +23,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _ReadStream:
     reads_are_translated = False
-    window_kv_kind = IdSpaceKind.FULL
+    # The windowed layers store in the full sub-pool.
+    window_storage = IdSpaceKind.FULL.value
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)

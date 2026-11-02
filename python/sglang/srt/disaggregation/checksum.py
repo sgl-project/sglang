@@ -112,7 +112,7 @@ def _state_indices(
             scheduler,
             req,
             scheduler.token_to_kv_pool_allocator.id_spaces()[
-                IdSpaceKind.SLIDING_WINDOW
+                router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
             ],
             max(tails.values()),
             seq_len,

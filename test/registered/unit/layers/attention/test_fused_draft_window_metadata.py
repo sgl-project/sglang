@@ -215,7 +215,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ),
         )
         full = allocator.translate_kv_loc(virtual)
-        swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virtual)
+        swa = allocator.id_spaces()[allocator.roles.window].ids(virtual)
         self.assertFalse(torch.equal(full, swa))
         return backend, batch, full if host == "full" else swa, host
 
@@ -353,7 +353,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self._fixture(window, target_window=128)
         # The window side no longer holds the prefix before the window.
         self.allocator.free_swa_segment(self.virtual[:200], start_pos=0)
-        swa = self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+        swa = self.allocator.id_spaces()[self.allocator.roles.window].ids(
             self.virtual[:seq_len]
         )
         span = window + accept
