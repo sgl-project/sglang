@@ -119,22 +119,36 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
         # Rebuild the full token batch before routed-expert readback. With DP
         # attention each attention-TP rank keeps its own tokens' ids, and the
-        # output rank's group gathers every layer once in on_forward_end; the
-        # other groups (pp > 0, attn_cp > 0) send nothing.
+        # output rank's group all-gathers every layer once in on_forward_end;
+        # the other groups (pp > 0, attn_cp > 0) send nothing.
         parallel = get_parallel()
         self.local_cache: Optional[BaseDeviceCache] = None
+        self.all_gather_scratch: Optional[torch.Tensor] = None
         self._local_rows: Optional[int] = None
         self._gathers_per_layer = False
         if _is_scattered_a2a_backend():
             if is_dp_attention_enabled() and parallel.attn_tp_size > 1:
                 if parallel.pp_rank == 0 and parallel.attn_cp_rank == 0:
+                    local_rows = -(-max_batch_size // parallel.attn_tp_size)
                     self.local_cache = BaseDeviceCache(
-                        -(-max_batch_size // parallel.attn_tp_size),
+                        local_rows,
                         num_layers,
                         self.device_topk_size,
                         device,
                         name="routed_experts_local",
                     )
+                    if self.device_cache is None:
+                        # The all-gather fills every rank; only the output
+                        # rank keeps the rows.
+                        self.all_gather_scratch = torch.empty(
+                            (
+                                local_rows * parallel.attn_tp_size,
+                                num_layers,
+                                self.device_topk_size,
+                            ),
+                            dtype=torch.int32,
+                            device=device,
+                        )
             else:
                 self._gathers_per_layer = True
                 attn_tp_size = parallel.attn_tp_size if is_dp_attention_enabled() else 1
@@ -186,22 +200,24 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         no_copy_to_cpu: bool = False,
     ) -> Optional[TopkCaptureOutput]:
         if self.local_cache is not None:
-            self._gather_local_rows(can_run_graph)
+            self._all_gather_local_rows(can_run_graph)
         return super().on_forward_end(
             forward_batch, can_run_graph, cuda_graph_batch, no_copy_to_cpu
         )
 
-    def _gather_local_rows(self, can_run_graph: bool):
-        """Send every layer's ids for this rank's tokens to the output rank.
+    def _all_gather_local_rows(self, can_run_graph: bool):
+        """Collect every layer's ids for all of the group's tokens on the output rank.
 
         Each attention-TP rank holds an equal, rank-ordered share of the local
         DP buffer, so concatenating the shares rebuilds the row order the
         per-layer all-gather produced. Every rank of the group must call this
-        once per forward.
+        once per forward. An all-gather reuses the group's existing all-gather
+        path; a gather runs as NCCL send/recv, which took ~1 GiB more on the
+        receiving rank.
         """
         parallel = get_parallel()
-        # Graph replay runs no Python capture(); the runners size the local DP
-        # buffer for the replayed batch before replay.
+        # Graph replay runs no Python capture(); the graph runners publish the
+        # replayed graph's padded size as the local DP buffer length.
         local_rows = get_local_dp_buffer_len() // parallel.attn_tp_size
         if not can_run_graph and self._local_rows is not None:
             if self._local_rows != local_rows:
@@ -213,11 +229,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 )
             local_rows = self._local_rows
         self._local_rows = None
-        gathered = parallel.attn_tp_group.gather(
-            self.local_cache.buffer[:local_rows], dst=0, dim=0
+        out = (
+            self.device_cache.buffer
+            if self.device_cache is not None
+            else self.all_gather_scratch
         )
-        if gathered is not None:
-            self.device_cache.buffer[: gathered.shape[0]].copy_(gathered)
+        attn_tp_all_gather_into_tensor(
+            out[: local_rows * parallel.attn_tp_size],
+            self.local_cache.buffer[:local_rows],
+        )
 
     def _get_local_slice(
         self,

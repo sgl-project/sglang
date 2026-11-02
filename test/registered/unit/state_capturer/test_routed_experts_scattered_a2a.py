@@ -271,21 +271,20 @@ class TestOutputRankHostCache(CustomTestCase):
 
 class TestForwardEndGather(CustomTestCase):
     """DeepEP with DP attention: each attention-TP rank keeps its own tokens'
-    ids, and one gather per forward rebuilds the per-layer all-gather's rows."""
+    ids, and one all-gather per forward rebuilds the per-layer all-gather's rows."""
 
     NUM_LAYERS = 3
     K = 2
     LOCAL_ROWS = 3
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5, 9])
 
-    def _parallel(self, attn_tp_rank, attn_tp_group=None, pp_rank=0):
+    def _parallel(self, attn_tp_rank, pp_rank=0):
         return SimpleNamespace(
             num_dp_ranks=1,
             pp_rank=pp_rank,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=2,
             attn_cp_rank=0,
-            attn_tp_group=attn_tp_group,
         )
 
     def _capturer(self, parallel):
@@ -331,11 +330,16 @@ class TestForwardEndGather(CustomTestCase):
             for layer_id in range(self.NUM_LAYERS):
                 cap.capture(layer_id=layer_id, topk_indices=local_topk[:, layer_id])
 
-    def _forward_end(self, cap, parallel, can_run_graph, local_dp_buffer_len):
+    def _forward_end(
+        self, cap, parallel, can_run_graph, local_dp_buffer_len, all_gather
+    ):
         with (
             mock.patch.object(re_mod, "get_parallel", return_value=parallel),
             mock.patch.object(
                 re_mod, "get_local_dp_buffer_len", return_value=local_dp_buffer_len
+            ),
+            mock.patch.object(
+                re_mod, "attn_tp_all_gather_into_tensor", side_effect=all_gather
             ),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
@@ -350,7 +354,7 @@ class TestForwardEndGather(CustomTestCase):
                 cuda_graph_batch=None,
             )
 
-    def test_one_gather_rebuilds_the_per_layer_rows(self):
+    def test_one_all_gather_rebuilds_the_per_layer_rows(self):
         shares = [
             torch.randint(
                 0, 64, (self.LOCAL_ROWS, self.NUM_LAYERS, self.K), dtype=torch.int32
@@ -359,27 +363,32 @@ class TestForwardEndGather(CustomTestCase):
         ]
         sent = {}
 
-        class _Group:
-            def __init__(self, rank):
-                self.rank = rank
+        def all_gather(rank):
+            # The last rank to join sees every share, like the real collective.
+            def _all_gather(output, input_):
+                sent[rank] = input_.clone()
+                if len(sent) == 2:
+                    output.copy_(torch.cat([sent[0], sent[1]], dim=0))
 
-            def gather(self, input_, dst, dim):
-                sent[self.rank] = input_.clone()
-                if self.rank != dst:
-                    return None
-                return torch.cat([sent[0], sent[1]], dim=dim)
+            return _all_gather
 
-        output_parallel = self._parallel(0, _Group(0))
-        peer_parallel = self._parallel(1, _Group(1))
+        output_parallel = self._parallel(0)
+        peer_parallel = self._parallel(1)
         output_rank = self._capturer(output_parallel)
         peer = self._capturer(peer_parallel)
         self.assertIsNone(peer.device_cache)
         self.assertIsNotNone(peer.local_cache)
+        self.assertIsNotNone(peer.all_gather_scratch)
+        self.assertIsNone(output_rank.all_gather_scratch)
 
         self._capture_layers(peer, peer_parallel, shares[1])
         self._capture_layers(output_rank, output_parallel, shares[0])
-        self.assertIsNone(self._forward_end(peer, peer_parallel, False, 6))
-        self.assertIsNone(self._forward_end(output_rank, output_parallel, False, 6))
+        self.assertIsNone(
+            self._forward_end(peer, peer_parallel, False, 6, all_gather(1))
+        )
+        self.assertIsNone(
+            self._forward_end(output_rank, output_parallel, False, 6, all_gather(0))
+        )
 
         # What the per-layer all-gather wrote: rank 0's rows, then rank 1's.
         expected = torch.cat(shares, dim=0)
@@ -397,19 +406,25 @@ class TestForwardEndGather(CustomTestCase):
         """Graph replay runs no Python capture(), so the row count comes from
         the local DP buffer the runner set for the replayed batch."""
         gathered_rows = []
-        group = SimpleNamespace(
-            gather=lambda input_, dst, dim: gathered_rows.append(input_.shape[0])
-        )
-        parallel = self._parallel(1, group)
+        parallel = self._parallel(1)
         peer = self._capturer(parallel)
-        self._forward_end(peer, parallel, can_run_graph=True, local_dp_buffer_len=8)
-        self.assertEqual(gathered_rows, [4])
+        self._forward_end(
+            peer,
+            parallel,
+            can_run_graph=True,
+            local_dp_buffer_len=8,
+            all_gather=lambda output, input_: gathered_rows.append(
+                (output.shape[0], input_.shape[0])
+            ),
+        )
+        self.assertEqual(gathered_rows, [(8, 4)])
 
     def test_later_pipeline_stages_send_nothing(self):
         parallel = self._parallel(1, pp_rank=1)
         cap = self._capturer(parallel)
         self.assertIsNone(cap.local_cache)
         self.assertIsNone(cap.device_cache)
+        self.assertIsNone(cap.all_gather_scratch)
         self._capture_layers(
             cap,
             parallel,

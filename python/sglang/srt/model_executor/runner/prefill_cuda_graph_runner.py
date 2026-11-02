@@ -71,6 +71,7 @@ from sglang.srt.layers.dp_attention import (
     dp_slot_in,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    set_local_dp_buffer_len,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
@@ -1871,6 +1872,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "Prefill CUDA graph replay was admitted without a fitting bucket"
                 )
         self.raw_num_tokens = num_tokens
+        # The graph replays at its padded size, which can exceed the bucket
+        # prepare_mlp_sync_batch published; publish it as _run_forward did at
+        # capture (routed-experts capture all-gathers each rank's share).
+        set_local_dp_buffer_len(static_num_tokens)
 
         if self.max_context_size is not None:
             batch_max_context_len = self._batch_max_context_len(forward_batch)
