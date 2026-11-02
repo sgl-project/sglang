@@ -662,6 +662,8 @@ class Envs:
     # switch rather than a pure kill-switch. Off falls back to the contiguous
     # gather path. Default on.
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
+    # Bucket aiter paged_attention_ragged decode partitions by sequence length.
+    SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
