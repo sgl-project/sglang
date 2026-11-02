@@ -106,11 +106,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
     def test_embedding_rejects_enabled_prefill_tracking(self) -> None:
         """Embedding and reward models reject enabled prefill tracking before allocation."""
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.server_args = SimpleNamespace(enable_prefill_weight_versions=True)
@@ -126,11 +121,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
     def test_embedding_without_prefill_tracking_remains_supported(self) -> None:
         """Embedding initialization remains unchanged when prefill tracking is disabled."""
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.server_args = SimpleNamespace(enable_prefill_weight_versions=False)
@@ -145,11 +135,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
     def test_encoder_decoder_rejects_enabled_prefill_tracking(self) -> None:
         """Encoder-decoder models reject prefill tracking before allocating a tracker."""
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.server_args = SimpleNamespace(enable_prefill_weight_versions=True)
@@ -161,11 +146,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
     def test_encoder_decoder_without_prefill_tracking_remains_supported(self) -> None:
         """Disabled tracking leaves encoder-decoder initialization unchanged."""
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.server_args = SimpleNamespace(enable_prefill_weight_versions=False)

@@ -31,14 +31,12 @@ class DeferredResponses:
         self.disaggregation_mode = disaggregation_mode
         self.output_streamer = output_streamer
         self.send_abort = send_abort
-        # The held responses by rid, each with its completion.
         self.held: Dict[str, Tuple[Req, ResponseCompletion]] = {}
 
     def held_reqs(self) -> List[Req]:
         return [req for req, _ in self.held.values()]
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:
-        """Hold a finished response until completion; see deferred_output."""
         if self.disaggregation_mode != DisaggregationMode.NULL:
             raise ValueError("deferred responses do not support PD disaggregation")
         if not req.finished() or req.finished_output:

@@ -57,11 +57,6 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_scheduler(self, disaggregation_mode: DisaggregationMode) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.disaggregation_mode = disaggregation_mode
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = False
@@ -970,11 +965,6 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.deferred_responses = DeferredResponses(
-            disaggregation_mode=DisaggregationMode.NULL,
-            output_streamer=None,
-            send_abort=None,
-        )
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = []
