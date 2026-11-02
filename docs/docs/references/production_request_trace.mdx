@@ -62,6 +62,8 @@ This section explains how to configure the request tracing and export the trace 
     SGLANG_TRACE_LEVEL=2 python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other options>
     ```
 
+    By default, level `3` traces a `decode_loop` slice for every decode step. To reduce the span volume of long generations, set `SGLANG_TRACE_DECODE_MAX_STEPS=N` before server startup to trace only the first `N` decode steps of each request (e.g. `10`; `0` disables them; the default `-1` traces every step). The limit does not affect metrics or other request spans, and retraction does not reset the per-request budget. A step normally produces one token, but speculative decoding can accept multiple tokens per step; the prefill token does not consume this budget.
+
     **At runtime** — dynamically adjust via HTTP API without restarting:
     ```bash Command
     curl http://0.0.0.0:30000/set_trace_level?level=2

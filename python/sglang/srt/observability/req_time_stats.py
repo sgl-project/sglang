@@ -26,6 +26,7 @@ import msgspec
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+# Max decode_loop slices traced per request; negative (default) = every decode step.
+SGLANG_TRACE_DECODE_MAX_STEPS = envs.SGLANG_TRACE_DECODE_MAX_STEPS.get()
 
 
 logger = logging.getLogger(__name__)
@@ -974,8 +977,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         last_time = self.last_decode_scheduled_time
             stage = RequestStage.DECODE_LOOP
             self.observe_per_stage_req_latency(stage, ts - last_time)
-            attrs = {"decode_ct": self.decode_ct}
-            self.trace_slice(stage, last_time, ts, attrs)
+            if (
+                SGLANG_TRACE_DECODE_MAX_STEPS < 0
+                or self.decode_ct < SGLANG_TRACE_DECODE_MAX_STEPS
+            ):
+                attrs = {"decode_ct": self.decode_ct}
+                self.trace_slice(stage, last_time, ts, attrs)
             self.decode_ct += 1
 
     def set_last_scheduled_time(self, forward_mode: ForwardMode, ts=None, attrs=None):
