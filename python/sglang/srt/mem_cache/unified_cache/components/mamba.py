@@ -44,7 +44,13 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_server_args,
+    mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
+)
+from sglang.srt.system_prompt.radix_patch import cap_mamba_donate_len
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -229,7 +235,24 @@ class MambaComponent(TreeComponent):
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
                 )
-                assert dst_index is not None, "Can not alloc mamba cache"
+                if dst_index is None:
+                    # Fail-loud (upstream contract), but with context: this is
+                    # the request's running mamba slot, allocated at match time.
+                    # Admission (PrefillAdder static-pool budget) should have
+                    # throttled before this point; reaching it means over-admit
+                    # or a pool too small for --max-running-requests.
+                    _alloc = self.cache.req_to_token_pool.mamba_allocator
+                    raise RuntimeError(
+                        "Can not alloc mamba cache: match COW for the request's "
+                        "running mamba slot failed even after evicting 1 "
+                        f"(free={_alloc.schedulable_available_size()}, "
+                        f"evictable={self.cache.mamba_evictable_size()}). "
+                        "The mamba pool is exhausted — with --system-prompt the "
+                        "admission budget should throttle this; otherwise the "
+                        "pool is too small for --max-running-requests, try "
+                        "increasing --mamba-full-memory-ratio. Check the last "
+                        "[MambaAudit] line for the slot-accounting snapshot."
+                    )
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
@@ -779,6 +802,21 @@ class MambaComponent(TreeComponent):
             if is_finished:
                 storage, sub_pool = self._state()
                 cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
+
+        # Fixed system prompt (--system-prompt): retain ONLY the shared system-
+        # prefix mamba state in the tree and free every per-request suffix
+        # state. Cap the donate length at the chunk-aligned system boundary so
+        # every request maps to the same shared boundary node; subsequent
+        # donates find mamba_exist=True (commit_insert_component_data) and the
+        # donated suffix state is freed in cleanup_after_caching_req, never
+        # stored. The boundary state itself is captured during prefill by
+        # req.mamba_branching_seqlen (seeded from system_prefix_boundary), so
+        # the shared node is created on the first request that crosses it.
+        # extra_buffer only (see cap_mamba_donate_len): no_buffer donates the
+        # live chunk-end state, so capping there would store a wrong state.
+        cache_len = cap_mamba_donate_len(
+            cache_len, req.system_prefix_boundary, self.cache.enable_mamba_extra_buffer
+        )
 
         if is_finished:
             if cache_len is None:

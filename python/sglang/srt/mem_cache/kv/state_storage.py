@@ -138,11 +138,55 @@ class StateStorage:
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
-                    if not self.alloc_ping_pong_buffer(table, req):
+                    from sglang.srt.system_prompt import is_system_prefix_warm
+
+                    if is_system_prefix_warm(
+                        req.system_prefix_boundary,
+                        req.prefix_len,
+                        req.mamba_branching_seqlen,
+                    ):
+                        # Fixed system prompt, warm request: the boundary state
+                        # is already cached and the suffix is neither tracked
+                        # (mask=False in _mamba_radix_cache_v2_req_prepare_for_extend)
+                        # nor donated (cap_mamba_donate_len). It needs no real
+                        # ping-pong slot. Use reserved slot 0 as the sentinel
+                        # (MambaSlotAllocator.clear never hands slot 0 out): it is
+                        # a valid dummy write/gather/COW target, so any index
+                        # consumer (decode track kernel dst, donate path, COW-from
+                        # root under eviction) stays in bounds. Every position is
+                        # marked empty so release() frees nothing of it — slot 0
+                        # never returns to the free list. Real allocations start
+                        # at 1, so the all-empty marking is a no-op on cold/lazy
+                        # buffers.
+                        size = table.mamba_ping_pong_track_buffer_size
+                        req.kv.mamba_ping_pong_track_buffer = torch.zeros(
+                            (size,),
+                            dtype=torch.int64,
+                            device=table.device,
+                        )
+                        req.kv.mamba_ping_pong_empty = [True] * size
+                        req.kv.mamba_prev_track_seqlen = None
+                        req.kv.mamba_next_track_idx = 0
+                        req.kv.mamba_last_track_idx = (
+                            0
+                            if table.enable_mamba_extra_buffer_lazy
+                            else table.get_mamba_ping_pong_other_idx(0)
+                        )
+                    elif not self.alloc_ping_pong_buffer(table, req):
                         self._give_back(given_state, given_tracking)
+                        # Admission (PrefillAdder slot budget + alloc_req_slots)
+                        # should throttle before this point; reaching it means
+                        # the budget under-counted actual allocation. Report
+                        # with context so the crash log shows what to tune.
                         raise StateSlotsExhausted(
-                            "Not enough space for mamba ping pong idx, "
-                            "try to increase --mamba-full-memory-ratio."
+                            f"Not enough space for mamba ping pong idx: need "
+                            f"{table.mamba_initial_tracking_slots} slot(s) for "
+                            f"req={req.rid} but the mamba allocator has "
+                            f"{self.slots.schedulable_available_size()} free. "
+                            "This means admission over-committed the mamba "
+                            "pool — with --system-prompt check the startup "
+                            "probe log line; otherwise try to increase "
+                            "--mamba-full-memory-ratio."
                         )
                     given_tracking.append(req)
                 mamba_ping_pong_track_buffers.append(

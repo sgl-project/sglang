@@ -1435,7 +1435,20 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+        # Fixed system prompt: the donated key is capped at the chunk-aligned
+        # system boundary (the mamba component's cache_len), which can sit
+        # BELOW the extent the request matched at admission — deep keys
+        # inserted by boundary-less requests extend the shared system node.
+        # The coverage assert and the protected-extent update below must
+        # tolerate that cap: pages in [page_aligned_len, cache_protected_len)
+        # belong to the matched node, and release_kv_cache frees from
+        # cache_protected_len, so shrinking would hand tree-referenced pages
+        # back to the allocator (silent KV corruption on later matches).
+        system_capped_key = (
+            req.system_prefix_boundary is not None
+            and page_aligned_len < req.kv.cache_protected_len
+        )
+        assert system_capped_key or req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
         assert (
@@ -1464,7 +1477,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.protect_prefix(len(new_indices))
+        if system_capped_key:
+            # Keep the matched extent (see the comment at the assert above);
+            # the capped insert must not shrink the tree-owned range.
+            req.kv.cache_protected_len = max(
+                len(new_indices), req.kv.cache_protected_len
+            )
+        else:
+            req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
 
         # cleanup

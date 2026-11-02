@@ -7,6 +7,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
     get_schedule,
+    get_server_args,
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
@@ -1207,6 +1208,7 @@ class Req(ReqDllmMixin):
         dimensions: Optional[int] = None,
         encoding_format: Optional[str] = None,
         http_worker_ipc: Optional[str] = None,
+        system_prefix_boundary: Optional[int] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -1309,6 +1311,21 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
 
+        # Fixed system-prompt boundary (--system-prompt). The shared system-prefix
+        # token length (chunk/page-aligned on the tokenizer side). It drives:
+        #  - mamba/linear-attention: stop tracking after the boundary (hybrid SSM);
+        #  - KV radix cache: retain only the system-prefix KV, free the per-request
+        #    suffix (both full-attention and hybrid). Seeded here for cold requests;
+        #    warm requests override mamba_branching_seqlen with the matched boundary.
+        self.system_prefix_boundary: Optional[int] = None
+        if system_prefix_boundary is not None:
+            self.system_prefix_boundary = system_prefix_boundary
+            from sglang.srt.system_prompt import seed_mamba_boundary
+
+            self.mamba_branching_seqlen = seed_mamba_boundary(
+                system_prefix_boundary,
+                mamba_cache_chunk_size(),
+            )
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_checkpoint: bool = True
@@ -1900,7 +1917,17 @@ class Req(ReqDllmMixin):
                 cow_mamba=cow_mamba,
                 max_prefix_len=key_limit,
             )
-            self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+            # Fixed system prompt: the __init__-seeded boundary is needed by
+            # the first (cold) request, but an unconditional overwrite drops it
+            # when the match returns None (empty tree). Re-derive so the seed
+            # survives the warm-up pass; see reseed_mamba_boundary_after_match.
+            from sglang.srt.system_prompt import reseed_mamba_boundary_after_match
+
+            self.mamba_branching_seqlen = reseed_mamba_boundary_after_match(
+                self.system_prefix_boundary,
+                self.prefix_len,
+                match_result.mamba_branching_seqlen,
+            )
             if match_result.cache_protected_len is None:
                 self.kv.protect_prefix(self.prefix_len)
 
@@ -3338,6 +3365,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
+        # Fixed system prompt: a warm request (shared system-prefix boundary
+        # fully cached, mamba boundary state already in the tree) only runs its
+        # suffix and donates nothing — cap_mamba_donate_len caps the donate at
+        # the boundary, and the boundary checkpoint already exists. It has no
+        # chunk-boundary state to track, so skip the ping-pong swap and tracking
+        # write entirely. Cold requests (warm-up pass / evicted mamba state)
+        # keep the default length-based mask so the boundary state is captured.
+        from sglang.srt.system_prompt import is_system_prefix_warm
+
+        system_prefix_warm = is_system_prefix_warm(
+            req.system_prefix_boundary,
+            req.prefix_len,
+            req.mamba_branching_seqlen,
+        )
         prefix_len = req.prefix_len
         seq_end = req.extend_end
         if get_parallel().dcp_enabled:
@@ -3356,6 +3397,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
+        mask = mask and not system_prefix_warm
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
@@ -3716,6 +3758,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             NewTokenRatioTracker.estimate_new_token_ratio_after_retract(self.reqs)
         )
 
+        # Retraction is a low-frequency, high-suspicion event for the mamba
+        # slot accounting: retracted reqs release their slots and re-allocate
+        # on the next prefill. Record the pool state right after for the
+        # [MambaAudit] trail.
+        if retracted_reqs and self.tree_cache.supports_mamba():
+            allocator = self.tree_cache.req_to_token_pool.mamba_allocator
+            logger.info(
+                "[MambaAudit] retract_decode: n=%d free=%d evictable=%d",
+                len(retracted_reqs),
+                allocator.schedulable_available_size(),
+                self.tree_cache.mamba_evictable_size(),
+            )
+
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     @staticmethod
@@ -3808,6 +3863,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, req in enumerate(self.reqs):
             buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
+            # Fixed system prompt: warm requests neither track nor donate, so
+            # they hold no real ping-pong slot (sentinel-only buffer) and must
+            # not be allocated a transient second slot here.
+            from sglang.srt.system_prompt import is_system_prefix_warm
+
+            if is_system_prefix_warm(
+                req.system_prefix_boundary,
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+            ):
+                continue
             # Skip reqs not at a track boundary
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
@@ -3999,7 +4065,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
+            if get_server_args().system_prompt is not None:
+                # Warm requests (system-prefix boundary already cached) hold a
+                # sentinel ping-pong buffer and must never track. Prefill excludes
+                # them in _mamba_radix_cache_v2_req_prepare_for_extend; mirror it
+                # here so the decode track mask is False for warm rows too —
+                # otherwise a warm row whose seq_len hits a track-interval boundary
+                # would feed its sentinel slot index to the decode track kernel.
+                from sglang.srt.system_prompt import is_system_prefix_warm
+
+                warm_mask_cpu = torch.tensor(
+                    [
+                        not is_system_prefix_warm(
+                            r.system_prefix_boundary,
+                            r.prefix_len,
+                            r.mamba_branching_seqlen,
+                        )
+                        for r in self.reqs
+                    ],
+                    dtype=torch.bool,
+                    pin_memory=True,
+                )
+                track_mask_cpu = track_mask_cpu & warm_mask_cpu
+                self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+                if self.mamba_track_mask_next_cpu is not None:
+                    self.mamba_track_mask_next_cpu = [
+                        m and w
+                        for m, w in zip(
+                            self.mamba_track_mask_next_cpu, warm_mask_cpu.tolist()
+                        )
+                    ]
             self.mamba_track_mask = track_mask_cpu.pin_memory().to(
                 device=self.device, non_blocking=True
             )

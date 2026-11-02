@@ -714,6 +714,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
+    def mamba_evictable_size(self) -> int:
+        # Caches that never hold evictable mamba nodes (e.g. a disabled or
+        # non-mamba tree) report 0; the mamba-aware radix caches override this.
+        # Keeps the scheduler's [MambaAudit] slot accounting total over every
+        # tree_cache implementation.
+        return 0
+
     def release_session(self, session_id: str) -> None:
         pass
 

@@ -136,6 +136,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.system_prompt import probe_system_prefix_or_disable
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -1202,6 +1203,14 @@ class Engine(EngineScoreMixin, EngineBase):
         # Architecture defaults and template auto-detection must run before
         # publication; plugins may register parsers used by either path.
         resolve_auto_parsers(server_args)
+
+        # Fixed system prompt: probe before ANY subprocess forks. The mamba
+        # pool sizing (kv_cache_configurator, ratio 1) and the scheduler-side
+        # boundary machinery key off server_args.system_prompt alone, so a
+        # prefix that only fails the probe at request time would leave the pool
+        # sized for the warm steady state while every request stays cold. The
+        # gate clears the flag on failure -> consistent feature-off everywhere.
+        probe_system_prefix_or_disable(server_args)
 
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
