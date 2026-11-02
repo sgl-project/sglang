@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
+from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -634,6 +635,34 @@ class TestModelSerialization(unittest.TestCase):
             with self.subTest(tool_calls=expected):
                 for payload in self._chat_payloads(tool_calls):
                     self.assertEqual(payload["tool_calls"], expected)
+
+    def test_reasoning_text_is_served_under_both_names(self):
+        """The reasoning text goes out as reasoning_content and as vLLM's `reasoning`,
+        with the same value and presence, on unary messages and on both stream paths."""
+        for reasoning in ("think first", None):
+            with self.subTest(reasoning=reasoning):
+                sse = build_sse_content(
+                    chunk_id="chatcmpl-test",
+                    created=0,
+                    model="test-model",
+                    index=0,
+                    reasoning_content=reasoning,
+                )
+                payloads = (
+                    ChatMessage(
+                        role="assistant", content="4", reasoning_content=reasoning
+                    ).model_dump(),
+                    DeltaMessage(reasoning_content=reasoning).model_dump(),
+                    json.loads(sse.removeprefix("data: "))["choices"][0]["delta"],
+                )
+                for payload in payloads:
+                    self.assertEqual(payload["reasoning_content"], reasoning)
+                    self.assertEqual(payload["reasoning"], reasoning)
+        # A dump that drops reasoning_content must not reintroduce it as `reasoning`.
+        dumped = ChatMessage(role="assistant", content="4").model_dump(
+            exclude_none=True
+        )
+        self.assertNotIn("reasoning", dumped)
 
     def test_hidden_states_excluded_when_none(self):
         """Test that None hidden_states are excluded with exclude_none=True"""

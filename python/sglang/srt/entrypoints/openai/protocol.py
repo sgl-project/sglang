@@ -1313,6 +1313,9 @@ class ChatMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # vLLM names the same text `reasoning`; serve both so clients of either read it.
+        if "reasoning_content" in data:
+            data["reasoning"] = data["reasoning_content"]
         if self.tool_calls is None:
             data.pop("tool_calls", None)
         return data
@@ -1375,6 +1378,9 @@ class DeltaMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # vLLM names the same text `reasoning`; serve both so clients of either read it.
+        if "reasoning_content" in data:
+            data["reasoning"] = data["reasoning_content"]
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         return data

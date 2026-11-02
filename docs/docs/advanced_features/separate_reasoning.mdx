@@ -122,7 +122,7 @@ To cap how many tokens the model spends thinking, see [Thinking Budget](/docs/ad
 
 Using the OpenAI compatible API, the contract follows the [DeepSeek API design](https://api-docs.deepseek.com/guides/reasoning_model) established with the release of DeepSeek-R1:
 
-- `reasoning_content`: The content of the CoT.
+- `reasoning_content`: The content of the CoT. The same text is also returned as `reasoning`, the name vLLM uses.
 - `content`: The content of the final answer.
 
 

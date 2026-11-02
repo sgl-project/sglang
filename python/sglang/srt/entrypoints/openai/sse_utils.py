@@ -18,9 +18,11 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
     None would drop the key entirely from the SSE payload, making
     `data.reasoning_content` raise AttributeError on the client. Keep it
     required (no default) so it is always serialized as null or a string.
+    ``reasoning`` carries the same value under vLLM's name, on the same terms.
     """
 
     reasoning_content: Optional[str]
+    reasoning: Optional[str]
     role: Optional[str] = None
     content: Optional[str] = None
 
@@ -80,7 +82,12 @@ def build_sse_content(
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
     """
-    delta = StreamDelta(role=role, content=content, reasoning_content=reasoning_content)
+    delta = StreamDelta(
+        role=role,
+        content=content,
+        reasoning_content=reasoning_content,
+        reasoning=reasoning_content,
+    )
     choice = StreamChoice(
         index=index,
         delta=delta,
