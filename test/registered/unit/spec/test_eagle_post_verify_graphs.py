@@ -279,6 +279,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
+                has_spec_opt_out=False,
             )
             fields = dict(has_grammar=False, hisparse_coordinator=None)
             for name, value in changes.items():
@@ -306,6 +307,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(logit_bias=torch.zeros(1)),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
+            dict(has_spec_opt_out=True),
         ):
             with self.subTest(change=sorted(change)):
                 self.assertIsNone(key(**change))

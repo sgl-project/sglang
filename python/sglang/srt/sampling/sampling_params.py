@@ -179,6 +179,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
     watermark: Optional[WatermarkRequestConfig] = None
+    disable_speculative_decoding: bool = False
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop

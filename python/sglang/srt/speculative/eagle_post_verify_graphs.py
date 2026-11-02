@@ -109,6 +109,7 @@ class EaglePostVerifyGraphs:
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             or (watermark is not None and info.has_watermark_candidates)
+            or getattr(info, "has_spec_opt_out", False)
         ):
             return None
         return (

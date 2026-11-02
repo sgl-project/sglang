@@ -922,6 +922,17 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     accept_lens = num_correct_drafts + 1
+
+    # For requests opting out of speculative decoding, clamp accept_lens to 1.
+    # This guarantees that only the target model's first emitted token is accepted
+    # and no draft proposals are ever accepted for opted-out requests.
+    if getattr(sampling_info, "has_spec_opt_out", False) and sampling_info.spec_opt_out_mask is not None:
+        accept_lens = torch.where(
+            sampling_info.spec_opt_out_mask,
+            torch.ones_like(accept_lens),
+            accept_lens,
+        )
+
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,

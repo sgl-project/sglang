@@ -923,6 +923,39 @@ class TestFromScheduleBatch(CustomTestCase):
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
 
+    def test_spec_opt_out_propagation(self):
+        """Test per-request speculative decoding opt-out tracking in from_schedule_batch."""
+        req1 = self._make_req()
+        req1.sampling_params.disable_speculative_decoding = True
+        req2 = self._make_req()
+        req2.sampling_params.disable_speculative_decoding = False
+
+        batch = MagicMock(reqs=[req1, req2], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+
+        self.assertTrue(info.has_spec_opt_out)
+        self.assertFalse(info.is_all_spec_opt_out)
+        self.assertIsNotNone(info.spec_opt_out_mask)
+        self.assertEqual(info.spec_opt_out_mask.tolist(), [True, False])
+
+        # Filter
+        info.filter_batch([1], torch.tensor([1], dtype=torch.long, device=DEVICE))
+        self.assertFalse(info.has_spec_opt_out)
+        self.assertFalse(info.is_all_spec_opt_out)
+        self.assertEqual(info.spec_opt_out_mask.tolist(), [False])
+
+        # Merge
+        req3 = self._make_req()
+        req3.sampling_params.disable_speculative_decoding = True
+        batch2 = MagicMock(reqs=[req3], device=DEVICE)
+        info2 = SamplingBatchInfo.from_schedule_batch(batch2, VOCAB_SIZE)
+        self.assertTrue(info2.is_all_spec_opt_out)
+
+        info.merge_batch(info2)
+        self.assertTrue(info.has_spec_opt_out)
+        self.assertFalse(info.is_all_spec_opt_out)
+        self.assertEqual(info.spec_opt_out_mask.tolist(), [False, True])
+
 
 if __name__ == "__main__":
     unittest.main()
