@@ -531,8 +531,8 @@ class TestFusedQKNorm:
     ):
         out = x.reshape(-1, head_dim).float()
         out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + eps)
-        out = out.to(x.dtype) * weight
-        return out.reshape(x.shape)
+        out = out * weight.float()
+        return out.to(x.dtype).reshape(x.shape)
 
     @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
     @pytest.mark.parametrize(
@@ -590,50 +590,33 @@ class TestFusedQKNorm:
         position_ids = torch.arange(batch_size, dtype=torch.int32)
         base = 10000.0
 
-        ref_q = q.clone()
-        ref_k = k.clone()
-        ref_q = self._norm_per_head_native(ref_q, q_weight, head_dim, eps)
-        ref_k = self._norm_per_head_native(ref_k, k_weight, head_dim, eps)
-
-        def apply_rope(x: torch.Tensor, pos: int) -> torch.Tensor:
-            x = x.reshape(x.shape[0], -1, head_dim)
-            rotated = x.clone()
-            for b in range(x.shape[0]):
-                for h in range(x.shape[1]):
-                    row = x[b, h].clone()
-                    if is_neox:
-                        half = head_dim // 2
-                        for d in range(half):
-                            x0 = row[d]
-                            y0 = row[d + half]
-                            freq = base ** (-2.0 * d / head_dim)
-                            theta = pos * freq
-                            s = torch.sin(torch.tensor(theta, dtype=torch.float32))
-                            c = torch.cos(torch.tensor(theta, dtype=torch.float32))
-                            rotated[b, h, d] = x0 * c - y0 * s
-                            rotated[b, h, d + half] = y0 * c + x0 * s
-                    else:
-                        for d in range(0, head_dim, 2):
-                            x0 = row[d]
-                            y0 = row[d + 1]
-                            freq = base ** (-2.0 * (d / 2) / head_dim)
-                            theta = pos * freq
-                            s = torch.sin(torch.tensor(theta, dtype=torch.float32))
-                            c = torch.cos(torch.tensor(theta, dtype=torch.float32))
-                            rotated[b, h, d] = x0 * c - y0 * s
-                            rotated[b, h, d + 1] = y0 * c + x0 * s
-            return rotated.reshape_as(x)
-
-        for pos_idx, pos in enumerate(position_ids.tolist()):
-            ref_q[pos_idx] = apply_rope(ref_q[pos_idx : pos_idx + 1], pos).reshape(-1)
-            ref_k[pos_idx] = apply_rope(ref_k[pos_idx : pos_idx + 1], pos).reshape(-1)
-
         half = head_dim // 2
         freqs = base ** (-2.0 * torch.arange(half, dtype=torch.float32) / head_dim)
         theta = position_ids.to(torch.float32)[:, None] * freqs[None, :]
         cos_sin_cache = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1).to(
             dtype
         )
+
+        def apply_rope(x: torch.Tensor) -> torch.Tensor:
+            rows = x.reshape(batch_size, -1, head_dim).float()
+            # Use the same quantized cache as the kernel, with FP32 arithmetic.
+            cache = cos_sin_cache[position_ids.long()].float()
+            cos = cache[:, None, :half]
+            sin = cache[:, None, half:]
+            if is_neox:
+                x0, y0 = rows[..., :half], rows[..., half:]
+                rotated = torch.cat(
+                    [x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1
+                )
+            else:
+                x0, y0 = rows[..., 0::2], rows[..., 1::2]
+                rotated = torch.stack(
+                    [x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1
+                ).flatten(-2)
+            return rotated.to(x.dtype).reshape_as(x)
+
+        ref_q = apply_rope(self._norm_per_head_native(q, q_weight, head_dim, eps))
+        ref_k = apply_rope(self._norm_per_head_native(k, k_weight, head_dim, eps))
 
         torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
             q,
@@ -647,7 +630,7 @@ class TestFusedQKNorm:
             head_dim,
         )
 
-        atol = rtol = 5e-2
+        atol = rtol = precision[dtype]
         torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
         torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
 
