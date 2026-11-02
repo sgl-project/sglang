@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -41,7 +42,6 @@ from sglang.kernels.ops.gemm.bf16_fp32 import (
     linear_bf16_fp32,
     mark_hpc_bf16xfp32_gemm_enabled,
 )
-from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.environ import envs
@@ -70,7 +70,10 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
+    adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
+    get_moe_a2a_backend,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -122,6 +125,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+
+if _is_npu:
+    from sgl_kernel_npu.moe.zero_experts_compute_identity import (
+        zero_experts_compute_identity_triton as zero_experts_compute_triton,
+    )
+else:
+    from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
@@ -312,26 +322,48 @@ class LongcatFlashMoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        if _is_npu and num_tokens == 0:
+            # An empty DP rank must still participate in expert dispatch/combine.
+            return self.experts(
+                hidden_states, self.topk.empty_topk_output(hidden_states.device)
+            ).view(num_tokens, hidden_dim)
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_weights, topk_idx, _ = self.topk(
             hidden_states,
             router_logits,
         )
-        if self.zero_expert_type is not None:
+        if self.zero_expert_type is not None and num_tokens > 0:
+            zero_expert_kwargs = (
+                {"identity_mask_value": -1 if get_moe_a2a_backend().is_deepep() else 0}
+                if _is_npu
+                else {}
+            )
             zero_expert_result = zero_experts_compute_triton(
                 expert_indices=topk_idx,
                 expert_scales=topk_weights,
                 num_experts=self.num_experts,
                 zero_expert_type=self.zero_expert_type,
                 hidden_states=hidden_states,
+                **zero_expert_kwargs,
             )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+        if (
+            self.zero_expert_type is not None
+            and num_tokens > 0
+            and (
+                not _is_npu
+                or is_moe_input_scattered_across_dp_ranks()
+                or adds_replicated_output_to_partial()
+            )
+        ):
+            # A2A outputs are complete on each rank. For replicated inputs, the
+            # boundary sums partial outputs, so count the identity branch once.
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -820,9 +852,10 @@ class LongcatFlashForCausalLM(nn.Module):
                         self_attn.w_kc,
                         w_kc.transpose(1, 2).contiguous().transpose(1, 2),
                     )
-                    self_attn.w_vc = bind_or_assign(
-                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                    )
+                    w_vc = w_vc.contiguous().transpose(1, 2)
+                    if _is_npu:
+                        w_vc = w_vc.contiguous()
+                    self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                     if (
                         hasattr(self_attn.kv_b_proj, "weight_scale")
                         and self_attn.w_scale is None
@@ -942,6 +975,17 @@ class LongcatFlashForCausalLM(nn.Module):
                 if "mtp" in name:
                     continue
                 if self.use_ngram_embedding:
+                    # Original LongCat-2.0 checkpoints number OE branches from zero.
+                    name = re.sub(
+                        r"^model\.oe_embed_tokens(\d+)\.weight$",
+                        r"model.ngram_embeddings.embedders.\1.weight",
+                        name,
+                    )
+                    name = re.sub(
+                        r"^model\.oe_embed_proj(\d+)\.weight$",
+                        r"model.ngram_embeddings.post_projs.\1.weight",
+                        name,
+                    )
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
                     if ".ngram_embeddings" in name:

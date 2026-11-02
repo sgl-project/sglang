@@ -40,7 +40,7 @@ class NgramEmbedding(torch.nn.Module):
         self.exclusive_oe_embedder_size_sums = torch.zeros(
             [over_embedding_k * (over_embedding_n - 1) + 1],
             dtype=torch.int32,
-            device="cuda",
+            device=self.word_embeder.weight.device,
         )
         for i in range(over_embedding_k * (over_embedding_n - 1)):
             self.exclusive_oe_embedder_size_sums[i + 1] = (
@@ -48,7 +48,9 @@ class NgramEmbedding(torch.nn.Module):
                 + int(over_embedding_m + i * 2 + 1)
             )
         self.oe_embeder = VocabParallelEmbedding(
-            num_embeddings=int(self.exclusive_oe_embedder_size_sums[-1]),
+            num_embeddings=sum(
+                over_embedding_m + i * 2 + 1 for i in range(self.n_grams)
+            ),
             embedding_dim=oe_hidden_dim,
             use_attn_tp_group=use_attn_tp_group,
         )
@@ -61,11 +63,14 @@ class NgramEmbedding(torch.nn.Module):
         )
 
         self.oe_mods = torch.zeros(
-            [self.over_embedding_n - 1, self.over_embedding_k], dtype=torch.int32
+            [self.over_embedding_n - 1, self.over_embedding_k],
+            dtype=torch.int32,
+            device=self.word_embeder.weight.device,
         )
         self.oe_weights = torch.zeros(
             [self.over_embedding_n - 1, self.over_embedding_k, self.over_embedding_n],
             dtype=torch.int32,
+            device=self.word_embeder.weight.device,
         )
         for n in range(2, self.over_embedding_n + 1):
             for k in range(self.over_embedding_k):

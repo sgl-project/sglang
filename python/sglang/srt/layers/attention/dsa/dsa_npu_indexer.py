@@ -54,6 +54,71 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
 
 
 class DSANPUIndexerMixin:
+    def _project_npu_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
+        # Match the shared projection's parameters. The sink/local operator
+        # takes FP32 gates; the standard torch_npu indexer takes BF16 gates.
+        weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+        dtype = (
+            torch.float32
+            if self.num_init_tokens or self.num_local_tokens
+            else torch.bfloat16
+        )
+        return weights.to(dtype)
+
+    def _forward_npu_sink_local_indexer(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        weights: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        if actual_seq_lengths_q.numel() == 0 or query.shape[0] == 0:
+            return torch.full(
+                (query.shape[0], self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=query.device,
+            )
+
+        # Unlike torch_npu's indexer, this existing operator takes leading-zero
+        # INT64 cumulative lengths for BOTH Q and KV. KV includes cached tokens.
+        q_ends = actual_seq_lengths_q.to(device=query.device, dtype=torch.int64)
+        kv_lengths = actual_seq_lengths_kv.to(device=query.device, dtype=torch.int64)
+        zero = q_ends.new_zeros(1)
+        indices, _ = torch.ops.npu.mlp_lightning_indexer(
+            query,
+            key,
+            weights.float(),
+            cur_seq_lengths_query=torch.cat((zero, q_ends)),
+            cur_seq_lengths_key=torch.cat((zero, kv_lengths.cumsum(0))),
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            kv_block_len=1,
+            q_block_len=1,
+            init_num=self.num_init_tokens,
+            local_num=self.num_local_tokens,
+            sparse_mode=3,
+            return_value=False,
+        )
+
+        # The operator does not initialize all padded TND rows (including
+        # multi-token verify requests with zero KV length). Mask them on-device
+        # so eager DP padding and graph replay share the same [T, K] contract.
+        rows = torch.arange(query.shape[0], device=query.device)
+        requests = torch.searchsorted(q_ends, rows, right=True).clamp_max(
+            q_ends.numel() - 1
+        )
+        valid = (rows < q_ends[-1]) & (
+            kv_lengths[requests] > q_ends[requests] - rows - 1
+        )
+        indices.masked_fill_(~valid[:, None, None], -1)
+        # Share logical token indices with the next attention, like ordinary DSA.
+        return indices.squeeze(1)
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -138,12 +203,12 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
                     x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                    weights = self._project_npu_indexer_weights(x)
                     weights.record_stream(indexer_weight_stream)
                     weights_event = indexer_weight_stream.record_event()
             else:
                 x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                weights = self._project_npu_indexer_weights(x)
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
@@ -167,12 +232,12 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
                     x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                    weights = self._project_npu_indexer_weights(x)
                     weights.record_stream(indexer_weight_stream)
                     weights_event = indexer_weight_stream.record_event()
             else:
                 x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+                weights = self._project_npu_indexer_weights(x)
 
             q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
@@ -233,6 +298,11 @@ class DSANPUIndexerMixin:
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
+        if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
+            raise NotImplementedError(
+                "NPU DSA with sink/local tokens does not support quantized indexer KV. "
+                "Use --kv-cache-dtype bfloat16; INT8 model weights remain supported."
+            )
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
@@ -288,6 +358,17 @@ class DSANPUIndexerMixin:
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
+        if self.num_init_tokens or self.num_local_tokens:
+            return self._forward_npu_sink_local_indexer(
+                q.view(-1, self.n_heads, self.head_dim),
+                past_key_states,
+                weights,
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                block_table[: actual_seq_lengths_q.numel()]
+                if is_prefill
+                else block_table,
+            )
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
