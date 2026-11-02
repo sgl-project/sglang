@@ -645,8 +645,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
 
 
 def _fused_q_lora_projection(q_lora, q_norm, wq_b, e8m0: bool = False):
-    # gfx1250 skips it: its MXFP8 GEMMs quantize their own input
-    if not _is_gfx95_supported:
+    if _fused_rms_fp8_group_quant is None:
         return None
     q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
         q_lora, q_norm.weight, q_norm.variance_epsilon, e8m0=e8m0
