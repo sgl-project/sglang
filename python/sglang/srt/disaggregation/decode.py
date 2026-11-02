@@ -1057,6 +1057,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return True
         return False
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_prealloc": [decode_req.req for decode_req in self.queue],
+            "decode_retracted": self.retracted_queue,
+            "decode_held": self.held_rebootstrap_reqs,
+        }
+
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
@@ -2834,6 +2841,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        return {
+            "decode_transfer": [decode_req.req for decode_req in self.queue],
+            # Aborted, with KV held until the transfer drains.
+            "decode_releasing": [
+                decode_req.req for decode_req, *_ in self._deferred_releases
+            ],
+        }
+
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
@@ -3523,6 +3539,13 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
+            )
+            if process_last_batch_early:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -3533,13 +3556,6 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
-            # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -3552,7 +3568,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
