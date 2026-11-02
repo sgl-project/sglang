@@ -856,7 +856,7 @@ class Envs:
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
     # Render every tool into the chat template when tool_choice names a function,
     # instead of only the named one. The prompt then keeps the prefix of earlier
-    # turns. Applies only when the request has an output constraint for the tool.
+    # turns. Applies only with xgrammar, and not to every parser or request.
     SGLANG_ENABLE_NAMED_TOOL_CHOICE_KEEP_TOOLS = EnvBool(False)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the

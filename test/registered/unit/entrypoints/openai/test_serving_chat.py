@@ -2534,11 +2534,14 @@ class ServingChatTestCase(CustomTestCase):
             (True, "hermes", "llguidance", False, {}, False),
             # No output constraint for a named tool.
             (True, "hunyuan", "xgrammar", False, {}, False),
-            # The parser reads a call to another tool from the free text after
-            # the forced call.
+            # The parser can read a call to another tool from the forced call's
+            # string value or from the free text after the forced call.
             (True, "deepseekv3", "xgrammar", False, {}, False),
             (True, "inkling", "xgrammar", False, {}, False),
             (True, "llama3", "xgrammar", False, {}, False),
+            (True, "nanbeige", "xgrammar", False, {}, False),
+            (True, "qwen3_coder", "xgrammar", False, {}, False),
+            (True, "step3p5", "xgrammar", False, {}, False),
             (True, "glm47", "xgrammar", False, text_format, True),
             # The output constraint replaces the full-assistant tool grammar.
             (True, "glm47", "xgrammar", False, {"regex": "x"}, False),

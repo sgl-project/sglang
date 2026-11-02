@@ -1945,7 +1945,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
             # Keep every tool in the prompt, so that this turn extends the prefix
-            # of earlier turns, only when the grammar limits output to the named tool.
+            # of earlier turns, only when the grammar limits the first call to the
+            # named tool. Some parsers can still return a later call to another tool.
             if (
                 isinstance(request.tool_choice, ToolChoice)
                 and request.tools
@@ -1961,9 +1962,17 @@ class OpenAIServingChat(OpenAIServingBase):
                         and request.response_format.type != "text"
                     )
                 )
-                # These parsers read a call to another tool from the free text
-                # that their legacy tags allow after the forced call.
-                and self.tool_call_parser not in ("deepseekv3", "inkling", "llama3")
+                # These parsers can read a call to another tool from the forced
+                # call's string value or from the free text after the forced call.
+                and self.tool_call_parser
+                not in (
+                    "deepseekv3",
+                    "inkling",
+                    "llama3",
+                    "nanbeige",
+                    "qwen3_coder",
+                    "step3p5",
+                )
                 # Other backends do not enforce the named call.
                 and self.tokenizer_manager.config_value("grammar_backend") == "xgrammar"
             ):
