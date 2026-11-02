@@ -110,6 +110,8 @@ def _ones(num_experts: int, device: torch.device) -> torch.Tensor:
 
 
 def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
+    if info.mega_gate_maps is not None:
+        return info.mega_gate_maps
     if info.ep_dispatch_algorithm == "static":
         rank_map = info.partial_logical_to_rank_dispatch_physical_map
         return rank_map.to(torch.int32)[:, None], _ones(len(rank_map), rank_map.device)
@@ -201,12 +203,7 @@ def run_mega_gate(
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
-    # The benchmark override writes logical ids, so with EPLB it must run before the remap.
-    in_buffer = (
-        buf is not None
-        and not _captures_routed_experts(moe)
-        and not (dispatch_info is not None and routing_simulation_enabled())
-    )
+    in_buffer = buf is not None and not _captures_routed_experts(moe)
     to_physical_map = logical_count = None
     if in_buffer and dispatch_info is not None:
         # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
@@ -246,6 +243,8 @@ def run_mega_gate(
             weight_scale=(
                 routed_scaling_factor if in_buffer and not fused_in_topk else 1.0
             ),
+            to_physical_map=to_physical_map,
+            logical_count=logical_count,
         )
     if in_buffer:
         get_global_expert_distribution_recorder().on_select_experts(
