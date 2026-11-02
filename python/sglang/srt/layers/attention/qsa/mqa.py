@@ -1,6 +1,7 @@
 """Weight-free TileLang MQA operators for the simple QSA indexer;
 the torch implementations are the fallback and the reference."""
 
+import functools
 import math
 from typing import Optional
 
@@ -108,6 +109,25 @@ def torch_qsa_mqa_decode(
     return logits
 
 
+# TileLang dtype names of the scoring-kernel operands. The logits stay fp32.
+_TILELANG_DTYPES = {
+    torch.bfloat16: "bfloat16",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+
+
+def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+    """The dtype both GEMM operands run in: fp8 only when Q and K already are."""
+    if q.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e4m3fn:
+        if q.dtype != k.dtype:
+            raise ValueError(
+                "QSA fp8 scoring needs Q and the compressed K in the same dtype, "
+                f"got q={q.dtype} k={k.dtype}"
+            )
+        return torch.float8_e4m3fn
+    return torch.bfloat16
+
+
 if HAS_TILELANG:
 
     @tilelang.jit(
@@ -124,21 +144,22 @@ if HAS_TILELANG:
         block_q: int = 32,
         num_stages: int = 3,
         threads: int = 512,
+        dtype: str = "bfloat16",
     ):
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([rows * heads, head_dim], T.bfloat16),  # type: ignore
-            K: T.Tensor([keys, head_dim], T.bfloat16),  # type: ignore
+            Q: T.Tensor([rows * heads, head_dim], dtype),  # type: ignore
+            K: T.Tensor([keys, head_dim], dtype),  # type: ignore
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
         ):
             with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
-                q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
-                k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
+                q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
+                k_shared = T.alloc_shared([block_n, head_dim], dtype)
                 scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
                 scores_3d = T.reshape(scores, (block_n, block_q, heads))
                 reduced = T.alloc_fragment([block_n, block_q], T.float32)
@@ -174,6 +195,87 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        }
+    )
+    def _tilelang_qsa_mqa_prefill_relative_kernel(
+        heads: int,
+        head_dim: int,
+        block_n: int = 64,
+        block_q: int = 32,
+        num_stages: int = 3,
+        threads: int = 512,
+        key_splits: int = 1,
+        dtype: str = "bfloat16",
+    ):
+        """The packed prefill kernel with request-relative columns: row r's score
+        for key ``Starts[r] + j`` lands in ``Logits[r, j]``, so the workspace is
+        [rows, longest request] instead of [rows, all keys of the batch]. A
+        second grid dimension splits each row block's key range, which keeps the
+        grid full when few rows are scored."""
+        rows = T.dynamic("rows")
+        keys = T.dynamic("keys")
+        width = T.dynamic("width")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([rows * heads, head_dim], dtype),  # type: ignore
+            K: T.Tensor([keys, head_dim], dtype),  # type: ignore
+            Logits: T.Tensor([rows, width], T.float32),  # type: ignore
+            Starts: T.Tensor([rows], T.int32),  # type: ignore
+            Ends: T.Tensor([rows], T.int32),  # type: ignore
+        ):
+            with T.Kernel(T.ceildiv(rows, block_q), key_splits, threads=threads) as (
+                bx,
+                by,
+            ):
+                q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
+                k_shared = T.alloc_shared([block_n, head_dim], dtype)
+                scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
+                scores_3d = T.reshape(scores, (block_n, block_q, heads))
+                reduced = T.alloc_fragment([block_n, block_q], T.float32)
+                row_base = bx * block_q
+                start_min = T.alloc_var(T.int32)
+                end_max = T.alloc_var(T.int32)
+                start_min = 2147483647
+                end_max = -2147483648
+                for qi in T.serial(block_q):
+                    start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
+                    end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+                num_tiles = T.ceildiv(end_max - start_min, block_n)
+                tiles_per_split = T.ceildiv(num_tiles, key_splits)
+                tile_begin = by * tiles_per_split
+                tile_count = T.max(T.min(num_tiles - tile_begin, tiles_per_split), 0)
+
+                T.copy(Q[row_base * heads, 0], q_shared)
+                for ti in T.Pipelined(tile_count, num_stages=num_stages):
+                    key_base = start_min + (tile_begin + ti) * block_n
+                    T.copy(K[key_base, 0], k_shared)
+                    T.gemm(
+                        k_shared,
+                        q_shared,
+                        scores,
+                        transpose_B=True,
+                        clear_accum=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    for n, qi, head in T.Parallel(block_n, block_q, heads):
+                        scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
+                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+                    for qi, n in T.Parallel(block_q, block_n):
+                        column = key_base + n - Starts[row_base + qi]
+                        # A row block can straddle requests; keep each row to
+                        # its own window.
+                        if column >= 0:
+                            if column < width:
+                                Logits[row_base + qi, column] = reduced[n, qi]
+
+        return kernel
+
     @tilelang.jit
     def _tilelang_qsa_mqa_mask_kernel(threads: int = 512, block_k: int = 4096):
         rows = T.dynamic("rows")
@@ -205,9 +307,10 @@ if HAS_TILELANG:
         heads: int,
         head_dim: int,
         page_size: int = 64,
-        groups_per_cta: int = 1,
-        num_stages: int = 3,
+        ctas_per_row: int = 1,
+        min_scored_len: int = 0,
         threads: int = 128,
+        dtype: str = "bfloat16",
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -221,56 +324,61 @@ if HAS_TILELANG:
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([batch, 1, heads, head_dim], T.bfloat16),  # type: ignore
-            KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
             ContextLens: T.Tensor([batch], T.int32),  # type: ignore
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
             Scale: T.float32,
         ):
-            with T.Kernel(
-                batch,
-                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
-                threads=threads,
-            ) as (bx, group_block):
-                q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)
-                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
+            # A fixed number of CTAs per row strides over that row's groups, so the
+            # grid no longer scales with the page-table width (the max context).
+            with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):
+                q_shared = T.alloc_shared([heads, head_dim], dtype)
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
                 reduced = T.alloc_fragment([GROUP], T.float32)
-                T.copy(Q[bx, 0, :, :], q_shared)
+                context_len = T.alloc_var(T.int32)
                 context_len = ContextLens[bx]
+                num_groups = T.ceildiv(context_len, GROUP)
 
-                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
-                    group = group_block * groups_per_cta + gi
-                    if group * GROUP < context_len:
-                        # TileLang's pipeliner rejects dynamic loops around smem copies;
-                        # unroll at the Python level instead.
-                        for sp in range(sub_pages):
-                            if (group * sub_pages + sp) * page_size < context_len:
-                                T.copy(
-                                    KCache[
-                                        PageTable[bx, group * sub_pages + sp],
-                                        :,
-                                        0,
-                                        :,
-                                    ],
-                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
-                                )
-                        T.gemm(
-                            k_shared,
-                            q_shared,
-                            scores,
-                            transpose_B=True,
-                            clear_accum=True,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
-                        for token, head in T.Parallel(GROUP, heads):
-                            scores[token, head] = T.max(scores[token, head], 0.0)
-                        T.reduce_sum(scores, reduced, dim=1, clear=True)
-                        for token in T.Parallel(GROUP):
-                            position = group * GROUP + token
-                            if position < context_len:
-                                Logits[bx, position] = reduced[token] / Scale
+                # Rows at or below min_scored_len select every block, so their
+                # scores are never read.
+                if context_len > min_scored_len:
+                    T.copy(Q[bx, 0, :, :], q_shared)
+                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
+                        group = step * ctas_per_row + cta
+                        if group < num_groups:
+                            # TileLang's pipeliner rejects dynamic loops around smem
+                            # copies; unroll the sub-pages at the Python level.
+                            for sp in range(sub_pages):
+                                if (group * sub_pages + sp) * page_size < context_len:
+                                    T.copy(
+                                        KCache[
+                                            PageTable[bx, group * sub_pages + sp],
+                                            :,
+                                            0,
+                                            :,
+                                        ],
+                                        k_shared[
+                                            sp * page_size : (sp + 1) * page_size, :
+                                        ],
+                                    )
+                            T.gemm(
+                                k_shared,
+                                q_shared,
+                                scores,
+                                transpose_B=True,
+                                clear_accum=True,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
+                            for token, head in T.Parallel(GROUP, heads):
+                                scores[token, head] = T.max(scores[token, head], 0.0)
+                            T.reduce_sum(scores, reduced, dim=1, clear=True)
+                            for token in T.Parallel(GROUP):
+                                position = group * GROUP + token
+                                if position < context_len:
+                                    Logits[bx, position] = reduced[token] / Scale
 
         return kernel
 
@@ -301,7 +409,8 @@ def tilelang_qsa_mqa_prefill(
     # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
     # doubling the dominant prefill buffer; allocate pre-padded instead.
     logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
-    q_padded = q.to(torch.bfloat16).contiguous()
+    scoring_dtype = _scoring_dtype(q, k)
+    q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
     if padding:
@@ -309,9 +418,14 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
+    )(
         q_padded.reshape(-1, head_dim),
-        k[:, 0].to(torch.bfloat16).contiguous(),
+        k[:, 0].to(scoring_dtype).contiguous(),
         logits,
         starts,
         ends,
@@ -324,6 +438,122 @@ def tilelang_qsa_mqa_prefill(
     return logits
 
 
+# Key-split levels for the relative prefill kernel; few levels bound the
+# TileLang specializations.
+_PREFILL_KEY_SPLIT_LEVELS = (1, 2, 4, 8, 16, 32, 64)
+
+
+def _prefill_key_splits(row_blocks: int, width: int, block_n: int, device) -> int:
+    """Enough key splits for about two CTAs per SM, never more than the tiles."""
+    wanted = -(-2 * _num_sms(device.index or 0) // max(row_blocks, 1))
+    max_useful = max(1, -(-width // block_n))
+    for level in _PREFILL_KEY_SPLIT_LEVELS:
+        if level >= wanted or level >= max_useful:
+            return level
+    return _PREFILL_KEY_SPLIT_LEVELS[-1]
+
+
+def torch_qsa_mqa_prefill_relative(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    width: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Reference for the request-relative layout: ``out[r, j]`` is row r's
+    score for key ``row_starts[r] + j`` for ``j < row_ends[r] - row_starts[r]``,
+    and -inf elsewhere."""
+    full = torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+    columns = row_starts.to(q.device).long().reshape(-1, 1) + torch.arange(
+        width, device=q.device
+    )
+    valid = columns < row_ends.to(q.device).long().reshape(-1, 1)
+    gathered = full.gather(1, columns.clamp(max=max(k.shape[0] - 1, 0)))
+    return gathered.masked_fill(~valid, -float("inf"))
+
+
+def tilelang_qsa_mqa_prefill_relative(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    width: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Packed prefill scoring into request-relative columns.
+
+    Returns fp32 [rows, width] where ``[r, :row_ends[r] - row_starts[r]]`` holds
+    the same values ``tilelang_qsa_mqa_prefill`` puts at
+    ``[r, row_starts[r]:row_ends[r]]``. Columns past a row's length are left
+    undefined: callers must read only each row's own section (the fast top-k
+    reads ``[start, start + length)``). ``width`` must cover the longest row
+    and comes from host lengths, so no device sync is needed to size it."""
+
+    if not HAS_TILELANG:
+        raise RuntimeError("TileLang is unavailable")
+    _validate_q(q)
+    _validate_k(k)
+    rows, keys = q.shape[0], k.shape[0]
+    width = max(int(width), 1)
+    if not rows or not keys:
+        return torch.full(
+            (rows, width), -float("inf"), dtype=torch.float32, device=q.device
+        )
+    heads, head_dim = q.shape[1:]
+    block_q = max(1, 128 // heads)
+    block_n = 64
+    padding = (-rows) % block_q
+    padded_rows = rows + padding
+    logits = torch.empty((padded_rows, width), dtype=torch.float32, device=q.device)
+    scoring_dtype = _scoring_dtype(q, k)
+    q_padded = q.to(scoring_dtype).contiguous()
+    starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
+    ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+    if padding:
+        q_padded = torch.cat([q_padded, q_padded.new_zeros(padding, heads, head_dim)])
+        starts = torch.cat([starts, starts[-1:].expand(padding)])
+        ends = torch.cat([ends, ends[-1:].expand(padding)])
+
+    _tilelang_qsa_mqa_prefill_relative_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_n=block_n,
+        block_q=block_q,
+        key_splits=_prefill_key_splits(
+            padded_rows // block_q, width, block_n, q.device
+        ),
+        dtype=_TILELANG_DTYPES[scoring_dtype],
+    )(
+        q_padded.reshape(-1, head_dim),
+        k[:, 0].to(scoring_dtype).contiguous(),
+        logits,
+        starts,
+        ends,
+    )
+    logits = logits[:rows]
+    logits.div_(score_scale or math.sqrt(head_dim))
+    return logits
+
+
+# CTAs per decode row: few enough levels to bound the TileLang specializations, and
+# a grid of about four waves (at least one CTA per row).
+_DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
+    wanted = -(-4 * _num_sms(device.index or 0) // max(rows, 1))
+    for level in _DECODE_CTAS_PER_ROW_LEVELS:
+        if level >= wanted:
+            return level
+    return _DECODE_CTAS_PER_ROW_LEVELS[-1]
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -331,8 +561,15 @@ def tilelang_qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
-    """Validated TileLang paged decode kernel with weights removed."""
+    """Validated TileLang paged decode kernel with weights removed.
+
+    With ``min_scored_len`` > 0, rows whose context length is at most that are not
+    scored and the logits past each row's context length are left unset: only for
+    a top-k that selects every block of a row that fits k and reads nothing past
+    the length."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -343,12 +580,17 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    logits = torch.full(
-        (q.shape[0], max_model_len),
-        -float("inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if min_scored_len > 0:
+        logits = torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    else:
+        logits = torch.full(
+            (q.shape[0], max_model_len),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
     if not q.shape[0] or not max_model_len:
         return logits
     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
@@ -359,7 +601,8 @@ def tilelang_qsa_mqa_decode(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
     )
-    q_kernel = q.to(torch.bfloat16)
+    scoring_dtype = _scoring_dtype(q, k_cache)
+    q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
             [
@@ -369,10 +612,15 @@ def tilelang_qsa_mqa_decode(
             dim=1,
         )
     _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size
+        heads=kernel_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
+        min_scored_len=min_scored_len,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
     )(
         q_kernel.unsqueeze(1).contiguous(),
-        k_cache.to(torch.bfloat16).contiguous(),
+        k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
@@ -393,6 +641,24 @@ def qsa_mqa_prefill(
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
+def qsa_mqa_prefill_relative(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    width: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Request-relative prefill scoring; see ``tilelang_qsa_mqa_prefill_relative``."""
+    if q.is_cuda and HAS_TILELANG:
+        return tilelang_qsa_mqa_prefill_relative(
+            q, k, row_starts, row_ends, width, score_scale
+        )
+    return torch_qsa_mqa_prefill_relative(
+        q, k, row_starts, row_ends, width, score_scale
+    )
+
+
 def qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -400,10 +666,18 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
@@ -414,8 +688,11 @@ __all__ = [
     "HAS_TILELANG",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
+    "qsa_mqa_prefill_relative",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
+    "tilelang_qsa_mqa_prefill_relative",
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
+    "torch_qsa_mqa_prefill_relative",
 ]

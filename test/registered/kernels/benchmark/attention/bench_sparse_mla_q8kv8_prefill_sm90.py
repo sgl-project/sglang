@@ -7,20 +7,13 @@ import triton
 import triton.testing
 
 from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     sparse_mla_q8kv8_prefill_fwd,
 )
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
-
-try:
-    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
-    HAS_Q16_FLASHMLA = True
-except ImportError:
-    flash_mla_sparse_fwd = None
-    HAS_Q16_FLASHMLA = False
 
 register_cuda_ci(
     est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -49,13 +42,9 @@ else:
     # DeepSeek NSA E2E does not pass a per-head attention sink into sparse MLA, so
     # sink-enabled timings are kernel feature coverage rather than E2E proxy data.
 
-LINE_VALS = ["q8_fp8_jit"]
-LINE_NAMES = ["Q8 FP8 JIT"]
-STYLES = [("blue", "-")]
-if HAS_Q16_FLASHMLA:
-    LINE_VALS.insert(0, "q16_bf16_flashmla")
-    LINE_NAMES.insert(0, "Q16 BF16 FlashMLA")
-    STYLES.insert(0, ("orange", "--"))
+LINE_VALS = ["q16_bf16_flashmla", "q8_fp8_jit"]
+LINE_NAMES = ["Q16 BF16 FlashMLA", "Q8 FP8 JIT"]
+STYLES = [("orange", "--"), ("blue", "-")]
 
 
 def _sm90_available() -> bool:
@@ -123,10 +112,6 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
     s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int, provider: str
 ):
     if provider == "q16_bf16_flashmla":
-        if not HAS_Q16_FLASHMLA:
-            raise RuntimeError(
-                "sgl_kernel.flash_mla.flash_mla_sparse_fwd is not available"
-            )
         q, kv, indices, sm_scale = _make_q16_inputs(s_q, s_kv, h_q, d_qk, topk)
 
         def fn():

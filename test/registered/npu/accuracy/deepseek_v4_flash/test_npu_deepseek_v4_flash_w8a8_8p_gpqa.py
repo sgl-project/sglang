@@ -13,16 +13,18 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
 
+register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
+
 register_npu_ci(
     est_time=3600,
     suite="nightly-acc-16-npu-a3",
     nightly=True,
 )
 
-register_npu_ci(
-    est_time=7200,
-    suite="nightly-acc-16-npu-a3-cann910",
-    nightly=True,
+# Nightly is also PR-triggered, so exclude it by workflow ref; every other caller
+# (local runs, full test) still gets the full run.
+_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
+    "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
@@ -49,7 +51,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FAST_KERNEL": "0",
     # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -83,9 +84,8 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     131072,
     "--max-running-requests",
     192,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
@@ -138,10 +138,11 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
-    accuracy = 0.874
-    datasets = ["gpqa_diamond"]
+    accuracy = 0.93 if _is_pr_pipeline else 0.874
+    datasets = ["gsm8k"] if _is_pr_pipeline else ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
+    limit = 300 if _is_pr_pipeline else 100000
     eval_batch_size = 128
     stream = True
     timeout = 6000

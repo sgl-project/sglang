@@ -17,7 +17,10 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    reject_attn_tp_shard_with_tp_reduce,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -28,7 +31,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
+from sglang.srt.utils import add_prefix, envs, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,20 @@ class CLIPVisionConfig:
         return cls(**filtered)
 
 
+def _run_in_token_blocks(fn, x: torch.Tensor, block: int) -> torch.Tensor:
+    """Apply a token-wise fn over blocks of the token dim (-2) and concatenate.
+
+    A long video yields hundreds of thousands of patch tokens, and the widened
+    intermediate for all of them at once can exceed the memory the KV pool
+    leaves. fn must be per-token (or per aligned token group). Every TP rank sees
+    the same tokens, so collectives inside fn run the same number of times.
+    """
+    n = x.shape[-2]
+    if block <= 0 or n <= block:
+        return fn(x)
+    return torch.cat([fn(x[..., i : i + block, :]) for i in range(0, n, block)], dim=-2)
+
+
 class MiniMaxVLMultiModalProjector(nn.Module):
     def __init__(
         self,
@@ -82,7 +99,16 @@ class MiniMaxVLMultiModalProjector(nn.Module):
         )
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             vision_hidden_size,
@@ -90,8 +116,7 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             bias=multimodal_projector_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         assert projector_hidden_act == "gelu", (
             f"Only gelu activation is supported, got {projector_hidden_act}"
@@ -103,8 +128,7 @@ class MiniMaxVLMultiModalProjector(nn.Module):
             bias=multimodal_projector_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -137,7 +161,16 @@ class MiniMaxVLPatchMerger(nn.Module):
         )
 
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.linear_1 = ColumnParallelLinear(
             text_hidden_size * spatial_merge_size**2,
@@ -145,8 +178,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             bias=patch_merge_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         assert projector_hidden_act == "gelu", (
             f"Only gelu activation is supported, got {projector_hidden_act}"
@@ -158,8 +190,7 @@ class MiniMaxVLPatchMerger(nn.Module):
             bias=patch_merge_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -259,7 +290,16 @@ class CLIPEncoderLayer(nn.Module):
         self.embed_dim = config.hidden_size
         self.use_data_parallel = use_data_parallel
         tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group without attention DP; reduce over the attention-TP group so
+        # attention CP narrower than TP can run it.
+        reject_attn_tp_shard_with_tp_reduce(
+            type(self).__name__,
+            shard_tp_size=tp_size,
+            reduces_over_attn_tp=is_dp_attention_enabled(),
+            multimodal_encoder=True,
+            hint=", or --mm-enable-dp-encoder where the model supports it",
+        )
 
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
@@ -281,8 +321,7 @@ class CLIPEncoderLayer(nn.Module):
             config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.fc1",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
         hidden_act = getattr(config, "hidden_act", "gelu")
         assert hidden_act == "gelu", (
@@ -294,11 +333,16 @@ class CLIPEncoderLayer(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp.fc2",
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+    def _mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -323,9 +367,9 @@ class CLIPEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states, _ = self.fc1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states, _ = self.fc2(hidden_states)
+        hidden_states = _run_in_token_blocks(
+            self._mlp, hidden_states, envs.SGLANG_MINIMAX_VIT_TOKEN_BLOCK.get()
+        )
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -770,9 +814,15 @@ class MiniMaxVLVisionModel(nn.Module):
         hidden_states = self.vision_model(pixel_values=pixel_values, grid_thw=grid_thw)
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.squeeze(0)
-        hidden_states = self.multi_modal_projector(hidden_states)
-        hidden_states = self.patch_merge_mlp(hidden_states)
-        return hidden_states
+        # The merger folds each run of spatial_merge_size**2 tokens, so blocks
+        # aligned to that size give identical results.
+        unit = self.spatial_merge_size**2
+        block = envs.SGLANG_MINIMAX_VIT_TOKEN_BLOCK.get() // unit * unit
+        return _run_in_token_blocks(
+            lambda x: self.patch_merge_mlp(self.multi_modal_projector(x)),
+            hidden_states,
+            block,
+        )
 
 
 def _run_vision_tower(
@@ -791,14 +841,21 @@ def _run_vision_tower(
     return vision_tower(pixel_values, grid_thw=grid_thw)
 
 
+def _stack_pixel_values(
+    vision_tower: MiniMaxVLVisionModel, items: List[MultimodalDataItem]
+) -> torch.Tensor:
+    weight = vision_tower.vision_model.embeddings.patch_embedding.weight
+    return torch.cat([item.feature for item in items], dim=0).to(
+        device=weight.device, dtype=vision_tower.dtype
+    )
+
+
 def get_image_feature(
     vision_tower: MiniMaxVLVisionModel,
     items: List[MultimodalDataItem],
     use_data_parallel: bool,
 ) -> torch.Tensor:
-    pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-        vision_tower.dtype
-    )
+    pixel_values = _stack_pixel_values(vision_tower, items)
     image_grid_thw: list[list[int]] = []
     for item in items:
         image_grid_thw.extend(item.image_grid_thw.tolist())
@@ -812,9 +869,7 @@ def get_video_feature(
     items: List[MultimodalDataItem],
     use_data_parallel: bool,
 ) -> torch.Tensor:
-    pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-        vision_tower.dtype
-    )
+    pixel_values = _stack_pixel_values(vision_tower, items)
     video_grid_thw: list[list[int]] = []
     for item in items:
         video_grid_thw.extend(item.video_grid_thw.tolist())

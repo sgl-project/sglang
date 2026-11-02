@@ -110,6 +110,16 @@ def handle_pd_role_switch(
                 safe_to_restore=True,
             )
 
+    if recv_req.prepare_only:
+        # The tokenizer checks every DP worker before allowing any teardown.
+        return PdRoleSwitchReqOutput(
+            success=True,
+            message="ready",
+            old_role=old_role,
+            new_role=new_role,
+            safe_to_restore=True,
+        )
+
     scheduler._pd_role_switch_in_progress = True
     try:
         # Teardown + role flip + rebuild are one logical atomic step. If any of
@@ -237,7 +247,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             if km is not None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue = []
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:
@@ -256,7 +266,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     """Release the prefix (radix/hicache) cache so a flip works with radix ON.
 
-    With radix disabled (ChunkCache) the flip needs nothing here: ChunkCache
+    With radix disabled the flip needs nothing here: the disabled cache
     keeps no persistent prefixes and, since the instance is idle before the
     switch, the allocator is already empty. This is the historical
     ``--disable-radix-cache`` path, left untouched by the guard below.

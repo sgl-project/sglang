@@ -39,7 +39,7 @@ class CacheConfig(msgspec.Struct):
     moe_dp_size: int
     moe_dp_rank: int
     moe_ep_rank: int
-    enable_dp_attention: bool
+    attn_dp_size: int
     enable_dp_lm_head: bool
     attn_cp_size: int
     moe_dense_tp_size: Optional[int]

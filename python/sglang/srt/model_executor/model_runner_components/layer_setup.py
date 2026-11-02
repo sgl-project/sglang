@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import msgspec
 from torch import nn
@@ -130,6 +130,11 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
+    # Global ids of the layers this runner owns; None when the model has no split.
+    swa_attention_layer_ids: Optional[list[int]] = None
+    full_attention_layer_ids: Optional[list[int]] = None
+    # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
+    draft_owns_its_depth: bool = False
 
 
 def resolve_layer_indices(
@@ -137,6 +142,7 @@ def resolve_layer_indices(
     model: Any,
     model_config: ModelConfig,
     is_draft_worker: bool,
+    draft_model_idx: Optional[int] = None,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
     # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -152,10 +158,65 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
+    draft_owns_its_depth = (
+        is_draft_worker
+        and draft_model_idx is not None
+        and getattr(model, "mtp_layer_id_is_depth", False)
+    )
+    owned_layers = (
+        range(draft_model_idx, draft_model_idx + 1)
+        if draft_owns_its_depth
+        else range(pp_range.start_layer, pp_range.end_layer)
+    )
+    swa_attention_layer_ids, full_attention_layer_ids = (
+        _resolve_local_hybrid_swa_layer_ids(
+            model_config=model_config, owned_layers=owned_layers
+        )
+    )
+
     return ModelLayerInfo(
         start_layer=pp_range.start_layer,
         end_layer=pp_range.end_layer,
         num_effective_layers=num_effective_layers,
+        swa_attention_layer_ids=swa_attention_layer_ids,
+        full_attention_layer_ids=full_attention_layer_ids,
+        draft_owns_its_depth=draft_owns_its_depth,
+    )
+
+
+def check_layer_types_hybrid_swa_split(*, model: nn.Module, model_config: ModelConfig):
+    """Fail if `layer_types` put a layer in the KV pool its attention does not use.
+
+    Only a split taken from `layer_types` alone is checked: the model code decides
+    each layer's window, and it may not read `layer_types`.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    swa_layer_ids = set(model_config.swa_attention_layer_ids)
+    misplaced = sorted(
+        module.layer_id
+        for module in model.modules()
+        if isinstance(module, RadixAttention)
+        and (module.layer_id in swa_layer_ids) != (module.sliding_window_size > 0)
+    )
+    if misplaced:
+        raise ValueError(
+            f"{model_config.hf_config.architectures[0]}: layer_types puts layers "
+            f"{misplaced} in the wrong KV pool for the attention the model builds. "
+            "Pass --disable-hybrid-swa-memory to serve it from a single KV pool."
+        )
+
+
+def _resolve_local_hybrid_swa_layer_ids(
+    *,
+    model_config: ModelConfig,
+    owned_layers: range,
+) -> tuple[Optional[list[int]], Optional[list[int]]]:
+    if model_config.swa_attention_layer_ids is None:
+        return None, None
+    return (
+        [i for i in model_config.swa_attention_layer_ids if i in owned_layers],
+        [i for i in model_config.full_attention_layer_ids if i in owned_layers],
     )
 
 
@@ -196,32 +257,3 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
         start_layer=getattr(model, "start_layer", 0),
         end_layer=getattr(model, "end_layer", model_num_layers),
     )
-
-
-def adjust_hybrid_swa_layer_ids(
-    *,
-    model_config: ModelConfig,
-    start_layer: int,
-    end_layer: int,
-    is_hybrid_swa: bool,
-) -> None:
-    if not is_hybrid_swa:
-        return
-
-    if model_config.is_deepseek_v4_arch:
-        return
-
-    full_attention_layer_ids = [
-        layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "full_attention_layer_ids")
-        and layer_idx in model_config.full_attention_layer_ids
-    ]
-    swa_attention_layer_ids = [
-        layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "swa_attention_layer_ids")
-        and layer_idx in model_config.swa_attention_layer_ids
-    ]
-    model_config.swa_attention_layer_ids = swa_attention_layer_ids
-    model_config.full_attention_layer_ids = full_attention_layer_ids

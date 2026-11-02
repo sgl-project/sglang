@@ -72,23 +72,12 @@ class Arg(msgspec.Struct, frozen=True):
     action: Any | None = None
     action_kwargs: dict | None = None
     const: Any | None = None
-    # When True, this field is skipped by add_cli_args_from_dataclass.
-    # Use for fields that have no CLI surface (e.g. injected via Python only).
+    # Skip automatic CLI registration.
     no_cli: bool = False
-    # When True, config resolution (model overrides and post-process passes)
-    # may decide this field: the declaration stash accepts the name, and
-    # `resolution_result` and the config bags answer with the decision. The
-    # field keeps what the operator passed.
+    # Allow resolution passes to declare a value for this field.
     resolvable: bool = False
-    # What the field means when nobody said anything -- the bottom of the read
-    # chain: override, decision, input, then this. Not the dataclass default,
-    # which stays `None` because that is how the record spells "not typed".
-    # `None` here means the field declares no fallback, which is the same
-    # answer the read chain gives without one.
-    #
-    # Only a value fixed for the life of the configuration belongs here. One
-    # that depends on the machine, on another field, or on anything impure is a
-    # decision, and decisions stay in a hook where their order is visible.
+    # Scalar fallback when neither resolution nor input supplies a value.
+    # Machine- or config-dependent defaults belong in resolution hooks.
     fallback: Any = None
 
 
@@ -112,44 +101,25 @@ class Derived(msgspec.Struct, frozen=True):
 
 
 class NS(msgspec.Struct, frozen=True):
-    """Namespace-path marker for a ServerArgs field, attached alongside the
-    field's metadata in ``Annotated``:
+    """Per-field namespace marker for records spanning multiple namespaces.
 
-        field: A[int, "help", NS("parallel")] = 1
-        field: A[str, Arg(help="…"), NS("exec.moe")] = "auto"
-
-    ``ServerArgs`` no longer uses it: its fields are declared in the
-    ``arg_groups/fields/`` classes, each of which carries the ``_NS_PATH`` it
-    stands for, so the module a declaration lives in *is* its namespace. What
-    is left for this marker is the case a class cannot express -- one ad-hoc
-    dataclass whose fields span several namespaces, which is what the
-    config-bag tests build."""
+    Example: ``field: A[int, "help", NS("parallel")] = 1``.
+    ServerArgs instead collects each namespace class's ``_NS_PATH``.
+    """
 
     path: str
 
 
 @functools.cache
 def namespace_of(cls) -> dict:
-    """``{field_name: dotted namespace path}``, read from the declaring class.
+    """Return ``{field: namespace}`` from collected metadata, class paths, or NS markers.
 
-    A field's namespace is where it is declared: each class in
-    ``arg_groups/fields/`` carries the ``_NS_PATH`` it stands for, and
-    ``ServerArgs`` composes them. Walking the MRO therefore answers "which
-    namespace owns this field" without a per-field marker -- the file the
-    declaration sits in is the marker.
-
-    A class that is not built that way -- an ad-hoc dataclass spanning several
-    namespaces, which is what the config-bag tests construct -- falls back to
-    the per-field ``NS`` marker. A field with neither is absent from the map
-    (the coverage lint flags them). Non-dataclass types yield an empty map.
+    Unmarked fields are omitted; non-record types yield an empty map.
     """
     if not is_record(cls):
         return {}
-    # An assembled record: the collector recorded who declared each field,
-    # because there are no base classes left to ask.
     out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
-    # A class that still inherits its namespaces: nearest declaration wins, so
-    # walk the MRO front to back and keep the first answer.
+    # Nearest namespace declaration wins.
     for base in cls.__mro__:
         path = base.__dict__.get("_NS_PATH")
         if path is None:
@@ -199,12 +169,7 @@ def resolvable_fields(cls) -> frozenset:
 
 @functools.cache
 def fallbacks_of(cls) -> dict:
-    """``{field_name: value}`` for every field of ``cls`` that declares one.
-
-    Read the same way `resolvable_fields` reads its flag, so a fallback lives
-    beside the help text of the field it belongs to rather than in whatever
-    hook used to fill it in.
-    """
+    """Return declared scalar fallbacks for fields whose input default is None."""
     if not is_record(cls):
         return {}
     hints = get_type_hints(cls, include_extras=True)
@@ -212,11 +177,7 @@ def fallbacks_of(cls) -> dict:
     for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.fallback is not None:
-            # Two things `with_fallback` relies on and cannot check itself,
-            # asserted where a new declaration passes through. This function is
-            # cached, so a mutable fallback would hand one shared object to
-            # every reader; and a field whose dataclass default is not `None`
-            # can never reach the fallback, which makes the declaration dead.
+            # Reject shared mutable fallbacks and defaults that make the fallback unreachable.
             assert not isinstance(arg.fallback, (list, dict, set)), (
                 f"{cls.__name__}.{field.name}: a mutable fallback would be "
                 "shared by every reader -- use a scalar"
@@ -230,16 +191,10 @@ def fallbacks_of(cls) -> dict:
 
 
 def with_fallback(cls, name: str, value: Any) -> Any:
-    """``value``, or the declared fallback when nothing has answered.
+    """Apply a declared fallback when ``value`` is None.
 
-    `resolution_result` calls this as its last step -- the effective surface,
-    which the config bags and `/server_info` read through. Deliberately not the
-    views a pass reads *while deciding*: `model_overrides/inkling.py` branches
-    on `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
-    would make that branch dead. `test_declared_fallbacks.py` pins both halves.
-
-    A mutable fallback would need copying per read, for the reason a dataclass
-    spells this `default_factory`. Every declared one is a scalar.
+    Used by ``resolution_result``, but not mid-resolution views: handlers must
+    still distinguish unset inputs. Fallbacks must be immutable scalars.
     """
     if value is not None:
         return value
@@ -247,12 +202,7 @@ def with_fallback(cls, name: str, value: Any) -> Any:
 
 
 def record_fields(cls):
-    """The declared fields of a record, Struct or dataclass.
-
-    `ServerArgs` and the namespace classes are `msgspec.Struct`; the config-bag
-    tests build ad-hoc dataclasses spanning namespaces, and the helpers here are
-    driven with both. Anything else yields nothing.
-    """
+    """Return Struct or dataclass fields, or an empty tuple for other types."""
     if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
         return msgspec.structs.fields(cls)
     if dataclasses.is_dataclass(cls):
@@ -326,12 +276,7 @@ def _infer_type_func(tp):
 
 
 def _field_default(field):
-    """Return the default value for a field, or `_MISSING`.
-
-    The two record shapes spell "no default" differently -- a Struct field says
-    `msgspec.NODEFAULT`, a dataclass field `dataclasses.MISSING` -- so both are
-    normalized here and every caller below tests against `_MISSING` alone.
-    """
+    """Return a field default, normalizing Struct and dataclass missing sentinels."""
     absent = (_MISSING, msgspec.NODEFAULT)
     if field.default not in absent:
         return field.default

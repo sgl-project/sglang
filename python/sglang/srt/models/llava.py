@@ -47,7 +47,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.mm_utils import (
     get_anyres_image_grid_shape,
@@ -604,6 +603,9 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # mistral.py subclasses LlavaForConditionalGeneration from this module
+        from sglang.srt.models.mistral import MistralForCausalLM
+
         super().__init__()
 
         self.config = config
@@ -650,7 +652,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     def dtype(self):
         return self.torch_dtype
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
         else:

@@ -98,6 +98,7 @@ class RouterArgs:
     queue_timeout_secs: int = 60
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: Optional[int] = None
+    decode_dispatch_limit: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -397,6 +398,13 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}decode-dispatch-limit",
+            type=int,
+            default=RouterArgs.decode_dispatch_limit,
+            help="Max requests per prefill worker in flight to decode; the rest pick their "
+            "decode worker when sent (PD mode only)",
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",

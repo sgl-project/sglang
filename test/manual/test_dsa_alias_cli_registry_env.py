@@ -1,15 +1,4 @@
-"""
-Manual test for step 01: NSA → DSA user-facing alias layer.
-
-Tests:
-  1. CLI: --dsa-* non-CP canonical flags write to dsa_* attrs
-  2. Registry: "dsa" key creates the backend; "nsa" key triggers DeprecationWarning
-  3. Env: SGLANG_DSA_* canonical vars work
-  4. Env: SGLANG_NSA_* deprecated vars fall back to SGLANG_DSA_* with DeprecationWarning
-
-Run:
-    python test/manual/test_dsa_alias_cli_registry_env.py
-"""
+"""DSA canonical CLI flags, env vars, and the deprecated "nsa" registry key."""
 
 import argparse
 import os
@@ -132,15 +121,13 @@ class TestAttentionRegistry(unittest.TestCase):
 
 
 class TestEnvVarAliases(unittest.TestCase):
-    """SGLANG_DSA_* canonical; SGLANG_NSA_* fall back with DeprecationWarning."""
+    """SGLANG_DSA_* canonical env vars."""
 
     def setUp(self):
         # Clean state for every test
         for key in [
             "SGLANG_DSA_FUSE_TOPK",
-            "SGLANG_NSA_FUSE_TOPK",
             "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
         ]:
             os.environ.pop(key, None)
         # Re-import to reset descriptor state
@@ -156,9 +143,7 @@ class TestEnvVarAliases(unittest.TestCase):
     def tearDown(self):
         for key in [
             "SGLANG_DSA_FUSE_TOPK",
-            "SGLANG_NSA_FUSE_TOPK",
             "SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
-            "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD",
         ]:
             os.environ.pop(key, None)
 
@@ -169,31 +154,10 @@ class TestEnvVarAliases(unittest.TestCase):
         os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
         self.assertFalse(self.envs.SGLANG_DSA_FUSE_TOPK.get())
 
-    def test_nsa_fuse_topk_deprecated_fallback(self):
-        """SGLANG_NSA_FUSE_TOPK=0 should be read by SGLANG_DSA_FUSE_TOPK with DeprecationWarning."""
-        os.environ["SGLANG_NSA_FUSE_TOPK"] = "0"
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            val = self.envs.SGLANG_DSA_FUSE_TOPK.get()
-            self.assertFalse(val)
-            dep = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            self.assertTrue(
-                len(dep) > 0, "Expected DeprecationWarning for SGLANG_NSA_FUSE_TOPK"
-            )
-
     def test_dsa_threshold_default(self):
         self.assertEqual(
             self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get(), 2048
         )
-
-    def test_nsa_threshold_deprecated_fallback(self):
-        os.environ["SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"] = "1024"
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            val = self.envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
-            self.assertEqual(val, 1024)
-            dep = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            self.assertTrue(len(dep) > 0)
 
 
 if __name__ == "__main__":

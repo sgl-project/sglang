@@ -1,20 +1,30 @@
+import gc
+import io
 import sys
 import unittest
 from array import array
 from unittest import mock
 
 import torch
+from PIL import Image
 
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
+    _load_image,
     flatten_arrays_to_int64_tensor,
+    freeze_gc,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -147,6 +157,34 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             subprocess.run = original
 
 
+class TestLoadImage(CustomTestCase):
+    def test_corrupt_image_bytes_raise_value_error(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (10, 120, 200)).save(buf, format="PNG")
+        valid_png = buf.getvalue()
+
+        broken_chunk_png = bytearray(valid_png)
+        idat_pos = broken_chunk_png.index(b"IDAT")
+        broken_chunk_png[idat_pos - 1] -= 6
+
+        img = _load_image(image_bytes=valid_png, gpu_image_decode=False)
+        self.assertEqual(img.size, (16, 16))
+
+        cases = [
+            b"not an image",
+            b"",
+            valid_png[: len(valid_png) // 2],
+            bytes(broken_chunk_png),
+        ]
+        for image_bytes in cases:
+            with self.subTest(length=len(image_bytes)):
+                with self.assertRaisesRegex(ValueError, "Could not decode image"):
+                    _load_image(
+                        image_bytes=image_bytes,
+                        gpu_image_decode=False,
+                    )
+
+
 class _FakePynvml:
     """Records the NVML index it was asked for, so a test can tell which
     physical GPU the helper would have reported."""
@@ -213,6 +251,16 @@ class TestGetDeviceSmViaNvml(CustomTestCase):
         ):
             self.assertIsNone(_get_device_sm_via_nvml())
         self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestFreezeGc(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(gc.set_threshold, *gc.get_threshold())
+        self.addCleanup(gc.unfreeze)
+
+    def test_applies_configured_threshold(self):
+        freeze_gc("test", [700, 10, 1000])
+        self.assertEqual(gc.get_threshold(), (700, 10, 1000))
 
 
 if __name__ == "__main__":

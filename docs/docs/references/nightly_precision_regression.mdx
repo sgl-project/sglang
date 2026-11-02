@@ -100,8 +100,8 @@ A `capture_signature` (SHA-1 hash of schema version, max_tokens, ignore_eos, TP 
 
 The harness pins FlashInfer all-reduce fusion **on** (`--flashinfer-allreduce-fusion-backend trtllm`; the SM90 auto-enable was dropped in #23402). Two names are captured per layer:
 
-- `inputs.1` — hidden states entering the layer. `LayerCommunicator` defers the cross-layer all-reduce, so with fusion active these are rank-local TP-partial sums. CPU-side reduction of them is not the kernel's semantic output and drifts across self-hosted runners, so they are **not** compared. `_assert_fused_tp_layout()` keeps them only as a guard: if they come back replicated, fusion silently fell back and the test fails.
-- `self_attn.inputs.hidden_states` — the value attention consumes after `prepare_attn()`, i.e. post fused all-reduce and residual RMSNorm. This is replicated across ranks and is what the comparator actually diffs.
+- `inputs.1` — hidden states entering the layer. The FFN boundary defers the cross-layer all-reduce, so with fusion active these are rank-local TP-partial sums. CPU-side reduction of them is not the kernel's semantic output and drifts across self-hosted runners, so they are **not** compared. `_assert_fused_tp_layout()` keeps them only as a guard: if they come back replicated, fusion silently fell back and the test fails.
+- `self_attn.inputs.hidden_states` — the value attention consumes after `attn_boundary.prepare()`, i.e. post fused all-reduce and residual RMSNorm. This is replicated across ranks and is what the comparator actually diffs.
 
 This is why a stale baseline captured with fusion *not* initialized is incompatible: it holds replicated layer-entry tensors where the target holds TP-partial ones, which reads as an approximately `tp_size`x mismatch. Fusion initialization failures are tracked in [FlashInfer #3676](https://github.com/flashinfer-ai/flashinfer/issues/3676) and [SGLang #30875](https://github.com/sgl-project/sglang/issues/30875).
 

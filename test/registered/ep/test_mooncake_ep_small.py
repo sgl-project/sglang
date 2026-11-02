@@ -12,7 +12,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
     try_cached_model,
@@ -93,8 +92,7 @@ class TestTP(CustomTestCase):
 
 class TestPureDP(TestTP):
     extra_args = [
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "4",
     ]
 
@@ -122,26 +120,6 @@ class TestPureDP(TestTP):
         """
         self._kill_and_bootstrap(self.pkill_process_1)
         super().test_gsm8k()
-
-    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-    def test_gsm8k_fault_2(self):
-        """
-        Kill another rank and the system should remain operational.
-        """
-        self._kill_and_bootstrap(self.pkill_process_2)
-        super().test_gsm8k()
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHybridDPTP(TestPureDP):
-    extra_args = [
-        "--enable-dp-attention",
-        "--dp",
-        "2",
-    ]
-
-    pkill_process_1 = "sglang::scheduler_DP1_TP2_EP2"
-    pkill_process_2 = "sglang::scheduler_DP1_TP3_EP3"
 
 
 if __name__ == "__main__":

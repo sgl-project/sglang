@@ -18,6 +18,7 @@
 """Inference-only GLM-4.1V model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
@@ -35,6 +36,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv3dLayer
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -48,8 +50,8 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -74,6 +76,18 @@ class Glm4vRMSNorm(RMSNorm):
         return x
 
 
+def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
+    return is_dp_attention_enabled() and not use_data_parallel
+
+
+def _glm4v_vision_parallel_group(use_data_parallel: bool) -> str:
+    if use_data_parallel:
+        return "replicated"
+    if glm4v_vision_reduces_over_attn_tp(use_data_parallel):
+        return "attn_tp"
+    return "tp"
+
+
 class Glm4vVisionMLP(nn.Module):
     def __init__(
         self,
@@ -85,16 +99,14 @@ class Glm4vVisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -102,8 +114,10 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
+            parallel_group=parallel_group,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.act_fn = SiluAndMul()
 
@@ -143,6 +157,9 @@ class Glm4vVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = Glm4vVisionMLP(
             dim,
@@ -236,8 +253,7 @@ class Glm4vPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
-        tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
+        parallel_group = _glm4v_vision_parallel_group(use_data_parallel)
         self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
@@ -252,8 +268,7 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -261,8 +276,10 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+            parallel_group=parallel_group,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.extra_activation_func = nn.GELU()
 
@@ -442,6 +459,9 @@ class Glm4vVisionModel(nn.Module):
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
         )
+        # One-time NHWC-ordered GEMM weight derived from downsample.weight on
+        # first NPU forward; weights are loaded before any forward runs.
+        self._downsample_linear_weight: Optional[torch.Tensor] = None
         self.post_layernorm = Glm4vRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
@@ -508,7 +528,21 @@ class Glm4vVisionModel(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        # Prepare the CPU cumulative lengths once per vision forward: every
+        # ViT block reuses the same list for Ascend FIA instead of copying
+        # cu_seqlens back from the device per block.
+        actual_seq_lengths_cpu = None
+        metadata_max_seqlen = None
+        if is_npu():
+            # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+            cu_seqlens = cu_seqlens.to(device="cpu", dtype=torch.int32)
+            cu_cpu = cu_seqlens.tolist()
+            actual_seq_lengths_cpu = cu_cpu[1:]
+            seqlens = [end - start for start, end in zip(cu_cpu[:-1], cu_cpu[1:])]
+            metadata_max_seqlen = max(seqlens)
+        else:
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
         x = self.embeddings(
             x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
         )
@@ -516,12 +550,11 @@ class Glm4vVisionModel(nn.Module):
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
 
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if is_npu():
-            cu_seqlens = cu_seqlens.to("cpu")
-
         forward_metadata = prepare_vision_attention_metadata(
-            cu_seqlens, device=self.device
+            cu_seqlens,
+            device=self.device,
+            max_seqlen=metadata_max_seqlen,
+            actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         )
 
         # x.shape: (s, b, d) where b=1 for vision processing
@@ -539,8 +572,19 @@ class Glm4vVisionModel(nn.Module):
         # adapter
         x = self.post_layernorm(x)
         x = x.view(-1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1])
-        x = x.permute(0, 3, 1, 2)
-        x = self.downsample(x).view(-1, self.out_hidden_size)
+        if is_npu():
+            # kernel == stride conv is a GEMM over flattened (h, w, c); the
+            # NHWC input is already in that order, so skip the NCHW permute
+            # and layout copy entirely. Equivalent within fp16 rounding to
+            # the Conv2d path (verified against an FP32 reference).
+            weight = self._downsample_linear_weight
+            if weight is None:
+                w = self.downsample.weight
+                weight = w.permute(0, 2, 3, 1).reshape(w.shape[0], -1).contiguous()
+                self._downsample_linear_weight = weight
+            x = F.linear(x.reshape(x.shape[0], -1), weight, self.downsample.bias)
+        else:
+            x = self.downsample(x.permute(0, 3, 1, 2)).view(-1, self.out_hidden_size)
         x = self.merger(x)
 
         return x
@@ -594,9 +638,8 @@ class Glm4vForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in GLM-V, last dim is the same

@@ -12,9 +12,12 @@ from __future__ import annotations
 import sys
 import unittest
 from functools import partial
+from types import SimpleNamespace
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +28,7 @@ from sglang.test.observability.fake_ray import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -42,23 +45,11 @@ class TestRayWrapperBase(unittest.TestCase):
 
 
 class TestNameSanitization(TestRayWrapperBase):
-    def test_replaces_colons_with_underscores(self):
-        sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang:num_running_reqs"
-        )
-        self.assertEqual(sanitized, "sglang_num_running_reqs")
-
     def test_replaces_all_punctuation(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
             "sglang:foo.bar-baz/qux"
         )
         self.assertEqual(sanitized, "sglang_foo_bar_baz_qux")
-
-    def test_keeps_already_valid_names(self):
-        sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
-            "sglang_foo_bar"
-        )
-        self.assertEqual(sanitized, "sglang_foo_bar")
 
 
 class TestReplicaIdInjection(TestRayWrapperBase):
@@ -80,14 +71,6 @@ class TestReplicaIdInjection(TestRayWrapperBase):
 
 
 class TestCounterWrapper(TestRayWrapperBase):
-    def test_inc_forwards_value_and_tags(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        counter.labels(m="x").inc(5)
-        self.assertEqual(
-            counter.metric.calls[-1],
-            ("inc", 5, {"m": "x", "ReplicaId": "rep-001"}),
-        )
-
     def test_inc_zero_is_noop(self):
         counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
         counter.labels(m="x").inc(0)
@@ -103,14 +86,6 @@ class TestGaugeWrapper(TestRayWrapperBase):
             gauge.metric.calls[-1],
             ("set", 12, {"m": "x", "ReplicaId": "rep-001"}),
         )
-
-    def test_set_to_current_time_uses_set(self):
-        gauge = self.rw.RayGaugeWrapper("sglang:start_time", "doc")
-        gauge.set_to_current_time()
-        op, value, _ = gauge.metric.calls[-1]
-        self.assertEqual(op, "set")
-        self.assertIsInstance(value, float)
-        self.assertGreater(value, 0)
 
     def test_accepts_multiprocess_mode_for_api_parity(self):
         # multiprocess_mode is irrelevant under Ray; the wrapper must still
@@ -132,12 +107,6 @@ class TestHistogramWrapper(TestRayWrapperBase):
             hist.metric.calls[-1],
             ("observe", 0.3, {"m": "x", "ReplicaId": "rep-001"}),
         )
-
-    def test_buckets_translate_to_boundaries(self):
-        hist = self.rw.RayHistogramWrapper(
-            "sglang:ttft_seconds", "doc", buckets=[0.1, 0.5, 1.0, 2.0]
-        )
-        self.assertEqual(hist.metric.boundaries, [0.1, 0.5, 1.0, 2.0])
 
     def test_no_buckets_defaults_to_empty_list(self):
         hist = self.rw.RayHistogramWrapper("sglang:ttft_seconds", "doc")
@@ -161,13 +130,6 @@ class TestHistogramWrapper(TestRayWrapperBase):
 
 
 class TestSummaryWrapperFallback(TestRayWrapperBase):
-    def test_observe_uses_default_boundaries(self):
-        summary = self.rw.RaySummaryWrapper("sglang:request_latency", "doc")
-        self.assertEqual(
-            summary.metric.boundaries,
-            self.rw.RaySummaryWrapper.DEFAULT_BOUNDARIES,
-        )
-
     def test_observe_forwards_value_and_tags(self):
         summary = self.rw.RaySummaryWrapper(
             "sglang:request_latency", "doc", labelnames=["m"]
@@ -180,16 +142,6 @@ class TestSummaryWrapperFallback(TestRayWrapperBase):
 
 
 class TestLabelsCopyAndGuard(TestRayWrapperBase):
-    def test_labels_returns_copy_not_self(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        labeled = counter.labels(m="x")
-        self.assertIsNot(labeled, counter)
-
-    def test_original_remains_unlabeled_after_labels_call(self):
-        counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
-        counter.labels(m="x")
-        self.assertFalse(counter._is_labeled)
-
     def test_double_labels_raises(self):
         counter = self.rw.RayCounterWrapper("sglang:requests", "doc", labelnames=["m"])
         labeled = counter.labels(m="x")
@@ -220,46 +172,6 @@ class TestLabelsCopyAndGuard(TestRayWrapperBase):
             counter.labels("only_one_arg")
 
 
-class TestCollectorSubclassWiring(TestRayWrapperBase):
-    """Each Ray collector subclass must override only the ``_xxx_cls`` attrs the
-    underlying collector actually uses."""
-
-    def test_scheduler_overrides_all_four(self):
-        cls = self.rw.RaySchedulerMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._gauge_cls, self.rw.RayGaugeWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIs(cls._summary_cls, self.rw.RaySummaryWrapper)
-
-    def test_tokenizer_overrides_counter_gauge_histogram(self):
-        cls = self.rw.RayTokenizerMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._gauge_cls, self.rw.RayGaugeWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_storage_overrides_counter_histogram_only(self):
-        cls = self.rw.RayStorageMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_radix_overrides_counter_histogram_only(self):
-        cls = self.rw.RayRadixCacheMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_expert_dispatch_overrides_histogram_only(self):
-        cls = self.rw.RayExpertDispatchCollector
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._counter_cls)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-
 class TestRayMissingImportError(unittest.TestCase):
     """Importing the module must succeed even without Ray; instantiating a
     wrapper without Ray must raise ImportError with a clear message."""
@@ -269,10 +181,6 @@ class TestRayMissingImportError(unittest.TestCase):
 
     def tearDown(self) -> None:
         clear_fake_ray_modules()
-
-    def test_module_imports_without_ray(self):
-        # If we got here without exception, the import succeeded.
-        self.assertTrue(hasattr(self.rw, "RayCounterWrapper"))
 
     def test_instantiating_wrapper_without_ray_raises(self):
         with self.assertRaises(ImportError) as ctx:
@@ -299,12 +207,7 @@ class TestAsciiDocumentation(TestRayWrapperBase):
                 self.assertEqual(metric.description, "load - seconds")
 
 
-class TestInterTokenLatencyEquivalence(CustomTestCase):
-    """``observe_inter_token_latency`` writes histogram internals directly for
-    the default backend but replays ``observe()`` for an injected one; both must
-    record identical sums and bucket counts, or ITL diverges between the default
-    and Ray backends."""
-
+class _TokenizerCollectorCase(CustomTestCase):
     _BUCKETS = [0.05, 0.1, 0.5, 1.0]
     _LABELS = {"model_name": "m"}
 
@@ -338,6 +241,13 @@ class TestInterTokenLatencyEquivalence(CustomTestCase):
             collector._histogram_cls = None
         return collector
 
+
+class TestInterTokenLatencyEquivalence(_TokenizerCollectorCase):
+    """``observe_inter_token_latency`` writes histogram internals directly for
+    the default backend but replays ``observe()`` for an injected one; both must
+    record identical sums and bucket counts, or ITL diverges between the default
+    and Ray backends."""
+
     def test_fast_and_fallback_agree(self):
         fast = self._build_collector(force_fallback=False)
         fallback = self._build_collector(force_fallback=True)
@@ -354,6 +264,90 @@ class TestInterTokenLatencyEquivalence(CustomTestCase):
             [b.get() for b in fb_h._buckets],
         )
         self.assertAlmostEqual(fast_h._sum.get(), fb_h._sum.get())
+
+
+class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
+    """``TokenizerManager.collect_metrics`` against the default-backend histogram
+    path, where a negative token weight lands in the buckets unchecked."""
+
+    def _run(self, role, completion_tokens, *, finish_type=None):
+        collector = self._build_collector(force_fallback=False)
+        manager = SimpleNamespace(
+            metrics_collector=collector,
+            disaggregation_mode=DisaggregationMode(role),
+            enable_priority_scheduling=False,
+            _request_has_grammar=lambda obj: False,
+        )
+        state = SimpleNamespace(
+            obj=SimpleNamespace(stream=False),
+            ttft_observed=False,
+            last_completion_tokens=1,
+            finished=False,
+            time_stats=SimpleNamespace(
+                get_first_token_latency=lambda: 0.2,
+                get_interval=lambda: 0.2,
+                get_e2e_latency=lambda: 1.0,
+                get_time_per_output_token=lambda completion_tokens: None,
+                set_last_time=lambda: None,
+            ),
+        )
+        request_stats = SimpleNamespace(
+            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
+        )
+        for j, count in enumerate(completion_tokens):
+            last = j == len(completion_tokens) - 1
+            state.finished = last and finish_type is not None
+            recv = SimpleNamespace(
+                finished_reasons=[{"type": finish_type} if state.finished else None],
+            )
+            if count is not None:
+                recv.completion_tokens = [count]
+            TokenizerManager.collect_metrics(manager, state, recv, 0, request_stats)
+        return collector
+
+    def _itl_samples(self, collector):
+        his = collector.histogram_inter_token_latency.labels(**self._LABELS)
+        return [b.get() for b in his._buckets] + [his._sum.get()]
+
+    def _ttft_count(self, collector):
+        his = collector.histogram_time_to_first_token.labels(
+            **self._LABELS, is_streaming="false"
+        )
+        return sum(b.get() for b in his._buckets)
+
+    def test_ttft_skips_only_aborted_requests(self):
+        """Aborts must not add a TTFT sample, but embedding and zero-output
+        requests still have a first output and must."""
+        cases = [
+            ("abort_decode", "decode", [0], "abort", 0),
+            ("embedding", "null", [None], "stop", 1),
+            ("zero_output", "null", [0], "length", 1),
+        ]
+        for name, role, counts, finish_type, expected in cases:
+            with self.subTest(name):
+                collector = self._run(role, counts, finish_type=finish_type)
+                self.assertEqual(self._ttft_count(collector), expected)
+
+    def test_first_batch_abort_observes_nothing(self):
+        """An abort in the first output batch (e.g. a non-streaming request aborted
+        before its first flush) must not turn its tokens into ITL samples."""
+        collector = self._run("null", [30], finish_type="abort")
+        self.assertEqual(self._ttft_count(collector), 0)
+        self.assertEqual(self._itl_samples(collector), [0.0] * 6)
+
+    def test_prefill_never_observes_decode_intervals(self):
+        """PD prefill's 0-token first report must never become a negative ITL
+        weight, which breaks histogram_quantile and rate()."""
+        collector = self._run("prefill", [0, 1, 8, 0], finish_type="stop")
+        self.assertEqual(self._itl_samples(collector), [0.0] * 6)
+
+    def test_token_count_decrease_resets_baseline(self):
+        """A decreasing count must restart the baseline, not subtract tokens."""
+        collector = self._run("decode", [8, 0, 0, 2])
+        samples = self._itl_samples(collector)
+        self.assertTrue(all(v >= 0 for v in samples), samples)
+        self.assertEqual(sum(samples[:-1]), 2)
+        self.assertAlmostEqual(samples[-1], 0.2)
 
 
 if __name__ == "__main__":

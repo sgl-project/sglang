@@ -9,9 +9,10 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan, FastWan, FLUX, Qwen-Image / Qwen-Image 2.1, LongCat-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, FastH3, VDN-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image / Qwen-Image 2.1 / Qwen-Image 2.1 Turbo, LongCat-Image, Z-Image, Anima, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, FastH3, VDN-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
-  - Ease of use: OpenAI-compatible api, CLI, and python sdk support
+  - Ease of use: OpenAI-compatible api, CLI, python sdk, and a [ComfyUI plugin](apps/ComfyUI_SGLDiffusion/README.md)
+  - [Conditioning reuse](https://docs.sglang.io/docs/sglang-diffusion/caching-acceleration#conditioning-cache): bounded CPU caching for repeated text/image inputs and VAE posteriors, with `--disable-conditioning-cache` to opt out
   - Multi-platform support:
     - NVIDIA GPUs (H100, H200, A100, B200, 4090, 5090)
     - AMD GPUs (MI300X, MI325X, MI355X)
@@ -34,11 +35,10 @@ SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Tr
 
 ## Getting Started
 
-```bash
-uv pip install 'sglang[diffusion]' --prerelease=allow
-```
+Docker is recommended for Linux GPU deployments. Follow the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) to start a container with diffusion dependencies included, or choose pip/uv, source installation, or another platform's setup. Run the examples below inside that environment.
 
-For more installation methods (e.g. pypi, uv, docker, ROCm/AMD, MUSA/Moore Threads), check the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation).
+Video output requires a system `ffmpeg` with the `libx264` encoder on `PATH`. For Ubuntu source or pip installations, install it with `sudo apt-get install ffmpeg`; on macOS, use `brew install ffmpeg`.
+
 
 ## Inference
 
@@ -76,28 +76,6 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A curious raccoon" \
     --save-output
 ```
-
-### Qwen-Image 2.1
-
-The native `QwenImage21Pipeline` supports text-to-image and reference-image
-conditioning with Qwen3-VL, a single-stream block-causal DiT, and the 64-channel
-VAE. Use an authorized checkpoint directory:
-
-```bash
-sglang generate --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
-  --prompt "A capybara reading a book by candlelight" \
-  --height 1024 --width 1024 --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
-```
-
-Add `--image-path /path/to/input.png` for editing. Dimensions must be multiples
-of 32. Full-checkpoint generation and editing have been tested on H200; see the
-[model cookbook](../../../docs/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1.mdx)
-for component requirements and optimization boundaries. Compatible text-to-image
-requests support opt-in dynamic batching with `--batching-max-size 2` when
-serving. Image edits are not merged across requests; use `n` for multiple
-outputs within an edit request. Batching can improve offload throughput, but
-changes floating-point rounding and is not always faster with resident weights.
 
 ### Component residency
 

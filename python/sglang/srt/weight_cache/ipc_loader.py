@@ -261,9 +261,7 @@ class IpcModelLoader(BaseModelLoader):
             attn = getattr(module, "attn", None)
             if conv1d is not None and isinstance(attn, RadixLinearAttention):
                 if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.conv_weights = conv1d.weight.view(
-                        conv1d.weight.size(0), conv1d.weight.size(2)
-                    )
+                    attn.refresh_conv_weights(conv1d.weight)
                     if hasattr(conv1d, "bias") and conv1d.bias is not None:
                         attn.bias = conv1d.bias
                     count += 1
@@ -501,8 +499,6 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.layers.dp_attention import get_moe_cp_size
-
             parallel = get_parallel()
             tp_size = parallel.tp_size
             tp_rank = parallel.tp_rank
@@ -511,11 +507,11 @@ class IpcModelLoader(BaseModelLoader):
             pp_rank = parallel.pp_rank
 
             ep_size = parallel.moe_ep_size
-            moe_dp_size = get_moe_cp_size()
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size = parallel.moe_dp_size
             moe_dp_rank = parallel.moe_dp_rank
             moe_ep_rank = parallel.moe_ep_rank
-
-            dp_size = get_parallel().dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
@@ -530,12 +526,12 @@ class IpcModelLoader(BaseModelLoader):
                 tp_rank=tp_rank,
                 pp_size=pp_size,
                 pp_rank=pp_rank,
-                dp_size=dp_size,
+                dp_size=parallel.dp_size,
                 ep_size=ep_size,
                 moe_dp_size=moe_dp_size,
                 moe_dp_rank=moe_dp_rank,
                 moe_ep_rank=moe_ep_rank,
-                enable_dp_attention=parallel.enable_dp_attention,
+                attn_dp_size=parallel.attn_dp_size,
                 enable_dp_lm_head=parallel.enable_dp_lm_head,
                 attn_cp_size=parallel.attn_cp_size,
                 moe_dense_tp_size=parallel.moe_dense_tp_size,

@@ -14,84 +14,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inference-side helpers for the bidirectional fused GDN path.
-
-Precision knob: env var ``FUSED_GDN_PRECISION`` or ``PRECISION_OVERRIDE``:
-  0=IEEE fp32 dots, 1=TF32, 2=bf16 TC + fp32 state [default], 3=bf16 TC + bf16 state.
-"""
+"""Inference-side helpers for the bidirectional fused GDN path."""
 
 # ruff: noqa: E501
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
-
-# =====================================================================
-#  GPU-adaptive kernel config
-# =====================================================================
-
-
-def _get_kernel_config() -> dict:
-    """Return optimal kernel parameters for the current GPU.
-
-    STATE_FP32 (fp32 state_prev) needs ~128KB SRAM (H100 228KB), vs ~96KB for
-    bf16 state_prev (fits GB10's 101KB).
-    """
-    if not torch.cuda.is_available():
-        return {"BLOCK_S": 64, "num_stages": 1, "num_warps": 4, "STATE_FP32": False}
-    smem = torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
-    state_fp32 = smem >= 150 * 1024  # H100 (228KB) yes, GB10 (101KB) no
-    return {"BLOCK_S": 64, "num_stages": 1, "num_warps": 8, "STATE_FP32": state_fp32}
-
-
-_KCFG = None
-
-
-def _kcfg():
-    global _KCFG
-    if _KCFG is None:
-        _KCFG = _get_kernel_config()
-    return _KCFG
-
-
-# precision=0 → IEEE fp32 dots + fp32 state  (DOT_PRECISION=2, STATE_FP32=1)
-# precision=1 → TF32  dots   + fp32 state    (DOT_PRECISION=1, STATE_FP32=1)
-# precision=2 → bf16  dots   + fp32 state    (DOT_PRECISION=0, STATE_FP32=1) [default]
-# precision=3 → bf16  dots   + bf16 state    (DOT_PRECISION=0, STATE_FP32=0)
-def _precision_params(precision: int) -> tuple:
-    if precision == 0:
-        return 2, True
-    elif precision == 1:
-        return 1, True
-    elif precision == 3:
-        return 0, False
-    else:  # default
-        return 0, True
-
-
-_env_prec = os.environ.get("FUSED_GDN_PRECISION", None)
-PRECISION_OVERRIDE: int | None = int(_env_prec) if _env_prec is not None else None
-
-
-def _resolve_launch_config() -> tuple:
-    """Returns (prec, dot_prec, state_fp32, num_warps).
-
-    Uses ``PRECISION_OVERRIDE`` when set, else ``_kcfg()`` (per-GPU SRAM).
-    num_warps clamped to 4 when dots run on fp32 operands (more registers).
-    """
-    cfg = _kcfg()
-    prec = PRECISION_OVERRIDE if PRECISION_OVERRIDE is not None else 2
-    dot_prec, state_fp32 = _precision_params(prec)
-    if PRECISION_OVERRIDE is None:
-        state_fp32 = cfg["STATE_FP32"]
-    nw = cfg["num_warps"]
-    if dot_prec >= 1:
-        nw = min(nw, 4)
-    return prec, dot_prec, state_fp32, nw
 
 
 def prepare_rope_tables(
