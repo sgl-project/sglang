@@ -1,6 +1,6 @@
 ---
 title: MiMo-V2.6
-description: "Deploy MiMo-V2.6-Flash and Pro with SGLang on NVIDIA H200 and B300 GPUs, using MXFP4 MoE weights, BF16 routing, DFlash decoding, and a 1M-token context window."
+description: "Deploy MiMo-V2.6-Flash and Pro with SGLang on NVIDIA H200 and B300 or AMD MI355X GPUs, using MXFP4 MoE weights, BF16 routing, DFlash decoding, and a 1M-token context window."
 tag: NEW
 ---
 
@@ -48,6 +48,44 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/XiaomiMiMo/mimo-v2.6.jsx";
 
 <Deployment config={config} />
+
+### AMD MI355X
+
+For MiMo-V2.6-Pro on eight MI355X GPUs, use TP8/EP8 with AITER and explicitly
+select INT4 QuickReduce. SGLang does not enable quantized QuickReduce globally,
+so omitting `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` leaves this recipe on its
+unquantized collective path.
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+python -m sglang.launch_server \
+  --model-path XiaomiMiMo/MiMo-V2.6-Pro-RL \
+  --served-model-name mimo-v2.6-pro \
+  --tp 8 \
+  --ep 8 \
+  --moe-runner-backend aiter \
+  --moe-dense-tp-size 1 \
+  --enable-dp-lm-head \
+  --attention-backend aiter \
+  --mm-attention-backend triton_attn \
+  --page-size 1 \
+  --cuda-graph-max-bs-decode 256 \
+  --max-running-requests 256 \
+  --mem-fraction-static 0.7 \
+  --swa-full-tokens-ratio 0.08 \
+  --disable-hybrid-swa-memory \
+  --chunked-prefill-size 32768 \
+  --max-prefill-tokens 65536 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path /path/to/MiMo-V2.6-Pro-RL/dflash \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-attention-backend triton \
+  --reasoning-parser mimo \
+  --tool-call-parser mimo \
+  --trust-remote-code
+```
 
 ## Playground
 
