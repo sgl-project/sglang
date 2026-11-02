@@ -14,8 +14,8 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V4-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-1p1d-16p-in8k-out1k-50ms) |
-| DeepSeek-V4-Flash | Ascend A3 Series Products | 8 | PD Mixed | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in8k-out1k-50ms) |
+| DeepSeek-V4-Flash | A3 Series Products | 16 | PD Disaggregation | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-1p1d-16p-in8k-out1k-50ms) |
+| DeepSeek-V4-Flash | A3 Series Products | 8 | PD Mixed | 8k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v4-flash-w8a8-8p-in8k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -25,7 +25,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: DeepSeek-V4-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -235,7 +235,7 @@ python -m sglang.bench_serving \
 
 **Model**: DeepSeek-V4-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 

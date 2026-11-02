@@ -10,24 +10,31 @@ import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.auxiliary_output import append_auxiliary_output
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
+from sglang.srt.utils.common import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
-    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
+    from sglang.srt.managers.auxiliary_output import (
+        DeviceAuxiliaryOutput,
+        HostAuxiliaryOutput,
+    )
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
         ScheduledRequestMetrics,
@@ -50,6 +57,10 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def is_war_barrier_enabled() -> bool:
+    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
 @dataclasses.dataclass
@@ -125,9 +136,9 @@ class GenerationBatchResult:
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
     # The plan the forward wrote its KV through, when the caller asked for it
-    # (`return_kv_loc_plan`): a speculative worker's own writes into the same
+    # (`return_iteration_ids`): a speculative worker's own writes into the same
     # slots take their ids from it.
-    kv_loc_plan: Optional[KVLocPlan] = None
+    iteration_ids: Optional[IterationIds] = None
 
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
@@ -145,6 +156,7 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -153,6 +165,8 @@ class GenerationBatchResult:
     fpm_timing: Optional[FpmTiming] = None
     fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
+    # ForwardObserver output, copied together with the sampling observer's.
+    forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
     @property
@@ -221,6 +235,7 @@ class GenerationBatchResult:
             sampling_mask_output,
             self.routed_experts_output,
             self.indexer_topk_output,
+            self.kv_weight_version_record,
             self.expert_distribution_metrics,
         ):
             if holder is not None:
@@ -233,10 +248,13 @@ class GenerationBatchResult:
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
             return
-        device_output = self.logits_output.auxiliary_device_output
+        device_output = append_auxiliary_output(
+            self.forward_auxiliary_output, self.logits_output.auxiliary_device_output
+        )
         if device_output is not None:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
             self.logits_output.auxiliary_device_output = None
+            self.forward_auxiliary_output = None
 
     @classmethod
     def from_pp_proxy(

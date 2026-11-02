@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -418,7 +419,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                         rid="r",
                         cache_request_handle=handle,
                         prefix_len=0,
-                        kv=SimpleNamespace(cache_protected_len=0),
+                        kv=ReqKvInfo(cache_protected_len=0),
                     )
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertEqual(req.host_hit_length, 2)
@@ -1167,6 +1168,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
+        host._layer_sharded = False
+        host._draft_device_layer_ids = []
+        host.packed_device_index_buffers = list(device_layers)
         host.device_pool = device_pool
         host.layout = "page_first"
         host.page_size = page_size

@@ -1023,6 +1023,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
+                self.check_cancelled(batch)
                 if sana_wm_diagnostics_enabled() and (
                     step_idx == 0 or step_idx == len(timesteps) - 1
                 ):

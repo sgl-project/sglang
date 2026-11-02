@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MingImageReferenceStage,
     ming_reference_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -201,6 +203,51 @@ def test_ming_norm_and_swiglu_preserve_reference_rounding():
     torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
     gate, up = x.chunk(2, -1)
     torch.testing.assert_close(MingSiluAndMul()(x), F.silu(gate) * up, rtol=0, atol=0)
+
+
+# The fused RMSNorm kernel is CUDA-only; on ROCm MingRMSNorm always takes the
+# native path, so the kernel call this test expects never happens.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or current_platform.is_rocm(),
+    reason="the fused RMSNorm kernel needs CUDA",
+)
+@pytest.mark.parametrize("dim", [128, 3840])
+def test_ming_norm_fusion_replay_and_native_fallback(dim, monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import ming_image
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    gate = BitExactFusionGate("test Ming norm", per_signature=True)
+    monkeypatch.setattr(ming_image, "_MING_RMSNORM_FUSION", gate)
+    norm = MingRMSNorm(dim).to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn_like(norm.weight))
+    kernel = Mock(wraps=ming_image.rmsnorm_cast_before_weight_bitexact)
+    monkeypatch.setattr(ming_image, "rmsnorm_cast_before_weight_bitexact", kernel)
+    assert torch.equal(norm(x), RMSNorm.forward_native(norm, x))
+    assert kernel.call_count == 1 and gate.verified and not gate.disabled
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = norm(x)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    assert torch.equal(output, RMSNorm.forward_native(norm, x))
+    # These arguments are unused by the native path without a residual.
+    kwargs = {"post_residual_addition": x, "quant_linear": object()}
+    assert torch.equal(
+        norm.forward_native(x, **kwargs), RMSNorm.forward_native(norm, x, **kwargs)
+    )
+    fused_calls = kernel.call_count
+    for inputs in (x[:, ::2], x.float()):
+        assert torch.equal(norm(inputs), RMSNorm.forward_native(norm, inputs))
+    residual = torch.randn_like(x)
+    actual = norm(x, residual)
+    expected = RMSNorm.forward_native(norm, x, residual)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    compiled = torch.compile(norm, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(x), RMSNorm.forward_native(norm, x))
+    assert kernel.call_count == fused_calls
 
 
 def test_padding_replacement_keeps_valid_rows_and_registers():

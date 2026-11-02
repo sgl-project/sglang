@@ -750,13 +750,21 @@ def test_bias_residual_add_predicates():
     assert not can_use_bias_residual_add(narrow, bias, torch.randn_like(narrow))
 
 
-# MOSSImage keeps the ATen FP32 mean and rounds before gamma.
+# MOSSImage and Ming-Image keep the ATen FP32 mean and round before gamma.
 @torch.no_grad()
 @pytest.mark.parametrize(
-    "shape", [(1, 6620, 3072), (1, 4109, 24, 128), (2, 65, 3072), (1, 13, 128)]
+    "shape,eps",
+    [
+        ((1, 6620, 3072), 1e-6),
+        ((1, 4109, 24, 128), 1e-6),
+        ((2, 65, 3072), 1e-6),
+        ((1, 13, 128), 1e-6),
+        ((1, 4416, 3840), 1e-5),
+        ((1, 4416, 30, 128), 1e-5),
+    ],
 )
 @pytest.mark.parametrize("varying_exponent", [False, True])
-def test_rmsnorm_cast_before_weight_bitexact(shape, varying_exponent):
+def test_rmsnorm_cast_before_weight_bitexact(shape, eps, varying_exponent):
     from sglang.kernels.ops.diffusion import (
         can_use_rmsnorm_cast_before_weight,
         rmsnorm_cast_before_weight_bitexact,
@@ -770,10 +778,10 @@ def test_rmsnorm_cast_before_weight_bitexact(shape, varying_exponent):
         x = (x.float() * torch.exp2(exponents)).to(x.dtype)
     weight = torch.randn(shape[-1], device=DEVICE, dtype=x.dtype)
     expected = (
-        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
     ).to(x.dtype) * weight
-    assert can_use_rmsnorm_cast_before_weight(device=x.device, dtype=x.dtype)
-    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
+    assert can_use_rmsnorm_cast_before_weight(device=x.device, dtype=x.dtype, eps=eps)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
 
 
 @torch.no_grad()
@@ -828,9 +836,12 @@ def test_rmsnorm_cast_before_weight_guards():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("dim", [128, 256, 3072])
+@pytest.mark.parametrize(
+    "dim,eps",
+    [(128, 1e-6), (256, 1e-6), (3072, 1e-6), (128, 1e-5), (2560, 1e-5), (3840, 1e-5)],
+)
 @pytest.mark.parametrize("rows", [1, 15, 16, 17])
-def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, rows):
+def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, eps, rows):
     from sglang.kernels.ops.diffusion import rmsnorm_cast_before_weight_bitexact
 
     # Nonzero, unaligned storage offsets remain contiguous; the reference
@@ -843,9 +854,9 @@ def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, rows):
         torch.exp2(torch.randint(-12, 12, x.shape, device=DEVICE).float()).to(x.dtype)
     )
     expected = (
-        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
     ).to(x.dtype) * weight
-    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
 
 
 def _moss_image_norm_eager(x, weight):
@@ -856,7 +867,7 @@ def _moss_image_norm_eager(x, weight):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+@pytest.mark.parametrize("epilogue", ["modulate", "rope", "rope_packed"])
 @pytest.mark.parametrize("batch,seq", [(1, 16), (2, 17), (1, 3643)])
 @pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
 def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
@@ -867,7 +878,11 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
 
     torch.manual_seed(0)
     shape = (batch, seq, 3072) if epilogue == "modulate" else (batch, seq, 24, 128)
+    if epilogue == "rope_packed":
+        shape = (batch, seq, 3, 24, 128)
     x = (torch.randn(shape, device="cuda") * amplitude).bfloat16()
+    if epilogue == "rope_packed":
+        x = x[:, :, 1]
     weight = torch.randn(shape[-1], device="cuda", dtype=torch.bfloat16)
     norm = _moss_image_norm_eager(x, weight)
     if epilogue == "modulate":
@@ -936,6 +951,84 @@ def test_moss_image_norm_epilogue_guards(epilogue):
     )
     with pytest.raises(ValueError, match="Unsupported MOSSImage"):
         kernel(x, weight, a, a)
+
+    if epilogue == "rope":
+        packed = torch.randn(4, 17, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
+        for x in (packed[::2, :, 1], packed[:, :, 1, ::2]):
+            a = torch.randn(x.shape[0] * x.shape[1], 128, device="cuda", dtype=x.dtype)
+            with pytest.raises(ValueError, match="Unsupported MOSSImage"):
+                kernel(x, weight, a, a)
+
+
+@torch.no_grad()
+@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
+@pytest.mark.parametrize("shape", [(8256, 56), (37, 14), (2, 9, 3)])
+@pytest.mark.parametrize("varying_exponent", [False, True])
+def test_aten_head_rmsnorm_matches_rocm_rms_norm(shape, varying_exponent):
+    from sglang.kernels.ops.diffusion import (
+        aten_head_rmsnorm,
+        can_use_aten_head_rmsnorm,
+    )
+
+    *tokens, heads = shape
+    # q of a fused qkv projection: a strided view with packed heads
+    qkv = torch.randn(*tokens, 3 * heads * 128, device=DEVICE, dtype=torch.bfloat16)
+    if varying_exponent:
+        exponents = torch.randint(-12, 12, qkv.shape, device=DEVICE).float()
+        qkv = (qkv.float() * torch.exp2(exponents)).to(qkv.dtype)
+    q = qkv[..., : heads * 128].unflatten(-1, (heads, 128))
+    weight = torch.randn(128, device=DEVICE, dtype=q.dtype)
+    assert can_use_aten_head_rmsnorm(q, weight)
+    out = aten_head_rmsnorm(q, weight, 1e-6)
+    assert out.is_contiguous()
+    assert torch.equal(out, F.rms_norm(q, (128,), weight, 1e-6))
+
+
+@torch.no_grad()
+@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
+@pytest.mark.parametrize("rot_dim", [96, 128, 64])
+def test_aten_head_rmsnorm_rope_matches_rms_norm_then_rotary_embedding(rot_dim):
+    from sgl_kernel import rotary_embedding
+
+    from sglang.kernels.ops.diffusion import (
+        aten_head_rmsnorm,
+        can_use_aten_head_rmsnorm_rope,
+    )
+
+    tokens, heads = 1031, 14
+    qkv = torch.randn(tokens, 3 * heads * 128, device=DEVICE, dtype=torch.bfloat16)
+    q = qkv[:, : heads * 128].view(tokens, heads, 128)
+    weight = torch.randn(128, device=DEVICE, dtype=q.dtype)
+    angles = torch.rand(2 * tokens, rot_dim // 2, device=DEVICE) * 100
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(q.dtype)
+    positions = torch.randperm(2 * tokens, device=DEVICE)[:tokens]
+    assert can_use_aten_head_rmsnorm_rope(q, cache, positions)
+    expected = F.rms_norm(q, (128,), weight, 1e-5)
+    key = expected.clone()
+    rotary_embedding(
+        positions, expected.view(tokens, -1), key.view(tokens, -1), 128, cache, True
+    )
+    out = aten_head_rmsnorm(q, weight, 1e-5, cache, positions)
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
+def test_aten_head_rmsnorm_guards():
+    from sglang.kernels.ops.diffusion import can_use_aten_head_rmsnorm
+
+    x = torch.ones(4, 3, 128, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.ones(128, device=DEVICE, dtype=x.dtype)
+    for inputs, gamma in [
+        (x.float(), weight.float()),
+        (x, weight.float()),
+        (x, None),
+        (x.transpose(0, 1), weight),
+        (x[..., ::2], weight[::2]),
+        (x.flatten(0, 1), weight),
+        (x[:0], weight),
+        (x.cpu(), weight.cpu()),
+    ]:
+        assert not can_use_aten_head_rmsnorm(inputs, gamma)
 
 
 if __name__ == "__main__":
