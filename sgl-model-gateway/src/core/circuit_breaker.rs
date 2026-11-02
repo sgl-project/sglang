@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
     time::{Duration, Instant},
 };
 
@@ -113,6 +113,7 @@ pub struct CircuitBreaker {
     last_state_change_ms: AtomicU64,
     config: CircuitBreakerConfig,
     metric_label: String,
+    metrics_retired: AtomicBool,
 }
 
 impl CircuitBreaker {
@@ -135,12 +136,18 @@ impl CircuitBreaker {
             last_state_change_ms: AtomicU64::new(now_ms()),
             config,
             metric_label,
+            metrics_retired: AtomicBool::new(false),
         }
     }
 
     /// Get the metric label
     pub fn metric_label(&self) -> &str {
         &self.metric_label
+    }
+
+    /// Stop publishing gauges for this breaker (its worker was removed)
+    pub fn retire_metrics(&self) {
+        self.metrics_retired.store(true, Ordering::Release);
     }
 
     /// Check if a request can be executed (lock-free hot path)
@@ -189,7 +196,9 @@ impl CircuitBreaker {
 
                     info!("Circuit breaker state transition: open -> half_open");
                     Metrics::record_worker_cb_transition(&self.metric_label, "open", "half_open");
-                    Metrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
+                    if !self.metrics_retired.load(Ordering::Acquire) {
+                        Metrics::set_worker_cb_state(&self.metric_label, STATE_HALF_OPEN);
+                    }
                     self.publish_gauge_metrics();
                     return CircuitState::HalfOpen;
                 }
@@ -285,7 +294,9 @@ impl CircuitBreaker {
             let to = new_state.as_str();
             info!("Circuit breaker state transition: {} -> {}", from, to);
             Metrics::record_worker_cb_transition(&self.metric_label, from, to);
-            Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
+            if !self.metrics_retired.load(Ordering::Acquire) {
+                Metrics::set_worker_cb_state(&self.metric_label, new_state.to_int());
+            }
             self.publish_gauge_metrics();
         }
     }
@@ -374,6 +385,9 @@ impl CircuitBreaker {
     }
 
     fn publish_gauge_metrics(&self) {
+        if self.metrics_retired.load(Ordering::Acquire) {
+            return;
+        }
         Metrics::set_worker_cb_consecutive_failures(
             &self.metric_label,
             self.consecutive_failures(),
@@ -399,6 +413,7 @@ impl Clone for CircuitBreaker {
             last_state_change_ms: AtomicU64::new(self.last_state_change_ms.load(Ordering::Acquire)),
             config: self.config.clone(),
             metric_label: self.metric_label.clone(),
+            metrics_retired: AtomicBool::new(self.metrics_retired.load(Ordering::Acquire)),
         }
     }
 }
