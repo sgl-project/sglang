@@ -46,6 +46,10 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
     should_run_explicit_client_warmup,
 )
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    DiffusionRuntimeError,
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
@@ -119,6 +123,7 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
+        self._runtime_error: str | None = None
 
     @classmethod
     def from_pretrained(
@@ -206,7 +211,9 @@ class DiffGenerator:
         if not should_run_explicit_client_warmup(self.server_args):
             return
 
-        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
+        run_sync_client_warmup(
+            self.server_args, self._send_to_scheduler_and_wait_for_response
+        )
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""
@@ -248,8 +255,11 @@ class DiffGenerator:
 
         Returns one GenerationResult per final sample, including each layer
         of a layered image. Returns a single result without a list wrapper,
-        or None when every request failed.
+        or None when every request failed with a recoverable error. Raises
+        DiffusionRuntimeError when a device failure or a dead local worker
+        requires recreating the generator.
         """
+        self._raise_if_unavailable()
         # 1. prepare requests
         prompts = self._resolve_prompts(
             sampling_params_kwargs.get("prompt"),
@@ -319,7 +329,7 @@ class DiffGenerator:
         total_start_time = time.perf_counter()
         global_output_index = 0
 
-        for requests in request_groups:
+        for group_index, requests in enumerate(request_groups):
             output_requests = []
             try:
                 output_requests = map_request_outputs(requests)
@@ -450,20 +460,18 @@ class DiffGenerator:
                                     output_file_path=output_file_path,
                                 )
                             )
+            except DiffusionRuntimeError:
+                self._cleanup_video_request_groups(request_groups[group_index + 1 :])
+                raise
             except Exception as e:
+                if is_unrecoverable_device_error(e):
+                    self._cleanup_video_request_groups(
+                        request_groups[group_index + 1 :]
+                    )
+                    self._fail_runtime(e)
                 logger.error("Generation failed: %s", e, exc_info=True)
             finally:
-                if requests and requests[0].data_type == DataType.VIDEO:
-                    try:
-                        # Pre-queue resources are shared by the shallow
-                        # per-output Req copies, so one idempotent cleanup is
-                        # sufficient for the whole parent request.
-                        requests[0].sampling_params.cleanup_video_request(requests[0])
-                    except Exception:
-                        logger.warning(
-                            "Failed to clean up model-owned video request resources",
-                            exc_info=True,
-                        )
+                self._cleanup_video_request_groups([requests])
                 global_output_index += len(output_requests)
 
         total_gen_time = time.perf_counter() - total_start_time
@@ -478,6 +486,19 @@ class DiffGenerator:
         if not results:
             return None
         return results[0] if len(results) == 1 else results
+
+    @staticmethod
+    def _cleanup_video_request_groups(request_groups: list[list[Req]]) -> None:
+        for requests in request_groups:
+            if requests and requests[0].data_type == DataType.VIDEO:
+                try:
+                    # Expanded outputs share the parent's pre-queue resources.
+                    requests[0].sampling_params.cleanup_video_request(requests[0])
+                except Exception:
+                    logger.warning(
+                        "Failed to clean up model-owned video request resources",
+                        exc_info=True,
+                    )
 
     def generate_action(
         self,
@@ -595,15 +616,59 @@ class DiffGenerator:
                 f"Expected {request_count} outputs, got {output_count} from scheduler"
             )
 
-    def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
-        """
-        Sends a request to the scheduler and waits for a response.
-        """
-        return sync_scheduler_client.forward(batch)
+    def _send_to_scheduler_and_wait_for_response(
+        self, batch: Any, *, replica: int | None = None
+    ) -> OutputBatch:
+        """Send a request without reusing a failed inference runtime."""
+        self._raise_if_unavailable()
+        forward_kwargs = {"replica": replica} if replica is not None else {}
+        try:
+            if self.local_scheduler_process:
+                self._check_worker_health()
+                output_batch = sync_scheduler_client.forward(
+                    batch,
+                    check_worker_health=self._check_worker_health,
+                    **forward_kwargs,
+                )
+            else:
+                output_batch = sync_scheduler_client.forward(batch, **forward_kwargs)
+            if output_batch.error and is_unrecoverable_device_error(output_batch.error):
+                raise DiffusionRuntimeError(output_batch.error)
+            return output_batch
+        except Exception as error:
+            if isinstance(
+                error, DiffusionRuntimeError
+            ) or is_unrecoverable_device_error(error):
+                self._fail_runtime(error)
+            raise
+
+    def _raise_if_unavailable(self) -> None:
+        error = getattr(self, "_runtime_error", None)
+        if error is not None:
+            raise DiffusionRuntimeError(error)
+
+    def _check_worker_health(self) -> None:
+        for process in self.local_scheduler_process or ():
+            if not process.is_alive():
+                raise DiffusionRuntimeError(
+                    f"Local diffusion worker {process.name} (pid={process.pid}) "
+                    f"exited with code {process.exitcode}; recreate the generator."
+                )
+
+    def _fail_runtime(self, error: BaseException) -> None:
+        self._runtime_error = str(error)
+        logger.error("Inference runtime failed; recreate the generator: %s", error)
+        try:
+            # Do not send ShutdownReq to a worker that cannot answer. This also
+            # only terminates processes owned by a local-mode generator.
+            self._force_shutdown_local_processes()
+        except Exception:
+            logger.exception("Failed to clean up the failed inference runtime")
+        raise DiffusionRuntimeError(self._runtime_error) from error
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
-        response = sync_scheduler_client.forward(req)
+        response = self._send_to_scheduler_and_wait_for_response(req)
         if response.error is None:
             logger.info(success_msg)
             return response

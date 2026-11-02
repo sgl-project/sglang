@@ -147,6 +147,11 @@ class VisionAttentionMetadata:
     seq_lens: torch.Tensor
     max_seqlen: int
 
+    # Cumulative sequence ends for Ascend FIA; excludes the leading zero.
+    # Read-only by convention; prepared once per vision forward on the CPU
+    # so per-block NPU->CPU copies of the same metadata can be skipped.
+    actual_seq_lengths_cpu: Optional[list[int]] = None
+
     # flashinfer_cudnn specific (optional)
     packed_indptrs: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
@@ -158,6 +163,7 @@ def prepare_vision_attention_metadata(
     device: torch.device,
     *,
     max_seqlen: Optional[int] = None,
+    actual_seq_lengths_cpu: Optional[list[int]] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -172,6 +178,7 @@ def prepare_vision_attention_metadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
+        actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
@@ -922,9 +929,14 @@ class VisionAscendAttention(nn.Module):
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
-            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = cu[1:].to(torch.int32)
+            if forward_metadata.actual_seq_lengths_cpu is not None:
+                # Prepared once per vision forward on the CPU; reuse it in
+                # every block instead of copying cu_seqlens back per block.
+                seq_len_arg = forward_metadata.actual_seq_lengths_cpu
+            else:
+                cu = forward_metadata.cu_seqlens.to("cpu")
+                seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -940,7 +952,8 @@ class VisionAscendAttention(nn.Module):
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        seq_len_arg = seq_len_arg.tolist()
+        if isinstance(seq_len_arg, torch.Tensor):
+            seq_len_arg = seq_len_arg.tolist()
 
         total_tokens = int(seq_len_arg[-1])
 
