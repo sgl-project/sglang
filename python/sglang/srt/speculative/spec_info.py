@@ -52,6 +52,8 @@ class SpeculativeAlgorithm(Enum):
         if name is None:
             return cls.NONE
         upper = name.upper()
+        if upper == "DSPINE":
+            return cls.DFLASH
         try:
             return cls[upper]
         except KeyError:
@@ -310,7 +312,6 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-
         cfg = resolving_view(server_args)
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
