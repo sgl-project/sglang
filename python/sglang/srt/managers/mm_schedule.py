@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -9,7 +10,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
@@ -159,6 +160,40 @@ DataEmbeddingFunc = Callable[
 ]
 
 
+class PrefetchedEmbeddingFunc(ABC):
+    """A ``DataEmbeddingFunc`` that already holds some items' embeddings.
+
+    The per-image paths take a held embedding in place of a vision pass.
+    """
+
+    @abstractmethod
+    def __call__(
+        self, items: List[MultimodalDataItem]
+    ) -> torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult:
+        """Encode ``items`` that hold no embedding."""
+
+    @abstractmethod
+    def has_prefetched(self) -> bool:
+        """Whether any embedding is held; lets the lookups below be skipped."""
+
+    @abstractmethod
+    def prefetched(
+        self, item_hash: Optional[int], token_count: int
+    ) -> Optional[torch.Tensor]:
+        """The held ``[token_count, hidden]`` embedding of an item, or None."""
+
+
+def _prefetched_source(
+    data_embedding_func: DataEmbeddingFunc,
+) -> Optional[PrefetchedEmbeddingFunc]:
+    if (
+        isinstance(data_embedding_func, PrefetchedEmbeddingFunc)
+        and data_embedding_func.has_prefetched()
+    ):
+        return data_embedding_func
+    return None
+
+
 def _flatten_embedding_result(
     embedding: torch.Tensor | List[torch.Tensor],
 ) -> torch.Tensor:
@@ -243,26 +278,6 @@ def _move_items_to_device(
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def _acknowledge_deferred_cuda_ipc_cache_hits(
-    items: List[MultimodalDataItem],
-) -> None:
-    """Release lazy Kimi IPC slices when a cached embedding skips ViT.
-
-    On an encoder-DP miss, exactly one rank copies an image and acknowledges
-    the full TP group.  On a cache hit no rank copies it, so rank zero performs
-    the equivalent single acknowledgement.  This preserves the fixed-pool
-    lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
-    """
-    parallel = get_parallel()
-    if parallel.attn_tp_rank != 0:
-        return
-    # The pool's recycler counts the whole TP group, so the acknowledgement must
-    # match that count even when an attention subgroup is smaller.
-    consumer_count = max(parallel.tp_size, 1)
-    for item in items:
-        item.acknowledge_deferred_cuda_ipc_feature(consumer_count)
-
-
 def _item_overlap(
     item: MultimodalDataItem, chunk_start: int, chunk_end: int
 ) -> Optional[int]:
@@ -330,8 +345,8 @@ def _get_chunked_embedding_full(
             else embedding
         )
         embedding_cache.set(embedding_items_hash, embedding_per_req)
-    else:
-        _acknowledge_deferred_cuda_ipc_cache_hits(embedding_items_per_req)
+
+    # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
         item = embedding_items_per_req[0]
@@ -384,6 +399,7 @@ def _batch_encode_per_image_misses(
     unique_misses: Dict[Tuple[Optional[int], int], Tuple[MultimodalDataItem, int]] = {}
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
 
+    prefetched = _prefetched_source(data_embedding_func)
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
@@ -400,6 +416,11 @@ def _batch_encode_per_image_misses(
             cache_key = (item.hash, expected_token_count)
             if cache_key in hash_to_embedding:
                 continue
+            if prefetched is not None:
+                early = prefetched.prefetched(item.hash, expected_token_count)
+                if early is not None:
+                    hash_to_embedding[cache_key] = early
+                    continue
             cached = embedding_cache.get_single(item.hash)
             if cached is not None:
                 cached_embedding = cached.embedding
@@ -485,14 +506,19 @@ def _get_chunked_embedding_by_item(
 
     cached_embeddings = {}
     miss_items = []
+    prefetched = _prefetched_source(data_embedding_func)
     for idx, item, expected_token_count in overlapping:
+        if prefetched is not None:
+            early = prefetched.prefetched(item.hash, expected_token_count)
+            if early is not None:
+                cached_embeddings[idx] = early
+                continue
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embedding = cached.embedding
             cached_token_count = _embedding_token_count(cached_embedding)
             if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
-                _acknowledge_deferred_cuda_ipc_cache_hits([item])
             else:
                 _discard_mismatched_cached_embedding(
                     item.hash, expected_token_count, cached_token_count
@@ -594,8 +620,12 @@ def _get_chunked_prefill_embedding(
         if extend_seq_len <= 0:
             continue
 
-        # Skip if all items already prefilled.
-        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+        # Multi-span items (e.g. videos) use the full encoder path below.
+        # Do not encode them for chunks before, after, or between their spans.
+        if not any(
+            end >= extend_prefix_len and start < extend_prefix_len + extend_seq_len
+            for start, end in items_offset
+        ):
             continue
 
         req_info = PerImageRequestInfo(
@@ -672,7 +702,15 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
-    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
+    # placeholder_tensor arrives sorted from embed_mm_inputs. torch.isin
+    # brute-forces only while P < 10 * N**0.145 (P placeholders, N ids); past
+    # that it sorts with unique(), whose count syncs the host. The sorted
+    # lookup never syncs.
+    assert placeholder_tensor.numel() > 0
+    placeholders = placeholder_tensor.to(input_ids.dtype)
+    idx = torch.searchsorted(placeholders, input_ids)
+    idx.clamp_(max=placeholders.numel() - 1)
+    return (placeholders[idx] == input_ids).unsqueeze(-1)
 
 
 def _count_mm_tokens_in_extend(

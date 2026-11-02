@@ -141,6 +141,9 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             device=device,
         )
         capture_batch.max_seq_len_override = max_context_size
+        # capture and replay build at this context length: the explicit size, else the
+        # backend's default limit (DeepSeek-V4.1's captured indexer width)
+        context_limit = backend._graph_metadata_max_seq_len(capture_batch)
         # static view of the live batch: out_cache_loc padded to the bucket with the dummy slot
         static = copy.copy(live)
         static.max_seq_len_override = max_context_size
@@ -152,9 +155,9 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             backend.init_forward_metadata(live)
             eager = backend.forward_metadata
             eager_out = attention(live)
-            if max_context_size is not None:
+            if context_limit is not None:
                 eager = backend._prefill_metadata_for_batch(
-                    live, max_seq_len_override=max_context_size
+                    live, max_seq_len_override=context_limit
                 )
                 backend.forward_metadata = eager
                 backend.init_forward_metadata_in_graph(live)
@@ -165,10 +168,11 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             self.assertIs(backend.forward_metadata, captured)
             pinned = captured.core_attn_metadata.swa_out_cache_loc
             self.assertEqual(tuple(pinned.shape), (self.BUCKET,))
+            # the page table never outgrows req_to_token
+            table_len = min(context_limit or self.BUCKET, backend.req_to_token.shape[1])
             self.assertEqual(
                 captured.core_attn_metadata.page_table.shape[1],
-                ((max_context_size or self.BUCKET) + DSV4_PAGE_SIZE - 1)
-                // DSV4_PAGE_SIZE,
+                (table_len + DSV4_PAGE_SIZE - 1) // DSV4_PAGE_SIZE,
             )
 
             # A segment's store reads the target by address.
@@ -262,9 +266,9 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                     eager2.core_attn_metadata.seq_lens_casual,
                 )
             )
-            if max_context_size is not None:
+            if context_limit is not None:
                 overflow = copy.copy(live2)
-                overflow.seq_lens_cpu = torch.tensor([max_context_size + 1, 40])
+                overflow.seq_lens_cpu = torch.tensor([context_limit + 1, 40])
                 with self.assertRaisesRegex(
                     ValueError, "smaller than the live context"
                 ):

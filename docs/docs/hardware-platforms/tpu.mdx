@@ -1,12 +1,46 @@
 ---
 title: "TPU"
-description: "SGLang supports high-performance TPU inference through the SGLang-JAX backend, which is specifically optimized for Google Cloud TPUs. The JAX-based implementation delivers exceptional throughput and low latency for Large Language Model (LLM) serving workloads on TPU hardware."
+description: "Serve models on Google TPUs with SGLang-TorchTPU for PyTorch or SGL-JAX for JAX."
 ---
-SGLang supports high-performance TPU inference through the SGLang-JAX backend, which is specifically optimized for Google Cloud TPUs. The JAX-based implementation delivers exceptional throughput and low latency for Large Language Model (LLM) serving workloads on TPU hardware.
 
-For TPU-specific issues or feature requests, please visit the [sglang-jax GitHub issues page](https://github.com/sgl-project/sglang-jax/issues).
+SGLang provides two TPU serving backends. Choose the backend that matches your framework and model configuration:
 
-**NOTE:** SGLang TPU support is implemented via the SGLang-JAX backend, a dedicated JAX-based inference engine maintained as a separate repository at [https://github.com/sgl-project/sglang-jax](https://github.com/sgl-project/sglang-jax).
+| Backend | Framework | Hardware scope |
+| --- | --- | --- |
+| [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) | PyTorch through torch_tpu, with Pallas kernels | TPU7x (Ironwood) |
+| [SGL-JAX](https://github.com/sgl-project/sglang-jax) | JAX | TPU v6e and v7 |
+
+Each backend maintains its own runtime, model coverage, and deployment configurations. Select its tab below for details.
+
+<Tabs>
+<Tab title="SGLang-TorchTPU" id="sglang-torchtpu">
+
+## PyTorch serving on TPU
+
+[SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) runs the SGLang serving engine on Google TPUs through torch_tpu and Pallas kernels. You can use PyTorch models with SGLang's OpenAI-compatible serving API, eager execution, and TPU compilation.
+
+Development and testing focus on TPU7x (Ironwood). A single host has four chips and eight TensorCores. Multi-host configurations use tensor and expert parallelism; disaggregated configurations separate prefill and decode across hosts.
+
+## Model coverage
+
+Model integrations include Muse Spark Open, GLM-5.3-Flash, Kimi-K3, DeepSeek-V4-Flash, Qwen3.8-27B, GPT-OSS, and Gemma 4. Coverage ranges from serving recipes to registered accuracy tests; Kimi-K3 currently has a small-model compile test with dummy weights.
+
+
+The backend includes prefix caching, host-memory KV offload, EAGLE3 and DFlash speculative decoding, and prefill/decode disaggregation. Available combinations depend on the model and topology. Check the repository's [support guide](https://github.com/sgl-project/sglang-torchtpu/blob/main/SUPPORT.md) for feature restrictions and experimental capabilities.
+
+## Deployment resources
+
+Follow the [SGLang-TorchTPU getting-started guide](https://github.com/sgl-project/sglang-torchtpu#get-started) for runtime prerequisites, installation, and a first request.
+
+Find model-specific configurations in the repository's [TPU serving recipes](https://github.com/sgl-project/sglang-torchtpu/tree/main/benchmark/tpu/recipe). Run these recipes from the TorchTPU checkout with its matching runtime.
+
+Report PyTorch TPU issues in [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu/issues), including the TPU generation, topology, model, and runtime versions.
+
+</Tab>
+
+<Tab title="SGL-JAX">
+
+This tab covers the JAX backend. Report JAX-specific issues in [sglang-jax](https://github.com/sgl-project/sglang-jax/issues).
 
 ## System Requirements
 
@@ -635,3 +669,6 @@ For contributors who need TPU access for testing:
 - [JAX Documentation](https://jax.readthedocs.io/)
 - [Google Cloud TPU Documentation](https://cloud.google.com/tpu/docs)
 - [SkyPilot Documentation](https://skypilot.readthedocs.io/)
+
+</Tab>
+</Tabs>

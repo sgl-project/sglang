@@ -81,6 +81,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -123,6 +124,7 @@ def _init_process_global_configs() -> None:
     """
     initialize_moe_config()
     initialize_fp8_gemm_config()
+    initialize_bf16_gemm_config()
     initialize_fp4_gemm_config()
 
 
@@ -497,6 +499,7 @@ def extend(reqs, model_runner):
     dummy_tree_cache = TreeCacheNamespace(
         page_size=get_schedule().page_size,
         device=model_runner.device,
+        req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
 

@@ -17,6 +17,7 @@ module collapses to a thin wrapper that delegates to it.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from itertools import chain
 from typing import Any, List, Optional, Sequence, Tuple, Union
@@ -31,6 +32,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.minicpmv import MiniCPMV4_6ForConditionalGeneration
+from sglang.srt.multimodal.cache import (
+    CONTENT_HASH_PREFIX,
+    resolve_multimodal_item_hash,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -127,16 +132,16 @@ def _reshape_by_patch(image: torch.Tensor, patch_size: int) -> torch.Tensor:
     return patches
 
 
-def _flatten_patches(
-    per_item_pv: List[List[torch.Tensor]],
-    per_item_ts: List[List[List[int]]],
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Per-item per-patch -> flat per-patch (source first, slices row-major)."""
-    flat_pv = list(chain.from_iterable(per_item_pv))
-    flat_ts = [
-        torch.tensor(ts, dtype=torch.int32) for ts in chain.from_iterable(per_item_ts)
-    ]
-    return flat_pv, flat_ts
+def _layout_namespace(
+    downsample_mode: str,
+    tgt_size: List[int],
+    media_tgt_sizes: List[List[int]],
+    media_grids: List[List[int]],
+) -> str:
+    # Pixels alone omit the layout: patches of different shape can pack to the
+    # same tensor while their embeddings and M-RoPE positions differ.
+    layout = f"{downsample_mode}|{tgt_size}|{media_tgt_sizes}|{media_grids}"
+    return CONTENT_HASH_PREFIX + hashlib.sha256(layout.encode()).hexdigest()
 
 
 class MiniCPMV4_6ImageProcessor:
@@ -231,6 +236,14 @@ class MiniCPMV4_6ImageProcessor:
                     min_error = error
         return best_grid
 
+    @property
+    def use_vit_merger(self) -> bool:
+        return self.downsample_mode != "4x"
+
+    @property
+    def pad_divisor(self) -> int:
+        return 16 if self.use_vit_merger else 4
+
     def _normalize(self, t: torch.Tensor) -> torch.Tensor:
         t = t * self.rescale_factor
         return (t - self.image_mean.to(t.dtype)) / self.image_std.to(t.dtype)
@@ -305,6 +318,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV4_6ForConditionalGeneration]
     support_dynamic_frame_expansion = False
     gpu_image_decode = False
+    video_image_id = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -353,8 +367,6 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self.slice_start_id = self._token_id(self.slice_start_token)
         self.slice_end_id = self._token_id(self.slice_end_token)
 
-        self.pad_divisor = 16 if downsample_mode != "4x" else 4
-
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.image_token,
             image_token_id=self.image_token_id,
@@ -375,19 +387,20 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self,
         tgt_sizes: List[List[int]],
         grid: List[int],
+        pad_divisor: int,
     ) -> str:
         """``<image>...</image>`` (+ optional ``<slice>...</slice>`` rows) for
         one image or video frame; inner pads are ``_PAD_PLACEHOLDER`` (caller
         swaps back after splicing).
         """
         h0, w0 = tgt_sizes[0]
-        n_src = (h0 * w0) // self.pad_divisor
+        n_src = (h0 * w0) // pad_divisor
         out = self.image_start_token + _PAD_PLACEHOLDER * n_src + self.image_end_token
 
         if len(tgt_sizes) > 1 and grid and grid[0] > 0 and grid[1] > 0:
             grid_y, grid_x = int(grid[0]), int(grid[1])
             h_s, w_s = tgt_sizes[1]
-            n_slice = (h_s * w_s) // self.pad_divisor
+            n_slice = (h_s * w_s) // pad_divisor
             slice_chunk = (
                 self.slice_start_token
                 + _PAD_PLACEHOLDER * n_slice
@@ -401,9 +414,13 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self,
         index: int,
         frames: Sequence[Tuple[List[List[int]], List[int]]],
+        pad_divisor: int,
+        image_id: bool = True,
     ) -> str:
         """One image or one video. Image is a single-frame video."""
-        body = "".join(self._expand_frame(ts, grid) for ts, grid in frames)
+        body = "".join(self._expand_frame(ts, grid, pad_divisor) for ts, grid in frames)
+        if not image_id:
+            return body
         return f"{self.image_id_start_token}{index}{self.image_id_end_token}" + body
 
     async def process_mm_data_async(
@@ -433,19 +450,28 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         images = base.images or []
         videos = base.videos or []
 
+        image_processor = self._image_processor_for(request_obj)
+        pad_divisor = image_processor.pad_divisor
+
         # Image: one "frame" per image. Video: per-frame nesting kept so each
         # frame becomes its own ``<image>...</image>`` block in the expansion.
-        img_per_pv, img_per_ts, img_grids = self._preprocess_images(images)
-        vid_per_pv, vid_per_ts, vid_grids = self._preprocess_videos(videos)
+        img_per_pv, img_per_ts, img_grids = self._preprocess_images(
+            images, image_processor
+        )
+        vid_per_pv, vid_per_ts, vid_grids = self._preprocess_videos(
+            videos, image_processor
+        )
 
         prompt = self._splice_expansions(
             prompt,
             (
-                self._expand_media(i, [(ts, gd)])
+                self._expand_media(i, [(ts, gd)], pad_divisor)
                 for i, (ts, gd) in enumerate(zip(img_per_ts, img_grids))
             ),
             (
-                self._expand_media(i, list(zip(fts, fgd)))
+                self._expand_media(
+                    i, list(zip(fts, fgd)), pad_divisor, self.video_image_id
+                )
                 for i, (fts, fgd) in enumerate(zip(vid_per_ts, vid_grids))
             ),
         )
@@ -462,20 +488,29 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             self._build_items(
                 input_ids_tensor,
                 self.image_token_id,
-                _flatten_patches(img_per_pv, img_per_ts),
+                [
+                    (pvs, tss, [grid])
+                    for pvs, tss, grid in zip(img_per_pv, img_per_ts, img_grids)
+                ],
                 Modality.IMAGE,
+                image_processor,
             )
         )
-        # Video: extra ``per-frame -> per-patch`` nesting; pre-flatten one
-        # level so ``_flatten_patches`` sees the same shape as image.
-        vid_pv_flat = [list(chain.from_iterable(v)) for v in vid_per_pv]
-        vid_ts_flat = [list(chain.from_iterable(v)) for v in vid_per_ts]
+        # Video: one media unit per video, its frames' patches flattened in order.
         mm_items.extend(
             self._build_items(
                 input_ids_tensor,
                 self.video_token_id,
-                _flatten_patches(vid_pv_flat, vid_ts_flat),
+                [
+                    (
+                        list(chain.from_iterable(pvs)),
+                        list(chain.from_iterable(tss)),
+                        grids,
+                    )
+                    for pvs, tss, grids in zip(vid_per_pv, vid_per_ts, vid_grids)
+                ],
                 Modality.VIDEO,
+                image_processor,
             )
         )
 
@@ -483,24 +518,28 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
             mm_items=mm_items,
             input_ids=input_ids,
             im_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
             im_start_id=self.image_start_id,
             im_end_id=self.image_end_id,
             slice_start_id=self.slice_start_id,
             slice_end_id=self.slice_end_id,
         )
 
-    def _preprocess_images(self, images):
+    def _image_processor_for(self, request_obj) -> MiniCPMV4_6ImageProcessor:
+        return self.image_processor
+
+    def _preprocess_images(self, images, image_processor):
         if not images:
             return [], [], []
-        out = self.image_processor.preprocess(images)
+        out = image_processor.preprocess(images)
         return out["pixel_values"], out["tgt_sizes"], out["grids"]
 
-    def _preprocess_videos(self, videos):
+    def _preprocess_videos(self, videos, image_processor):
         per_video_pv: List[List[List[torch.Tensor]]] = []
         per_video_ts: List[List[List[List[int]]]] = []
         per_video_grids: List[List[List[int]]] = []
         for frames in videos:
-            out = self.image_processor.preprocess(list(frames))
+            out = image_processor.preprocess(list(frames))
             per_video_pv.append(out["pixel_values"])
             per_video_ts.append(out["tgt_sizes"])
             per_video_grids.append(out["grids"])
@@ -527,22 +566,33 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
         self,
         input_ids: torch.Tensor,
         pad_token_id: int,
-        flat: Tuple[List[torch.Tensor], List[torch.Tensor]],
+        media: List[Tuple[List[torch.Tensor], List[List[int]], List[List[int]]]],
         modality: Modality,
+        image_processor: MiniCPMV4_6ImageProcessor,
     ) -> List[MultimodalDataItem]:
-        flat_pv, flat_ts = flat
+        """``media``: per image / video, its patches' pixel values, tgt sizes
+        and slice grids (source patch first, slices row-major)."""
+        patches = [
+            (pv, ts, _layout_namespace(image_processor.downsample_mode, ts, tss, grids))
+            for pvs, tss, grids in media
+            for pv, ts in zip(pvs, tss)
+        ]
         runs = self.get_mm_items_offset(input_ids, pad_token_id)
-        if len(runs) != len(flat_pv):
+        if len(runs) != len(patches):
             raise RuntimeError(
                 f"[minicpmv4_6] {modality} pad run / feature count mismatch: "
-                f"{len(runs)} runs vs {len(flat_pv)} patches"
+                f"{len(runs)} runs vs {len(patches)} patches"
             )
         return [
             MultimodalDataItem(
                 feature=[pv],
+                hash=resolve_multimodal_item_hash(feature=[pv], namespace=namespace),
                 offsets=[run],
-                model_specific_data={"tgt_size": [ts]},
+                model_specific_data={
+                    "tgt_size": [torch.tensor(ts, dtype=torch.int32)],
+                    "use_vit_merger": image_processor.use_vit_merger,
+                },
                 modality=modality,
             )
-            for run, pv, ts in zip(runs, flat_pv, flat_ts)
+            for run, (pv, ts, namespace) in zip(runs, patches)
         ]

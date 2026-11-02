@@ -147,6 +147,22 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
+    def test_postprocess_scale_ranges(self):
+        """Out-of-range upscaling/interpolation scales must not reach the kernels."""
+        for field, value in [
+            ("frame_interpolation_scale", 0.0),
+            ("frame_interpolation_scale", math.nan),
+            ("frame_interpolation_scale", 100.0),
+            ("upscaling_scale", 0),
+            ("upscaling_scale", 1000),
+            ("upscaling_scale", True),
+        ]:
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams(**{field: value})
+        SamplingParams(frame_interpolation_scale=0.25, upscaling_scale=1)
+        SamplingParams(frame_interpolation_scale=4.0, upscaling_scale=8)
+
     def test_teacache_and_spectrum_are_mutually_exclusive(self):
         with self.assertRaisesRegex(
             ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
@@ -370,6 +386,17 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
+
+    def test_cli_accepts_url_postprocess_model_paths(self):
+        """URL weights stay supported outside HTTP; only network entry points reject them."""
+        url = "https://example.com/weights.pth"
+        params = SamplingParams(
+            **self._parse_cli_kwargs(
+                ["--upscaling-model-path", url, "--frame-interpolation-model-path", url]
+            )
+        )
+        self.assertEqual(params.upscaling_model_path, url)
+        self.assertEqual(params.frame_interpolation_model_path, url)
 
     def test_get_cli_args_accepts_seed_list(self):
         self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)

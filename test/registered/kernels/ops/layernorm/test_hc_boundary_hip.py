@@ -4,13 +4,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.layernorm.mhc import (
-    _hc_split_sinkhorn_torch,
-    hc_combine,
-    hc_mix_stats_sinkhorn,
-)
+from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_sinkhorn, mhc_combine
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.mhc import hc_split_sinkhorn_torch
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
@@ -35,7 +32,7 @@ def _ref_coefficients(residual, hc_fn, hc_scale, hc_base):
     x = residual.flatten(1).double()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + RMS_EPS)
     mixes = ((x @ hc_fn.double().T) * rsqrt).float().unsqueeze(1)
-    pre, post, comb = _hc_split_sinkhorn_torch(
+    pre, post, comb = hc_split_sinkhorn_torch(
         mixes, hc_scale, hc_base, HC, ITERS, HC_EPS
     )
     return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)
@@ -114,8 +111,8 @@ class TestHcBoundaryFused(CustomTestCase):
                 bool(((ulp <= 1) | near_zero).all()),
                 f"m={m}: {int(((ulp > 1) & ~near_zero).sum())} elements beyond one bf16 ulp",
             )
-            # The collapse of the stored residual, as hc_combine computes it.
-            y_ref = hc_combine(res_out.flatten(1), pre_prev, HC, torch.bfloat16)
+            # The collapse of the stored residual, as mhc_combine computes it.
+            y_ref = mhc_combine(res_out.flatten(1), pre_prev, HC, torch.bfloat16)
             self.assertTrue(torch.equal(y, y_ref))
             # Coefficients of the stored residual against fp64.
             ref = _ref_coefficients(res_out, self.hc_fn, self.hc_scale, self.hc_base)
@@ -127,7 +124,7 @@ class TestHcBoundaryFused(CustomTestCase):
         _, residual, _, _, pre_prev = self._inputs(33, 5)
         res_out, y, pre, post, comb = self._run(None, residual, None, None, pre_prev)
         self.assertIsNone(res_out)
-        y_ref = hc_combine(residual.flatten(1), pre_prev, HC, torch.bfloat16)
+        y_ref = mhc_combine(residual.flatten(1), pre_prev, HC, torch.bfloat16)
         self.assertTrue(torch.equal(y, y_ref))
         ref = _ref_coefficients(residual, self.hc_fn, self.hc_scale, self.hc_base)
         for got, want in zip((pre, post, comb), ref):
@@ -167,7 +164,7 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
             hc_boundary_fused_deferred,
             rmsnorm_with_sinkhorn,
         )
-        from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+        from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
             rmsnorm_fake_quant_fp8,
         )
 

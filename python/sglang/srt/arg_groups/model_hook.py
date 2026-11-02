@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
@@ -308,15 +305,21 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        cuda_graph_config=with_phase(
-                            cfg.cuda_graph_config,
-                            Phase.PREFILL,
-                            backend=Backend.DISABLED,
-                        ),
-                    )
+                    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+                    if not (
+                        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                        and supports_prefill_cp_bcg(server_args)
+                    ):
+                        declare_resolution(
+                            server_args,
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     attn_tp_size = derive_attn_tp_size(
@@ -669,7 +672,7 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
-            # (arg_groups/overrides.py: _exaone_overrides).
+            # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
@@ -677,8 +680,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
             )
     elif model_arch in ["Olmo2ForCausalLM"]:
-        # disable_hybrid_swa_memory + attention backend selection moved to
-        # the override registry (arg_groups/overrides.py: _olmo2_overrides).
+        # The attention backend selection moved to the override registry
+        # (arg_groups/model_overrides/olmo2.py).
 
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
@@ -981,12 +984,21 @@ def handle_model_capability_adjustments(server_args: Any):
     # A Clef checkpoint's joint schema head reads the final hidden state of
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    # also puts the FA backend on its raw K/V path, which skips the KV pool. A
+    # Kev checkpoint's pointer head reads two positions of each question's
+    # prompt and is served the same way.
     if model_config.joint_head_config is not None:
+        name, head = "Clef", "joint schema head"
+        tp_reason = ", since the joint schema head reads full LM head rows"
+    elif model_config.pointer_head is not None:
+        name, head, tp_reason = "Kev", "pointer head", ""
+    else:
+        name = None
+    if name is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
-                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
-                "since the joint schema head reads full LM head rows"
+                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
+                f"{tp_reason}"
             )
         for key, value in (
             ("is_embedding", True),
@@ -1005,7 +1017,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 ),
             )
         logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
+            f"{name} {head} detected: serving /v1/systemone decisions in "
             "embedding mode without radix cache, chunked prefill, or CUDA graphs."
         )
 
@@ -1022,6 +1034,15 @@ def handle_model_capability_adjustments(server_args: Any):
             f"Automatically turn off --chunked-prefill-size as it is not supported for "
             f"{hf_config.model_type}"
         )
+
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_encoder_replay_budget,
+        )
+
+        validate_deepseek_v41_encoder_replay_budget(server_args)
+    elif cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError("--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1")
 
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
@@ -1071,12 +1092,14 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
+    hf_config = model_config_of(server_args).hf_config
+    # V4.1 text-only workers use the standard PD KV transfer path.
+    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = model_config_of(server_args).hf_config.architectures
+    architectures = hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):

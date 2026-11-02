@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
+    get_request_reasoning_in_grammar,
 )
 
 if TYPE_CHECKING:
@@ -138,6 +139,8 @@ class GrammarManager:
         )
         if think_end_ids is not None:
             req.grammar.set_request_think_end_ids(think_end_ids)
+        if get_request_reasoning_in_grammar(req.sampling_params.custom_params):
+            req.grammar.set_reasoning_in_grammar()
         thinking_budget = self._get_request_thinking_budget(req)
         if thinking_budget is not None:
             req.grammar.max_think_tokens = thinking_budget
@@ -168,6 +171,11 @@ class GrammarManager:
                     key = (key_type, req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
+                key = self.grammar_backend.get_request_grammar_key(
+                    key,
+                    input_ids=req.origin_input_ids,
+                    thinking_budget=self._get_request_thinking_budget(req),
+                )
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning
