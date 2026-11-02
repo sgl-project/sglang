@@ -10,17 +10,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 import torch_npu
+from sgl_kernel_npu.operators import dsv4 as dsv4_ops
+from sgl_kernel_npu.operators.dsv4 import NPU_KV_QUANT_PATH
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.utils import (
-    MQSMLA_OP_NAMES,
-    NPU_KV_QUANT_PATH,
-    is_npu_arch35,
-    require_cann_transformer_ops,
-    use_npu_arch35_mqsmla_attn,
-)
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -43,9 +39,11 @@ _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 def _sparse_attn_ops():
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention."""
     if is_npu_arch35():
-        metadata_op, attn_op, _ = require_cann_transformer_ops(*MQSMLA_OP_NAMES)
-        return metadata_op, attn_op
-    return require_cann_transformer_ops("sparse_flash_mla_metadata", "sparse_flash_mla")
+        return (
+            dsv4_ops.mixed_quant_sparse_flash_mla_metadata,
+            dsv4_ops.mixed_quant_sparse_flash_mla,
+        )
+    return dsv4_ops.sparse_flash_mla_metadata, dsv4_ops.sparse_flash_mla
 
 
 def _sparse_attn_kv_quant_kwargs() -> dict:
@@ -170,7 +168,7 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
 @functools.lru_cache(maxsize=1)
 def _loc_pad_value() -> int:
     """Slot-map skip sentinel: mqsmla writers skip -1, legacy writers skip 0."""
-    return -1 if use_npu_arch35_mqsmla_attn() else 0
+    return -1 if is_npu_arch35() else 0
 
 
 class CompressorAscendBackendMixin:
@@ -491,7 +489,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = torch.ops.npu.compressor(
+        cmp_kv = dsv4_ops.compressor(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
@@ -581,7 +579,7 @@ class CompressorAscendBackendMixin:
                 )
             if forward_batch.forward_mode.is_target_verify():
                 # mqsmla pads the slot map with -1; slot 0 is a real slot.
-                valid = loc >= 0 if use_npu_arch35_mqsmla_attn() else loc != 0
+                valid = loc >= 0 if is_npu_arch35() else loc != 0
                 if self.graph_mode:
                     kv_mask = valid.to(kv.dtype).view(
                         valid.shape[0], *([1] * (kv.dim() - 1))
@@ -616,7 +614,7 @@ class CompressorAscendBackendMixin:
                     "leave the indexer KV cache stale."
                 )
             # Fused epilog: fp8 per-token quant with an fp32 scale.
-            require_cann_transformer_ops("indexer_quant_cache")[0](
+            dsv4_ops.indexer_quant_cache(
                 self.token_to_kv_pool.get_compress_buffer(compressor.layer_id, True),
                 self.token_to_kv_pool.get_compress_dequant_scale_buffer(
                     compressor.layer_id, True
@@ -870,14 +868,11 @@ class C4IndexerAscendBackendMixin:
 
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
-        v2_ops = require_cann_transformer_ops(
-            "quant_lightning_indexer", "quant_lightning_indexer_metadata"
-        )
         # v2 takes the compressed K length plus the tail remainder.
         cmp_ratio = int(c4_indexer.compressor.ratio)
         kv_len = fm.actual_seq_lengths_kv.to(torch.int32)
         seqused_k = (kv_len // cmp_ratio).to(torch.int32)
-        topk_idxs, _ = v2_ops[0](
+        topk_idxs, _ = dsv4_ops.quant_lightning_indexer(
             q_quant,
             k,
             weights.to(q_scale.dtype),
@@ -2081,9 +2076,6 @@ class DeepseekV4AscendAttnBackend(
         actual_seq_lengths_kv: torch.Tensor,
     ) -> torch.Tensor:
         """Top-k metadata for the c4 indexer (v2 op)."""
-        v2_ops = require_cann_transformer_ops(
-            "quant_lightning_indexer", "quant_lightning_indexer_metadata"
-        )
         cmp_ratio = 4
         kv_len = actual_seq_lengths_kv.to(torch.int32)
         if actual_seq_lengths_q_pa is not None:
@@ -2095,7 +2087,7 @@ class DeepseekV4AscendAttnBackend(
                     kv_len.cumsum(0).to(torch.int32),
                 ]
             )
-        return v2_ops[1](
+        return dsv4_ops.quant_lightning_indexer_metadata(
             self._dsv4_index_n_heads,
             1,
             self._dsv4_index_head_dim,
