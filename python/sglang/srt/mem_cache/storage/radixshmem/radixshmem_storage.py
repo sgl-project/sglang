@@ -5,6 +5,7 @@ import hashlib
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -267,6 +268,8 @@ class RadixShmemStorage(HiCacheStorage):
         self.init_timeout_s = float(cfg.get("radixshmem_init_timeout_s", 30))
         self.pull_timeout_ms = int(cfg.get("radixshmem_pull_timeout_ms", 30000))
         self.retry_s = float(cfg.get("radixshmem_retry_s", 30))
+        self.copy_threads = max(1, int(cfg.get("radixshmem_copy_threads", 4)))
+        self._copy_pool: Optional[ThreadPoolExecutor] = None
         self.full = radixshmem.ComponentType.FULL
         self.full_mask = int(radixshmem.COMPONENT_MASK_FULL)
         self.components = {
@@ -1024,14 +1027,34 @@ class RadixShmemStorage(HiCacheStorage):
                 continue
             ptrs, sizes = m.host_pool.get_page_buffer_meta(host_indices)
             per = len(ptrs) // n
+            moves = []
             for i, slot in pairs:
                 at = self._data_base + offsets[slot] + base + m.offset
                 for j in range(i * per, (i + 1) * per):
                     if to_slot:
-                        ctypes.memmove(at, ptrs[j], sizes[j])
+                        moves.append((at, ptrs[j], sizes[j]))
                     else:
-                        ctypes.memmove(ptrs[j], at, sizes[j])
+                        moves.append((ptrs[j], at, sizes[j]))
                     at += sizes[j]
+            self._memmove_all(moves)
+
+    def _memmove_all(self, moves: List[Tuple[int, int, int]]) -> None:
+        if self.copy_threads <= 1 or len(moves) < 2:
+            for dst, src, size in moves:
+                ctypes.memmove(dst, src, size)
+            return
+        if self._copy_pool is None:
+            self._copy_pool = ThreadPoolExecutor(
+                self.copy_threads, thread_name_prefix="radixshmem-copy"
+            )
+
+        def run(chunk):
+            for dst, src, size in chunk:
+                ctypes.memmove(dst, src, size)
+
+        k = min(self.copy_threads, len(moves))
+        for future in [self._copy_pool.submit(run, moves[i::k]) for i in range(k)]:
+            future.result()
 
     def _copy_layout(
         self, m: _Pool, base: int, offsets, host_indices, stride, pairs, to_slot
@@ -1266,6 +1289,9 @@ class RadixShmemStorage(HiCacheStorage):
                 logger.exception("radixshmem: recycling deferred slots failed")
         if self.client is not None:
             self.client.close()
+        if self._copy_pool is not None:
+            self._copy_pool.shutdown(wait=True)
+            self._copy_pool = None
         if self._own_groups:
             import torch.distributed as dist
 
