@@ -230,7 +230,10 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
 class TestKDACuteDslVerifySelection(unittest.TestCase):
     def test_cute_verify_gate_admits_sm90_and_sm100_only(self):
-        """Outside the gate, nv_cutedsl verify silently runs Triton instead."""
+        """Outside the gate, nv_cutedsl verify silently runs Triton instead.
+
+        SM90 passes only in CUDA graph capture; its eager verify keeps Triton.
+        """
         heads, dim, steps = 2, 128, 4
         width = heads * dim
         layer = SimpleNamespace(
@@ -272,20 +275,32 @@ class TestKDACuteDslVerifySelection(unittest.TestCase):
             retrieve_parent_token=None,
             replayssm_rawv=None,
         )
-        for capability, admitted in (
-            ((9, 0), True),
-            ((10, 0), True),
-            ((8, 0), False),
-            ((12, 0), False),
+        for capability, capturing, admitted in (
+            ((9, 0), True, True),
+            ((9, 0), False, False),
+            ((10, 0), True, True),
+            ((10, 0), False, True),
+            ((8, 0), True, False),
+            ((12, 0), True, False),
         ):
             with (
-                self.subTest(capability=capability),
+                self.subTest(capability=capability, capturing=capturing),
                 patch(
                     "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
                     return_value=True,
                 ),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend."
+                    "get_is_capture_mode",
+                    return_value=capturing,
+                ),
                 patch("importlib.util.find_spec", return_value=SimpleNamespace()),
-                patch("torch.cuda.get_device_capability", return_value=capability),
+                patch(
+                    "sglang.srt.layers.attention.linear.kda_backend.current_arch",
+                    return_value=SimpleNamespace(
+                        cuda=SimpleNamespace(major=capability[0])
+                    ),
+                ),
             ):
                 self.assertIs(
                     backend._can_run_dspark_cutedsl_mtp(**verify_args), admitted

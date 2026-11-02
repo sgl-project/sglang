@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner import model_capture_mode
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -344,7 +345,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         """nv_cutedsl verify runs the CuTe kernel and matches Triton verify.
 
         A rejected capability gate falls back to Triton silently, so only the
-        dispatch count proves the CuTe kernel ran.
+        dispatch count proves the CuTe kernel ran. It runs in capture mode, as
+        the CUDA graph runner does: SM90 keeps Triton for an eager verify.
         """
         if importlib.util.find_spec("cutlass") is None:
             self.skipTest("nvidia-cutlass-dsl is required")
@@ -369,11 +371,14 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         reference, _, ref_state = self._make_backend(
             initial, slots, 4, fused=False, ring=False
         )
-        with patch.object(
-            KDAAttnBackend,
-            "_run_dspark_cutedsl_mtp",
-            wraps=KDAAttnBackend._run_dspark_cutedsl_mtp,
-        ) as run_cute:
+        with (
+            patch.object(
+                KDAAttnBackend,
+                "_run_dspark_cutedsl_mtp",
+                wraps=KDAAttnBackend._run_dspark_cutedsl_mtp,
+            ) as run_cute,
+            model_capture_mode(),
+        ):
             out_cute = self._verify(cute, layers, batch, rounds[0])
         self.assertEqual(run_cute.call_count, len(layers))
         out_ref = self._verify(reference, layers, batch, rounds[0])
@@ -386,6 +391,14 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             _max_rel_err(cute_state.intermediate_ssm, ref_state.intermediate_ssm),
             _CUTE_MAX_REL_ERR,
         )
+        if torch.cuda.get_device_capability()[0] == 9:
+            with patch.object(
+                KDAAttnBackend,
+                "_run_dspark_cutedsl_mtp",
+                wraps=KDAAttnBackend._run_dspark_cutedsl_mtp,
+            ) as run_eager:
+                self._verify(cute, layers, batch, rounds[1])
+            self.assertEqual(run_eager.call_count, 0)
 
 
 if __name__ == "__main__":
