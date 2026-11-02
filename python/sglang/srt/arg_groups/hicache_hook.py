@@ -260,9 +260,8 @@ def _validate_mha_dcp_hicache(server_args: Any) -> None:
         for backend in (cfg.prefill_attention_backend, cfg.decode_attention_backend)
     ):
         unsupported.append("attention backends other than Triton")
-    auto_fp16 = cfg.kv_cache_dtype == "auto" and cfg.dtype in ("float16", "half")
-    if cfg.kv_cache_dtype != "bf16" and not auto_fp16:
-        unsupported.append("KV dtypes other than bf16 or auto with float16 compute")
+    # Validate the resolved KV dtype in build_kv_host_pool: "auto" can also
+    # depend on the loaded model's quantization config.
     if (cfg.hicache_mem_layout, cfg.hicache_io_backend) not in (
         ("page_first", "kernel"),
         ("page_first_direct", "direct"),
