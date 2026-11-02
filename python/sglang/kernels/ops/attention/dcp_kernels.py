@@ -683,7 +683,6 @@ def dcp_lse_combine_triton(
     recv_lse: torch.Tensor,
     is_lse_base_on_e: bool = True,
     return_lse: bool = False,
-    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Launch the Triton LSE-combine kernel.
 
@@ -693,17 +692,14 @@ def dcp_lse_combine_triton(
         is_lse_base_on_e: True if LSE uses base-e (FlashAttention),
                           False if base-2 (FlashInfer).
         return_lse: If True, also return the combined global LSE.
-        out: Optional [B, H_local, D] destination for the combined output.
 
     Returns:
         (combined_output [B, H_local, D], combined_lse [B, H_local] or None)
     """
     N, B, H_local, D = recv_output.shape
-    if out is None:
-        out = torch.empty(
-            (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
-        )
-    assert out.shape == (B, H_local, D) and out.dtype == recv_output.dtype
+    out = torch.empty(
+        (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
+    )
     out_lse = (
         torch.empty((B, H_local), device=recv_lse.device, dtype=recv_lse.dtype)
         if return_lse

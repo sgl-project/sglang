@@ -1,20 +1,18 @@
-"""Owned DSA DCP route on ROCm: the aiter FP8 asm sparse MLA, the decode
-indexer row split, and the row-chunked prefill a2a.
+"""Owned DSA DCP route on ROCm: the aiter FP8 asm sparse MLA and the decode
+indexer row split.
 
 Covers:
 1. ``build_dcp_csr`` packs exactly the owned slots of the localized page table.
 2. ``asm_sparse_mla_dcp`` matches the Triton owned-count sparse MLA (output, and
-   its natural-log LSE against the Triton base-2 one), a row that owns no slot
-   drops out of the merge, and CSR row slices match.
+   its natural-log LSE against the Triton base-2 one), and a row that owns no
+   slot drops out of the merge.
 3. The AITER fused RoPE + fp8 query row + KV write at this rank's owned locs
    writes what the pool's DCP-widened write does.
 4. A row slice of the packed top-k with ``row_to_batch`` gives the same rows as
    the whole batch, which is what the per-rank decode indexer split relies on.
-5. ``DcpA2aChunkPipeline`` over row chunks equals one ``dcp_a2a_lse_reduce``.
 """
 
 import math
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -144,20 +142,6 @@ def test_asm_sparse_mla_matches_triton(T):
         is_lse_base_on_e=True,
     )
     torch.testing.assert_close(merged, other_out, rtol=0, atol=0)
-
-    # Row chunks of the batch read their slice of the same CSR.
-    lo, hi = T // 3, T
-    out_c, lse_c = asm_sparse_mla_dcp(
-        q8[lo:hi].contiguous(),
-        kv,
-        indptr[lo : hi + 1],
-        indices,
-        sm_scale,
-        KV_LORA_RANK,
-        one,
-    )
-    torch.testing.assert_close(out_c, out[lo:hi], rtol=0, atol=0)
-    torch.testing.assert_close(lse_c, lse[lo:hi], rtol=0, atol=0)
 
 
 def _rope_interleaved(x, cos, sin):
@@ -298,43 +282,6 @@ def test_packed_topk_row_slice_matches_whole_batch(rows):
         pos = torch.topk(scores[r, :n], TOPK).indices
         expect = page_table[r, pos // page_size] * page_size + pos % page_size
         assert set(whole[r].tolist()) == set(expect.int().tolist())
-
-
-def _mock_group(world_size: int):
-    group = MagicMock()
-    group.world_size = world_size
-    group.all_to_all_single = MagicMock(side_effect=lambda out, inp: out.copy_(inp))
-    return group
-
-
-@pytest.mark.parametrize("rows,chunk", [(4096, 1024), (5000, 1250), (300, 128)])
-def test_a2a_chunk_pipeline_matches_reduce(rows, chunk):
-    from sglang.srt.layers.dcp import DcpA2aChunkPipeline, dcp_a2a_lse_reduce
-
-    torch.manual_seed(3)
-    N, D = 2, 256
-    group = _mock_group(N)
-    partial = torch.randn(rows, H, KV_LORA_RANK, device="cuda").bfloat16()
-    lse = torch.randn(rows, H, device="cuda") * 3
-    w_vc = (torch.randn(H, KV_LORA_RANK, D, device="cuda") * 0.04).bfloat16()
-
-    def project(x):
-        return torch.bmm(x.transpose(0, 1), w_vc).transpose(0, 1).contiguous()
-
-    # Project per chunk for the reference too: bmm rounding depends on the batch.
-    projected = torch.cat(
-        [project(partial[lo : lo + chunk]) for lo in range(0, rows, chunk)]
-    )
-    ref = dcp_a2a_lse_reduce(projected, lse, group, is_lse_base_on_e=False)
-
-    pipe = DcpA2aChunkPipeline(rows, chunk, group, project, is_lse_base_on_e=False)
-    for lo in range(0, rows, chunk):
-        hi = min(rows, lo + chunk)
-        pipe.submit(lo, hi, partial[lo:hi], lse[lo:hi].contiguous())
-    out = pipe.finish()
-
-    assert pipe.consumed
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
