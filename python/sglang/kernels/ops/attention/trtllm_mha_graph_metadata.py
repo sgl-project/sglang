@@ -161,7 +161,7 @@ def update_trtllm_mha_graph_metadata(
 
     ``skip_page_table=True`` (the unified memory pool): the seqlen metadata is
     still rebuilt in one launch, but the page-table writes are compiled out --
-    the bound tables are capture-stable read tables the translator
+    the bound tables are capture-stable read tables the `RunnerIds`
     refreshes out-of-graph. ``page_table`` may then be None.
     """
     if bs == 0:

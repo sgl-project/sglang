@@ -13,12 +13,12 @@
 # ==============================================================================
 """ForwardBatch construction wires the unified write-loc rebind.
 
-`init_new` must bind the batch to a plan (`translator.own_plan`,
-`kv_loc_plan.bind`): a construction path that skips it ships VIRTUAL write
+`init_new` must bind the batch to a plan (`runner_ids.own_plan`,
+`iteration_ids.bind`): a construction path that skips it ships VIRTUAL write
 ids to the kernels, a silent wrong-slot store. Also runs the REAL
-`_pad_inputs_to_size` against a live translator, since pad lanes are zeros
+`_pad_inputs_to_size` against a live runner_ids, since pad lanes are zeros
 and must write the slot-0 sink in every id space. Sliding-window semantics
-are pinned in test_kv_index_translator.py.
+are pinned in test_runner_ids.py.
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
@@ -29,8 +29,8 @@ from unittest.mock import create_autospec
 
 import torch
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -57,13 +57,15 @@ def _make_fb(out_cache_loc, **kw):
 
 
 def _armed_source(v2p, swa_map):
-    """A KVIndexTranslator hand-armed with fake translates: this file pins the
+    """A RunnerIds hand-armed with fake translates: this file pins the
     ForwardBatch-side wiring, not the composite's formulas (those are pinned
-    in test_kv_index_translator.py over the real allocator)."""
-    src = KVIndexTranslator(
+    in test_runner_ids.py over the real allocator)."""
+    src = RunnerIds(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device=_DEV,
     )
@@ -89,7 +91,7 @@ class TestPadComposesWithDerivation(CustomTestCase):
     def _fake_runner_for_pad(self, src):
         return SimpleNamespace(
             attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 0),
-            kv_index_translator=src,
+            runner_ids=src,
         )
 
     def test_pad_lanes_write_the_sink_in_both_spaces(self):
@@ -158,24 +160,24 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
             return True
 
         fb = self._fb_for_one_shot()
-        fb.kv_loc_plan = object()
-        # autospec, not a bare namespace: setting a name the translator does
+        fb.iteration_ids = object()
+        # autospec, not a bare namespace: setting a name the `RunnerIds` does
         # not have raises, so renaming the method breaks this test loudly.
-        fake_translator = create_autospec(KVIndexTranslator, instance=True)
+        fake_translator = create_autospec(RunnerIds, instance=True)
         fake_translator.pack_read_stream = pack
-        fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        fake_backend = SimpleNamespace(runner_ids=fake_translator)
         with patch.object(mix, "get_attn_backend", return_value=fake_backend):
             r1 = fb.fetch_mha_one_shot_kv_indices()
             r2 = fb.fetch_mha_one_shot_kv_indices()
 
         # One gather, from the iteration's plan; the cache holds its result.
-        self.assertEqual(plans, [fb.kv_loc_plan])
+        self.assertEqual(plans, [fb.iteration_ids])
         self.assertIs(r2, r1)
         self.assertTrue(torch.equal(r1, torch.full((5,), 7, dtype=torch.int32)))
 
     def _fb_for_chunks(self):
         fb = self._fb_for_one_shot()
-        fb.kv_loc_plan = object()
+        fb.iteration_ids = object()
         fb.num_prefix_chunks = 2
         fb.prefix_chunk_starts = [torch.tensor([0, 0]), torch.tensor([2, 1])]
         fb.prefix_chunk_seq_lens = [torch.tensor([2, 1]), torch.tensor([1, 2])]
@@ -203,10 +205,10 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
             return True
 
         fb = self._fb_for_chunks()
-        fake_translator = create_autospec(KVIndexTranslator, instance=True)
+        fake_translator = create_autospec(RunnerIds, instance=True)
         fake_translator.reads_are_translated = True
         fake_translator.pack_read_stream = pack
-        fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        fake_backend = SimpleNamespace(runner_ids=fake_translator)
         fake_pool = SimpleNamespace(req_to_token=torch.zeros((4, 8), dtype=torch.int32))
         with (
             patch.object(mix, "get_attn_backend", return_value=fake_backend),
@@ -216,7 +218,7 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
 
         self.assertEqual(len(calls), 2)
         for idx, (plan, seq_lens, indptr, kv_start_idx) in enumerate(calls):
-            self.assertIs(plan, fb.kv_loc_plan)
+            self.assertIs(plan, fb.iteration_ids)
             self.assertIs(seq_lens, fb.prefix_chunk_seq_lens[idx])
             self.assertIs(indptr, fb.prefix_chunk_cu_seq_lens[idx])
             self.assertIs(kv_start_idx, fb.prefix_chunk_starts[idx])
@@ -234,7 +236,7 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
             req_to_token=torch.zeros((4, 16), dtype=torch.int32)
         )
         # A backend that never set the attribute inherits the base-class None.
-        fake_backend = SimpleNamespace(kv_index_translator=None)
+        fake_backend = SimpleNamespace(runner_ids=None)
         with (
             patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
             patch.object(mix, "get_attn_backend", return_value=fake_backend),
@@ -250,7 +252,7 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         recorded = {}
 
         class _RecordingLeafPool:
-            def get_mla_kv_buffer(self, layer, loc, dst_dtype):
+            def get_mla_kv_buffer(self, layer, loc, dst_dtype, layer_id_override):
                 recorded["loc"] = loc
                 return None, None
 

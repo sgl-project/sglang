@@ -18,6 +18,44 @@ from typing import Union
 
 import torch
 
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
+from sglang.utils import LazyImport
+
+if is_cuda():
+    top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
+    top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
+elif is_hip():
+
+    def top_k_renorm_prob(*args, **kwargs):
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_k_renorm_probs_triton,
+        )
+
+        return top_k_renorm_probs_triton(*args, **kwargs)
+
+    def top_p_renorm_prob(*args, **kwargs):
+        from sglang.kernels.ops.sampling.renorm_triton import (
+            top_p_renorm_probs_triton,
+        )
+
+        return top_p_renorm_probs_triton(*args, **kwargs)
+
+elif is_npu():
+    try:
+        from sgl_kernel_npu.sample import top_k_renorm_prob, top_p_renorm_prob
+    except ImportError:
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+elif is_musa() or is_xpu():
+    try:
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+    except Exception:
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+else:
+    top_k_renorm_prob = None
+    top_p_renorm_prob = None
+
 
 def per_row_threshold(
     value: Union[torch.Tensor, int, float],
@@ -149,3 +187,15 @@ def top_p_renorm_probs_torch(
 
     top_ps = per_row_threshold(top_p, probs=probs, dtype=torch.float32).clamp(0.0, 1.0)
     return _apply_pivot(probs, top_p_pivots(probs, top_ps))
+
+
+__all__ = [
+    "per_row_threshold",
+    "restore_rows_above_host_top_k",
+    "top_k_pivots",
+    "top_k_renorm_prob",
+    "top_k_renorm_probs_torch",
+    "top_p_pivots",
+    "top_p_renorm_prob",
+    "top_p_renorm_probs_torch",
+]

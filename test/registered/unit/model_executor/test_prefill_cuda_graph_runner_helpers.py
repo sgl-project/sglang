@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.graph_utils import _zero_padded_tokens
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
@@ -59,6 +60,52 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_attention_padding_respects_cuda_moe_and_quantization(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = True
+        runner.attention_layers = []
+        runner.moe_fusions = []
+        runner.dsa_indexers = None
+        runner.mha_companion_layers = None
+        for cuda, moe_layers, quant_config, quantization, zero_tail in (
+            (True, [], None, None, False),
+            (True, [None, None], None, None, False),
+            (True, [None, object()], None, None, True),
+            (True, [], object(), None, True),
+            (True, [], None, "fp8", True),
+            (False, [], None, None, True),
+            (False, [None, object()], None, None, True),
+        ):
+            with self.subTest(
+                cuda=cuda,
+                moe_layers=moe_layers,
+                quant_config=quant_config,
+                quantization=quantization,
+            ):
+                runner.model_runner = SimpleNamespace(
+                    attn_backend=object(),
+                    model_config=SimpleNamespace(quantization=quantization),
+                )
+                runner.quant_config = quant_config
+                runner.moe_layers = moe_layers
+                output = torch.ones(4, 2)
+                with (
+                    patch(
+                        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
+                        return_value=cuda,
+                    ),
+                    runner._prefill_forward_context(
+                        SimpleNamespace(moe_num_token_non_padded=lambda: None),
+                        num_tokens=4,
+                        raw_num_tokens=2,
+                    ),
+                ):
+                    _zero_padded_tokens(output, 2)
+                torch.testing.assert_close(output[:2], torch.ones(2, 2))
+                torch.testing.assert_close(
+                    output[2:], torch.zeros(2, 2) if zero_tail else torch.ones(2, 2)
+                )
+
     def test_capture_buckets_keep_tp_shards_equal(self):
         override = get_context().override_server_args(
             enable_two_batch_overlap=False,
@@ -168,7 +215,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             positions=None,
             forward_batch=batch,
         )
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         x = torch.full((8, 2), 3, dtype=torch.int32)
         with (
             patch.object(
@@ -202,7 +249,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
@@ -226,9 +273,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         ngram_eos_token_id=None,
                         holder=holder,
                     )
-                else:
-                    for replay in capture.cuda_graph._break_fns:
-                        replay()
+                    self.assertIsNone(holder.batch)
+                for replay in capture.cuda_graph._break_fns:
+                    replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):

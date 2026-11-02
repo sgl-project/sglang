@@ -91,5 +91,73 @@ def test_empty_mhc_view_clears_idle_dispatch() -> None:
     torch.testing.assert_close(buf_weights, torch.zeros_like(buf_weights))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+@pytest.mark.parametrize("scale", [1.0, 2.5, 1.0 / 3.0])
+def test_topk_weight_scale_matches_torch_multiply(scale: float) -> None:
+    torch.manual_seed(7)
+    num_tokens, padded_max, hidden, top_k = 198, 256, 5120, 6
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_idx = torch.randint(0, 384, (num_tokens, top_k), device="cuda").int()
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    buf_x = torch.empty(padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn)
+    buf_x_sf = torch.empty(padded_max, hidden // 128, device="cuda", dtype=torch.int32)
+    buf_idx = torch.empty(padded_max, top_k, device="cuda", dtype=torch.int64)
+    buf_weights = torch.empty(padded_max, top_k, device="cuda", dtype=torch.float32)
+    mega_moe_pre_dispatch(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_idx,
+        buf_weights,
+        topk_weight_scale=scale,
+    )
+    expected = topk_weights * scale
+    assert torch.equal(buf_weights[:num_tokens], expected)
+    assert torch.all(buf_weights[num_tokens:] == 0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+def test_hidden_5120_two_chunk_matches_one_chunk() -> None:
+    """top_k=6 takes the two-chunk path on 1024-thread SMs, top_k=384 the one-chunk path."""
+    torch.manual_seed(0)
+    num_tokens, padded_max, hidden = 198, 512, 5120
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16) * 3
+
+    def dispatch(top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_idx = torch.randint(
+            0, 384, (num_tokens, top_k), device="cuda", dtype=torch.int32
+        )
+        topk_weights = torch.rand(num_tokens, top_k, device="cuda")
+        buf_x = torch.empty(
+            padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        buf_x_sf = torch.empty(
+            padded_max, hidden // 128, device="cuda", dtype=torch.int32
+        )
+        buf_idx = torch.empty(padded_max, top_k, device="cuda", dtype=torch.int64)
+        buf_weights = torch.empty(padded_max, top_k, device="cuda")
+        mega_moe_pre_dispatch(
+            x, topk_idx, topk_weights, buf_x, buf_x_sf, buf_idx, buf_weights
+        )
+        assert torch.equal(buf_idx[:num_tokens], topk_idx.to(torch.int64))
+        assert torch.equal(buf_weights[:num_tokens], topk_weights)
+        assert torch.all(buf_idx[num_tokens:] == -1)
+        assert torch.all(buf_weights[num_tokens:] == 0)
+        return buf_x[:num_tokens].view(torch.uint8), buf_x_sf[:num_tokens]
+
+    q_two_chunk, sf_two_chunk = dispatch(6)
+    q_one_chunk, sf_one_chunk = dispatch(384)
+    assert torch.equal(q_two_chunk, q_one_chunk)
+    assert torch.equal(sf_two_chunk, sf_one_chunk)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
