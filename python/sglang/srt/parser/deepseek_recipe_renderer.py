@@ -157,6 +157,8 @@ class DeepSeekRecipe:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
+    # Miles (radixark/miles) calls `convert` and `encode_conversation` directly;
+    # keep their signatures and behavior stable.
     def convert(
         self, body: dict[str, Any], *, effort_budget: Optional[int] = None
     ) -> Any:
