@@ -162,6 +162,66 @@ class TestKdaPrefill(CustomTestCase):
         )
 
     @torch.inference_mode()
+    def test_nvidia_prefill_correlated_keys(self):
+        """Keys close to one direction, beta near 1 and slow decay make the
+        diagonal blocks of A_kk hard to invert in bf16 (#44758)."""
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("NVIDIA KDA prefill requires datacenter Blackwell")
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        # 250 tokens leaves a partial last chunk.
+        batch_size, seq_len, num_heads, head_dim = 1, 250, 2, 128
+        shape = (batch_size, seq_len, num_heads, head_dim)
+        base = torch.randn(head_dim, generator=generator, device="cuda")
+        k = base + 0.1 * torch.randn(shape, generator=generator, device="cuda")
+        k = F.normalize(k, dim=-1).to(torch.bfloat16)
+        q = torch.randn(shape, generator=generator, device="cuda")
+        q = F.normalize(q, dim=-1).to(torch.bfloat16)
+        v = (0.1 * torch.randn(shape, generator=generator, device="cuda")).to(
+            torch.bfloat16
+        )
+        gate = (torch.randn(shape, generator=generator, device="cuda") - 6.0).to(
+            torch.bfloat16
+        )
+        beta = torch.sigmoid(
+            torch.randn(shape[:-1], generator=generator, device="cuda") + 4.0
+        ).to(torch.bfloat16)
+        a_log = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
+        dt_bias = torch.zeros(num_heads * head_dim, device="cuda", dtype=torch.float32)
+        state = 0.1 * torch.randn(
+            batch_size,
+            num_heads,
+            head_dim,
+            head_dim,
+            generator=generator,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        actual, actual_state = nvidia_chunk_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=gate,
+            beta=beta,
+            scale=head_dim**-0.5,
+            initial_state=state.transpose(-1, -2).contiguous(),
+            output_final_state=True,
+            safe_gate=True,
+            lower_bound=-5.0,
+            use_gate_in_kernel=True,
+            A_log=a_log,
+            dt_bias=dt_bias,
+        )[:2]
+        expected = _reference(
+            q, k, v, gate, beta, a_log, dt_bias, state, fused_qk_norm=False
+        )
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=2e-2, atol=3e-2
+        )
+        torch.testing.assert_close(
+            actual_state.transpose(-1, -2), state, rtol=2e-2, atol=3e-2
+        )
+
+    @torch.inference_mode()
     def test_ptx_prefill(self):
         if not _ptx_supported():
             self.skipTest("PTX KDA prefill requires SM100 or SM103")
