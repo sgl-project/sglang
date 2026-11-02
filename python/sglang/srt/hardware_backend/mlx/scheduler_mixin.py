@@ -16,7 +16,6 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List, Optional
 
@@ -91,16 +90,10 @@ class SchedulerMlxOverlapMixin:
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
         """Stamp scheduler bookkeeping before an MLX forward is launched."""
-        # Match run_batch's launch boundary. In particular, the profiler
-        # predicate must run before graph construction / mx.async_eval; running
-        # it while finalizing the previous step profiles at least one queued
+        # Before graph construction / mx.async_eval: the profiler predicate run
+        # while finalizing the previous step would profile at least one queued
         # decode beyond the requested step count.
-        self.forward_ct += 1
-        batch.forward_iter = self.forward_ct
-        batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
-        self._sched_idled = False
-        self.profiler_manager._profile_batch_predicate(batch)
+        self._on_step_launch(batch)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
@@ -213,6 +206,8 @@ class SchedulerMlxOverlapMixin:
                 # releasing host resources during graceful teardown.
                 mx.synchronize()
                 break
+
+            self.increment_scheduler_iterations()
 
             self.ingest_requests()
             if self._engine_paused:

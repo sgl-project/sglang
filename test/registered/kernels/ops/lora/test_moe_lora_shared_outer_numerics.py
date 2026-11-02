@@ -22,7 +22,7 @@ from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="production MoE LoRA requires CUDA"
@@ -145,13 +145,6 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
     return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
-def _bind_test_menu(runner, plan, launch_config):
-    """Bind one plan to both phases to isolate execution from plan selection."""
-    tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
-    selected = SelectedPlan(name="test", base_gemm_rows="test", plan=plan, tiles=tiles)
-    runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
-
-
 def _build_runner(
     gpu: dict[str, torch.Tensor],
     vendor: str = "cutedsl",
@@ -190,7 +183,12 @@ def _build_runner(
         is_gated=gated,
     )
     runner.validate_plan(choice.plan, base_gemm_rows="test")
-    _bind_test_menu(runner, choice.plan, launch_config)
+    # Bind both phases to isolate execution from plan selection.
+    tiles = SimpleNamespace(config_for=lambda num_tokens: launch_config)
+    selected = SelectedPlan(
+        name="test", base_gemm_rows="test", plan=choice.plan, tiles=tiles
+    )
+    runner.plans = {Phase.PREFILL: selected, Phase.DECODE: selected}
     return runner
 
 
@@ -224,29 +222,8 @@ def _skip_unless_supported(device):
 
 
 @pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
-def test_shared_outer_decode_matches_fp32_reference(
-    monkeypatch: pytest.MonkeyPatch, vendor: str
-) -> None:
-    device = torch.device("cuda")
-    _skip_unless_supported(device)
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
-    cpu = _make_cpu_tensors()
-    gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
-    reference = _fp32_reference(cpu)
-    runner = _build_runner(gpu, vendor)
-    actual = _run_once(runner, gpu).hidden_states.detach().float().cpu()
-    torch.testing.assert_close(actual, reference, atol=0.018, rtol=0.06)
-    # LoRA math must be present, not bypassed within tolerance.
-    base_only = dict(cpu)
-    base_only["token_lora_mapping"] = torch.full((_NUM_TOKENS,), -1, dtype=torch.int32)
-    assert (reference - _fp32_reference(base_only)).abs().max().item() > 0.02
-
-
-@pytest.mark.parametrize("vendor", ("cutedsl", "triton"))
 @pytest.mark.parametrize("phase", (Phase.DECODE, Phase.PREFILL))
-def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
+def test_shared_outer_eager_and_graph_replay_match_fp32_reference(
     monkeypatch: pytest.MonkeyPatch, vendor: str, phase: Phase
 ) -> None:
     device = torch.device("cuda")
@@ -259,6 +236,16 @@ def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
         cpu["token_lora_mapping"].fill_(0)
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
     runner = _build_runner(gpu, vendor, phase=phase)
+    reference = _fp32_reference(cpu)
+    eager = _run_once(runner, gpu, is_prefill=phase is Phase.PREFILL)
+    torch.testing.assert_close(
+        eager.hidden_states.detach().float().cpu(), reference, atol=0.018, rtol=0.06
+    )
+    # LoRA math must be present, not bypassed within tolerance.
+    base_only = dict(cpu)
+    base_only["token_lora_mapping"] = torch.full((_NUM_TOKENS,), -1, dtype=torch.int32)
+    assert (reference - _fp32_reference(base_only)).abs().max().item() > 0.02
+
     capture = dict(is_prefill=phase is Phase.PREFILL, use_cuda_graph=True)
     # Workspace scratch is stream-local: warm up on the capture stream.
     stream = torch.cuda.Stream()
@@ -275,7 +262,7 @@ def test_shared_outer_graph_replays_changed_inputs_and_token_assignments(
     torch.cuda.synchronize()
     torch.testing.assert_close(
         captured.hidden_states.detach().float().cpu(),
-        _fp32_reference(cpu),
+        reference,
         atol=0.018,
         rtol=0.06,
     )

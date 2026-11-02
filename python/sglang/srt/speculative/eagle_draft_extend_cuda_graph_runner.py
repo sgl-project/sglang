@@ -137,7 +137,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Disable parent paths that don't apply.
         self.compile_bs = []
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -164,6 +163,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.enable_torch_compile:
             set_torch_compile_config()
+
+        self.backend = resolve_decode_backend(self)
 
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -308,8 +309,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.attention_variant_sizes = self.megakernel_served
 
-        self.backend = resolve_decode_backend(self)
-
         try:
             with model_capture_mode():
                 self.capture()
@@ -323,11 +322,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             return self.backend.replay(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
-        return torch.int64
+        return self.backend.cache_loc_dtype
 
-    def _make_graph_key(
-        self, bs, stream_idx=None, variant_label=None, attention_variant=None
-    ):
+    def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
         return ShapeKey(size=bs, attention_variant=attention_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
@@ -373,7 +370,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
@@ -470,7 +466,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         if self.buffers.dsa_seed_topk_capture is not None:
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
@@ -669,6 +665,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
@@ -681,8 +678,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            kv_loc_plan=forward_batch.kv_loc_plan,
-            kv_loc_cols=forward_batch.kv_loc_cols,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             # Virtual input stays separate from the backend's physical buffer.
             mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),

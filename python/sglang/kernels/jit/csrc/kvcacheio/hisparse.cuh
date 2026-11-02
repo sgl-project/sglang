@@ -262,7 +262,7 @@ void transfer_cache_dsv4_mla(
   auto N = SymbolicSize{"num_items"};
   auto L = SymbolicSize{"num_layers"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   TensorMatcher({L}).with_dtype<uint64_t>().with_device(device).verify(src_ptrs).verify(dst_ptrs);
   // Existing 1D indices are shared across layers; 2D indices retain each
   // layer's physical slot ownership after speculative cache rotation.

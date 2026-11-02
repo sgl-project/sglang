@@ -26,11 +26,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_sail
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,13 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.dsa_backend import (
+            SailDeepseekSparseAttnBackend,
+        )
+
+        return SailDeepseekSparseAttnBackend(runner)
+
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)
@@ -214,6 +222,16 @@ def create_triton_backend(runner):
     return TritonAttnBackend(runner)
 
 
+@register_attention_backend("unlimited_ocr_v2")
+def create_unlimited_ocr_v2_backend(runner):
+    """Build the DASH block-sparse attention backend for Unlimited-OCR v2."""
+    from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
+        UnlimitedOCRV2AttnBackend,
+    )
+
+    return UnlimitedOCRV2AttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
@@ -230,6 +248,13 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+            SailFlashMLABackend,
+        )
+
+        return SailFlashMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
@@ -240,10 +265,19 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+        assert (
+            major == 8 and (_is_sail or not runner.use_mla_backend)
+        ) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend,
+            )
+
+            return SailFlashAttentionBackend(runner)
+
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )

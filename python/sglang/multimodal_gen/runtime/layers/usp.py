@@ -397,12 +397,16 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    # clone, not contiguous(): with one head and one batch row per rank the
+    # reorder is a free view of the staging buffer the next exchange reuses.
     if head_dim == 1:
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+        x = x.permute(2, 1, 0, 3, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, h_local, s_global, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
-        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+        x = x.permute(2, 0, 3, 1, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, s_global, h_local, d)
 
     return x
 
@@ -457,6 +461,72 @@ def _usp_input_all_to_all_packed_qkv(
     packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
     q, k, v = packed.split(head_size, dim=-1)
     return q, k, v
+
+
+def ulysses_head_group_pipelined_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attend,
+    groups: int,
+) -> torch.Tensor:
+    """Ulysses attention with the collective exchange pipelined over head groups.
+
+    q/k/v are matching ``[rows, heads, head_size]`` row shards and
+    ``attend(q, k, v)`` attends one head group over the gathered rows; it must
+    treat heads independently, so the result is the sequential exchange's
+    bytes. Every input exchange is queued up front on the collective stream
+    and group g's output exchange runs while group g + 1 attends.
+    """
+    group = get_sp_group().ulysses_group
+    world_size = get_ulysses_parallel_world_size()
+    rows, heads, head_size = q.shape
+    group_heads = heads // (world_size * groups)
+    # pack block w * groups + g holds rank w's heads of group g
+    packed = pack_qkv_destination_major(
+        q,
+        k,
+        v,
+        world_size * groups,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size * groups, rows, group_heads, 3 * head_size),
+            q.dtype,
+            q.device,
+        ),
+    ).view(world_size, groups, rows, group_heads, 3 * head_size)
+    received = _a2a_staging_buffer(
+        "usp_packed_qkv_recv",
+        (groups, world_size, rows, group_heads, 3 * head_size),
+        q.dtype,
+        q.device,
+    )
+    exchanges = [
+        dist.all_to_all(
+            list(received[g].unbind(0)),
+            list(packed[:, g].unbind(0)),
+            group=group,
+            async_op=True,
+        )
+        for g in range(groups)
+    ]
+    out = _a2a_staging_buffer(
+        "usp_output",
+        (groups, world_size, rows, group_heads, head_size),
+        q.dtype,
+        q.device,
+    )
+    for g in range(groups):
+        exchanges[g].wait()
+        group_qkv = received[g].view(world_size * rows, group_heads, 3 * head_size)
+        group_out = attend(*group_qkv.split(head_size, dim=-1))
+        exchanges.append(
+            dist.all_to_all_single(out[g], group_out, group=group, async_op=True)
+        )
+    for exchange in exchanges[groups:]:
+        exchange.wait()
+    # [group, rank, row, head, dim] -> [row, rank, group, head, dim]
+    return out.permute(2, 1, 0, 3, 4).reshape(rows, heads, head_size)
 
 
 def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
