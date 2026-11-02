@@ -78,6 +78,11 @@ CP_ARGS = [
     "--enable-cp-decode-attn-tp",
 ]
 CASES = [[1], [257], [8193], [257 + 8 * i for i in range(4)]]
+# Prefixes of one 2100-token sequence, scored by prefill alone. Position p has
+# the same context in every prefix, so a CP-vs-TP gap that tracks p points at
+# short key lists, and one that tracks the prefix length points at short
+# sequences (padding, per-rank split). 8 is the smallest length that runs as CP.
+SWEEP_LENGTHS = [8, 9, 16, 17, 33, 64, 65, 128, 257, 2049, 2100]
 
 
 def _stats(diff):
@@ -191,6 +196,14 @@ class TestCpDecodeAttnTpLogprobGapDiag(CustomTestCase):
                         for prompt, f in zip(prompts, foreign, strict=True)
                     ]
                 out[key] = case
+            base = self._prompt(max(SWEEP_LENGTHS), 0)
+            out["sweep"] = {}
+            for length in SWEEP_LENGTHS:
+                (score,) = self._generate([base[:length]], 0)
+                # Entry 0 has no logprob; entry p + 1 is scored from position p.
+                out["sweep"][length] = [
+                    row[0] for row in score["meta_info"]["input_token_logprobs"][1:]
+                ]
             return out
         finally:
             kill_process_tree(process.pid)
@@ -198,8 +211,25 @@ class TestCpDecodeAttnTpLogprobGapDiag(CustomTestCase):
     def test_report_logprob_gaps(self):
         tp = self._run_server(COMMON_ARGS)
         cp = self._run_server(COMMON_ARGS + CP_ARGS, foreign_tokens=tp)
+        sweep = {}
+        for length in SWEEP_LENGTHS:
+            diff = np.abs(np.array(cp["sweep"][length]) - np.array(tp["sweep"][length]))
+            sweep[length] = {
+                "mean": round(float(diff.mean()), 4),
+                "max": round(float(diff.max()), 4),
+                "argmax": int(diff.argmax()),
+                "first_16": [round(float(x), 4) for x in diff[:16]],
+            }
+            print(
+                f"[sweep] len={length} mean={sweep[length]['mean']} "
+                f"max={sweep[length]['max']} at pos={sweep[length]['argmax']} "
+                f"first_16={sweep[length]['first_16']}"
+            )
+        print("CP_PREFILL_SWEEP_REPORT " + json.dumps(sweep))
         report = {}
         for key in tp:
+            if key == "sweep":
+                continue
             rows = []
             for i, prompt in enumerate(tp[key]["prompts"]):
                 n = len(prompt)
