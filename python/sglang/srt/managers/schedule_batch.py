@@ -3975,21 +3975,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
+            # In deterministic mode, prevent Decode from overwriting/advancing
+            # the reusable Prefill checkpoint. Decode-produced states are not
+            # numerically identical to Prefill-produced states, so reusing them
+            # would change logprobs for the same request.
+            deterministic_mode = (
+                get_exec().deterministic.enable_deterministic_inference
+            )
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                if (
+                    get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    and not deterministic_mode
+                ):
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
-            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
-            track_mask_cpu = track_remainders_cpu == 0
-            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            if deterministic_mode:
+                # Disable tracking masks in deterministic mode to prevent
+                # Decode from saving checkpoints that would be reused
+                track_mask_cpu = [False] * len(self.seq_lens_cpu)
+            else:
+                track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+                track_mask_cpu = (track_remainders_cpu == 0).tolist()
+            self.mamba_track_mask_cpu = track_mask_cpu
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                [False] * len(self.seq_lens_cpu)
+                if deterministic_mode
+                else (
+                    (
+                        (self.seq_lens_cpu % mamba_track_interval)
+                        == mamba_track_interval - 1
+                    ).tolist()
+                )
                 if self.enable_overlap
                 else None
             )
