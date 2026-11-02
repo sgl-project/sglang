@@ -108,7 +108,9 @@ class TestWindowNames(CustomTestCase):
             host_pool="window_16",
             tree_component="WINDOW_16",
             metrics="window",
+            label="window_16",
             wire="swa",
+            wire_key="window_16",
         )
         self.assertEqual(_plan((16,)).sub_pool("window_16").external, first)
         two = _plan((16, 64))
@@ -118,7 +120,9 @@ class TestWindowNames(CustomTestCase):
                 host_pool="window_64",
                 tree_component="WINDOW_64",
                 metrics="window",
+                label="window_64",
                 wire="swa",
+                wire_key="window_64",
             ),
         )
         self.assertEqual(
@@ -127,7 +131,9 @@ class TestWindowNames(CustomTestCase):
                 host_pool="window_16",
                 tree_component="WINDOW_16",
                 metrics="window",
+                label="window_16",
                 wire="swa",
+                wire_key="window_16",
             ),
         )
         slots = two.tree_slots()

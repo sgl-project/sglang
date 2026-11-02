@@ -682,7 +682,7 @@ class KVStorage:
             SubPoolUsage(
                 name=s.name,
                 metrics=s.external.metrics,
-                label=s.name,
+                label=s.external.label,
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )
@@ -701,9 +701,12 @@ class KVStorage:
         return self._plan.wire_entries()
 
     def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
-        """The sub-pool a transfer entry carries, as peers tell entries of one
-        state type apart."""
+        """The sub-pool a transfer entry carries here."""
         return entry.sub_pool
+
+    def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
+        """The key PD peers tell entries of one state type apart by."""
+        return entry.key
 
     def primary_window_name(self) -> Optional[str]:
         """The target's window sub-pool (the one a single-window reader sizes

@@ -54,21 +54,35 @@ class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
     """The names a sub-pool goes by outside this process, at the values peers,
     host stores, the radix tree and metrics already use: its HiCache host pool
     (also the suffix of its L3 keys), its radix tree component, the family its
-    usage is reported under, and the PD state type it travels as (None for the
-    sub-pool whose token KV PD registers as the transfer's KV entries)."""
+    usage is reported under and the label within it, the PD state type it
+    travels as (None for the sub-pool whose token KV PD registers as the
+    transfer's KV entries), and the key PD peers tell its entries apart by.
+    Renaming a sub-pool inside this process changes none of them unless they
+    are derived from its name."""
 
     host_pool: str
     tree_component: str
     metrics: str
+    label: str
     wire: Optional[str] = None
+    wire_key: Optional[str] = None
 
 
 _EXTERNAL: Dict[Type, SubPoolExternal] = {
     FullLifetime: SubPoolExternal(
-        host_pool="kv", tree_component="FULL", metrics="full"
+        host_pool="kv",
+        tree_component="FULL",
+        metrics="full",
+        label="full",
+        wire_key="full",
     ),
     StateLifetime: SubPoolExternal(
-        host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
+        host_pool="mamba",
+        tree_component="MAMBA",
+        metrics="mamba",
+        label="mamba",
+        wire="mamba",
+        wire_key="mamba",
     ),
 }
 
@@ -89,7 +103,9 @@ def _window_external(name: str) -> SubPoolExternal:
         host_pool=name,
         tree_component=window_tree_component(name),
         metrics="window",
+        label=name,
         wire=WINDOW_WIRE,
+        wire_key=name,
     )
 
 
@@ -160,11 +176,13 @@ def tree_slot_ids(slots: Sequence[TreeSlot]) -> Dict[str, ComponentType]:
 
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
-    """One PD state entry: the sub-pool part it carries and its state type."""
+    """One PD state entry: the sub-pool part it carries, its state type, and
+    the key peers tell entries of one type apart by (the sub-pool's)."""
 
     sub_pool: str
     part: str
     state_type: str
+    key: Optional[str] = None
 
 
 class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -325,6 +343,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                 sub_pool=s.name,
                 part=STATE_PART if isinstance(s.lifetime, StateLifetime) else KV_PART,
                 state_type=s.external.wire,
+                key=s.external.wire_key,
             )
             for s in self.sub_pools
             if s.external.wire is not None
@@ -339,6 +358,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=declared.sub_pool,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.sub_pool(declared.sub_pool).external.wire_key,
                     ),
                 )
         for declared in self.request_parts:
@@ -350,6 +370,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=self.owner().name,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.owner().external.wire_key,
                     ),
                 )
         entries.extend(groups.values())
@@ -359,7 +380,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         return tuple(
             sorted(
                 entries,
-                key=lambda e: (_WIRE_ORDER.index(e.state_type), e.sub_pool),
+                key=lambda e: (_WIRE_ORDER.index(e.state_type), e.key),
             )
         )
 
