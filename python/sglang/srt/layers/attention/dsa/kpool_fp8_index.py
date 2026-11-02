@@ -1088,6 +1088,7 @@ def kpool_decode_update_and_maybe_write_cache(
         ape.stride(0),
         block_tables.stride(0),
         block_tables.stride(1),
+        block_tables.shape[1],
         REQ_POOL_SIZE=tail_k.shape[0],
         PAGE_SIZE=pool.page_size,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
@@ -1095,7 +1096,6 @@ def kpool_decode_update_and_maybe_write_cache(
         POOL_SIZE=pool.index_kpool,
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=tail_k.shape[2],
-        BLOCK_TABLE_COLS=block_tables.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
@@ -1247,7 +1247,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
         tl.store(compressed_scale_ptr + row, scale)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_cols"])
 def _kpool_decode_update_and_maybe_write_cache_kernel(
     buf_fp8_ptr,
     buf_fp32_ptr,
@@ -1270,13 +1270,13 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     ape_stride_0,
     block_tables_stride_0,
     block_tables_stride_1,
+    block_table_cols,
     REQ_POOL_SIZE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     POOL_SIZE: tl.constexpr,
     TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    BLOCK_TABLE_COLS: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
@@ -1383,7 +1383,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         pool_id = safe_pos // POOL_SIZE
         pool_page_group = pool_id // INDEX_PAGE_SIZE
         token_page_row = pool_page_group * POOL_SIZE
-        token_page_row = tl.minimum(tl.maximum(token_page_row, 0), BLOCK_TABLE_COLS - 1)
+        token_page_row = tl.minimum(tl.maximum(token_page_row, 0), block_table_cols - 1)
         packed_page = tl.load(
             block_tables_ptr
             + row * block_tables_stride_0
