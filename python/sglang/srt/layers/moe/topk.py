@@ -2182,23 +2182,6 @@ def biased_grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    # The CPU AOT kernel currently specializes biased grouped top-k to topk=8.
-    # Nemotron-H uses topk=6, so fall back to the torch implementation instead
-    # of calling the native op and raising "Unexpected topk: 6".
-    if topk != 8:
-        return biased_grouped_topk_impl(
-            hidden_states,
-            gating_output,
-            correction_bias,
-            topk,
-            renormalize,
-            num_expert_group,
-            topk_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-        )
-
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
