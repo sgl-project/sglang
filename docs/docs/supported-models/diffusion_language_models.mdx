@@ -33,6 +33,27 @@ python3 -m sglang.launch_server \
 
 Depending on the algorithm selected, the configuration parameters vary.
 
+For LLaDA2, `block_size` defaults to the value in the checkpoint configuration,
+or `32` if the checkpoint does not declare it. You can set `block_size` in the
+YAML file when the checkpoint does not declare it. If both declare a value,
+they must match. The effective value must be a positive integer.
+
+LLaDA2 uses the tokenizer's declared `mask_token` and its ID in the serialized
+vocabulary selected by Transformers. Metadata lookup uses the same source
+resolution as the tokenizer loader and respects a separate `--tokenizer-path`.
+The vocabulary is `tokenizer.json` by default, or
+the compatible versioned file selected from `fast_tokenizer_files` in
+`tokenizer_config.json`. Standard fast-tokenizer loading resolves declarations in
+`tokenizer_config.json` and legacy `special_tokens_map.json`. If no mask token
+is declared, it falls back to the architecture default. A declared token that is missing
+from the tokenizer vocabulary or outside the model vocabulary causes an error.
+This metadata lookup does not execute custom tokenizer Python code.
+It requires a serialized fast tokenizer when a mask is declared, including
+when you use `--skip-tokenizer-init`. Custom tokenizer code that changes token
+IDs and slow-only tokenizer formats are not covered by this metadata lookup.
+Continue to select the decoding algorithm with `--dllm-algorithm`;
+the LLaDA2 checkpoints do not declare a default algorithm.
+
 LowConfidence Config:
 
 ```yaml Config
@@ -42,7 +63,7 @@ LowConfidence Config:
 # Range: 0.0 - 1.0
 threshold: 0.95
 
-# Default: 32, for LLaDA2MoeModelLM
+# Optional override; omit to use the checkpoint's block_size (fallback: 32).
 block_size: 32
 ```
 

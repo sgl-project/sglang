@@ -1,6 +1,7 @@
 """Unit tests for JointThresholdInDel without a server or model weights."""
 
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -176,6 +177,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         server_args = SimpleNamespace(
             dllm_algorithm="JointThresholdInDel",
             model_path="local/indel-checkpoint",
+            tokenizer_path=self.enterContext(TemporaryDirectory()),
             revision=None,
             max_running_requests=None,
             dllm_algorithm_config=None,
@@ -195,6 +197,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         server_args = SimpleNamespace(
             dllm_algorithm="JointThresholdInDel",
             model_path="local/indel-checkpoint",
+            tokenizer_path=self.enterContext(TemporaryDirectory()),
             revision=None,
             max_running_requests=4,
             dllm_algorithm_config=None,
@@ -245,6 +248,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
                 server_args = SimpleNamespace(
                     dllm_algorithm="JointThresholdInDel",
                     model_path=model_path,
+                    tokenizer_path=self.enterContext(TemporaryDirectory()),
                     revision=None,
                     max_running_requests=4,
                     dllm_algorithm_config=None,
@@ -269,6 +273,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
         server_args = SimpleNamespace(
             dllm_algorithm="JointThreshold",
             model_path="inclusionAI/LLaDA2.0-mini",
+            tokenizer_path=self.enterContext(TemporaryDirectory()),
             revision=None,
             max_running_requests=4,
             dllm_algorithm_config=None,
