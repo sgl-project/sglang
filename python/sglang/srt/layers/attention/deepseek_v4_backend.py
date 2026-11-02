@@ -1601,15 +1601,36 @@ class DeepseekV4AttnBackend(
             out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
         )
 
-        seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
-            num_tokens=num_tokens,
-            seq_lens=seq_lens_cpu,
-            extend_seq_lens=extend_seq_lens_cpu,
-            req_pool_indices=req_pool_indices,
-            padded_num_tokens=padded_num_tokens,
-            seq_lens_tensor=seq_lens,
-            extend_seq_lens_tensor=extend_seq_lens,
-            extend_start_loc=extend_start_loc,
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        reuse_window_groups = (
+            _is_cuda
+            and self.token_to_kv_pool.request_window is not None
+            and not cp_active
+            and get_parallel().attn_cp_size == 1
+            and not use_prefill_cuda_graph
+            and not get_is_capture_mode()
+            and not is_capturing()
+            and not torch.cuda.is_current_stream_capturing()
+            and num_tokens > 0
+            and req_pool_indices.is_contiguous()
+            and seq_lens.is_contiguous()
+            and extend_seq_lens.is_contiguous()
+        )
+        seq_lens_casual, req_pool_indices_repeated, row_groups = (
+            self.expand_prefill_casually(
+                num_tokens=num_tokens,
+                seq_lens=seq_lens_cpu,
+                extend_seq_lens=extend_seq_lens_cpu,
+                req_pool_indices=req_pool_indices,
+                padded_num_tokens=padded_num_tokens,
+                seq_lens_tensor=seq_lens,
+                extend_seq_lens_tensor=extend_seq_lens,
+                extend_start_loc=extend_start_loc,
+                return_window_groups=reuse_window_groups,
+            )
         )
         graph_window = (
             use_prefill_cuda_graph and self.token_to_kv_pool.request_window is not None
@@ -1634,6 +1655,7 @@ class DeepseekV4AttnBackend(
                 else len(extend_seq_lens_cpu)
             ),
             request_window_live_rows=num_tokens if graph_window else None,
+            row_groups=row_groups,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -4690,7 +4712,12 @@ class DeepseekV4AttnBackend(
         seq_lens_tensor: Optional[torch.Tensor] = None,
         extend_seq_lens_tensor: Optional[torch.Tensor] = None,
         extend_start_loc: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_window_groups: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
         assert seq_lens_tensor is not None and extend_seq_lens_tensor is not None
         result = ExpandPrefillCausally.execute(
             req_pool_indices=req_pool_indices,
@@ -4701,8 +4728,13 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu=extend_seq_lens,
             num_tokens=num_tokens,
             padded_num_tokens=padded_num_tokens,
+            return_window_groups=return_window_groups,
         )
-        return result.seq_lens_casual, result.req_pool_indices_repeated
+        return (
+            result.seq_lens_casual,
+            result.req_pool_indices_repeated,
+            result.window_groups,
+        )
 
     def _expand_prefill_casually_vectorized(
         self,
@@ -4758,6 +4790,7 @@ class DeepseekV4AttnBackend(
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         request_window_live_rows: Optional[int] = None,
+        row_groups: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -4820,6 +4853,7 @@ class DeepseekV4AttnBackend(
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
                 padded_rows=None if live is None else raw_positions.numel(),
+                row_groups=row_groups,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
