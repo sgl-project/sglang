@@ -237,6 +237,7 @@ class MistralAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
             },
             allow_cudnn_sdp=allow_cudnn_sdp,
         )
