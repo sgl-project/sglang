@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -183,6 +184,9 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 )
+DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Pro-0813-w4a8"
+)
 # DeepSeek-V4-Flash default model for a5 testcase
 DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
@@ -214,7 +218,14 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
-BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+# Idle timeout: no output for this long means the benchmark is stuck, then
+# force-kill. Long silent phases are normal here: the server may still be
+# loading weights or capturing DSPARK graphs while the bench process waits,
+# and triton JIT compilation is quiet for minutes (run 40705231433 lost
+# both attempts to the old 300s default). Override via env if needed.
+BENCHMARK_STDOUT_IDLE_TIMEOUT = int(
+    os.environ.get("SGLANG_BENCH_STDOUT_IDLE_TIMEOUT", "1800")
+)
 BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
@@ -400,6 +411,28 @@ def run_bench_serving(
 
     write_pkg_info_to_file(result_file)
 
+    if dataset_name == "gsm8k-shared-prefix":
+        # Natural-text shared-prefix dataset: bench_serving's built-in
+        # generated-shared-prefix prompts are random token ids, which the
+        # DSPARK draft cannot predict (accept len ~1.6, run 40993824705).
+        # Pad one GSM8K QA pool to 101% of input_len and emit identical
+        # rows, so random-mode truncation leaves every request
+        # byte-identical - the dev acceptance shape
+        # (sharegpt_natural_shared_131072_100cache_480.json, whose
+        # divergence points sit past the truncation length on purpose).
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.json"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+            )
+        dataset_path = dataset_file
+        dataset_name = "random"
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
+
     if dataset_name == "generated-shared-prefix":
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
@@ -445,6 +478,12 @@ def run_bench_serving(
             cmd_args.extend(["--num-prompts", str(num_prompts)])
         if request_rate:
             cmd_args.extend(["--request-rate", str(request_rate)])
+        if warmup_requests:
+            # Prime the shared prefix before the measured pass: warmup
+            # requests reuse the first GSP prompt with output capped at 32
+            # tokens, so a handful of them (one per DP rank) fills every
+            # rank's radix cache with the system prompt.
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
         if temperature is not None:
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
@@ -621,6 +660,9 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
+    api_type="chat",
+    warmup_dp=0,
+    warmup_shape=0,
 ):
 
     if dataset_type == "sharegpt":
@@ -658,6 +700,32 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # Pure-decode case on aisbench (dev Perf-1015 method): identical
+        # natural-text rows (one GSM8K QA pool padded past input_len) so
+        # every request hits the same ~131072-token radix prefix, mirroring
+        # the dev 99.9% cache-hit shared-prefix shape. Emitted as
+        # test.jsonl because GSM8KDataset hardcodes that name inside the
+        # config's path dir. Identical rows are NOT deduped by the aisbench
+        # main loader (run 41027224138 log: "Total data num: 12").
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        # run_aisbench.sh's gsm8k branch resolves the dataset as
+        # <dataset_dir>/test.jsonl and ignores the file name, so publish the
+        # generated rows under that name.
+        dataset_path = "/tmp/datasets/test.jsonl"
+        shutil.copyfile(dataset_file, dataset_path)
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -706,6 +774,12 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
+    if api_type != "chat":
+        cmd += f" --api-type {api_type}"
+    if warmup_dp:
+        cmd += f" --warmup-dp {warmup_dp}"
+    if warmup_shape:
+        cmd += f" --warmup-shape {warmup_shape}"
 
     logger.info(f"Command: {cmd}")
 
@@ -735,6 +809,16 @@ def run_aisbench(
 
         metrics = {}
         full_output = "\n".join(output_lines)
+
+        # The raw path may run unscored warmup passes (cache-fill, then a
+        # full-shape pass) before the formal invocation; every invocation
+        # prints its own summarizer table, in order. All metrics must come
+        # from the LAST table - the formal run (run 41197446071 asserted
+        # the cache-fill warmup's TPOT because re.search matched the first
+        # table; the formal C12 run printed TPOT 24.1 ms).
+        last_table = full_output.rfind("Performance Parameters")
+        if last_table != -1:
+            full_output = full_output[last_table:]
 
         simplified_output = re.sub(r"[^\w\s.]", " ", full_output)
 
@@ -1222,6 +1306,9 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1249,7 +1336,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1315,7 +1403,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        wait_server_ready(
+            f"{cls.base_url}/health", deep_url=f"{cls.base_url}/model_info"
+        )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
@@ -1355,6 +1445,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1382,7 +1475,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1524,6 +1618,9 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1551,7 +1648,8 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()

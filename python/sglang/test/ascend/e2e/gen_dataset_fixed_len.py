@@ -332,6 +332,76 @@ def generate_gsm8k_dataset(
             f.write("\n")
 
 
+def generate_gsm8k_shared_prefix_dataset(
+    model_path,
+    source_dataset_path,
+    batch_size,
+    input_len,
+    output_file,
+    output_format="sharegpt",
+):
+    """Generate a natural-text shared-prefix dataset from GSM8K.
+
+    bench_serving's generated-shared-prefix dataset builds prompts from
+    random token ids, which the DSPARK draft cannot predict - the measured
+    acceptance length collapses to ~1.6 vs the dev-measured 3.9 on natural
+    text. This generator instead pads one GSM8K QA pool (natural text,
+    repeated cyclically) slightly past input_len and writes batch_size
+    identical rows, so bench_serving's random-mode truncation leaves every
+    request byte-identical - the same 100%-cache shape as the dev
+    acceptance dataset (sharegpt_natural_shared_131072_100cache_480.json),
+    whose divergence points sit beyond the truncation length on purpose.
+
+    Output is a JSON array in the ShareGPT "conversations" layout that
+    bench_serving --dataset-name random consumes via sample_random_requests.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    train_data = load_jsonl(source_dataset_path)
+    pool_ids = []
+    total = 0
+    target = int(input_len * 1.01)  # over-fill: truncation lands inside the shared prefix
+    for item in train_data * ((target // 500) + 1):  # a QA pair is ~200-500 tokens
+        ids = tokenizer.encode(format_qa(item), add_special_tokens=False)
+        pool_ids.extend(ids)
+        total = len(pool_ids)
+        if total >= target:
+            break
+    pool_ids = pool_ids[:total]
+    prompt_text = tokenizer.decode(pool_ids[:target])
+
+    output_data = []
+    for i in range(batch_size):
+        if output_format == "aisbench":
+            # run_aisbench()'s gsm8k jsonl layout: {"question": ..., "answer": ...}
+            output_data.append({"question": prompt_text, "answer": "none"})
+        else:
+            output_data.append(
+                {
+                    "id": f"gsm8k_shared_prefix_{i:02d}",
+                    "conversations": [
+                        {"from": "human", "value": prompt_text},
+                        {"from": "gpt", "value": "none"},
+                    ],
+                }
+            )
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    if output_format == "aisbench":
+        with open(output_file, "w", encoding="utf-8") as f:
+            for row in output_data:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    else:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, ensure_ascii=False)
+    print(
+        f"Shared-prefix GSM8K dataset saved to {output_file} "
+        f"({len(output_data)} identical rows of ~{input_len} tokens)"
+    )
+
+
 def generate_random_dataset(
     model_path,
     source_dataset_path,
