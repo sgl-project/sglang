@@ -18,10 +18,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed.communication_op import (
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -99,8 +95,6 @@ class HYV3MoEFused(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.tp_size = get_parallel().moe_tp_size
-        self.ep_size = get_parallel().moe_ep_size
         self.is_mori = get_moe_a2a_backend().is_mori()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
@@ -176,17 +170,19 @@ class HYV3MoEFused(nn.Module):
             return self._forward_dual_stream(hidden_states)
         return self._forward_single_stream(hidden_states)
 
-    def _reduce_mori_shared_output(self, shared_output: torch.Tensor) -> torch.Tensor:
-        # MoRI's combine already returns the full routed output replicated across
-        # ranks, so the blanket post-experts all-reduce is skipped (see
-        # should_skip_post_experts_all_reduce). The shared expert output is still a
-        # partial (shared_mlp uses reduce_results=False), so reduce it on its own
-        # over the same group(s) the blanket all-reduce would have used.
-        if self.ep_size > 1:
-            shared_output = moe_expert_parallel_all_reduce(shared_output)
-        if self.tp_size > 1:
-            shared_output = moe_tensor_model_parallel_all_reduce(shared_output)
-        return shared_output
+    def _reduce_outputs(
+        self, routed_output: torch.Tensor, shared_output: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if self.is_mori:
+            # MoRI's combine already sums each token's routed expert outputs back
+            # to its source rank; only the shared expert's partial still owes the
+            # post-experts sum.
+            if shared_output is None:
+                return routed_output
+            return routed_output + post_experts_all_reduce(shared_output)
+        if shared_output is not None:
+            routed_output = routed_output + shared_output
+        return post_experts_all_reduce(routed_output)
 
     def _forward_single_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -195,20 +191,14 @@ class HYV3MoEFused(nn.Module):
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
         topk_output = self.topk(hidden_states, router_logits)
+        shared_output = None
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
-            if self.is_mori:
-                shared_output = self._reduce_mori_shared_output(shared_output)
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
 
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        final_hidden_states = self._reduce_outputs(final_hidden_states, shared_output)
 
         return final_hidden_states.view(orig_shape)
 
@@ -231,11 +221,8 @@ class HYV3MoEFused(nn.Module):
             )
 
         current_stream.wait_stream(self.alt_stream)
-        if self.is_mori:
-            shared_output = self._reduce_mori_shared_output(shared_output)
-        final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        final_hidden_states = self._reduce_outputs(final_hidden_states, shared_output)
 
         return final_hidden_states.view(orig_shape)
 

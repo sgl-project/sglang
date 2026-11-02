@@ -882,10 +882,6 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    if get_moe_a2a_backend().is_mori():
-        # MoRI's combine already sums each token's expert outputs back to the
-        # source rank
-        return True
     return should_skip_mlp_all_reduce() or post_experts_output_is_complete(
         is_tp_path=is_tp_path
     )
