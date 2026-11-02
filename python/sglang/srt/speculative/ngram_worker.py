@@ -73,6 +73,34 @@ def _derive_tree_links(
     return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
+def _prepare_full_verify_mask_buffer(
+    *,
+    seq_lens: torch.Tensor,
+    seq_lens_sum: int,
+    draft_token_num: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Build the flattened FULL_MASK verify buffer and scatter indices on device
+    # without per-request host-to-device copies or float32 allocations.
+    bs = seq_lens.numel()
+    device = seq_lens.device
+    seq_lens_i64 = seq_lens.to(dtype=torch.int64)
+    row_widths = seq_lens_i64 + draft_token_num
+    req_mask_sizes = draft_token_num * row_widths
+    total_mask_size = draft_token_num * (seq_lens_sum + bs * draft_token_num)
+    full_mask = torch.ones((total_mask_size,), dtype=torch.bool, device=device)
+
+    req_offsets = torch.cumsum(req_mask_sizes, dim=0) - req_mask_sizes
+    row_idx = torch.arange(draft_token_num, device=device, dtype=torch.int64)
+    col_idx = torch.arange(draft_token_num, device=device, dtype=torch.int64)
+    row_bases = (
+        req_offsets[:, None]
+        + row_idx[None, :] * row_widths[:, None]
+        + seq_lens_i64[:, None]
+    )
+    dst_indices = (row_bases[:, :, None] + col_idx[None, None, :]).reshape(-1)
+    return full_mask, dst_indices
+
+
 class NGRAMWorker(BaseSpecWorker):
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
@@ -316,16 +344,21 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
 
-        # Pre-sync: only needs seq_lens_cpu, so build before the blocking
+        # Pre-sync: only needs seq_lens, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
-        ones_masks = None
+        full_mask = None
+        dst_indices = None
         if USE_FULL_MASK and not _is_cpu:
-            ones_masks = [
-                torch.ones(
-                    (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
-                )
-                for i in range(bs)
-            ]
+            seq_lens_sum = (
+                batch.seq_lens_sum
+                if batch.seq_lens_sum is not None
+                else int(sum(batch.seq_lens_cpu))
+            )
+            full_mask, dst_indices = _prepare_full_verify_mask_buffer(
+                seq_lens=batch.seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                draft_token_num=self.draft_token_num,
+            )
 
         req_drafts, mask = self._prepare_draft_tokens(batch)
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
@@ -349,21 +382,8 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK and not _is_cpu:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            for i in range(bs):
-                req_mask = torch.cat(
-                    (
-                        ones_masks[i],
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            full_mask[dst_indices] = tree_mask
+            tree_mask = full_mask
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
