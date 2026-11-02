@@ -624,8 +624,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
-    # Unlimited-OCR v2: the decode CUDA graph loads input_ids and positions itself.
-    uocr_graph_io_deferred: bool = False
+    # the decode graph owns input_ids and positions until replay or eager fallback
+    input_ids_from_graph: bool = False
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
@@ -1015,7 +1015,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         pp_loras: Optional[set[Optional[str]]] = None,
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
-        uocr_graph_io_deferred: bool = False,
+        input_ids_from_graph: bool = False,
     ):
         # init_new must not mutate ScheduleBatch; use explicit forward overrides.
         # Speculative forwards share iteration_ids and select their write_cols;
@@ -1138,7 +1138,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
-            uocr_graph_io_deferred=uocr_graph_io_deferred,
+            input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1275,7 +1275,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            if ret.positions is None and not ret.uocr_graph_io_deferred:
+            if ret.positions is None and not ret.input_ids_from_graph:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
