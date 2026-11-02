@@ -238,7 +238,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         fill_len = 512
         sliding_window_size = 200
-        # _swa_tail_len floors the window start to a page boundary:
+        # The window tail floors the window start to a page boundary:
         # floor_align(512 - 200, 256) = 256, so the tail is one whole page.
         swa_tail_len = 256
         kv_loc = torch.arange(512, 512 + fill_len, dtype=torch.int64)

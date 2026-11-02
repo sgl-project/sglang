@@ -640,7 +640,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Admit ``req``'s preallocation and make its rows takeable: the
         allocator reclaims whatever its admission credited."""
         allocator = self.token_to_kv_pool_allocator
-        full_len, _ = self._prealloc_kv_lens(req)
+        full_len = pre_alloc_fill_len(req)
         take = self._prealloc_demand(
             req,
             ceil_align(full_len, allocator.page_size),
@@ -700,22 +700,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _keep_insert_boundary(self) -> bool:
         return get_disagg().disaggregation_decode_enable_radix_cache
 
-    def _target_window_tail(self) -> Optional[int]:
-        """The tail a request keeps of the target's window (the storage's
-        retained length), or None without a window."""
-        return (
-            self._storage()
-            .retained_window_lengths()
-            .get(window_sub_pool_of(self.token_to_kv_pool_allocator))
-        )
-
-    def _swa_tail_len(self, seq_len: int) -> int:
-        if not self._uses_swa_tail_prealloc():
-            return max(seq_len, 0)
-        tails = self._storage().window_tails(
-            seq_len, keep_insert_boundary=self._keep_insert_boundary()
-        )
-        return tails.get(window_sub_pool_of(self.token_to_kv_pool_allocator), seq_len)
+    def _window_available_sizes(self) -> Dict[str, int]:
+        """Each window pool's free tokens, by name."""
+        allocator = self.token_to_kv_pool_allocator
+        return {
+            name: allocator.window_available_size(name)
+            for name in allocator.window_pool_names()
+        }
 
     def _window_evictable_sizes(self) -> Dict[str, int]:
         """Each window pool's evictable tokens, by name."""
@@ -784,12 +775,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for name, tokens in self._window_retractable_lens(req).items():
                 total[name] += tokens
         return total
-
-    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = pre_alloc_fill_len(req)
-        if self._uses_swa_tail_prealloc():
-            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
-        return allocated_kv_len, allocated_kv_len
 
     def _prealloc_required(self, req: Req) -> Tuple[int, Dict[str, int]]:
         """The tokens a preallocation of ``req`` needs: the owner's, and each
@@ -2822,14 +2807,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
-        swa_tail_len = self._swa_tail_len(fill_len)
+        window_tails = self._window_tails(fill_len)
         swa_pages_charged = (
             uses_swa_tail
             and not is_swa_req_ring(allocator)
             and not self.scheduler.enable_hisparse
-        )
-        required_swa_tokens = (
-            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
         )
         if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
             # Admission includes evictable pages; allocation needs free pages.
@@ -2858,7 +2840,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req=req,
                 fill_len=fill_len,
                 uses_swa_tail=uses_swa_tail,
-                swa_tail_len=swa_tail_len,
+                # HiSparse pools keep one window.
+                swa_tail_len=next(iter(window_tails.values()), fill_len),
             )
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
@@ -2878,7 +2861,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len=total_prefix_len,
                 prefix_indices=prefix_indices,
                 uses_swa_tail=uses_swa_tail,
-                window_tails=self._window_tails(fill_len),
+                window_tails=window_tails,
                 req_to_token_pool=self.req_to_token_pool,
             )
         assert kv_loc is not None, (
@@ -2888,9 +2871,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
+            f"window_available={self._window_available_sizes() if swa_pages_charged else -1}, "
             f"window_evictable={self._window_evictable_sizes() if swa_pages_charged else -1}, "
-            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"window_tails={window_tails}, "
             f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
