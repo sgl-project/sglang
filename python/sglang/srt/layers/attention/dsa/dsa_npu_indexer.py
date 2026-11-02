@@ -54,17 +54,6 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
 
 
 class DSANPUIndexerMixin:
-    def _project_npu_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
-        # Match the shared projection's parameters. The sink/local operator
-        # takes FP32 gates; the standard torch_npu indexer takes BF16 gates.
-        weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
-        dtype = (
-            torch.float32
-            if self.num_init_tokens or self.num_local_tokens
-            else torch.bfloat16
-        )
-        return weights.to(dtype)
-
     def _forward_npu_sink_local_indexer(
         self,
         query: torch.Tensor,
@@ -203,12 +192,12 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
                     x = x.view(-1, self.hidden_size)
-                    weights = self._project_npu_indexer_weights(x)
+                    weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
                     weights.record_stream(indexer_weight_stream)
                     weights_event = indexer_weight_stream.record_event()
             else:
                 x = x.view(-1, self.hidden_size)
-                weights = self._project_npu_indexer_weights(x)
+                weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
@@ -232,12 +221,12 @@ class DSANPUIndexerMixin:
                 indexer_weight_stream.wait_stream(torch.npu.current_stream())
                 with torch.npu.stream(indexer_weight_stream):
                     x = x.view(-1, self.hidden_size)
-                    weights = self._project_npu_indexer_weights(x)
+                    weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
                     weights.record_stream(indexer_weight_stream)
                     weights_event = indexer_weight_stream.record_event()
             else:
                 x = x.view(-1, self.hidden_size)
-                weights = self._project_npu_indexer_weights(x)
+                weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
 
             q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
