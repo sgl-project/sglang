@@ -43,6 +43,42 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
+def k3_mla_verify_max_kv_len(forward_batch: ForwardBatch, num_draft_tokens: int) -> int:
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        max_seq_len = int(seq_lens_cpu.max().item())
+    else:
+        max_seq_len = int(forward_batch.seq_lens.max().item())
+    return max_seq_len + num_draft_tokens
+
+
+@dataclass(frozen=True)
+class K3MlaVerifyGraphVariants:
+    """One target-verify graph per AITER MLA verify kernel (Gluon, HipKittens)."""
+
+    num_draft_tokens: int
+    capture_labels: ClassVar[tuple[str, ...]] = ("gluon", "hk")
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        from aiter.mla_verify import select_mla_verify_kernel
+
+        return select_mla_verify_kernel(
+            forward_batch.batch_size,
+            k3_mla_verify_max_kv_len(forward_batch, self.num_draft_tokens),
+        )
+
+
+def create_k3_mla_verify_graph_variants(
+    attn_backend, capture_forward_mode
+) -> Optional[K3MlaVerifyGraphVariants]:
+    if not capture_forward_mode.is_target_verify():
+        return None
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if not getattr(backend, "use_k3_mla_verify", False):
+        return None
+    return K3MlaVerifyGraphVariants(backend.num_draft_tokens)
+
+
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
