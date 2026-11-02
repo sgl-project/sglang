@@ -62,7 +62,6 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
-    get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The lists that hold the live requests, by name (`Scheduler.request_lists`).
     get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
@@ -71,8 +70,6 @@ class SchedulerInvariantChecker:
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
     get_pp_mbs: Callable = field(default=lambda: ())
-    # When False, extend step batches hold no running request.
-    prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -269,11 +266,6 @@ class SchedulerInvariantChecker:
 
     def _requests_owning_rows(self) -> List[Req]:
         reqs = [req for reqs in self.get_request_lists().values() for req in reqs]
-        # A request PD prefill or HiSparse launched is in no list until its
-        # result is processed.
-        for batch in (self.get_last_batch(), self.get_running_batch()):
-            if batch is not None:
-                reqs += batch.reqs
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
@@ -498,16 +490,15 @@ class SchedulerInvariantChecker:
         last_batch: Optional[ScheduleBatch],
     ) -> None:
         """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the batches hold, apart from the chunked request."""
+        the unfinished ones the running batches and the decode steps hold, apart
+        from the chunked request. A launched prefill joins running at its merge."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        step_batches = [last_batch, *self.get_pp_mbs()]
-        if not self.prefill_launch_starts_running():
-            step_batches = [
-                b
-                for b in step_batches
-                if b is not None and not b.forward_mode.is_extend()
-            ]
+        step_batches = [
+            b
+            for b in (last_batch, *self.get_pp_mbs())
+            if b is not None and not b.forward_mode.is_extend()
+        ]
         self.get_running_reqs().check(
             [running_batch, *self.get_pp_running_mbs(), *step_batches],
             chunked_req=self.get_chunked_req(),

@@ -85,7 +85,6 @@ def _invariant_checker(s):
         req_to_token_pool=None,
         pool_stats_observer=None,
         get_last_batch=Mock(),
-        get_running_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -97,6 +96,7 @@ def _empty_request_lists(s):
     s.waiting_queue = []
     s.grammar_manager = SimpleNamespace(grammar_queue=[])
     s.chunked_req = None
+    s.prefill_launched = []
     s.disagg_prefill_transfer_queue = None
     s.disagg_prefill_bootstrap_queue = None
     s.disagg_decode_prealloc_queue = None
@@ -140,6 +140,21 @@ def _scheduler():
     s._maybe_clear_mm_inputs = Mock()
     s.maybe_send_health_check_signal = Mock()
     return s
+
+
+def _schedule_without_admission(s):
+    s.process_pending_chunked_abort = Mock()
+    s._process_hicache_events = Mock()
+    s.require_mlp_sync = False
+    s.spec_algorithm = SpeculativeAlgorithm.NONE
+    s._should_defer_prefill = Mock(return_value=True)
+    s.update_running_batch = lambda b: b
+    s.dp_attn_adapter = SimpleNamespace(
+        maybe_prepare_mlp_sync_batch=lambda b, **_: b,
+        maybe_convert_decode_to_extend=lambda b: b,
+    )
+    s._arm_prefill_decode_interval = Mock()
+    s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=lambda b, **_: b)
 
 
 def _launch(s, batch):
@@ -189,28 +204,32 @@ class TestRunningReqsHooks(CustomTestCase):
         super().setUp()
         enter_scope(self, published_topology())
 
-    def test_launch_joins_requests_whose_last_chunk_runs(self):
+    def test_launch_holds_prefills_until_the_merge(self):
         s = _scheduler()
         a, chunk, new, decoding = (_req(rid) for rid in ("a", "c", "n", "d"))
         s.running_reqs.join([decoding])
 
         _launch(s, _batch([a, chunk], ForwardMode.EXTEND, chunked_req=chunk))
-        _launch(s, _batch([new, decoding], ForwardMode.MIXED))
+        mixed = _batch([new, decoding], ForwardMode.MIXED)
+        _launch(s, mixed)
         _launch(s, _batch([_req("decode-only")], ForwardMode.DECODE))
 
-        self.assertEqual(list(s.running_reqs), [decoding, a, new])
+        self.assertEqual(s.prefill_launched, [a, new])
+        self.assertEqual(list(s.running_reqs), [decoding])
 
-        for field, value in (
-            ("disaggregation_mode", DisaggregationMode.PREFILL),
-            ("disaggregation_mode", DisaggregationMode.DECODE),
-            ("dllm_config", object()),
-            ("enable_hisparse", True),
-        ):
-            with self.subTest(field=field, value=value):
-                s = _scheduler()
-                setattr(s, field, value)
-                _launch(s, _batch([_req("p")], ForwardMode.EXTEND))
-                self.assertEqual(len(s.running_reqs), 0)
+        _schedule_without_admission(s)
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            Scheduler.get_next_batch_to_run(
+                s, ScheduleBatch(reqs=[], batch_is_full=False), mixed
+            )
+        self.assertEqual(s.prefill_launched, [a])
+        self.assertEqual(list(s.running_reqs), [decoding, new])
+
+        # dLLM keeps its requests in its own queue.
+        s = _scheduler()
+        s.dllm_config = object()
+        _launch(s, _batch([_req("p")], ForwardMode.EXTEND))
+        self.assertEqual(s.prefill_launched, [])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
         # A grammar row under NGRAM processes the previous result early; once it

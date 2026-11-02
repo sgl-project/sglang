@@ -97,6 +97,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
         scheduler.running_reqs = RunningReqs()
+        scheduler.prefill_launched = []
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
