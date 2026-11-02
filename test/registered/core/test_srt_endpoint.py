@@ -109,6 +109,15 @@ class TestSRTEndpoint(CustomTestCase):
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
 
+    def test_clear_hicache_storage_without_hierarchical_cache(self):
+        response = requests.post(
+            self.base_url + "/hicache/storage-backend/clear", timeout=10
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.text, "Failed to clear hierarchical cache storage backend.\n"
+        )
+
     def test_logprob(self):
         self.run_decode(
             return_logprob=True,
