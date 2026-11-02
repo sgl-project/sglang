@@ -295,6 +295,10 @@ print(dict(zip(options, scores)))
 
 Structured output gives the same decision through generation. A one-token regex such as `(A|B|C)` with `temperature` 0 and logprobs returns probabilities renormalized over the labels, equal to the `/v1/score` values for one-character labels in the same cache state. A JSON schema with `enum` fields fills several fields in one response, but gives no clean per-option probability, because an enum value can span several tokens. See [Structured outputs](/docs/advanced_features/structured_outputs) for the request formats.
 
+## Block-bidirectional checkpoints
+
+Some decision checkpoints, such as Base Labs' [elephant-1](https://huggingface.co/baselabs/elephant-1) and [mammoth-1](https://huggingface.co/baselabs/mammoth-1), are trained with a two-block prefix-LM mask: the state attends to itself in both directions, the question attends to the state and to itself in both directions, and the state never sees the question. Serve them through `/generate` with `bidir_prefix_len` set to the token index where the question starts and read the answer probabilities from `token_ids_logprob` at the last position. The radix cache keeps a state block only when a request matches it in full, so every question on the same state after the first reuses the state prefill; partial matches are treated as misses because their keys were computed with a different state. This needs `--attention-backend triton` and prompts that fit in `--chunked-prefill-size`.
+
 ## Limitations
 
 - Labels must be one token at the answer position. `/v1/decisions` assigns one-token labels for you, and a client-built prompt must do the same.
