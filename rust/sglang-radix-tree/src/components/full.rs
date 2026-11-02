@@ -7,7 +7,7 @@ use std::collections::{BinaryHeap, HashMap};
 use tch::{Kind, Tensor};
 
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL};
+use crate::components::{ComponentType, FULL, Family};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -30,6 +30,10 @@ impl FullComponent {
 impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn component_type(&self) -> ComponentType {
         FULL
+    }
+
+    fn family(&self) -> Family {
+        Family::Token
     }
 
     fn create_match_validator(
