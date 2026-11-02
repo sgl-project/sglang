@@ -1131,28 +1131,82 @@ class TopK(BaseFusedOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        explicit_dispatch_info = expert_location_dispatch_info is not None
         num_token_non_padded, expert_location_dispatch_info = (
             self._resolve_routing_inputs(
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
-        self.topk_config.torch_native = True
-        # [NOTE] XPU device support for topk kernels
-        #   - support 'topk_softmax' and 'topk_sigmoid'
-        #   - support up to 8 top-k and 256 experts
-        self.topk_config.torch_native = not (
-            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
-        )
+        if dynamic_expert_bias is not None:
+            output_format = TopKOutputFormat.STANDARD
+        elif self.topk_config.output_format is not None:
+            output_format = self.topk_config.output_format
+        else:
+            raise RuntimeError(
+                "TopK requires the owning experts' runner backend or an explicit output format."
+            )
 
-        return select_experts(
-            hidden_states=hidden_states,
-            layer_id=self.layer_id,
-            router_logits=router_logits,
-            topk_config=self.topk_config,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            dynamic_expert_bias=dynamic_expert_bias,
+        requires_remapping = expert_location_dispatch_info is not None and (
+            explicit_dispatch_info
+            or is_expert_remapping_enabled()
+            or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
         )
+        if output_format == TopKOutputFormat.TRITON_KERNEL and requires_remapping:
+            raise NotImplementedError(
+                "Expert placement remapping requires a MoE runner with standard TopK routing; "
+                f"got {output_format.name}."
+            )
+
+        if output_format == TopKOutputFormat.TRITON_KERNEL:
+            # renormalize=True is equivalent to sm_first=False
+            (
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            ) = routing(
+                router_logits,
+                self.topk_config.top_k,
+                sm_first=not self.topk_config.renormalize,
+                n_rows=num_token_non_padded,
+            )
+            return TritonKernelTopKOutput(
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            )
+        elif output_format == TopKOutputFormat.BYPASSED:
+            return BypassedTopKOutput(
+                hidden_states=hidden_states,
+                raw_router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=(
+                    expert_location_dispatch_info if requires_remapping else None
+                ),
+            )
+        else:
+            self.topk_config.torch_native = True
+            # [NOTE] XPU device support for topk kernels
+            #   - support 'topk_softmax' and 'topk_sigmoid'
+            #   - support up to 8 top-k and 256 experts
+            self.topk_config.torch_native = not (
+                self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
+            )
+            # TODO: symmetric memory
+            topk_output = select_experts(
+                hidden_states=hidden_states,
+                layer_id=self.layer_id,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                dynamic_expert_bias=dynamic_expert_bias,
+            )
+        return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
 
 # ------------------------------- TopK implementation -------------------------------------

@@ -37,7 +37,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
-  "openai==2.6.1",
+  "openai==2.8.0",
   "openai-harmony==0.0.4",
   "orjson",
   "outlines==0.1.11",
@@ -59,6 +59,7 @@ dependencies = [
   "setproctitle",
   "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.5.0+xpu/sglang_kernel_xpu-0.5.0-cp310-abi3-manylinux_2_38_x86_64.whl",
   "smg-grpc-servicer>=0.9.0",
+  "triton_kernels @ git+https://github.com/intel/intel-xpu-backend-for-triton.git@v3.8.0#subdirectory=python/triton_kernels",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.25",
@@ -125,6 +126,7 @@ test = [
   "sentence_transformers",
   "sgl-eval==0.1.3",
   "tabulate",
+  "sgl-eval==0.1.3",
 ]
 
 dev = ["sglang[test]"]
