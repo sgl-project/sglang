@@ -316,6 +316,42 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
             result, torch.tensor([17, 64, 31], dtype=torch.int32)
         )
 
+    def test_verify_scratch_builds_the_valid_mask_only_for_stable_rows(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
+        )
+
+        default = torch.arange(8, dtype=torch.int32)
+        req_rows = torch.tensor([17, 23, 31], dtype=torch.int64)
+        cache_indices = torch.tensor([4, -1, 9], dtype=torch.int32)
+        calls = []
+
+        def valid():
+            calls.append(1)
+            return cache_indices >= 0
+
+        with patch(
+            "sglang.srt.layers.attention.linear.utils.pp_spec_stable_rows_enabled",
+            return_value=False,
+        ):
+            result = select_verify_intermediate_state_indices(
+                default, req_rows, valid, pool_size=64
+            )
+        self.assertIs(result, default)
+        self.assertEqual(calls, [])
+
+        with patch(
+            "sglang.srt.layers.attention.linear.utils.pp_spec_stable_rows_enabled",
+            return_value=True,
+        ):
+            result = select_verify_intermediate_state_indices(
+                default, req_rows, valid, pool_size=64
+            )
+        self.assertEqual(calls, [1])
+        torch.testing.assert_close(
+            result, torch.tensor([17, 64, 31], dtype=torch.int32)
+        )
+
 
 class TestMtpVerifyHookSignature(CustomTestCase):
     """Every ``update_mamba_state_after_mtp_verify`` override must accept the full
