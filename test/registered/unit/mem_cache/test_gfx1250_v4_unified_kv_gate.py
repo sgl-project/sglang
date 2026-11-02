@@ -1,13 +1,13 @@
 import unittest
 from unittest.mock import patch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4 import unified_kv_gate as env_gate
+from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_fp8,
     is_unified_kv_triton,
     maybe_enable_gfx1250_v4_unified_kv,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx1250_supported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
