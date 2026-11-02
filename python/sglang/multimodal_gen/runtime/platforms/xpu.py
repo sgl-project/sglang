@@ -116,6 +116,14 @@ class XpuPlatform(Platform):
         Defaults to XPU backend (requires fp16/bf16 and a supported head size),
         falling back to Torch SDPA if constraints are not met.
         """
+        if selected_backend == AttentionBackendEnum.SAGE_ATTN:
+            sage_cls_str = cls._get_sage_attn_backend_cls_str(
+                head_size=head_size, dtype=dtype
+            )
+            if sage_cls_str is not None:
+                return sage_cls_str
+            selected_backend = AttentionBackendEnum.FA
+
         if selected_backend in (AttentionBackendEnum.FA, None):
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.info(
@@ -152,7 +160,6 @@ class XpuPlatform(Platform):
 
         if selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
-            AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.SAGE_ATTN_3,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
@@ -169,6 +176,35 @@ class XpuPlatform(Platform):
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )
+
+    @classmethod
+    def _get_sage_attn_backend_cls_str(
+        cls, head_size: int, dtype: torch.dtype
+    ) -> str | None:
+        try:
+            from sglang.kernels.ops.diffusion import (  # noqa: F401
+                sage_attn_qk_int8_pv_fp16,
+            )
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (
+                SageAttentionBackend,
+            )
+        except ImportError as e:
+            logger.info(
+                "Sage Attention Triton kernel failed to import (%s); falling back to Flash Attention.",
+                e,
+            )
+            return None
+
+        # leave fallback policy to the component-aware selector
+        if head_size not in SageAttentionBackend.get_supported_head_sizes():
+            raise ValueError(
+                f"SageAttention 2 does not support head size {head_size}; "
+                "supported head sizes are 1 through 128"
+            )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"SageAttention requires fp16/bf16 but got dtype={dtype}")
+        logger.info("Using Sage Attention (Triton) backend on Intel XPU.")
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
 
     @classmethod
     def get_all_to_all_communicator_cls(cls) -> str:
