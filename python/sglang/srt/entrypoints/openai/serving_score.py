@@ -88,6 +88,7 @@ class OpenAIServingScore(OpenAIServingBase):
                 item_embed_overrides=item_embed_overrides,
                 score_extraction_token_id=score_extraction_token_id,
                 request=raw_request,
+                received_time=request.received_time,
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
                 temperature=request.temperature,
                 return_token_logprobs=request.return_token_logprobs,
