@@ -297,7 +297,7 @@ class HcReadCall(HcRead):
                 layer.hc_sinkhorn_iters,
                 cached if cached is not None else norm.weight.data,
                 norm.variance_epsilon,
-                fn_transpose=not self.attention,
+                fn_transpose=True,
             )
             if fused is not None:
                 streams, x, post, comb, norm_fused = fused
