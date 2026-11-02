@@ -4452,7 +4452,9 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
