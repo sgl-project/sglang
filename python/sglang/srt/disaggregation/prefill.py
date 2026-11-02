@@ -1857,7 +1857,7 @@ class SchedulerDisaggregationPrefillMixin:
             send_state_indices = state_indices if segment_is_last else None
             # The engine reads these rows by physical id until it is done.
             record_network_transfer(
-                self.token_to_kv_pool_allocator,
+                kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator),
                 req,
                 kv_manager=sender.kv_mgr,
                 writes=False,

@@ -164,15 +164,13 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
-def end_network_transfer(token_to_kv_pool_allocator, req) -> None:
+def end_network_transfer(storage, req) -> None:
     """The request's transfers ended: the rows they addressed may be reused."""
-    storage = token_to_kv_pool_allocator.storage
-    if storage is not None:
-        storage.end_network_transfer(req)
+    storage.end_network_transfer(req)
 
 
 def record_network_transfer(
-    token_to_kv_pool_allocator,
+    storage,
     req,
     *,
     kv_manager,
@@ -194,12 +192,12 @@ def record_network_transfer(
     from sglang.srt.disaggregation.common.conn import CommonKVManager
     from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 
-    storage = token_to_kv_pool_allocator.storage
-    if storage is None:
-        return
     flag = storage.record_network_transfer(
         req, storage.owner, page_indices, unit_tokens=page_size, writes=writes
     )
+    if flag is None:
+        # A storage whose rows never move keeps no completion flag.
+        return
     if state_indices is not None:
         # State entries are registered in the storage's wire order, so the
         # i-th entry carries the i-th wire entry's sub-pool.

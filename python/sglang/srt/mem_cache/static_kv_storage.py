@@ -374,6 +374,31 @@ class StaticKVStorage:
             window_sub_pool=window_sub_pool or "swa",
         )
 
+    def record_forward(
+        self,
+        forward_done,
+        *,
+        written_tokens,
+        token_writes_unknown: bool,
+        req_pool_indices,
+        state_slots,
+    ) -> None:
+        """See `KVStorage.record_forward`: static pools never move a row, so
+        nothing races a forward."""
+
+    def retire_forward(self, forward_done) -> None:
+        """See `KVStorage.retire_forward`: nothing was recorded."""
+
+    def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
+        """See `KVStorage.record_host_transfer`: no row moves under a copy."""
+
+    def record_network_transfer(
+        self, req: Req, sub_pool: str, units, *, unit_tokens: int, writes: bool
+    ) -> None:
+        """See `KVStorage.record_network_transfer`: no row moves under a
+        transfer, so there is no completion flag to wait."""
+        return None
+
     def end_network_transfer(self, req: Req) -> None:
         """Rows of a static pool are not ordered against network transfers."""
 
@@ -630,6 +655,11 @@ class StaticKVStorage:
         """See `KVStorage.entry_sub_pool`: a static pool's entries are slices
         of its pools, not sub-pools."""
         return None
+
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """See `KVStorage.entry_sub_pools`: a static pool's entries are slices
+        of its pools, none of them a sub-pool."""
+        return ()
 
     def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
         """See `KVStorage.entry_wire_key`: none for a static pool's entries."""

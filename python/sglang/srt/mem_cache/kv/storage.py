@@ -166,6 +166,14 @@ class KVStorage:
                 )
             )
         self._sub_pools = tuple(sub_pools)
+        # The allocator prices each window by the tail a request keeps of it;
+        # a window the model does not state has none until it is bound.
+        if all(
+            s.lifetime.window is not None
+            for s in plan.sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        ):
+            allocator.retained_windows = self.retained_window_lengths()
 
     def host_layout(self, name: str):
         """The sub-pool's host layout and persistent device buffers."""
@@ -682,6 +690,10 @@ class KVStorage:
         """The sub-pool a transfer entry carries here."""
         return entry.sub_pool
 
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """The sub-pool each transfer entry carries, in wire order."""
+        return tuple(self.entry_sub_pool(entry) for entry in self.wire_entries())
+
     def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
         """The key PD peers tell entries of one state type apart by."""
         return entry.key
@@ -718,6 +730,7 @@ class KVStorage:
         the model does not state (``sliding_window``)."""
         self._window_reaches = dict(reaches or {})
         self._unstated_window = sliding_window
+        self._allocator.retained_windows = self.retained_window_lengths()
 
     def retained_window_lengths(self) -> Dict[str, int]:
         """The tail a running request keeps of each window sub-pool, by name:

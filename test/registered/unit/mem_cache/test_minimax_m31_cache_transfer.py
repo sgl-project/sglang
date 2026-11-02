@@ -242,7 +242,7 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
     sender.get_max_transfer_tokens.return_value = None
     scheduler = SimpleNamespace(
         token_to_kv_pool_allocator=SimpleNamespace(
-            page_size=128, translate_kv_indices_for_transfer=lambda x: x
+            page_size=128, translate_kv_indices_for_transfer=lambda x: x, storage=None
         ),
         req_to_token_pool=SimpleNamespace(
             req_to_token=token_mapping([2, 4, 1, 3], length).unsqueeze(0)

@@ -141,7 +141,7 @@ class TestUnifiedWindowWire(CustomTestCase):
         ids = [np.array([i + 1]) for i in range(len(kv_args.state_types))]
         with patch.object(storage, "record_network_transfer") as record:
             record_network_transfer(
-                SimpleNamespace(storage=storage),
+                storage,
                 req,
                 kv_manager=None,
                 writes=True,

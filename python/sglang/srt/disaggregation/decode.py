@@ -2140,7 +2140,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # transfer is done with them where main releases them.
             transfer_queue = self.transfer_queue
             record_network_transfer(
-                self.token_to_kv_pool_allocator,
+                self._storage(),
                 decode_req.req,
                 kv_manager=self.kv_manager,
                 writes=True,
@@ -3421,7 +3421,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 # The peer wrote its last byte.
                 end_network_transfer(
-                    self.tree_cache.token_to_kv_pool_allocator, decode_req.req
+                    kv_storage_of(
+                        self.tree_cache.req_to_token_pool,
+                        self.tree_cache.token_to_kv_pool_allocator,
+                    ),
+                    decode_req.req,
                 )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

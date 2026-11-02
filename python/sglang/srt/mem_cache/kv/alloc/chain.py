@@ -204,6 +204,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     """Token, window and state allocation over one shared byte buffer."""
 
     hands_out_virtual_ids = True
+    # Bound at construction: the plan the chain's sub-pools come from, the
+    # request rows' memory a snapshot copies, and (once the storage binds
+    # them) the tail a running request keeps of each window, by sub-pool.
+    plan = None
+    request_memory = None
+    retained_windows: Optional[Dict[str, int]] = None
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -855,8 +861,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cap this pool applies."""
         # Each window is charged the tail a running request keeps of it.
         windows = (
-            self.storage.retained_window_lengths()
-            if self.storage is not None
+            self.retained_windows
+            if self.retained_windows is not None
             else {window.sub_pool_name: sliding_window_size for window in self._windows}
         )
         state_slots = 0 if self.mamba_allocator is None else 1

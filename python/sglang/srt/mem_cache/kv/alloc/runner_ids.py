@@ -163,7 +163,7 @@ class RunnerIds:
                     "A sharded --cp-kv-layout does not support --enable-unified-memory."
                 )
             alloc = token_to_kv_pool_allocator
-            plan = None if alloc.storage is None else alloc.storage.plan
+            plan = alloc.plan
             drafts = (
                 set()
                 if plan is None or plan.fused_draft is None

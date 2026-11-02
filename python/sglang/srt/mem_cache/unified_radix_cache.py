@@ -1900,11 +1900,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
             (id(self), "restore"), completion.finish_event
         )
-        storage = self.token_to_kv_pool_allocator.storage
-        if storage is not None:
-            storage.record_host_transfer(
-                completion.finish_event, transfers, writes=True
-            )
+        self.kv_storage().record_host_transfer(
+            completion.finish_event, transfers, writes=True
+        )
         req.kv.restore_done_event = completion.finish_event
         self._pending_restore_backups.append((completion.finish_event, backup))
 

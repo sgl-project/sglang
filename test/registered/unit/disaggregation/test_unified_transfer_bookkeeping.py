@@ -87,7 +87,7 @@ class TestTransferBookkeeping(CustomTestCase):
             kv=SimpleNamespace(holds_kv=True, is_kv_released=False),
         )
         record_network_transfer(
-            allocator,
+            storage,
             req,
             kv_manager=_Manager(),
             writes=True,
