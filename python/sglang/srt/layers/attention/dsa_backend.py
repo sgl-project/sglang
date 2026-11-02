@@ -731,15 +731,19 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.gluon_sparse_mla_decode = _load_gluon_sparse_mla_decode(
-            decode_impl=self.dsa_decode_impl,
-            kv_cache_dtype=self.kv_cache_dtype,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=model_runner.model_config.v_head_dim,
-            num_q_heads=self.num_q_heads,
-            dcp_size=self.dcp_size,
+        self.gluon_sparse_mla_decode = (
+            _load_gluon_sparse_mla_decode(
+                decode_impl=self.dsa_decode_impl,
+                kv_cache_dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=model_runner.model_config.v_head_dim,
+                num_q_heads=self.num_q_heads,
+                dcp_size=self.dcp_size,
+            )
+            if _IS_GFX95
+            else None
         )
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
