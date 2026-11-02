@@ -1208,6 +1208,9 @@ class HummingMoEMethod(FusedMoEMethodBase):
             self._process_sublayer_after_loading(
                 layer, sublayer_name, configs, use_deepep_fp8_dispatch
             )
+            # Free the replaced blocks before later allocations split them and
+            # strand the rest.
+            torch.cuda.empty_cache()
         self.processed = True
 
     def _process_sublayer_after_loading(
