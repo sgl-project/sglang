@@ -333,7 +333,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
             base_dims = (self.layer_num, self.page_num, self.page_size, 1)
             indexer_dims = (
-                len(native.index_layer_indices), self.page_num, self.page_size, 1
+                len(native.index_layer_indices),
+                self.page_num,
+                self.page_size,
+                1,
             )
             return self._init_kv_split_buffer(
                 base_dims,
@@ -385,7 +388,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             base_dims = (self.page_num, self.layer_num, self.page_size, 1)
             indexer_dims = (
-                self.page_num, len(native.index_layer_indices), self.page_size, 1
+                self.page_num,
+                len(native.index_layer_indices),
+                self.page_size,
+                1,
             )
             return self._init_kv_split_buffer(
                 base_dims,
@@ -977,7 +983,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             for native, host_layer_start, is_target in self._npu_pool_bindings:
-                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                if (
+                    torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() == 0
+                ):
                     print(
                         f"[MF-AIV D2H] all-layer begin: layout={self.layout} "
                         f"host_layer_start={host_layer_start} is_target={is_target} "
@@ -1000,7 +1009,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     host_layer_start=host_layer_start,
                     impl="auto",
                 )
-                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                if (
+                    torch.distributed.is_initialized()
+                    and torch.distributed.get_rank() == 0
+                ):
                     print(
                         f"[MF-AIV D2H] all-layer end: "
                         f"host_layer_start={host_layer_start} "

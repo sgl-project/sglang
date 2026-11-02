@@ -7,6 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -62,6 +66,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
             _is_npu=True,
             maybe_dcp_kernel_indices=self.localize,
             logger=Mock(),
+            torch=SimpleNamespace(
+                distributed=SimpleNamespace(is_initialized=lambda: False)
+            ),
             memfabric_host_memory_enabled=lambda: False,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
@@ -188,7 +195,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
     def test_transfers_reuse_bindings_without_resolving_pools_or_checking_drafts(self):
         self.add_draft()
         for info in self.host._native_infos:
-            info.native_buffers = Mock(side_effect=AssertionError("resolved at runtime"))
+            info.native_buffers = Mock(
+                side_effect=AssertionError("resolved at runtime")
+            )
         self.host._npu_draft_pool_compatible = Mock(
             side_effect=AssertionError("checked at runtime")
         )
@@ -255,12 +264,15 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
-                    expected_bytes = 8 * 128 * (
-                        3 * (self.native.k_width + v_width) * h.dtype.itemsize
-                        + 2 * 128 * h.dtype.itemsize
-                        + 2 * 4
+                    expected_blocks = [
+                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
+                    ]
+                    if v_width:
+                        expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
+                    expected_blocks.extend(
+                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
                     )
-                    reserve.assert_called_once_with(expected_bytes, 0)
+                    reserve.assert_called_once_with(expected_blocks, 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
@@ -279,11 +291,13 @@ class TestNPUSparseDispatch(unittest.TestCase):
         path = ROOT / "python/sglang/srt/hardware_backend/npu/utils.py"
         tree = ast.parse(path.read_text())
         function = next(
-            n for n in tree.body
+            n
+            for n in tree.body
             if isinstance(n, ast.FunctionDef) and n.name == "set_default_server_args"
         )
         block = next(
-            n for n in function.body
+            n
+            for n in function.body
             if isinstance(n, ast.If)
             and any(
                 isinstance(child, ast.keyword) and child.arg == "hicache_io_backend"
@@ -302,14 +316,20 @@ class TestNPUSparseDispatch(unittest.TestCase):
                         cfg=cfg,
                         args=cfg,
                         use_mla_backend=lambda _: mla,
-                        declare_resolution=lambda args, source, **kw: resolved.update(kw),
+                        declare_resolution=lambda args, source, **kw: resolved.update(
+                            kw
+                        ),
                     )
                     exec(code, namespace)
                     expected = (
-                        "layer_first_kv_split"
-                        if layout in ("layer_first", "layer_first_kv_split")
-                        else "page_first_kv_split"
-                    ) if mla else "page_first_direct"
+                        (
+                            "layer_first_kv_split"
+                            if layout in ("layer_first", "layer_first_kv_split")
+                            else "page_first_kv_split"
+                        )
+                        if mla
+                        else "page_first_direct"
+                    )
                     self.assertEqual(resolved["hicache_mem_layout"], expected)
                     self.assertEqual(resolved["hicache_io_backend"], "kernel_ascend")
 

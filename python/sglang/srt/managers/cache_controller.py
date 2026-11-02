@@ -989,9 +989,8 @@ class HiCacheController:
             )
 
             if (
-                self.mem_pool_host.layout in (
-                    "page_first_kv_split", "layer_first_kv_split"
-                )
+                self.mem_pool_host.layout
+                in ("page_first_kv_split", "layer_first_kv_split")
                 or ascendc_io_enabled()
             ):
                 # Both LOCAL kv_exchange and LOCAL_URMA sparse_copy read token

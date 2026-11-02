@@ -59,7 +59,7 @@ class PrefetchHandle:
 
     def __init__(
         self,
-        engine: "L2TransferEngine",
+        engine: L2TransferEngine,
         transfers: list[L2Transfer],
         layer_num: int,
         ack_finish_event,
