@@ -182,14 +182,19 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        with _local_rank_compile_lock(kernel_type, n, k, num_groups):
-            _compile_deep_gemm_one_type_all(
-                kernel_type=kernel_type,
-                n=n,
-                k=k,
-                num_groups=num_groups,
-                m_list=_BUILTIN_M_LIST,
-            )
+        try:
+            with _local_rank_compile_lock(kernel_type, n, k, num_groups):
+                _compile_deep_gemm_one_type_all(
+                    kernel_type=kernel_type,
+                    n=n,
+                    k=k,
+                    num_groups=num_groups,
+                    m_list=_BUILTIN_M_LIST,
+                )
+        except BaseException:
+            # A failed or interrupted warmup must not suppress a later retry.
+            _INITIALIZATION_DICT.pop(query_key, None)
+            raise
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
@@ -249,13 +254,16 @@ def _compile_deep_gemm_one_type_all(
         )
         if has_compile_mode_api:
             old_compile_mode = deep_gemm.get_compile_mode()
-            deep_gemm.set_compile_mode(1)
 
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc="DeepGEMM warmup"):
-            executor.execute(m=m)
-        if has_compile_mode_api:
-            deep_gemm.set_compile_mode(old_compile_mode)
+        try:
+            if has_compile_mode_api:
+                deep_gemm.set_compile_mode(1)
+            # TODO can use multi thread
+            for m in tqdm(m_list, desc="DeepGEMM warmup"):
+                executor.execute(m=m)
+        finally:
+            if has_compile_mode_api:
+                deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
