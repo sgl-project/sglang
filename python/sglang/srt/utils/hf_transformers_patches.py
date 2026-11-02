@@ -41,17 +41,9 @@ _applied = False
 
 
 def apply_all_hf_patches():
-    """Apply all transformers compatibility patches (idempotent).
-
-    No-op when the ``transformers`` package is not installed.
-    """
+    """Apply all transformers compatibility patches (idempotent)."""
     global _applied
     if _applied:
-        return
-    try:
-        import transformers  # noqa: F401
-    except ImportError:
-        _applied = True
         return
     _applied = True
 
