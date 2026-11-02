@@ -202,6 +202,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                 fixture.runner._server_args_override.restore()
 
     def test_window_511_prefill_and_cached_decode_boundary_keys(self):
+        """Sliding layers must drop the key past the window in prefill and decode."""
         # Orthogonal key coordinates give the selected sentinel a logit of 32.
         # Its value dominates when visible; masking it out yields an exactly
         # representable uniform mean. A missing/extra boundary key therefore
@@ -295,6 +296,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                         )
 
     def test_window_511_mixed_prefill_boundary_keys(self):
+        """Prefill must apply the window at each request's own positions."""
         case = DenseAttentionCase(
             name="swa_511_mixed_prefill_boundary_keys",
             backend="flashinfer",
@@ -326,8 +328,8 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             )
 
     def test_long_prefix_and_extend_masks(self):
-        # Both portions exceed the window: cached keys must leave the window
-        # while new keys first enter it, then leave it within the same extend.
+        """Both portions exceed the window: cached keys must leave the window
+        while new keys first enter it, then leave it within the same extend."""
         case = DenseAttentionCase(
             name="swa_long_prefix_and_extend_masks",
             backend="flashinfer",
@@ -382,6 +384,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                 )
 
     def test_sliding_and_full_layers_reuse_same_prefill_metadata(self):
+        """Full layers must not inherit the sliding layers' prefill window."""
         case = DenseAttentionCase(
             name="swa_full_swa_shared_prefill_metadata",
             backend="flashinfer",

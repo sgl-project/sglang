@@ -543,30 +543,28 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
-        # Sliding and full layers can require different kernels and window
-        # specializations. Keep their ragged plans separate, as for paged KV.
-        self.prefill_wrappers_ragged = [
-            BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                # CUTLASS ragged attention does not apply a sliding mask.
-                backend=(
-                    "auto"
-                    if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-                    and wrapper_id == 0
-                    else fmha_backend
-                ),
-            )
-            for wrapper_id in range(self.num_wrappers)
-        ]
-        self.prefill_wrapper_ragged = self.prefill_wrappers_ragged[0]
 
         # Sliding/full or decoder/cross-attention layers use separate plans.
+        self.prefill_wrappers_ragged = []
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
+        for wrapper_id in range(self.num_wrappers):
             if not skip_prefill:
+                self.prefill_wrappers_ragged.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        # CUTLASS ragged attention does not apply a sliding mask.
+                        backend=(
+                            "fa2"
+                            if fmha_backend == "cutlass"
+                            and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                            and wrapper_id == 0
+                            else fmha_backend
+                        ),
+                    )
+                )
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -1956,7 +1954,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self._swa_space = attn_backend._swa_space
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
@@ -2022,7 +2019,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
