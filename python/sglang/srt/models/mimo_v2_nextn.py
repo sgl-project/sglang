@@ -20,15 +20,19 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    enable_moe_dense_fully_dp,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+    layer_stack,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -36,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
@@ -96,37 +101,32 @@ class MiMoV2MTPLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
-        is_previous_layer_sparse = True
         is_next_layer_sparse = False
 
-        if enable_moe_dense_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
-        else:
-            mlp_tp_rank, mlp_tp_size = None, None
+        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
         self.mlp = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
+            parallel_group=mlp_parallel_group,
+            reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
         )
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (declare_attn(), self.input_layernorm),
+            (
+                declare_ffn(
+                    sparse=self.is_layer_sparse,
+                    next_layer_sparse=is_next_layer_sparse,
+                ),
+                self.post_attention_layernorm,
+            ),
         )
 
     def forward(
@@ -134,12 +134,9 @@ class MiMoV2MTPLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -148,16 +145,13 @@ class MiMoV2MTPLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class MiMoV2ModelNextN(nn.Module):
@@ -183,12 +177,13 @@ class MiMoV2ModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.mtp_block = MiMoV2MTPLayer(
-            config,
-            0,
-            quant_config=quant_config,
-            prefix=add_prefix("decoder", prefix),
-        )
+        with layer_stack():
+            self.mtp_block = MiMoV2MTPLayer(
+                config,
+                0,
+                quant_config=quant_config,
+                prefix=add_prefix("decoder", prefix),
+            )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
     def forward(
@@ -217,22 +212,23 @@ class MiMoV2ModelNextN(nn.Module):
                     dim=-1,
                 )
             )
-        hidden_states, residual = self.mtp_block(
+        residual_batch.start(forward_batch)
+        hidden_states = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            residual=None,
         )
+
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             if forward_batch.return_hidden_states_before_norm:
-                hidden_states_before_norm = (
-                    hidden_states if residual is None else hidden_states + residual
+                hidden_states_before_norm = residual_batch.snapshot(
+                    hidden_states, forward_batch
                 )
-            if residual is not None:
-                hidden_states, _ = self.final_layernorm(hidden_states, residual)
-            else:
-                hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = residual_batch.final_norm(
+                hidden_states, forward_batch, self.final_layernorm
+            )
 
         return hidden_states, hidden_states_before_norm
 
@@ -247,7 +243,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
 
         self.model = MiMoV2ModelNextN(
@@ -315,6 +310,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -348,7 +344,12 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        start = get_parallel().attn_tp_rank * param.numel()
+                        projection = unwrap_lora_layer(
+                            self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                        )
+                        start = (
+                            get_group_rank_size(projection.tp_group)[0] * param.numel()
+                        )
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(

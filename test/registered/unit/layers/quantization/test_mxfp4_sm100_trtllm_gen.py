@@ -20,7 +20,7 @@ from flashinfer import trtllm_fp4_block_scale_moe
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 if not is_sm100_supported():
     pytest.skip(
@@ -33,12 +33,7 @@ GROUP_SIZE = 32  # MXFP4 block size
 
 @pytest.fixture
 def stated_tp_group():
-    """A TP group for a test that runs in a process without one.
-
-    The production call passes the group *into* `use_symmetric_memory`, so
-    stubbing that context manager does not stop the read -- the argument is
-    evaluated first. Stating it on the context answers every spelling.
-    """
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):
@@ -201,7 +196,7 @@ class _MockDispatchOutput:
         self.hidden_states = hidden_states
         self.topk_output = BypassedTopKOutput(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            raw_router_logits=router_logits,
             topk_config=TopKConfig(top_k=top_k, renormalize=True),
         )
 

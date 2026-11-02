@@ -258,3 +258,22 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
 
     def post_denoising_loop(self, latents, batch):
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ernie_image import (
+        ErnieImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=ErnieImageSamplingParams,
+        pipeline_config_cls=ErnieImagePipelineConfig,
+        hf_model_paths=[
+            "baidu/ERNIE-Image",
+            "baidu/ERNIE-Image-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "ernie-image" in hf_id.lower(),
+        ],
+    )

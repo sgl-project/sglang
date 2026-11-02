@@ -11,9 +11,11 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     fill_gateup_input_triton_kernel,
     moe_ep_deepgemm_preprocess,
 )
-from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
-    per_token_quant_fp8_ue8m0,
+from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
     per_token_quant_fp8_ue8m0_scatter,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -35,14 +37,15 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b
 dev = "cuda"
 
 
+def _quant_ue8m0(x, group):
+    return sglang_per_token_group_quant_fp8(
+        x, group, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True
+    )
+
+
 @pytest.fixture
 def stated_tp_group():
-    """A TP group for a test that runs in a process without one.
-
-    The production call passes the group *into* `use_symmetric_memory`, so
-    stubbing that context manager does not stop the read -- the argument is
-    evaluated first. Stating it on the context answers every spelling.
-    """
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):
@@ -106,7 +109,7 @@ def test_quant_scatter_matches_quant_plus_fill(num_tokens, topk, hidden, group):
     tids.copy_(tids_cpu)
     s2d = torch.tensor(s2d, dtype=torch.int32, device=dev)
 
-    x_q, x_sf = per_token_quant_fp8_ue8m0(x, group)
+    x_q, x_sf = _quant_ue8m0(x, group)
     gi_ref = torch.zeros(E, m_max, hidden, device=dev, dtype=torch.float8_e4m3fn)
     gs_ref = torch.zeros(E, G4, m_max, device=dev, dtype=torch.int32)
     fill_gateup_input_triton_kernel[(num_tokens,)](
@@ -166,7 +169,7 @@ def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
         output_dtype=torch.float8_e4m3fn,
         use_mxfp8=False,
     )
-    direct_x, direct_scale = per_token_quant_fp8_ue8m0(x, group)
+    direct_x, direct_scale = _quant_ue8m0(x, group)
 
     assert grouped_scale.dtype == torch.int32
     for token in range(num_tokens):
@@ -239,29 +242,45 @@ def test_compact_eager_keeps_masked_layout_for_cuda_graph(monkeypatch):
         )
 
 
-def test_standard_layout_auto_memory_policy(monkeypatch):
+@pytest.mark.parametrize("packed_scales", [False, True])
+@pytest.mark.parametrize(
+    "experts,hidden,intermediate,budget_gib,choices",
+    [
+        (512, 4096, 256, 42.5, ((4096, True), (8192, False), (16384, False))),
+        # Qwen3-30B on H200: M=4608 OOMs when captured input storage is omitted.
+        (128, 2048, 768, 3.15, ((3072, True), (4608, False))),
+        # Qwen3.5-122B TP2 reaches the same failure at M=3072.
+        (256, 3072, 512, 5.37, ((1792, True), (2304, False), (3072, False))),
+    ],
+)
+def test_standard_layout_auto_memory_policy(
+    monkeypatch, experts, hidden, intermediate, budget_gib, choices, packed_scales
+):
+    monkeypatch.setattr(
+        deep_gemm_runner.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", packed_scales
+    )
     config = MoeRunnerConfig(
-        num_experts=512,
-        num_local_experts=512,
-        hidden_size=4096,
-        intermediate_size_per_partition=256,
+        num_experts=experts,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
         top_k=8,
     )
     quant_info = DeepGemmMoeQuantInfo(
-        w13_weight=torch.empty((1, 512, 1), dtype=torch.float8_e4m3fn),
-        w2_weight=torch.empty((1, 4096, 1), dtype=torch.float8_e4m3fn),
+        w13_weight=torch.empty((1, 2 * intermediate, 1), dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty((1, hidden, 1), dtype=torch.float8_e4m3fn),
         use_fp8=True,
         block_shape=[128, 128],
     )
     monkeypatch.setattr(
         deep_gemm_runner,
         "_masked_standard_layout_memory_budget_bytes",
-        int(42.5 * (1 << 30)),
+        int(budget_gib * (1 << 30)),
     )
 
     with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"):
-        for num_tokens, expected in ((8192, True), (16384, False)):
-            hidden_states = torch.empty((num_tokens, 4096), device="meta")
+        for num_tokens, expected in choices:
+            hidden_states = torch.empty((num_tokens, hidden), device="meta")
             assert (
                 deep_gemm_runner._should_use_masked_standard_layout(
                     config, quant_info, hidden_states

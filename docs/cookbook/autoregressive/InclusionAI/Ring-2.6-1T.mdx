@@ -337,16 +337,16 @@ Mean ITL (ms):                           47.77
 - Benchmark Command:
 
 ```bash Command
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k \
-  --host 127.0.0.1 \
-  --port ${PORT} \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:${PORT}/v1 \
   --model auto \
   --num-examples 200 \
   --num-threads 64 \
   --max-tokens 2048 \
   --reasoning-effort high
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - Test Results (B200 x8):
 

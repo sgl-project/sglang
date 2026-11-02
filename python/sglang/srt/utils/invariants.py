@@ -236,6 +236,8 @@ def expect(
     (`inv.recover`) is applied unconditionally; only detection is gated. Returns
     the recovered value."""
     level = resolve_level()
+    if isinstance(inv.prop, NotNaN) and envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get():
+        level = InvariantCheckLevel.STRICT
     if level >= InvariantCheckLevel.WARN and value is not None and value.numel() > 0:
         detail = f"{inv.prop.name}: {msg}" if msg else inv.prop.name
         _signal(inv.prop.ok(value), inv=inv, level=level, msg=detail)

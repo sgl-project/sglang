@@ -8,6 +8,9 @@ from typing import Any
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -17,6 +20,24 @@ def maybe_enable_inductor_compute_comm_overlap() -> None:
         _inductor_cfg.reorder_for_compute_comm_overlap = True
     except ImportError:
         pass
+
+
+def apply_inductor_config(overrides: dict[str, Any]) -> None:
+    """Apply a model's torch._inductor.config overrides before it is compiled."""
+    import torch._inductor.config as _inductor_cfg
+
+    for name, value in overrides.items():
+        if not hasattr(_inductor_cfg, name):
+            logger.warning("Unknown torch._inductor.config option %r, ignoring", name)
+            continue
+        setattr(_inductor_cfg, name, value)
+    if overrides.get("multi_kernel_hints"):
+        # torch reads its saved multi-kernel pick through sub-kernels an
+        # FX-graph cache hit has not restored yet (triton _hash_lock is None),
+        # so every warm restart fails the compile -- under TP on one rank only,
+        # which deadlocks the others. Without the saved pick, each process
+        # re-picks during warmup.
+        os.environ.setdefault("TORCHINDUCTOR_DISABLE_MULTI_KERNEL_CACHE", "1")
 
 
 def build_torch_compile_kwargs(

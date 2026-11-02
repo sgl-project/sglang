@@ -1,4 +1,3 @@
-import argparse
 import os
 
 from sglang.multimodal_gen.apps.webui.minimax_h3 import (
@@ -19,13 +18,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
-
-
-def add_webui_args(parser: argparse.ArgumentParser):
-    """Add the arguments for the generate command."""
-    parser = ServerArgs.add_cli_args(parser)
-    parser = SamplingParams.add_cli_args(parser)
-    return parser
 
 
 def run_sgl_diffusion_webui(server_args: ServerArgs):

@@ -19,6 +19,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict
 
@@ -31,8 +32,8 @@ from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -47,7 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_xpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -201,17 +202,16 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             self.language_model.logits_processor.logit_scale *= logit_scale
         self.post_init()
 
-    def pad_input_ids(
-        self, input_ids: List[int], image_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         """Pad input IDs with image tokens."""
         # Get special token IDs
         im_start_id: int = image_inputs.im_start_id
         im_end_id: int = image_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-        ids = pattern.pad_input_tokens(input_ids, image_inputs)
+        ids = pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
         return ids
 
     def prepare_attn_masks(
@@ -221,7 +221,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(get_attn_backend(), TritonAttnBackend):
+        backend = get_attn_backend()
+        if isinstance(backend, TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -272,6 +273,47 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 get_attn_backend().forward_metadata.custom_mask = (
                     bidirectional_attn_masks
                 )
+        elif is_xpu():
+            # XPU takes a per extend-token image-block id (image index, -1 for
+            # text); the sgl-kernel-xpu FMHA prefill turns it into bidirectional
+            # image attention (see xpu_backend.forward_extend). Import lazily so
+            # non-XPU builds are unaffected.
+            from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+            if isinstance(backend, XPUAttentionBackend):
+                assert forward_batch.forward_mode == ForwardMode.EXTEND
+                backend.bidirectional_block_ids = self._build_xpu_image_block_ids(
+                    forward_batch=forward_batch, device=input_ids.device
+                )
+
+    @staticmethod
+    def _build_xpu_image_block_ids(forward_batch: ForwardBatch, device):
+        # Image spans are sglang layout, so they are read here; the kernel package
+        # cannot import sglang types and only builds the id tensor.
+        from sgl_kernel.flash_attn import build_bidirectional_block_ids
+
+        # Ids cover whole sequences (cached prefix + extend); with a prefix the backend
+        # pads the queries to match. None keeps the plain causal path.
+        seq_lens, block_spans = [], []
+        for i in range(forward_batch.batch_size):
+            start = forward_batch.extend_prefix_lens_cpu[i]
+            end = start + forward_batch.extend_seq_lens_cpu[i]
+            spans = []
+            mm_inputs = forward_batch.mm_inputs[i]
+            if mm_inputs is not None:
+                for mm_item in mm_inputs.mm_items:
+                    if mm_item.is_image():
+                        for begin, last in mm_item.offsets:
+                            last = min(last, end - 1)
+                            # Fewer than two image tokens in this extend attend the
+                            # same keys under causal attention.
+                            if max(begin, start) < last:
+                                spans.append((begin, last))
+            seq_lens.append(end)
+            block_spans.append(spans)
+        return build_bidirectional_block_ids(
+            seq_lens=seq_lens, block_spans=block_spans, device=device
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -494,6 +536,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             # For EAGLE3, head might not be needed
             return embed, None
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.language_model.get_embed_and_head_for_draft(draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):

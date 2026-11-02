@@ -3,8 +3,8 @@
 This module exposes :class:`FlexKVRadixCache`, a subclass of
 :class:`sglang.srt.mem_cache.radix_cache.RadixCache` that delegates
 host-side prefix storage to a FlexKV ``KVManager``. The design mirrors
-``LMCRadixCache`` (the LMCache integration) so the scheduler-side
-contract is identical:
+the two-phase external-cache integration pattern, so the scheduler-side
+contract is:
 
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
@@ -118,7 +118,7 @@ class FlexKVRadixCache(RadixCache):
             # forward layer blocks on its own eventfd.
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
-        # CUDA streams (mirroring LMCRadixCache).
+        # CUDA streams.
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
@@ -174,29 +174,25 @@ class FlexKVRadixCache(RadixCache):
         if len(key) == 0:
             return base_res
 
-        device_value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
         if self._mode is FlexKVMode.MP:
             if params.req is None:
                 return base_res
-            return self._mp_match_prefix(
-                key, base_res, device_value, last_node, params.req
-            )
-        return self._ip_match_prefix(key, base_res, device_value, last_node)
+            return self._mp_match_prefix(key, base_res, last_node, params.req)
+        return self._ip_match_prefix(key, base_res, last_node)
 
     def _mp_match_prefix(
         self,
         key: RadixKey,
         base_res: MatchResult,
-        device_value: torch.Tensor,
         last_node: TreeNode,
         req: Req,
     ) -> MatchResult:
         """LOOKUP-only path. Sets ``host_hit_length`` on the result so
         the scheduler later invokes :meth:`init_load_back`."""
         token_ids = key.raw_token_ids()
-        device_len = int(device_value.numel())
+        device_len = base_res.device_prefix_len
         if device_len >= len(token_ids):
             return base_res
 
@@ -226,7 +222,7 @@ class FlexKVRadixCache(RadixCache):
             value_numel=device_len,
         )
         return MatchResult(
-            device_indices=device_value,
+            device_prefix_len=device_len,
             last_device_node=last_node,
             last_host_node=last_node,
             best_match_node=last_node,
@@ -237,13 +233,12 @@ class FlexKVRadixCache(RadixCache):
         self,
         key: RadixKey,
         base_res: MatchResult,
-        device_value: torch.Tensor,
         last_node: TreeNode,
     ) -> MatchResult:
         """Layerwise path: allocate slots and fire ``start_load_kv_layerwise``
         immediately. Per-layer hook waits during forward."""
         token_ids = key.raw_token_ids()
-        device_len = int(device_value.numel())
+        device_len = base_res.device_prefix_len
         if device_len >= len(token_ids):
             return base_res
 
@@ -271,7 +266,7 @@ class FlexKVRadixCache(RadixCache):
             return base_res
         new_slots, new_node = result
         return MatchResult(
-            device_indices=torch.cat([device_value, new_slots]),
+            device_prefix_len=device_len + len(new_slots),
             last_device_node=new_node,
             last_host_node=new_node,
             best_match_node=new_node,
@@ -284,7 +279,7 @@ class FlexKVRadixCache(RadixCache):
     def init_load_back(  # type: ignore[override]
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Optional[TreeNode]]:
+    ) -> Tuple[int, Optional[TreeNode]]:
         """MP RETRIEVE. Allocates uncached slots and fires the FlexKV
         load; inserts the resulting TreeNode."""
         req = params.req
@@ -295,10 +290,7 @@ class FlexKVRadixCache(RadixCache):
             # scheduler still called us. Release any held task and
             # return an empty load.
             self.flexkv_connector.release_pending(req.cache_request_handle)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
+            return 0, last_node
 
         result = self._allocate_and_load(
             key=marker.key,
@@ -315,11 +307,9 @@ class FlexKVRadixCache(RadixCache):
             # is idempotent for the case where allocation failed before
             # we even popped the held task.
             self.flexkv_connector.release_pending(req.cache_request_handle)
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                last_node,
-            )
-        return result
+            return 0, last_node
+        new_slots, new_node = result
+        return len(new_slots), new_node
 
     def _allocate_and_load(
         self,
@@ -382,19 +372,20 @@ class FlexKVRadixCache(RadixCache):
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
-    # cache_finished_req (STORE)
+    # checkpoint (STORE)
     # ------------------------------------------------------------------
 
-    def cache_finished_req(  # type: ignore[override]
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ) -> None:
-        """Base cache_finished_req then fire an async FlexKV store."""
-        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
-        if not is_insert:
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if not checkpointed:
             self._load_markers.pop(req.cache_request_handle, None)
+
+    def checkpoint(self, req: Req, *, up_to: int) -> None:  # type: ignore[override]
+        """Base checkpoint; a finished request also fires an async FlexKV store."""
+        super().checkpoint(req, up_to=up_to)
+        if not req.finished():
             return
 
-        # Compute the committed prefix mirroring LMCRadixCache's logic.
+        # Compute the committed prefix.
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
@@ -403,6 +394,8 @@ class FlexKVRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        # Keep the stored prefix within the checkpoint boundary.
+        kv_committed_len = min(kv_committed_len, up_to)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:

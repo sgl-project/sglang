@@ -86,6 +86,12 @@ class HttpServerEngineAdapter(EngineBase):
         response.raise_for_status()
         return response.json()
 
+    def begin_weight_update(self, selector: str = "all"):
+        return self._make_request("begin_weight_update", {"selector": selector})
+
+    def end_weight_update(self):
+        return self._make_request("end_weight_update")
+
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],

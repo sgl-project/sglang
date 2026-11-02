@@ -14,8 +14,6 @@
 
 - `README.md`: This package structure overview.
 - `__init__.py`: Package initialization and public Python APIs.
-- `bench_offline_throughput.py`: Deprecated wrapper for the offline throughput benchmark.
-- `bench_one_batch.py`: Deprecated wrapper for the one-batch benchmark.
 - `bench_one_batch_server.py`: Deprecated wrapper for the server-based one-batch benchmark.
 - `bench_serving.py`: Deprecated wrapper for the online serving benchmark.
 - `check_env.py`: Environment and dependency diagnostics.

@@ -70,7 +70,8 @@ class TestUSPAttentionReplicatedPrefix(unittest.TestCase):
             patch(f"{_LAYER}.get_ulysses_parallel_rank", return_value=sp_rank),
             patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=1),
             patch(
-                f"{_LAYER}._usp_input_all_to_all", side_effect=_fake_input_all_to_all
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda *qkv: tuple(_fake_input_all_to_all(x) for x in qkv),
             ),
             patch(
                 f"{_LAYER}._usp_output_all_to_all",
@@ -221,7 +222,10 @@ class TestUSPAttentionMaskedReplicatedPrefix(unittest.TestCase):
             patch(f"{_LAYER}.get_ulysses_parallel_world_size", return_value=_SP),
             patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=1),
             patch(f"{_LAYER}.get_ulysses_parallel_rank", return_value=0),
-            patch(f"{_LAYER}._usp_input_all_to_all", side_effect=fake_input_a2a),
+            patch(
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda *qkv: tuple(fake_input_a2a(x) for x in qkv),
+            ),
             patch(f"{_LAYER}._usp_output_all_to_all", side_effect=fake_output_a2a),
             patch(
                 f"{_LAYER}.sequence_model_parallel_all_gather",

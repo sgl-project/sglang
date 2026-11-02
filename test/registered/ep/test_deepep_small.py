@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=407, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=415, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):
@@ -32,8 +32,7 @@ class TestPureDP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp-size",
                 "4",
-                "--enable-dp-attention",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
@@ -121,8 +120,7 @@ class TestTBO(CustomTestCase):
                 "--trust-remote-code",
                 "--tp-size",
                 "4",
-                "--enable-dp-attention",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -173,8 +171,7 @@ class TestMTPWithTBO(CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
-                "--enable-dp-attention",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
                 "--enable-two-batch-overlap",
                 "--moe-a2a-backend",

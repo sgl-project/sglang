@@ -11,15 +11,17 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 
 
 class HelionKDAKernel(LinearAttnKernelBase):
-    """KDA packed decode and prefill implemented with Helion kernels.
+    """KDA packed decode, prefill, and verification with Helion kernels.
 
-    The generic decode interface delegates to Triton, and the dispatcher routes
-    speculative target verification directly to Triton. The one-token decode
+    The generic decode interface delegates to Triton. The one-token decode
     and ReplaySSM paths use :meth:`packed_decode`, while prefill uses
-    :meth:`extend`.
+    :meth:`extend`. Verification writes per-candidate snapshots without
+    updating the committed state pool.
     """
 
     supports_packed_decode = True
+    supports_packed_decode_safe_gate = True
+    supports_safe_gate_verify = True
     supports_track_state_snapshot: bool = True
 
     def __init__(
@@ -157,6 +159,51 @@ class HelionKDAKernel(LinearAttnKernelBase):
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+        retrieve_parent_token: torch.Tensor | None = None,
+        lower_bound: float | None = None,
+        cache_ring: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        if cache_ring:
+            raise NotImplementedError(
+                "Helion KDA verify does not support ReplaySSM rings"
+            )
+        from sglang.kernels.ops.attention.helion.kda_verify import helion_kda_verify
+
+        return helion_kda_verify(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_steps,
+            retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
+        )
+
     def extend(
         self,
         q: torch.Tensor,
@@ -172,6 +219,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
         dt_bias: torch.Tensor | None = None,
         lower_bound: float | None = None,
         return_intermediate_states: bool = False,
+        beta_is_raw: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         assert self._chunk_kda is not None
@@ -188,6 +236,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
             track_state=kwargs.get("track_state"),
             track_chunk_idx=kwargs.get("track_chunk_idx"),

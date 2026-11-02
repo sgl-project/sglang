@@ -581,7 +581,7 @@ class SRTRunner:
         context_length: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
         page_size: Optional[int] = None,
-        dp_size: int = 1,
+        attn_dp_size: int = 1,
         tokenizer_path: Optional[str] = None,
         mem_fraction_static: float = 0.65,
         trust_remote_code: bool = False,
@@ -598,16 +598,18 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        lora_use_virtual_experts: Optional[bool] = None,
         enable_lora_overlap_loading: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
         lora_drain_wait_threshold: float = 0.0,
+        load_format: str = "auto",
+        model_loader_extra_config: Optional[dict[str, Any]] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
-        enable_dp_attention = dp_size > 1
 
         spec_kwargs = {}
         if speculative_draft_model_path:
@@ -630,6 +632,8 @@ class SRTRunner:
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
+            load_format=load_format,
+            model_loader_extra_config=json.dumps(model_loader_extra_config or {}),
             mem_fraction_static=mem_fraction_static,
             trust_remote_code=trust_remote_code,
             is_embedding=not self.is_generation,
@@ -645,8 +649,7 @@ class SRTRunner:
             context_length=context_length,
             max_total_tokens=max_total_tokens,
             page_size=page_size,
-            enable_dp_attention=enable_dp_attention,
-            dp_size=dp_size,
+            attn_dp_size=attn_dp_size,
             tokenizer_path=tokenizer_path,
             disable_overlap_schedule=disable_overlap_schedule,
             cuda_graph_max_bs_decode=cuda_graph_max_bs_decode,
@@ -655,6 +658,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            lora_use_virtual_experts=bool(lora_use_virtual_experts),
             enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loaded_loras=max_loaded_loras,
             json_model_override_args=(
@@ -693,6 +697,7 @@ class SRTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
@@ -707,7 +712,10 @@ class SRTRunner:
         else:
             if self.model_type == "embedding":
                 response = self.engine.encode(
-                    prompt=prompts, image_data=image_data, dimensions=dimensions
+                    prompt=prompts,
+                    image_data=image_data,
+                    dimensions=dimensions,
+                    encoding_format=encoding_format,
                 )
                 if isinstance(response, list):
                     logits = [x["embedding"] for x in response]
