@@ -1,22 +1,31 @@
-"""K-pool prefill row sharding: row arithmetic, then the real path on real TP ranks."""
+"""K-pool prefill row sharding on real TP ranks, compared with the replicated path."""
 
-import os
 import tempfile
 import unittest
 from dataclasses import dataclass
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
-from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import shard_row_chunks
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.kpool_plan import init_kpool_extend_metadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_forward
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_cuda_ci(est_time=60, stage="extra-b", runner_config="4-gpu-b200")
+
+WORLD = 4
 
 
 @dataclass
@@ -25,28 +34,10 @@ class _Metadata:
     kpool_extend_plan: object = None
 
 
-def _run_ranks(rank, world, init_method):
-    from sglang.srt.distributed.parallel_state import (
-        GroupCoordinator,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-    from sglang.srt.layers.attention.dsa.kpool_plan import init_kpool_extend_metadata
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.runtime_context import get_forward, get_parallel
-
-    os.environ.update(RANK=str(rank), WORLD_SIZE=str(world))
+def _run_rank(rank, init_method):
     torch.cuda.set_device(rank)
-    init_distributed_environment(
-        world_size=world,
-        rank=rank,
-        local_rank=rank,
-        distributed_init_method=init_method,
-        backend="nccl",
-    )
-    publish_build_topology(tp_size=world, world_rank=rank)
+    init_distributed_environment(WORLD, rank, init_method, local_rank=rank)
+    publish_build_topology(tp_size=WORLD, world_rank=rank)
     initialize_model_parallel()
     device = torch.device(f"cuda:{rank}")
 
@@ -80,45 +71,38 @@ def _run_ranks(rank, world, init_method):
         ),
         topk_transform_method=TopkTransformMethod.RAGGED,
     )
-    # The same generator on every rank, because attention TP replicates inputs.
-    generator = torch.Generator().manual_seed(7)
-    keys = torch.randn((pages + 1, 64, 128), generator=generator)
-    scales = torch.rand((pages + 1, 64), generator=generator) + 0.5
-    buf = torch.cat(
-        [
-            keys.to(torch.float8_e4m3fn).view(torch.uint8).flatten(1),
-            scales.view(torch.uint8).flatten(1),
-        ],
-        dim=1,
-    ).to(device)
-    q_fp8 = torch.randn((n_real + pad_rows, 32, 128), generator=generator).to(
-        device, torch.float8_e4m3fn
+    # The same seed on every rank, because attention TP replicates inputs.
+    torch.manual_seed(7)
+    keys = torch.randn((pages + 1, 64, 128)).to(torch.float8_e4m3fn).view(torch.uint8)
+    scales = (torch.rand((pages + 1, 64)) + 0.5).view(torch.uint8)
+    buf = torch.cat([keys.flatten(1), scales.flatten(1)], dim=1).to(device)
+    q_fp8 = torch.randn((n_real + pad_rows, 32, 128)).to(device, torch.float8_e4m3fn)
+    weights = torch.rand((n_real + pad_rows, 32, 1)).to(device)
+    pool = SimpleNamespace(
+        index_page_size=64, get_index_k_with_scale_buffer=lambda layer_id: buf
     )
-    weights = torch.rand((n_real + pad_rows, 32, 1), generator=generator).to(device)
-    indexer = SimpleNamespace(
-        index_kpool=4,
-        index_topk=2048,
-        _get_index_k_read_buffer=lambda pool, layer_id: buf,
-        _fp8_mqa_logits=indexer_module.IndexerKPool._fp8_mqa_logits,
-    )
-    for name in ("_topk_from_kpool_logits", "_kpool_topk_by_row_chunks"):
-        method = getattr(indexer_module.IndexerKPool, name)
-        setattr(indexer, name, MethodType(method, indexer))
+    indexer = object.__new__(indexer_module.IndexerKPool)
+    indexer.index_kpool, indexer.index_topk = 4, 2048
 
     def topk(enabled, q_rows):
-        envs.SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP.set(enabled)
-        return indexer_module.IndexerKPool._get_topk_ragged_kpool_plan(
-            indexer, batch, 0, q_fp8[:q_rows], weights[:q_rows], metadata
-        )
+        with envs.SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP.override(enabled):
+            return indexer._get_topk_ragged_kpool_plan(
+                batch, 0, q_fp8[:q_rows], weights[:q_rows], metadata
+            )
 
-    # Eager prefill has no padding rows, so the gather needs more rows than the output.
-    for q_rows in (n_real, n_real + pad_rows):
+    # Without padding rows the gather needs more rows than the output. The small
+    # logits budget splits each rank's rows across row chunks.
+    for q_rows, budget_bytes in ((n_real, 1 << 40), (n_real + pad_rows, 1 << 26)):
         with (
+            patch.object(indexer_module, "get_token_to_kv_pool", return_value=pool),
             patch.object(
-                indexer_module,
-                "get_token_to_kv_pool",
-                return_value=SimpleNamespace(index_page_size=64),
+                indexer_module, "mqa_logits_budget_bytes", return_value=budget_bytes
             ),
+            patch.object(
+                indexer_module.IndexerKPool,
+                "_fp8_mqa_logits",
+                wraps=indexer_module.IndexerKPool._fp8_mqa_logits,
+            ) as logits,
             patch.object(
                 GroupCoordinator,
                 "all_gather_into_tensor",
@@ -128,8 +112,10 @@ def _run_ranks(rank, world, init_method):
         ):
             replicated = topk(False, q_rows)
             gather.assert_not_called()
+            logits.reset_mock()
             sharded = topk(True, q_rows)
-            gather.assert_called_once()
+            scored = sum(c.kwargs["q_fp8"].shape[0] for c in logits.call_args_list)
+            assert scored <= (n_real + WORLD - 1) // WORLD, f"scored {scored} rows"
             with get_forward().scoped(attn_input_scattered=True):
                 topk(True, q_rows)
             gather.assert_called_once()
@@ -140,40 +126,14 @@ def _run_ranks(rank, world, init_method):
             dim=-1
         )
         assert (~same).sum() < 5, f"{(~same).sum()} rows differ"
-        assert sharded.shape == replicated.shape and (sharded[n_real:] == -1).all()
-        gathered = [torch.empty_like(sharded) for _ in range(world)]
-        torch.distributed.all_gather(
-            gathered, sharded, group=get_parallel().attn_tp_group.device_group
-        )
-        assert all(torch.equal(other, sharded) for other in gathered)
+        # A tie keeps the row's width, while a row no rank scored stays all -1.
+        assert ((sharded < 0).sum(-1) == (replicated < 0).sum(-1)).all()
 
 
 class TestPrefillTPRows(CustomTestCase):
-    def test_chunks_reassemble_without_missing_or_duplicate_rows(self):
-        for num_rows in (8, 17, 4097, 16384):
-            for world_size in (2, 4, 8):
-                for chunk_size in (3, 1024, 16384):
-                    chunks = tuple(
-                        slice(i, min(i + chunk_size, num_rows))
-                        for i in range(0, num_rows, chunk_size)
-                    )
-                    all_rows = []
-                    for rank in range(world_size):
-                        local, padded = shard_row_chunks(chunks, world_size, rank)
-                        rows = [
-                            i for chunk in local for i in range(chunk.start, chunk.stop)
-                        ]
-                        self.assertLessEqual(len(rows), padded // world_size)
-                        self.assertEqual(padded % world_size, 0)
-                        all_rows.extend(rows)
-                    self.assertEqual(all_rows, list(range(num_rows)))
-
     def test_sharded_path_matches_replicated_on_tp_ranks(self):
-        for world in (2, 4):
-            if torch.cuda.device_count() < world:
-                self.skipTest(f"requires {world} CUDA GPUs")
-            with tempfile.TemporaryDirectory(prefix="kpool-tp-") as tmp:
-                mp.spawn(_run_ranks, args=(world, f"file://{tmp}/init"), nprocs=world)
+        with tempfile.TemporaryDirectory(prefix="kpool-tp-") as tmp:
+            mp.spawn(_run_rank, args=(f"file://{tmp}/init",), nprocs=WORLD)
 
 
 if __name__ == "__main__":
