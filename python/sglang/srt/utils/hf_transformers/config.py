@@ -65,6 +65,7 @@ def _apply_deepseek_ocr_overrides(config, model):
 
 _GEMMA4_MODEL_TYPES = (
     "gemma4",
+    "gemma4_text",
     "gemma4_assistant",
     "gemma4_unified",
     "gemma4_unified_assistant",
@@ -115,7 +116,7 @@ def _gemma4_attention_shapes(text_config) -> dict[str, tuple[int, int]]:
 def _apply_gemma4_attention_overrides(config):
     # Gemma4 states its shapes SWA-first: base attributes are the sliding-window
     # values and full-attention overrides them; SGLang's base is full attention.
-    text_config = config.text_config
+    text_config = config.get_text_config()
 
     if text_config.is_heterogeneous:
         # transformers states that split as a `per_layer_config`, and
@@ -232,6 +233,18 @@ class HfModelConfigParser(ModelConfigParserBase):
                 **kwargs,
             )
 
+        if config.model_type == "gemma4_text" and "gguf_file" in kwargs:
+            from gguf import GGUFReader
+
+            # Transformers omits these fields when converting Gemma4 GGUF configs.
+            fields = GGUFReader(kwargs["gguf_file"]).fields
+            shared_kv = fields.get("gemma4.attention.shared_kv_layers")
+            if shared_kv is not None:
+                config.num_kv_shared_layers = int(shared_kv.contents())
+            softcap = fields.get("gemma4.final_logit_softcapping")
+            if softcap is not None:
+                config.final_logit_softcapping = float(softcap.contents())
+
         if (
             config.architectures is not None
             and config.architectures[0] == "Phi4MMForCausalLM"
@@ -257,7 +270,11 @@ class HfModelConfigParser(ModelConfigParserBase):
 
         text_config = get_hf_text_config(config=config)
 
-        if isinstance(model, str) and text_config is not None:
+        if (
+            isinstance(model, str)
+            and text_config is not None
+            and text_config is not config
+        ):
             items = (
                 text_config.items()
                 if hasattr(text_config, "items")

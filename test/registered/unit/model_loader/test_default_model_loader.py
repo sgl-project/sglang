@@ -130,5 +130,44 @@ class TestDefaultModelLoader(CustomTestCase):
                 )
 
 
+class TestGGUFConfigIsolation(CustomTestCase):
+    """Config isolation for nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB."""
+
+    def test_gemma4_name_mapping_does_not_select_a_transformers_attention_backend(self):
+        from types import SimpleNamespace
+
+        from transformers import Gemma4TextConfig
+
+        from sglang.srt.model_loader.loader import GGUFModelLoader
+
+        config = Gemma4TextConfig(
+            vocab_size=32,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=6,
+            num_kv_shared_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            global_head_dim=16,
+            hidden_size_per_layer_input=0,
+            per_layer_config=None,
+        )
+        before = config._attn_implementation
+        loader = GGUFModelLoader.__new__(GGUFModelLoader)
+        names = loader._get_gguf_weights_map(SimpleNamespace(hf_config=config))
+        self.assertEqual(names["token_embd.weight"], "model.embed_tokens.weight")
+        self.assertEqual(config._attn_implementation, before)
+        self.assertEqual(config.num_kv_shared_layers, 2)
+        self.assertEqual(
+            names["blk.5.layer_output_scale.weight"], "model.layers.5.layer_scalar"
+        )
+        for projection in ("k", "v"):
+            self.assertEqual(
+                names[f"blk.5.attn_{projection}.weight"],
+                f"model.layers.5.self_attn.{projection}_proj.weight",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
