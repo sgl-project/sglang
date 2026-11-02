@@ -52,7 +52,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         server_args,
         params: CacheInitParams,
         *,
-        components,
+        cache,
         extra_config=None,
         storage=None,
         forward_stream=None,
@@ -64,7 +64,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             kvcache=kvcache,
             page_size=self.page_size,
             params=params,
-            components=components,
+            components=set(cache.components),
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
@@ -188,7 +188,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self,
+        rid,
+        _key,
+        _device_hit_len,
+        transfers: list[PoolTransfer],
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -222,7 +228,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
-    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+    def prefetch(
+        self, _rid: str, transfers: list[PoolTransfer]
+    ) -> Future[bool] | None:
         if self.load_mode != "prefetch" or not self.load_thread.is_alive():
             return None
         expanded = self.pool_group.resolve_transfers(
@@ -429,7 +437,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        _node_id: int,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
     ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:

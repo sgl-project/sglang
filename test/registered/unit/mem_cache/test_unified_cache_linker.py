@@ -92,14 +92,14 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
         self.pools = {}
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, key, device_hit_len, transfers):
         return list(self.restorable)
 
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
         return True
 
-    def prefetch(self, transfers):
+    def prefetch(self, rid, transfers):
         return None
 
     def start_layer_wise_loading(self):
@@ -114,7 +114,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
         self.offload_sessions.append(session_id)
         return True
@@ -243,7 +243,7 @@ class TestMooncakePrefetch(CustomTestCase):
             "device_module",
             SimpleNamespace(Event=lambda: event),
         ):
-            return linker.prefetch([transfer])
+            return linker.prefetch("rid", [transfer])
 
     def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
         """Neither publication nor reset may overtake the final device write."""
@@ -793,7 +793,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def _clone_transfers(cls, transfers):
         return [cls._clone_transfer(transfer) for transfer in transfers]
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, key, device_hit_len, transfers):
         transfers = self._clone_transfers(transfers)
         self.lookup_calls.append((rid, transfers))
         by_pool = {transfer.name: transfer for transfer in transfers}
@@ -825,7 +825,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.queued_loads[rid] = self._clone_transfers(transfers)
         return True
 
-    def prefetch(self, transfers):
+    def prefetch(self, rid, transfers):
         return None
 
     def start_layer_wise_loading(self):
@@ -843,7 +843,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)

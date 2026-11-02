@@ -142,7 +142,7 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools.
 
     Out-of-tree linkers are constructed per worker as
-    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    ``Linker(server_args, params, cache=..., extra_config=..., forward_stream=...)``.
     Store ``forward_stream`` and use ``record_offload_ready()`` to gate offloads.
     ``layer_done_counter`` provides ``set_consumer(index)`` and
     ``wait_until(layer)``. Report completion only after device copies finish.
@@ -172,12 +172,20 @@ class UnifiedCacheLinker(ABC):
             events.append(kv_written)
         return events
 
-    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+    def prefetch(
+        self, rid: str, transfers: list[PoolTransfer]
+    ) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
         return None
 
     @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self,
+        rid: str,
+        key: RadixKey,
+        device_hit_len: int,
+        transfers: list[PoolTransfer],
+    ) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
 
         A length is included only when *all* pools satisfy their hit policy at
@@ -213,10 +221,14 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def offload(
-        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+        self,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        session_id: Optional[str] = None,
     ) -> bool:
         """Queue every transfer for atomic persistence.
 
+        ``node_id`` identifies the radix path that produced the transfers.
         ``session_id`` names the session whose insert produced the transfers,
         when known; backends may attribute the stored objects to it.
         """
@@ -349,7 +361,9 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            self.cache_linker.lookup(
+                req.rid, key, device_hit_len, lookup_transfers
+            ),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -413,7 +427,7 @@ class UnifiedCacheLinkerWrapper:
             return
         try:
             # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
+            restorable = self.cache_linker.lookup(req.rid, key, start, lookups)
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
@@ -442,6 +456,7 @@ class UnifiedCacheLinkerWrapper:
                 state.component_transfers.append((component, transfer))
             if len(state.component_transfers) == len(self._components):
                 state.future = self.cache_linker.prefetch(
+                    req.rid,
                     [t for _, t in state.component_transfers]
                 )
         except Exception:
@@ -741,7 +756,9 @@ class UnifiedCacheLinkerWrapper:
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
             queued = self.cache_linker.offload(
-                transfers, session_id=getattr(cache, "insert_session_id", None)
+                node_id,
+                transfers,
+                session_id=getattr(cache, "insert_session_id", None),
             )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)

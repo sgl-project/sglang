@@ -255,7 +255,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         linker_cls.assert_called_once_with(
             ctx.server_args,
             ctx.params,
-            components={"full"},
+            cache=cache,
             extra_config={},
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
