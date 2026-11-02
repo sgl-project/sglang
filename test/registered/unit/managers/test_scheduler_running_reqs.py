@@ -1,6 +1,3 @@
-"""The scheduler's request lists, the launched-step count, the hooks that keep
-them, and the ownership check at a step launch."""
-
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -187,8 +184,6 @@ class TestRequestList(CustomTestCase):
 
 
 class TestRequestListsCheck(CustomTestCase):
-    """The ownership check at a step launch, one rule per failing case."""
-
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
@@ -248,8 +243,7 @@ class TestRequestListsCheck(CustomTestCase):
             self.check(self.s.running_batch)
 
     def test_passes_a_request_its_queued_result_finishes(self):
-        # Overlap scheduled this step before the last one is processed; that
-        # result finishes `finishing` by length, so it left the running batch.
+        # Overlap took it out of the running batch; its queued result finishes it.
         decoding, finishing = _req("r"), _req("f")
         self._start_running([decoding, finishing])
         _launch(self.s, _batch([decoding, finishing], ForwardMode.DECODE))
@@ -259,8 +253,8 @@ class TestRequestListsCheck(CustomTestCase):
         self.check(_batch([decoding], ForwardMode.DECODE))
 
     def test_passes_the_decode_rows_of_another_microbatch_mixed_step(self):
-        # Under PP a mixed step took its decode rows out of its microbatch's
-        # running batch; they rejoin it at the merge after its processing.
+        # A mixed step of another microbatch took these decode rows out of its
+        # running batch.
         new, decoding = _req("n"), _req("d")
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         self.s.running_reqs.join([decoding])

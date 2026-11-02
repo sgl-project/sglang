@@ -1369,9 +1369,8 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # The running requests: a request runs from the merge of its launched
-        # prefill into a running batch until it finishes. It leaves when it
-        # finishes, is retracted or preempted, or a pause retracts it.
+        # Requests merged into a running batch, until they finish or a retract,
+        # preemption or pause takes them out.
         self.running_reqs = RequestList()
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD

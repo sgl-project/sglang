@@ -75,7 +75,6 @@ class SchedulerInvariantChecker:
     get_chunked_req: Callable = field(default=lambda: None)
     get_running_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
     get_prefill_launched_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
-    # The running batch, and under PP every micro-batch's running batch.
     get_running_batches: Callable = field(default=lambda: ())
     # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
@@ -481,9 +480,8 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def maybe_check_request_lists(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: no
-        request is in two lists, the requests the running batches and the steps
-        in flight hold are in one, and each list holds requests in its state."""
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: each
+        live request is in exactly one list, one that matches its state."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
         owners: Dict[Req, str] = {}
@@ -522,9 +520,8 @@ class SchedulerInvariantChecker:
             live(in_running_batch) - running,
             "Requests in a running batch but not in running",
         )
-        # A running request is out of every running batch only with a step in
-        # flight: a mixed step took its decode row, or under overlap a queued
-        # result finishes it.
+        # Only a step in flight takes a running request out of every running
+        # batch: a mixed step's decode row, or an overlap result that finishes it.
         _raise_if_any(
             {req for req in running - in_running_batch if req.inflight_steps <= 0},
             "Requests in running but in no running batch or step",
