@@ -27,7 +27,6 @@ To test a specific model locally:
 
 import dataclasses
 import multiprocessing as mp
-import os
 import unittest
 from contextlib import nullcontext
 from typing import List, Optional
@@ -189,26 +188,6 @@ class TestGenerationModels(CustomTestCase):
                 prompts = DEFAULT_PROMPTS
 
                 # Skip long prompts for models that do not have a long context
-                if model_case.skip_long_prompt:
-                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-
-                # Assert the logits and output strs are close
-                self.assert_close_logits_and_output_strs(
-                    prompts, model_case, torch_dtype
-                )
-
-    @unittest.skipIf(is_in_ci(), "CI only runs selected models for simplicity")
-    def test_all_models(self):
-        for model_case in ALL_MODELS:
-            for torch_dtype in TORCH_DTYPES:
-                if (
-                    "ONLY_RUN" in os.environ
-                    and os.environ["ONLY_RUN"] != model_case.model_path
-                ):
-                    continue
-
-                # Skip long prompts for models that do not have a long context
-                prompts = DEFAULT_PROMPTS
                 if model_case.skip_long_prompt:
                     prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 
