@@ -829,12 +829,17 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                     else nullcontext()
                 )
                 with tune_context:
+
+                    def on_step():
+                        self.check_cancelled(batches)
+                        progress.update()
+
                     if flow_map:
                         latents = denoise_flow_map(
                             self._denoise_model(server_args),
                             packed,
                             schedule,
-                            step_callback=progress.update,
+                            step_callback=on_step,
                         )
                     else:
                         latents = denoise_packed(
@@ -842,7 +847,7 @@ class Flux3ImageDenoiseStage(DenoisingStage):
                             packed,
                             schedule,
                             guidance,
-                            step_callback=progress.update,
+                            step_callback=on_step,
                             sequential_cfg=sequential_cfg,
                         )
         counts = [sum(image[0].shape[0] for image, _ in group) for group in images]

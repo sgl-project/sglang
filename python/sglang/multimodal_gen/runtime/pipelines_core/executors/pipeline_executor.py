@@ -273,8 +273,11 @@ class PipelineExecutor(ABC):
         work can be removed. The base executor simply calls
         ``stage.run_grouped_requests`` for each stage in order.
         """
+        requests = list(batches)
         for stage in stages:
+            raise_if_cancelled(requests)
             batches = stage.run_grouped_requests(batches, server_args)
+        raise_if_cancelled(requests)
         return batches
 
     def execute_group_sequentially(

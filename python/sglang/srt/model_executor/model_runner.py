@@ -93,6 +93,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -197,12 +198,12 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
-    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -330,6 +331,8 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
+    # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
+    uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None
 
     @property
@@ -368,7 +371,6 @@ class ModelRunner:
             not self.is_draft_worker
             and self.is_generation
             and not use_mlx()
-            and not get_disagg().enable_pdmux
             and get_exec().dllm.dllm_algorithm is None
             and self.spec_algorithm.is_none()
             and get_parallel().pp_size == 1
@@ -505,6 +507,8 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        # Set by the scheduler when every KV offload copy waits for forward_stream.
+        self.kv_offload_fenced_on_forward_stream = False
 
         # CPU offload
         set_offloader(create_offloader())
@@ -778,6 +782,7 @@ class ModelRunner:
             capture_tail_hooks=self.capture_tail_hooks,
             is_draft=self.is_draft_worker,
         )
+        allocate_mega_moe_buffers(self.model)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1156,11 +1161,7 @@ class ModelRunner:
         self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
-        self.decode_attn_backend = backends.decode_attn_backend
-        self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.runner_ids.bind_and_verify_backends(
-            [self.attn_backend, self.decode_attn_backend]
-        )
+        self.runner_ids.bind_and_verify_backends([self.attn_backend])
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1175,22 +1176,48 @@ class ModelRunner:
         dcp_group = get_parallel().dcp_group
         if dcp_group.world_size <= 1:
             return
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+        def absorb_weight_16bit(w: torch.Tensor, w_scale) -> Optional[torch.Tensor]:
+            # Per-tensor fp8 absorb weights (GLM kv_b_proj on gfx95) carry a
+            # rank-local scale, so they are dequantized before the gather.
+            if w.dtype in (torch.bfloat16, torch.float16):
+                return w.contiguous()
+            if w.dtype in fp8_dtypes and (
+                isinstance(w_scale, (int, float)) or w_scale.numel() == 1
+            ):
+                return (w.to(torch.bfloat16) * w_scale).contiguous()
+            return None
+
         n_prepared = 0
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA) or m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
-                logger.warning("dcp_replicate_q_proj: skipping non-16-bit w_kc")
+            # q-replicate needs a 16-bit or per-tensor fp8 absorb weight;
+            # anything else keeps the per-layer Q all-gather.
+            w_kc = absorb_weight_16bit(m.w_kc, m.w_scale)
+            if w_kc is None:
+                logger.warning("dcp_replicate_q_proj: skipping unsupported w_kc")
                 continue
             if isinstance(qp.quant_method, UnquantizedLinearMethod):
-                m.q_b_proj_qrep_weight = dcp_group.all_gather(qp.weight.data, dim=0)
+                local = qp.weight.data
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(local.contiguous(), dim=0)
+                # The local q_b_proj rows are this rank's slice of the replica;
+                # alias them so the replica does not double the q_b_proj
+                # footprint.
+                rows = local.shape[0]
+                r = dcp_group.rank_in_group
+                qp.weight.data = m.q_b_proj_qrep_weight[r * rows : (r + 1) * rows]
             elif _is_block_fp8(qp):
                 m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
             else:
                 logger.warning("dcp_replicate_q_proj: skipping unsupported q-proj")
                 continue
-            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            m.w_kc_qrep = dcp_group.all_gather(w_kc, dim=0)
+            w_vc = absorb_weight_16bit(m.w_vc, m.w_scale)
+            if w_vc is not None:
+                m.w_vc_qrep = dcp_group.all_gather(w_vc, dim=0)
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
@@ -1637,6 +1664,19 @@ class ModelRunner:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
 
+    def maybe_init_uocr_greedy_graph(self) -> None:
+        """Record greedy argmax inside Unlimited-OCR v2 decode graph capture."""
+        # A recapture keeps the recorder and its one registered hook.
+        if self.uocr_greedy_graph is not None:
+            return
+        self.uocr_greedy_graph = UocrGreedyGraph.maybe_create(
+            model_config=self.model_config,
+            max_running_requests=get_schedule().max_running_requests,
+            device=self.device,
+        )
+        if self.uocr_greedy_graph is not None:
+            self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
+
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
@@ -1734,9 +1774,6 @@ class ModelRunner:
             model=self.model, device=self.device, tp_size=get_parallel().tp_size
         )
 
-    def update_decode_attn_backend(self, stream_idx: int):
-        self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
-
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
         # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
@@ -1820,38 +1857,11 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
-    def forward_split_prefill(
-        self,
-        forward_batch: ForwardBatch,
-        reinit_attn_backend: bool = False,
-        forward_count: int = 1,
-    ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
-            self.attn_backend.init_forward_metadata(forward_batch)
-        next_split_index = min(
-            forward_batch.split_index + forward_count,
-            self.model_config.num_hidden_layers,
-        )
-        with (
-            get_model().override(shared_experts=self.model.shared_experts_config),
-            device_timer_ctx(self.device_timer, "split_prefill"),
-        ):
-            ret = self.model.forward_split_prefill(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                (forward_batch.split_index, next_split_index),
-            )
-        forward_batch.split_index = next_split_index
-        return ret
-
     def forward(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1892,19 +1902,10 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
+                    output, forward_batch, pp_proxy_tensors
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
@@ -2011,8 +2012,6 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         prepare = getattr(self.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -2049,6 +2048,13 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if self.uocr_greedy_graph is not None:
+                self.uocr_greedy_graph.before_forward(
+                    forward_batch,
+                    replays_graph=can_run_graph,
+                    decode_graph_runner=self.decode_cuda_graph_runner,
+                )
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -2059,10 +2065,10 @@ class ModelRunner:
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
-            # early; split prefill, the prefill cuda graph, and the eager
-            # forward all run the live batch and need this first — it sets
-            # global_dp_buffer_len / padded token counts that graph eligibility
-            # and the collectives depend on.
+            # early; the prefill cuda graph and the eager forward both run the
+            # live batch and need this first -- it sets global_dp_buffer_len /
+            # padded token counts that graph eligibility and the collectives
+            # depend on.
             self._prepare_eager_forward_batch(forward_batch)
 
             # Deferred mamba COW/clear on the forward stream, before the extend
@@ -2073,14 +2079,7 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
-            if forward_batch.forward_mode.is_split_prefill():
-                # Layer-split mode; stays on ModelRunner, not the eager runner.
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
-                )
-            elif (
+            if (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
@@ -2205,22 +2204,30 @@ class ModelRunner:
             logprob_logits = None
 
         # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-            **(
-                {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
-            ),
-        )
+        next_token_ids = None
+        if self.uocr_greedy_graph is not None:
+            next_token_ids = self.uocr_greedy_graph.recorded_ids(
+                logits_output, forward_batch, watermark_state=watermark_state
+            )
+        if next_token_ids is None:
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+                **(
+                    {"logprob_logits": logprob_logits}
+                    if logprob_logits is not None
+                    else {}
+                ),
+            )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
@@ -2630,16 +2637,9 @@ class ModelRunner:
         output: ModelRunnerOutput,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
     ) -> ModelRunnerOutput:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            output = self._forward_raw(forward_batch, pp_proxy_tensors)
         return output
 
     def update_model_fields(
