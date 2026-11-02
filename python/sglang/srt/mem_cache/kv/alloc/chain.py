@@ -68,6 +68,11 @@ from sglang.srt.utils.invariants import expect, resolve_level
 # Rows an unreleased network transfer touches, fixed for one relief.
 _NETWORK_ROWS = "network-rows"
 
+# A band's growth average keeps 1 - 1/_GROWTH_DECAY of itself per take, in
+# units of 1/_GROWTH_SCALE page.
+_GROWTH_DECAY = 16
+_GROWTH_SCALE = 64
+
 logger = logging.getLogger(__name__)
 
 
@@ -310,6 +315,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.bands = tuple(by_name[band.name] for band in arena.bands)
         _wire_chain(self.bands)
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
+        # Each band's recent growth past its holes, a moving average of the
+        # pages its takes extend it by, in fixed point (`_GROWTH_SCALE` per
+        # page). Read from the plans alone, so every rank keeps the same one.
+        self._growth: Dict[str, int] = {b.sub_pool_name: 0 for b in self.bands}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
         # Largest-fit reads, each kept until the capacity epoch moves.
@@ -1302,6 +1311,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         Returns each demanded band's physical pages. A plan of the current
         snapshot always realizes; a refusal is an internal error."""
         self._lay_out(plan)
+        self._note_growth(plan)
         taken = {}
         for band in self.bands:
             take = plan.takes.get(band.sub_pool_name)
@@ -1315,6 +1325,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 )
             taken[band.sub_pool_name] = physical
         return taken
+
+    def _note_growth(self, plan: TakePlan) -> None:
+        """Fold one plan's extensions into every band's growth average: the
+        pages a take adds past the band's holes (a placed float's whole take),
+        none for a band the plan does not extend."""
+        for name, average in self._growth.items():
+            take = plan.takes.get(name)
+            extended = 0
+            if take is not None and take.pages is not None:
+                extended = take.pages[1] - take.pages[0]
+            self._growth[name] = (
+                average - average // _GROWTH_DECAY + extended * _GROWTH_SCALE
+            )
 
     def lay_out_for(self, demands: Dict[str, int]) -> bool:
         """Make the least rearrangement that serves ``demands`` (pages per
@@ -1344,7 +1367,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         layouts exists; the choice reads logical releases only, alike on every
         rank."""
         snapshot = self.pricing_snapshot()
-        in_place = plan_layout(snapshot, demands, NO_MOVE)
+        in_place = plan_layout(snapshot, demands, NO_MOVE, growth=self._growth)
         if in_place is not None:
             yield in_place
             return
@@ -1358,13 +1381,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     if rows:
                         band.fix_pages(_NETWORK_ROWS, sorted(rows))
                         held = True
-            found = first_plan(self.pricing_snapshot(), demands) if held else None
+            found = (
+                first_plan(self.pricing_snapshot(), demands, growth=self._growth)
+                if held
+                else None
+            )
             if found is None and held:
                 for band in self.bands:
                     band.unfix_pages(_NETWORK_ROWS)
                 held = False
             if found is None:
-                found = first_plan(self.pricing_snapshot(), demands)
+                found = first_plan(
+                    self.pricing_snapshot(), demands, growth=self._growth
+                )
             yield found
         finally:
             for band in self.bands:

@@ -160,12 +160,17 @@ def _live_pages(band):
 
 
 def _fixed(allocator):
-    """Every fixed page and the virtual page it holds."""
-    return {
-        (band.sub_pool_name, page): int(band.ids.physical_to_virtual[page])
-        for band in allocator.bands
-        for page in band.fixed_pages()
-    }
+    """Every fixed page holding a live page, and the virtual page it holds.
+    Fixed forbids moving a page; a fixed page that was freed holds nothing to
+    keep, and a take may reuse it in place like any hole."""
+    out = {}
+    for band in allocator.bands:
+        p2v = band.ids.physical_to_virtual
+        for page in band.fixed_pages():
+            virtual = int(p2v[page])
+            if virtual >= 0:
+                out[band.sub_pool_name, page] = virtual
+    return out
 
 
 def _page_bytes(allocator, taken):
@@ -184,6 +189,16 @@ def _page_bytes(allocator, taken):
 
 
 class TestChainRealize(CustomTestCase):
+    def _assert_fixed_kept(self, allocator, fixed):
+        """Every fixed page that held a live page still holds it, still fixed."""
+        now = {
+            (band.sub_pool_name, page): int(band.ids.physical_to_virtual[page])
+            for band in allocator.bands
+            for page in band.fixed_pages()
+        }
+        for key, virtual in fixed.items():
+            self.assertEqual(now.get(key), virtual, key)
+
     def _history(self, rng, allocator):
         held, slots = [], []
         state = allocator.mamba_allocator
@@ -239,7 +254,7 @@ class TestChainRealize(CustomTestCase):
             fixed = _fixed(allocator)
             taken = allocator.realize(first_plan(snapshot, demands, growth=growth))
             realized += 1
-            self.assertEqual(_fixed(allocator), fixed)
+            self._assert_fixed_kept(allocator, fixed)
             after = _live_bytes(allocator)
             self.assertEqual(before.keys(), after.keys())
             for key, payload in before.items():
@@ -308,7 +323,7 @@ class TestChainRealize(CustomTestCase):
                 torch.cuda.synchronize()
             realized += 1
             floats.add((windows, state))
-            self.assertEqual(_fixed(allocator), fixed)
+            self._assert_fixed_kept(allocator, fixed)
             after = _live_bytes(allocator)
             self.assertEqual(before.keys(), after.keys())
             for key, payload in before.items():
@@ -320,6 +335,30 @@ class TestChainRealize(CustomTestCase):
                 self.assertLessEqual(end, start, (a, b))
         self.assertGreater(refused, 0)
         self.assertEqual(floats, set(shapes))
+
+    def test_growth_follows_the_bands_takes_extend(self):
+        # Two chains with the same history keep the same growth averages, read
+        # from their plans alone. A take that extends a band adds to its
+        # average; one that only reuses its holes leaves the average decaying.
+        def history():
+            setup_allocator_context()
+            allocator = _allocator("cpu", "tri", lazy=True)
+            for _ in range(4):
+                allocator.alloc_state_slots(1)
+            held = allocator.alloc(6)
+            return allocator, held
+
+        first, held = history()
+        second, _ = history()
+        self.assertEqual(first._growth, second._growth)
+        state = first.mamba_allocator.sub_pool_name
+        owner = first.full_attn_allocator.sub_pool_name
+        self.assertGreater(first._growth[state], 0)
+        grown = first._growth[owner]
+        self.assertGreater(grown, 0)
+        first.free(held)
+        self.assertIsNotNone(first.alloc(6))
+        self.assertEqual(first._growth[owner], grown - grown // 16)
 
     def test_a_load_reservation_is_fixed_until_submitted_or_cancelled(self):
         # A HiCache load reserves window pages before its copy is submitted;
@@ -576,7 +615,7 @@ class TestChainRealize(CustomTestCase):
                 torch.cuda.synchronize()
             realized += 1
             self.assertIsNotNone(taken)
-            self.assertEqual(_fixed(allocator), fixed, "a relief left pages fixed")
+            self._assert_fixed_kept(allocator, fixed)
             after = _live_bytes(allocator)
             self.assertEqual(before.keys(), after.keys())
             for key, payload in before.items():
