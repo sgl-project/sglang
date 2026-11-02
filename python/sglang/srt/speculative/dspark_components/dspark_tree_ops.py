@@ -10,9 +10,9 @@ contain any other device-specific tree code.
 
 The four device operators follow the vllm-ascend reference backend switch:
 
-* ``vendor`` (default): load the vllm-ascend ``_C_ascend`` bindings listed in
+* ``sgl_kernel_npu`` (default): use the in-tree Triton package.
+* ``vendor``: load the vllm-ascend ``_C_ascend`` bindings listed in
   ``SGLANG_DSPARK_TREE_OPS`` and call the AscendC operators.
-* ``sgl_kernel_npu``: use the in-tree Triton package.
 
 The public functions keep the same signatures for every backend. If an
 operator is unavailable the selected backend raises ``RuntimeError`` instead of
@@ -180,7 +180,7 @@ def get_node_plan(pre) -> NodePlan:
 
 def _tree_backend() -> str:
     """Return the selected tree backend (vendor / sgl_kernel_npu)."""
-    raw = os.environ.get(_TREE_BACKEND_ENV, "vendor").strip().lower()
+    raw = os.environ.get(_TREE_BACKEND_ENV, "sgl_kernel_npu").strip().lower()
     backend = _TREE_BACKEND_ALIASES.get(raw, raw)
     if backend not in _TREE_BACKENDS:
         raise ValueError(

@@ -127,6 +127,10 @@ class PublicSurfaceTest(CustomTestCase):
         for token in REQUIRED_BACKEND_TOKENS:
             self.assertIn(token, src, f"missing backend token {token!r}")
 
+    def test_default_backend_is_sgl_kernel_npu(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(tree_ops._tree_backend(), "sgl_kernel_npu")
+
     def test_source_uses_the_four_direct_sgl_kernel_imports(self) -> None:
         src = _module_source()
         for op in (
