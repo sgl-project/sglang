@@ -45,7 +45,11 @@ class DeepseekSparseAttnBackendKPoolMixin:
     ) -> None:
         if topk_indices is None or self.dsa_index_kpool <= 1:
             return
-        supported = kpool_tail_backends(phase, bf16_kv=not self.dsa_kv_cache_store_fp8)
+        supported = kpool_tail_backends(
+            phase,
+            bf16_kv=not self.dsa_kv_cache_store_fp8,
+            device_sm_major=self.device_sm_major,
+        )
         if dsa_impl in supported:
             return
         raise NotImplementedError(
@@ -58,15 +62,13 @@ class DeepseekSparseAttnBackendKPoolMixin:
         self,
         topk_indices: Optional[torch.Tensor],
         dsa_impl: _DSA_IMPL_T,
-        phase: str,
     ) -> _DSA_IMPL_T:
         if topk_indices is None or self.dsa_index_kpool <= 1:
             return dsa_impl
         return resolve_kpool_tail_backend(
             dsa_impl,
             self.device_sm_major,
-            phase=phase,
-            bf16_kv=not self.dsa_kv_cache_store_fp8,
+            packed_fp8=self.dsa_kv_cache_store_fp8,
         )
 
     def _kpool_index_page_size(self) -> int:

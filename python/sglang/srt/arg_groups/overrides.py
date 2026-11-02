@@ -607,32 +607,36 @@ def _check_dsa_kpool_backend_support(
     from sglang.srt.layers.attention.dsa.kpool_backend import (
         kpool_tail_backends,
         resolve_kpool_tail_backend,
-        supported_kpool_tail_backends,
     )
 
     index_kpool = get_dsa_index_kpool(hf_config)
     if index_kpool <= 1:
         return
+    bf16_kv = kv_cache_dtype == "bfloat16"
+    # A literal trtllm keeps FP8 rows raw (calculate_mla_kv_cache_dim).
+    packed_fp8 = not bf16_kv and "trtllm" not in (prefill_backend, decode_backend)
+    sparse_target = resolve_kpool_tail_backend(
+        "flashmla_sparse", device_sm_major, packed_fp8=not bf16_kv
+    )
     supported = {}
     unsupported = []
-    bf16_kv = kv_cache_dtype == "bfloat16"
     for phase, backend in (("prefill", prefill_backend), ("decode", decode_backend)):
-        backends = kpool_tail_backends(phase, bf16_kv=bf16_kv)
-        supported[phase] = ", ".join(
-            supported_kpool_tail_backends(
-                phase, bf16_kv=bf16_kv, device_sm_major=device_sm_major
-            )
+        backends = kpool_tail_backends(
+            phase, bf16_kv=bf16_kv, device_sm_major=device_sm_major
         )
-        if (
-            backend
-            and resolve_kpool_tail_backend(
-                backend,
-                device_sm_major,
-                phase=phase,
-                bf16_kv=bf16_kv,
-            )
-            not in backends
-        ):
+        names = (
+            (*backends, "flashmla_sparse") if sparse_target in backends else backends
+        )
+        supported[phase] = ", ".join(names)
+        # set_dsa_prefill_impl picks flashmla_sparse for auto over unpacked rows.
+        # Packed rows reject either name.
+        chosen = backend
+        if phase == "prefill" and backend == "flashmla_auto":
+            chosen = "flashmla_sparse"
+        chosen = resolve_kpool_tail_backend(
+            chosen, device_sm_major, packed_fp8=packed_fp8
+        )
+        if chosen not in backends:
             unsupported.append(f"{phase}={backend}")
     if not unsupported:
         return
@@ -640,10 +644,9 @@ def _check_dsa_kpool_backend_support(
         f"{hf_config.architectures[0]} sets index_kpool={index_kpool}, and the "
         f"{', '.join(unsupported)} DSA backend does not support index_kpool > 1 "
         f"(kv_cache_dtype={kv_cache_dtype}, prefill={prefill_backend}, "
-        f"decode={decode_backend}). "
+        f"decode={decode_backend}, sm_major={device_sm_major}). "
         f"Supported prefill backends: {supported['prefill']}. "
-        f"Supported decode backends: {supported['decode']}. "
-        "Choose a backend supported by the selected KV dtype and GPU."
+        f"Supported decode backends: {supported['decode']}."
     )
 
 
@@ -719,10 +722,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = backend
         if not user_set_decode:
             declared["dsa_decode_backend"] = backend
-        if not get_platform().is_hip:
-            _check_dsa_kpool_backend_support(
-                hf_config, kv_cache_dtype, backend, backend, device_sm_major=major
-            )
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
@@ -736,13 +735,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = backend
         if not user_set_decode:
             declared["dsa_decode_backend"] = backend
-        _check_dsa_kpool_backend_support(
-            hf_config,
-            kv_cache_dtype,
-            declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
-            declared.get("dsa_decode_backend", view.dsa_decode_backend),
-            device_sm_major=major,
-        )
         logger.warning(
             "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
@@ -775,10 +767,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
         )
-        if not get_platform().is_hip:
-            _check_dsa_kpool_backend_support(
-                hf_config, kv_cache_dtype, prefill, decode, device_sm_major=major
-            )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."

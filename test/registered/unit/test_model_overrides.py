@@ -2665,14 +2665,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _dsa_split_backend_resolution,
         )
 
-        def _view(
-            arch="DeepseekV32ForCausalLM", learnable_sink=False, index_kpool=1, **kw
-        ):
-            hf = SimpleNamespace(
-                architectures=[arch],
-                learnable_sink=learnable_sink,
-                index_kpool=index_kpool,
-            )
+        def _view(arch="DeepseekV32ForCausalLM", learnable_sink=False, **kw):
+            hf = SimpleNamespace(architectures=[arch], learnable_sink=learnable_sink)
             defaults = dict(
                 kv_cache_dtype="fp8_e4m3",
                 dsa_prefill_backend=None,
@@ -2742,87 +2736,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _dsa_split_backend_resolution(
                                 _view(arch=arch, learnable_sink=True, **{field: value})
                             )
-            # index_kpool > 1: Hopper FP8 defaults (flashmla_kv) cannot take the
-            # pooled tail tokens, so reject at resolution time instead of failing
-            # in CUDA graph capture after the weights load.
-            kpool_arch = "Glm5NextForConditionalGeneration"
-            with self.assertRaisesRegex(ValueError, "index_kpool=4.*flashmla_kv"):
-                _dsa_split_backend_resolution(_view(arch=kpool_arch, index_kpool=4))
-            # explicit unsupported decode backend is rejected too
-            with self.assertRaisesRegex(ValueError, "flashmla_kv"):
-                _dsa_split_backend_resolution(
-                    _view(
-                        arch=kpool_arch,
-                        index_kpool=4,
-                        kv_cache_dtype="bfloat16",
-                        dsa_decode_backend="flashmla_kv",
-                    )
-                )
-            # Hopper bf16 defaults stay valid: flashmla_sparse is remapped to
-            # fa3 for the kpool tail at run time.
-            self.assertEqual(
-                _dsa_split_backend_resolution(
-                    _view(arch=kpool_arch, index_kpool=4, kv_cache_dtype="bfloat16")
-                ),
-                {
-                    "dsa_prefill_backend": "flashmla_sparse",
-                    "dsa_decode_backend": "fa3",
-                },
-            )
-            # BF16 auto prefill resolves to pooled backends on Hopper and Blackwell.
-            for sm_major, expected_decode in ((9, "fa3"), (10, "trtllm")):
-                with self.subTest(sm_major=sm_major, backend="flashmla_auto"):
-                    with patch(
-                        "torch.cuda.get_device_capability",
-                        return_value=(sm_major, 0),
-                    ):
-                        self.assertEqual(
-                            _dsa_split_backend_resolution(
-                                _view(
-                                    arch=kpool_arch,
-                                    index_kpool=4,
-                                    kv_cache_dtype="bfloat16",
-                                    dsa_prefill_backend="flashmla_auto",
-                                )
-                            ),
-                            {"dsa_decode_backend": expected_decode},
-                        )
-
-            # FP8 auto prefill and auto decode still lack pooled-tail support.
-            for field, dtype in (
-                ("dsa_prefill_backend", "fp8_e4m3"),
-                ("dsa_decode_backend", "bfloat16"),
-            ):
-                with self.subTest(field=field, dtype=dtype, backend="flashmla_auto"):
-                    with self.assertRaisesRegex(ValueError, field.split("_")[1]):
-                        _dsa_split_backend_resolution(
-                            _view(
-                                arch=kpool_arch,
-                                index_kpool=4,
-                                kv_cache_dtype=dtype,
-                                **{field: "flashmla_auto"},
-                            )
-                        )
-            for field, dtype, error in (
-                ("dsa_prefill_backend", "bfloat16", None),
-                ("dsa_prefill_backend", "fp8_e4m3", "prefill=flashmla_sparse_q8"),
-                ("dsa_decode_backend", "bfloat16", "decode=flashmla_sparse_q8"),
-            ):
-                with self.subTest(field=field, dtype=dtype):
-                    view = _view(
-                        arch=kpool_arch,
-                        index_kpool=4,
-                        kv_cache_dtype=dtype,
-                        **{field: "flashmla_sparse_q8"},
-                    )
-                    if error:
-                        with self.assertRaisesRegex(ValueError, error):
-                            _dsa_split_backend_resolution(view)
-                    else:
-                        self.assertEqual(
-                            _dsa_split_backend_resolution(view),
-                            {"dsa_decode_backend": "fa3"},
-                        )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
@@ -2857,52 +2770,82 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
-    def test_kpool_validation_runs_before_backend_resolution_returns_early(self):
+    def test_kpool_backend_support_follows_kv_dtype_and_gpu(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_split_backend_resolution,
         )
 
         hf_config = SimpleNamespace(
-            architectures=["GlmMoeDsaForCausalLM"],
+            architectures=["Glm5NextForConditionalGeneration"],
             index_topk=2048,
             index_kpool=4,
         )
-
-        def make_view(**options):
-            defaults = dict(
-                _model_config=SimpleNamespace(hf_config=hf_config),
-                kv_cache_dtype="fp8_e4m3",
-                dsa_prefill_backend=None,
-                dsa_decode_backend=None,
-                enable_hisparse=False,
+        # sm_major, kv dtype, prefill, decode, rejected backend
+        cases = (
+            (9, "fp8_e4m3", None, None, "prefill=flashmla_kv"),
+            (9, "fp8_e4m3", "fa3", "fa3", "prefill=fa3"),
+            (9, "fp8_e4m3", "flashmla_sparse", "fa3", "prefill=flashmla_sparse"),
+            (9, "fp8_e4m3", "trtllm", "trtllm", "prefill=trtllm"),
+            (9, "fp8_e4m3", "tilelang", "tilelang", None),
+            (9, "bfloat16", None, None, None),
+            (9, "bfloat16", "flashmla_auto", None, None),
+            (9, "bfloat16", "flashmla_sparse_q8", "tilelang", None),
+            (9, "bfloat16", "tilelang", "tilelang", None),
+            (9, "bfloat16", "tilelang", "flashmla_kv", "decode=flashmla_kv"),
+            (9, "bfloat16", "tilelang", "flashmla_auto", "decode=flashmla_auto"),
+            (9, "bfloat16", "trtllm", "trtllm", "prefill=trtllm"),
+            (10, "fp8_e4m3", None, None, None),
+            (
+                10,
+                "fp8_e4m3",
+                "flashmla_sparse",
+                "flashmla_sparse",
+                "prefill=flashmla_sparse",
+            ),
+            (10, "fp8_e4m3", "flashmla_sparse", "trtllm", None),
+            (10, "fp8_e4m3", "flashmla_auto", "trtllm", None),
+            (10, "fp8_e4m3", "trtllm", "fa3", "decode=fa3"),
+            (10, "bfloat16", None, None, None),
+            (10, "bfloat16", "tilelang", "tilelang", None),
+            (10, "bfloat16", "fa3", "fa3", "prefill=fa3"),
+            (
+                10,
+                "bfloat16",
+                "flashmla_sparse_q8",
+                "tilelang",
+                "prefill=flashmla_sparse_q8",
+            ),
+            (12, "fp8_e4m3", None, None, "prefill=trtllm"),
+            (12, "bfloat16", "fa3", "fa3", "prefill=fa3"),
+        )
+        for sm_major, dtype, prefill, decode, rejected in cases:
+            view = ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(hf_config=hf_config),
+                    kv_cache_dtype=dtype,
+                    dsa_prefill_backend=prefill,
+                    dsa_decode_backend=decode,
+                    enable_hisparse=False,
+                )
             )
-            return ResolvedView(SimpleNamespace(**(defaults | options)))
-
-        for capability, hisparse, backend in (
-            ((12, 0), False, "flashinfer_sparse_mla"),
-            ((9, 0), True, "flashmla_kv"),
-        ):
             with (
-                self.subTest(capability=capability, hisparse=hisparse),
+                self.subTest(sm=sm_major, dtype=dtype, pair=(prefill, decode)),
                 override_platform(is_npu=False, is_xpu=False, is_hip=False),
-                patch("torch.cuda.get_device_capability", return_value=capability),
+                patch("torch.cuda.get_device_capability", return_value=(sm_major, 0)),
             ):
-                with self.assertRaisesRegex(ValueError, f"index_kpool=4.*{backend}"):
-                    _dsa_split_backend_resolution(make_view(enable_hisparse=hisparse))
-
-        with (
-            override_platform(is_npu=False, is_xpu=False, is_hip=False),
-            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
-        ):
-            self.assertEqual(
-                _dsa_split_backend_resolution(
-                    make_view(
-                        dsa_prefill_backend="tilelang", dsa_decode_backend="tilelang"
+                if rejected is None:
+                    _dsa_split_backend_resolution(view)
+                    continue
+                with self.assertRaisesRegex(
+                    ValueError, f"and the .*{rejected}.* DSA backend"
+                ) as raised:
+                    _dsa_split_backend_resolution(view)
+                # The error must not recommend a backend that cannot read these rows.
+                if (sm_major, dtype) == (9, "fp8_e4m3"):
+                    self.assertIn(
+                        "Supported prefill backends: tilelang.", str(raised.exception)
                     )
-                ),
-                {},
-            )
 
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (
