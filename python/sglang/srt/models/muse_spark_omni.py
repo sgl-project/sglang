@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 from collections.abc import Iterable
 from typing import Optional
 
@@ -137,6 +138,10 @@ class _NormalizedEmbedding(nn.Module):
     @property
     def num_embeddings(self):
         return self._embedding.num_embeddings
+
+
+# LoRA covers the language model; the towers' layers repeat the text projections' names.
+_TEXT_LAYER = re.compile(r"^model\.layers\.\d+\.")
 
 
 class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
@@ -387,6 +392,9 @@ class MuseSparkForConditionalGeneration(MuseSpark1xForCausalLM):
     ) -> list[int]:
         pattern = mm_utils.MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return _TEXT_LAYER.match(module_name) is not None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         parameters = dict(self.named_parameters())
