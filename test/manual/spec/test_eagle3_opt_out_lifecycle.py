@@ -92,6 +92,13 @@ def install_probes():
         out = original(self, batch, result, **kw)
         torch.cuda.synchronize()
         tokens = result.next_token_ids.reshape(len(rows), -1)
+        bonus = result.next_draft_input.bonus_tokens.tolist()
+        assert bonus == [
+            int(tokens[i, n - 1]) for i, n in enumerate(lengths)
+        ], "draft bonus token lost retained target token"
+        assert torch.equal(
+            batch.input_ids.reshape_as(tokens), tokens
+        ), "draft extend input differs from retained predictions"
         for i, (rid, row, old, new, locs, values, buffers) in enumerate(snapshots):
             now_locs = table[row, :new].long().clone()
             assert len(now_locs.unique()) == new, "aliased committed draft slots"

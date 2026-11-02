@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,6 +53,19 @@ class TestPrefixAnalysis(unittest.TestCase):
 
 
 class TestOptOutE2EDiagnostics(unittest.TestCase):
+    def test_stream_prefix_must_be_monotonic(self):
+        module_spec = importlib.util.spec_from_file_location(
+            "lifecycle", path.with_name("test_eagle3_opt_out_lifecycle.py")
+        )
+        lifecycle = importlib.util.module_from_spec(module_spec)
+        with patch.dict(sys.modules, test_per_request_spec_opt_out_e2e=smoke):
+            module_spec.loader.exec_module(lifecycle)
+        lifecycle.check_stream([7], [7, 8])
+        lifecycle.check_stream([7, 8], [7, 8])
+        for current in ([7], [7, 9], []):
+            with self.subTest(current=current), self.assertRaises(AssertionError):
+                lifecycle.check_stream([7, 8], current)
+
     def test_failed_response_is_saved_before_validation(self):
         response = {
             "output_ids": [9],
