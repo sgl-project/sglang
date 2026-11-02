@@ -133,10 +133,6 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         if self.is_modelslim_mxfp8:
-            if page_size % 64:
-                raise ValueError(
-                    "ModelSlim MXFP8 KV cache requires a page size divisible by 64."
-                )
             head_num = modelslim_cache_layout.local_kv_heads
             head_dim = modelslim_cache_layout.key_head_dim
             v_head_dim = modelslim_cache_layout.value_head_dim
