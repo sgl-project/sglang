@@ -597,6 +597,7 @@ def _check_dsa_kpool_backend_support(
     decode_backend: Optional[str],
     *,
     device_sm_major: int,
+    disaggregation_mode: str,
 ) -> None:
     """Reject DSA backends that cannot serve an index_kpool > 1 model.
 
@@ -612,22 +613,26 @@ def _check_dsa_kpool_backend_support(
     index_kpool = get_dsa_index_kpool(hf_config)
     if index_kpool <= 1:
         return
+    # A PD node runs only its own role, and calculate_mla_kv_cache_dim reads only
+    # that role. A literal trtllm there keeps FP8 rows raw.
+    roles = {"prefill": prefill_backend, "decode": decode_backend}
+    if disaggregation_mode in roles:
+        roles = {disaggregation_mode: roles[disaggregation_mode]}
     bf16_kv = kv_cache_dtype == "bfloat16"
-    # A literal trtllm keeps FP8 rows raw (calculate_mla_kv_cache_dim).
-    packed_fp8 = not bf16_kv and "trtllm" not in (prefill_backend, decode_backend)
+    packed_fp8 = not bf16_kv and "trtllm" not in roles.values()
     sparse_target = resolve_kpool_tail_backend(
         "flashmla_sparse", device_sm_major, packed_fp8=not bf16_kv
     )
-    supported = {}
+    supported = []
     unsupported = []
-    for phase, backend in (("prefill", prefill_backend), ("decode", decode_backend)):
+    for phase, backend in roles.items():
         backends = kpool_tail_backends(
             phase, bf16_kv=bf16_kv, device_sm_major=device_sm_major
         )
         names = (
             (*backends, "flashmla_sparse") if sparse_target in backends else backends
         )
-        supported[phase] = ", ".join(names)
+        supported.append(f"Supported {phase} backends: {', '.join(names)}.")
         # set_dsa_prefill_impl picks flashmla_sparse for auto over unpacked rows.
         # Packed rows reject either name.
         chosen = backend
@@ -645,8 +650,7 @@ def _check_dsa_kpool_backend_support(
         f"{', '.join(unsupported)} DSA backend does not support index_kpool > 1 "
         f"(kv_cache_dtype={kv_cache_dtype}, prefill={prefill_backend}, "
         f"decode={decode_backend}, sm_major={device_sm_major}). "
-        f"Supported prefill backends: {supported['prefill']}. "
-        f"Supported decode backends: {supported['decode']}."
+        f"{' '.join(supported)}"
     )
 
 
@@ -803,7 +807,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
     if not get_platform().is_hip:
         _check_dsa_kpool_backend_support(
-            hf_config, kv_cache_dtype, prefill, decode, device_sm_major=major
+            hf_config,
+            kv_cache_dtype,
+            prefill,
+            decode,
+            device_sm_major=major,
+            disaggregation_mode=getattr(view, "disaggregation_mode", "null"),
         )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

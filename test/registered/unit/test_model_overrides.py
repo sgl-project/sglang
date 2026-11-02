@@ -2781,7 +2781,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             index_topk=2048,
             index_kpool=4,
         )
-        # sm_major, kv dtype, prefill, decode, rejected backend
+        # sm_major, kv dtype, prefill, decode, rejected backend, optional PD role
         cases = (
             (9, "fp8_e4m3", None, None, "prefill=flashmla_kv"),
             (9, "fp8_e4m3", "fa3", "fa3", "prefill=fa3"),
@@ -2818,8 +2818,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             (12, "fp8_e4m3", None, None, "prefill=trtllm"),
             (12, "bfloat16", "fa3", "fa3", "prefill=fa3"),
+            (10, "fp8_e4m3", "flashmla_kv", "trtllm", None, "decode"),
+            (10, "fp8_e4m3", "trtllm", "flashmla_kv", None, "prefill"),
+            (
+                10,
+                "fp8_e4m3",
+                "flashmla_sparse",
+                "trtllm",
+                "prefill=flashmla_sparse",
+                "prefill",
+            ),
         )
-        for sm_major, dtype, prefill, decode, rejected in cases:
+        for sm_major, dtype, prefill, decode, rejected, *role in cases:
             view = ResolvedView(
                 SimpleNamespace(
                     _model_config=SimpleNamespace(hf_config=hf_config),
@@ -2827,10 +2837,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     dsa_prefill_backend=prefill,
                     dsa_decode_backend=decode,
                     enable_hisparse=False,
+                    disaggregation_mode=role[0] if role else "null",
                 )
             )
             with (
-                self.subTest(sm=sm_major, dtype=dtype, pair=(prefill, decode)),
+                self.subTest(
+                    sm=sm_major, dtype=dtype, pair=(prefill, decode), role=role
+                ),
                 override_platform(is_npu=False, is_xpu=False, is_hip=False),
                 patch("torch.cuda.get_device_capability", return_value=(sm_major, 0)),
             ):
