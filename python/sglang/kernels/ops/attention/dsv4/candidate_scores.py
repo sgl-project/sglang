@@ -1,9 +1,11 @@
-"""Candidate-only BF16 indexer matmul; keep eager head-score postprocessing unchanged."""
+"""Index scores of each row over its candidate blocks only."""
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
+from sglang.srt.utils.common import is_cuda
 
 
 @triton.jit
@@ -75,7 +77,20 @@ def _mask_scores(
     tl.store(S + row * N + n, tl.where(valid, value, float("-inf")), n < N)
 
 
-def candidate_scores(q, k, weights, blocks, lens, block_size=8):
+def can_use_candidate_scores(q, k, weights, candidate_width: int, lc: int) -> bool:
+    """Whether candidate scoring supports these operands and reduces the score width."""
+    return (
+        candidate_width > 0
+        and candidate_width * 2 <= lc
+        and q.is_cuda
+        and is_cuda()
+        and q.dtype == k.dtype == weights.dtype == torch.bfloat16
+        and 0 < q.shape[1] <= 64
+        and q.shape[2] == 128
+    )
+
+
+def candidate_scores(q, k, weights, blocks, lens, block_size=CANDIDATE_BLOCK_SIZE):
     rows, heads, dim = q.shape
     width = blocks.shape[1] * block_size
     assert q.dtype == k.dtype == weights.dtype == torch.bfloat16
@@ -96,12 +111,11 @@ def candidate_scores(q, k, weights, blocks, lens, block_size=8):
             heads,
             dim,
             block_size,
-            triton.next_power_of_2(heads),
+            max(16, triton.next_power_of_2(heads)),
             triton.next_power_of_2(dim),
             64,
             num_warps=4,
         )
-    # Deliberately preserve the baseline epilogue to isolate candidate reduction.
     scores = (per_head.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
     if rows and width:
         _mask_scores[(rows, triton.cdiv(width, 256))](
@@ -116,17 +130,3 @@ def candidate_scores(q, k, weights, blocks, lens, block_size=8):
             num_warps=4,
         )
     return scores
-
-
-def candidate_topk(scores, blocks, k, block_size=8):
-    if scores.shape[1] == 0:
-        return torch.full(
-            (scores.shape[0], k), -1, dtype=torch.int64, device=scores.device
-        )
-    top = scores.topk(min(k, scores.shape[1]), dim=-1, sorted=False)
-    picked = blocks.to(torch.int64).gather(1, top.indices // block_size) * block_size
-    picked = picked + top.indices % block_size
-    picked = picked.masked_fill(top.values == -torch.inf, -1)
-    if picked.shape[1] < k:
-        picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
-    return picked

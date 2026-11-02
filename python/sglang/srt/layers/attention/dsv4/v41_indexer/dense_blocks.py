@@ -11,10 +11,10 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
     candidate_block_mask,
+    candidate_topk,
     select_candidate_block_ids,
     topk_among_blocks,
 )
-from sglang.kernels.ops.attention.dsv4.candidate_scores import candidate_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
 from .scoring import (

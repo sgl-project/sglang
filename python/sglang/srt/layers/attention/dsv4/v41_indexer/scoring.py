@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.candidate_scores import candidate_scores
+from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+    can_use_candidate_scores,
+    candidate_scores,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     flat_selection_slots,
@@ -387,7 +391,9 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    # FP32 [rows, lc] position scores or [rows, candidate_width] in block order;
+    # invalid positions or candidate columns are -inf.
+    scores: torch.Tensor
     candidate_only: bool = False
 
 
@@ -404,7 +410,7 @@ def prefill_requests(
     inputs: PrefillInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     candidate_blocks: Optional[torch.Tensor] = None,
-    candidate_block_size: int = 8,
+    candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
@@ -477,7 +483,7 @@ def _score_chunks(
     index_k: torch.Tensor,
     request: RequestScores,
     candidate_blocks: Optional[torch.Tensor] = None,
-    candidate_block_size: int = 8,
+    candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     candidate_width = (
@@ -485,16 +491,9 @@ def _score_chunks(
         if candidate_blocks is not None
         else 0
     )
-    candidate_only = (
-        candidate_width > 0
-        and candidate_width * 2 <= lc
-        and q.is_cuda
-        and torch.version.hip is None
-        and q.dtype == index_k.dtype == weights.dtype == torch.bfloat16
-        and q.shape[1] <= 64
-        and q.shape[2] == 128
-    )
+    candidate_only = can_use_candidate_scores(q, index_k, weights, candidate_width, lc)
     score_width = candidate_width if candidate_only else index_k.shape[0]
+    # Chunk rows so the [rows, heads, score_width] BF16 scores stay under budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
