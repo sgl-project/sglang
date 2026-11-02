@@ -9,10 +9,6 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
-from sglang.srt.managers.prefill_delayer import (
-    PrefillDelayerSinglePassExecutor,
-    _NegotiateOutput,
-)
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -61,28 +57,6 @@ class _RecordingDelayer:
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
         self.calls.append(local_prefillable)
         return self.allow
-
-
-def _single_rank_delaying_executor() -> PrefillDelayerSinglePassExecutor:
-    """Real executor over a stub delayer that always delays and echoes the
-    local in-flight bit back as the gathered any-rank bit (dp=1)."""
-    delayer = MagicMock()
-    delayer.attn_dp_enabled = True
-    delayer.num_dp_ranks = 1
-    delayer._metrics_collector = None
-    delayer._debug_log_enabled = False
-    delayer._negotiate_should_allow_prefill.side_effect = (
-        lambda prefill_in_flight=False, **kwargs: _NegotiateOutput(
-            next_state=None,
-            input_estimation="all",
-            output_allow=False,
-            output_reason="delay",
-            num_prefillable=1,
-            num_token_watermark_force_allow=0,
-            any_prefill_in_flight=prefill_in_flight,
-        )
-    )
-    return PrefillDelayerSinglePassExecutor(delayer, token_usage=0.9)
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -1279,53 +1253,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(result, req)
         self.assertIsNone(req.extend_end)
         self.assertEqual(len(adder.can_run_list), 0)
-
-    def test_parked_chunk_leaves_pass_in_decode_phase(self):
-        for shared_pool in (False, True):
-            with self.subTest(shared_pool=shared_pool):
-                adder, req = self._build_hybrid_swa_chunked_req(
-                    page_size=64, rem_swa=64
-                )
-                if shared_pool:
-                    self.mock_token_allocator.can_reserve.return_value = False
-                    adder.memory_budget = ChainPrefillBudget(
-                        self.mock_token_allocator,
-                        self.mock_tree_cache,
-                        rules=ChainAdmissionRules(window="joint"),
-                    )
-                    self.assertIsNotNone(
-                        adder.memory_budget.available_chunk_tokens(
-                            adder.rem_chunk_tokens
-                        )
-                    )
-                executor = _single_rank_delaying_executor()
-                adder.prefill_delayer_single_pass = executor
-                adder.running_batch.batch_size.return_value = 0
-                adder.max_running_requests = 64
-
-                self.assertIs(adder.add_chunked_req(req), req)
-                executor.finalize(actual_prefill_bs=0)
-
-                self.assertEqual(adder.can_run_list, [])
-                self.assertIsNone(req.extend_end)
-                self.assertFalse(executor.is_phase_prefill)
-
-    def test_admitted_chunk_forces_prefill_phase_even_when_delayed(self):
-        PAGE_SIZE = 64
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=PAGE_SIZE, rem_swa=100
-        )
-        executor = _single_rank_delaying_executor()
-        adder.prefill_delayer_single_pass = executor
-        adder.running_batch.batch_size.return_value = 0
-        adder.max_running_requests = 64
-
-        adder.add_chunked_req(req)
-        executor.finalize(actual_prefill_bs=1)
-
-        self.assertEqual(adder.can_run_list, [req])
-        self.assertFalse(executor._result.output_allow)
-        self.assertTrue(executor.is_phase_prefill)
 
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,

@@ -95,7 +95,7 @@ class TestPrefillDelayerClockSkew(CustomTestCase):
                 ):
                     delayer._gather_info = MagicMock(
                         return_value=torch.tensor(
-                            [[1, 0, 8, 4, 1, int(gathered_expired), 0]]
+                            [[1, 0, 8, 4, 1, int(gathered_expired)]]
                         )
                     )
                     start_time = float("-inf") if local_expired else time.perf_counter()

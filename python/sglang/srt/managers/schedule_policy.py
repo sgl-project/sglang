@@ -1137,6 +1137,17 @@ class PrefillAdder:
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
                 _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
 
+        # A mid-chunk rank prefills this pass regardless of the delayer
+        # verdict, so report prefillable=True and ignore the result.
+        if self.prefill_delayer_single_pass is not None:
+            self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
+            )
+
         if self.chunked_req_limit is not None:
             assert self.chunked_req_limit > 0
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
@@ -1179,17 +1190,6 @@ class PrefillAdder:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
-        # Only admitted chunks force prefill; either SWA budget check can park
-        # a chunk that needs decode to free capacity. Continuations ignore delay.
-        if self.prefill_delayer_single_pass is not None:
-            self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
-                max_prefill_bs=self.max_prefill_bs,
-                max_running_requests=self.max_running_requests,
-                waiting_queue_len=self.waiting_queue_len,
-                prefill_in_flight=True,
-            )
         self._update_prefill_budget(
             prefix_tokens,
             req.extend_len,

@@ -262,7 +262,7 @@ class Schedule(msgspec.Struct):
         (
             "Keep all DP-attention ranks in the same phase (extend or decode) "
             "each pass so mixed passes stop vetoing cuda graphs. Requires the "
-            "prefill delayer."
+            "prefill delayer; adds a prefill synchronization before decode."
         ),
     ] = False
     prefill_delayer_max_delay_ms: A[

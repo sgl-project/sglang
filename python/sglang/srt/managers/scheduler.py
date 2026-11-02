@@ -4161,7 +4161,6 @@ class Scheduler(
             running_batch.batch_is_full = False
         self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
-        delayer_phase_prefill = False
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill(running_batch):
@@ -4170,26 +4169,17 @@ class Scheduler(
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
-            delayer_phase_prefill = prefill_plan.delayer_phase_prefill
-
-        if (
-            self.dp_phase_lockstep
-            and self.require_mlp_sync
-            and new_batch is None
-            and delayer_phase_prefill
-        ):
-            new_batch = self.dp_attn_adapter.get_idle_batch()
 
         need_mlp_sync = self.require_mlp_sync
-        if (
-            need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        if need_mlp_sync and (
+            self.dp_phase_lockstep
+            or (
+                not self.spec_algorithm.is_none()
+                and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            )
         ):
-            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
-            # Before merging the new batch into running batch:
-            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
-            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            # Synchronize admitted prefill batches before preparing decode;
+            # an optimistic delayer vote may still fail request admission.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
@@ -4269,7 +4259,6 @@ class Scheduler(
             running_batch=running_batch,
         )
 
-        delayer_phase_prefill = False
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
                 actual_prefill_bs=ret.batch_size() if ret is not None else 0
@@ -4278,13 +4267,8 @@ class Scheduler(
                 self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
                     observed_prefill_bs
                 )
-            delayer_phase_prefill = prefill_delayer_single_pass.is_phase_prefill
 
-        return NextBatchPlan(
-            batch_to_run=ret,
-            running_batch=running_batch,
-            delayer_phase_prefill=delayer_phase_prefill,
-        )
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def _get_new_batch_prefill_raw(
         self,

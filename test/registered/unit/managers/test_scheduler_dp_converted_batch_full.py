@@ -48,7 +48,6 @@ class _RunningBatch:
 class TestDpConvertedBatchFull(unittest.TestCase):
     def _scheduler(self, seen):
         s = Scheduler.__new__(Scheduler)
-        s.dp_phase_lockstep = False
         s.scheduler_stage_metrics = None
         s.disaggregation_mode = DisaggregationMode.NULL
         s.process_pending_chunked_abort = Mock()

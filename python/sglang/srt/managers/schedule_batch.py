@@ -921,6 +921,7 @@ class MultimodalInputs:
         return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
+
         # args needed to be merged
         optional_args = [
             "mm_items",
@@ -4311,4 +4312,3 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 class NextBatchPlan(msgspec.Struct):
     batch_to_run: Optional[ScheduleBatch]
     running_batch: ScheduleBatch
-    delayer_phase_prefill: bool = False
