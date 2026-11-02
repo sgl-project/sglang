@@ -71,6 +71,8 @@ LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use e
 _is_hip = is_hip()
 _MAX_KV_SPLITS = 16 if _is_hip else 64  # Hard cap on kv_splits.
 _TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
+# Head tile of aiter's gfx1250 gluon decode kernel at decode batch sizes.
+_GFX1250_DECODE_BLOCK_H = 16
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
@@ -958,6 +960,11 @@ def sparse_attn_v4_paged_decode(
         # test, so the import has to sit behind the same gate as the call.
         from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
+        # aiter's default fills ~1024 CTAs, which over-splits small decode batches
+        # into partials the reduce then dominates; the stream override is a floor.
+        splits = _kv_splits_heuristic(q.shape[0], q.shape[1], _GFX1250_DECODE_BLOCK_H)
+        if kv_splits is not None:
+            splits = max(splits, kv_splits)
         return pa_decode_sparse(
             q,
             unified_kv,
@@ -967,6 +974,7 @@ def sparse_attn_v4_paged_decode(
             softmax_scale,
             has_invalid=False,
             kv_scales=kv_scales,
+            kv_splits=splits,
         )
     else:
         return _sparse_attn_v4_paged_decode_triton(
