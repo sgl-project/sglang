@@ -293,9 +293,9 @@ def _linker_script(windows, backend, store_window: bool):
     return {
         "backend": _backend_of(cache),
         "refused": False,
-        "window": None if wrapper._window is None else by_object[id(wrapper._window)],
-        "window_pool": str(wrapper._swa_pool),
-        "skip_window": wrapper._skip_swa,
+        "windows": [by_object[id(w)] for w in wrapper._windows],
+        "window_pools": [str(w.pool_name) for w in wrapper._windows],
+        "skipped_windows": [by_object[id(w)] for w in wrapper._skipped_windows],
         "components": [by_object[id(c)] for c in wrapper._components],
     }
 

@@ -42,11 +42,7 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     chain_byte_accounting_violations,
     flush_deferred_free_group,
 )
-from sglang.srt.mem_cache.kv.alloc.demand import (
-    KVDemand,
-    estimate_window_tokens,
-    new_window_peak,
-)
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, request_demand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     NO_MOVE,
@@ -836,31 +832,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
         def fits(new_tokens):
-            # Priced as admission and a chunked request's commitment price it
-            # (`ChainPrefillBudget.request_demand`): the prompt page-ceiled.
+            # Priced as admission and a chunked request's commitment price it.
             return self.admits(
-                KVDemand(
-                    -(-input_tokens // self.page_size) * self.page_size
-                    + new_tokens
-                    + self.page_size,
-                    {
-                        # A lone request holds none of its window yet.
-                        name: new_window_peak(
-                            estimate_window_tokens(
-                                input_tokens,
-                                new_tokens,
-                                sliding_window_size=window,
-                                page_size=self.page_size,
-                                allocation_limit=chunk_size,
-                            ),
-                            input_tokens,
-                            sliding_window_size=window,
-                            page_size=self.page_size,
-                            allocation_limit=chunk_size,
-                        )
-                        for name, window in windows.items()
-                    },
-                    state_slots,
+                request_demand(
+                    input_tokens,
+                    new_tokens,
+                    windows=windows,
+                    page_size=self.page_size,
+                    chunk_size=chunk_size,
+                    state_slots=state_slots,
+                    new_window=True,
                 ),
                 empty_pool=True,
             )

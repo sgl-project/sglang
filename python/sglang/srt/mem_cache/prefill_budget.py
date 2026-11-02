@@ -35,16 +35,14 @@ from sglang.srt.mem_cache.capacity import reclaim_for_load_back
 from sglang.srt.mem_cache.kv.alloc.demand import (
     KVDemand,
     estimate_window_tokens,
-    new_window_peak,
+    request_demand,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 
 def _single_window_hit(
-    window_host_hit_lengths: Optional[Mapping[ComponentType, int]],
+    window_host_hit_lengths: Optional[Mapping[str, int]],
 ) -> int:
-    """Host hit tokens of a pool keeping one window, whichever slot id the
-    tree gives it."""
+    """Host hit tokens of a pool keeping one window, whatever its name."""
     return max((window_host_hit_lengths or {}).values(), default=0)
 
 
@@ -80,7 +78,7 @@ class PrefillBudget:
         extend_input_len: int,
         max_new_tokens: int,
         chunk_limit: int | None,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ) -> bool:
         """Prepare pools whose admission depends on movable shared space."""
@@ -135,7 +133,7 @@ class PrefillBudget:
         max_new_tokens: int,
         input_tokens: int,
         chunk_limit: int | None,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         """Return admission feasibility and a memory bound on the requested chunk."""
@@ -153,7 +151,7 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
     ) -> bool:
         return paged_input + state_slots * self.state_slot_cost <= min(
             self.remaining_current, self.remaining_total
@@ -290,7 +288,7 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         input_tokens: int,
         chunk_limit: int | None,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         if total_tokens + state_slots * self.state_slot_cost >= self.remaining_total:
@@ -366,7 +364,7 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
     ) -> bool:
         return (
             super().can_allocate_prefill(
@@ -457,49 +455,23 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots=0,
         extra_tokens=0,
         new_window=False,
-    ):
-        """What one request still needs to place ``extend_input_len`` prompt
-        tokens and then decode ``max_new_tokens``, as (token sub-pool tokens,
-        tokens per window sub-pool, state slots): the page-ceiled prompt, its
-        decode and one page of allocation rounding (plus ``extra_tokens`` its
-        caller charges on top), the peak each window holds, and its state
-        slots. With ``new_window`` the request holds none of its window yet
-        (`new_window_peak`). One pricing serves the memory clip, admission
-        and the commitment a chunked request keeps until its last chunk: a
-        request the clip lets through is one its chunks can finish."""
-        windows = self.window_tokens(
+    ) -> KVDemand:
+        """What one request still needs (`demand.request_demand`) over this
+        pool's windows."""
+        return request_demand(
             extend_input_len,
             max_new_tokens,
-            chunk_limit=chunk_limit,
+            windows=dict(self.windows),
+            page_size=self.page_size,
+            chunk_size=chunk_limit,
+            state_slots=state_slots,
             host_hit_lengths=host_hit_lengths,
-        )
-        if new_window:
-            hits = {
-                self.tree_cache.window_sub_pool_of_slot(slot): n
-                for slot, n in (host_hit_lengths or {}).items()
-            }
-            windows = {
-                name: new_window_peak(
-                    windows[name],
-                    extend_input_len,
-                    sliding_window_size=window,
-                    page_size=self.page_size,
-                    allocation_limit=chunk_limit,
-                    host_hit_length=hits.get(name, 0),
-                )
-                for name, window in self.windows
-            }
-        return (
-            self.ceil_paged_tokens(extend_input_len)
-            + max_new_tokens
-            + self.page_size
-            + extra_tokens,
-            windows,
-            state_slots,
+            extra_tokens=extra_tokens,
+            new_window=new_window,
         )
 
     def window_tokens(
@@ -508,25 +480,18 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        host_hit_lengths: Optional[Mapping[str, int]] = None,
     ):
         """The tokens one request reserves in each window sub-pool; host hits
-        are given per tree window slot."""
-        hits = {
-            self.tree_cache.window_sub_pool_of_slot(slot): n
-            for slot, n in (host_hit_lengths or {}).items()
-        }
-        return {
-            name: estimate_window_tokens(
+        are given per window sub-pool."""
+        return dict(
+            self.request_demand(
                 extend_input_len,
                 max_new_tokens,
-                sliding_window_size=window,
-                page_size=self.page_size,
-                allocation_limit=chunk_limit,
-                host_hit_length=hits.get(name, 0),
-            )
-            for name, window in self.windows
-        }
+                chunk_limit=chunk_limit,
+                host_hit_lengths=host_hit_lengths,
+            ).window_tokens
+        )
 
     def request_state_slots(self, req) -> int:
         return self.allocator.storage.pending_state_slots(req)
@@ -535,7 +500,9 @@ class ChainPrefillBudget(PrefillBudget):
         """Whether memory is held by anything but ``req`` that gives it back
         when it ends: memory's answer, not the running batch's, which misses
         a PD prefill's sent requests and other pipeline microbatches."""
-        return self.allocator.storage.others_hold_rows(req)
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        return kv_storage_of(None, self.allocator).others_hold_rows(req)
 
     def _only_parked_rows_hold_memory(self) -> bool:
         """Whether the memory held by others is only parked rows' (idle
@@ -579,9 +546,10 @@ class ChainPrefillBudget(PrefillBudget):
             empty_pool=empty_pool,
         )
 
-    def _admits(self, demand, **kwargs) -> bool:
-        full_tokens, window_tokens, state_slots = demand
-        return self._fits(full_tokens, window_tokens, state_slots, **kwargs)
+    def _admits(self, demand: KVDemand, **kwargs) -> bool:
+        return self._fits(
+            demand.full_tokens, demand.window_tokens, demand.state_slots, **kwargs
+        )
 
     @property
     def remaining_window_tokens(self):
@@ -615,7 +583,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         input_tokens: int,
         chunk_limit: int | None,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         """Admit the whole request if it fits; otherwise, with chunking and
@@ -765,7 +733,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
     ) -> bool:
         return self._fits(
             paged_input + max_new_tokens,
@@ -795,7 +763,7 @@ class ChainPrefillBudget(PrefillBudget):
         the last chunk (``deferred_max_new_tokens``) stay pending for every
         later admission, though this pass takes only the chunk's rows."""
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
-        committed_full, committed_windows, _ = self.request_demand(
+        committed = self.request_demand(
             extend_input_len + unfinished_input_len,
             max_new_tokens + deferred_max_new_tokens,
             chunk_limit=chunk_limit,
@@ -805,15 +773,15 @@ class ChainPrefillBudget(PrefillBudget):
             # whether or not a prefix was cached: more pending, never less.
             new_window=unfinished_input_len > 0 and not is_chunked_continuation,
         )
-        now_full, now_windows, _ = self.request_demand(
+        now = self.request_demand(
             extend_input_len, 0, chunk_limit=chunk_limit, extra_tokens=extra_tokens
         )
-        self.total_offset += committed_full
-        self.current_offset += now_full
+        self.total_offset += committed.full_tokens
+        self.current_offset += now.full_tokens
         self.pending_state_slots += state_slots
         for name, _ in self.windows:
-            self.window_offsets[name] += committed_windows[name]
-            self.window_current_offsets[name] += now_windows[name]
+            self.window_offsets[name] += committed.window_tokens[name]
+            self.window_current_offsets[name] += now.window_tokens[name]
 
     def _load_back_demand(
         self,
@@ -822,7 +790,7 @@ class ChainPrefillBudget(PrefillBudget):
         extend_input_len: int,
         max_new_tokens: int,
         chunk_limit: int | None,
-        window_host_hit_lengths: Optional[Mapping[ComponentType, int]] = None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ):
         # H2D pins the restored rows. Realize the selected budget while the

@@ -706,7 +706,12 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.window_host_hit_lengths.get(ComponentType.SWA, 0), 2)
+        self.assertEqual(
+            match.window_host_hit_lengths.get(
+                consumer.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            2,
+        )
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])
@@ -1479,8 +1484,29 @@ def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
         tree_components=(ComponentType.FULL, ComponentType.SWA),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._skipped_windows) is (not swa_stored)
     assert (swa in wrapper._components) is swa_stored
+
+
+def test_linker_keeps_every_window_slot():
+    """A tree with several window slots (a draft window of its own length
+    beside the target's) gets a linker; each window is stored, or tombstoned
+    when the store lacks its pool, on its own."""
+    linker = _FakeLinker()
+    linker.pools["window_127"] = object()
+    target = SimpleNamespace(pool_name="window_127", window_sub_pool="window_127")
+    draft = SimpleNamespace(pool_name="window_128", window_sub_pool="window_128")
+    target_slot, draft_slot = ComponentType.SWA, object()
+    cache = _cache_for_wrapper(
+        components={target_slot: target, draft_slot: draft},
+        _components_tuple=(target, draft),
+        tree_components=(ComponentType.FULL, target_slot),
+        window_slots=lambda: (target_slot, draft_slot),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._windows == (target, draft)
+    assert wrapper._skipped_windows == (draft,)
+    assert target in wrapper._components and draft not in wrapper._components
 
 
 @pytest.fixture
@@ -1509,6 +1535,7 @@ def full_linker_component():
 def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )

@@ -1574,7 +1574,15 @@ class BufferModePipeline:
             # The device already covers every pool's remaining demand.
             return None
         return StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, windows, mamba_slots
+            f.operation_id,
+            key,
+            matched_len,
+            full_tokens,
+            windows,
+            mamba_slots,
+            window_sub_pools={
+                ct: self._cache.window_sub_pool_of_slot(ct) for ct in windows
+            },
         )
 
     def _resolve_device_covered(self, req: Req) -> None:

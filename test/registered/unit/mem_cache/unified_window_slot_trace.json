@@ -575,9 +575,15 @@
    "FULL"
   ],
   "refused": false,
-  "skip_window": true,
-  "window": "WINDOW_16",
-  "window_pool": "window_16"
+  "skipped_windows": [
+   "WINDOW_16"
+  ],
+  "window_pools": [
+   "window_16"
+  ],
+  "windows": [
+   "WINDOW_16"
+  ]
  },
  "linker/python/one/True": {
   "backend": "python",
@@ -586,13 +592,31 @@
    "WINDOW_16"
   ],
   "refused": false,
-  "skip_window": false,
-  "window": "WINDOW_16",
-  "window_pool": "window_16"
+  "skipped_windows": [],
+  "window_pools": [
+   "window_16"
+  ],
+  "windows": [
+   "WINDOW_16"
+  ]
  },
  "linker/python/two/True": {
   "backend": "python",
-  "refused": true
+  "components": [
+   "FULL",
+   "WINDOW_16",
+   "WINDOW_8"
+  ],
+  "refused": false,
+  "skipped_windows": [],
+  "window_pools": [
+   "window_16",
+   "window_8"
+  ],
+  "windows": [
+   "WINDOW_16",
+   "WINDOW_8"
+  ]
  },
  "linker/rust/one/False": {
   "backend": "rust",
@@ -600,9 +624,15 @@
    "FULL"
   ],
   "refused": false,
-  "skip_window": true,
-  "window": "WINDOW_16",
-  "window_pool": "window_16"
+  "skipped_windows": [
+   "WINDOW_16"
+  ],
+  "window_pools": [
+   "window_16"
+  ],
+  "windows": [
+   "WINDOW_16"
+  ]
  },
  "linker/rust/one/True": {
   "backend": "rust",
@@ -611,9 +641,13 @@
    "WINDOW_16"
   ],
   "refused": false,
-  "skip_window": false,
-  "window": "WINDOW_16",
-  "window_pool": "window_16"
+  "skipped_windows": [],
+  "window_pools": [
+   "window_16"
+  ],
+  "windows": [
+   "WINDOW_16"
+  ]
  },
  "tree/python/one": {
   "backend": "python",

@@ -386,7 +386,9 @@ class MatchResult(NamedTuple):
     full_device_match_len: Optional[int] = None
     # Host hit tokens per window slot (within that slot's window), to be
     # loaded back into its device pool, by component id.
-    window_host_hit_lengths: Mapping[ComponentType, int] = MappingProxyType({})
+    # Host hit tokens per window: by tree slot inside the tree, by sub-pool name
+    # once the cache hands the match out.
+    window_host_hit_lengths: Mapping[Any, int] = MappingProxyType({})
 
 
 def zero_match_result(

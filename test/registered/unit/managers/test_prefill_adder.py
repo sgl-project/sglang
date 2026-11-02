@@ -1388,7 +1388,7 @@ class TestPrefillAdder(CustomTestCase):
             req.prefix_len = 0
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
-            req.window_host_hit_lengths = {ComponentType.SWA: WINDOW}
+            req.window_host_hit_lengths = {"swa": WINDOW}
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
@@ -1466,7 +1466,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         req = self._create_host_hit_req(host_hit=6144, tail=2048)
         req.sampling_params.max_new_tokens = 1024
-        req.window_host_hit_lengths = {ComponentType.SWA: 1024}
+        req.window_host_hit_lengths = {"swa": 1024}
         req.best_match_node = MagicMock()
         req.needs_host_load_back.return_value = True
 
@@ -1976,9 +1976,10 @@ class TestPrefillAdder(CustomTestCase):
         rows = allocator.alloc(req.extend_end - req.prefix_len)
         self.assertIsNotNone(rows)
         held = torch.cat([held, rows])
+        (window,) = allocator.window_pool_names()
         out_of_window = len(held) - 8
         if out_of_window > 0:
-            allocator.free_swa(held[:out_of_window])
+            allocator.free_window(window, held[:out_of_window])
         req.prefix_len = req.extend_end
         return held
 
@@ -2201,7 +2202,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.host_hit_length -= 4
                 old_node, restored_node = req.last_node, object()
                 if name == "aux_only":
-                    req.window_host_hit_lengths = {ComponentType.SWA: 8}
+                    req.window_host_hit_lengths = {"swa": 8}
 
                 def load_back(params):
                     self.assertIs(params.req, req)
@@ -2501,7 +2502,7 @@ class TestPrefillAdder(CustomTestCase):
             adder.memory_budget.swa_never_fits(
                 extend_input_len=256,
                 max_new_tokens=64,
-                window_host_hit_lengths={ComponentType.SWA: 4096},
+                window_host_hit_lengths={"swa": 4096},
             )
         )
 
@@ -2511,7 +2512,7 @@ class TestPrefillAdder(CustomTestCase):
         req = dict(
             extend_input_len=256,
             max_new_tokens=64,
-            window_host_hit_lengths={ComponentType.SWA: 600},
+            window_host_hit_lengths={"swa": 600},
         )
         self.assertTrue(
             self.create_swa_adder(

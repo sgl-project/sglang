@@ -38,11 +38,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 
-def _window_hit(req, component=ComponentType.SWA):
-    """``Req.window_host_hit_lengths`` read off a stand-in request."""
+def _window_hit(req):
+    """The one window's ``Req.window_host_hit_lengths`` entry, read off a
+    stand-in request."""
     from sglang.srt.managers.schedule_batch import Req
 
-    return Req.window_host_hit_lengths.fget(req).get(component, 0)
+    return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
 
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")

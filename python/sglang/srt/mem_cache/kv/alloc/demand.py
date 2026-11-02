@@ -100,26 +100,68 @@ def estimate_window_tokens(
     return reserved
 
 
-def new_window_peak(
-    peak: int,
+def request_demand(
     input_tokens: int,
+    max_new_tokens: int,
     *,
-    sliding_window_size: Optional[int],
+    windows: Mapping[str, Optional[int]],
     page_size: int,
-    allocation_limit: Optional[int],
-    host_hit_length: int = 0,
-) -> int:
-    """``peak`` (`estimate_window_tokens`) for a request that holds none of its
-    window yet (no cached prefix): between its chunks it keeps a window of
-    rows it took itself, beside the next chunk, so a request of more than one
-    chunk peaks at that window plus a chunk."""
-    if (
-        sliding_window_size is None
-        or sliding_window_size <= 0
-        or allocation_limit is None
-        or input_tokens <= allocation_limit
-    ):
-        return peak
-    hit = -(-host_hit_length // page_size) * page_size if host_hit_length > 0 else 0
-    held_between_chunks = min(sliding_window_size, input_tokens - allocation_limit)
-    return max(peak, held_between_chunks + allocation_limit + page_size + hit)
+    chunk_size: Optional[int] = None,
+    state_slots: int = 0,
+    host_hit_lengths: Optional[Mapping[str, int]] = None,
+    extra_tokens: int = 0,
+    new_window: bool = False,
+) -> KVDemand:
+    """What one request still needs to place ``input_tokens`` prompt tokens,
+    in chunks of at most ``chunk_size``, and then decode ``max_new_tokens``:
+    the page-ceiled prompt, its decode and one page of allocation rounding in
+    the token sub-pool (plus ``extra_tokens`` its caller charges on top), the
+    peak each window sub-pool of ``windows`` (name to retained window) holds,
+    and ``state_slots``.
+
+    With ``new_window``, the request holds none of its window yet (no cached
+    prefix): between its chunks it keeps a window of rows it took itself,
+    beside the next chunk, so a request of more than one chunk peaks at that
+    window plus a chunk.
+
+    One function prices a request wherever its demand is asked: the memory
+    clip of a lone request in an empty pool, its admission, and the
+    commitment a chunked request keeps until its last chunk. Priced alike,
+    a request the clip lets through is one its chunks can finish."""
+    hits = host_hit_lengths or {}
+
+    def window_peak(name: str, window: Optional[int]) -> int:
+        peak = estimate_window_tokens(
+            input_tokens,
+            max_new_tokens,
+            sliding_window_size=window,
+            page_size=page_size,
+            allocation_limit=chunk_size,
+            host_hit_length=hits.get(name, 0),
+        )
+        if not (
+            new_window
+            and window is not None
+            and window > 0
+            and chunk_size is not None
+            and input_tokens > chunk_size
+        ):
+            return peak
+        hit = hits.get(name, 0)
+        held_between_chunks = min(window, input_tokens - chunk_size)
+        return max(
+            peak,
+            held_between_chunks
+            + chunk_size
+            + page_size
+            + (-(-hit // page_size) * page_size if hit > 0 else 0),
+        )
+
+    return KVDemand(
+        -(-input_tokens // page_size) * page_size
+        + max_new_tokens
+        + page_size
+        + extra_tokens,
+        {name: window_peak(name, window) for name, window in windows.items()},
+        state_slots,
+    )
