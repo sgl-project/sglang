@@ -1,0 +1,121 @@
+---
+title: "Ascend MXFP capability inventory"
+description: "MXFP implementation paths, checkpoint contracts, and preflight restrictions on Ascend NPUs."
+metatags:
+    description: "Local MXFP implementation, checkpoint contracts, preflight restrictions, and hardware validation boundaries."
+---
+
+## Scope and evidence
+
+This is a **local inventory**, not a global quantization or kernel registry. It
+covers native SRT `mxfp8`, `mxfp_w4a8`, `mxfp4`, Diffusion `mxfp8`, `mxfp4_npu`,
+and their ModelSlim MXFP schemes. HF DSV4 FP4, Comfy/GGUF, integer INT4, GPU
+quantization, and diffusion MoE implementations are not advertised by this trial.
+
+The rows below come from `MXFP_CAPABILITIES` in
+`hardware_backend/npu/quantization/mxfp_capabilities.py`. Config/Method/Scheme
+continue selecting algorithms and owning loading; `KernelSpec` is reused only
+for backend, device, dtype, and callable metadata. No local entry is registered
+with the global kernel registry. CPU tests check the same inventory and this
+document; update both when the loader or implementation changes.
+
+- **Implemented** means a path exists in this checkout, not that every model,
+  generation, dtype/layout, or parallel configuration works on hardware.
+- **Fallback** identifies an already-existing choice. Validation does not add
+  fallback, change quantization algorithms, or repack loaded checkpoints.
+- **Blocked** is a demonstrated code-level failure, distinct from absent NPU
+  evidence. Unverified hardware alone never causes an unsupported verdict.
+- **Hardware evidence** is not supplied for this revision. CPU/mock contracts
+  cannot prove NZ storage, NPU numerics, model loading/warmup, quality, or speed.
+  Older support reports are not evidence for the current checkout.
+
+## Inventory
+
+{/* BEGIN ASCEND MXFP CAPABILITIES */}
+<table>
+<thead><tr><th>Path</th><th>Implementation</th><th>Checkpoint / compute</th><th>Scale / local K</th><th>Requirements / limits</th><th>Hardware evidence</th></tr></thead>
+<tbody>
+<tr><td>srt/dense/W8A8_MXFP8/online</td><td>implemented</td><td>BF16/FP16; W=float8_e4m3fn, A=float8_e4m3fn; ND strided weight [K,N]; scale [ceil(K/64),N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/dense/W8A8_MXFP8/modelslim</td><td>implemented</td><td>float8_e4m3fn [N,K]; W=float8_e4m3fn, A=float8_e4m3fn; ND strided weight [K,N]; scale [ceil(K/64),N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/dense/W4A8_MXFP/online</td><td>implemented</td><td>BF16/FP16; W=float4_e2m1fn_x2, A=float8_e4m3fn; FRACTAL_NZ packed weight transpose; scale [K/64,N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 2 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/dense/W4A8_MXFP/modelslim</td><td>implemented</td><td>packed uint8 [N,K/2]; W=float4_e2m1fn_x2, A=float8_e4m3fn; FRACTAL_NZ packed weight transpose; scale [K/64,N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/dense/W4A4_MXFP4/online</td><td>implemented</td><td>BF16/FP16; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; FRACTAL_NZ weight (not transposed); L0 scale transposed</td><td>dual: L0 FLOAT32 / block=512, L1 UE8M0 / block=32; not single-level UE8M0; K % 2 = 0</td><td>Ascend 950 for dual-level MXFP4; ops=npu_dynamic_dual_level_mx_quant, npu_dual_level_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/dense/W4A4_MXFP4/modelslim</td><td>implemented</td><td>packed uint8 [N,K/2]; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; Packed strided weight transpose; scale [K/64,N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W8A8_MXFP8/online</td><td>implemented</td><td>BF16/FP16; W=float8_e4m3fn, A=float8_e4m3fn; Expert weight/scale transpose; existing NZ/ND alignment fallback</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_grouped_matmul, npu_grouped_matmul_swiglu_quant_v2; fused-only ops=none; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W8A8_MXFP8/modelslim</td><td>implemented</td><td>float8_e4m3fn [E,N,K]; W=float8_e4m3fn, A=float8_e4m3fn; Expert weight/scale transpose; existing NZ/ND alignment fallback</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_grouped_matmul, npu_grouped_matmul_swiglu_quant_v2; fused-only ops=none; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W4A8_MXFP/modelslim</td><td>implemented</td><td>packed uint8 [E,N,K/2]; W=float4_e2m1fn_x2, A=float8_e4m3fn; Expert weight/scale transpose; existing NZ/ND alignment fallback</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_grouped_matmul; fused-only ops=npu_grouped_matmul_swiglu_quant_v2; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W4A4_MXFP4/modelslim</td><td>implemented</td><td>packed uint8 [E,N,K/2]; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; Expert weight/scale transpose; existing NZ/ND alignment fallback</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_grouped_matmul; fused-only ops=none; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W4A8_MXFP/online</td><td>fallback</td><td>BF16/FP16; W=BF16/FP16 (existing fallback), A=BF16/FP16 (existing fallback); Existing full-precision layout</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>No MXFP operator needed for existing full-precision fallback; ops=none; fused-only ops=npu_grouped_matmul_swiglu_quant_v2; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; No quantized online W4A8 MoE method on this baseline; retain full-precision BF16/FP16 MoE</td><td>Not validated on this revision</td></tr>
+<tr><td>srt/moe/W4A4_MXFP4/online</td><td>fallback</td><td>BF16/FP16; W=BF16/FP16 (existing fallback), A=BF16/FP16 (existing fallback); Existing full-precision layout</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>No MXFP operator needed for existing full-precision fallback; ops=none; fused-only ops=none; Ascend TP and DeepEP normal/LL adapters; TP/EP sizes unverified; No quantized online W4A4 MoE method on this baseline; retain full-precision BF16/FP16 MoE</td><td>Not validated on this revision</td></tr>
+<tr><td>diffusion/dense/W8A8_MXFP8/online</td><td>implemented</td><td>BF16/FP16; W=float8_e4m3fn, A=float8_e4m3fn; ND strided weight [K,N]; scale [ceil(K/64),N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>diffusion/dense/W8A8_MXFP8/modelslim</td><td>implemented</td><td>float8_e4m3fn [N,K]; W=float8_e4m3fn, A=float8_e4m3fn; ND strided weight [K,N]; scale [ceil(K/64),N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 1 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>diffusion/dense/W4A4_MXFP4/online</td><td>implemented (experimental)</td><td>BF16/FP16; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; FRACTAL_NZ weight (not transposed); L0 scale transposed</td><td>dual: L0 FLOAT32 / block=512, L1 UE8M0 / block=32; not single-level UE8M0; K % 2 = 0</td><td>Ascend 950 for dual-level MXFP4; ops=npu_dynamic_dual_level_mx_quant, npu_dual_level_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>diffusion/dense/W4A4_MXFP4/modelslim</td><td>implemented</td><td>packed uint8 [N,K/2]; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; Packed strided weight transpose; scale [K/64,N,2]</td><td>single: UE8M0 bytes (+127), block=32; paired/transposed after load; K % 64 = 0</td><td>Ascend NPU with the listed MXFP ops; generations unverified; ops=npu_dynamic_mx_quant, npu_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; existing routing constraints still apply</td><td>Not validated on this revision</td></tr>
+<tr><td>diffusion/dense/W4A4_MXFP4_DUALSCALE/modelslim</td><td>blocked</td><td>packed uint8 [N,K/2]; W=float4_e2m1fn_x2, A=float4_e2m1fn_x2; FRACTAL_NZ weight (not transposed); L0 scale transposed</td><td>dual: L0 FLOAT32 / block=512, L1 UE8M0 / block=32; not single-level UE8M0; K % 2 = 0</td><td>Ascend 950 for dual-level MXFP4; ops=npu_dynamic_dual_level_mx_quant, npu_dual_level_quant_matmul; fused-only ops=none; TP validates local K; EP not a Dense execution axis; sizes unverified; Diffusion ModelSlim dual-scale constructor references undefined is_dual_scale_key on this baseline; fix that path before enabling it</td><td>Not validated on this revision</td></tr>
+</tbody>
+</table>
+{/* END ASCEND MXFP CAPABILITIES */}
+
+## Preflight and format boundaries
+
+Configuration checks run at ModelSlim scheme selection and before allocation
+when local partition K is known. Raw checkpoint dtype/shape checks run before
+reshape, cast, or NPU operations. Operator/dtype registration is checked before
+online weight processing and before constructing an MXFP MoE runner. Unsupported
+conditions raise descriptive errors, with no new BF16 fallback.
+
+- Online paths load BF16/FP16 placeholders. Existing activation conversion keeps
+  FP16/BF16 and casts other dtypes to BF16; existing nonstandard weight-dtype
+  conversions remain in the owning Method. Output shape, dtype, and bias behavior
+  stay in `apply`, not in the capability description.
+- ModelSlim W8A8 stores FP8 E4M3 weights, while W4A8/W4A4 single-level stores
+  packed uint8 weights (two FP4 values per byte). Single-level scale bytes are
+  UE8M0 (+127), not floating-point scales to be numerically cast. Packed weights
+  are never quantized or packed again by this validator.
+- The Diffusion ModelSlim MXFP8 adapter allocates `ceil(K/32)` scales and pads
+  an odd final scale count before shared post-load processing. Its preflight
+  accepts positive local K without the old K=64 loader restriction. This does
+  not certify arbitrary K on hardware. Other single-level ModelSlim loaders
+  still reshape flat scales into pairs without padding and require **local K
+  divisible by 64**; keep those restrictions until their adapters change.
+- Dense online W4A4 is **dual-level** (L0 FLOAT32 / block 512, L1 UE8M0 / block 32),
+  using `npu_dynamic_dual_level_mx_quant` and `npu_dual_level_quant_matmul` on
+  Ascend 950. It is not the single-level offline MoE W4A4 format. Dual-level
+  weight is NZ without a weight transpose; the L0 scale is transposed.
+- Single-level FP4 APIs require the integer `torch_npu.float4_e2m1fn_x2` enum,
+  not a torch dtype object. UE8M0 execution needs `torch.float8_e8m0fnu`.
+  Operator registration is necessary, not sufficient: CANN/torch_npu versions
+  must also accept the actual layout and operator schema. No new SoC checks or
+  build-provider decisions are made in feature code.
+- Diffusion ModelSlim `W4A4_MXFP4_DUALSCALE` is blocked because its constructor
+  references undefined `is_dual_scale_key`, even with dual-scale metadata. The
+  validator reports this before construction, rather than suggesting that an
+  untested packed single-level export is interchangeable. The constructor and
+  checkpoint payload are not repaired or changed by this capability trial.
+
+## MoE communication, fallback, and parallelism
+
+- SRT online W4A8/W4A4 MoE on this baseline retains its existing full-precision
+  MoE fallback. Online W4 MoE implementations on other feature branches are not
+  silently imported into this inventory.
+- MXFP MoE requires the Ascend runner (`auto` resolves to it). Fused MXFP gmm1
+  uses SiLU. MXFP8 gmm1 cannot apply a positive `swiglu_limit`; W4A8 retains its
+  existing unfused clamp path, which does not require the fused gmm1 operator.
+  `ascend_fuseep` has an INT8/float-scale contract and is not this MXFP path.
+- W4A8 Ascend TP can emit MXFP8 activations/scales. DeepEP low-latency requests
+  MXFP8 dispatch, while normal retains BF16 dispatch for multi-node prefill and
+  quantizes before GMM. BF16 **communication** is not BF16 **computation**.
+  MXFP8/W4A4 keep their existing dispatcher and activation policies unchanged.
+- TP checks use partition-local K, not the global hidden dimension. Existing
+  routing, expert partition, and dispatcher checks still apply. Dense EP is not
+  an execution axis. No TP/EP size or multi-node matrix is certified by these
+  CPU tests, and lack of a hardware test does not introduce a blanket rejection.
+
+## Required hardware follow-up
+
+For every deployed combination, record SoC, torch/torch_npu/CANN, kernel wheel
+provider, attention backend, TP/EP, and communication mode. Validate native
+operator availability and scale/layout probes, then online and offline model
+load, warmup, graph/eager inference, text/image requests, quality, and performance.
+Include bias-bearing layers and uneven/partial scale groups where the selected
+adapter supports them. A successful metadata preflight does not replace this.

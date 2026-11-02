@@ -111,13 +111,15 @@ class Mxfp4W4A8Config(QuantizationConfig):
                 "kernel exists yet. Add a device branch here when one lands."
             )
         elif isinstance(layer, FusedMoE):
-            # MoE MXFP4 not yet implemented; fall back to unquantised
-            logger.warning(
-                "MXFP4 W4A8 quantization is not yet supported for FusedMoE layers "
-                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
-                "run in full precision (BF16/FP16).",
-                prefix,
+            from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+                W4A8,
+                get_mxfp_capability,
+                validate_mxfp_configuration,
             )
+
+            cap = get_mxfp_capability("srt", "moe", W4A8, "online")
+            reason = validate_mxfp_configuration(cap, prefix=prefix)
+            logger.warning("Ascend MXFP (prefix=%s): %s", prefix, reason)
             return UnquantizedFusedMoEMethod(
                 layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
             )
