@@ -118,6 +118,29 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _dflash_draft_cell_sizes(
+    kvc: KVCacheConfigurator, *, unified: bool
+) -> tuple[int, int]:
+    """Private draft bytes per FULL token and per SWA token."""
+    cell_size = _dflash_draft_cell_size(kvc)
+    if not cell_size or unified:
+        return cell_size, 0
+    draft = kvc.spec_aux_config.draft_model_config
+    if (
+        draft is None
+        or not draft.is_hybrid_swa
+        or len(draft.swa_attention_layer_ids)
+        != kvc.spec_aux_config.dflash_draft_num_layers
+    ):
+        return cell_size, 0
+    draft_tp = kvc.draft_attn_tp_size
+    full_width = draft.get_num_kv_heads(draft_tp) * (draft.head_dim + draft.v_head_dim)
+    swa_width = draft.get_swa_num_kv_heads(draft_tp) * (
+        draft.swa_head_dim + draft.swa_v_head_dim
+    )
+    return 0, cell_size * swa_width // full_width
+
+
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
     """Global layer ids represented by the local DSA pool's dense layer slots."""
     if kvc.mambaish_config and not kvc.is_draft_worker:
@@ -779,7 +802,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_full_layers_num
                 )
 
-        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        self._draft_cell_size, self._draft_swa_cell_size = _dflash_draft_cell_sizes(
+            kvc, unified=self._enable_unified_memory
+        )
         self._fused_full_entry = kvc.fused_entry_bytes("full")
         self._fused_swa_entry = kvc.fused_entry_bytes("swa")
         if self._fused_full_entry is not None or self._fused_swa_entry is not None:
@@ -787,6 +812,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_swa_layers_num = 0
             self._draft_swa_full_layers_num = 0
             self._draft_cell_size = 0
+            self._draft_swa_cell_size = 0
 
         self._recompute_cell_size()
 
@@ -802,16 +828,18 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def _swa_cell_bytes(self) -> int:
         if self._fused_swa_entry is not None:
             return self._fused_swa_entry
-        return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+        return (
+            self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._draft_swa_cell_size
+        )
 
     def _recompute_cell_size(self) -> None:
         # Bytes per token of max_total_num_tokens: full_tokens when hybrid, else
         # swa_tokens with no ratio, since all-SWA has no full pool to relate to.
         if self._full_layers_num == 0:
             self._cell_size = (
-                self._swa_per_token * self._swa_layers_num
+                self._swa_cell_bytes()
                 + self._full_per_token * self._draft_full_layers_num
-                + self._swa_per_token * self._draft_swa_layers_num
                 + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._draft_cell_size
             )
@@ -840,9 +868,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._full_per_token * self._full_layers_num
 
     def _unified_pool_bytes(self, full_tokens: int, swa_tokens: int) -> int:
+        swa_entry = (
+            self._fused_swa_entry
+            if self._fused_swa_entry is not None
+            else self._swa_per_token * self._swa_layers_num
+        )
         return (
-            full_tokens * self._unified_full_bytes_per_token()
-            + swa_tokens * self._swa_per_token * self._swa_layers_num
+            full_tokens * self._unified_full_bytes_per_token() + swa_tokens * swa_entry
         )
 
     def _max_unified_full_tokens(
