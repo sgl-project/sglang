@@ -103,7 +103,7 @@ class PrefillBudget:
         return self._available_and_evictable() - self.current_offset
 
     @property
-    def remaining_swa(self):
+    def remaining_window_tokens(self):
         return 0
 
     def has_capacity(self) -> bool:
@@ -215,7 +215,7 @@ class SWAPrefillBudget(PrefillBudget):
         return global_full_available_size + self.tree_cache.full_evictable_size()
 
     @property
-    def remaining_swa(self):
+    def remaining_window_tokens(self):
         evictable = 0 if self.req_ring else self.tree_cache.swa_evictable_size()
         global_swa_available_size = self.allocator.swa_available_size()
         if is_cp_sharded_padded():
@@ -260,7 +260,7 @@ class SWAPrefillBudget(PrefillBudget):
         headroom = self.swa_tokens(
             0, max_new_tokens, window_host_hit_lengths=window_host_hit_lengths
         )
-        cap = int(self.remaining_swa) - headroom
+        cap = int(self.remaining_window_tokens) - headroom
         cap = max(0, cap // self.page_size * self.page_size)
         if is_cp_sharded_padded() and cap > 0:
             # Keep SWA availability at the caller; the helper only aligns tokens.
@@ -296,9 +296,9 @@ class SWAPrefillBudget(PrefillBudget):
             window_host_hit_lengths=window_host_hit_lengths,
         )
         fits = (
-            needed <= self.remaining_swa
+            needed <= self.remaining_window_tokens
             if self.req_ring
-            else needed < self.remaining_swa
+            else needed < self.remaining_window_tokens
         )
         if fits:
             return True, chunk_limit
@@ -323,8 +323,8 @@ class SWAPrefillBudget(PrefillBudget):
     def has_capacity(self) -> bool:
         if is_cp_sharded_padded():
             # CP can reuse padding in already reserved SWA pages with zero fresh capacity.
-            return super().has_capacity() and self.remaining_swa >= 0
-        return super().has_capacity() and self.remaining_swa > 0
+            return super().has_capacity() and self.remaining_window_tokens >= 0
+        return super().has_capacity() and self.remaining_window_tokens > 0
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available_tokens = int(self.remaining_total)
@@ -335,7 +335,7 @@ class SWAPrefillBudget(PrefillBudget):
             available_tokens,
         )
         if not self.req_ring:
-            available_tokens = int(self.remaining_swa)
+            available_tokens = int(self.remaining_window_tokens)
             if is_cp_sharded_padded():
                 available_tokens = get_cp_sharded_padded_available_tokens(
                     available_tokens, reserved_tokens=self.page_size
@@ -370,7 +370,7 @@ class SWAPrefillBudget(PrefillBudget):
                 chunk_limit=chunk_limit,
                 window_host_hit_lengths=window_host_hit_lengths,
             )
-            <= self.remaining_swa
+            <= self.remaining_window_tokens
         )
 
     def reserve(
@@ -483,16 +483,16 @@ class ChainPrefillBudget(PrefillBudget):
         )
 
     @property
-    def remaining_swa(self):
-        # Token views for paths that size work by a token count (dLLM): the
-        # target window's reachable tokens less what is pending on it.
+    def remaining_window_tokens(self):
+        # Token view for paths that size work by a token count (dLLM): the
+        # fewest tokens any window can still take, less what is pending on it.
         if not self.windows:
             return 0
-        name = self.allocator.swa_attn_allocator.sub_pool_name
-        return (
-            self.allocator.swa_available_size()
-            + self.tree_cache.swa_evictable_size()
+        return min(
+            self.allocator.window_available_size(name)
+            + self.tree_cache.window_evictable_size(name)
             - self.window_offsets[name]
+            for name, _ in self.windows
         )
 
     def has_capacity(self) -> bool:

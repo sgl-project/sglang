@@ -209,7 +209,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
         budget = create_prefill_budget(allocator, _cache())
         self.assertTrue(budget.state_slots_fit(12))
         self.assertGreaterEqual(budget.remaining_total, 12)
-        self.assertGreaterEqual(budget.remaining_swa, 12)
+        self.assertGreaterEqual(budget.remaining_window_tokens, 12)
         held = {p: int(window.ids.physical_to_virtual[p]) for p in window.fixed_pages()}
         fits = budget.check_prefill(
             extend_input_len=11,

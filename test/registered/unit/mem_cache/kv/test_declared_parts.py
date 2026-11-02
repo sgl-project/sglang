@@ -1990,7 +1990,7 @@ class TestDeclaredParts(CustomTestCase):
                 token_demand(a, 400, 16),
                 evictable=evictable_by_sub_pool(cache, a),
                 full_budget_tokens=full_budget,
-                swa_budget_tokens=swa_budget,
+                window_budget_tokens={a.target_window_pool(): swa_budget},
             )
         )
         # Pending requests and decode headroom are deducted from these budgets.
@@ -2011,7 +2011,9 @@ class TestDeclaredParts(CustomTestCase):
                         token_demand(a, 400, 16),
                         evictable=evictable_by_sub_pool(cache, a),
                         full_budget_tokens=full_budget - full_reserved,
-                        swa_budget_tokens=swa_budget - swa_reserved,
+                        window_budget_tokens={
+                            a.target_window_pool(): swa_budget - swa_reserved
+                        },
                     ),
                     fits,
                 )
@@ -2493,7 +2495,7 @@ class TestDeclaredParts(CustomTestCase):
                 queue._prealloc_reservation_fits(
                     token_demand(a, need, need),
                     full_allocatable_tokens=full,
-                    swa_allocatable_tokens=swa,
+                    window_allocatable_tokens={a.target_window_pool(): swa},
                 ),
                 fits,
             )

@@ -174,7 +174,7 @@ class TestDecodePreallocationTakesItsStateSlots(CustomTestCase):
                         self.assertEqual(slots, 1)
                         budgets = dict(
                             full_allocatable_tokens=10**9,
-                            swa_allocatable_tokens=10**9,
+                            window_allocatable_tokens=None,
                         )
                         alone = queue._prealloc_reservation_fits(
                             token_demand(allocator, tokens, tokens), **budgets

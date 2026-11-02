@@ -1489,7 +1489,7 @@ class TestPrefillAdder(CustomTestCase):
                     )
                 admitted_before = [first] if has_prior_req else []
                 budget_before = (
-                    adder.memory_budget.remaining_swa,
+                    adder.memory_budget.remaining_window_tokens,
                     adder.rem_total_tokens,
                     adder.rem_chunk_tokens,
                 )
@@ -1511,7 +1511,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIsNone(req.extend_end)
                 self.assertEqual(
                     (
-                        adder.memory_budget.remaining_swa,
+                        adder.memory_budget.remaining_window_tokens,
                         adder.rem_total_tokens,
                         adder.rem_chunk_tokens,
                     ),
@@ -1540,7 +1540,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(result, AddReqResult.CONTINUE)
         self.assertEqual(adder.can_run_list, [req])
         self.assertEqual((req.prefix_len, req.extend_end), (0, 8192))
-        self.assertGreaterEqual(adder.memory_budget.remaining_swa, 0)
+        self.assertGreaterEqual(adder.memory_budget.remaining_window_tokens, 0)
         self.assertEqual(self.mock_tree_cache.inc_lock_ref.call_count, 3)
         self.assertEqual(self.mock_tree_cache.dec_lock_ref.call_count, 2)
 
@@ -1593,7 +1593,9 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIs(
                     adder.new_chunked_req, req if expected_end < 8192 else None
                 )
-                self.assertEqual(adder.memory_budget.remaining_swa, remaining_swa)
+                self.assertEqual(
+                    adder.memory_budget.remaining_window_tokens, remaining_swa
+                )
 
     def test_swa_partial_host_restore_fails_loudly_before_request_commit(self):
         adder, req = self._build_hicache_restore_admission(

@@ -711,33 +711,40 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         demand = demand.checked(self.window_pool_names())
         return self.admits(demand, empty_pool=True)
 
+    def window_capacity_and_available(self, sub_pool: str) -> Tuple[int, int]:
+        """Window sub-pool ``sub_pool``'s tokens held plus what a take from it
+        can serve now, and that take's reach (the planner's answer)."""
+        band = self._window_band(sub_pool)
+        available = self.units_available(sub_pool)
+        return available + band.allocated_count(), available
+
+    def _window_band(self, sub_pool: str):
+        for window in self._windows:
+            if window.sub_pool_name == sub_pool:
+                return window
+        raise KeyError(f"no window sub-pool {sub_pool!r}")
+
     def prealloc_fits(
         self,
         demand: KVDemand,
         *,
         evictable: Dict[str, int],
         full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
+        window_budget_tokens: Optional[Dict[str, int]] = None,
     ) -> bool:
         """A decode-node preallocation on the admission rule: its tokens, every
         window's own tail and the state slots it takes with them, priced
         together since they share bytes. The budgets are the scheduler's
-        token views of the owner and of the target's window after decode
-        headroom and retraction: the request stays within them, and what
-        they hold back from that side's reachable tokens is pending demand,
-        charged alongside the request."""
+        token views of the owner and of each window after decode headroom and
+        retraction, by window sub-pool name: the request stays within them,
+        and what they hold back from a side's reachable tokens is pending
+        demand, charged alongside the request in one admission question."""
         demand = demand.checked(self.window_pool_names())
         full_tokens = demand.full_tokens
         windows = dict(demand.window_tokens)
-        target = (
-            None
-            if self.swa_attn_allocator is None
-            else self.swa_attn_allocator.sub_pool_name
-        )
-        if full_tokens > full_budget_tokens or (
-            swa_budget_tokens is not None
-            and target is not None
-            and windows[target] > swa_budget_tokens
+        budgets = dict(window_budget_tokens or {})
+        if full_tokens > full_budget_tokens or any(
+            windows[name] > budget for name, budget in budgets.items()
         ):
             return False
         evictable = dict(evictable)
@@ -746,12 +753,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             0,
             self.full_available_size() + evictable.get(owner, 0) - full_budget_tokens,
         )
-        if swa_budget_tokens is not None and target is not None:
-            windows[target] += max(
+        for name, budget in budgets.items():
+            windows[name] += max(
                 0,
-                self.swa_available_size()
-                + evictable.get(target, 0)
-                - swa_budget_tokens,
+                self.window_available_size(name) + evictable.get(name, 0) - budget,
             )
         return self.admits(
             KVDemand(full_tokens, windows, demand.state_slots), evictable=evictable

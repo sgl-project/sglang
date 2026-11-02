@@ -614,9 +614,9 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         cache.swa_evictable_size = lambda: 1000
         budget = create_prefill_budget(allocator, cache)
         budget.reserve(12, 4, chunk_limit=16)
-        self.assertEqual(budget.remaining_swa, 32)
+        self.assertEqual(budget.remaining_window_tokens, 32)
         budget.reserve(12, 4, chunk_limit=16, is_chunked_continuation=True)
-        self.assertEqual(budget.remaining_swa, 32)
+        self.assertEqual(budget.remaining_window_tokens, 32)
         # The last exact ring slot remains admissible.
         self.assertEqual(
             budget.check_prefill(
@@ -641,7 +641,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator.full_available_size = lambda: 12
         budget = create_prefill_budget(allocator, _cache())
         self.assertEqual(budget.remaining_total, 12)
-        self.assertEqual(budget.remaining_swa, 64)
+        self.assertEqual(budget.remaining_window_tokens, 64)
 
     def test_tri_pool_eviction_does_not_reenter_common(self):
         from array import array

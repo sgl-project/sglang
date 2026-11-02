@@ -277,7 +277,7 @@ class TestMambaCapacity(unittest.TestCase):
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
 
-        queue._prealloc_required_tokens = MagicMock(return_value=(1, 0))
+        queue._prealloc_required = MagicMock(return_value=(1, {}))
         queue._admit_preallocation = MagicMock(return_value=True)
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         with patch(

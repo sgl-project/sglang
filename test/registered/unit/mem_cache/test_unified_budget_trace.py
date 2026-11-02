@@ -93,18 +93,25 @@ def _allocator_answers(allocator, names, state):
             out[f"take/{full}/{list(values)}/{slots}"] = allocator.ensure_capacity(
                 demand
             )
+            target = allocator.target_window_pool()
             for full_budget, swa_budget in itertools.product(
                 [16, 64, 200], [None, 8, 32]
             ):
-                out[
-                    f"prealloc/{full}/{list(values)}/{slots}/{ev_name}/"
-                    f"{full_budget}/{swa_budget}"
-                ] = allocator.prealloc_fits(
-                    demand,
-                    evictable=dict(evictables[ev_name]),
-                    full_budget_tokens=full_budget,
-                    swa_budget_tokens=swa_budget,
-                )
+                key = f"{full}/{list(values)}/{slots}/{ev_name}/{full_budget}/{swa_budget}"
+                # A budget on the target's window alone, and one on every
+                # window: the scheduler budgets each window by the same rule.
+                for label, budgets in (
+                    ("prealloc", {target: swa_budget}),
+                    ("prealloc_every_window", dict.fromkeys(names, swa_budget)),
+                ):
+                    out[f"{label}/{key}"] = allocator.prealloc_fits(
+                        demand,
+                        evictable=dict(evictables[ev_name]),
+                        full_budget_tokens=full_budget,
+                        window_budget_tokens=(
+                            None if swa_budget is None or target is None else budgets
+                        ),
+                    )
     for input_tokens, max_new, chunk in itertools.product(
         [4, 40, 120], [8, 64], [None, 16]
     ):
@@ -123,7 +130,7 @@ def _allocator_answers(allocator, names, state):
 def _budget_answers(allocator, cache):
     budget = create_prefill_budget(allocator, cache)
     out = {
-        "remaining_swa": int(budget.remaining_swa),
+        "remaining_swa": int(budget.remaining_window_tokens),
         "has_capacity": budget.has_capacity(),
     }
     for extend, max_new, chunk in itertools.product([4, 24, 80], [4, 32], [None, 16]):
@@ -148,7 +155,7 @@ def _budget_answers(allocator, cache):
                 extend_input_len=extend, max_new_tokens=max_new, chunk_limit=chunk
             )
     budget.reserve(16, 8)
-    out["after_reserve/remaining_swa"] = int(budget.remaining_swa)
+    out["after_reserve/remaining_swa"] = int(budget.remaining_window_tokens)
     out["after_reserve/check"] = list(
         budget.check_prefill(
             extend_input_len=24,

@@ -842,7 +842,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
                 patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),
-                patch.object(queue, "_prealloc_required_tokens", return_value=(0, 0)),
+                patch.object(queue, "_prealloc_required", return_value=(0, {})),
                 patch.object(queue, "_admit_preallocation", return_value=True),
                 patch.object(queue, "_pre_alloc", side_effect=pre_alloc),
                 torch.cuda.stream(queue.scheduler.schedule_stream),
