@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,

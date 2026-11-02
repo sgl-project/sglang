@@ -192,7 +192,7 @@ def record_network_transfer(
     ``kv_manager``'s status path publishes (after ``failed_delay`` seconds for
     a failed transfer)."""
     from sglang.srt.disaggregation.common.conn import CommonKVManager
-    from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
+    from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 
     storage = token_to_kv_pool_allocator.storage
     if storage is None:

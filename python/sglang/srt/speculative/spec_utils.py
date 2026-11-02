@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

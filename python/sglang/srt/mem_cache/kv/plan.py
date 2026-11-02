@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    STATE_PART,
     DerivedPartDecl,
     FullLifetime,
     KVLayerDecl,
@@ -31,7 +33,6 @@ from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_STATE,
     LAYER_WINDOW,

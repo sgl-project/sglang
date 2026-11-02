@@ -29,16 +29,12 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.srt.environ import InvariantCheckLevel
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import (
+from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.swa import (
-    UNIFIED_SWA_SEGMENT_BOUND,
-    UNIFIED_SWA_SEGMENT_RELEASED,
-)
+from sglang.srt.environ import InvariantCheckLevel
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -47,6 +43,10 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, estimate_window_tokens
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.invariants import (
+    WINDOW_SEGMENT_BOUND,
+    WINDOW_SEGMENT_RELEASED,
+)
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     NO_MOVE,
     ChainSnapshot,
@@ -1744,7 +1744,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
-                UNIFIED_SWA_SEGMENT_BOUND,
+                WINDOW_SEGMENT_BOUND,
                 window.ids.virtual_to_physical[v_pages] > 0,
                 msg="caller wants free_full_segment",
             )
@@ -1786,7 +1786,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if resolve_level() >= InvariantCheckLevel.WARN:
             for window in self._windows:
                 expect(
-                    UNIFIED_SWA_SEGMENT_RELEASED,
+                    WINDOW_SEGMENT_RELEASED,
                     window.ids.virtual_to_physical[reps // self.page_size] <= 0,
                     msg="caller wants free_segment",
                 )

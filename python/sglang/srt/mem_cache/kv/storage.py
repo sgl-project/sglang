@@ -25,13 +25,18 @@ from typing import (
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.advance import (
+    TrackingAdvance,
+    advance_tracking,
+    coalesce_ranges,
+    retire_window_rows,
+)
 from sglang.srt.mem_cache.kv.alloc.signals import (
     CompletionFlag,
     CompletionFlagPool,
     TransferRelease,
 )
-from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
+from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -90,22 +95,6 @@ class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     label: str
     capacity: int
     available: int
-
-
-class Region(msgspec.Struct, frozen=True, kw_only=True):
-    """A sub-pool's device memory as a PD peer registers it: one entry per
-    buffer, and per entry the slices a peer of another TP size reads. A whole
-    page envelope has no slices: both peers must lay it out identically."""
-
-    ptrs: Tuple[int, ...]
-    lens: Tuple[int, ...]
-    item_lens: Tuple[int, ...]
-    dim_per_tensor: Tuple[int, ...] = ()
-    conv_shard_groups: Tuple[Any, ...] = ()
-    slice_outer_counts: Tuple[int, ...] = ()
-    layer_ids: Tuple[int, ...] = ()
-    # The token KV byte layout both peers must share, for views that have one.
-    kv_layout: Optional[str] = None
 
 
 class ResumeUnits(msgspec.Struct, frozen=True, kw_only=True):
@@ -351,10 +340,8 @@ class KVStorage:
         if window_sub_pool is None:
             raise ValueError("window retirement names the window's sub-pool")
 
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
         sub_pool = window_sub_pool
-        free_swa_out_of_window_slots(
+        retire_window_rows(
             req,
             frontier,
             sliding_window_size=window,
@@ -448,8 +435,6 @@ class KVStorage:
         self._allocator.free_full_segment(ids, start_pos=0)
 
     def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
-        from sglang.srt.mem_cache.common import coalesce_ranges
-
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
         dead_lo = kv.window_dead_lo(self._allocator.page_size)

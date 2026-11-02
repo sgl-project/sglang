@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,

@@ -23,7 +23,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,

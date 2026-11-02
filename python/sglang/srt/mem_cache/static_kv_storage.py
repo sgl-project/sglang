@@ -17,7 +17,11 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.advance import (
+    TrackingAdvance,
+    advance_tracking,
+    retire_window_rows,
+)
 from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
@@ -357,9 +361,7 @@ class StaticKVStorage:
         if frontier is None:
             raise ValueError("window retirement needs a token frontier")
 
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
-        free_swa_out_of_window_slots(
+        retire_window_rows(
             req,
             frontier,
             sliding_window_size=window,
