@@ -10,22 +10,17 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
-from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.kernels.ops.attention.fla.utils import (
+    autotune_cache_kwargs,
+    check_shared_mem,
+    is_amd,
+    is_nvidia_hopper,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BKV_LIST
-#         for BV in BKV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT"],
-# )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -125,6 +120,21 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+# On AMD the fixed launch below is ~1.6x slower than the tuned config (gfx1100, GDN prefill),
+# so tune there; elsewhere keep the fixed launch. The kernel only writes `o`, so tuning reruns are safe.
+_chunk_fwd_kernel_o_autotuned = triton.autotune(
+    configs=[
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in BKV_LIST
+        for BV in BKV_LIST
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ],
+    key=["H", "K", "V", "BT"],
+    **autotune_cache_kwargs,
+)(chunk_fwd_kernel_o)
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -150,7 +160,12 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
+    if is_amd:
+        kernel, launch = _chunk_fwd_kernel_o_autotuned, {}
+    else:
+        kernel = chunk_fwd_kernel_o
+        launch = dict(BK=128, BV=64, num_warps=4, num_stages=2)
+    kernel[grid](
         q,
         k,
         v,
@@ -166,11 +181,8 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        **launch,
     )
     return o
