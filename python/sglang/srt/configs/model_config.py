@@ -2532,6 +2532,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "UltravoxModel",
     "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
