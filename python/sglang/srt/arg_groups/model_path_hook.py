@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.model_hub import resolve_model_hub_paths
 from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -23,8 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_source_paths(server_args: Any):
-    """Prepare metadata for model paths backed by remote object stores."""
+    """Resolve explicit Hub sources before generic remote-connector handling."""
     cfg = resolving_view(server_args)
+    hub_paths = resolve_model_hub_paths(cfg)
+    if hub_paths:
+        declare_resolution(server_args, "_handle_model_hub_paths", **hub_paths)
     resolve_hf_gguf_model_path(server_args)
 
     seen_paths = set()
