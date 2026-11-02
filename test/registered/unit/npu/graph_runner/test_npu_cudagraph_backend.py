@@ -59,7 +59,7 @@ def _make_eagle_draft_runner(
             hf_config=SimpleNamespace(
                 architectures=architectures, index_topk=index_topk
             )
-        )
+        ),
     )
     return runner
 
