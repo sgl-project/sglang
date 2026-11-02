@@ -351,8 +351,6 @@ if _use_aiter:
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
     from aiter.ops.quant import per_group_quant_hip
 
-    if _use_aiter_bpreshuffle_gfx95:
-        from sglang.srt.layers.quantization import fp8_utils_hip as _hip
     from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
         smallm_fp8_gemm,
         smallm_fp8_gemm_supported,
@@ -1783,8 +1781,6 @@ def aiter_w8a8_block_fp8_linear(
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
     elif _use_aiter_bpreshuffle_gfx95:
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
-        if input_scale is not None:
-            gemm_a8w8_blockscale_op = _hip.zeroed_gemm(input, gemm_a8w8_blockscale_op)
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 

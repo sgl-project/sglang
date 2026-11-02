@@ -149,16 +149,6 @@ def norm_quant(layer) -> Optional["Gfx950NormQuant"]:
     return Gfx950NormQuant(layer)
 
 
-def bind_fp8_norms(model) -> None:
-    """Bind every decoder layer's norms to the GEMMs reading their fused fp8 output, once the
-    fused qkv + index projections exist."""
-    from sglang.srt.models.minimax_m3 import MiniMaxM3DecoderLayer
-
-    for module in model.modules():
-        if isinstance(module, MiniMaxM3DecoderLayer) and module._norm_quant is not None:
-            module._norm_quant.bind()
-
-
 @dataclass(frozen=True)
 class NormFp8Readout(NormReadout):
     """The residual's norm, as ``(fp8, scale, bf16 norm)`` when the consumer's GEMM
@@ -230,16 +220,6 @@ class Gfx950NormQuant:
 
     def ffn_read(self) -> NormFp8Readout:
         return NormFp8Readout(quant_format_for=self.ffn_quant_format)
-
-    def bind(self) -> None:
-        """Bind each norm to the GEMM that reads its fused fp8 output."""
-        layer = self.layer
-        for norm, proj in (
-            (layer.input_layernorm, layer.self_attn._fused_qkv_index),
-            (layer.post_attention_layernorm, self._ffn_gate_up()),
-        ):
-            if isinstance(norm, GemmaRMSNorm) and proj is not None:
-                norm.fp8_out_gemm_shape = tuple(proj.weight.shape)
 
 
 class Gfx950SwigluFp8:

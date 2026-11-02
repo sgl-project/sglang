@@ -297,8 +297,6 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
             module.maybe_build_fused_qkv_index()
-    if _is_gfx95_supported:
-        _hip.bind_fp8_norms(model)
 
 
 class MiniMaxM3MLP(nn.Module):
