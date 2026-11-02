@@ -43,6 +43,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
                 as_tuple=True
             )[0]
+            self.forward_metadata.mamba_track_mask_indices = mamba_track_mask_indices
             self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[mamba_track_mask_indices]
             )

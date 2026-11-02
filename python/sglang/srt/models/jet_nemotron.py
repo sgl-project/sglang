@@ -31,8 +31,26 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
-from sglang.srt.utils import add_prefix
+from sglang.srt.runtime_context import mamba_cache_chunk_size
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
+
+
+class JetRMSNormGated(RMSNormGated):
+    def forward(self, x, z=None):
+        if not _is_npu:
+            return super().forward(x, z)
+        # The Triton gated-norm tile exceeds the 910B4 UB for Jet's heads.
+        # Keep normalization and gating in fp32, then round once at the end.
+        out = torch_npu.npu_rms_norm(x.float(), self.weight.float(), self.eps)[0]
+        if z is not None:
+            out = out * nn.functional.silu(z.float())
+        return out.to(x.dtype)
 
 
 class DynamicShortConvolutionKernelGenerator(nn.Module):
@@ -103,88 +121,70 @@ class DynamicShortConvolution(nn.Module):
         conv_state: torch.Tensor,  # (batch_size, hidden_size, kernel_size - 1)
         generator_input: torch.Tensor,  # (cu_seq_len, generator_input_size)
         seq_lens: torch.Tensor,  # (batch_size,)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        checkpoint_lens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Args:
             x: (cu_seq_len, hidden_size)
             conv_state: (batch_size, hidden_size, kernel_size - 1)
             generator_input: (cu_seq_len, generator_input_size)
             seq_lens: (batch_size,)
+            checkpoint_lens: optional consumed-token counts to snapshot per sequence
 
         Returns:
             out: (cu_seq_len, hidden_size)
             conv_state: (batch_size, hidden_size, kernel_size - 1)
+            checkpoint_state: same shape as conv_state, or None
         """
+        num_tokens = x.shape[0]
+        if num_tokens == 0:
+            return x, conv_state, conv_state if checkpoint_lens is not None else None
 
-        x_seqs = self._continuous_to_seqs(x, seq_lens=seq_lens)
-        conv_state = einops.rearrange(conv_state, "b d k -> b k d")
-        x_seqs = [torch.cat([conv_state[i], x_seqs[i]]) for i in range(len(x_seqs))]
-        x = self._seqs_to_batch(
-            x_seqs
-        )  # (batch_size, max_seq_len + kernel_size - 1, hidden_size)
-
-        x = einops.rearrange(x, "b l d -> b d l")
-
-        new_conv_state = x[
-            :, :, -(self.kernel_size - 1) :
-        ]  # (batch_size, hidden_size, kernel_size - 1)
-
-        x = x.unfold(
-            dimension=-1, size=self.kernel_size, step=1
-        )  # (batch_size, hidden_size, max_seq_len, kernel_size)
-        x = einops.rearrange(x, "b d l k -> b l d k")
-
-        kernels = self.kernel_generator(
-            generator_input
-        )  # (cu_seq_len, hidden_size * kernel_size)
-        kernels = einops.rearrange(
-            kernels,
-            "l (d k) -> l d k",
-            d=self.hidden_size,
-            k=self.kernel_size,
+        # Ragged windows stay on device: Python slices with device scalars
+        # synchronize the forward stream and stall overlapped scheduling.
+        seq_lens = seq_lens.to(device=x.device, dtype=torch.long)
+        batch_size = seq_lens.numel()
+        window = self.kernel_size - 1
+        starts = seq_lens.cumsum(0) - seq_lens
+        seq_ids = torch.repeat_interleave(
+            torch.arange(batch_size, device=x.device),
+            seq_lens,
+            output_size=num_tokens,
         )
-        kernels = self._seqs_to_batch(
-            self._continuous_to_seqs(kernels, seq_lens=seq_lens)
-        )  # (batch_size, max_seq_len, hidden_size, kernel_size)
-
-        out = (x * kernels).sum(dim=-1)  # (batch_size, max_seq_len, hidden_size)
-
-        out = self._batch_to_continuous(
-            out, seq_lens=seq_lens
-        )  # (cu_seq_len, hidden_size)
-
-        out = nn.functional.silu(out)
-
-        return out, new_conv_state
-
-    def _batch_to_continuous(
-        self,
-        x: torch.Tensor,
-        *,
-        seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.cat([x[i, -seq_lens[i] :] for i in range(seq_lens.size(0))])
-
-    def _continuous_to_seqs(
-        self,
-        x: torch.Tensor,
-        *,
-        seq_lens: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        return [
-            x[(seq_lens[:i].sum()) : (seq_lens[: i + 1].sum())]
-            for i in range(seq_lens.size(0))
-        ]
-
-    def _seqs_to_batch(
-        self,
-        seqs: list[torch.Tensor],
-    ) -> torch.Tensor:
-        return nn.utils.rnn.pad_sequence(
-            seqs,
-            batch_first=True,
-            padding_side="left",
+        history = conv_state.transpose(1, 2).reshape(-1, self.hidden_size)
+        values = torch.cat((history, x), dim=0)
+        history_size = batch_size * window
+        token_offsets = torch.arange(num_tokens, device=x.device) - starts[seq_ids]
+        positions = token_offsets[:, None] + torch.arange(-window, 1, device=x.device)
+        indices = torch.where(
+            positions < 0,
+            seq_ids[:, None] * window + positions + window,
+            history_size + starts[seq_ids, None] + positions,
         )
+        inputs = values[indices].transpose(1, 2)
+        kernels = self.kernel_generator(generator_input).reshape(
+            num_tokens, self.hidden_size, self.kernel_size
+        )
+        out = nn.functional.silu((inputs * kernels).sum(dim=-1))
+
+        def state_at(lengths):
+            positions = lengths[:, None] + torch.arange(-window, 0, device=x.device)
+            indices = torch.where(
+                positions < 0,
+                torch.arange(batch_size, device=x.device)[:, None] * window
+                + positions
+                + window,
+                history_size + starts[:, None] + positions,
+            )
+            return values[indices].transpose(1, 2)
+
+        new_conv_state = state_at(seq_lens)
+        checkpoint_state = None
+        if checkpoint_lens is not None:
+            # Untracked rows may carry -1; they are masked out by the caller.
+            checkpoint_lens = checkpoint_lens.clamp(min=0).minimum(seq_lens)
+            checkpoint_state = state_at(checkpoint_lens)
+        return out, new_conv_state, checkpoint_state
 
 
 class JetBlock(nn.Module):
@@ -240,7 +240,7 @@ class JetBlock(nn.Module):
             generator_reduction=jet_block_config.dconv_generator_reduction,
         )
 
-        self.o_norm = RMSNormGated(
+        self.o_norm = JetRMSNormGated(
             head_v_dim,
             eps=float(jet_block_config.norm_eps),
         )
@@ -287,7 +287,28 @@ class JetBlock(nn.Module):
 
         conv_cache = layer_cache.conv[0]
         assert isinstance(conv_cache, torch.Tensor)
-        v, new_conv_state = self.dynamic_conv1d(
+        # Normalize window-first caches to a channel-first view for reads and writes.
+        if conv_cache.shape[-2] == self.conv_size - 1:
+            conv_cache = conv_cache.transpose(1, 2)
+
+        checkpoint_lens = None
+        checkpoint_indices = None
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_metadata.has_mamba_track_mask
+        ):
+            chunk_size = mamba_cache_chunk_size()
+            checkpoint_lens = (
+                (forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens)
+                // chunk_size
+                * chunk_size
+            )
+            checkpoint_lens = torch.where(
+                forward_batch.mamba_track_mask, checkpoint_lens, -1
+            )
+            checkpoint_indices = forward_metadata.mamba_track_indices
+
+        v, new_conv_state, checkpoint_conv_state = self.dynamic_conv1d(
             v,
             conv_state=conv_cache[
                 forward_metadata.mamba_cache_indices, -self.total_v_dim :, :
@@ -299,12 +320,19 @@ class JetBlock(nn.Module):
                 else torch.ones(
                     (forward_batch.batch_size,),
                     dtype=torch.long,
+                    device=hidden_states.device,
                 )
             ),
+            checkpoint_lens=checkpoint_lens,
         )
         conv_cache[forward_metadata.mamba_cache_indices, -self.total_v_dim :, :] = (
             new_conv_state
         )
+        if checkpoint_conv_state is not None:
+            rows = forward_metadata.mamba_track_mask_indices
+            conv_cache[
+                forward_metadata.conv_states_mask_indices, -self.total_v_dim :, :
+            ] = checkpoint_conv_state[rows]
         v = einops.rearrange(v, "l (h d) -> l h d", h=self.num_heads, d=self.head_v_dim)
 
         g = -self.A_log.float().exp() * nn.functional.softplus(a.float() + self.dt_bias)
@@ -321,7 +349,18 @@ class JetBlock(nn.Module):
             initial_state_indices=forward_metadata.mamba_cache_indices,
             cu_seqlens=cast(torch.LongTensor, forward_metadata.query_start_loc),
             use_qk_l2norm_in_kernel=True,
+            checkpoint_seq_lens=checkpoint_lens,
+            checkpoint_state_indices=checkpoint_indices,
         ).squeeze(0)
+
+        if forward_batch.forward_mode.is_decode():
+            linear_attn_backend._track_mamba_state_decode(
+                forward_batch,
+                layer_cache.conv[0],
+                layer_cache.temporal,
+                forward_metadata.mamba_cache_indices,
+                layer_id=self.layer_id,
+            )
 
         z = einops.rearrange(z, "l (h d) -> l h d", h=self.num_heads)
 

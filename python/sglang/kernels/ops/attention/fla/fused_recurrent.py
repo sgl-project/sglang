@@ -890,6 +890,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     h0_source,
     h0_indices,
     stride_h0_source,
+    checkpoint_seq_lens,
+    checkpoint_state_indices,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
@@ -914,6 +916,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr,  # whether to disable final state update
     DISABLE_OUTPUT_CALCULATION: tl.constexpr,  # whether to disable output calculation
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    STORE_STATE_CHECKPOINT: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -981,6 +984,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
+    if STORE_STATE_CHECKPOINT:
+        checkpoint_len = tl.load(checkpoint_seq_lens + i_n)
+        checkpoint_idx = tl.load(checkpoint_state_indices + i_n).to(tl.int64)
+
     step_idx = 0
     for _ in range(0, T):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
@@ -1042,6 +1049,19 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+        if STORE_STATE_CHECKPOINT:
+            if checkpoint_idx >= 0 and step_idx + 1 == checkpoint_len:
+                checkpoint_ptr = (
+                    h0_source
+                    + checkpoint_idx * stride_h0_source
+                    + i_hv * K * V
+                    + o_v[:, None] * K
+                    + o_k[None, :]
+                )
+                tl.store(
+                    checkpoint_ptr, b_h.to(checkpoint_ptr.dtype.element_ty), mask=mask_h
+                )
+
         step_idx += 1
 
         p_q += H * K
@@ -1083,6 +1103,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    checkpoint_seq_lens: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -1120,6 +1142,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        checkpoint_seq_lens=checkpoint_seq_lens,
+        checkpoint_state_indices=checkpoint_state_indices,
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
         stride_h0_source=(
@@ -1145,6 +1169,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         USE_INITIAL_STATE=initial_state_source is not None,
         IS_VARLEN=cu_seqlens is not None,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        STORE_STATE_CHECKPOINT=checkpoint_seq_lens is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
@@ -1178,6 +1203,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         intermediate_state_indices: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
         retrieve_parent_token: Optional[torch.Tensor] = None,
+        checkpoint_seq_lens: Optional[torch.Tensor] = None,
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -1196,6 +1223,8 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            checkpoint_seq_lens=checkpoint_seq_lens,
+            checkpoint_state_indices=checkpoint_state_indices,
         )
 
         return o
@@ -1227,7 +1256,24 @@ def fused_recurrent_gated_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    checkpoint_seq_lens: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (checkpoint_seq_lens is None) != (checkpoint_state_indices is None):
+        raise ValueError(
+            "Checkpoint lengths and state indices must be supplied together."
+        )
+    if checkpoint_seq_lens is not None:
+        if initial_state_source is None:
+            raise ValueError("Checkpointing requires an initial state pool.")
+        num_seqs = q.shape[0] if cu_seqlens is None else len(cu_seqlens) - 1
+        if (
+            checkpoint_seq_lens.numel() != num_seqs
+            or checkpoint_state_indices.numel() != num_seqs
+        ):
+            raise ValueError(
+                "Checkpoint lengths and state indices must have one entry per sequence."
+            )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
@@ -1272,6 +1318,8 @@ def fused_recurrent_gated_delta_rule_update(
         intermediate_state_indices,
         cache_steps,
         retrieve_parent_token,
+        checkpoint_seq_lens,
+        checkpoint_state_indices,
     )
     return o
 

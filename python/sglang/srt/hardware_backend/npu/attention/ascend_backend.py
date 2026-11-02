@@ -385,6 +385,13 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
+        if model_runner.model_config.hf_config.architectures[0] in (
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ):
+            # Jet mixes full and sliding-window attention in the same KV pool.
+            # The legacy PA/QLens fast paths do not apply a per-layer window.
+            self.use_fia = True
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -1725,7 +1732,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+            if sinks is not None or (layer.sliding_window_size > -1 and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
@@ -3164,7 +3171,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+            if sinks is not None or (layer.sliding_window_size > -1 and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self._is_swa_layer(layer):
                     block_tables = self.forward_metadata.block_tables_swa
