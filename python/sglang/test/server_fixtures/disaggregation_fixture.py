@@ -63,6 +63,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
+        os.environ["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
@@ -241,6 +242,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         if cls._fail_fast_stop is not None:
             cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        os.environ.pop("SGLANG_ENABLE_RANK_CONSENSUS_CHECKER")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
         if getattr(cls, "_ucx_net_devices_set", False):
