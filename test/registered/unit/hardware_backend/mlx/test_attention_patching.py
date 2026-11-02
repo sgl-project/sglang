@@ -19,9 +19,10 @@ _SKIP_REASON = "requires mlx"
 if _HAS_MLX:
     import mlx.core as mx
     import mlx.nn as nn
-    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
     import torch
     from mlx_lm.models.cache import ArraysCache
+
+    import sglang.srt.hardware_backend.mlx.aot as mlx_aot
     from sglang.srt.hardware_backend.mlx.aot import (
         MlxAOTKernelSet,
         MlxAOTRoPEKernel,
