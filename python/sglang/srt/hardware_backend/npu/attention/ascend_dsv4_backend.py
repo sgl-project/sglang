@@ -10,8 +10,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 import torch_npu
-from sgl_kernel_npu.operators import dsv4 as dsv4_ops
-from sgl_kernel_npu.operators.dsv4 import NPU_KV_QUANT_PATH
+from sgl_kernel_npu.operators import attention as npu_attention_ops
+from sgl_kernel_npu.operators import kvcacheio as npu_cache_ops
+from sgl_kernel_npu.operators.kvcacheio import NPU_KV_QUANT_PATH
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
@@ -40,10 +41,13 @@ def _sparse_attn_ops():
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention."""
     if is_npu_arch35():
         return (
-            dsv4_ops.mixed_quant_sparse_flash_mla_metadata,
-            dsv4_ops.mixed_quant_sparse_flash_mla,
+            npu_attention_ops.mixed_quant_sparse_flash_mla_metadata,
+            npu_attention_ops.mixed_quant_sparse_flash_mla,
         )
-    return dsv4_ops.sparse_flash_mla_metadata, dsv4_ops.sparse_flash_mla
+    return (
+        npu_attention_ops.sparse_flash_mla_metadata,
+        npu_attention_ops.sparse_flash_mla,
+    )
 
 
 def _sparse_attn_kv_quant_kwargs() -> dict:
@@ -489,7 +493,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = dsv4_ops.compressor(
+        cmp_kv = npu_attention_ops.compressor(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
@@ -614,7 +618,7 @@ class CompressorAscendBackendMixin:
                     "leave the indexer KV cache stale."
                 )
             # Fused epilog: fp8 per-token quant with an fp32 scale.
-            dsv4_ops.indexer_quant_cache(
+            npu_cache_ops.indexer_quant_cache(
                 self.token_to_kv_pool.get_compress_buffer(compressor.layer_id, True),
                 self.token_to_kv_pool.get_compress_dequant_scale_buffer(
                     compressor.layer_id, True
@@ -872,7 +876,7 @@ class C4IndexerAscendBackendMixin:
         cmp_ratio = int(c4_indexer.compressor.ratio)
         kv_len = fm.actual_seq_lengths_kv.to(torch.int32)
         seqused_k = (kv_len // cmp_ratio).to(torch.int32)
-        topk_idxs, _ = dsv4_ops.quant_lightning_indexer(
+        topk_idxs, _ = npu_attention_ops.quant_lightning_indexer(
             q_quant,
             k,
             weights.to(q_scale.dtype),
@@ -2087,7 +2091,7 @@ class DeepseekV4AscendAttnBackend(
                     kv_len.cumsum(0).to(torch.int32),
                 ]
             )
-        return dsv4_ops.quant_lightning_indexer_metadata(
+        return npu_attention_ops.quant_lightning_indexer_metadata(
             self._dsv4_index_n_heads,
             1,
             self._dsv4_index_head_dim,
