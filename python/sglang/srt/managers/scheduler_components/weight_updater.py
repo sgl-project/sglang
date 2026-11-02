@@ -44,9 +44,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.model_executor.model_runner_components.weight_updater import (
-    _unsupported_derived_weight_cache_error,
-)
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -317,11 +314,18 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _unsupported_derived_weight_cache_error,
+        )
+
         runners = self._select_runners(recv_req.selector)
-        # Preflight every selected runner before restoring any packed weights or
-        # admitting external P2P/RDMA writes into the update session.
+        # Restoring packed weights already mutates storage. Check every runner
+        # before touching any of them, including sessions used by P2P/RDMA
+        # writers which bypass update_weights_from_tensor/distributed.
         for _, runner in runners:
-            error = _unsupported_derived_weight_cache_error(runner.model)
+            error = _unsupported_derived_weight_cache_error(
+                runner.weight_updater.get_model()
+            )
             if error is not None:
                 return BeginWeightUpdateReqOutput(success=False, message=error)
         for _, runner in runners:
@@ -440,6 +444,7 @@ class SchedulerWeightUpdaterManager:
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
                     role=role,
+                    names=recv_req.names,
                 )
                 if p is not None:
                     role_payloads.append((role, p))

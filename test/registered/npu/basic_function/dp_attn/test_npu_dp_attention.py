@@ -45,9 +45,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
-            True
-        )
+        cls._env_override = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True)
         cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
@@ -77,8 +75,10 @@ class TestDPAttentionMixedChunk(
 ):
     # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    # Moonlight bf16 GSM8K baseline is ~0.837.
+    # evalscope is the harness the 0.83 Moonlight bf16 baseline was calibrated
+    # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
+    gsm8k_backend = "evalscope"
 
     @classmethod
     def setUpClass(cls):

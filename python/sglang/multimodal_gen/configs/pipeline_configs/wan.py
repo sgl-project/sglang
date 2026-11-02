@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+    TextConditioningOutput,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -35,7 +36,25 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def wan_text_encoder_extra_args() -> list[dict]:
+    """Tokenizer overrides for the Wan UMT5 encoder, chosen by
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING. t5_postprocess_text zero-pads the
+    embeddings back to 512, so the encoder itself can run on fewer tokens."""
+    mode = envs.SGLANG_DIFFUSION_WAN_TEXT_PADDING
+    if mode == "max":
+        return [{}]
+    if mode == "longest":
+        return [dict(padding="longest")]
+    if mode == "bucket":
+        return [dict(padding="longest", pad_to_multiple_of=64)]
+    raise ValueError(
+        f"SGLANG_DIFFUSION_WAN_TEXT_PADDING must be max, longest or bucket, got {mode!r}"
+    )
+
+
+def t5_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
     mask: torch.Tensor = outputs.attention_mask
     hidden_state: torch.Tensor = outputs.last_hidden_state
     seq_lens = mask.gt(0).sum(dim=1).long()
@@ -48,7 +67,10 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
         ],
         dim=0,
     )
-    return prompt_embeds_tensor
+    prompt_embeds_mask = torch.arange(512, device=seq_lens.device) < seq_lens[:, None]
+    return TextConditioningOutput(
+        prompt_embeds_tensor, prompt_embeds_mask, seq_lens.tolist()
+    )
 
 
 def animate2_postprocess_text(outputs: BaseEncoderOutput, text_inputs) -> torch.Tensor:
@@ -95,6 +117,11 @@ class WanT2V480PConfig(PipelineConfig):
     )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (t5_postprocess_text,))
+    )
+    # Off by default ("max"): a shorter padding changes the bf16 rounding, so the
+    # video is a different valid sample. See wan_text_encoder_extra_args.
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=wan_text_encoder_extra_args
     )
 
     # Precision for each component
@@ -288,9 +315,12 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         self.dit_config.torch_compile_mode = "default"
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
@@ -305,9 +335,12 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 

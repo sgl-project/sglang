@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dflash import _prepare_dflash_draft_block_unchecked
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -217,7 +218,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 and self._fused_kv_helper is not None
                 and hasattr(draft_pool, "set_kv_buffer_prefix_valid")
             )
-            mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+            mamba_pool = target_kvcache.layer_router.part_view(STATE_PART)
             if not can_fold_draft_kv or not getattr(
                 mamba_pool, "factorized_kda_tree", False
             ):
@@ -235,7 +236,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 get_workspace_tensors=self._fused_kv_helper.get_workspace_tensors,
             )
             epilogue.attach_kda_tree_commit(
-                spec_state=req_to_token_pool.get_speculative_mamba2_params_all_layers(),
+                spec_state=mamba_pool.get_speculative_mamba2_params_all_layers(),
                 mamba_index_mapping=req_to_token_pool.req_index_to_mamba_index_mapping,
                 mamba_track_interval=mamba_track_grid(
                     token_to_kv_pool_allocator.page_size

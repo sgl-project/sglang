@@ -154,7 +154,9 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     )
 
 
-def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
+def bootstrap_http_server_process(
+    server_args: ServerArgsPayload, worker_pids: tuple[int, ...] = ()
+) -> None:
     from sglang.multimodal_gen.runtime.utils.process import (
         defer_full_gc_for_imports,
         kill_itself_when_parent_died,
@@ -179,4 +181,4 @@ def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
 
         materialized = server_args.materialize()
 
-    launch_server.launch_http_server_only(materialized)
+    launch_server.launch_http_server_only(materialized, worker_pids=worker_pids)

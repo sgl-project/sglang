@@ -5,7 +5,11 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
+
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -220,6 +224,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        ring_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         factorized_tree = (
@@ -280,6 +285,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             force_precomputed_tree_transforms=kwargs.get(
                 "force_precomputed_tree_transforms", False
             ),
+            ring_indices=ring_indices,
         )
 
     def extend(
@@ -300,6 +306,25 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _is_hip:
+            out = kda_gfx950_prefill.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
+                return_intermediate_states=return_intermediate_states,
+                **kwargs,
+            )
+            if out is not None:
+                return out
         return chunk_kda(
             q=q,
             k=k,

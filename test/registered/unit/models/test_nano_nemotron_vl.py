@@ -23,7 +23,7 @@ from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 TOKENS_PER_TUBELET = 4
 HIDDEN_SIZE = 8
@@ -99,15 +99,20 @@ class TestNemotronHOmniVideo(CustomTestCase):
     def test_evs_keeps_image_pad_values_for_redistribution(self):
         """EVS placeholder redistribution must not restore raw image tokens next to a video."""
         start, end, image_token = 1, 2, 18
-        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[], hash=11)
+        image = MultimodalDataItem(modality=Modality.IMAGE, offsets=[(2, 2)], hash=11)
         video = _video_item([2], pre_chunked_input_ids=[])
+        video.offsets = [(5, 5)]
         video.hash = 22
         for item in (image, video):
             item.set_pad_value()
         input_ids = array("q", [7, start, image_token, end, start, image_token, end])
         video.pre_chunked_input_ids = input_ids.tolist()
         mm_inputs = MultimodalInputs(
-            mm_items=[image, video], im_start_id=start, im_end_id=end
+            mm_items=[image, video],
+            im_start_id=start,
+            im_end_id=end,
+            im_token_id=image_token,
+            video_token_id=image_token,
         )
 
         model = object.__new__(NemotronH_Omni_Reasoning_V3)

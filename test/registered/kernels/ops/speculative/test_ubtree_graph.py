@@ -60,13 +60,17 @@ def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
     from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
     from sglang.srt.runtime_context import get_context, get_parallel
 
     pool = SimpleNamespace(
         req_to_token=torch.arange(3 * 512, device="cuda").reshape(3, 512)
     )
-    kv_pool = SimpleNamespace()
+    kv_pool = SimpleNamespace(
+        layer_router=SimpleNamespace(routes_to=lambda kind: False),
+        id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))},
+    )
     runner = SimpleNamespace(
         sliding_window_size=None,
         model_config=SimpleNamespace(
@@ -85,9 +89,9 @@ def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
         kv_cache_dtype_str="bfloat16",
         page_size=1,
         is_draft_worker=False,
-        kv_index_translator=KVIndexTranslator(
+        runner_ids=RunnerIds(
             req_to_token=pool.req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=kv_pool,
             page_size=1,
             device="cuda",
@@ -147,7 +151,8 @@ def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, l
         spec_info=spec,
         positions=spec.positions,
         out_cache_loc=None,
-        kv_loc_plan=None,
+        iteration_ids=None,
+        ragged_verify_layout=None,
     )
     if mode == "replay":
         backend.init_forward_metadata_out_graph(batch, in_capture=True)
@@ -212,7 +217,8 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
         spec_info=spec,
         positions=spec.positions,
         out_cache_loc=None,
-        kv_loc_plan=None,
+        iteration_ids=None,
+        ragged_verify_layout=None,
     )
 
     def stage_mask(visible, length):

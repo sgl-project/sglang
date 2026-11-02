@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
@@ -16,6 +17,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _runner(is_draft_worker=False):
+    state_pool = SimpleNamespace(
+        enable_linear_replayssm=False, replayssm_request_ring=False
+    )
     return SimpleNamespace(
         server_args=SimpleNamespace(enable_mis=False),
         device="cpu",
@@ -23,8 +27,16 @@ def _runner(is_draft_worker=False):
         req_to_token_pool=SimpleNamespace(
             get_mamba_indices=lambda indices: indices.to(torch.int32).clone(),
             translate_mamba_indices=lambda indices: indices,
+            state_sub_pool=None,
+            holds_state_slots=True,
         ),
-        token_to_kv_pool=None,
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: state_pool,
+                part_indices=lambda part: {},
+            )
+        ),
+        runner_ids=SimpleNamespace(state_ids=lambda sub_pool: IdSpace(key="state")),
     )
 
 

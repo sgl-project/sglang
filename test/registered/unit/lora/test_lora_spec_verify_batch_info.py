@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 def _verify_batch(bs: int, draft_token_num: int) -> SimpleNamespace:
@@ -71,7 +71,9 @@ class TestLoRASpecVerifyBatchInfo(CustomTestCase):
         The matching case also pins that bs is rebound per batch, which is
         what makes a mixed-adapter batch index the right slots."""
         backend = self._backend()
-        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=4, num_tokens_per_req=4)
+        backend.init_decode_cuda_graph_batch_info(
+            max_bs_in_cuda_graph=4, num_tokens_per_req=4
+        )
 
         batch_info = self._prepare(
             backend, _verify_batch(bs=2, draft_token_num=4), use_cuda_graph=True

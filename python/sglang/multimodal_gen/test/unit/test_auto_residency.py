@@ -7,17 +7,23 @@ import pytest
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
+    SERVER_WARMUP_VIDEO_STEPS,
     _resolve_auto_residency_warmup_shape,
     _resolve_warmup_num_frames,
+    build_warmup_reqs,
 )
+
+PLANNER_UNAVAILABLE = "residency planner not available"
 
 
 def _record(
@@ -455,8 +461,9 @@ class TestAutoResidencySkipReason:
     ):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
     def test_cache_dit_excluded(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
@@ -472,15 +479,53 @@ class TestAutoResidencySkipReason:
             {"use_fsdp_inference": True},
         ],
     )
-    def test_parallel_paths_reach_platform_gate(self, monkeypatch, overrides):
+    def test_parallel_paths_reach_planner_gate(self, monkeypatch, overrides):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
-    def test_eligible_path_reaches_platform_gate(self, monkeypatch):
+    def test_eligible_path_reaches_planner_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args())
-        # on a CUDA host everything passes; CPU CI stops at the platform gate
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
+
+    def test_eligible_server_warmup_runs_no_probe_or_step_floor(self, monkeypatch):
+        # no calibration consumer yet: one bounded warmup, not probe + 4-step floor
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        args = self._base_args(
+            warmup_steps=1,
+            enable_cfg_parallel=False,
+            num_gpus=1,
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                supports_auto_residency=True,
+                adjust_num_frames=lambda value: value,
+                vae_stride=None,
+                vae_scale_factor=None,
+                vae_config=SimpleNamespace(arch_config=None),
+            ),
+            is_arg_explicitly_set=lambda _name: False,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            lambda _args: SamplingParams(
+                width=1280,
+                height=720,
+                num_frames=81,
+                num_inference_steps=35,
+                adjust_frames=False,
+                supported_resolutions=[(1280, 720), (832, 480)],
+            ),
+        )
+        reqs = build_warmup_reqs(
+            args, warmup_resolutions=None, server_based_warmup=True
+        )
+        assert len(reqs) == 1
+        assert not reqs[0].extra.get("auto_residency_full_shape_probe")
+        assert reqs[0].num_inference_steps == SERVER_WARMUP_VIDEO_STEPS
