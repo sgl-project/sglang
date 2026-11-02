@@ -611,7 +611,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
         scheduler.device_module = SimpleNamespace(Event=Mock, current_stream=Mock())
-        scheduler._pp_recv_proxy_tensors = Mock()
+        scheduler._pp_recv_proxy_tensors = Mock(return_value=None)
         scheduler._pp_commit_comm_work = Mock()
         scheduler._pp_prepare_tensor_dict = Mock(return_value={})
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
