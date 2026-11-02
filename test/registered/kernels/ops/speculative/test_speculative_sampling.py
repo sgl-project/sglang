@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -231,7 +232,10 @@ def test_target_only_sampling_cdf_boundaries(
 
 
 @pytest.fixture
-def joint_top_k_top_p_case():
+def joint_top_k_top_p_case(request):
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    request.addfinalizer(override.restore)
     original_probs = torch.tensor(
         [[0.35, 0.25, 0.20, 0.05, 0.03, 0.03, 0.03, 0.03, 0.03]],
         device="cuda",
