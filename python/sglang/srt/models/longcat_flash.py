@@ -334,6 +334,7 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
+        topk_weights = topk_weights * self.routed_scaling_factor
         if self.zero_expert_type is not None and num_tokens > 0:
             zero_expert_kwargs = (
                 {"identity_mask_value": -1 if get_moe_a2a_backend().is_deepep() else 0}
@@ -351,7 +352,6 @@ class LongcatFlashMoE(nn.Module):
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states *= self.routed_scaling_factor
 
         if (
             self.zero_expert_type is not None
