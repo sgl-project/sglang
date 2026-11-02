@@ -2,10 +2,14 @@
 
 import json
 import unittest
+from copy import deepcopy
 
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.function_call.utils import normalize_json_schema_types
+from sglang.srt.function_call.utils import (
+    hoist_json_schema_defs,
+    normalize_json_schema_types,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -403,6 +407,70 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertIs(schema["additionalProperties"], True)
         self.assertIs(schema["unevaluatedProperties"], False)
         self._assert_accepts(schema)
+
+
+class TestHoistJsonSchemaDefs(CustomTestCase):
+    def test_embedded_definitions_resolve_root_refs(self):
+        for key in ("$defs", "definitions"):
+            with self.subTest(key=key):
+                schema = {
+                    "type": "object",
+                    "properties": {
+                        "w": {
+                            "$ref": f"#/{key}/WaitFor",
+                            key: {"WaitFor": {"type": "string"}},
+                        },
+                        "local": {"$ref": f"#/properties/w/{key}/WaitFor"},
+                    },
+                }
+                hoist_json_schema_defs(schema)
+                validator = Draft202012Validator(schema)
+                self.assertTrue(validator.is_valid({"w": "ready", "local": "ready"}))
+                self.assertFalse(validator.is_valid({"w": 1}))
+                self.assertFalse(validator.is_valid({"local": 1}))
+
+    def test_unrepairable_schemas_stay_untouched(self):
+        cases = [
+            # an existing root map is never merged into
+            {
+                "$defs": {"WaitFor": {"type": "string"}},
+                "properties": {
+                    "w": {
+                        "$ref": "#/$defs/WaitFor",
+                        "$defs": {"WaitFor": {"type": "integer"}},
+                    }
+                },
+            },
+            # conflicting nested maps have no safe hoist
+            {
+                "properties": {
+                    "w": {
+                        "$ref": "#/$defs/WaitFor",
+                        "$defs": {"WaitFor": {"type": "string"}},
+                    },
+                    "other": {"$defs": {"WaitFor": {"type": "integer"}}},
+                }
+            },
+        ]
+        for schema in cases:
+            with self.subTest(schema=schema):
+                before = deepcopy(schema)
+                hoist_json_schema_defs(schema)
+                self.assertEqual(schema, before)
+
+    def test_instance_data_is_not_read_as_definitions(self):
+        cases = [
+            {"type": "object", "default": {"$defs": {"price": 42}}},
+            {"type": "object", "examples": [{"$defs": {"price": 42}}]},
+            # a property named "$defs" is a property, not a definition map
+            {"type": "object", "properties": {"$defs": {"type": "string"}}},
+        ]
+        for schema in cases:
+            with self.subTest(schema=schema):
+                before = deepcopy(schema)
+                hoist_json_schema_defs(schema)
+                self.assertEqual(schema, before)
+                Draft202012Validator.check_schema(schema)
 
 
 if __name__ == "__main__":

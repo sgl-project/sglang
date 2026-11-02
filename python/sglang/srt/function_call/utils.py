@@ -1,6 +1,7 @@
 import ast
 import threading
 import warnings
+from copy import deepcopy
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
@@ -172,6 +173,70 @@ def normalize_json_schema_types(schema: Any) -> None:
     ):
         if key in schema:
             normalize_json_schema_types(schema[key])
+
+
+def hoist_json_schema_defs(schema: Any) -> None:
+    """Give root-relative ``$ref`` targets a root to resolve against when an
+    embedded sub-schema (e.g. Pydantic ``model_json_schema()``) buried them."""
+    if not isinstance(schema, dict):
+        return
+    keys = [key for key in ("$defs", "definitions") if key not in schema]
+    if not keys:
+        return
+    collected: Dict[str, Dict[str, Any]] = {key: {} for key in keys}
+
+    def collect(node: Any) -> bool:
+        if isinstance(node, list):
+            return all(collect(item) for item in node)
+        if not isinstance(node, dict):
+            return True
+        if node is not schema and ("$id" in node or "id" in node):
+            return False
+        for key in keys:
+            nested = node.get(key)
+            if isinstance(nested, dict):
+                for name, definition in nested.items():
+                    if name in collected[key] and collected[key][name] != definition:
+                        return False
+                    collected[key][name] = definition
+        # Only schema-bearing keywords hold subschemas; instance data such as
+        # ``default`` or ``examples`` must never be read as definitions.
+        for key in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+        ):
+            nested = node.get(key)
+            if isinstance(nested, dict) and not all(
+                collect(value) for value in nested.values()
+            ):
+                return False
+        for key in (
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "prefixItems",
+            "items",
+            "additionalProperties",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contains",
+            "propertyNames",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ):
+            if key in node and not collect(node[key]):
+                return False
+        return True
+
+    if collect(schema):
+        for key in keys:
+            if collected[key]:
+                schema[key] = deepcopy(collected[key])
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
@@ -457,6 +522,9 @@ def get_json_schema_constraint(
                 }
                 if not parallel_tool_calls:
                     schema["maxItems"] = 1
+                json_schema_defs = _get_tool_schema_defs([tool])
+                if json_schema_defs:
+                    schema["$defs"] = json_schema_defs
                 return schema
         return None
     elif tool_choice == "required":
