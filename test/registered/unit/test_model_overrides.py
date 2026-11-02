@@ -2703,7 +2703,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             # user-set prefill survives; only decode defaulted
             self.assertEqual(
-                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                _dsa_split_backend_resolution(
+                    _view(dsa_prefill_backend="flashmla_sparse")
+                ),
                 {"dsa_decode_backend": "flashmla_kv"},
             )
             # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
@@ -2754,6 +2756,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "flashinfer_sparse_mla",
                 },
             )
+            # The rest of the DSA family has no trtllm-free default, so a launch
+            # with no DSA flag at all is refused here rather than crashing in the
+            # first forward.
+            for kv_cache_dtype in ("fp8_e4m3", "bfloat16"):
+                with self.subTest(kv_cache_dtype=kv_cache_dtype):
+                    with self.assertRaisesRegex(
+                        ValueError, "requires SM100/SM103/SM107"
+                    ):
+                        _dsa_split_backend_resolution(
+                            _view(kv_cache_dtype=kv_cache_dtype)
+                        )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
