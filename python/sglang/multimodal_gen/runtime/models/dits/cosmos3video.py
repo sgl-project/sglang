@@ -2014,8 +2014,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         on them would cast their FP8 weights back to BF16/FP32 and break the
         quant kernels.
 
-        Also rebuilds the RoPE ``inv_freq`` buffer on ``get_local_torch_device()``,
-        then moves it to the DiT's device.
+        Also rebuilds the RoPE ``inv_freq`` buffer from powers computed on
+        ``get_local_torch_device()``, and places it on the DiT's device.
         """
         # Get the actual device from a loaded parameter
         device = next(self.parameters()).device
@@ -2023,11 +2023,25 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Compute RoPE on the runtime device so offload preserves resident values
         rotary_emb = self.language_model.rotary_emb
         dim = rotary_emb.head_dim
-        exponents = torch.arange(
-            0, dim, 2, dtype=torch.float32, device=get_local_torch_device()
-        )
-        inv_freq = 1.0 / (self.rope_theta ** (exponents / dim))
-        rotary_emb.register_buffer("inv_freq", inv_freq.to(device), persistent=False)
+        runtime_device = get_local_torch_device()
+        if current_platform.is_cuda() and dim & (dim - 1) == 0:
+            # CUDA logspace matches pow for power-of-two dims without its cold load.
+            # CPU and CUDA reciprocals round identically for these FP32 powers.
+            powers = torch.logspace(
+                start=0,
+                end=(dim - 2) / dim,
+                steps=dim // 2,
+                base=self.rope_theta,
+                dtype=torch.float32,
+                device=runtime_device,
+            )
+            inv_freq = powers.to(device).reciprocal()
+        else:
+            exponents = torch.arange(
+                start=0, end=dim, step=2, dtype=torch.float32, device=runtime_device
+            )
+            inv_freq = (1.0 / (self.rope_theta ** (exponents / dim))).to(device)
+        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Collect all quantized submodules so we can skip them during
         # dtype casts.  Calling .to(dtype) on a quantized layer would
