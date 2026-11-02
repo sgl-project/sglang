@@ -503,7 +503,7 @@ async def async_request_openai_chat_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    if args.disable_stream:
+                    if not payload["stream"]:
                         # Non-streaming response
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
@@ -1361,8 +1361,8 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             # which a streamed response only carries when asked for. Default the
             # key rather than the object, so a user's stream_options still gets
             # it, while an explicit include_usage=false is kept.
-            if not args.disable_stream:
-                body = inner_input.extra_request_body
+            body = inner_input.extra_request_body
+            if body.get("stream", not args.disable_stream):
                 options = body.get("stream_options") or {}
                 options.setdefault("include_usage", True)
                 body["stream_options"] = options
