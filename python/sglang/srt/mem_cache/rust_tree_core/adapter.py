@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW, tree_slot_ids
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
     ComponentType,
+    tree_slot_ids,
 )
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (

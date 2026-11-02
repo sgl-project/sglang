@@ -12,8 +12,10 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.kv.layout.mha import MHAHostLayout
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import StateHostLayout
-from sglang.srt.mem_cache.kv.plan import tree_slot_ids
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -162,24 +164,22 @@ class TestPlanNames(CustomTestCase):
             StaticKVStorage,
             StaticPoolShape,
         )
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         storage = StaticKVStorage(
             None,
             None,
             shape=StaticPoolShape(has_window=True, has_state=True, token_capacity=1),
         )
-        self.assertEqual(storage.tree_sub_pool(ComponentType.FULL), "kv")
-        self.assertEqual(storage.tree_sub_pool(ComponentType.SWA), "swa")
-        self.assertEqual(storage.tree_sub_pool(ComponentType.MAMBA), "mamba")
-        # A window component under another name holds the one window's rows;
-        # a component of no family the storage keeps has no sub-pool.
-        custom = ComponentType.of("CUSTOM_WINDOW")
-        self.assertEqual(storage.tree_sub_pool(custom, family="window"), "swa")
+        self.assertEqual(storage.tree_sub_pool("FULL"), "kv")
+        self.assertEqual(storage.tree_sub_pool("SWA"), "swa")
+        self.assertEqual(storage.tree_sub_pool("MAMBA"), "mamba")
+        # A window slot under another name holds the one window's rows; a
+        # slot of no family the storage keeps has no sub-pool.
+        self.assertEqual(storage.tree_sub_pool("CUSTOM_WINDOW", family="window"), "swa")
         with self.assertRaises(KeyError):
-            storage.tree_sub_pool(custom)
+            storage.tree_sub_pool("CUSTOM_WINDOW")
         with self.assertRaises(KeyError):
-            storage.tree_sub_pool(ComponentType.C128, family="block")
+            storage.tree_sub_pool("C128", family="block")
 
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:

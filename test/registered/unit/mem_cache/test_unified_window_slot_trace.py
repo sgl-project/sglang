@@ -22,8 +22,9 @@ import torch
 
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, tree_slot_ids
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context

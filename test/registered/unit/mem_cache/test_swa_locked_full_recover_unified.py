@@ -32,14 +32,17 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.plan import TREE_WINDOW, tree_slot_ids
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.kv.storage import _page_pairs
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
