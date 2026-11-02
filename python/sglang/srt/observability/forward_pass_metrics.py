@@ -24,15 +24,17 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from functools import wraps
 from itertools import count
-from typing import TYPE_CHECKING, Callable, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 import msgspec
 from msgspec.structs import replace
 
 if TYPE_CHECKING:
-    from sglang.srt.utils.device_timer import DeviceTimer
+    from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
 
 # Schema version. Must match the consumer (Dynamo's ForwardPassMetrics).
 # Bump when the schema changes incompatibly.
@@ -138,6 +140,14 @@ def decode(data: bytes) -> ForwardPassMetrics:
     return _decoder.decode(data)
 
 
+@dataclass(frozen=True, slots=True)
+class TimingSegment:
+    """One completed forward segment: its GPU time and a read-only metadata copy."""
+
+    elapsed_seconds: float
+    metadata: Mapping[str, Any]
+
+
 class FpmTiming:
     """First-start to last-end GPU span on one stream, including segment gaps."""
 
@@ -145,14 +155,36 @@ class FpmTiming:
         self.num_intervals = 0
         self._pending = 0
         self._sealed = False
-        self._callback = None
+        self._callbacks: list[Callable[[Optional[float]], None]] = []
+        self._intervals: list[_TimingInterval] = []
+        self._segments: Optional[tuple[TimingSegment, ...]] = None
         self._first_interval = None
         self._last_interval = None
         self._same_stream = True
 
+    @property
+    def segments(self) -> tuple[TimingSegment, ...]:
+        """Completed segments in submission order; read once ready.
+
+        Built on first read, so a span-only consumer never queries per-segment
+        durations or copies metadata.
+        """
+        if self._segments is None:
+            if not self._sealed or self._pending:
+                raise RuntimeError("FpmTiming segments are read only once ready")
+            self._segments = tuple(
+                TimingSegment(
+                    elapsed_seconds=interval.elapsed_time() / 1000.0,
+                    metadata=MappingProxyType(dict(interval.metadata or {})),
+                )
+                for interval in self._intervals
+            )
+        return self._segments
+
     def on_interval_start(self, interval):
         self.num_intervals += 1
         self._pending += 1
+        self._intervals.append(interval)
         if self._first_interval is None:
             self._first_interval = interval
         elif interval.stream != self._first_interval.stream:
@@ -168,24 +200,26 @@ class FpmTiming:
         self._notify()
 
     def when_ready(self, callback: Callable[[Optional[float]], None]):
-        self._callback = callback
+        self._callbacks.append(callback)
         self._notify()
 
     def _notify(self):
-        if not self._sealed or self._pending or self._callback is None:
+        if not self._sealed or self._pending or not self._callbacks:
             return
-        callback, self._callback = self._callback, None
+        callbacks, self._callbacks = self._callbacks, []
         if self._first_interval is None:
-            callback(0.0)
+            elapsed = 0.0
         elif not self._same_stream:
-            callback(None)
+            elapsed = None
         else:
-            callback(
+            elapsed = (
                 self._first_interval.start_event.elapsed_time(
                     self._last_interval.end_event
                 )
                 / 1000.0
             )
+        for callback in callbacks:
+            callback(elapsed)
 
     def publish_when_ready(self, metrics, publisher):
         # Hold only immutable scalar statistics, never a live batch/request.
@@ -201,7 +235,7 @@ class FpmTiming:
 
 
 def wrap_forward_with_fpm(forward: Callable, timer: DeviceTimer) -> Callable:
-    """Installed on the scheduler instance only when that rank enables FPM."""
+    """Capture a forward's existing intervals and attach them to its result."""
 
     @wraps(forward)
     def timed_forward(batch, *args, **kwargs):
