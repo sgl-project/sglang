@@ -1,10 +1,10 @@
-"""Test shorthand for an allocator's `TokenDemand`."""
+"""Test shorthand for an allocator's `KVDemand`."""
 
 from __future__ import annotations
 
 from typing import Mapping, Optional
 
-from sglang.srt.mem_cache.allocator.base import TokenDemand
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
 
 def _target_window(allocator) -> Optional[str]:
@@ -22,7 +22,7 @@ def token_demand(
     *,
     state_slots: int = 0,
     windows: Optional[Mapping[str, int]] = None,
-) -> TokenDemand:
+) -> KVDemand:
     """A demand naming every window ``allocator`` keeps, in the tests'
     two-number form: the target model's window takes
     ``target_window_tokens``; any other window (a draft window of another
@@ -34,7 +34,7 @@ def token_demand(
     if unknown:
         raise ValueError(f"the allocator keeps no window {sorted(unknown)}")
     target = _target_window(allocator)
-    return TokenDemand(
+    return KVDemand(
         full_tokens,
         {
             name: windows.get(

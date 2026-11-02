@@ -453,7 +453,7 @@ class TestChainRealize(CustomTestCase):
                 largest = max(
                     n
                     for n in range(bound + 2)
-                    if n == 0 or allocator._units_fit({name: n})
+                    if n == 0 or allocator.units_fit({name: n})
                 )
                 unit = 1 if band is allocator.mamba_allocator else page
                 self.assertEqual(allocator.units_available(name), largest * unit)

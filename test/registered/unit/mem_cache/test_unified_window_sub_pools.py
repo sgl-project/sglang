@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 from test_unified_chain_realize import _live_bytes, _page_bytes
 
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
@@ -485,11 +486,18 @@ class TestThreeWindowTree(CustomTestCase):
             ["WINDOW_16", "WINDOW_8", "WINDOW_4"],
         )
         self.assertEqual(
-            [(name, ct) for name, ct, _, _ in a.admission_windows(cache)],
-            [("window_16", swa), ("window_8", swa_8), ("window_4", swa_4)],
+            [
+                (name, cache.window_slot_of(name), window)
+                for name, window in cache.window_sub_pools()
+            ],
+            [("window_16", swa, 16), ("window_8", swa_8, 8), ("window_4", swa_4, 4)],
         )
         self.assertEqual(
-            [cache.window_retain_size(ct) for ct in (swa, swa_8, swa_4)], [16, 8, 4]
+            [
+                cache.window_retain_size(n)
+                for n in ("window_16", "window_8", "window_4")
+            ],
+            [16, 8, 4],
         )
 
         key = RadixKey(array("q", range(16)))
@@ -498,7 +506,9 @@ class TestThreeWindowTree(CustomTestCase):
         self.assertEqual(match.device_prefix_len, 16)
         node = cache.tree_core.node_by_id(match.last_device_node)
         for ct in (swa, swa_8, swa_4):
-            self.assertEqual(cache.window_evictable_size(ct), 16)
+            self.assertEqual(
+                cache.window_evictable_size(cache.window_sub_pool_of_slot(ct)), 16
+            )
             self.assertIsNotNone(node.component_data[ct].value)
 
         # A lock holds each window slot's own trailing window of the prefix.
@@ -506,7 +516,10 @@ class TestThreeWindowTree(CustomTestCase):
         for ct in (swa, swa_8, swa_4):
             self.assertEqual(node.component_data[ct].lock_ref, 1)
         self.assertEqual(
-            [cache.window_evictable_size(ct) for ct in (swa, swa_8, swa_4)],
+            [
+                cache.window_evictable_size(n)
+                for n in ("window_16", "window_8", "window_4")
+            ],
             [0, 8, 12],
         )
         # Each further window evicts what lies before its own window, alone.
@@ -538,11 +551,11 @@ class TestThreeWindowTree(CustomTestCase):
         """The tree's first window is read, evicted and reclaimed through the
         same per-slot interface as every further window."""
         from sglang.srt.mem_cache.base_prefix_cache import (
-            AllocDemand,
             EvictParams,
             InsertParams,
             MatchPrefixParams,
         )
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         lengths = {"window_16": 16, "window_8": 8, "window_4": 4}
@@ -551,12 +564,11 @@ class TestThreeWindowTree(CustomTestCase):
                 storage, cache = self._cache()
                 a = storage.allocator
                 slots = cache.window_slots()
-                names = [name for name, _, _, _ in a.admission_windows(cache)]
-                for (name, ct, _, evictable), slot in zip(
-                    a.admission_windows(cache), slots
-                ):
-                    self.assertEqual(ct, slot)
-                    self.assertEqual(evictable, cache.window_evictable_size(ct))
+                names = [name for name, _ in cache.window_sub_pools()]
+                evictable = evictable_by_sub_pool(cache)
+                for name, slot in zip(names, slots):
+                    self.assertEqual(cache.window_slot_of(name), slot)
+                    self.assertEqual(evictable[name], cache.window_evictable_size(name))
                 key = RadixKey(array("q", range(32)))
                 cache.insert(InsertParams(key=key, value=a.alloc(32).clone()))
                 match = cache.match_prefix(MatchPrefixParams(key=key))
@@ -564,15 +576,17 @@ class TestThreeWindowTree(CustomTestCase):
                 # A lock holds each window's own trailing window: the rest of
                 # the prefix is each window's evictable history.
                 self.assertEqual(
-                    [cache.window_evictable_size(ct) for ct in slots],
+                    [cache.window_evictable_size(name) for name in names],
                     [32 - lengths[name] for name in names],
                 )
                 for ct, name in zip(slots, names):
                     self.assertEqual(
-                        cache.window_available_size(ct), a.units_available(name)
+                        cache.window_available_size(name), a.units_available(name)
                     )
                 ct, name = slots[victim], names[victim]
-                before = {c: cache.window_evictable_size(c) for c in slots}
+                before = {
+                    c: cache.window_evictable_size(n) for c, n in zip(slots, names)
+                }
                 result = cache.evict(EvictParams(window_num_tokens={ct: 64}))
                 self.assertEqual(result.num_tokens_evicted, 0)
                 # The victim's whole history goes; another window's entries
@@ -582,13 +596,13 @@ class TestThreeWindowTree(CustomTestCase):
                     result.window_num_tokens_evicted,
                     {c: min(before[c], before[ct]) for c in slots},
                 )
-                self.assertEqual(cache.window_evictable_size(ct), 0)
+                self.assertEqual(cache.window_evictable_size(name), 0)
                 cache.unlock(lock)
                 # A demand on this window alone is reclaimed for it alone.
                 held = {b.sub_pool_name: b.allocated_count() for b in a.bands}
                 pages = -(-a.units_available(name) // 4) + 1
-                cache.evict_for_alloc(AllocDemand(window_num_tokens={ct: pages * 4}))
-                self.assertTrue(a._units_fit({name: pages}))
+                cache.evict_for_alloc(KVDemand(window_tokens={name: pages * 4}))
+                self.assertTrue(a.units_fit({name: pages}))
                 after = {b.sub_pool_name: b.allocated_count() for b in a.bands}
                 self.assertLess(after[name], held[name])
                 self.assertEqual(storage.accounting_violations(), [])
@@ -599,29 +613,28 @@ class TestThreeWindowTree(CustomTestCase):
 
         storage, cache = self._cache()
         a = storage.allocator
-        _, _, swa_4 = cache.window_slots()
         # Fill the pool with cached prefixes.
         start = 1000
         while (ids := a.alloc(16)) is not None:
             key = RadixKey(array("q", range(start, start + 16)))
             cache.insert(InsertParams(key=key, value=ids.clone()))
             start += 16
-        reclaimable = a._reclaimable_units(cache)
+        reclaimable = cache._reclaimable_units()
         pages = next(
             (
                 n
                 for n in range(1, 64)
-                if not a._units_fit({"window_4": n})
-                and a._admits_pages({"window_4": n}, reclaimable)
+                if not a.units_fit({"window_4": n})
+                and a.admits_units({"window_4": n}, reclaimable)
             ),
             None,
         )
         self.assertIsNotNone(pages)
         full_before = cache.full_evictable_size()
-        own_before = cache.window_evictable_size(swa_4)
-        self.assertTrue(a.reclaim(cache, {"window_4": pages}))
+        own_before = cache.window_evictable_size("window_4")
+        self.assertTrue(cache.reclaim({"window_4": pages}))
         # The window's own entries go first and suffice: no token entry goes.
-        self.assertLess(cache.window_evictable_size(swa_4), own_before)
+        self.assertLess(cache.window_evictable_size("window_4"), own_before)
         self.assertEqual(cache.full_evictable_size(), full_before)
         self.assertEqual(storage.accounting_violations(), [])
 

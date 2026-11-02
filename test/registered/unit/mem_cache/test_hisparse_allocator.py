@@ -7,11 +7,11 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocator.base import TokenDemand
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -197,7 +197,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         logical_allocator.reclaim_for_prealloc.return_value = None
 
         tree_cache = object()
-        demand = TokenDemand(512, {"swa": 256})
+        demand = KVDemand(512, {"swa": 256})
         self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, demand))
         logical_allocator.reclaim_for_prealloc.assert_called_once_with(
             tree_cache, demand

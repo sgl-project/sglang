@@ -19,13 +19,13 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
-    AllocDemand,
     DecLockRefParams,
     IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -77,9 +77,9 @@ class _RatioCache:
         # Static pools: the component's slot takes reach the bounded allocator.
         return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
-    def evict_for_alloc(self, params: AllocDemand):
+    def evict_for_alloc(self, params: KVDemand):
         self.alloc_evict_params.append(params)
-        need = params.mamba_num
+        need = params.state_slots
         for node in list(self.prefix_nodes):
             if need <= 0:
                 break
@@ -356,7 +356,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         self.assertIsNone(component._try_alloc_mamba_slot())
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
-        self.assertEqual(cache.alloc_evict_params, [AllocDemand(mamba_num=1)] * 2)
+        self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)] * 2)
 
     def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
         for extra_buffer, quantized in ((True, False), (True, True), (False, False)):
@@ -399,9 +399,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                 self.assertTrue(torch.equal(req.kv.mamba_pool_idx, owned[0]))
                 self.assertEqual(len(cache.prefix_nodes), N)
                 self.assertEqual(cache.allocator.free_ids, [])
-                self.assertEqual(
-                    cache.alloc_evict_params, [AllocDemand(mamba_num=1)]
-                )
+                self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)])
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
@@ -417,7 +415,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
-        self.assertEqual(cache.alloc_evict_params, [AllocDemand(mamba_num=1)])
+        self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)])
 
 
 class TestMambaDonationCheckpointIntegration(CustomTestCase):

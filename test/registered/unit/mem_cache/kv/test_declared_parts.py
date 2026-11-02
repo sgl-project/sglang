@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     DerivedPartDecl,
@@ -1233,7 +1234,7 @@ class TestDeclaredParts(CustomTestCase):
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
                     self.assertEqual(cache.swa_evictable_size(), 0)
-                    self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
+                    self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
                     self.assertEqual(cache.mamba_evictable_size(), 16)
                     phases = []
                     original = cache.evict_until
@@ -1977,8 +1978,8 @@ class TestDeclaredParts(CustomTestCase):
         swa_budget = a.conserve_swa_available_size()
         self.assertTrue(
             a.prealloc_fits(
-                cache,
                 token_demand(a, 400, 16),
+                evictable=evictable_by_sub_pool(cache, a),
                 full_budget_tokens=full_budget,
                 swa_budget_tokens=swa_budget,
             )
@@ -1996,8 +1997,8 @@ class TestDeclaredParts(CustomTestCase):
             with self.subTest(full_reserved=full_reserved, swa_reserved=swa_reserved):
                 self.assertEqual(
                     a.prealloc_fits(
-                        cache,
                         token_demand(a, 400, 16),
+                        evictable=evictable_by_sub_pool(cache, a),
                         full_budget_tokens=full_budget - full_reserved,
                         swa_budget_tokens=swa_budget - swa_reserved,
                     ),
@@ -2072,7 +2073,7 @@ class TestDeclaredParts(CustomTestCase):
                 receipt = cache.inc_lock_ref(node)
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
-                    self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
+                    self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
                     self.assertEqual(cache.swa_evictable_size(), 144)
                     self.assertFalse(a.ensure_capacity(token_demand(a, 4, 4)))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
@@ -2203,7 +2204,7 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 budget = a.create_prefill_budget(cache)
                 # The draft reads beyond its retained window during speculation.
-                retained = {name: window for name, _, window in budget.windows}
+                retained = dict(budget.windows)
                 self.assertEqual(retained["draft_swa"], 12)
                 self.assertEqual(
                     budget.window_tokens(1, 400, chunk_limit=8)["draft_swa"], 16
@@ -2271,8 +2272,9 @@ class TestDeclaredParts(CustomTestCase):
         cache = SimpleNamespace(
             sliding_window_size=16,
             # The target's window slot retains its own window; the draft's more.
-            window_retain_size=lambda component: (
-                16 if component == TARGET_WINDOW else 32
+            window_retain_size=lambda name: 16 if name == "window_16" else 32,
+            window_sub_pool_of_slot=lambda slot: (
+                "draft_swa" if slot == DRAFT_WINDOW else "window_16"
             ),
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
@@ -2557,7 +2559,7 @@ class TestDeclaredParts(CustomTestCase):
             (
                 cache.full_evictable_size(),
                 cache.swa_evictable_size(),
-                cache.window_evictable_size(DRAFT_WINDOW),
+                cache.window_evictable_size("draft_swa"),
             ),
             (80, 8, 4),
         )

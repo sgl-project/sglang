@@ -193,9 +193,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 cache = SimpleNamespace(
                     sliding_window_size=16,
                     # The target's window slot retains its own window.
-                    window_retain_size=lambda component: (
-                        16 if component.name == "WINDOW_16" else 12
-                    ),
+                    window_retain_size=lambda name: 16 if name == "window_16" else 12,
                     full_evictable_size=lambda: 0,
                     swa_evictable_size=lambda: 0,
                     window_evictable_size=lambda component: 0,

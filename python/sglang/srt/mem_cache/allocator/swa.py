@@ -197,13 +197,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         reclaiming here, since the full side is priced by the caller's budget
         and state slots (in a pool of their own) by the caller's state check.
         """
-        from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
         (swa_tokens,) = demand.checked(self.window_pool_names()).window_tokens.values()
         available = self.swa_available_size()
         if available < swa_tokens:
             tree_cache.evict_for_alloc(
-                AllocDemand(window_num_tokens=tree_cache.all_windows(swa_tokens))
+                KVDemand(
+                    window_tokens=dict.fromkeys(self.window_pool_names(), swa_tokens)
+                )
             )
             available = self.swa_available_size()
         if available < swa_tokens:
@@ -219,7 +221,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
@@ -227,12 +229,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_available_size() < num_tokens
             or self.swa_available_size() < num_tokens
         ):
-            tree_cache.evict_for_alloc(
-                AllocDemand(
-                    num_tokens=num_tokens,
-                    window_num_tokens=tree_cache.all_windows(num_tokens),
-                )
-            )
+            tree_cache.evict_for_alloc(KVDemand.same_tokens(self, num_tokens))
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
