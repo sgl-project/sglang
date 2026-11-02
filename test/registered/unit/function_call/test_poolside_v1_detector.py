@@ -93,6 +93,48 @@ class TestPoolsideV1Detector(CustomTestCase):
         self.assertEqual(args["count"], 3)
         self.assertEqual(args["options"], {"verbose": True})
 
+    def test_nullable_string_schema_preserves_raw_value(self):
+        """Nullable JSON Schema strings must not be JSON-decoded as scalars."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "zip": {"type": ["string", "null"]},
+                            "enabled": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "null"},
+                                ]
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        wire = (
+            "<tool_call>lookup\n"
+            "<arg_key>zip</arg_key>\n<arg_value>123</arg_value>\n"
+            "<arg_key>enabled</arg_key>\n<arg_value>true</arg_value>\n"
+            "</tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(wire, tools)
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"zip": "123", "enabled": "true"},
+        )
+
+        streamed = PoolsideV1Detector()
+        all_calls = []
+        for chunk in [wire[i : i + 7] for i in range(0, len(wire), 7)]:
+            all_calls.extend(streamed.parse_streaming_increment(chunk, tools).calls)
+        params = "".join(call.parameters for call in all_calls if call.parameters)
+        self.assertEqual(json.loads(params), {"zip": "123", "enabled": "true"})
+
     def test_multiple_tool_calls(self):
         text = (
             "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
