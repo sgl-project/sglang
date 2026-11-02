@@ -233,8 +233,7 @@ class CompressorAscendBackendMixin:
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
             # seqused only for decode. Every eager prefill uses the fused compressor,
             # so build its global block positions, state metadata, and output locs
-            # here. Exclude speculative modes so the cu.cpu() host read never
-            # runs for target_verify / draft_extend (potentially graph-captured).
+            # here. Speculative modes use their own compression metadata path.
             if forward_batch.forward_mode.is_extend_without_speculative():
                 self._build_npu_compress_metadata_prefill(forward_batch)
 
@@ -242,7 +241,7 @@ class CompressorAscendBackendMixin:
             self._build_npu_compress_metadata_verify(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
-        # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
+        # Reuse the CPU query-length mirror prepared by init_forward_metadata.
         fm = self.forward_metadata
         device = forward_batch.seq_lens.device
         positions = forward_batch.positions
@@ -250,7 +249,7 @@ class CompressorAscendBackendMixin:
         bs = forward_batch.batch_size
         cu = fm.actual_seq_lengths_q_pa
 
-        cu_cpu = cu.cpu().tolist()
+        cu_cpu = fm.actual_seq_lengths_q_pa_cpu.tolist()
         fm.dsv4_max_input_capacity = max(
             1,
             max(
