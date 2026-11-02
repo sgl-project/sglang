@@ -287,5 +287,6 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
         s = torch.einsum("bhd,nd->bhn", q, k)
-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        return s.float()
+        # In place: the [t, H, n] product is the largest prefill transient.
+        s.relu_().mul_(weights.unsqueeze(-1))
+        return s.sum(dim=1).float()
