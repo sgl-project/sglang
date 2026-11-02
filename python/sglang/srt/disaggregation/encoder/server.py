@@ -2429,7 +2429,13 @@ class EncoderProfiler:
         output_dir = obj.output_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         os.makedirs(output_dir, exist_ok=True)
         self.output_dir = output_dir
-        self.prefix = obj.profile_prefix or "encoder"
+        from sglang.srt.utils.profile_utils import (
+            sanitize_profile_filename_component,
+        )
+
+        self.prefix = (
+            sanitize_profile_filename_component(obj.profile_prefix) or "encoder"
+        )
         self.profile_id = str(time.time())
 
         activities = obj.activities or ["CPU", "GPU"]
