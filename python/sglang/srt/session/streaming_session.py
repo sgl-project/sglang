@@ -179,12 +179,14 @@ class StreamingSession:
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
-        if isinstance(req.finished_reason, FINISH_ABORT):
+        # retract_decode releases an OOM-aborted turn with the reason still pending.
+        if isinstance(req.finished_reason or req.to_finish, FINISH_ABORT):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
             req.release_mm_inputs_on_abort()
             req.session.abort_req()
+            req.session = None
             return False
 
         finished_len = (
