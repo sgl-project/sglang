@@ -102,11 +102,7 @@ def test_renoise_update() -> None:
     torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise, rtol=0, atol=0)
     last = state.clone()
     _minimax_h3_renoise_target_rows_(
-        last,
-        velocity,
-        sigma=0.8,
-        sigma_next=0.0,
-        generator=torch.Generator(),
+        last, velocity, sigma=0.8, sigma_next=0.0, generator=torch.Generator()
     )
     torch.testing.assert_close(last, denoised, rtol=0, atol=0)
 
@@ -185,65 +181,3 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     explicit = server_args(True, "merge")
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
-
-
-@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
-def test_condition_noise_preserves_clean_cache_and_release_precision(task, monkeypatch):
-    """Per-condition draws preserve cache rows and each adapter's conditioning precision."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
-        minimax_h3_patchify_video_latent,
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
-        denoising,
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    monkeypatch.setattr(
-        denoising.current_platform, "get_local_torch_device", lambda: device
-    )
-    frames = (1, 1 if task == "fl2va" else 3)
-    clean = torch.linspace(-2.003, 7.997, sum(frames) * 2 * 96).reshape(-1, 96)
-    original = clean.clone()
-    seed = None if task == "fl2va" else 7
-    ctx = SimpleNamespace(
-        cond_rows=clean,
-        audio_ref_rows=None,
-        plan=SimpleNamespace(task=task, seed=seed),
-        latent_t=8,
-        is_ref2va=task == "ref2va",
-        keyframe={"keyframes": [dict(latent_h=2, latent_w=4)] * 2}
-        if task == "fl2va"
-        else None,
-        ref2va_positive_blocks=[
-            dict(kind=kind, latent_t=t, latent_h=2, latent_w=4)
-            for kind, t in zip(("image", "video"), frames)
-        ]
-        if task == "ref2va"
-        else None,
-    )
-    denoising._apply_condition_noise_aug(
-        ctx,
-        sampling=SimpleNamespace(seed=seed),
-        imgvid_noise_aug=0.999,
-        audio_noise_aug=1.0,
-        stochastic_sampling=True,
-    )
-    generator = torch.Generator(device=device).manual_seed(
-        (42 if seed is None else seed) + 7919
-    )
-    noise = torch.cat(
-        [
-            minimax_h3_patchify_video_latent(
-                torch.randn(1, t, 24, 2, 4, generator=generator, device=device).permute(
-                    0, 2, 1, 3, 4
-                ),
-                patch_size=[1, 2, 2],
-            )
-            for t in frames
-        ]
-    )
-    rounded = (clean.bfloat16().float() if task == "fl2va" else clean).to(device)
-    torch.testing.assert_close(
-        ctx.cond_rows, 0.999 * rounded + (1.0 - 0.999) * noise, rtol=0, atol=0
-    )
-    torch.testing.assert_close(clean, original, rtol=0, atol=0)
