@@ -100,6 +100,9 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+    from sglang.srt.layers.quantization.modelslim.modelslim import (
+        ModelSlimKVCacheMethod,
+    )
 
 
 def aiter_fused_qk_norm_rope_set_kv(
@@ -277,6 +280,20 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            scheme = quant_config.get_modelslim_kv_scheme(prefix)
+            if scheme is not None:
+                self.attn.scheme = scheme
+                self.attn.quant_method = ModelSlimKVCacheMethod()
+                self.attn.quant_method.create_weights(
+                    self.attn,
+                    qkv_proj=self.qkv_proj,
+                    params_dtype=torch.get_default_dtype(),
+                )
         self.alt_stream = alt_stream
 
         # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
@@ -905,7 +922,7 @@ class Qwen3ForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            if "scale" in name:
+            if "scale" in name or (_is_npu and ".fa_" in name):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue

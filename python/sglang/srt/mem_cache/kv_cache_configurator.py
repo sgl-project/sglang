@@ -1828,6 +1828,21 @@ class KVCacheConfigurator:
                     mha_pool_class=mha_pool_class,
                     quant_method=quant_method,
                 )
+        if (
+            self.modelslim_cache_layout is not None
+            and self.modelslim_cache_layout.layout == "gqa_mxfp8"
+        ):
+            # Static V scales are expanded once, before warmup/graph capture.
+            # The pool's accessor also maps hybrid model IDs to compact IDs.
+            for module in self.model.modules():
+                scheme = getattr(module, "scheme", None)
+                if getattr(scheme, "cache_layout", None) == self.modelslim_cache_layout:
+                    _, v_scale = token_to_kv_pool.get_kv_scale_buffer(module.layer_id)
+                    v_scale.copy_(
+                        scheme.v_scale_encoded.view(
+                            1, v_scale.shape[1], 1, v_scale.shape[-2], 1
+                        )
+                    )
         return token_to_kv_pool
 
     def _build_mtp_kv_shard_pool(
@@ -2249,6 +2264,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 

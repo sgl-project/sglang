@@ -461,6 +461,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 if not kvc.is_draft_worker and not dsa_shards_index_k():
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
+        elif kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
         elif is_minimax_sparse(model_config.hf_config):
             from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
