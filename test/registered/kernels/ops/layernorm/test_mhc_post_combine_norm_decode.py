@@ -42,12 +42,18 @@ def _inputs(m: int):
 def _transition_rows(quant: bool):
     from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
         MAX_ROWS,
+        SPLIT2_MAX_ROWS,
+        SPLIT4_MAX_ROWS,
+        _num_sms,
         _rows_per_wave,
     )
 
+    device = torch.cuda.current_device()
     rows = {1, MAX_ROWS}
+    for b in (SPLIT4_MAX_ROWS, SPLIT2_MAX_ROWS, _num_sms(device)):
+        rows |= {b, b + 1}
     for threads in (640, 320, 160):
-        b = _rows_per_wave(torch.cuda.current_device(), threads, quant)
+        b = _rows_per_wave(device, threads, quant)
         rows |= {b, b + 1}
     return sorted(r for r in rows if r <= MAX_ROWS)
 

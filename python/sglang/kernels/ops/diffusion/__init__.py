@@ -418,6 +418,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.silu_temporal_pad",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.silu_temporal_pad:fused_silu_temporal_pad",
+        _CUDA,
+    ),
+    (
         "diffusion.situ_softcap_mul",
         KernelBackend.TRITON,
         "activation.situ_softcap_mul_bitexact:fused_situ_softcap_mul_bitexact",
@@ -807,6 +813,7 @@ _EXPORTS: dict[str, str] = {
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "fused_silu_temporal_pad": "sglang.kernels.kda_kernels.silu_temporal_pad",
     "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
     "fused_situ_softcap_mul_bitexact": "activation.situ_softcap_mul_bitexact",
     # Diffusion attention kernels

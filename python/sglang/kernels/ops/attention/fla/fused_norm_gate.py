@@ -8,7 +8,8 @@ import triton
 import triton.language as tl
 
 import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -246,8 +247,7 @@ def layer_norm_gated_fwd(
         BT = 32
         use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
         if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
-            arch = get_jit_cuda_arch()
-            if (arch.major, arch.minor) == (10, 3):
+            if current_arch().is_sm(10, 3):
                 # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
                 # Other norm modes retain their T=64 selection.
                 BT = 8
