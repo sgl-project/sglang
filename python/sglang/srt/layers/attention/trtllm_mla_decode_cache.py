@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from inspect import Parameter, signature
 from typing import Optional
 
 import torch
@@ -36,6 +37,52 @@ logger = logging.getLogger(__name__)
 # Keys hold no per-layer state, so the cache grows with the number of distinct
 # (batch size, max_seq_len bucket) pairs only.
 _TACTIC_CACHE_MAX_ENTRIES = 4096
+
+_CUTE_DSL_RUNNER_PARAMS = frozenset(
+    {
+        "kv_cache",
+        "workspace_buffer",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "max_seq_len",
+        "softmax_scale",
+        "output_scale",
+        "out_dtype",
+        "enable_pdl",
+        "is_var_seq",
+        "uses_shared_paged_kv_idx",
+        "lse",
+        "return_lse",
+        "sinks",
+        "cute_dsl_impl",
+        "enable_dcp",
+        "cp_world",
+        "cp_rank",
+    }
+)
+_TRTLLM_GEN_RUNNER_PARAMS = frozenset(
+    {
+        "kv_cache",
+        "workspace_buffer",
+        "sm_count",
+        "qk_nope_head_dim",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "max_seq_len",
+        "sparse_mla_top_k",
+        "bmm1_scale",
+        "bmm2_scale",
+        "sinks",
+        "skip_softmax_threshold_scale_factor",
+        "enable_pdl",
+        "is_var_seq",
+        "uses_shared_paged_kv_idx",
+        "return_lse",
+        "lse",
+        "use_fp16_softmax",
+    }
+)
 
 
 class _LruCache(OrderedDict):
@@ -73,6 +120,42 @@ def _device_info(device: torch.device) -> tuple[int, int]:
     return info
 
 
+def _probe_runner_extra_kwargs(
+    runner_cls, supplied_params: frozenset[str]
+) -> Optional[dict[str, object]]:
+    try:
+        params = signature(runner_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return None
+    has_var_kw = any(p.kind == Parameter.VAR_KEYWORD for p in params.values())
+    accepted_kw = {
+        name
+        for name, p in params.items()
+        if p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+    }
+    if not has_var_kw and not supplied_params.issubset(accepted_kw):
+        return None
+    extra: dict[str, object] = {}
+    if "return_lse_base" in accepted_kw:
+        # flashinfer 0.7.1-0.7.2 added required keyword-only
+        # `return_lse_base: Optional[Literal["basee", "base2"]]`.
+        extra["return_lse_base"] = None
+    covered = supplied_params | extra.keys() | {"self"}
+    for name, p in params.items():
+        if (
+            p.default is Parameter.empty
+            and p.kind
+            in (
+                Parameter.POSITIONAL_ONLY,
+                Parameter.POSITIONAL_OR_KEYWORD,
+                Parameter.KEYWORD_ONLY,
+            )
+            and name not in covered
+        ):
+            return None
+    return extra
+
+
 def _flashinfer_runner_api():
     """flashinfer's MLA decode runner classes and helpers, or None.
 
@@ -102,15 +185,31 @@ def _flashinfer_runner_api():
             if hasattr(AutoTuner, "selection_cache_token"):
                 _FI_RUNNER_API = False  # flashinfer caches the dispatch decision itself
             else:
-                _FI_RUNNER_API = (
-                    AutoTuner,
-                    CuteDslMlaDecodeRunner,
-                    TrtllmGenMlaDecodeRunner,
-                    _build_mla_decode_tuning_config,
-                    _cute_dsl_incompatibility_reason,
-                    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
-                    _round_to_seq_len_bucket,
+                cute_extra_kwargs = _probe_runner_extra_kwargs(
+                    CuteDslMlaDecodeRunner, _CUTE_DSL_RUNNER_PARAMS
                 )
+                trtllm_extra_kwargs = _probe_runner_extra_kwargs(
+                    TrtllmGenMlaDecodeRunner, _TRTLLM_GEN_RUNNER_PARAMS
+                )
+                if cute_extra_kwargs is None or trtllm_extra_kwargs is None:
+                    logger.info(
+                        "flashinfer MLA decode runner signature does not match "
+                        "expected parameters; trtllm_mla decode uses the public "
+                        "flashinfer API."
+                    )
+                    _FI_RUNNER_API = False
+                else:
+                    _FI_RUNNER_API = (
+                        AutoTuner,
+                        CuteDslMlaDecodeRunner,
+                        TrtllmGenMlaDecodeRunner,
+                        _build_mla_decode_tuning_config,
+                        _cute_dsl_incompatibility_reason,
+                        _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
+                        _round_to_seq_len_bucket,
+                        cute_extra_kwargs,
+                        trtllm_extra_kwargs,
+                    )
     return _FI_RUNNER_API or None
 
 
@@ -177,7 +276,11 @@ def _cute_dsl_reason(
 
 def _tuner_token(tuner) -> Optional[tuple]:
     """None while tuning; otherwise a value that changes when tuner state changes."""
-    if tuner.is_tuning_mode or tuner._active_tuning_contexts:
+    if (
+        tuner.is_tuning_mode
+        or tuner._active_tuning_contexts
+        or tuner.__dict__.get("_managed_cache") is not None
+    ):
         return None
     return (
         id(tuner),
@@ -297,6 +400,8 @@ def cached_trtllm_mla_decode(
         cute_dsl_incompat_reason,
         resolve_counter_buffer,
         round_to_seq_len_bucket,
+        cute_extra_kwargs,
+        trtllm_extra_kwargs,
     ) = api
 
     dev = query.device
@@ -432,6 +537,7 @@ def cached_trtllm_mla_decode(
                 enable_dcp=False,
                 cp_world=1,
                 cp_rank=0,
+                **cute_extra_kwargs,
             )
         return TrtllmGenMlaDecodeRunner(
             kv_cache=kv_4d,
@@ -452,6 +558,7 @@ def cached_trtllm_mla_decode(
             return_lse=False,
             lse=None,
             use_fp16_softmax=False,
+            **trtllm_extra_kwargs,
         )
 
     inputs = [query, block_tables, seq_lens, out]

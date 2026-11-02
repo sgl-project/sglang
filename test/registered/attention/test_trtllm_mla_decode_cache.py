@@ -249,6 +249,187 @@ class TestTrtllmMlaDecodeCache(unittest.TestCase):
         self.assertNotEqual(t1, t2)
         fake._active_tuning_contexts = 1
         self.assertIsNone(self.mod._tuner_token(fake))
+        fake._active_tuning_contexts = 0
+        fake._managed_cache = object()
+        self.assertIsNone(self.mod._tuner_token(fake))
+
+    def test_runner_signature_compat_for_return_lse_base_and_unknown_required_kwarg(
+        self,
+    ):
+        from flashinfer.mla import _core as fi_core
+
+        real_cute = fi_core.CuteDslMlaDecodeRunner
+        real_trtllm = fi_core.TrtllmGenMlaDecodeRunner
+        real_cute_extra = (
+            self.mod._probe_runner_extra_kwargs(
+                real_cute, self.mod._CUTE_DSL_RUNNER_PARAMS
+            )
+            or {}
+        )
+        real_trtllm_extra = (
+            self.mod._probe_runner_extra_kwargs(
+                real_trtllm, self.mod._TRTLLM_GEN_RUNNER_PARAMS
+            )
+            or {}
+        )
+        seen_cute: list[dict] = []
+        seen_trtllm: list[dict] = []
+
+        class CuteDslMlaDecodeRunner(real_cute):
+            def __init__(
+                self,
+                *,
+                kv_cache,
+                workspace_buffer,
+                kv_lora_rank,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                max_seq_len,
+                softmax_scale,
+                output_scale,
+                out_dtype,
+                enable_pdl,
+                is_var_seq,
+                uses_shared_paged_kv_idx,
+                lse,
+                return_lse,
+                return_lse_base,
+                sinks,
+                cute_dsl_impl,
+                enable_dcp=False,
+                cp_world=1,
+                cp_rank=0,
+            ):
+                seen_cute.append({"return_lse_base": return_lse_base})
+                kw = dict(
+                    kv_cache=kv_cache,
+                    workspace_buffer=workspace_buffer,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    softmax_scale=softmax_scale,
+                    output_scale=output_scale,
+                    out_dtype=out_dtype,
+                    enable_pdl=enable_pdl,
+                    is_var_seq=is_var_seq,
+                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                    lse=lse,
+                    return_lse=return_lse,
+                    sinks=sinks,
+                    cute_dsl_impl=cute_dsl_impl,
+                    enable_dcp=enable_dcp,
+                    cp_world=cp_world,
+                    cp_rank=cp_rank,
+                )
+                if "return_lse_base" in real_cute_extra:
+                    kw["return_lse_base"] = return_lse_base
+                super().__init__(**kw)
+
+        class TrtllmGenMlaDecodeRunner(real_trtllm):
+            def __init__(
+                self,
+                *,
+                kv_cache,
+                workspace_buffer,
+                sm_count,
+                qk_nope_head_dim,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                max_seq_len,
+                sparse_mla_top_k,
+                bmm1_scale,
+                bmm2_scale,
+                sinks,
+                skip_softmax_threshold_scale_factor,
+                enable_pdl,
+                is_var_seq,
+                uses_shared_paged_kv_idx,
+                return_lse,
+                lse,
+                return_lse_base,
+                use_fp16_softmax=None,
+            ):
+                seen_trtllm.append({"return_lse_base": return_lse_base})
+                kw = dict(
+                    kv_cache=kv_cache,
+                    workspace_buffer=workspace_buffer,
+                    sm_count=sm_count,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    sparse_mla_top_k=sparse_mla_top_k,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    enable_pdl=enable_pdl,
+                    is_var_seq=is_var_seq,
+                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                    return_lse=return_lse,
+                    lse=lse,
+                    use_fp16_softmax=use_fp16_softmax,
+                )
+                if "return_lse_base" in real_trtllm_extra:
+                    kw["return_lse_base"] = return_lse_base
+                super().__init__(**kw)
+
+        args = _make_inputs(2, 128, [1024] * 2, 1024 // _PAGE_SIZE, seed=41)
+        ref = self._public(*args, 1024, return_lse=False)
+
+        with (
+            mock.patch.object(self.mod, "_FI_RUNNER_API", None),
+            mock.patch.object(
+                fi_core, "CuteDslMlaDecodeRunner", CuteDslMlaDecodeRunner
+            ),
+            mock.patch.object(
+                fi_core, "TrtllmGenMlaDecodeRunner", TrtllmGenMlaDecodeRunner
+            ),
+        ):
+            self.mod._TACTIC_CACHE.clear()
+            api = self.mod._flashinfer_runner_api()
+            self.assertIsNotNone(api)
+            self.assertEqual(api[-2], {"return_lse_base": None})
+            self.assertEqual(api[-1], {"return_lse_base": None})
+            miss = self._cached(*args, 1024)
+            hit = self._cached(*args, 1024)
+            self.assertTrue(torch.equal(miss, ref))
+            self.assertTrue(torch.equal(hit, ref))
+            self.assertGreaterEqual(len(seen_cute), 1)
+            self.assertGreaterEqual(len(seen_trtllm), 2)
+            self.assertIsNone(seen_cute[0]["return_lse_base"])
+            self.assertIsNone(seen_trtllm[0]["return_lse_base"])
+            self.assertIsNone(seen_trtllm[1]["return_lse_base"])
+
+        class _TrtllmUnknownRequired:
+            def __init__(self, *, future_required_param):
+                pass
+
+        class _TrtllmDroppedSuppliedKw:
+            def __init__(self, *, kv_cache):
+                pass
+
+        self.assertIsNone(
+            self.mod._probe_runner_extra_kwargs(
+                _TrtllmDroppedSuppliedKw, self.mod._TRTLLM_GEN_RUNNER_PARAMS
+            )
+        )
+
+        with mock.patch.object(self.mod, "_FI_RUNNER_API", None):
+            with mock.patch.object(
+                fi_core, "TrtllmGenMlaDecodeRunner", _TrtllmUnknownRequired
+            ):
+                self.assertIsNone(self.mod._flashinfer_runner_api())
+            self.assertIs(self.mod._FI_RUNNER_API, False)
+            with mock.patch.object(
+                self.mod, "_public_decode", wraps=self.mod._public_decode
+            ) as pub_mock:
+                self.mod._TACTIC_CACHE.clear()
+                out = self._cached(*args, 1024)
+            self.assertEqual(pub_mock.call_count, 1)
+            self.assertTrue(torch.equal(out, ref))
+            self.assertEqual(len(self.mod._TACTIC_CACHE), 0)
 
     def test_non_sm10x_delegates_to_public_api(self):
         args = _make_inputs(2, 16, [1024] * 2, 1024 // _PAGE_SIZE, seed=19)
