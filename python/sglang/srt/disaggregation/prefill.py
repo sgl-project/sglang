@@ -44,10 +44,9 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     staging_grid_tokens,
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    FAKE_BOOTSTRAP_HOST,
     CustomizedInfoError,
-    DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
