@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
-from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -47,27 +46,30 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     if not results:
         return None
     results = results[: group.num_return]
-    sequences = []
+    reasons = {}  # one dict per distinct reason, which pickle sends once
+    finish_reasons = []
     for r in results:
-        if r.matched_token is not None:
-            finish_reason = FINISH_MATCHED_TOKEN(matched=r.matched_token)
-        else:
-            finish_reason = FINISH_LENGTH(length=len(r.tokens))
-        sequences.append(
-            BeamSearchSequence(
-                tokens=r.tokens,
-                cum_logprob=r.cum_logprob,
-                beam_score=r.beam_score,
-                finish_reason=finish_reason.to_json(),
-            )
-        )
-    return BeamSearchOutput(sequences=sequences)
+        key = (r.matched_token, None if r.matched_token is not None else len(r.tokens))
+        reason = reasons.get(key)
+        if reason is None:
+            if r.matched_token is not None:
+                reason = FINISH_MATCHED_TOKEN(matched=r.matched_token).to_json()
+            else:
+                reason = FINISH_LENGTH(length=len(r.tokens)).to_json()
+            reasons[key] = reason
+        finish_reasons.append(reason)
+    return BeamSearchOutput(
+        tokens=[r.tokens for r in results],
+        cum_logprobs=[r.cum_logprob for r in results],
+        beam_scores=[r.beam_score for r in results],
+        finish_reasons=finish_reasons,
+    )
 
 
 def beam_completion_tokens(beam_output: BeamSearchOutput) -> int:
     """A group's completion_tokens: the total across its returned sequences
     (the leader row's output_ids is a length placeholder, not output)."""
-    return sum(len(seq.tokens) for seq in beam_output.sequences)
+    return sum(map(len, beam_output.tokens))
 
 
 def is_beam_search_batch(recv_obj: BatchTokenIDOutput) -> bool:
@@ -84,49 +86,32 @@ def decode_beam_search_output(
     disable_batch_decode: bool,
     trim_matched_stop: Callable,
 ) -> None:
-    """Fill each candidate sequence's `text` in place."""
-    if disable_batch_decode:
-        for i, beam_output in enumerate(recv_obj.beam_search_output):
-            header = headers[i]
-            if beam_output is None or header is None:
-                # A non-beam item of a mixed batch, or a row with no detokenize state.
-                continue
-            for beam in beam_output.sequences:
-                # A group's returned beams mix stop-finished and length-finished
-                # ones, so the leader's reason would trim the wrong ones.
-                trimmed_tokens = trim_matched_stop(
-                    beam.tokens,
-                    beam.finish_reason,
-                    header.no_stop_trim,
-                )
-                beam.text = tokenizer.decode(
-                    trimmed_tokens,
-                    skip_special_tokens=header.skip_special_tokens,
-                    spaces_between_special_tokens=header.spaces_between_special_tokens,
-                )
-    else:
+    """Fill each output's sequence `texts` in place."""
+    for i, beam_output in enumerate(recv_obj.beam_search_output):
+        header = headers[i]
+        if beam_output is None or header is None:
+            # A non-beam item of a mixed batch, or a row with no detokenize state.
+            continue
+        # A group's returned beams mix stop-finished and length-finished
+        # ones, so the leader's reason would trim the wrong ones.
+        trimmed_tokens = [
+            trim_matched_stop(tokens, finish_reason, header.no_stop_trim)
+            for tokens, finish_reason in zip(
+                beam_output.tokens, beam_output.finish_reasons
+            )
+        ]
         # batch_decode takes scalar skip_special_tokens flags, so decode per
         # request; batching all would apply request 0's flags to everyone.
-        for i, beam_output in enumerate(recv_obj.beam_search_output):
-            header = headers[i]
-            if beam_output is None or header is None:
-                # A non-beam item of a mixed batch, or a row with no detokenize state.
-                continue
-            trimmed_tokens = [
-                trim_matched_stop(
-                    beam.tokens,
-                    beam.finish_reason,
-                    header.no_stop_trim,
-                )
-                for beam in beam_output.sequences
+        flags = dict(
+            skip_special_tokens=header.skip_special_tokens,
+            spaces_between_special_tokens=header.spaces_between_special_tokens,
+        )
+        if disable_batch_decode:
+            beam_output.texts = [
+                tokenizer.decode(tokens, **flags) for tokens in trimmed_tokens
             ]
-            beam_texts = tokenizer.batch_decode(
-                trimmed_tokens,
-                skip_special_tokens=header.skip_special_tokens,
-                spaces_between_special_tokens=header.spaces_between_special_tokens,
-            )
-            for beam, text in zip(beam_output.sequences, beam_texts):
-                beam.text = text
+        else:
+            beam_output.texts = tokenizer.batch_decode(trimmed_tokens, **flags)
 
 
 def build_beam_search_out(out: Dict[str, Any]) -> Dict[str, Any]:
@@ -163,40 +148,50 @@ def try_build_beam_search_out_dict(
         if recv_obj.beam_search_output and i < len(recv_obj.beam_search_output)
         else None
     )
-    has_beam_search = (
-        beam_search_output is not None
-        and hasattr(beam_search_output, "sequences")
-        and beam_search_output.sequences
-    )
-    if not has_beam_search or recv_obj.finished_reasons[i] is None:
+    if (
+        beam_search_output is None
+        or not beam_search_output.tokens
+        or recv_obj.finished_reasons[i] is None
+    ):
         return None
 
     return _build_beam_search_out_dict(beam_search_output, meta_info, recv_obj)
 
 
 def _build_beam_search_out_dict(
-    beam_search_output: Any,
+    beam_search_output: BeamSearchOutput,
     meta_info: Dict[str, Any],
     recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
 ) -> dict:
-    include_text = isinstance(recv_obj, BatchStrOutput)
-    beam_results = []
-    total_completion_tokens = beam_completion_tokens(beam_search_output)
-    for idx, beam_seq in enumerate(beam_search_output.sequences):
-        beam_out_dict = {"output_ids": beam_seq.tokens.copy()}
-        if include_text:
-            beam_out_dict["text"] = beam_seq.text if beam_seq.text else ""
-        if idx == 0:
-            beam_meta_info = meta_info.copy()
-            # Override completion_tokens with the sum of all beam sequences,
-            # since recv_obj.completion_tokens[i] only counts the first beam.
-            beam_meta_info["completion_tokens"] = total_completion_tokens
-        else:
-            beam_meta_info = {}
-        beam_meta_info["finish_reason"] = beam_seq.finish_reason
-        beam_meta_info["sequence_score"] = beam_seq.beam_score
-        beam_out_dict["meta_info"] = beam_meta_info
-
-        beam_results.append(beam_out_dict)
-
+    columns = zip(
+        beam_search_output.tokens,
+        beam_search_output.finish_reasons,
+        beam_search_output.beam_scores,
+    )
+    # Reasons are copied: the carrier shares one dict between beams that
+    # finished alike, and callers edit a reply's reason in place.
+    if isinstance(recv_obj, BatchStrOutput):
+        texts = beam_search_output.texts or [None] * len(beam_search_output.tokens)
+        beam_results = [
+            {
+                "output_ids": tokens.copy(),
+                "text": text or "",
+                "meta_info": {"finish_reason": reason.copy(), "sequence_score": score},
+            }
+            for (tokens, reason, score), text in zip(columns, texts)
+        ]
+    else:
+        beam_results = [
+            {
+                "output_ids": tokens.copy(),
+                "meta_info": {"finish_reason": reason.copy(), "sequence_score": score},
+            }
+            for tokens, reason, score in columns
+        ]
+    # The first beam also carries the request's meta_info, with completion_tokens
+    # summed over every beam: recv_obj.completion_tokens[i] counts the first only.
+    first = meta_info.copy()
+    first["completion_tokens"] = beam_completion_tokens(beam_search_output)
+    first.update(beam_results[0]["meta_info"])
+    beam_results[0]["meta_info"] = first
     return {"beam_results": beam_results}

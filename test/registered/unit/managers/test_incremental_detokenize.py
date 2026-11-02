@@ -310,7 +310,11 @@ class TestDetokenizeState(CustomTestCase):
 
             beam = _output(sent, [("r", [8], None, True)])
             beam.completion_tokens = [9]
-            beam.beam_search_output = [BeamSearchOutput(sequences=[])]
+            beam.beam_search_output = [
+                BeamSearchOutput(
+                    tokens=[], cum_logprobs=[], beam_scores=[], finish_reasons=[]
+                )
+            ]
             with self.assertNoLogs("sglang.srt.managers", level="WARNING"):
                 out = detok.handle_batch_token_id_out(
                     _output({"r": 6}, [("r", [7], None, False)])

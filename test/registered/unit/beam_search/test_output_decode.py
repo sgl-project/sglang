@@ -1,23 +1,28 @@
-"""Stop trimming must use each beam's own finish reason, not the leader's.
+"""Each returned beam keeps its own finish reason.
 
-A group's returned beams mix stop-finished and length-finished ones, so a shared
-reason either drops a real token from a length-finished beam or leaks a stop
-token into a matched one.
+A group's returned beams mix stop-finished and length-finished ones, so stop
+trimming with a shared reason either drops a real token from a length-finished
+beam or leaks a stop token into a matched one.
 """
 
+import pickle
 import unittest
 from array import array
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.srt.beam_search import BeamGroup, joint_select, select_final_topk
+from sglang.srt.beam_search.beam_group import BeamResult
 from sglang.srt.beam_search.output import (
     decode_beam_search_output,
     pack_beam_search_output,
+    try_build_beam_search_out_dict,
 )
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
+from sglang.srt.managers.io_struct import BatchTokenIDOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,7 +117,7 @@ def _decode(group, *, disable_batch_decode):
         disable_batch_decode=disable_batch_decode,
         trim_matched_stop=_trim,
     )
-    return {tuple(s.tokens): s.text for s in packed.sequences}
+    return dict(zip(map(tuple, packed.tokens), packed.texts))
 
 
 class TestDecodeBeamSearchOutput(CustomTestCase):
@@ -160,8 +165,8 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
             disable_batch_decode=True,
             trim_matched_stop=_trim,
         )
-        for seq in packed.sequences:
-            self.assertEqual(seq.text, ",".join(map(str, seq.tokens)))
+        for tokens, text in zip(packed.tokens, packed.texts):
+            self.assertEqual(text, ",".join(map(str, tokens)))
 
     def test_non_beam_item_in_a_mixed_batch_is_skipped(self):
         group = _mixed_group(stop_wins=True)
@@ -177,7 +182,43 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
             disable_batch_decode=False,
             trim_matched_stop=_trim,
         )
-        self.assertTrue(all(s.text is not None for s in packed.sequences))
+        self.assertEqual(len(packed.texts), len(packed.tokens))
+
+
+def _token_id_output(beam_output, finished_reason) -> BatchTokenIDOutput:
+    """A one-request batch carrying `beam_output`; the fields the reply builder
+    does not read stay None."""
+    fields = {
+        f.name: None for f in msgspec.structs.fields(BatchTokenIDOutput) if f.required
+    }
+    fields.update(
+        rids=["r"], finished_reasons=[finished_reason], beam_search_output=[beam_output]
+    )
+    return BatchTokenIDOutput(**fields)
+
+
+class TestBeamSearchReply(CustomTestCase):
+    def test_beams_that_finished_alike_get_their_own_finish_reason(self):
+        """The carrier sends one dict per distinct reason, but callers edit a
+        reply's reason in place (serving_chat turns "stop" into "tool_calls"),
+        so the reply's beams must not share it."""
+        results = [
+            BeamResult(
+                tokens=[1, 2, 3], cum_logprob=-0.3, beam_score=-0.1, matched_token=None
+            ),
+            BeamResult(
+                tokens=[4, 5, 6], cum_logprob=-0.6, beam_score=-0.2, matched_token=None
+            ),
+        ]
+        group = SimpleNamespace(final_results=results, num_return=len(results))
+        packed = pack_beam_search_output(SimpleNamespace(beam_group=group))
+        length = {"type": "length", "length": 3}
+        recv_obj = pickle.loads(pickle.dumps(_token_id_output(packed, length)))
+
+        beams = try_build_beam_search_out_dict(recv_obj, 0, {"id": "r"})["beam_results"]
+        self.assertEqual([b["meta_info"]["finish_reason"] for b in beams], [length] * 2)
+        beams[0]["meta_info"]["finish_reason"]["type"] = "tool_calls"
+        self.assertEqual(beams[1]["meta_info"]["finish_reason"], length)
 
     def test_beam_row_without_detokenize_state_is_skipped(self):
         """A row with no header gets no beam text instead of failing the whole batch."""
@@ -196,7 +237,7 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
                     disable_batch_decode=disable_batch_decode,
                     trim_matched_stop=_trim,
                 )
-                self.assertTrue(all(s.text is None for s in packed.sequences))
+                self.assertIsNone(packed.texts)
 
 
 if __name__ == "__main__":
