@@ -719,9 +719,13 @@ def _fwd_kernel(
 
     # stage 2: compute the triangle part
 
+    # A custom mask replaces the elementwise causal predicate below and may
+    # grant keys after the query tile (e.g. Gemma 3/4 bidirectional image
+    # spans), so stop at the causal diagonal only when there is no custom mask.
+    # Tiles the mask leaves empty are skipped by SKIP_TILE.
     cur_block_m_end = (
         cur_seq_len_extend
-        if not IS_CAUSAL
+        if not IS_CAUSAL or USE_CUSTOM_MASK
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
