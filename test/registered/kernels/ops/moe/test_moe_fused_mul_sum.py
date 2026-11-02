@@ -25,21 +25,22 @@ def test_ep_masking_skips_invalid_nan_slots_and_accumulates_in_fp32():
             [[2.0, 4.0], [torch.nan, torch.nan]],
             [[torch.nan, torch.nan], [6.0, 8.0]],
             [[torch.nan, torch.nan], [torch.nan, torch.nan]],
+            [[1.0, 1.0], [2**-8, 2**-8]],
         ],
         dtype=torch.bfloat16,
         device="cuda",
     )
     topk_weights = torch.tensor(
-        [[0.25, 0.0], [0.0, 0.5], [0.0, 0.0]],
+        [[0.25, 0.0], [0.0, 0.5], [0.0, 0.0], [1.0, 1.0]],
         dtype=torch.bfloat16,
         device="cuda",
     )
     topk_ids = torch.tensor(
-        [[0, -1], [-1, 1], [-1, -1]],
+        [[0, -1], [-1, 1], [-1, -1], [0, 1]],
         dtype=torch.int32,
         device="cuda",
     )
-    output = torch.empty((3, 2), dtype=torch.float32, device="cuda")
+    output = torch.empty((4, 2), dtype=torch.float32, device="cuda")
 
     result = moe_fused_mul_sum(
         inputs=expert_outputs,
@@ -55,7 +56,7 @@ def test_ep_masking_skips_invalid_nan_slots_and_accumulates_in_fp32():
     torch.testing.assert_close(
         result,
         torch.tensor(
-            [[0.5, 1.0], [3.0, 4.0], [0.0, 0.0]],
+            [[0.5, 1.0], [3.0, 4.0], [0.0, 0.0], [1 + 2**-8, 1 + 2**-8]],
             dtype=torch.float32,
             device="cuda",
         ),

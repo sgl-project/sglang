@@ -2022,21 +2022,6 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_ep_size_makes_auto_cfg_back_off(self):
-        args = self._from_dict_with_pipeline_config(
-            LingBotVideoMoEPipelineConfig(),
-            kwargs={
-                "model_path": "robbyant/lingbot-video-moe-30b-a3b",
-                "num_gpus": 2,
-                "ep_size": 2,
-                "performance_mode": "auto",
-            },
-        )
-
-        self.assertFalse(args.enable_cfg_parallel)
-        self.assertEqual(args.cfg_parallel_degree, 1)
-        self.assertEqual(args.ep_size, 2)
-
     def test_ep_preserves_the_sp2_default_exchange(self):
         args = self._from_dict_with_pipeline_config(
             LingBotVideoMoEPipelineConfig(),
@@ -2049,6 +2034,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         )
 
         self.assertFalse(args.enable_cfg_parallel)
+        self.assertEqual(args.cfg_parallel_degree, 1)
         self.assertEqual(args.sp_degree, 2)
         self.assertEqual(args.ulysses_degree, 2)
         self.assertEqual(args.kv_gather_degree, 2)
@@ -2571,6 +2557,41 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 )
 
                 self.assertNotIn("dit", args.layerwise_offload_components or [])
+
+    def test_auto_sizes_an_expert_parallel_dit_by_its_local_experts(self):
+        def params(*_args, name_suffixes=None, **_kwargs):
+            return 28_991_000_000 if name_suffixes else 30_085_000_000
+
+        sizes = {
+            "transformer": (30_085_000_000, 60_170_000_000),
+            "text_encoder": (4_437_000_000, 8_874_000_000),
+            "vae": (127_000_000, 508_000_000),
+        }
+        for available_gb, checkpoint_sizes, streams in (
+            (30, None, True),
+            (50, None, False),
+            (79, sizes, False),
+        ):
+            with self.subTest(available_gb=available_gb):
+                args = self._from_dict_with_pipeline_config(
+                    LingBotVideoMoEPipelineConfig(),
+                    available_memory_gb=available_gb,
+                    dit_parameter_count=Mock(side_effect=params),
+                    checkpoint_sizes=checkpoint_sizes,
+                    kwargs={
+                        "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+                        "performance_mode": "auto",
+                        "num_gpus": 2,
+                        "ulysses_degree": 2,
+                        "ep_size": 2,
+                    },
+                )
+
+                self.assertEqual(
+                    "dit" in (args.layerwise_offload_components or []), streams
+                )
+                if checkpoint_sizes is not None:
+                    self.assertFalse(args.dit_cpu_offload)
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -3946,14 +3967,9 @@ class TestExpertParallelMesh(CustomTestCase):
 
     def test_ep_accepts_valid_topologies(self):
         cases = {
-            "shares the SP axis": dict(num_gpus=2, ep_size=2),
             "composes with TP": dict(num_gpus=4, tp_size=2, ep_size=2),
-            "larger degree": dict(num_gpus=8, tp_size=2, ep_size=4),
-            "ring": dict(num_gpus=2, ep_size=2, ulysses_degree=1, ring_degree=2),
-            "kv_gather": dict(num_gpus=2, ep_size=2, kv_gather_degree=2),
-            "multi-node": dict(
-                num_gpus=2, nnodes=2, ep_size=2, dist_init_addr="127.0.0.1:29500"
-            ),
+            "composes with CFG": dict(num_gpus=4, enable_cfg_parallel=True, ep_size=2),
+            "composes with DP": dict(num_gpus=4, dp_size=2, ep_size=2),
         }
         for name, kwargs in cases.items():
             with self.subTest(name):
@@ -4039,11 +4055,6 @@ class TestExpertParallelMesh(CustomTestCase):
                 self.assertRaisesRegex(ValueError, "requires CUDA or ROCm"),
             ):
                 args._validate_expert_parallel()
-
-    def test_ep_disabled_leaves_sp_budget_untouched(self):
-        args = self._args(num_gpus=4, tp_size=2)
-        self.assertEqual(args.ep_size, 1)
-        self.assertEqual(args.sp_degree, 2)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

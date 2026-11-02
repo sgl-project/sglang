@@ -55,18 +55,30 @@ gathered once after the final DiT block. Model-level sequence sharding is
 enabled automatically and cannot be disabled when `sp_degree` is greater than
 one.
 
-Hidden-state traffic grows with `ep_size`. Benchmark larger degrees and
-multi-node layouts on the target topology before deployment.
+Hidden-state traffic grows with `ep_size`. In each MoE block, every rank sends
+each of its local rows to the other `ep_size - 1` ranks as BF16 hidden states,
+BF16 routing weights, and int32 expert ids, and each destination returns one
+FP32 partial per row. Across dispatch and combine, each rank sends about
+`(ep_size - 1) × rows × (6 × hidden_size + 6 × top_k)` bytes per block. Benchmark
+larger degrees and multi-node layouts on the target topology before deployment.
 
 For the other parallel axes, see
 [Parallelism in SGLang Diffusion](/docs/sglang-diffusion/parallelism).
 
 ## Performance tradeoff
 
-EP reduces routed-expert memory while preserving sequence-parallel attention.
-Token dispatch adds communication to each MoE block, so benchmark against the
-same SP configuration without EP. Earlier measurements made before LingBot's
-model-level sequence sharding fix are not comparable.
+EP reduces routed-expert memory while preserving sequence-parallel attention,
+and it costs latency, GPU time, and interconnect bytes, so benchmark against the
+same SP configuration without EP. On two H200 GPUs with Ulysses degree 2, at
+480x480, 81 frames, and 40 steps, EP2 lowered peak memory by about 24 GiB per
+GPU. It added up to 50 percent to request latency, GPU busy time, and GPU energy
+per request and up to 55 percent to host CPU time per request, lowered frames per
+second by up to 33 percent, and used up to 2.7 times the interconnect bytes.
+
+Most of the added time is in the expert GEMMs, which run at the local expert
+count. The fused MoE kernel looks up its tuned configs by that count, so a GPU
+with no tuned config for it runs the default config. Earlier measurements made
+before LingBot's model-level sequence sharding fix are not comparable.
 
 ## Numerical behavior
 

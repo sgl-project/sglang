@@ -60,6 +60,11 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("memory",),
             supports_expert_parallel=True,
+            expert_parallel_param_suffixes=(
+                ".ffn.experts.w1",
+                ".ffn.experts.w2",
+                ".ffn.experts.w3",
+            ),
         )
 
     def validate_server_args(self, server_args) -> None:

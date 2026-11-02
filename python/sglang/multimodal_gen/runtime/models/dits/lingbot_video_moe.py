@@ -95,8 +95,6 @@ def pack_expert_weights(
     *,
     ep_info: MoeExpertParallelInfo,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Pack gate/up weights and retain this rank's expert shard."""
-
     def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
         if not ep_info.enabled or not is_expert_parallel_param(name):
             return tensor

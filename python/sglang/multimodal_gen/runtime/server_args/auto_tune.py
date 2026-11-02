@@ -821,9 +821,10 @@ class ServerArgsAutoTuner:
             # loaded in the component's configured precision, else as stored
             dtype = resolve_component_precision(args, name)
             nbytes = num_params * dtype.itemsize if dtype is not None else stored_bytes
-            # tensor parallelism shards the DiT's linear layers across the ranks
             weight_bytes += (
-                nbytes / (args.tp_size or 1) if is_dit_component_name(name) else nbytes
+                nbytes * self._dit_share_per_gpu()
+                if is_dit_component_name(name)
+                else nbytes
             )
         weight_gb = weight_bytes / BYTES_PER_GB
         fits = available_gb >= AUTO_ALL_RESIDENT_WEIGHT_MULTIPLE * weight_gb
@@ -877,8 +878,7 @@ class ServerArgsAutoTuner:
             )
             return False
         dtype = resolve_precision(args, "dit", precision_attr="dit_precision")
-        # tensor parallelism shards the DiT's linear layers across the ranks
-        dit_gb = num_params * dtype.itemsize / (args.tp_size or 1) / BYTES_PER_GB
+        dit_gb = num_params * dtype.itemsize * self._dit_share_per_gpu() / BYTES_PER_GB
         overflows = dit_gb > available_gb * AUTO_DIT_MAX_DEVICE_FRACTION
         logger.info(
             "Auto memory policy for %s: the DiT needs %.1f GiB per GPU in %s, %s "
@@ -937,6 +937,26 @@ class ServerArgsAutoTuner:
             args.is_arg_explicitly_set("use_fsdp_inference")
             or args.explicit_residency_mode("transformer") is not None
         )
+
+    def _dit_share_per_gpu(self) -> float:
+        args = self.server_args
+        # tensor parallelism shards the DiT's linear layers across the ranks
+        share = 1.0 / (args.tp_size or 1)
+        if args.ep_size <= 1:
+            return share
+        suffixes = self._deployment_config().expert_parallel_param_suffixes
+        total = dit_parameter_count(
+            args.model_path, subfolder=args.model_subfolder, revision=args.revision
+        )
+        routed = dit_parameter_count(
+            args.model_path,
+            subfolder=args.model_subfolder,
+            revision=args.revision,
+            name_suffixes=suffixes,
+        )
+        if not total or not routed:
+            return share
+        return share * (total - routed * (1 - 1 / args.ep_size)) / total
 
     def _has_explicit_parallel_policy(self) -> bool:
         args = self.server_args

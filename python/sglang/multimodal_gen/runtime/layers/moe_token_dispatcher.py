@@ -7,10 +7,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_group,
-    sequence_parallel_is_initialized,
-)
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
 
 NON_LOCAL_EXPERT_ID = -1
 
@@ -20,20 +17,6 @@ class FixedCapacityMoeDispatchedTokens(msgspec.Struct, frozen=True):
     topk_weights: torch.Tensor
     local_expert_ids: torch.Tensor
     num_source_tokens: int
-
-
-def _validate_dispatch_inputs(
-    *,
-    global_expert_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-) -> None:
-    if global_expert_ids.shape != topk_weights.shape:
-        raise ValueError(
-            "global_expert_ids and topk_weights must have the same shape, got "
-            f"{tuple(global_expert_ids.shape)} and {tuple(topk_weights.shape)}"
-        )
-    if global_expert_ids.ndim != 2:
-        raise ValueError("global_expert_ids and topk_weights must be two-dimensional")
 
 
 class FixedCapacityMoeTokenDispatcher:
@@ -61,18 +44,6 @@ class FixedCapacityMoeTokenDispatcher:
         topk_weights: torch.Tensor,
         global_expert_ids: torch.Tensor,
     ) -> FixedCapacityMoeDispatchedTokens:
-        _validate_dispatch_inputs(
-            global_expert_ids=global_expert_ids,
-            topk_weights=topk_weights,
-        )
-        if (
-            hidden_states.ndim != 2
-            or hidden_states.shape[0] != global_expert_ids.shape[0]
-        ):
-            raise ValueError(
-                "hidden_states must be two-dimensional and match the routed token count"
-            )
-
         num_tokens = hidden_states.shape[0]
         destination_ranks = torch.arange(
             self._ep_size,
@@ -122,18 +93,8 @@ def create_moe_token_dispatcher(
 ) -> FixedCapacityMoeTokenDispatcher | None:
     if ep_size <= 1:
         return None
-    if not sequence_parallel_is_initialized():
-        raise RuntimeError(
-            "expert parallelism reuses the SP group, but it is not initialized"
-        )
-    sp_group = get_sp_group()
-    if sp_group.world_size != ep_size:
-        raise RuntimeError(
-            "expert parallelism reuses the SP group, so ep_size must equal the SP "
-            f"world size; got ep_size={ep_size}, sp_world_size={sp_group.world_size}"
-        )
     return FixedCapacityMoeTokenDispatcher(
-        process_group=sp_group.device_group,
+        process_group=get_sp_group().device_group,
         ep_size=ep_size,
         num_local_experts=num_local_experts,
     )

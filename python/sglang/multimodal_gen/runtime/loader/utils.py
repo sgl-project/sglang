@@ -429,7 +429,21 @@ def _index_shard_names(index_path: str) -> list[str]:
         return sorted(set(json.load(f)["weight_map"].values()))
 
 
-def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
+def _metadata_parameter_counts(
+    metadata, name_suffixes: tuple[str, ...] | None
+) -> Counter[str]:
+    if name_suffixes is None:
+        return Counter(metadata.parameter_count)
+    counts: Counter[str] = Counter()
+    for name, info in metadata.tensors.items():
+        if name.endswith(name_suffixes):
+            counts[info.dtype] += info.parameter_count
+    return counts
+
+
+def _local_dit_parameter_counts(
+    folder: str, name_suffixes: tuple[str, ...] | None = None
+) -> Counter[str] | None:
     # the same files _list_safetensors_files loads, without its shard repair
     index_path = _select_safetensors_index_file(folder, _DEFAULT_SAFETENSORS_INDEX)
     if index_path is None:
@@ -442,12 +456,19 @@ def _local_dit_parameter_counts(folder: str) -> Counter[str] | None:
         return None
     counts: Counter[str] = Counter()
     for shard in shards:
-        counts.update(parse_local_safetensors_file_metadata(shard).parameter_count)
+        counts.update(
+            _metadata_parameter_counts(
+                parse_local_safetensors_file_metadata(shard), name_suffixes
+            )
+        )
     return counts
 
 
 def _hub_dit_parameter_counts(
-    repo_id: str, folder: str, revision: str | None
+    repo_id: str,
+    folder: str,
+    revision: str | None,
+    name_suffixes: tuple[str, ...] | None = None,
 ) -> Counter[str]:
     try:
         index_path = hf_hub_download(
@@ -463,15 +484,20 @@ def _hub_dit_parameter_counts(
         metadata = parse_safetensors_file_metadata(
             repo_id=repo_id, filename=f"{folder}/{shard}", revision=revision
         )
-        counts.update(metadata.parameter_count)
+        counts.update(_metadata_parameter_counts(metadata, name_suffixes))
     return counts
 
 
 def _dit_parameter_counts(
-    model_path: str, folder: str, revision: str | None
+    model_path: str,
+    folder: str,
+    revision: str | None,
+    name_suffixes: tuple[str, ...] | None = None,
 ) -> Counter[str] | None:
     if os.path.isdir(model_path):
-        return _local_dit_parameter_counts(os.path.join(model_path, folder))
+        return _local_dit_parameter_counts(
+            os.path.join(model_path, folder), name_suffixes
+        )
     if os.path.exists(model_path) or envs.SGLANG_USE_MODELSCOPE.get():
         # a single-file checkpoint has no transformer folder to size,
         # and ModelScope has no header-only read
@@ -483,24 +509,33 @@ def _dit_parameter_counts(
             allow_patterns=[f"{folder}/*"],
             local_files_only=True,
         )
-        counts = _local_dit_parameter_counts(os.path.join(snapshot, folder))
+        counts = _local_dit_parameter_counts(
+            os.path.join(snapshot, folder), name_suffixes
+        )
     except LocalEntryNotFoundError:
         counts = None
     if counts is None:
-        counts = _hub_dit_parameter_counts(model_path, folder, revision)
+        counts = _hub_dit_parameter_counts(model_path, folder, revision, name_suffixes)
     return counts
 
 
 def dit_parameter_count(
-    model_path: str, *, subfolder: str | None, revision: str | None
+    model_path: str,
+    *,
+    subfolder: str | None,
+    revision: str | None,
+    name_suffixes: tuple[str, ...] | None = None,
 ) -> int | None:
     """Parameter count of a Diffusers transformer, from its safetensors headers.
 
-    None when it cannot be sized without its weights, or is stored quantized.
+    Counts only tensors whose names end with name_suffixes when given. None
+    when it cannot be sized without its weights, or is stored quantized.
     """
     folder = f"{subfolder}/{_DIT_SUBFOLDER}" if subfolder else _DIT_SUBFOLDER
     try:
-        counts = _dit_parameter_counts(os.path.expanduser(model_path), folder, revision)
+        counts = _dit_parameter_counts(
+            os.path.expanduser(model_path), folder, revision, name_suffixes
+        )
     except Exception as exc:
         logger.debug("Could not size the transformer of %s: %s", model_path, exc)
         return None

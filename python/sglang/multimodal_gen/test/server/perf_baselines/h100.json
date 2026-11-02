@@ -3207,6 +3207,33 @@
             "runtime_peak_allocated_mb": 58436.0,
             "estimated_full_test_time_s": 150
         },
+        "lingbot_video_moe_ep2_t2v": {
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "LingBotVideoTextEncodingStage": 217.51,
+                "LatentPreparationStage": 0.15,
+                "TimestepPreparationStage": 5.52,
+                "DenoisingStage": 1677.64,
+                "DecodingStage": 371.66,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 1426.95,
+                "1": 249.6
+            },
+            "expected_e2e_ms": 2397.78,
+            "expected_load_ms": 68717.3,
+            "expected_avg_denoise_ms": 838.27,
+            "expected_median_denoise_ms": 838.27,
+            "load_peak_vram_mb": 30006.0,
+            "runtime_peak_vram_mb": 37090.0,
+            "warmup_peak_vram_mb": 37074.0,
+            "load_peak_allocated_mb": 30272.45,
+            "runtime_peak_allocated_mb": 35395.61,
+            "load_peak_host_anon_mb": 6065.67,
+            "runtime_peak_host_anon_mb": 6065.67,
+            "estimated_full_test_time_s": 109.3
+        },
         "lingbot_world_realtime_plastic_beach": {
             "expected_load_ms": 41626.64,
             "stages_ms": {

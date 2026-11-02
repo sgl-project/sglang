@@ -14,7 +14,8 @@ import torch
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 _WORLD = 2
-_REL_FRO_LIMIT = 1e-2
+# One BF16 rounding of each of two ring partials in each of 2 blocks and proj_out.
+_REL_FRO_LIMIT = 6 * 2**-8
 # (ulysses_degree, ring_degree, kv_gather_degree); kv_gather runs on the Ulysses layout.
 _SP_MODES = {
     "ulysses": (_WORLD, 1, 1),
@@ -63,6 +64,10 @@ def _worker_impl(sp_mode: str) -> int:
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
+    from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
+        LingBotVideoBlock,
+        LingBotVideoRMSNorm,
+    )
     from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
     from sglang.multimodal_gen.runtime.server_args import set_global_server_args
     from sglang.multimodal_gen.runtime.utils.precision import (
@@ -99,6 +104,13 @@ def _worker_impl(sp_mode: str) -> int:
     with torch.no_grad():
         for parameter in dense.parameters():
             parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.02)
+        # Unit norms and residual gates let attention, and so RoPE, reach the output.
+        for module in dense.modules():
+            if isinstance(module, (LingBotVideoRMSNorm, torch.nn.LayerNorm)):
+                if module.weight is not None:
+                    module.weight.fill_(1.0)
+            if isinstance(module, LingBotVideoBlock):
+                module.scale_shift_table.view(1, 6, -1)[:, [2, 5]] = 1.0
     sequence_parallel = _build_tiny_dit()
     sequence_parallel.load_state_dict(dense.state_dict())
 

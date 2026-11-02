@@ -133,6 +133,12 @@ class TestDitParameterCount(CustomTestCase):
             self.assertEqual(
                 dit_parameter_count(tmpdir, subfolder="sub", revision=None), 17
             )
+            self.assertEqual(
+                dit_parameter_count(
+                    tmpdir, subfolder="sub", revision=None, name_suffixes=("b",)
+                ),
+                5,
+            )
 
     def test_counts_the_canonical_file_over_a_precision_variant(self):
         with tempfile.TemporaryDirectory() as tmpdir:

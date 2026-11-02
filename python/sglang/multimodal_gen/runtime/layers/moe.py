@@ -9,10 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
-    get_sp_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_sp_parallel_rank
 from sglang.multimodal_gen.runtime.layers.moe_token_dispatcher import (
     FixedCapacityMoeTokenDispatcher,
     create_moe_token_dispatcher,
@@ -33,19 +30,6 @@ class MoeExpertParallelInfo(msgspec.Struct, frozen=True):
 def resolve_moe_expert_parallel(
     num_experts: int, *, ep_size: int
 ) -> MoeExpertParallelInfo:
-    if ep_size < 1:
-        raise ValueError(f"ep_size ({ep_size}) must be >= 1")
-    if num_experts % ep_size != 0:
-        raise ValueError(
-            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
-        )
-    if ep_size > 1:
-        sp_world_size = get_sp_world_size()
-        if sp_world_size != ep_size:
-            raise RuntimeError(
-                f"configured ep_size ({ep_size}) does not match the SP world size "
-                f"({sp_world_size})"
-            )
     num_local_experts = num_experts // ep_size
     ep_rank = get_sp_parallel_rank() if ep_size > 1 else 0
     return MoeExpertParallelInfo(

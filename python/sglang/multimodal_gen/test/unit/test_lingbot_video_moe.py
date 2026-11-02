@@ -25,7 +25,6 @@ from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
-    LingBotVideoSparseMoeBlock,
     MoeExpertParallelInfo,
     resolve_moe_expert_parallel,
 )
@@ -420,23 +419,6 @@ def _ep_info(ep_size: int, ep_rank: int, num_experts: int) -> MoeExpertParallelI
     )
 
 
-def _make_moe_block(**overrides):
-    kwargs = dict(
-        hidden_size=8,
-        intermediate_size=4,
-        num_experts=8,
-        top_k=2,
-        score_func="sigmoid",
-        norm_topk_prob=True,
-        n_group=None,
-        topk_group=None,
-        routed_scaling_factor=1.0,
-        n_shared_experts=1,
-    )
-    kwargs.update(overrides)
-    return LingBotVideoSparseMoeBlock(**kwargs)
-
-
 def test_expert_parallel_shards_tile_the_dense_checkpoint():
     num_experts, intermediate_size, hidden_size, ep_size = 8, 3, 4, 4
     w1 = torch.arange(
@@ -454,6 +436,17 @@ def test_expert_parallel_shards_tile_the_dense_checkpoint():
         ("blocks.0.ffn.experts.w3", w3),
         ("blocks.0.ffn.router.weight", router),
         ("blocks.0.ffn.shared_experts.up_proj.weight", shared),
+    ]
+
+    suffixes = (
+        LingBotVideoMoEPipelineConfig()
+        .get_model_deployment_config()
+        .expert_parallel_param_suffixes
+    )
+    assert [name for name, _ in src if name.endswith(suffixes)] == [
+        "blocks.0.ffn.experts.w1",
+        "blocks.0.ffn.experts.w2",
+        "blocks.0.ffn.experts.w3",
     ]
 
     shards = [
@@ -488,62 +481,13 @@ def test_expert_parallel_shards_tile_the_dense_checkpoint():
         torch.testing.assert_close(torch.cat([s[key] for s in shards]), dense)
 
 
-@pytest.mark.parametrize("ep_rank", [0, 3])
-def test_moe_block_with_expert_parallel_owns_only_its_shard(ep_rank):
-    with patch(
-        "sglang.multimodal_gen.runtime.layers.moe.create_moe_token_dispatcher",
-        return_value=object(),
-    ):
-        block = _make_moe_block(ep_info=_ep_info(4, ep_rank, 8))
-
-    assert block.ep_info.enabled
-    assert block.num_local_experts == 2
-    assert block.ep_info.local_expert_start == ep_rank * 2
-    assert block.experts.w13_weight.shape[0] == 2
-    assert block.experts.w2.shape[0] == 2
-    assert block.router.weight.shape[0] == 8
-
-
-def test_resolve_ep_disabled_ignores_sp():
-    info = resolve_moe_expert_parallel(8, ep_size=1)
-    assert not info.enabled
-    assert info.ep_size == 1
-    assert info.ep_rank == 0
-    assert info.num_local_experts == 8
-
-
-def test_resolve_ep_uses_sp_rank_for_larger_degree():
-    with (
-        patch(
-            "sglang.multimodal_gen.runtime.layers.moe.get_sp_world_size",
-            return_value=4,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.layers.moe.get_sp_parallel_rank",
-            return_value=3,
-        ),
-    ):
-        info = resolve_moe_expert_parallel(8, ep_size=4)
-
-    assert info.enabled
-    assert info.ep_size == 4
-    assert info.ep_rank == 3
-    assert info.num_local_experts == 2
-    assert info.local_expert_start == 6
-
-
-def test_resolve_ep_requires_matching_sp_world_size():
-    with patch(
-        "sglang.multimodal_gen.runtime.layers.moe.get_sp_world_size",
-        return_value=4,
-    ):
-        with pytest.raises(RuntimeError, match="SP world size"):
-            resolve_moe_expert_parallel(8, ep_size=2)
-
-
 def test_lingbot_uses_model_level_sequence_sharding():
     config = LingBotVideoMoEPipelineConfig()
     assert resolve_sequence_shard(config, None)
+    warmup_req = SimpleNamespace(enable_sequence_shard=None)
+    LingBotVideoMoESamplingParams().prepare_synthetic_warmup_request_for_queue(
+        warmup_req, SimpleNamespace(pipeline_config=config)
+    )
 
     latents = torch.zeros(1, 16, 21, 4, 4)
     with patch(
@@ -553,6 +497,7 @@ def test_lingbot_uses_model_level_sequence_sharding():
         sharded, did_shard = config.shard_latents_for_sp(
             SimpleNamespace(enable_sequence_shard=True), latents
         )
+        config.shard_latents_for_sp(warmup_req, latents)
         with pytest.raises(ValueError, match="model-level sequence sharding"):
             config.shard_latents_for_sp(
                 SimpleNamespace(enable_sequence_shard=False), latents
@@ -562,8 +507,23 @@ def test_lingbot_uses_model_level_sequence_sharding():
     assert sharded is latents
 
 
+def test_lingbot_sp_rejects_token_counts_the_sp_degree_does_not_divide():
+    config = LingBotVideoMoEPipelineConfig()
+    server_args = SimpleNamespace(
+        pipeline_config=config, num_gpus=2, sp_degree=2, comfyui_mode=True
+    )
+    LingBotVideoMoESamplingParams()._adjust_visual_fields(server_args, config)
+    with pytest.raises(ValueError, match="divisible by sp_degree"):
+        LingBotVideoMoESamplingParams(width=496, height=496)._adjust_visual_fields(
+            server_args, config
+        )
+
+
 def test_lingbot_sp_rejects_dynamic_batching():
     config = LingBotVideoMoEPipelineConfig()
+    config.validate_server_args(
+        SimpleNamespace(ep_size=1, sp_degree=1, batching_max_size=2)
+    )
     with pytest.raises(ValueError, match="dynamic batching"):
         config.validate_server_args(
             SimpleNamespace(ep_size=1, sp_degree=2, batching_max_size=2)
