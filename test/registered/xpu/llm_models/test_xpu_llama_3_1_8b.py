@@ -3,7 +3,7 @@
 TP=4 wedges the Level Zero driver during the first prefill batch on Arc/BMG;
 TP=2 runs cleanly with the same model and serves at ~18 tok/s.
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``.
+Scored by sgl-eval's ``gsm8k`` benchmark.
 """
 
 import unittest
@@ -24,7 +24,10 @@ register_xpu_ci(est_time=1200, suite="nightly-xpu-kernel-main-2-gpu", nightly=Tr
 class TestLlama31_8BInstructXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "meta-llama/Llama-3.1-8B-Instruct"
     tp_size = 2
-    accuracy = 0.80
+    # sgl-eval's 0-shot boxed grader scores 0.81-0.82 here (5-shot run_eval: 0.85).
+    accuracy = 0.77
+    # sgl-eval's 0-shot CoT runs past the mixin's 512-token default.
+    max_tokens = 1024
 
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",

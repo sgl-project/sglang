@@ -21,10 +21,14 @@ def reference(src, dst, source, target, page, layout):
     # Independent scalar row slicing also checks every untouched padding byte.
     result = dst.clone()
     for s, d in zip(source.tolist(), target.tolist()):
-        for width, base in (
-            (layout.data_bytes, 0),
-            (layout.scale_bytes, page * layout.data_bytes),
-        ):
+        if layout.is_interleaved:
+            rows = ((layout.bytes_per_token, 0),)
+        else:
+            rows = (
+                (layout.data_bytes, 0),
+                (layout.scale_bytes, page * layout.data_bytes),
+            )
+        for width, base in rows:
             result[
                 d // page, base + d % page * width : base + (d % page + 1) * width
             ] = src[s // page, base + s % page * width : base + (s % page + 1) * width]
@@ -140,7 +144,13 @@ class TestRequestWindowCopy(CustomTestCase):
             pos = torch.cat(
                 [torch.arange(n, device="cuda") + 191 + shift for n in lengths]
             )
-            return window_layout(req, pos, capacity=capacity, num_groups=len(lengths))
+            return window_layout(
+                req,
+                pos,
+                zero_row=window.zero_row,
+                capacity=capacity,
+                num_groups=len(lengths),
+            )
 
         active = metadata(lens, 0)
         window.activate(active)

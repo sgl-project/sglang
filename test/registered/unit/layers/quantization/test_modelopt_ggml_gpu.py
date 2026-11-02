@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.modelopt_ggml import (
     ModelOptGGMLLinearMethod,
     ModelOptGGMLMoEMethod,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,6 +60,12 @@ def make_moe(rng, experts, *, gated, activation):
 
 
 class TestModelOptGGMLGPU(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="cuda")
+        )
+
     def assert_relative_error(self, actual, expected):
         self.assertTrue(torch.isfinite(actual).all().item())
         error = (actual.float() - expected.float()).norm() / expected.float().norm()

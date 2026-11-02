@@ -13,7 +13,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_parallel,
+    get_resources,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +41,12 @@ def quant_config(layers):
 
 
 class TestModelOptGGML(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="cpu")
+        )
+
     def test_packed_linear_loads_without_becoming_a_dense_weight(self):
         """A GGML recipe must not fall back to a dense BF16 parameter."""
         for algo, blocks, payload in (("Q8_0", 8, 34), ("IQ2_XXS", 1, 66)):
@@ -143,6 +154,10 @@ class TestModelOptGGML(CustomTestCase):
                     get_parallel().override(
                         tp_size=2,
                         tp_rank=1,
+                        attn_tp_size=2,
+                        attn_tp_rank=1,
+                        moe_tp_size=2,
+                        moe_tp_rank=1,
                         tp_group=SimpleNamespace(rank_in_group=1, world_size=2),
                     ),
                 ):
@@ -179,6 +194,10 @@ class TestModelOptGGML(CustomTestCase):
                 get_parallel().override(
                     tp_size=2,
                     tp_rank=1,
+                    attn_tp_size=2,
+                    attn_tp_rank=1,
+                    moe_tp_size=2,
+                    moe_tp_rank=1,
                     tp_group=SimpleNamespace(rank_in_group=1, world_size=2),
                 ),
             ):
@@ -212,6 +231,32 @@ class TestModelOptGGML(CustomTestCase):
         method = ModelOptGGMLMoEMethod("IQ2_XXS")
         method.create_weights(layer, 2, 256, 256, torch.bfloat16)
         return layer, method
+
+    def test_trivial_metadata_is_allowed_but_expert_remapping_is_rejected(self):
+        """Default serving creates identity metadata without enabling EPLB."""
+        from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+        ids = torch.arange(2).view(1, 2)
+        metadata = ExpertLocationMetadata._init_raw(
+            ep_size=1,
+            physical_to_logical_map=ids,
+            logical_to_all_physical_map=ids.unsqueeze(-1),
+            moe_ep_rank=0,
+        )
+        with get_resources().override(expert_location_metadata=metadata):
+            layer, _ = self._expert_layer()
+            self.assertEqual(tuple(layer.w13_weight.shape), (2, 256, 1, 66))
+            for settings in (
+                {"enable_eplb": True},
+                {"init_expert_location": '{"physical_to_logical_map": [[1, 0]]}'},
+                {"ep_num_redundant_experts": 1},
+            ):
+                with (
+                    self.subTest(settings=settings),
+                    get_exec().moe.override(**settings),
+                    self.assertRaisesRegex(ValueError, "trivial expert placement"),
+                ):
+                    self._expert_layer()
 
     def test_expert_tp_shards_rows_for_up_and_whole_blocks_for_down(self):
         """TP must shard logical K blocks, preserving their scale and payload bytes together."""
