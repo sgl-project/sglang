@@ -87,8 +87,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     @property
     def supports_shared_read_events(self) -> bool:
-        # Preserve the legacy NPUGraphRunner replay behavior.
-        return False
+        # QFA snapshots shared pool mappings inside the graph. Preserve the
+        # existing event behavior for the other NPU attention paths.
+        return self._use_qfa
 
     @property
     def cache_loc_dtype(self):
