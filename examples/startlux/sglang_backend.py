@@ -112,11 +112,10 @@ class SGLangBackend(Backend):
     async def readout(self, prompt: str, letter_ids: Sequence[int]) -> list[float]:
         """Next-token log-probabilities of the answer letters after `prompt`.
 
-        SGLang scores an arbitrary label set only through `/v1/score`, which compares a
-        query against items; a plain prompt has no such call, so this reads the last
-        prompt position's top log-probabilities from `/generate` instead. A letter
-        outside that window raises rather than being read as -inf, which would silently
-        change the answer.
+        `/v1/score` compares a query against a set of items, so it cannot read an
+        arbitrary label set over one prompt. `/generate` can score named token ids
+        instead of returning a top-k window: `token_ids_logprob` asks for exactly the
+        answer letters, so no letter can fall outside the window and be read as -inf.
         """
         ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         body = {
@@ -129,21 +128,22 @@ class SGLangBackend(Backend):
                 "top_p": 1.0,
             },
             "return_logprob": True,
-            "top_logprobs_num": max(64, len(letter_ids) * 2),
             "logprob_start_len": len(ids) - 1,
+            "token_ids_logprob": list(letter_ids),
         }
         meta = (await self._post("/generate", body)).get("meta_info") or {}
-        top = meta.get("output_top_logprobs") or []
-        if not top or not top[0]:
-            raise BackendError("/generate returned no next-token logprobs")
-        # Each entry is [logprob, token_id, token_text].
-        by_id = {int(entry[1]): float(entry[0]) for entry in top[0] if len(entry) >= 2}
+        rows = meta.get("output_token_ids_logprobs") or []
+        if not rows or not rows[0]:
+            raise BackendError(
+                "/generate returned no log-probabilities for the letters"
+            )
+        # One row per generated token, then one [logprob, token_id, text] per requested
+        # token id, so the letters are paired by id rather than assumed to be in order.
+        by_id = {int(entry[1]): float(entry[0]) for entry in rows[0] if len(entry) >= 2}
         missing = [token for token in letter_ids if token not in by_id]
         if missing:
-            raise BackendError(
-                f"the next-token window is missing answer letters {missing}; the "
-                "engine does not expose enough log-probabilities"
-            )
+            # Only a malformed response reaches this, never a window that is too small.
+            raise BackendError(f"/generate did not score answer letters {missing}")
         return [by_id[token] for token in letter_ids]
 
     async def generate(
