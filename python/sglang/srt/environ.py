@@ -1020,6 +1020,16 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Run GDN chunked prefill through AITER's opt_vk stages (fused FlyDSL prepare,
+    # tuned hidden-state kernel) instead of the Triton FLA chunk path. Requires
+    # SGLANG_USE_AITER. Measured on MI355X: 1.4x on the chunk stage, GSM8K unchanged.
+    SGLANG_AITER_GDN_PREFILL = EnvBool(False)
+    # Hidden-state kernel for SGLANG_AITER_GDN_PREFILL: "triton", "hip" or "flydsl".
+    # Measured on MI355X at T=16384: all three within 6%, but hip/flydsl land at
+    # 1.8x the final-state error of triton against an fp32 recurrence.
+    # "fused" instead runs the whole chunked prefill as one FlyDSL kernel
+    # (state kept on chip, l2norm and track snapshot in-kernel).
+    SGLANG_AITER_GDN_PREFILL_H = EnvStr("triton")
     SGLANG_USE_AITER_AG = EnvBool(True)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
