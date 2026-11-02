@@ -229,8 +229,37 @@ on the instance, so the hot path stays a single indirect call.
 `BaseFusedOp` also owns the torch.compile mode protocol
 (`enter_torch_compile(num_tokens)` / `leave_torch_compile()`, both
 idempotent): while an outer model is compiled, ops switch to their
-compile-safe native path so device kernels are never traced (TopK and Fused
-MoE override `_torch_compile_forward()` to keep their bs>1 behavior).
+compile-safe native path by default (TopK and Fused MoE override
+`_torch_compile_forward()` to keep their bs>1 behavior).
+
+OOT platforms can separately opt an exact operator class into outer compilation:
+
+```python
+BaseFusedOp.register_oot_forward(Op, eager_forward, platform_key)
+BaseFusedOp.register_oot_compile_forward(Op, compile_forward, platform_key)
+```
+
+Both functions receive the op instance as their first argument and must have
+the same signature and behavior. They may be the same function. If no compile
+function is registered, `_torch_compile_forward()` selects the implementation.
+A registered compile function takes precedence over that method on the active
+OOT platform.
+
+Register functions before their first use. `BaseFusedOp` stores each selected
+function on the instance. Its `_forward_oot()` and `_forward_oot_compile()`
+methods call that function, passing the op instance as `self`. Compiler guard
+serialization can look up these methods by name on the instance, even when
+the registered function has no `forward_<platform_key>` attribute on the class.
+
+SGLang calls `enter_torch_compile()` before compiling the model and
+`leave_torch_compile()` to restore the eager implementation. Registering a
+function alone does not change dispatch for an external `torch.compile` call.
+
+Dynamo traces the registered function's body as part of the model compilation.
+Unsupported operations fail with `fullgraph=True`; with `fullgraph=False`,
+PyTorch may introduce graph breaks. Plugins must provide functions that the
+compiler can trace and lower, verify the results against eager execution, and
+support device-graph capture when that is required.
 
 The public `ops.<group>` functions stay thin wrappers over
 module-level instances, so the import surface is unchanged; each instance also

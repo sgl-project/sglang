@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
@@ -37,6 +38,19 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+# Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which
+# only the pickle codec sends.
+_pickle_ipc = patch.object(io_struct, "_USE_PICKLE_IPC", True)
+
+
+def setUpModule():
+    _pickle_ipc.start()
+
+
+def tearDownModule():
+    _pickle_ipc.stop()
 
 
 _BASE_LOAD = msgspec.structs.replace(
