@@ -170,7 +170,7 @@ class TestMiniMaxHybridDenseMetadataSkip(unittest.TestCase):
                 name=name,
                 is_hip=True,
                 dense_layer_ids=list(dense_layer_ids),
-                kv_index_translator=None,
+                runner_ids=None,
                 init_forward_metadata=lambda fb: calls.append(name),
                 init_forward_metadata_out_graph=lambda fb, cap: calls.append(name),
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
