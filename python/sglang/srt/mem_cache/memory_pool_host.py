@@ -26,6 +26,33 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+
+
+def _npu_transfer_dsv4_tokens(src_tensors, dst_tensors, src_indices, dst_indices):
+    """Row gather/scatter equivalent of ``transfer_cache_dsv4_mla`` for NPU.
+
+    The DSV4 C4 pool uses the PA_ND layout ``(pages, kernel_page_size, 1, kv_dim)``
+    on NPU, so one token is one contiguous row of the last dimension. Unlike the
+    CUDA page layout, which packs ``[value0..63][scale0..63]`` per page, a plain
+    gather/scatter over the flattened rows is exact here.
+    """
+    si = src_indices.to(dtype=torch.long).flatten()
+    di = dst_indices.to(dtype=torch.long).flatten()
+    if si.numel() == 0:
+        return
+    for src_t, dst_t in zip(src_tensors, dst_tensors):
+        # Take the row width from the multi-dimensional pool tensor: the host
+        # buffer is a 2-D [pages, item_bytes] view whose rows expand to exactly
+        # kernel_page_size * kv_dim elements.
+        proto = src_t if src_t.dim() >= dst_t.dim() else dst_t
+        kv_dim = int(proto.shape[-1])
+        s = src_t.reshape(-1, kv_dim)
+        d = dst_t.reshape(-1, kv_dim)
+        s_idx = si.to(device=s.device)
+        d_idx = di.to(device=d.device)
+        d[d_idx] = s[s_idx].to(dtype=d.dtype, device=d.device)
+
+
 _dsv4_mla_unavailable_reason: Optional[str] = None
 if _is_xpu:
     try:
@@ -508,6 +535,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # [value0..value63][scale0..scale63].
         if self.page_aligned_only:
             raise self._unaligned_transfer_error(host_indices, device_indices)
+        # No NPU counterpart for the CUDA kernel above; copy rows with torch.
+        if _is_npu:
+            _npu_transfer_dsv4_tokens(
+                self.device_buffers,
+                self.data_refs,
+                device_indices,
+                host_indices,
+            )
+            return
         transfer_cache_dsv4_mla(
             src_ptrs=self.device_ptrs,
             dst_ptrs=self.data_ptrs,
@@ -627,6 +663,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             # preload, so it cannot use the normal HiCache page-row copy.
             if self.page_aligned_only:
                 raise self._unaligned_transfer_error(host_indices, device_indices)
+            # No NPU counterpart for the CUDA kernel above; copy rows with torch.
+            if _is_npu:
+                _npu_transfer_dsv4_tokens(
+                    [self.data_refs[layer_id]],
+                    [self.device_buffers[layer_id]],
+                    host_indices,
+                    device_indices,
+                )
+                return
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
