@@ -6,8 +6,11 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_agree,
+    megakernel_draft_sampler,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_draft_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -39,6 +42,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        sharded_accept: bool = False,
         out=None,
         megakernel_sampler: Optional[Callable] = None,
     ):
@@ -76,6 +80,7 @@ class DsparkDraftSampler:
                 device=device,
             )
         self.greedy_draft = greedy_draft
+        self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay.
@@ -97,8 +102,9 @@ class DsparkDraftSampler:
         if not self.greedy_draft:
             # The megakernel leaves temperature-0 rows' logits unwritten; a mixed accept
             # still reads them.
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.zeros(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             )
@@ -129,8 +135,9 @@ class DsparkDraftSampler:
                 else torch.cuda.is_current_stream_capturing()
             )
             assert not capturing
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.empty(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
                 device=base_logits.device,
             )
@@ -189,12 +196,15 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            sharded_accept=self.sharded_accept,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features
 
 
-def _step_logits_width(model) -> int:
+def _step_logits_width(model, sharded_accept: bool) -> int:
+    if sharded_accept:
+        return int(model.lm_head.num_embeddings_per_partition)
     # Unsharded base logits span the cropped vocab.
     return step_logits_width(model.markov_head, int(model.lm_head.org_vocab_size))
 
@@ -209,6 +219,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    sharded_accept: bool = False,
     out=None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
@@ -238,6 +249,7 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        sharded_accept=sharded_accept,
         out=out,
         megakernel_sampler=megakernel_sampler,
     )

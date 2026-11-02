@@ -3,7 +3,7 @@ gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -60,6 +60,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_attn_tp_input_scattered=False,
                     moe_dp_size=1,
                     cp_strategy=None,
+                    cp_kv_layout=None,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -141,6 +142,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             enable_prefill_cp=prefill,
                             cp_size=cp_size,
                             cp_strategy=cfg.cp_strategy,
+                            cp_kv_layout=None,
                         )
 
 
@@ -216,6 +218,9 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "speculative_draft_kv_cache_dtype",
+                    "speculative_draft_model_quantization",
+                    "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
                     "watermark_enforce_all",
@@ -1649,7 +1654,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
             _nemotron_h_overrides(server_args, hf_config)
 
-    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+    def test_nemotron_h_w4a16_moe_explicit_runner(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
         )
@@ -1662,10 +1667,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 }
             }
         )
-        server_args.moe_runner_backend = "flashinfer_trtllm"
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}, None),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}, None),
+            ("marlin", "none", False, {}, None),
+            ("marlin", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", False, None, "moe-runner-backend=marlin"),
+            ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
+            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+        ]
+        for runner, a2a, w4a16_enabled, expected, error in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16_enabled=w4a16_enabled),
+                override_platform(is_sm100=True),
+                override_platform(is_blackwell=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                server_args.moe_runner_backend = runner
+                server_args.moe_a2a_backend = a2a
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _nemotron_h_overrides(server_args, hf_config)
+                else:
+                    self.assertEqual(
+                        _nemotron_h_overrides(server_args, hf_config),
+                        {
+                            "quantization": "modelopt_mixed",
+                            "attention_backend": "trtllm_mha",
+                            **expected,
+                        },
+                    )
 
-        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
-            _nemotron_h_overrides(server_args, hf_config)
+    def test_nemotron_h_w4a16_cutedsl_rejects_non_sm100(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_cutedsl"
+        for is_blackwell in (False, True):
+            with (
+                self.subTest(is_blackwell=is_blackwell),
+                override_platform(is_sm100=False, is_blackwell=is_blackwell),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+                self.assertRaisesRegex(ValueError, "SM100-family GPUs"),
+            ):
+                _nemotron_h_overrides(server_args, hf_config)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
@@ -1686,24 +1743,125 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._leaf("swa_full_tokens_ratio"), 1.0)
         self.assertTrue(self._leaf("disable_hybrid_swa_memory"))
 
-    def test_gemma2_disables_hybrid_swa_memory(self):
-        sa = self._construct("Gemma2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertIn(
-            ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
-            sa._resolved_overrides,
+    # The mini config's two layers: one sliding-window layer, one full layer.
+    _SWA_MIX = {
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 64,
+    }
+
+    def test_gemma_keeps_hybrid_swa_memory(self):
+        for architecture, model_type, backend in (
+            ("Gemma2ForCausalLM", "gemma2", "fa3"),
+            ("Gemma3ForCausalLM", "gemma3_text", "triton"),
+            ("Gemma3ForConditionalGeneration", "gemma3", "triton"),
+        ):
+            with self.subTest(architecture=architecture, backend=backend):
+                sa = self._construct(
+                    architecture,
+                    model_type,
+                    config_extra=self._SWA_MIX,
+                    attention_backend=backend,
+                )
+                self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_gemma3_disables_hybrid_swa_memory_on_fa3(self):
+        for architecture, model_type in (
+            ("Gemma3ForCausalLM", "gemma3_text"),
+            ("Gemma3ForConditionalGeneration", "gemma3"),
+        ):
+            for backends in (
+                {"attention_backend": "fa3"},
+                {
+                    "prefill_attention_backend": "triton",
+                    "decode_attention_backend": "fa3",
+                },
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, model_type, config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_gemma2_gemma3_overrides",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_gemma3n_disables_hybrid_swa_memory(self):
+        for architecture in ("Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                sa = self._construct(architecture, "llama", config_extra=self._SWA_MIX)
+                self.assertIn(
+                    ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
+                    sa._resolved_overrides,
+                )
+
+    def test_layer_types_hybrid_swa_memory_off_on_backends_without_it(self):
+        for architecture in ("Gemma3ForCausalLM", "Cohere2ForCausalLM"):
+            for backends in (
+                {"attention_backend": "aiter"},
+                {
+                    "prefill_attention_backend": "aiter",
+                    "decode_attention_backend": "triton",
+                },
+                {"attention_backend": "wave"},
+                {"attention_backend": "flex_attention"},
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, "llama", config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_hybrid_swa_memory_backend_disable",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_layer_types_hybrid_swa_memory_off_on_default_aiter(self):
+        # The gate has to see the default backend, which resolves after the
+        # model overrides run.
+        with override_platform(is_cuda=False, is_hip=True):
+            sa = self._construct(
+                "Gemma3ForCausalLM", "llama", config_extra=self._SWA_MIX
+            )
+        self.assertEqual(self._resolved(sa, "attention_backend"), "aiter")
+        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_listed_hybrid_swa_models_keep_their_pool_on_aiter(self):
+        sa = self._construct(
+            "Gemma4ForCausalLM",
+            "llama",
+            config_extra=self._SWA_MIX,
+            attention_backend="aiter",
         )
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
 
-    def test_olmo2_disables_hybrid_swa_memory(self):
-        sa = self._construct("Olmo2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+    def test_olmo3_keeps_hybrid_swa_memory(self):
+        sa = self._construct(
+            "Olmo3ForCausalLM", "olmo3", config_extra={"num_hidden_layers": 4}
+        )
+        model_config = base_module.model_config_of(sa)
+        self.assertEqual(model_config.hf_config.architectures, ["Olmo2ForCausalLM"])
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
 
-    def test_exaone_conditional_on_sliding_window_pattern(self):
-        # With the pattern the branch also asserts an explicit backend.
+    def test_exaone4_keeps_hybrid_swa_memory(self):
         sa = self._construct(
             "Exaone4ForCausalLM",
+            "llama",
+            config_extra={"sliding_window_pattern": "LLLG", **self._SWA_MIX},
+            attention_backend="fa3",
+        )
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_exaone_moe_disables_hybrid_swa_memory(self):
+        # With the pattern the branch also asserts an explicit backend.
+        sa = self._construct(
+            "ExaoneMoEForCausalLM",
             "llama",
             config_extra={"sliding_window_pattern": "LLLG"},
             attention_backend="fa3",
@@ -1815,6 +1973,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
+
+    def test_deterministic_incompatible_phase_backend_raises(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        # A per-phase backend overrides --attention-backend for its phase, so a
+        # non-deterministic one must be refused even when the main backend is fine.
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            with self.subTest(field=field):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        **{field: "aiter"},
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    _deterministic_attention_backend(view)
+
+    def test_deterministic_compatible_phase_backends_are_accepted(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_attention_backend,
+        )
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                attention_backend="triton",
+                prefill_attention_backend="triton",
+                decode_attention_backend="fa3",
+            )
+        )
+        self.assertEqual(_deterministic_attention_backend(view), {})
 
     def test_deterministic_ascend_is_left_alone(self):
         from sglang.srt.arg_groups.overrides import (
@@ -3446,10 +3640,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+        # page_size 1 is accepted: the flat page table runs the non-paged varlen
+        # kernel.
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
+                )
+            ),
+            {},
+        )
+        # an unsupported page still snaps to 128
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    page_size=32,  # non-MLA accepts only 1, 64, 128
                 )
             ),
             {"page_size": 128},
@@ -3463,6 +3669,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {},
+        )
+        # MLA does not inherit MHA's page_size 1: mla_decode has no page_size 1 path.
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    _model_config=SimpleNamespace(attention_arch=AttentionArch.MLA),
+                    page_size=1,
+                )
+            ),
+            {"page_size": 128},
         )
 
     def test_monolith_attention_families_at_callable_level(self):
@@ -3642,7 +3859,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend=None,
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
+            ),
+            {},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend="ascend_ops",
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
             ),
             {},
         )
@@ -4034,6 +4271,42 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
+    """The deterministic fallback must not hand XPU a CUDA-only backend.
+
+    fa3 asserts on the device's SM version, so an XPU server that only asked
+    for --enable-deterministic-inference dies at launch rather than falling
+    back. The explicit-backend case guards the other direction: the platform
+    branch must not override a backend the user named.
+    """
+
+    @staticmethod
+    def _view(attention_backend):
+        return SimpleNamespace(
+            enable_deterministic_inference=True,
+            attention_backend=attention_backend,
+            model_path="Qwen/Qwen3-4B",
+        )
+
+    def test_xpu_fallback_is_an_xpu_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view(None)
+            )
+        self.assertEqual(updates, {"attention_backend": "intel_xpu"})
+
+    def test_xpu_keeps_explicit_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view("triton")
+            )
+        self.assertEqual(updates, {})
 
 
 if __name__ == "__main__":

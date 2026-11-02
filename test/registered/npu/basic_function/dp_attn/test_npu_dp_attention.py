@@ -45,9 +45,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
-            True
-        )
+        cls._env_override = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True)
         cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,

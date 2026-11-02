@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -31,11 +32,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+    request_finish = Req.request_finish
+    finish_outside_step = Req.finish_outside_step
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
@@ -45,8 +48,10 @@ class _FakeReq:
         self.session = None
         self.multimodal_inputs = None
         self._finished = is_finished
+        self.finished_reason = None
         self.output_ids = []
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -54,7 +59,7 @@ class _FakeReq:
         )
 
     def finished(self):
-        return self._finished
+        return self._finished or self.finished_reason is not None
 
 
 def _req(
@@ -77,6 +82,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.rust_server = None
+    s.output_streamer = MagicMock()
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
@@ -138,6 +144,37 @@ class TestWaitingTimeout(CustomTestCase):
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):
             self.assertEqual(s._poll_timeout_aborts(), [])
+
+
+class TestQueuedAbort(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_popped_request_is_finished_and_a_later_abort_skips_it(self):
+        req = _req("queued")
+        req.kv = SimpleNamespace(holds_mamba=False)
+        # Still listed in the last batch, as a requeued or dLLM request is.
+        s = _scheduler([req], last_batch_reqs=[req])
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s._deferred_responses = {}
+        s.chunked_req = None
+        s.mm_receiver = None
+        s.dllm_config = None
+        s.grammar_manager = MagicMock()
+        s._release_aborted_request = MagicMock()
+
+        s.abort_request(AbortReq(rid="queued"))
+        s.abort_request(AbortReq(abort_all=True))
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.to_finish)
+        s._release_aborted_request.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):

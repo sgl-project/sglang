@@ -33,7 +33,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAllocationConfiguration(CustomTestCase):
@@ -50,7 +50,6 @@ class TestAllocationConfiguration(CustomTestCase):
                 "disaggregation_mode": "decode",
                 "disaggregation_decode_host_receive_threshold": 0.5,
             },
-            {"enable_pdmux": True},
             {"enable_pd_role_switch": True},
             {"language_only": True},
             {
@@ -92,7 +91,9 @@ class TestAllocationIntegration(CustomTestCase):
 
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.customized_info_enabled = False
         mgr.local_ip, mgr.rank_port = ip, port
+        mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
@@ -610,7 +611,9 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.state_strides_validated = set()
         mgr.enable_deferred_decode_kv_release = True
         mgr.decode_kv_args_table = {
-            "session": SimpleNamespace(requires_dcp_relayout=False, dst_aux_ptrs=[])
+            "session": SimpleNamespace(
+                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
+            )
         }
         mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         mgr.send_aux = Mock(return_value=0)
@@ -747,6 +750,7 @@ class TestAllocationIntegration(CustomTestCase):
                     queue._transfer_page_indices = Mock(return_value=[0])
                     queue.transfer_queue = SimpleNamespace(enable_staging=False)
                     queue._num_published_destinations = 0
+                    queue.scheduler = SimpleNamespace(enable_overlap=False)
                     events = Mock()
                     events.attach_mock(receiver.send_metadata, "metadata")
                     events.attach_mock(

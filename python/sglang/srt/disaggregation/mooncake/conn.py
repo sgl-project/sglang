@@ -39,9 +39,11 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    bind_thread_to_device,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -53,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
@@ -74,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -172,6 +176,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -183,47 +188,50 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
-            dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
-            dst_tp_rank=int(msg[7].decode("ascii")),
-            dst_attn_tp_size=int(msg[8].decode("ascii")),
-            dst_kv_item_len=int(msg[9].decode("ascii")),
-            dst_state_item_lens=(
-                unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
+            dst_aux_item_lens=(
+                list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])) if msg[6] else None
             ),
-            dst_state_dim_per_tensor=(
+            dst_state_data_ptrs=unpack_int_lists(msg[7], "Q"),
+            dst_tp_rank=int(msg[8].decode("ascii")),
+            dst_attn_tp_size=int(msg[9].decode("ascii")),
+            dst_kv_item_len=int(msg[10].decode("ascii")),
+            dst_state_item_lens=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            dst_kv_layer_ids=(
-                list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
-                if len(msg) > 12 and msg[12] != b""
-                else []
+            dst_state_dim_per_tensor=(
+                unpack_int_lists(msg[12], "I") if len(msg) > 12 else []
             ),
-            dst_state_layer_ids=(
-                unpack_int_lists(msg[13], "I")
+            dst_kv_layer_ids=(
+                list(struct.unpack(f"{len(msg[13]) // 4}I", msg[13]))
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
+            dst_state_layer_ids=(
+                unpack_int_lists(msg[14], "I")
+                if len(msg) > 14 and msg[14] != b""
+                else []
+            ),
             staging_base_ptr=(
-                struct.unpack("Q", msg[14])[0]
-                if len(msg) > 14 and len(msg[14]) == 8
+                struct.unpack("Q", msg[15])[0]
+                if len(msg) > 15 and len(msg[15]) == 8
                 else 0
             ),
             staging_total_size=(
-                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 0
             ),
             dst_dcp_size=(
-                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
+                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 1
             ),
             dst_dcp_rank=(
-                int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+                int(msg[18].decode("ascii")) if len(msg) > 18 and msg[18] != b"" else 0
             ),
             dst_kv_item_lens=(
-                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
-                if len(msg) > 19 and msg[19]
+                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
+                if len(msg) > 20 and msg[20]
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
 
 
@@ -337,7 +345,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    transfer_thread_pool_size // transfer_queue_size,
+                    initializer=bind_thread_to_device,
+                    initargs=(self.kv_args.gpu_id,),
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -353,9 +363,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks threads
                 # (each parked forever in FastQueue.get()).
+                # transfer_worker makes device calls (wait_event.synchronize());
+                # a thread without a current device would run them on device 0
+                # and open a second context on another rank's GPU.
                 t = threading.Thread(
-                    target=self.transfer_worker,
+                    target=run_on_device,
                     args=(
+                        self.kv_args.gpu_id,
+                        self.transfer_worker,
                         queue,
                         executor,
                         (
@@ -919,6 +934,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         reason, if any.
         """
         fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        self.check_peer_aux_buffer_count(
+            mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
+        )
         with self.session_lock:
             self._unblacklist_session(mooncake_session_id)
             self.state_layout_rejections.pop(mooncake_session_id, None)
@@ -1777,6 +1795,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: Optional[List[int]],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
@@ -1787,11 +1806,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         transfer_blocks = []
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if dst_aux_item_lens is None:
+            dst_aux_item_lens = prefill_aux_item_lens
 
-        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1805,7 +1827,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i in range(len(prefill_aux_ptrs)):
+        for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
@@ -1875,8 +1897,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Prefill CP all-gathers before writing the pool, so every CP rank holds
         # the full state regardless of whether the pool is hybrid. We assume no
         # structure about the state rows, so we don't split them across CP ranks
-        # -- just let rank 0 send the whole thing (unless layer split already
-        # shards it per rank).
+        # -- just let rank 0 send the whole thing. Layer-split and page-sharded
+        # DSA pools are exceptions: every owner must send its distinct state.
         if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
 
@@ -1918,6 +1940,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
+
+    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
+        """Pair target/draft indexer pages before narrowing to this owner."""
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError(
+                "Sharded DSA state page count mismatch: "
+                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+            )
+        local_indices, positions = filter_kv_indices_for_shard_rank(
+            kv_indices=np.asarray(src_indices, dtype=np.int32),
+            index_slice=slice(0, len(src_indices)),
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+        )
+        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def maybe_send_extra(
         self,
@@ -2109,6 +2146,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DSA and get_parallel().enable_kv_cache_sharding:
+                    src_indices, dst_indices_local = self._prepare_sharded_dsa_indices(
+                        src_indices, dst_indices_local
+                    )
+                    if len(src_indices) == 0:
+                        continue
                 if (
                     st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
@@ -2581,6 +2624,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        try:
+                            self.validate_aux_buffers(
+                                target_rank_registration_info.dst_aux_ptrs,
+                                target_rank_registration_info.dst_aux_item_lens,
+                            )
+                        except ValueError as exc:
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room, failure_reason=str(exc)
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2771,6 +2824,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
+                                target_rank_registration_info.dst_aux_item_lens,
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -3232,6 +3286,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             session_id.encode("ascii"),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
+            # Always sent, empty unless customized-info transfer is enabled.
+            (
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+                if self.customized_info_enabled
+                else b""
+            ),
             packed_state_data_ptrs,
             dst_tp_rank,
             dst_attn_tp_size,
@@ -3298,6 +3360,27 @@ class MooncakeKVSender(CommonKVSender):
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
         )
+
+    def _record_transfer_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+    ):
+        metric_state_indices = state_indices
+        if metric_state_indices and get_parallel().enable_kv_cache_sharding:
+            # The queued state remains logical and is filtered by the worker.
+            # Account only for this sender's pages, including all target/draft
+            # indexer buffers represented by the DSA component's item lengths.
+            metric_state_indices = list(state_indices)
+            for i, (st, indices) in enumerate(
+                zip(self.kv_mgr.kv_args.state_types, state_indices)
+            ):
+                if st == StateType.DSA and indices is not None:
+                    pages = np.asarray(indices, dtype=np.int32)
+                    metric_state_indices[i] = pages[
+                        pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
+                    ]
+        super()._record_transfer_indices(kv_indices, metric_state_indices)
 
 
 class MooncakeKVReceiver(CommonKVReceiver):

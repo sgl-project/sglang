@@ -5,7 +5,11 @@ import importlib
 import logging
 from typing import TYPE_CHECKING, Any, Dict
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    _maybe_wrap_hicache_storage_failure_injector,
+)
 
 if TYPE_CHECKING:
     pass
@@ -83,6 +87,22 @@ class StorageBackendFactory:
             ImportError: If backend module cannot be imported
             Exception: If backend initialization fails
         """
+        backend = StorageBackendFactory._do_create_backend(
+            backend_name,
+            storage_config,
+            mem_pool_host,
+            **kwargs,
+        )
+        return _maybe_wrap_hicache_storage_failure_injector(backend)
+
+    @classmethod
+    def _do_create_backend(
+        cls,
+        backend_name: str,
+        storage_config: HiCacheStorageConfig,
+        mem_pool_host: Any,
+        **kwargs,
+    ) -> HiCacheStorage:
         # First check if backend is already registered
         if backend_name in cls._registry:
             registry_entry = cls._registry[backend_name]
@@ -160,6 +180,8 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name in ("file", "sim"):
             return backend_class(storage_config)
+        elif backend_name == "fast_file":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
@@ -203,6 +225,12 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "fast_file",
+    "sglang.srt.mem_cache.storage.fast_file.fast_file_store",
+    "HiCacheFastFile",
 )
 
 StorageBackendFactory.register_backend(

@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 import importlib.util
@@ -11,6 +11,7 @@ import sys
 import threading
 import unittest
 from collections import defaultdict
+from itertools import product
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -19,9 +20,24 @@ import numpy as np
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+)
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -44,6 +60,7 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
+    manager.customized_info_enabled = False
     return manager
 
 
@@ -171,6 +188,7 @@ class TestReceiverControlMessages(CustomTestCase):
             kv_data_mem_kinds=["VRAM"],
             kv_layer_ids=[7],
             aux_data_ptrs=[0x2000],
+            aux_item_lens=[64],
             state_data_ptrs=[[0x3000]],
             state_data_lens=[[512]],
             state_item_lens=[[32]],
@@ -286,13 +304,35 @@ class TestReceiverControlMessages(CustomTestCase):
                 layer,
             ],
         }
-        for backend in self.backends:
-            with self.subTest(backend=backend):
+        for backend, enabled in product(self.backends, (False, True)):
+            with self.subTest(backend=backend, customized_info=enabled):
                 receiver, sent = self._make_receiver(backend)
+                receiver.kv_mgr.customized_info_enabled = enabled
+                expected_frames = list(expected[backend])
+                if backend != "mori":
+                    # aux_item_lens follows aux_ptrs; empty when disabled.
+                    expected_frames.insert(
+                        expected_frames.index(aux) + 1,
+                        struct.pack("Q", 64) if enabled else b"",
+                    )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
-                    sent, [(port, expected[backend]) for port in (6000, 6001, 6002)]
+                    sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
                 )
+                if backend == "mori":
+                    continue
+                frames = sent[0][1]
+                if backend == "nixl":
+                    frames = frames[1:]
+                    registration_type = NixlKVArgsRegisterInfo
+                else:
+                    registration_type = MooncakeKVArgsRegisterInfo
+                info = registration_type.from_zmq(frames)
+                self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
+                self.assertEqual(info.dst_kv_item_lens, [16])
+                self.assertEqual(info.dst_state_item_lens, [[32]])
+                if backend == "nixl":
+                    self.assertEqual(info.dst_state_data_lens, [[512]])
 
     def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:
@@ -466,6 +506,23 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
         self.assertEqual(manager.prefill_response_tracker, {})
+
+    def test_staging_release_before_send_metadata(self):
+        """Overlap decode can fail a request before its held send_metadata runs;
+        releasing its staging room must still work."""
+        receiver, _ = self._make_receiver()
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        decode_req = SimpleNamespace(_chunk_events=[])
+        handler.release_room(17, decode_req, receiver)
+        self.assertEqual(receiver.chunk_staging_infos, [])
+
+
+class TestBootstrapServerClose(CustomTestCase):
+    def test_close_before_server_thread_runs(self):
+        with patch.object(threading.Thread, "start"):
+            server = CommonKVBootstrapServer("127.0.0.1", 0)
+        server.close()
 
 
 if __name__ == "__main__":

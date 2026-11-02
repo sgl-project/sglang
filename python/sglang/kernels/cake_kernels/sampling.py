@@ -14,8 +14,9 @@ if TYPE_CHECKING:
 def _device_supported(device_index: int) -> bool:
     import torch
 
+    # SM100 and SM103: the architectures of FlashInfer's Blackwell softmax routes.
     return (
-        torch.cuda.get_device_capability(device_index) == (10, 3)
+        torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
         and find_spec("flashinfer.jit.cake_blackwell_softmax") is not None
     )
 

@@ -2,9 +2,52 @@
 
 from __future__ import annotations
 
+import logging
+import math
+import os
+import weakref
 from typing import Dict, Sequence, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _pin_until_freed(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host memory of exactly the tensor's size (torch's pinned allocator rounds
+    every allocation up to a power of two): shared memory of that size, registered with CUDA
+    in place, as multimodal_gen's layerwise offload does.
+
+    The registration lasts as long as the storage, so as long as any tensor or view on it.
+    When the storage is freed, the device first finishes its queued reads (page-in copies,
+    gather), then the pages are unregistered, before torch releases them. Stores live as long
+    as their model, so that sync happens only at exit or in tests.
+    """
+    nbytes = math.prod(shape) * dtype.itemsize
+    fd = os.memfd_create("sglang-paged-experts", os.MFD_CLOEXEC)
+    try:
+        os.ftruncate(fd, nbytes)
+        storage = torch.UntypedStorage.from_file(
+            f"/proc/self/fd/{fd}", shared=True, nbytes=nbytes
+        )
+    finally:
+        os.close(fd)
+    rc = int(torch.cuda.cudart().cudaHostRegister(storage.data_ptr(), nbytes, 0))
+    if rc != 0:
+        raise RuntimeError(
+            f"Paged experts: cudaHostRegister of {nbytes} bytes failed (error {rc})"
+        )
+    weakref.finalize(storage, _unregister, storage.data_ptr())
+    # On the CPU, as its storage, also under a default CUDA device (model construction).
+    return torch.empty(0, dtype=dtype, device="cpu").set_(storage, 0, tuple(shape))
+
+
+def _unregister(data_ptr: int) -> None:
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+    rc = int(torch.cuda.cudart().cudaHostUnregister(data_ptr))
+    if rc != 0:
+        logger.warning("Paged experts: cudaHostUnregister failed (error %d)", rc)
 
 
 class HostExpertStore:
@@ -27,7 +70,9 @@ class HostExpertStore:
         }
 
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
-        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=self.pin)
+        if not self.pin or math.prod(shape) == 0:
+            return torch.empty(shape, dtype=dtype, device="cpu")
+        return _pin_until_freed(shape, dtype)
 
     def page_in(self, layer, loads: Sequence[Tuple[int, int]]) -> None:
         """Copy each ``(expert, slot)`` pair's expert, of every paged tensor, into its slot."""
@@ -43,24 +88,24 @@ class HostExpertStore:
             paged_experts_host_device_pointer,
         )
 
-        hosts, gpus, words = [], [], []
+        hosts, gpus, sizes = [], [], []
         for name, host in self.host.items():
             gpu = getattr(layer, name).data
             row_bytes = host[0].numel() * host.element_size()
             if row_bytes == 0:
                 continue  # e.g. GPTQ without act-order keeps empty g_idx tensors
-            if not (self.pin and gpu.is_contiguous() and row_bytes % 4 == 0):
+            if not (self.pin and gpu.is_contiguous() and row_bytes % 2 == 0):
                 raise RuntimeError(
-                    f"Paged experts: CUDA graphs need pinned, contiguous expert rows of whole "
-                    f"4-byte words; {name} has {row_bytes} bytes per expert, "
+                    f"Paged experts: CUDA graphs need pinned, contiguous expert rows of an "
+                    f"even size; {name} has {row_bytes} bytes per expert, "
                     f"pinned={host.is_pinned()}, contiguous={gpu.is_contiguous()}"
                 )
             hosts.append(paged_experts_host_device_pointer(host))
             gpus.append(gpu.data_ptr())
-            words.append(row_bytes // 4)
+            sizes.append(row_bytes)
         self._gather_args = [
             torch.tensor(v, dtype=torch.int64, device=gpu.device)
-            for v in (hosts, gpus, words)
+            for v in (hosts, gpus, sizes)
         ]
 
     def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:

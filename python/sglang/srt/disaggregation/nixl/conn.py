@@ -371,19 +371,20 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_aux_item_lens: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
         dst_kv_ptrs = list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5]))
         dst_kv_mem_kinds = (
-            _unpack_kv_mem_kinds(msg[17], len(dst_kv_ptrs))
-            if len(msg) > 17
+            _unpack_kv_mem_kinds(msg[18], len(dst_kv_ptrs))
+            if len(msg) > 18
             else ["VRAM"] * len(dst_kv_ptrs)
         )
-        dst_kv_item_len = int(msg[11].decode("ascii"))
+        dst_kv_item_len = int(msg[12].decode("ascii"))
         dst_kv_item_lens = (
-            list(struct.unpack(f"{len(msg[18]) // 8}Q", msg[18]))
-            if len(msg) > 18 and msg[18] != b""
+            list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+            if len(msg) > 19 and msg[19] != b""
             else [dst_kv_item_len] * len(dst_kv_ptrs)
         )
         if len(dst_kv_item_lens) != len(dst_kv_ptrs):
@@ -392,23 +393,23 @@ class KVArgsRegisterInfo:
                 f"got {len(dst_kv_item_lens)}, expected {len(dst_kv_ptrs)}"
             )
         dst_state_data_ptrs = (
-            unpack_int_lists(msg[7], "Q") if len(msg) > 7 and msg[7] != b"" else []
+            unpack_int_lists(msg[8], "Q") if len(msg) > 8 and msg[8] != b"" else []
         )
         dst_state_item_lens = (
-            unpack_int_lists(msg[12], "I") if len(msg) > 12 and len(msg[12]) > 0 else []
-        )
-        dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
         )
+        dst_state_dim_per_tensor = (
+            unpack_int_lists(msg[14], "I") if len(msg) > 14 and len(msg[14]) > 0 else []
+        )
         dst_num_slots = (
-            int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
+            int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else None
         )
         dst_state_layer_ids = (
-            unpack_int_lists(msg[19], "I") if len(msg) > 19 and len(msg[19]) > 0 else []
+            unpack_int_lists(msg[20], "I") if len(msg) > 20 and len(msg[20]) > 0 else []
         )
         dst_kv_layer_ids = (
-            list(struct.unpack(f"{len(msg[20]) // 4}I", msg[20]))
-            if len(msg) > 20 and msg[20] != b""
+            list(struct.unpack(f"{len(msg[21]) // 4}I", msg[21]))
+            if len(msg) > 21 and msg[21] != b""
             else []
         )
 
@@ -421,36 +422,39 @@ class KVArgsRegisterInfo:
             dst_kv_ptrs=dst_kv_ptrs,
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
+            dst_aux_item_lens=(
+                list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7])) if msg[7] else None
+            ),
             dst_state_data_ptrs=dst_state_data_ptrs,
-            gpu_id=int(msg[8].decode("ascii")),
-            decode_tp_size=int(msg[9].decode("ascii")),
-            decode_tp_rank=int(msg[10].decode("ascii")),
+            gpu_id=int(msg[9].decode("ascii")),
+            decode_tp_size=int(msg[10].decode("ascii")),
+            decode_tp_rank=int(msg[11].decode("ascii")),
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
             dst_kv_layer_ids=dst_kv_layer_ids,
-            # msg[19:21] are the layer-id frames above; DCP trails them.
+            # msg[20:22] are the layer-id frames above; DCP trails them.
             dst_dcp_size=(
-                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] != b"" else 1
+                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 1
             ),
             dst_dcp_rank=(
-                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 0
+                int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] != b"" else 0
             ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
             staging_base_ptr=(
-                struct.unpack("Q", msg[14])[0]
-                if len(msg) > 14 and len(msg[14]) == 8
+                struct.unpack("Q", msg[15])[0]
+                if len(msg) > 15 and len(msg[15]) == 8
                 else 0
             ),
             staging_total_size=(
-                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 0
             ),
-            # Frame 23 is absent on decodes that predate prepared state transfers.
+            # Frame 24 is absent on decodes that predate prepared state transfers.
             dst_state_data_lens=(
-                unpack_int_lists(msg[23], "Q")
-                if len(msg) > 23 and len(msg[23]) > 0
+                unpack_int_lists(msg[24], "Q")
+                if len(msg) > 24 and len(msg[24]) > 0
                 else []
             ),
         )
@@ -1604,6 +1608,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
+        # The early-send wait is this thread's first device call; with no device
+        # bound it opens a context on device 0 on every rank not on GPU 0.
+        device_bound = False
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1630,6 +1637,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
+
+                # Same wait as mooncake's worker: before reading source KV, skipped
+                # for a failed room, cleared so a deferred re-enqueue does not wait.
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        if not device_bound:
+                            torch.get_device_module(get_device().device).set_device(
+                                self.kv_args.gpu_id
+                            )
+                            device_bound = True
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
@@ -1680,6 +1699,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
+                    self.validate_aux_buffers(
+                        dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
+                    )
                     decode_tp_size = dst_info.decode_tp_size
 
                     # Skip KV RDMA transfer when there are no pages to send
@@ -1868,6 +1890,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
                             dst_info.dst_aux_ptrs,
+                            dst_info.dst_aux_item_lens,
                             req.dst_aux_index,
                         )
                         handles.append(aux_xfer_handle)
@@ -2040,6 +2063,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.check_peer_aux_buffer_count(
+                agent_name, len(decode_kv_args.dst_aux_ptrs)
+            )
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
 
@@ -2705,18 +2731,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name: str,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: Optional[List[int]],
         dst_aux_index: int,
     ):
+        self.validate_aux_buffers(dst_aux_ptrs, dst_aux_item_lens)
         src_addrs = []
         dst_addrs = []
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if dst_aux_item_lens is None:
+            dst_aux_item_lens = prefill_aux_item_lens
 
-        for i, _ in enumerate(dst_aux_ptrs):
+        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * dst_aux_index
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
@@ -3297,6 +3328,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -3469,6 +3501,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.agent.get_agent_metadata(),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
+            # Always sent, empty unless customized-info transfer is enabled.
+            (
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+                if self.customized_info_enabled
+                else b""
+            ),
             packed_state_data_ptrs,
             str(self.kv_args.gpu_id).encode("ascii"),
             str(self.attn_tp_size).encode("ascii"),

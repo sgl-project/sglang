@@ -13,9 +13,11 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -489,7 +491,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=vocab_gather
+            start=self._tp_shard.org_vocab_start,
+            width=self._tp_shard.org_vocab_end - self._tp_shard.org_vocab_start,
+            gather=vocab_gather,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -682,10 +686,12 @@ DSparkV4Stage = DSparkV4CudaStage if _is_cuda else DSparkV4PlatformStage
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -696,7 +702,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if cls.uses_own_vocab_modules:
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -1032,7 +1038,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for name, loaded_weight in weights:
             mapped = (
                 self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:

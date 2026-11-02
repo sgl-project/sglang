@@ -559,13 +559,16 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
     Inputs are already aligned and the block-size config is already resolved.
     Supports optional LoRA hooks that fire between the two kernels and before
-    combine. Returns ``out_hidden_states``.
+    combine. Returns ``out_hidden_states``. With ``defer_sum``, return the
+    routing-weighted ``[tokens, top_k, hidden]`` GEMM2 outputs instead; the
+    caller owns the expert sum, ``routed_scaling_factor`` and any TP reduction.
 
     ``a1_q`` (SGLANG_OPT_MOE_QUANT_ONCE): optional pre-quantized fp8 view of
     ``hidden_states`` for the gate-up GEMM (per-token-group ``block_shape[1]``
@@ -573,6 +576,10 @@ def _fused_moe_kernel_sequence(
     ``num_tokens`` due to 4-row padding). ``hidden_states`` stays bf16 and is
     still used for output dtype/shape and the inplace combine.
     """
+    if defer_sum:
+        assert not (no_combine or inplace or apply_router_weight_on_input)
+        assert hooks is None
+        assert not any((use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16))
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
@@ -611,6 +618,9 @@ def _fused_moe_kernel_sequence(
         )
     elif inplace:
         out_hidden_states = hidden_states
+    elif defer_sum:
+        # GEMM2 writes the per-expert outputs to intermediate_cache3 instead.
+        out_hidden_states = None
     else:
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
         # allocation is required, so the downstream all-reduce takes the low-latency
@@ -624,9 +634,11 @@ def _fused_moe_kernel_sequence(
     use_fused_moe_sum_all_reduce = (
         get_exec().moe.enable_fused_moe_sum_all_reduce
         and (not no_combine)
+        and (not defer_sum)
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not (hooks and hooks.after_down is not None))
     )
 
     if fuse_swiglu_interleaved:
@@ -869,8 +881,9 @@ def _fused_moe_kernel_sequence(
     # LoRA hooks force the second kernel to write to intermediate_cache3 so
     # hooks.after_down can inspect/modify it before reduction. Non-unit routed
     # scaling also needs the intermediate because the reduction applies it.
-    _use_intermediate = not no_combine and (
-        topk != 1 or hooks or routed_scaling_factor not in (None, 1.0)
+    _use_intermediate = defer_sum or (
+        not no_combine
+        and (topk != 1 or hooks or routed_scaling_factor not in (None, 1.0))
     )
 
     out_slice = None
@@ -942,6 +955,11 @@ def _fused_moe_kernel_sequence(
 
     del intermediate_cache2
 
+    if defer_sum:
+        # Keep routing multiplication inside GEMM2, including its BF16 output
+        # rounding. The consumer owns the FP32 sum and routed scaling.
+        return intermediate_cache3
+
     return moe_combine_topk(
         intermediate_cache3=intermediate_cache3,
         out_hidden_states=out_hidden_states,
@@ -971,12 +989,12 @@ def moe_combine_topk(
 
     if no_combine:
         pass
+    elif use_fused_moe_sum_all_reduce:
+        if routed_scaling_factor != 1.0 and not _use_aiter:
+            assert out_slice is not None
+            out_slice.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if use_fused_moe_sum_all_reduce:
-            if routed_scaling_factor != 1.0:
-                assert out_slice is not None
-                out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
             pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
@@ -1088,6 +1106,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
 ):
     padded_size = padding_size
@@ -1169,6 +1188,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        defer_sum=defer_sum,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
     )
 

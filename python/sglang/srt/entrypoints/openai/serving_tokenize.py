@@ -97,6 +97,22 @@ class OpenAIServingTokenize(OpenAIServingBase):
         validation_error = self.chat_serving._validate_request(chat_request)
         if validation_error:
             raise ValueError(validation_error)
+        if chat_request._format_add_generation_prompt is not None:
+            if (
+                self.chat_serving.template_manager.chat_template_name is not None
+                or self.chat_serving.chat_encoding_spec is not None
+            ):
+                raise ValueError(
+                    "add_generation_prompt is supported only with a Jinja chat template."
+                )
+            if (
+                chat_request.continue_final_message
+                and not chat_request._format_add_generation_prompt
+            ):
+                raise ValueError(
+                    "continue_final_message needs add_generation_prompt to open the "
+                    "assistant turn."
+                )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self.chat_serving._process_messages(
@@ -149,6 +165,8 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     return self.create_error_response(
                         "Invalid input: 'tokens' must be a list of integers."
                     )
+                if (error := self._out_of_vocab_error(request.tokens)) is not None:
+                    return error
                 tokens_to_decode = [int(t) for t in request.tokens]
                 text = tokenizer.decode(
                     tokens_to_decode, skip_special_tokens=request.skip_special_tokens
@@ -165,6 +183,8 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                         return self.create_error_response(
                             f"Invalid input: Sublist in 'tokens' must contain only integers. Found: {token_list}"
                         )
+                    if (error := self._out_of_vocab_error(token_list)) is not None:
+                        return error
                     decoded_text = tokenizer.decode(
                         [int(t) for t in token_list],
                         skip_special_tokens=request.skip_special_tokens,
@@ -192,3 +212,13 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    def _out_of_vocab_error(self, token_ids: List[int]) -> Optional[ErrorResponse]:
+        vocab_size = self.tokenizer_manager.model_config.vocab_size
+        for token_id in token_ids:
+            if token_id < 0 or token_id >= vocab_size:
+                return self.create_error_response(
+                    f"Invalid input: token id {token_id} is out of vocabulary; "
+                    f"valid range is [0, {vocab_size})."
+                )
+        return None

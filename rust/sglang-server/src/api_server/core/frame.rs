@@ -5,20 +5,24 @@
 //! as protobuf, so a column added here reaches both the same way. No Axum,
 //! SSE, Tonic, or scheduler-channel details.
 
+use std::sync::Arc;
+
 use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::response::{
+    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, RequestStats, WeightVersionSpan,
+};
 use crate::message::types::TokenIds;
 
 /// Canonical transport-neutral output payload for generation events.
 ///
 /// The runtime correlation ID is deliberately absent: it is an implementation
 /// detail used for scheduler routing, while adapters obtain the client-visible
-/// identity from [`crate::api_server::core::CoreCall::public_id`]. Runtime-only
+/// identity from [`crate::api_server::handlers::CoreCall::public_id`]. Runtime-only
 /// response variants such as raw control bytes are likewise hidden by
-/// [`crate::api_server::core::CoreCall`].
+/// [`crate::api_server::handlers::CoreCall`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,
@@ -26,6 +30,9 @@ pub(crate) struct CoreOutput {
     pub(crate) prompt_tokens: u32,
     pub(crate) cached_tokens: u32,
     pub(crate) reasoning_tokens: u64,
+    /// The launch weight version, which frames report until a terminal one's
+    /// spans name the last; stamped by the core call.
+    pub(crate) weight_version: Option<Arc<str>>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) stop_token_trimmed: bool,
@@ -52,6 +59,7 @@ impl From<ChunkEvent> for CoreOutput {
             prompt_tokens,
             cached_tokens,
             reasoning_tokens,
+            weight_version: None,
             text,
             completion_tokens,
             stop_token_trimmed,
@@ -86,6 +94,9 @@ impl CoreOutput {
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
             self.stop_token_trimmed = delta.stop_token_trimmed;
+        }
+        if delta.weight_version.is_some() {
+            self.weight_version = delta.weight_version.clone();
         }
 
         let Some(delta_extras) = delta.extras.as_deref() else {
@@ -153,6 +164,46 @@ impl CoreOutput {
             extras.hidden_val = delta_extras.hidden_val.clone();
             extras.hidden_lens = delta_extras.hidden_lens.clone();
         }
+        if !delta_extras.weight_versions.is_empty() {
+            extras.weight_versions = delta_extras.weight_versions.clone();
+        }
+        // A request's media counts never change; a frame without them (a
+        // scheduler abort) keeps the ones the stream reported.
+        for (count, delta_count) in [
+            (&mut extras.image_tokens, delta_extras.image_tokens),
+            (&mut extras.audio_tokens, delta_extras.audio_tokens),
+            (&mut extras.video_tokens, delta_extras.video_tokens),
+        ] {
+            if delta_count != 0 {
+                *count = delta_count;
+            }
+        }
+        // Nor does its split by cache tier once its prompt is cached.
+        if delta_extras.cached_tokens_details.is_some() {
+            extras.cached_tokens_details = delta_extras.cached_tokens_details.clone();
+        }
+        // A finished request's stats ride its terminal output.
+        if delta_extras.request_stats.is_some() {
+            extras.request_stats = delta_extras.request_stats.clone();
+        }
+    }
+
+    /// This delta as an incremental stream frame reports it, once folded into
+    /// `accumulated`: with the cumulative completion-token count, as Python's
+    /// incremental stream reports it, and the cached tokens by tier the
+    /// stream already reported, which a scheduler abort does not carry.
+    pub(crate) fn with_cumulative_counts(mut self, accumulated: &Self) -> Self {
+        self.completion_tokens = accumulated.completion_tokens;
+        if let Some(details) = accumulated
+            .extras
+            .as_deref()
+            .and_then(|extras| extras.cached_tokens_details.as_ref())
+        {
+            self.extras
+                .get_or_insert_with(Default::default)
+                .cached_tokens_details = Some(details.clone());
+        }
+        self
     }
 }
 
@@ -165,6 +216,8 @@ pub(crate) enum HealthStatus {
     Healthy,
     NotReady,
     Stalled,
+    /// A graceful drain has begun; no probe was sent.
+    Draining,
 }
 
 /// A semantic generation event before any transport-specific framing.
@@ -185,6 +238,31 @@ impl CoreEvent {
 }
 
 impl CoreOutput {
+    /// Move this delta's `customized_info` out. Only native `/generate`
+    /// reports it, so the fold above does not accumulate it.
+    pub(crate) fn take_customized_info(&mut self) -> CustomizedInfo {
+        self.extras
+            .as_deref_mut()
+            .map(|extras| std::mem::take(&mut extras.customized_info))
+            .unwrap_or_default()
+    }
+
+    /// The scheduler's decode latency for a finished non-streaming request,
+    /// whose first token this frontend does not see. It rides only that
+    /// request's terminal delta and is read off it there (for a model package's
+    /// [`GenerateHook`](crate::GenerateHook)), so [`append_delta`](Self::append_delta)
+    /// does not fold it into the cumulative output.
+    pub(crate) fn scheduler_decode_latency(&self) -> Option<std::time::Duration> {
+        let seconds = self.extras.as_deref()?.decode_latency?;
+        std::time::Duration::try_from_secs_f64(seconds).ok()
+    }
+
+    /// Move a finished request's stats out, for native `/generate`, which
+    /// reports them in `meta_info` (the schema does not model them).
+    pub(crate) fn take_request_stats(&mut self) -> Option<RequestStats> {
+        self.extras.as_deref_mut()?.request_stats.take()
+    }
+
     /// One `/generate` frame. `index` is the batch position (batch form only);
     /// `e2e_latency` rides the terminal frame only.
     ///
@@ -220,11 +298,29 @@ impl CoreOutput {
             e2e_latency,
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            weight_version: self.weight_version.as_deref().map(str::to_owned),
+            // On device unless a chunk said otherwise.
+            cached_tokens_details: self
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.cached_tokens_details.clone())
+                .or_else(|| CachedTokensDetails::on_device(self.cached_tokens))
+                .map(cached_tokens_details),
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {
             return meta;
         };
+
+        meta.weight_versions =
+            visible_weight_versions(&extras.weight_versions, self.completion_tokens);
+        if let Some(span) = meta.weight_versions.last() {
+            meta.weight_version = Some(span.version.clone());
+        }
+        let nonzero = |count: u32| (count != 0).then_some(count);
+        meta.image_tokens = nonzero(extras.image_tokens);
+        meta.audio_tokens = nonzero(extras.audio_tokens);
+        meta.video_tokens = nonzero(extras.video_tokens);
 
         // Python always sets input and output token logprobs together, including
         // the empty input list emitted by a disaggregated decode node.
@@ -277,6 +373,33 @@ impl CoreOutput {
         }
         meta
     }
+}
+
+fn cached_tokens_details(details: CachedTokensDetails) -> api::CachedTokensDetails {
+    api::CachedTokensDetails {
+        device: details.device,
+        host: details.host,
+        storage: details.storage,
+        storage_backend: details.storage_backend.as_deref().map(str::to_owned),
+    }
+}
+
+/// Python's `add_weight_versions_to_meta_info`: the spans that start inside
+/// the completion (and the first one, even for an empty completion), each
+/// clipped to it.
+fn visible_weight_versions(
+    spans: &[WeightVersionSpan],
+    completion_tokens: u64,
+) -> Vec<api::WeightVersionSpan> {
+    spans
+        .iter()
+        .filter(|span| span.start == 0 || span.start < completion_tokens)
+        .map(|span| api::WeightVersionSpan {
+            version: span.version.clone(),
+            start: span.start as i64,
+            end: span.end.min(completion_tokens) as i64,
+        })
+        .collect()
 }
 
 /// A decoded-text column becomes the entries' text source only when populated.
@@ -394,6 +517,29 @@ fn matched_value(matched: &Matched) -> api::Matched {
     api::Matched { value: Some(value) }
 }
 
+/// One case of `testdata/frame_metadata.json` (built by Python's
+/// `build_rust_frame_metadata_fixture`), and the events its frame decodes to.
+#[cfg(test)]
+pub(crate) fn frame_metadata_case(name: &str) -> (serde_json::Value, Vec<ChunkEvent>) {
+    use crate::message::response::{for_each_chunk, frame_decode_batch_cols};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/frame_metadata.json")).unwrap();
+    let case = fixture[name].clone();
+    let bytes = |hex: &serde_json::Value| -> Vec<u8> {
+        let hex = hex.as_str().unwrap_or_default();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let data = bytes(&case["data"]);
+    let framed = frame_decode_batch_cols(&bytes(&case["header"]), &[data.as_slice()]);
+    let mut events = Vec::new();
+    assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
+    (case, events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +579,45 @@ mod tests {
         assert!(meta.input_top_logprobs.is_empty());
     }
 
+    /// A request's cached tokens by tier survive the fold of a frame that
+    /// carries none (a scheduler abort); before any, its hits are on device.
+    #[test]
+    fn cached_tokens_details_survive_an_abort() {
+        let details = CachedTokensDetails {
+            device: 1,
+            host: 2,
+            storage: Some(3),
+            storage_backend: Some(Arc::from("HiCacheFile")),
+        };
+        let streamed = CoreOutput {
+            cached_tokens: 6,
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(details),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let aborted = CoreOutput {
+            cached_tokens: 6,
+            extras: Some(Box::new(ChunkExtras {
+                abort_output: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            json(&aborted.meta_info("rid", None))["cached_tokens_details"],
+            serde_json::json!({"device": 6, "host": 0})
+        );
+        let mut output = CoreOutput::default();
+        output.append_delta(&streamed);
+        output.append_delta(&aborted);
+        assert_eq!(
+            json(&output.meta_info("rid", None))["cached_tokens_details"],
+            serde_json::json!({"device": 1, "host": 2, "storage": 3, "storage_backend": "HiCacheFile"})
+        );
+    }
+
     /// The JSON the schema renders is SGLang's `[logprob, token_id, text]`
     /// tuple list, with the text slot null unless `return_text_in_logprobs`
     /// supplied a text column, and null positions in the ragged families.
@@ -459,6 +644,118 @@ mod tests {
         );
         assert!(opt_texts(&[]).is_none());
         assert_eq!(opt_texts(&texts), Some(texts.as_slice()));
+    }
+
+    /// The weight-version, media-count, cached-token-split and request-stats
+    /// columns, as Python's `push_generation` and `push_abort` send them,
+    /// render the `meta_info` keys Python's TokenizerManager derives from the
+    /// same values (`testdata/frame_metadata.json`, built by
+    /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
+    /// to the completion the client received, the launch version before one,
+    /// and only nonzero media counts, also behind a frame's logprob columns;
+    /// the cached tokens by tier, with and without a storage tier attached,
+    /// on device without a split; a finished request's stats, keys in
+    /// Python's order, and none for a running request, a frame without the
+    /// column, or the abort; the scheduler's decode latency reaches its row,
+    /// and only the abort is marked as ended outside the output stream.
+    #[test]
+    fn frame_metadata_matches_python() {
+        let keys = |output: &CoreOutput| {
+            let meta = json(&output.meta_info("rid", None));
+            let mut keys = serde_json::Map::new();
+            for key in [
+                "weight_version",
+                "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
+                "cached_tokens_details",
+            ] {
+                if let Some(value) = meta.get(key) {
+                    keys.insert(key.into(), value.clone());
+                }
+            }
+            serde_json::Value::Object(keys)
+        };
+        let launch = Some(Arc::<str>::from("launch"));
+
+        for name in [
+            "batch",
+            "logprob_batch",
+            "host_tier",
+            "storage_tier",
+            "request_stats",
+        ] {
+            let (batch, events) = super::frame_metadata_case(name);
+            assert_eq!(events.len(), batch["meta_info"].as_object().unwrap().len());
+            for event in events {
+                let rid = event.rid.as_str().to_owned();
+                assert!(!event.extras.as_deref().is_some_and(|e| e.abort_output));
+                let completion_tokens = event.token_ids.len() as u64;
+                let mut output = CoreOutput::from(event);
+                let request_stats = output.take_request_stats();
+                let expected = &batch["request_stats"][&rid];
+                assert_eq!(
+                    request_stats
+                        .as_ref()
+                        .map(|RequestStats(stats)| stats.keys().collect()),
+                    expected
+                        .as_object()
+                        .map(|stats| stats.keys().collect::<Vec<_>>()),
+                    "{name} {rid}"
+                );
+                assert_eq!(
+                    request_stats.map_or(serde_json::Value::Null, |RequestStats(stats)| {
+                        serde_json::Value::Object(stats)
+                    }),
+                    *expected,
+                    "{name} {rid}"
+                );
+                output.weight_version = launch.clone();
+                output.completion_tokens = completion_tokens;
+                assert_eq!(keys(&output), batch["meta_info"][&rid], "{name} {rid}");
+                assert_eq!(
+                    output.scheduler_decode_latency(),
+                    batch["decode_latencies"][&rid]
+                        .as_f64()
+                        .map(std::time::Duration::from_secs_f64),
+                    "{name} {rid}"
+                );
+                if rid == "logprobs" {
+                    let meta = json(&output.meta_info(&rid, None));
+                    assert_eq!(
+                        meta["output_token_logprobs"],
+                        serde_json::json!([[-0.5, 7, null], [-0.25, 8, null]])
+                    );
+                }
+            }
+        }
+
+        // A scheduler abort folds into what the stream already sent, and its
+        // spans are clipped to those tokens. Python reports no cached-token
+        // details for it.
+        let (abort, mut events) = super::frame_metadata_case("abort");
+        let mut aborted = CoreOutput {
+            weight_version: launch.clone(),
+            completion_tokens: abort["completion_tokens"].as_u64().unwrap(),
+            ..Default::default()
+        };
+        let event = events.pop().unwrap();
+        assert!(
+            event
+                .extras
+                .as_deref()
+                .is_some_and(|e| e.abort_output && e.request_stats.is_none())
+        );
+        let mut delta = CoreOutput::from(event);
+        delta.weight_version = launch;
+        aborted.append_delta(&delta);
+        let mut aborted_keys = keys(&aborted);
+        aborted_keys
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_tokens_details");
+        assert_eq!(aborted_keys, abort["meta_info"]);
     }
 
     /// A trimmed stop token stays in the accumulated `token_ids` but out of the

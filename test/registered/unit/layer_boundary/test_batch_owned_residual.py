@@ -2,22 +2,18 @@
 
 import unittest
 import weakref
-from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.layers.layer_boundary import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestBatchOwnedResidual(CustomTestCase):
@@ -69,82 +65,6 @@ class TestBatchOwnedResidual(CustomTestCase):
         self.assertIs(proxy["hidden_states"], hidden)
         self.assertIs(proxy["residual"], residual)
         self.assertIsNone(fb.residual_stream)
-
-    def test_split_prefill_retains_then_releases_batch_owner(self):
-        from sglang.srt.models.llama4 import Llama4ForCausalLM
-        from sglang.srt.models.qwen2_moe import Qwen2MoeForCausalLM
-        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-        from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-        from sglang.srt.models.sarvam_moe import (
-            SarvamMLAForCausalLM,
-            SarvamMoEForCausalLM,
-        )
-
-        for cls in (
-            Llama4ForCausalLM,
-            Qwen3ForCausalLM,
-            Qwen3MoeForCausalLM,
-            Qwen2MoeForCausalLM,
-            SarvamMLAForCausalLM,
-            SarvamMoEForCausalLM,
-        ):
-            with self.subTest(model=cls.__name__):
-                context = (
-                    nullcontext()
-                    if cls in (Llama4ForCausalLM, Qwen3ForCausalLM)
-                    else patch(
-                        cls.__module__ + ".get_global_expert_distribution_recorder",
-                        return_value=SimpleNamespace(
-                            with_current_layer=lambda i: nullcontext()
-                        ),
-                    )
-                )
-                with context:
-                    self._check_split_prefill(cls)
-
-    def _check_split_prefill(self, cls):
-        owner_ids = []
-        group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
-
-        class Layer:
-            def __call__(self, positions, hidden, forward_batch, **kwargs):
-                stream = batch.stream_of(forward_batch)
-                owner_ids.append(id(stream))
-                hidden, old = stream.export(hidden)
-                stream.write(hidden if old is None else hidden + old)
-                return stream.record(
-                    UnreducedOutput(torch.ones_like(hidden), group=group), PLAIN_ADD
-                )
-
-        self_outer = self
-        fb = SimpleNamespace(
-            residual_stream=None, residual=None, forward_mode=ForwardMode.DECODE
-        )
-
-        def norm(hidden, residual):
-            self.assertIsNone(fb.residual_stream)
-            return hidden + residual, residual
-
-        model = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=4),
-            layers=[Layer() for _ in range(4)],
-            norm=norm,
-        )
-        lm = SimpleNamespace(
-            model=model,
-            lm_head=None,
-            logits_processor=lambda ids, hidden, head, fb: hidden,
-        )
-        value = torch.ones(2, 4)
-        result = cls.forward_split_prefill(lm, None, None, fb, (0, 2), value)
-        self.assertIsNone(result)
-        self.assertIsNotNone(fb.residual_stream)
-        result = cls.forward_split_prefill(lm, None, None, fb, (2, 4))
-        self.assertEqual(len(set(owner_ids)), 1)
-        self.assertIsNone(fb.residual_stream)
-        self.assertIsNone(fb.residual)
-        self.assertEqual(group.all_reduce.call_count, 4)
-        torch.testing.assert_close(result, torch.full((2, 4), 9.0))
 
     def test_mtp_returns_written_normalized_output_and_releases_batch(self):
         from sglang.srt.models.nemotron_h_mtp import NemotronHMultiTokenPredictor

@@ -18,13 +18,13 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -50,7 +50,7 @@ STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
 @pytest.mark.skipif(not is_cuda(), reason="Uses a delayed CUDA producer stream")
 def test_unified_l2_waits_for_index_producer(direction, backend):
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device=DEVICE,
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -69,7 +69,7 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
         need_sort=False,
         lazy_compaction=True,
     )
-    device_pool = bundle.token_to_kv_pool.full_kv_pool
+    device_pool = bundle.token_to_kv_pool.layer_router.view("full")
     host_pool = UnifiedPageEnvelopeHostPool(
         device_pool,
         1.0,
@@ -85,7 +85,13 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
     virtual_indices = allocator.alloc(5)
     device_indices = virtual_indices[:1].clone()
     host_indices = host_pool.alloc(1)
-    transfer = L2Transfer(host_pool, device_pool, host_indices, device_indices)
+    transfer = L2Transfer(
+        host_pool,
+        device_pool,
+        host_indices,
+        device_indices,
+        device_translate=allocator.storage.host_ids("full"),
+    )
     device_pages = device_pool.get_page_envelope_buffer()
     try:
         # Warm both copy paths before creating the delayed producer dependency.
@@ -887,6 +893,101 @@ def test_can_use_page_unified_load_back_jit_kernel(group_bytes, expected):
     assert (
         can_use_page_unified_load_back_jit_kernel(group_bytes=group_bytes) is expected
     )
+
+
+@pytest.mark.skipif(not is_cuda(), reason="DeepSeek-V4 KV pools are CUDA only")
+def test_dsv4_v41_draft_swa_sidecar_moves_whole_pages():
+    """A V4.1 draft SWA sidecar round-trips whole pages and rejects partial ones,
+    which the V4 token copy would split at 576 + 8 bytes per token."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+    from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+    page = 256
+    publish(ServerArgs(model_path="dummy", page_size=page), role="test")
+    draft = DeepSeekV4TokenToKVPool(
+        max_num_reqs=4,
+        swa_size=4 * page,
+        c4_size=0,
+        c128_size=0,
+        c4_state_pool_size=0,
+        c128_state_pool_size=0,
+        page_size=page,
+        swa_page_size=page,
+        dtype=torch.float8_e4m3fn,
+        c4_state_dtype=torch.float32,
+        c128_state_dtype=torch.float32,
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        indexer_head_dim=128,
+        layer_num=2,
+        start_layer=None,
+        end_layer=None,
+        device=DEVICE,
+        enable_memory_saver=False,
+        compression_ratios=[0, 0],
+        kv_source_layers=[],
+        full_size=4 * page,
+        kv_layout=KVLayout.V41,
+        compressed_kv_layout=None,
+    )
+    target_swa = object.__new__(DeepSeekV4PagedHostPool)
+    target_swa.slot_page_size = page
+    target_swa.num_host_pages = 4
+    target_swa.layout = "layer_first"
+    tree_cache = SimpleNamespace(
+        cache_controller=SimpleNamespace(
+            mem_pool_host=SimpleNamespace(
+                entry_map={PoolName.SWA: SimpleNamespace(host_pool=target_swa)}
+            )
+        )
+    )
+    with patch.object(assembler, "_get_allocator_type", return_value="default"):
+        _, (entry,) = assembler.build_swa_draft_pools(
+            draft_kv_pool=draft, tree_cache=tree_cache
+        )
+    host, device_pool = entry.host_pool, entry.device_pool
+    buffers = [buffer.view(torch.uint8) for buffer in device_pool.kv_buffer]
+    engine = L2TransferEngine("kernel")
+
+    def slots(pages):
+        return (
+            torch.tensor(pages, device=DEVICE)[:, None] * page
+            + torch.arange(page, device=DEVICE)
+        ).reshape(-1)
+
+    try:
+        for buffer in buffers:
+            buffer.copy_(torch.randint_like(buffer, 256, dtype=torch.uint8))
+        source, destination, host_indices = slots([3, 1]), slots([2, 0]), slots([1, 3])
+        expected = [buffer[[3, 1]].clone() for buffer in buffers]
+        transfer = L2Transfer(host, device_pool, host_indices, source)
+        engine.submit_device_to_host([transfer]).finish_event.synchronize()
+        for buffer in buffers:
+            buffer.zero_()
+        engine.submit_host_to_device(
+            [
+                L2Transfer(
+                    host, device_pool, host_indices, destination, {0: 0, 1: 1}.get
+                )
+            ],
+            transfer_layer_id_max=2,
+        ).finish_event.synchronize()
+        for buffer, saved in zip(buffers, expected, strict=True):
+            torch.testing.assert_close(buffer[[2, 0]], saved, rtol=0, atol=0)
+
+        partial = L2Transfer(host, device_pool, host_indices[:5], source[:5])
+        with pytest.raises(ValueError):
+            engine.submit_device_to_host([partial]).finish_event.synchronize()
+    finally:
+        torch.cuda.synchronize()
+        host.destroy()
+        reset_context()
 
 
 if __name__ == "__main__":

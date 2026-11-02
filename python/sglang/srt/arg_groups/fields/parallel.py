@@ -12,6 +12,10 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.choices import (
+    CP_KV_LAYOUT_CHOICES,
+    CP_STRATEGY_CHOICES,
+)
 
 
 class Parallel(msgspec.Struct):
@@ -152,13 +156,20 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_prefill_cp: A[
         bool,
-        "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
+        "Enable context parallelism for the prefill phase. Select the compute strategy with --cp-strategy.",
     ] = False
     cp_strategy: A[
         Optional[str],
         Arg(
             help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
-            choices=("zigzag", "interleave"),
+            choices=CP_STRATEGY_CHOICES,
+        ),
+    ] = None
+    cp_kv_layout: A[
+        Optional[str],
+        Arg(
+            help="KV storage layout for prefill CP; omitted keeps replicated KV storage.",
+            choices=CP_KV_LAYOUT_CHOICES,
         ),
     ] = None
     enable_cp_tp_group_sharing: A[
@@ -251,14 +262,20 @@ class Parallel(msgspec.Struct):
         "NVLink/NVSwitch.",
     ] = False
     enable_megamoe_for_layernorm_sp: A[
-        bool,
-        "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
-        "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
-        "MoE runner and all-reduce, sharing expert weights with prefill. "
-        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
-        "and NVLink/NVSwitch. "
-        "No FlashInfer A2A backend is required when enabled.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+            "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+            "MoE runner and all-reduce, sharing expert weights with prefill. "
+            "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+            "and NVLink/NVSwitch. Enabled by default for Muse Spark NVFP4 on "
+            "data-center Blackwell when LayerNorm-SP is enabled, EP equals TP and "
+            "exceeds 1, and disaggregation mode is not decode. Use "
+            "--no-enable-megamoe-for-layernorm-sp to opt out. "
+            "No FlashInfer A2A backend is required when enabled.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "

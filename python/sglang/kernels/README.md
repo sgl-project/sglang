@@ -28,6 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
+  plugin_kernels/  # plugin kernel backend: contracts of external kernel
+                   # libraries, as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -84,7 +86,9 @@ Runtime integration that owns process groups, symmetric buffers, workspace
 classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
 collective-GEMM communication adapters and workspaces live in
 `srt/layers/communication/`, while their callable kernels live in
-`kernels/ops/communication/` and take that state as arguments. Reference/test oracles belong in
+`kernels/ops/communication/` and take that state as arguments. Likewise the
+integration of kernel plugins lives in `srt/kernel_plugins/`, and their
+contracts in `kernels/plugin_kernels/` (see below). Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
@@ -127,6 +131,36 @@ agent_kernels = [
 ]
 ```
 
+## Plugin kernel backend: `plugin_kernels/`
+
+This directory holds the contracts of external kernel libraries that load as
+SGLang plugins (the `sglang.srt.plugins` entry point) and replace a model's step
+with kernels specialized for one model, configuration and platform: today the
+small-batch decode and verify steps, possibly prefill or high-throughput steps
+later. `KernelBackend.PLUGIN` records them. These are kernel plugins, not the
+platform plugins that add a device. The kernels stay in the libraries, and the
+code is split at the kernel/runtime boundary:
+
+- `kernels/plugin_kernels/<hardware>/` holds what a plugin implements and
+  registers: its spec (registration, API version, requirements, capability and
+  width declarations, the build and forward contract) and any thin wrappers
+  around its kernels, under `<hardware>/<model>/`. It imports nothing from
+  `srt`.
+- `srt/kernel_plugins/<hardware>/binding.py` holds SGLang's integration: it
+  reads the server configuration at argument resolution, observes weight
+  loading, coordinates TP ranks, plans CUDA graph coverage, installs the
+  model-forward dispatch with its fallback, and hands a plugin the runtime
+  state it may use.
+
+| Hardware | Server flag | Library |
+| --- | --- | --- |
+| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
+
+An operator exposed from here registers into its logical group with
+`KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
+`test_kernels_namespace.py` enforces the pairing. See `plugin_kernels/README.md`.
+
 ## How it works
 
 Each `ops.<group>` function is a thin wrapper that forwards to a chosen
@@ -168,7 +202,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` /
+    `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared
@@ -195,8 +229,37 @@ on the instance, so the hot path stays a single indirect call.
 `BaseFusedOp` also owns the torch.compile mode protocol
 (`enter_torch_compile(num_tokens)` / `leave_torch_compile()`, both
 idempotent): while an outer model is compiled, ops switch to their
-compile-safe native path so device kernels are never traced (TopK and Fused
-MoE override `_torch_compile_forward()` to keep their bs>1 behavior).
+compile-safe native path by default (TopK and Fused MoE override
+`_torch_compile_forward()` to keep their bs>1 behavior).
+
+OOT platforms can separately opt an exact operator class into outer compilation:
+
+```python
+BaseFusedOp.register_oot_forward(Op, eager_forward, platform_key)
+BaseFusedOp.register_oot_compile_forward(Op, compile_forward, platform_key)
+```
+
+Both functions receive the op instance as their first argument and must have
+the same signature and behavior. They may be the same function. If no compile
+function is registered, `_torch_compile_forward()` selects the implementation.
+A registered compile function takes precedence over that method on the active
+OOT platform.
+
+Register functions before their first use. `BaseFusedOp` stores each selected
+function on the instance. Its `_forward_oot()` and `_forward_oot_compile()`
+methods call that function, passing the op instance as `self`. Compiler guard
+serialization can look up these methods by name on the instance, even when
+the registered function has no `forward_<platform_key>` attribute on the class.
+
+SGLang calls `enter_torch_compile()` before compiling the model and
+`leave_torch_compile()` to restore the eager implementation. Registering a
+function alone does not change dispatch for an external `torch.compile` call.
+
+Dynamo traces the registered function's body as part of the model compilation.
+Unsupported operations fail with `fullgraph=True`; with `fullgraph=False`,
+PyTorch may introduce graph breaks. Plugins must provide functions that the
+compiler can trace and lower, verify the results against eager execution, and
+support device-graph capture when that is required.
 
 The public `ops.<group>` functions stay thin wrappers over
 module-level instances, so the import surface is unchanged; each instance also

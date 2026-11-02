@@ -57,6 +57,21 @@ class _GrpcRequest:
         return bool(self._is_disconnected_fn())
 
 
+def _media_input_features(mm_processor) -> List[str]:
+    if mm_processor is None or mm_processor.mm_tokens is None:
+        return []
+    tokens = mm_processor.mm_tokens
+    return [
+        feature
+        for feature, token in (
+            ("image_inputs", tokens.image_token),
+            ("video_inputs", tokens.video_token),
+            ("audio_inputs", tokens.audio_token),
+        )
+        if token
+    ]
+
+
 class RuntimeHandle:
     """Thin Python handle that the Rust gRPC server calls into.
 
@@ -429,24 +444,24 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         return json.dumps(
             msgspec_to_builtins(
-                redact_watermark_secrets(
-                    build_server_info(
-                        self.tokenizer_manager.server_args, self.scheduler_info
-                    )
-                )
+                {
+                    **redact_watermark_secrets(
+                        build_server_info(
+                            self.tokenizer_manager.server_args, self.scheduler_info
+                        )
+                    ),
+                    # Older servers and processors without a modality's placeholder
+                    # drop that media silently, so clients check this list first.
+                    "grpc_features": _media_input_features(
+                        self.tokenizer_manager.mm_processor
+                    ),
+                }
             ),
             default=str,
         )
 
     def health_check(self) -> bool:
-        from sglang.srt.managers.tokenizer_manager import ServerStatus
-
-        if self.tokenizer_manager.gracefully_exit:
-            return False
-        return self.tokenizer_manager.server_status not in (
-            ServerStatus.Starting,
-            ServerStatus.UnHealthy,
-        )
+        return self.tokenizer_manager.is_healthy()
 
     def is_pause(self) -> bool:
         """Return the tokenizer manager's authoritative generation pause state."""

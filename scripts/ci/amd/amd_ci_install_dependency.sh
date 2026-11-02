@@ -56,12 +56,13 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000|-rocm1010)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
         *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
+        *-rocm1010) IMAGE_BASE_ARG_SUFFIX="_ROCM1010"; IMAGE_STAGE_SUFFIX="-rocm1010" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -93,6 +94,9 @@ unset IMAGE_GPU_ARCH
 # srt_hip pins compressed-tensors below the version required by torch 2.11.
 if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
+elif [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm1010" ]]; then
+  # ROCm 10.1 ships torch 2.12.
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm101}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
@@ -153,17 +157,58 @@ else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
   docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
-  # Clear Python cache to ensure latest code is used
-  docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
-  docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
-  # Also clear cache in sglang-checkout
+  # Clear Python cache in the checkout so the latest code is used. The uninstalls
+  # above already removed the old sglang files from /opt/venv, so walking all of
+  # site-packages there (~6 s) only made every job recompile torch's bytecode.
   docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
   docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
-  docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+
+  # The AOT kernels depend only on python/sglang/kernels/aot, the image and the
+  # GPU arch, yet rebuilding them took ~30 s in every job. Cache the wheel on the
+  # persistent /sgl-data volume, keyed by the source tree hash and the image ID.
+  # A dirty tree (local runs) or a missing key always builds without caching.
+  AOT_KEY=""
+  if git diff --quiet HEAD -- python/sglang/kernels/aot 2>/dev/null; then
+    AOT_TREE=$(git rev-parse --short=16 HEAD:python/sglang/kernels/aot 2>/dev/null || true)
+    AOT_IMAGE=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
+    AOT_IMAGE="${AOT_IMAGE#sha256:}"
+    if [[ -n "${AOT_TREE}" && -n "${AOT_IMAGE}" ]]; then
+      AOT_KEY="${AOT_TREE}-${AOT_IMAGE:0:16}-${IMAGE_GFX}"
+    fi
+  fi
+  AOT_CACHE_ROOT=/sgl-data/sgl-kernel-wheels
+  AOT_CACHE="${AOT_CACHE_ROOT}/${AOT_KEY}"
+  if [[ -n "${AOT_KEY}" ]] && docker exec ci_sglang bash -c "ls ${AOT_CACHE}/*.whl" >/dev/null 2>&1; then
+    echo "[AOT] Reusing cached sglang-kernel wheel ${AOT_KEY}"
+    docker exec ci_sglang touch "${AOT_CACHE}" || true
+    AOT_WHEEL_DIR="${AOT_CACHE}"
+  else
+    echo "[AOT] Building sglang-kernel (cache key: ${AOT_KEY:-none})"
+    docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && rm -rf dist && python3 setup_rocm.py bdist_wheel"
+    AOT_WHEEL_DIR=/sglang-checkout/python/sglang/kernels/aot/dist
+    if [[ -n "${AOT_KEY}" ]]; then
+      # Publish atomically: concurrent jobs on the same host may build the same key.
+      docker exec ci_sglang bash -c "
+        mkdir -p ${AOT_CACHE_ROOT} &&
+        tmp=\$(mktemp -d ${AOT_CACHE_ROOT}/.tmp.XXXXXX) &&
+        cp ${AOT_WHEEL_DIR}/*.whl \"\$tmp\"/ &&
+        { mv -T \"\$tmp\" ${AOT_CACHE} 2>/dev/null || rm -rf \"\$tmp\"; }
+        find ${AOT_CACHE_ROOT} -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+      " || echo "[AOT] Warning: could not store the wheel in ${AOT_CACHE}" >&2
+    fi
+  fi
+  docker exec ci_sglang bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
+
+# serving_responses.py imports responses_tools/beam.py, which needs
+# ResponseFunctionShellToolCall from openai>=2.8.0. pyproject_other.toml still
+# pins openai==2.6.1, so the Responses handler fails to import and every
+# /v1/responses request returns 500. Drop this once pyproject_other.toml moves
+# to 2.8.0.
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "openai==2.8.0"
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
@@ -244,11 +289,7 @@ elif docker exec ci_sglang test -d /sgl-workspace/mori; then
     exit 1
   fi
 
-  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    MORI_GPU_ARCHS="gfx950"
-  else
-    MORI_GPU_ARCHS="gfx942"
-  fi
+  MORI_GPU_ARCHS="${IMAGE_GFX}"
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
   # Only the rocm724 and rocm1000 (noble) bases attempt to install
@@ -367,6 +408,17 @@ elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI-AITER-CHECK] AITER version matches"
+elif [[ ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ) && "${IMAGE_AITER_VERSION}" =~ \+g([0-9a-f]+) ]]; then
+    # Version carries the short commit it was built from (e.g. v0.1.26.dev144+g285579b62.d20261027).
+    # Compare it with the Dockerfile pin, so an image older than a pin bump gets the pinned AITER.
+    IMAGE_AITER_HASH="${BASH_REMATCH[1]}"
+    if [[ "${REPO_AITER_COMMIT}" == "${IMAGE_AITER_HASH}"* ]]; then
+        echo "[CI-AITER-CHECK] AITER commit matches: image=${IMAGE_AITER_HASH}, repo=${REPO_AITER_COMMIT} → skipping rebuild"
+    else
+        echo "[CI-AITER-CHECK] AITER commit mismatch: image=${IMAGE_AITER_HASH} (${IMAGE_AITER_VERSION}), repo=${REPO_AITER_COMMIT}"
+        echo "[CI-AITER-CHECK] The CI image was likely built before the Dockerfile AITER pin changed → rebuilding AITER at ${REPO_AITER_COMMIT} (this adds significant job time)"
+        NEED_REBUILD="true"
+    fi
 elif [[ "${IMAGE_AITER_VERSION}" =~ (dev|\+g[0-9a-f]+) ]]; then
     # Dev/patched version (contains 'dev' or git hash) → preserve it
     echo "[CI-AITER-CHECK] Dev/patched version detected: ${IMAGE_AITER_VERSION} → skipping rebuild"
@@ -404,8 +456,19 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
+    # gfx942/gfx950: re-apply the Dockerfile's AITER patches, the v4 fp4 indexer
+    # fix and the grouped dsv4 decode .co (built from ROCm/aiter#5195's).
+    if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+            sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+            cp /sglang-checkout/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co hsa/gfx950/mla_v4/
+        "
+    fi
+
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
-    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" || "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
@@ -436,10 +499,20 @@ PY
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
     # The image already has the Dockerfile-pinned Triton; compile against it.
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    # gfx942/gfx950 use the Dockerfile's install command, without its
+    # PREBUILD_KERNELS=1 step (~2h per arch, past the job timeouts); kernels
+    # JIT-compile on first use.
+    if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${IMAGE_GFX} pip install --config-settings editable_mode=compat -e .
+        "
+    else
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
