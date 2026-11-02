@@ -256,6 +256,10 @@ class HybridCacheController(BaseHiCacheController):
         ):
             self.transfer_layer_id_max = transfer_layer_id_max
             self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+            self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
+            self.mem_pool_device.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:

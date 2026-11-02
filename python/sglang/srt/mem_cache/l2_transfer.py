@@ -49,6 +49,90 @@ class TransferCompletion(NamedTuple):
     timing_enabled: bool
 
 
+class PrefetchHandle:
+    """Handle for on-demand per-layer H2D loading.
+
+    Only layer 0 is loaded in submit; subsequent layers are triggered
+    during forward via trigger_layer(), so H2D overlaps with attention
+    compute instead of being issued as a single bulk transfer.
+    """
+
+    def __init__(
+        self,
+        engine: "L2TransferEngine",
+        transfers: list[L2Transfer],
+        layer_num: int,
+        ack_finish_event,
+        on_layer_done,
+    ):
+        self._engine = engine
+        self._transfers = transfers
+        self._layer_num = layer_num
+        self._ack_finish_event = ack_finish_event
+        self._on_layer_done = on_layer_done
+        self._next_layer = 1  # layer 0 already loaded
+
+    def trigger_layer(self, layer_id: int) -> None:
+        if layer_id < self._next_layer:
+            return
+        if layer_id >= self._layer_num:
+            return
+        self._next_layer = layer_id + 1
+        primary = self._transfers[0] if self._transfers else None
+        # Hold the shared-layout lease while enqueueing this layer's loads so
+        # compaction cannot relocate host pages mid-transfer; the recorded
+        # done_event keeps that protection until the loads complete.
+        domains = shared_host_layout_domains(t.host_pool for t in self._transfers)
+        for domain in domains:
+            domain.acquire_layout()
+        done_event = None
+        try:
+            with device_module.stream(self._engine.host_to_device_stream):
+                for transfer in self._transfers:
+                    local_layer_id = (
+                        transfer.layer_mapper(layer_id)
+                        if transfer.layer_mapper is not None
+                        else layer_id
+                    )
+                    if local_layer_id is None or (
+                        transfer is not primary
+                        and transfer.layer_mapper is None
+                        and layer_id >= transfer.host_pool.layer_num
+                    ):
+                        continue
+                    transfer.host_pool.load_to_device_per_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        local_layer_id,
+                        self._engine.io_backend,
+                        is_draft=transfer.is_draft,
+                    )
+                if self._on_layer_done is not None:
+                    self._on_layer_done(layer_id)
+                done_event = device_module.Event()
+                done_event.record()
+                if layer_id == self._layer_num - 1:
+                    self._ack_finish_event.record()
+        except Exception:
+            self._engine.host_to_device_stream.synchronize()
+            raise
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout(done_event)
+
+    def drain(self) -> None:
+        """Record completion events for any layers not yet triggered."""
+        if self._next_layer >= self._layer_num:
+            return
+        with device_module.stream(self._engine.host_to_device_stream):
+            for layer_id in range(self._next_layer, self._layer_num):
+                if self._on_layer_done is not None:
+                    self._on_layer_done(layer_id)
+            self._ack_finish_event.record()
+        self._next_layer = self._layer_num
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
@@ -56,6 +140,11 @@ class L2TransferEngine:
         self.io_backend = io_backend
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
+        self._prefetch_handle: Optional[PrefetchHandle] = None
+
+    @property
+    def prefetch_handle(self) -> Optional[PrefetchHandle]:
+        return self._prefetch_handle
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
@@ -149,7 +238,15 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        on_demand: bool = False,
     ) -> TransferCompletion:
+        if on_demand:
+            return self._submit_host_to_device_on_demand(
+                transfers,
+                transfer_layer_id_max=transfer_layer_id_max,
+                start_event=start_event,
+                on_layer_done=on_layer_done,
+            )
         with self._submission(
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
@@ -180,7 +277,76 @@ class L2TransferEngine:
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
+        self._prefetch_handle = None
         return completion
+
+    def _submit_host_to_device_on_demand(
+        self,
+        transfers: list[L2Transfer],
+        *,
+        transfer_layer_id_max: int,
+        start_event=None,
+        on_layer_done=None,
+    ) -> TransferCompletion:
+        """Load only layer 0; the PrefetchHandle triggers the rest in forward.
+
+        Mirrors _submission's layout-lease and index-preparation semantics, but
+        defers the ack_finish recording to the last triggered layer (or drain),
+        so the completion event fires only after the whole on-demand transfer.
+        """
+        start_event = self._start_event(start_event)
+        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
+        domains = shared_host_layout_domains(t.host_pool for t in transfers)
+        for domain in domains:
+            domain.acquire_layout()
+        layer0_done = None
+        try:
+            with device_module.stream(self.host_to_device_stream):
+                # Index preparation can read producer-owned device indices.
+                start_event.wait(self.host_to_device_stream)
+                prepared = self._prepare_transfers(transfers)
+                ack_start.record()
+                primary = prepared[0] if prepared else None
+                for transfer in prepared:
+                    local_layer_id = (
+                        transfer.layer_mapper(0)
+                        if transfer.layer_mapper is not None
+                        else 0
+                    )
+                    if local_layer_id is None or (
+                        transfer is not primary
+                        and transfer.layer_mapper is None
+                        and 0 >= transfer.host_pool.layer_num
+                    ):
+                        continue
+                    transfer.host_pool.load_to_device_per_layer_physical(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        local_layer_id,
+                        self.io_backend,
+                        is_draft=transfer.is_draft,
+                    )
+                if on_layer_done is not None:
+                    on_layer_done(0)
+                # A recorded event covering layer 0's loads; compaction
+                # synchronizes it before relocating host pages. Later layers
+                # register their own events in PrefetchHandle.trigger_layer.
+                layer0_done = device_module.Event()
+                layer0_done.record()
+                if transfer_layer_id_max <= 1:
+                    ack_finish.record()
+                self._record_stream(transfers + prepared, self.host_to_device_stream)
+        except Exception:
+            self.host_to_device_stream.synchronize()
+            raise
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout(layer0_done, (id(self), "host_to_device"))
+        self._prefetch_handle = PrefetchHandle(
+            self, prepared, transfer_layer_id_max, ack_finish, on_layer_done
+        )
+        return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     @staticmethod
     def _start_event(start_event):
