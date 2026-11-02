@@ -53,6 +53,23 @@ if TYPE_CHECKING:
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 
 
+def _exclude_module_names(exclude: List[str]) -> List[str]:
+    """Name every `exclude` entry by its module.
+
+    Exclusion is matched against module names (`mtp.fc`), but some Quark exports
+    list the parameter instead (`mtp.fc.weight`; amd/Qwen3.8-27B-Quark-AWQ-MXFP4
+    does this for its bf16 MTP layer). Such an entry would match nothing and the
+    module would be built quantized against bf16 checkpoint shards, so drop the
+    `.weight` suffix of plain names. Regex (`re:`) entries are kept as written.
+    """
+    return [
+        name.removesuffix(".weight")
+        if isinstance(name, str) and not name.startswith("re:")
+        else name
+        for name in exclude
+    ]
+
+
 def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
     """Extract NVFP4 producer-declared excludes as `re:` patterns.
 
@@ -356,7 +373,9 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
-        self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+        self.exclude_layers = _exclude_module_names(
+            cast(list[str], self.quant_config.get("exclude", []))
+        )
         # Both are consumed by _is_draft_layer(), which has to tell an appended
         # MTP/NextN draft layer from a target-model one. "No draft stack" is
         # spelled None as often as it is spelled absent -- ModelConfig defaults
