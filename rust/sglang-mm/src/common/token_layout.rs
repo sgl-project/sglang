@@ -57,15 +57,23 @@ pub fn apply_layout(
                     ));
                 }
                 consumed += 1;
-                let start = out.len() as u32;
-                let n = match pattern {
+                let (offset, n) = match pattern {
                     TokenPattern::Repeat { id, n } => {
+                        let start = out.len() as u32;
                         out.resize(out.len() + n, *id);
-                        *n
+                        (start, *n)
                     }
-                    TokenPattern::Explicit(ids) => {
+                    TokenPattern::Explicit { ids, content } => {
+                        if content.start >= content.end || content.end > ids.len() {
+                            return Err(format!(
+                                "layout: media item {item} content range {content:?} \
+                                 outside its {} token(s)",
+                                ids.len()
+                            ));
+                        }
+                        let start = out.len() as u32;
                         out.extend_from_slice(ids);
-                        ids.len()
+                        (start + content.start as u32, content.end - content.start)
                     }
                 };
                 if n == 0 {
@@ -74,7 +82,7 @@ pub fn apply_layout(
                 let slot = offsets
                     .get_mut(*item)
                     .ok_or_else(|| format!("layout: media item {item} out of range"))?;
-                if slot.replace((start, start + n as u32 - 1)).is_some() {
+                if slot.replace((offset, offset + n as u32 - 1)).is_some() {
                     return Err(format!("layout: media item {item} placed twice"));
                 }
             }
@@ -183,7 +191,10 @@ mod tests {
                 Segment::Text(0..1),
                 Segment::Media {
                     item: 0,
-                    pattern: TokenPattern::Explicit(vec![90, 5, 5, 91]),
+                    pattern: TokenPattern::Explicit {
+                        ids: vec![90, 5, 5, 91],
+                        content: 0..4,
+                    },
                 },
                 Segment::Text(2..3),
             ],
@@ -191,6 +202,23 @@ mod tests {
         let e = apply_layout(&[7, 1, 9], &layout, 1).unwrap();
         assert_eq!(e.input_ids, vec![7, 90, 5, 5, 91, 9]);
         assert_eq!(e.offsets, vec![(1, 4)]);
+
+        let wrapper = TokenLayout {
+            segments: vec![
+                Segment::Text(0..1),
+                Segment::Media {
+                    item: 0,
+                    pattern: TokenPattern::Explicit {
+                        ids: vec![90, 5, 5, 91],
+                        content: 1..3,
+                    },
+                },
+                Segment::Text(2..3),
+            ],
+        };
+        let e = apply_layout(&[7, 1, 9], &wrapper, 1).unwrap();
+        assert_eq!(e.input_ids, vec![7, 90, 5, 5, 91, 9]);
+        assert_eq!(e.offsets, vec![(2, 3)]);
 
         // Every item must be placed exactly once; ranges must be in bounds.
         let missing = TokenLayout {
