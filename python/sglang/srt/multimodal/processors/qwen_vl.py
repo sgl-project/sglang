@@ -261,7 +261,7 @@ async def preprocess_video(
     nframes = smart_nframes(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
-    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+    idx = np.rint(np.linspace(0, total_frames - 1, num=nframes)).astype(np.int64)
     idx = np.unique(idx)
 
     video = vr.get_frames_as_tensor(idx.tolist())
