@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -346,7 +347,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if not need_top1:
             return result, None
 
-        predictions = torch.argmax(logits, dim=-1).view(
+        predictions = sampling_argmax(logits).view(
             forward_batch.batch_size,
             self.forward_width,
         )
