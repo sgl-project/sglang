@@ -46,12 +46,6 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
-        "diffusion.alias_free_snake_beta",
-        KernelBackend.KDA,
-        "sglang.kernels.kda_kernels.alias_free_snake_beta:alias_free_snake_beta",
-        _CUDA,
-    ),
-    (
         "diffusion.fused_packed_swiglu_fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
@@ -436,6 +430,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.alias_free_snake_beta",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.alias_free_snake_beta:alias_free_snake_beta",
+        _CUDA,
+    ),
+    (
         "diffusion.bias_silu",
         KernelBackend.TRITON,
         "activation.sana_conv_post_triton:fused_bias_silu",
@@ -672,7 +672,6 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "alias_free_snake_beta": "sglang.kernels.kda_kernels.alias_free_snake_beta",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
@@ -816,6 +815,7 @@ _EXPORTS: dict[str, str] = {
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
+    "alias_free_snake_beta": "sglang.kernels.kda_kernels.alias_free_snake_beta",
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
