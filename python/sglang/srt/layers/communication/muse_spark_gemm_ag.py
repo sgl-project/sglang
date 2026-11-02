@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.communication.muse_spark_all_gather import (
-    MAX_TOKENS,
     all_gather,
+    projection_max_tokens,
 )
 
 if TYPE_CHECKING:
@@ -42,7 +42,9 @@ def reserve_projection_workspace(comm: Optional[CustomAllReduceV2], n: int) -> N
         and comm.world_size in (4, 8)
         and n in (4096, 8192)
     ):
-        comm.reserve_push_capacity(MAX_TOKENS * n * 2)
+        comm.reserve_push_capacity(
+            projection_max_tokens(comm.world_size, n, comm.device) * n * 2
+        )
 
 
 def gemm_local(

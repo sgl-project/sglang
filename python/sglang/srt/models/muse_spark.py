@@ -106,6 +106,9 @@ logger = logging.getLogger(__name__)
 
 # FusedMoE shard ids that expert weight loaders expect per checkpoint projection.
 _EXPERT_SHARD_IDS = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+# Archs whose pooler runs as slice GEMM + all-gather past the small-M range;
+# the per-width M bounds live in muse_spark_all_gather.projection_max_tokens.
+_PROJECTION_SPLIT_CAPABILITIES = ((9, 0), (10, 3))
 
 
 class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
@@ -547,12 +550,11 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_proj is not None
             and self.tp_size in (4, 8)
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and torch.cuda.get_device_capability() in _PROJECTION_SPLIT_CAPABILITIES
         ):
             ca_comm = get_parallel().tp_group.ca_comm
-            reserve_projection_workspace(
-                ca_comm, max(self.expert_hidden_size, self.hidden_size)
-            )
+            for n in (self.expert_hidden_size, self.hidden_size):
+                reserve_projection_workspace(ca_comm, n)
         self.pre_expert_norm = MuseSpark1xRMSNorm(
             self.expert_hidden_size,
             eps=config.rms_norm_eps,
@@ -811,7 +813,8 @@ class MuseSpark1xMoE(nn.Module):
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
-                and torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                and torch.cuda.get_device_capability(hidden_states.device)
+                in _PROJECTION_SPLIT_CAPABILITIES
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
