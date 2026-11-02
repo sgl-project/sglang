@@ -13,13 +13,11 @@ from huggingface_hub import snapshot_download
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
+    fill_front_out_cache_loc_func,
+    generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+    fill_accept_out_cache_loc_func,
 )
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
