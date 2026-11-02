@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import resource
@@ -111,20 +112,29 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     total_size = int(response.headers.get("content-length", 0))
     chunk_size = 1024  # Download in chunks of 1KB
 
-    # Use tqdm to display the progress bar
-    with (
-        open(filename, "wb") as f,
-        tqdm(
-            desc=filename,
-            total=total_size,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar,
-    ):
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            f.write(chunk)
-            bar.update(len(chunk))
+    # Callers treat an existing file as a complete cache, so a partial body must
+    # never be left at `filename`; it is moved there only after the stream ends.
+    tmp_path = f"{filename}.{os.getpid()}.part"
+    try:
+        # Use tqdm to display the progress bar
+        with (
+            open(tmp_path, "wb") as f,
+            tqdm(
+                desc=filename,
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as bar,
+        ):
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                f.write(chunk)
+                bar.update(len(chunk))
+        os.replace(tmp_path, filename)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
 
     return filename
 
