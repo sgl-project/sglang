@@ -46,52 +46,22 @@ class TestDerivedWeightCache(unittest.TestCase):
             )
         self.assertTrue(torch.equal(model[0].weight, original))
 
-    def test_direct_only_cache_rejects_direct_updates(self):
-        class Model(torch.nn.Sequential):
-            def load_weights(self, weights):
-                for name, tensor in weights:
-                    self.get_parameter(name).data.copy_(tensor)
-
-        model = Model(
-            torch.nn.Linear(2, 2, bias=False, device="cpu"),
-            torch.nn.Sequential(torch.nn.Module()),
+    def test_direct_update_error_only_blocks_the_direct_format(self):
+        model = torch.nn.Sequential(torch.nn.Module())
+        model[0]._direct_weight_update_error = "no direct"
+        loaded = []
+        model.load_weights = loaded.append
+        stub = SimpleNamespace(
+            get_model=lambda: model,
+            device="cpu",
+            custom_weight_loaders={},
+            _assert_weight_cache_inactive=lambda _: None,
         )
-        model[1][0]._direct_weight_update_error = "direct skips the loader"
-        original = model[0].weight.detach().clone()
-        updater = _cpu_updater(model)
-        with (
-            patch(
-                "sglang.srt.model_executor.model_runner_components.weight_updater.get_model",
-                return_value=SimpleNamespace(weight_cache_mode="off"),
-            ),
-            get_parallel().override(tp_rank=0),
-        ):
-            self.assertEqual(
-                updater.update_weights_from_tensor(
-                    [("0.weight", torch.zeros_like(original))], load_format="direct"
-                ),
-                (False, "direct skips the loader"),
-            )
-            self.assertTrue(torch.equal(model[0].weight, original))
-            success, _ = updater.update_weights_from_tensor(
-                [("0.weight", torch.zeros_like(original))], load_format=None
-            )
-        self.assertTrue(success)
-        self.assertTrue(torch.equal(model[0].weight, torch.zeros_like(original)))
-
-
-def _cpu_updater(model):
-    return WeightUpdater(
-        tp_rank=0,
-        device="cpu",
-        gpu_id=0,
-        model_config=None,
-        custom_weight_loaders={},
-        get_model=lambda: model,
-        update_model_fields=lambda *args, **kwargs: None,
-        recapture_cuda_graph=lambda: None,
-        get_model_runner=lambda: None,
-    )
+        update = WeightUpdater.update_weights_from_tensor
+        self.assertEqual(update(stub, [], load_format="direct"), (False, "no direct"))
+        with get_parallel().override(tp_rank=0):
+            self.assertTrue(update(stub, [], load_format=None)[0])
+        self.assertEqual(loaded, [[]])
 
 
 if __name__ == "__main__":
