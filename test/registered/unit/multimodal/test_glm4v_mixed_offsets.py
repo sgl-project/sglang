@@ -1,9 +1,18 @@
+import asyncio
+import concurrent.futures
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import numpy as np
 import pytest
 import torch
 from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentVideoURL
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    MultimodalPreprocessingAdmission,
+    MultimodalPreprocessingBusy,
+)
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors import glm4v as glm4v_module
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
@@ -273,6 +282,69 @@ def test_glm_video_merge_rejects_invalid_knobs(request_config):
 def test_video_url_rejects_non_positive_knobs(field, value):
     with pytest.raises(ValidationError):
         ChatCompletionMessageContentVideoURL(url="video.mp4", **{field: value})
+
+
+@pytest.mark.parametrize("submit_fails", [False, True])
+def test_glm4v_frame_preprocessing_holds_admission_after_request_exits(submit_fails):
+    """Cancelled requests and later submit errors cannot free active frame work.
+
+    The executor future stays running after the asyncio wrapper is cancelled;
+    another request must remain busy until that native future completes.
+    """
+
+    async def run():
+        submitted = asyncio.Event()
+        future = concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
+
+        class Executor:
+            def submit(self, fn, *args):
+                if submitted.is_set():
+                    raise RuntimeError("executor rejected second video")
+                submitted.set()
+                return future
+
+        processor = _processor()
+        processor._processor = SimpleNamespace(video_processor=None)
+        processor.video_config = {}
+        processor.mm_tokens = MultimodalSpecialTokens(video_token_id=99)
+        processor.io_executor = Executor()
+        frames = [{"url": "frame.png", "timestamp": 0}]
+        processor.load_mm_data = AsyncMock(
+            return_value=SimpleNamespace(
+                videos=[frames, frames] if submit_fails else [frames]
+            )
+        )
+        admission = MultimodalPreprocessingAdmission(1)
+        lease = admission.acquire(1)
+
+        async def preprocess():
+            try:
+                with lease.activate():
+                    await processor.process_mm_data_async(
+                        [], "video", SimpleNamespace(video_data=None)
+                    )
+            finally:
+                lease.release()
+
+        task = asyncio.create_task(preprocess())
+        await asyncio.wait_for(submitted.wait(), timeout=5)
+        if submit_fails:
+            with pytest.raises(RuntimeError, match="executor rejected second video"):
+                await task
+        else:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        try:
+            with pytest.raises(MultimodalPreprocessingBusy):
+                admission.acquire(1)
+        finally:
+            future.set_result(([], None))
+        assert admission.inflight_items == 0
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

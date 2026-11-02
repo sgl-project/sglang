@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, 
 import jinja2
 import openai.types.responses as openai_responses_types
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
     ResponseOutputText,
@@ -274,6 +274,46 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             }
         )
+
+    @staticmethod
+    def _http_failure_error(error: HTTPException) -> dict:
+        return {
+            "message": str(error.detail),
+            "type": (
+                "server_error" if error.status_code >= 500 else "invalid_request_error"
+            ),
+            "code": (
+                "rate_limit_exceeded"
+                if error.status_code == 503
+                else "server_error"
+                if error.status_code >= 500
+                else "invalid_prompt"
+            ),
+            "status_code": error.status_code,
+            "retryable": error.status_code == 503,
+        }
+
+    @classmethod
+    def _http_failure_response(
+        cls,
+        request: ResponsesRequest,
+        sampling_params: Any,
+        model_name: str,
+        created_time: int,
+        error: HTTPException,
+    ) -> dict:
+        failed = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=[],
+            status="failed",
+            usage=None,
+        ).model_dump()
+        failed["tools"] = []
+        failed["error"] = cls._http_failure_error(error)
+        return failed
 
     def _request_id_prefix(self) -> str:
         return "resp_"
@@ -726,6 +766,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_adapter=tool_adapter,
                 )
                 return result
+            except HTTPException:
+                raise
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
@@ -1873,6 +1915,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 require_reasoning=require_reasoning,
                 tool_adapter=tool_adapter,
             )
+        except HTTPException as error:
+            async with self.response_store_lock:
+                stored_response = self.response_store.get(request.request_id)
+                assert stored_response is not None
+                if stored_response.status not in ("completed", "cancelled"):
+                    stored_response.status = "failed"
+                    stored_response.error = self._http_failure_error(error)
+            return
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
             response = self.create_error_response(str(e))
@@ -2144,15 +2194,22 @@ class OpenAIServingResponses(OpenAIServingChat):
         yield _send_event("response.created", response=initial_response)
         yield _send_event("response.in_progress", response=initial_response)
 
-        async for ctx in result_generator:
-            for message in ctx.messages[num_messages:]:
-                for item in parse_output_message(message):
-                    for event in _update_item(item, done=True):
+        try:
+            async for ctx in result_generator:
+                for message in ctx.messages[num_messages:]:
+                    for item in parse_output_message(message):
+                        for event in _update_item(item, done=True):
+                            yield event
+                num_messages = len(ctx.messages)
+                for item in parse_remaining_state(ctx.parser):
+                    for event in _update_item(item):
                         yield event
-            num_messages = len(ctx.messages)
-            for item in parse_remaining_state(ctx.parser):
-                for event in _update_item(item):
-                    yield event
+        except HTTPException as error:
+            failed = self._http_failure_response(
+                request, sampling_params, model_name, created_time, error
+            )
+            yield _send_event("response.failed", response=failed)
+            return
 
         if active_model is not None:
             status = (
@@ -2984,6 +3041,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     yield ev
                 for ev in _emit_tool_calls(opening):
                     yield ev
+        except HTTPException as error:
+            failed = self._http_failure_response(
+                request, sampling_params, model_name, created_time, error
+            )
+            yield _send_event(
+                ResponsesLifecycleEvent(type="response.failed", response=failed)
+            )
+            return
         except Exception as e:
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id

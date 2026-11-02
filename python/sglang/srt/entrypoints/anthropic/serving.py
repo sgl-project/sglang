@@ -838,6 +838,8 @@ class AnthropicServing:
                 error_type="invalid_request_error",
                 message=str(e),
             )
+        except HTTPException as error:
+            return self._http_exception_response(error)
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -847,13 +849,32 @@ class AnthropicServing:
                 exception_name=type(e).__name__,
             )
 
+        generator = self._generate_anthropic_stream(
+            adapted_request,
+            processed_request,
+            anthropic_request,
+            raw_request,
+        )
+        # Trigger tokenizer admission before committing HTTP 200. Admission
+        # failures can then retain their retryable 503 / permanent 400 status.
+        try:
+            first_event = await generator.__anext__()
+        except HTTPException as error:
+            return self._http_exception_response(error)
+        except StopAsyncIteration:
+            return self._error_response(
+                status_code=500,
+                error_type="api_error",
+                message="Internal server error",
+            )
+
+        async def prepend_first_event():
+            yield first_event
+            async for event in generator:
+                yield event
+
         return StreamingResponse(
-            self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
-            ),
+            prepend_first_event(),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
                 adapted_request
@@ -1029,6 +1050,8 @@ class AnthropicServing:
         # and emit a clean Anthropic error sequence instead.
         try:
             stream_iter = openai_stream.__aiter__()
+        except HTTPException:
+            raise
         except Exception as e:
             logger.exception("Failed to open OpenAI stream: %s", e)
             for frame in _flush_on_error("api_error", "Internal server error"):
@@ -1042,6 +1065,15 @@ class AnthropicServing:
                 break
             except asyncio.CancelledError:
                 raise
+            except HTTPException as error:
+                if not message_started:
+                    raise
+                for frame in _flush_on_error(
+                    ERROR_TYPE_MAP.get(error.status_code, "api_error"),
+                    _scrub_error_message(str(error.detail), error.status_code),
+                ):
+                    yield frame
+                return
             except ValueError as e:
                 # _generate_chat_stream re-raises ValueError when its own
                 # ``stream_started`` flag is still False — surface as a
@@ -1405,6 +1437,13 @@ class AnthropicServing:
             status_code=status_code,
             error_type=error_type,
             message=message,
+        )
+
+    def _http_exception_response(self, error: HTTPException) -> JSONResponse:
+        return self._error_response(
+            status_code=error.status_code,
+            error_type=ERROR_TYPE_MAP.get(error.status_code, "api_error"),
+            message=_scrub_error_message(str(error.detail), error.status_code),
         )
 
     def _error_response(

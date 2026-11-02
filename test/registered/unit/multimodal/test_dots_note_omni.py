@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import re
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -11,6 +12,9 @@ maybe_stub_sgl_kernel()
 
 import torch
 
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    MultimodalPreprocessingAdmission,
+)
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.dots_note_omni import DotsNoteOmniProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -265,6 +269,51 @@ class TestDotsNoteOmniProcessMmDataAsync(CustomTestCase):
         )
         self.assertEqual(self.loaded["audio_data"], ["video-0-audio", "video-1-audio"])
         self.assertEqual(len(output.mm_items), 5)
+
+    def test_cancelled_video_preprocess_keeps_admission_until_worker_stops(self):
+        started = threading.Event()
+        release = threading.Event()
+        admission = MultimodalPreprocessingAdmission(1)
+        lease = admission.try_acquire(1)
+        request_obj = self._request(f"{_VIDEO_PLACEHOLDER}question", ["video-0"])
+
+        def blocking_preprocess(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return _fake_preprocess_dots_video("video-0", "question")
+
+        async def drive():
+            with patch(
+                "sglang.srt.multimodal.processors.dots_note_omni.preprocess_dots_video",
+                blocking_preprocess,
+            ):
+                with lease.activate():
+                    task = asyncio.create_task(
+                        self.processor.process_mm_data_async(
+                            request_obj.text,
+                            request_obj,
+                            max_req_input_len=4096,
+                        )
+                    )
+                    while not started.is_set():
+                        await asyncio.sleep(0)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+                lease.release()
+                self.assertEqual(admission.inflight_items, 1)
+                release.set()
+                for _ in range(100):
+                    if admission.inflight_items == 0:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(admission.inflight_items, 0)
+
+        try:
+            asyncio.run(drive())
+        finally:
+            release.set()
 
     def test_extra_native_image_without_placeholder_is_rejected(self):
         request_obj = self._request(f"{_VIDEO_PLACEHOLDER}question", ["video-0"])
