@@ -22,6 +22,7 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import BatchedRepetitionPenalizer
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -524,6 +525,67 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+class TestPromptRepetitionPenalty(CustomTestCase):
+    def test_prompt_and_output_history_match_transformers(self):
+        """Prompt-only candidates must receive the same penalty as generated ones."""
+        from transformers import RepetitionPenaltyLogitsProcessor
+
+        for penalty in (0.5, 1.0, 1.1, 2.0):
+            with self.subTest(penalty=penalty):
+                req = _make_req()
+                req.sampling_params.repetition_penalty = penalty
+                req.origin_input_ids_unpadded = [
+                    0,
+                    3,
+                    3,
+                    VOCAB_SIZE - 1,
+                    -1,
+                    VOCAB_SIZE + 42,
+                ]
+                req.output_ids = [5, 5]
+                batch = _make_batch([req])
+                orch = BatchedPenalizerOrchestrator(
+                    VOCAB_SIZE, batch, {BatchedRepetitionPenalizer}
+                )
+                logits = torch.linspace(-4, 4, VOCAB_SIZE).unsqueeze(0)
+                expected = RepetitionPenaltyLogitsProcessor(penalty)(
+                    torch.tensor([[0, 3, 3, VOCAB_SIZE - 1, 5, 5]]), logits.clone()
+                )
+                orch.apply(logits)
+                torch.testing.assert_close(logits, expected)
+
+    def test_merge_filter_and_decode_preserve_prompt_penalties(self):
+        """Continuous batching must retain each request's prompt and decode history."""
+        reqs = []
+        for penalty, prompt in [(2.0, [3]), (0.5, [7]), (1.0, [])]:
+            req = _make_req()
+            req.sampling_params.repetition_penalty = penalty
+            req.origin_input_ids_unpadded = prompt
+            req.output_ids = []
+            reqs.append(req)
+        first = _make_batch(reqs[:1])
+        second = _make_batch(reqs[1:])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, first, {BatchedRepetitionPenalizer}
+        )
+        other = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, second, {BatchedRepetitionPenalizer}
+        )
+        orch.cumulate_output_tokens(torch.tensor([9]))
+        orch.merge(other)
+        first.reqs = reqs
+        indices = torch.tensor([1, 0])
+        orch.filter(indices)
+        first.reqs = [reqs[1], reqs[0]]
+        orch.cumulate_output_tokens(torch.tensor([8, 3]))
+        logits = torch.full((2, VOCAB_SIZE), 4.0)
+        orch.apply(logits)
+        expected = torch.full_like(logits, 4.0)
+        expected[0, [7, 8]] = 8.0
+        expected[1, [3, 9]] = 2.0
+        torch.testing.assert_close(logits, expected)
 
 
 if __name__ == "__main__":
