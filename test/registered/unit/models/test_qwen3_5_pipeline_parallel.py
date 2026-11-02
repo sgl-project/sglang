@@ -1,3 +1,4 @@
+import logging
 import os
 import unittest
 from types import SimpleNamespace
@@ -9,10 +10,25 @@ from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
 from sglang.srt.distributed import get_pp_indices
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
     _refreshes_rope_cos_sin,
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+
+
+class _RecordingParam(torch.nn.Parameter):
+    def __new__(cls, data=None):
+        if data is None:
+            data = torch.zeros(1)
+        instance = super().__new__(cls, data, requires_grad=False)
+        instance.loaded_weights = []
+        return instance
+
+    def weight_loader(self, param, loaded_weight, shard_id=None):
+        self.loaded_weights.append((loaded_weight, shard_id))
+
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -161,6 +177,140 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
             ),
         ):
             self.assertTrue(_refreshes_rope_cos_sin(config, 0, is_nextn=True))
+
+    @staticmethod
+    def _make_conditional_generation_stub(quant_config=None, params=None):
+        model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=1,
+            num_experts=None,
+        )
+        model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        model.quant_config = quant_config
+        model.pooler = None
+        params = params or []
+        model.named_parameters = lambda remove_duplicate=False: params
+        return model
+
+    def test_unknown_bias_warning_on_vision_weights(self):
+        fc1_w = _RecordingParam()
+        fc1_b = _RecordingParam()
+        model = self._make_conditional_generation_stub(
+            quant_config=None,
+            params=[
+                ("visual.merger.linear_fc1.weight", fc1_w),
+                ("visual.merger.linear_fc1.bias", fc1_b),
+            ],
+        )
+
+        warnings = []
+        logger = logging.getLogger("sglang.srt.models.qwen3_5")
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                warnings.append(record.getMessage())
+
+        handler = Handler()
+        logger.addHandler(handler)
+        try:
+            weights = [
+                ("visual.merger.linear_fc1.weight", torch.tensor([1.0])),
+                ("visual.merger.linear_fc1.bias", torch.tensor([2.0])),
+                ("visual.merger.linear_fc2_renamed.weight", torch.tensor([3.0])),
+                ("visual.merger.linear_fc2_renamed.bias", torch.tensor([4.0])),
+            ]
+            loaded = model.load_weights(weights)
+            self.assertIn("visual.merger.linear_fc1.weight", loaded)
+            self.assertIn("visual.merger.linear_fc1.bias", loaded)
+            self.assertNotIn("visual.merger.linear_fc2_renamed.weight", loaded)
+            self.assertNotIn("visual.merger.linear_fc2_renamed.bias", loaded)
+            self.assertEqual(len(fc1_w.loaded_weights), 1)
+            self.assertEqual(len(fc1_b.loaded_weights), 1)
+            self.assertTrue(
+                any("linear_fc2_renamed.bias" in w for w in warnings),
+                "Missing warning for unknown visual.merger.*.bias parameter",
+            )
+            self.assertTrue(
+                any("linear_fc2_renamed.weight" in w for w in warnings),
+                "Missing warning for unknown visual.merger.*.weight parameter",
+            )
+        finally:
+            logger.removeHandler(handler)
+
+    def test_gptq_skips_non_visual_bias_silently(self):
+        model = self._make_conditional_generation_stub(
+            quant_config=SimpleNamespace(quant_method="gptq"),
+            params=[],
+        )
+
+        warnings = []
+        logger = logging.getLogger("sglang.srt.models.qwen3_5")
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                warnings.append(record.getMessage())
+
+        handler = Handler()
+        logger.addHandler(handler)
+        try:
+            weights = [
+                ("visual.merger.unknown.bias", torch.tensor([1.0])),
+                ("model.layers.0.extra.bias", torch.tensor([2.0])),
+            ]
+            model.load_weights(weights)
+            # visual bias should warn even on GPTQ
+            self.assertTrue(
+                any("visual.merger.unknown.bias" in w for w in warnings),
+                "Visual bias must warn even when quant_method == gptq",
+            )
+            # non-visual bias is skipped silently for GPTQ
+            self.assertFalse(
+                any("model.layers.0.extra.bias" in w for w in warnings),
+                "Non-visual bias on GPTQ must be skipped without warning",
+            )
+        finally:
+            logger.removeHandler(handler)
+
+    def test_moe_unknown_bias_warning_on_vision_weights(self):
+        model = Qwen3_5MoeForConditionalGeneration.__new__(
+            Qwen3_5MoeForConditionalGeneration
+        )
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            tie_word_embeddings=False,
+            num_hidden_layers=1,
+            num_experts=8,
+            encoder_only=False,
+        )
+        model.enable_shared_expert_fusion = False
+        model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        model.quant_config = None
+        model.pooler = None
+        model.model = SimpleNamespace(start_layer=0, end_layer=0, layers=[])
+        model.named_parameters = lambda remove_duplicate=False: []
+
+        warnings = []
+        logger = logging.getLogger("sglang.srt.models.qwen3_5")
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                warnings.append(record.getMessage())
+
+        handler = Handler()
+        logger.addHandler(handler)
+        try:
+            weights = [
+                ("visual.merger.unknown_fc.bias", torch.tensor([1.0])),
+            ]
+            model.load_weights(weights)
+            self.assertTrue(
+                any("visual.merger.unknown_fc.bias" in w for w in warnings),
+                "Missing warning for unknown visual bias in MoE model",
+            )
+        finally:
+            logger.removeHandler(handler)
 
 
 if __name__ == "__main__":
