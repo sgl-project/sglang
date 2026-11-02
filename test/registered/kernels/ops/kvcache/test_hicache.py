@@ -582,9 +582,21 @@ def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
 
 
 @pytest.mark.skipif(not is_cuda(), reason="GQA DCP HiCache requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bfloat16,
+        torch.float16,
+        torch.uint8,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ],
+)
+@pytest.mark.parametrize(
+    "layout, io", [("page_first", "kernel"), ("page_first_direct", "direct")]
+)
 @pytest.mark.parametrize("dcp_size, dcp_rank", [(1, 0), (2, 1), (4, 3)])
-def test_gqa_dcp_kv_roundtrip(dtype, dcp_size, dcp_rank):
+def test_gqa_dcp_kv_roundtrip(dtype, layout, io, dcp_size, dcp_rank):
     pool = MHATokenToKVPool(
         size=128,
         page_size=16,
@@ -600,7 +612,7 @@ def test_gqa_dcp_kv_roundtrip(dtype, dcp_size, dcp_rank):
         host_to_device_ratio=2,
         host_size=0,
         page_size=16 * dcp_size,
-        layout="page_first",
+        layout=layout,
         device_capacity_tokens=pool.size,
         start_layer=0,
         end_layer=2,
@@ -618,29 +630,44 @@ def test_gqa_dcp_kv_roundtrip(dtype, dcp_size, dcp_rank):
         buffers = [*pool.k_buffer, *pool.v_buffer]
         for i, buffer in enumerate(buffers):
             values = torch.arange(buffer.numel(), device="cuda").reshape_as(buffer)
-            buffer.copy_(values % 127 + i * 7)
+            buffer.copy_((values + i * 37) % 256)
         source, target = [7, 1, 3], [4, 5, 6]
         host_pages = [host.page_num - 1, 2, 0]
         expected = [buffer[indices(source)].clone() for buffer in buffers]
         logical_page = 16 * dcp_size
-        host_ids = indices(host_pages, logical_page)
-        host.backup_from_device_all_layer(
-            pool,
-            host_ids.cpu() if host.can_use_write_back_jit else host_ids,
-            indices(source, logical_page),
-            "kernel",
-        )
+        index_device = "cuda" if io == "kernel" else "cpu"
+        host_ids = indices(host_pages, logical_page, index_device)
+        # Direct IO uses cudaMemcpyBatchAsync, which requires a non-default stream.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            host.backup_from_device_all_layer(
+                pool,
+                host_ids.cpu() if host.can_use_write_back_jit else host_ids,
+                indices(source, logical_page, index_device),
+                io,
+            )
         torch.cuda.synchronize()
         for buffer, values in zip([*host.k_data_refs, *host.v_data_refs], expected):
+            host_rows = buffer.reshape(-1, *values.shape[1:])
             torch.testing.assert_close(
-                buffer[indices(host_pages, device="cpu")], values.cpu(), rtol=0, atol=0
+                host_rows[indices(host_pages, device="cpu")],
+                values.cpu(),
+                rtol=0,
+                atol=0,
             )
         for buffer in buffers:
             buffer.fill_(-1)
-        for layer in range(2):
-            host.load_to_device_per_layer(
-                pool, host_ids, indices(target, logical_page), layer, "kernel"
-            )
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for layer in range(2):
+                host.load_to_device_per_layer(
+                    pool,
+                    host_ids,
+                    indices(target, logical_page, index_device),
+                    layer,
+                    io,
+                )
         torch.cuda.synchronize()
         for buffer, values in zip(buffers, expected):
             restored = torch.full_like(buffer, -1)

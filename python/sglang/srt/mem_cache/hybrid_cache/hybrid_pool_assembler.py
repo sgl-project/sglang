@@ -206,13 +206,22 @@ def build_kv_host_pool(
     else:
         kwargs.update(mha_kwargs)
     if parallel.dcp_enabled:
+        # Per-tensor FP8 stores raw bytes; its static scales belong to the model.
         if not use_mla and (
             kv_host_pool_cls is not MHATokenToKVPoolHost
-            or host_input.dtype not in (torch.bfloat16, torch.float16)
+            or kv_pool.dtype
+            not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            or host_input.scales is not None
             or mtp_draft_device_pools
         ):
             raise ValueError(
-                "MHA HiCache + DCP requires a standard FP16/BF16 host pool without drafts."
+                "MHA HiCache + DCP requires a standard FP16/BF16 or per-tensor FP8 "
+                "host pool without drafts or pool-resident scales."
             )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
