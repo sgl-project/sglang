@@ -9,7 +9,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -18,6 +18,7 @@ from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
 )
+from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
@@ -950,7 +951,7 @@ def apply_dflash_simulated_acceptance(
     bs, block_size = candidates.shape
     if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
         # The sampling-verify branch does not materialize the target argmax.
-        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+        target_predict = sampling_argmax(next_token_logits).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(

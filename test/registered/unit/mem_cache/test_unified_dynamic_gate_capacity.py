@@ -105,7 +105,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         a.free_swa(slots[:40])
         scheduler = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
-            disagg_prefill_inflight_queue=[],
+            disagg_prefill_transfer_queue=[],
             disagg_prefill_pending_chunk_rids=set(),
         )
         pin_every_band(a, disagg_transfers_in_flight(scheduler))

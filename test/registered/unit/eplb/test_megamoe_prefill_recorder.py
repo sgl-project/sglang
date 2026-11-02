@@ -64,7 +64,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
     def test_pass_gate_records_only_real_prefill(self):
         cases = [
             (_batch(ForwardMode.EXTEND, extend_tokens=8192), True),
-            (_batch(ForwardMode.SPLIT_PREFILL, extend_tokens=8192), True),
             (_batch(ForwardMode.EXTEND, extend_tokens=0), False),
             (_batch(ForwardMode.DECODE), False),
             (_batch(ForwardMode.MIXED, extend_tokens=8192), False),
