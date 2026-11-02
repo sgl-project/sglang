@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _quantize_npu_indexer_activation,
 )
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,10 +86,13 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
     """SGLANG_NPU_INDEXER_INT8 may replace only the BF16 indexer cache."""
 
     def _build_pool(self, dtype, kv_cache_dim=None):
-        with patch.object(
-            memory_pool_npu,
-            "get_parallel",
-            return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=False),
+            patch.object(
+                memory_pool_npu,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+            ),
         ):
             return memory_pool_npu.NPUMLATokenToKVPool(
                 256,
