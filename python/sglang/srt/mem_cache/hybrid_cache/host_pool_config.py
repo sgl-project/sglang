@@ -28,6 +28,7 @@ class HostPoolConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 class HostPoolGroupConfig(msgspec.Struct, frozen=True, kw_only=True):
     root: Any
+    pool_infos: dict[PoolName, DevicePoolInfo]
     transfer_page_size: int
     layer_mapping: dict[int, int]
     transfer_layer_id_max: int
@@ -225,6 +226,7 @@ def prepare_host_pool_config(
     )
     return HostPoolGroupConfig(
         root=root,
+        pool_infos=targets,
         transfer_page_size=transfer_page_size,
         layer_mapping=mapping,
         transfer_layer_id_max=transfer_layer_id_max + len(drafts),

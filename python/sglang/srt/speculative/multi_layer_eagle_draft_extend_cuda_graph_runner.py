@@ -91,6 +91,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if is_npu():
+    from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
     from sglang.srt.speculative.multi_layer_eagle_utils import (
         fill_draft_extend_prepare_buffers_native,
     )
@@ -608,6 +609,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         allocated/captured (e.g. to allocate shared sconv buffers)."""
 
     def _cuda_graph_disabled(self) -> bool:
+        if is_npu():
+            return cuda_graph_fully_disabled()
         return check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
 
     def _init_and_capture(self):
