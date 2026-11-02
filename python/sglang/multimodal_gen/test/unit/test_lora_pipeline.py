@@ -370,6 +370,8 @@ def test_ipc_lora_sync_reconciles_layers_omitted_from_payload(merge_mode):
 
     pipeline.unmerge_lora_weights()
     torch.testing.assert_close(other.base_layer.weight, base_weight)
+
+
 def test_repeated_auto_lora_kept_unmerged_is_skipped():
     layer = BaseLayerWithLoRA(torch.nn.Linear(64, 96, bias=False, dtype=torch.bfloat16))
     pipeline = _make_pipeline(layer)
