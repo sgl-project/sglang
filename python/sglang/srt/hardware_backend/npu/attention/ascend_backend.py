@@ -10,9 +10,6 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.kernels.ops.attention.trtllm_mha_page_table import (
-    build_trtllm_mha_page_table,
-)
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -94,6 +91,26 @@ def _reshape_kv_for_fia_nz(
     """Reshapes a tensor for FIA NZ format."""
     tile_size = 32 if tensor.dtype == torch.float8_e4m3fn else 16
     return tensor.view(-1, 1, num_heads * head_dim // tile_size, page_size, tile_size)
+
+
+def build_npu_page_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Build fixed-shape page tables on device, zeroing inactive entries."""
+    token_positions = (
+        torch.arange(page_table.shape[1], dtype=torch.int64, device=page_table.device)
+        * page_size
+    )
+    valid_pages = token_positions[None, :] < cache_seqlens[:, None]
+    # Use in-bounds indices for padding without data-dependent tensor shapes.
+    request_indices = torch.where(cache_seqlens > 0, req_pool_indices, 0)
+    token_positions = torch.where(valid_pages, token_positions, 0)
+    page_ids = req_to_token[request_indices[:, None], token_positions] // page_size
+    page_table.copy_(page_ids.masked_fill_(~valid_pages, 0))
 
 
 @dataclass
@@ -353,10 +370,10 @@ class AscendAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         cache_layout = model_runner.kv_cache_configurator.modelslim_cache_layout
-        self.use_flash_attn = (
+        self.use_quant_flash_attn = (
             cache_layout is not None and cache_layout.layout == "gqa_mxfp8"
         )
-        if self.use_flash_attn:
+        if self.use_quant_flash_attn:
             from cann_ops_transformer.ops import (
                 quant_flash_attn,
                 quant_flash_attn_metadata,
@@ -510,7 +527,7 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (self.use_flash_attn or self.use_flash_mla or self.use_paged_mtp):
+            if self.use_fia and not (self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -615,7 +632,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.use_flash_attn:
+        if self.use_quant_flash_attn:
             self.forward_metadata = self.graph_metadata[bs]
             self.graph_mode = True
             return
@@ -642,7 +659,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.use_flash_attn:
+        if self.use_quant_flash_attn:
             metadata = self.forward_metadata
             # Eager MTP trims DP padding from Q; use the same request extent here.
             bs = forward_batch.seq_lens[: forward_batch._original_batch_size].numel()
@@ -960,7 +977,7 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        if not self.use_flash_attn:
+        if not self.use_quant_flash_attn:
             return
         metadata = self.forward_metadata
         bs = metadata.block_tables.shape[0]
@@ -984,9 +1001,9 @@ class AscendAttnBackend(AttentionBackend):
         if self.graph_mode and offset:
             # Zero is the existing graph-padding sentinel, not a real KV prefix.
             metadata.actual_seq_lengths_kv.masked_fill_(seq_lens == 0, 0)
-        # Read only valid page boundaries, using the same lengths as QFA. The
-        # static table capacity avoids host max() and keeps graph addresses fixed.
-        build_trtllm_mha_page_table(
+        # Build the page table on device; the static width avoids host max()
+        # and keeps graph addresses fixed.
+        build_npu_page_table(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices[:bs],
             cache_seqlens=metadata.actual_seq_lengths_kv,
@@ -1158,7 +1175,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        if self.use_flash_attn:
+        if self.use_quant_flash_attn:
             if forward_mode.is_draft_extend_v2():
                 query_len = out_cache_loc.shape[0] // bs
             elif forward_mode.is_target_verify():
@@ -2277,7 +2294,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_flash_attn:
+            if self.use_quant_flash_attn:
                 num_token_padding = q.shape[0]
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 query = query[: forward_batch.global_num_token_non_padded_cpu]
@@ -3199,7 +3216,7 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if not self.use_mla:
-            if self.use_flash_attn:
+            if self.use_quant_flash_attn:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
                 num_token_padding = q.shape[0]
@@ -3722,7 +3739,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if self.use_flash_attn:
+        if self.use_quant_flash_attn:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -4123,7 +4140,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if self.use_flash_attn:
+            if self.use_quant_flash_attn:
                 num_token_padding = q.shape[0]
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 query = query[: self.forward_metadata.block_tables.shape[0]]
