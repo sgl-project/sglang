@@ -660,7 +660,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        if self._uses_paged_ragged_decode():
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -2102,6 +2102,15 @@ class AiterAttnBackend(AttentionBackend):
             context_len=self.max_context_len,
         )
 
+    def _uses_paged_ragged_decode(self) -> bool:
+        """Whether forward_decode runs paged_attention_ragged, the only reader of
+        workspace_buffer and of the partition buckets."""
+        return not (
+            self.use_mla
+            or self.use_triton_unified_attention
+            or self.kv_cache_is_vectorized_5d
+        )
+
     def _build_decode_partition_buckets(self) -> tuple[tuple[str, int, int], ...]:
         """(label, max_seq_len, num_partitions), ascending; the last serves any length."""
         fallback = (
@@ -2109,15 +2118,10 @@ class AiterAttnBackend(AttentionBackend):
             self.max_context_len,
             self.max_num_partitions,
         )
-        paged_ragged_decode = not (
-            self.use_mla
-            or self.use_triton_unified_attention
-            or self.kv_cache_is_vectorized_5d
-        )
         # Below 128 partitions buckets save little: at batch 256 and 1.5K tokens,
         # 32 and 128 partitions cost 1% and 9% more than 16.
         if not (
-            paged_ragged_decode
+            self._uses_paged_ragged_decode()
             and self.max_num_partitions >= 128
             and envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.get()
         ):
