@@ -9,7 +9,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _make_state(steps: int) -> SpecRuntimeState:
+def _make_state(steps: int, gpu_memory_gb: float = 0.0) -> SpecRuntimeState:
     return SpecRuntimeState(
         speculative_num_steps=steps,
         speculative_num_draft_tokens=steps + 1,
@@ -19,12 +19,14 @@ def _make_state(steps: int) -> SpecRuntimeState:
         target_graph_runner=None,
         draft_extend_attn_backend=None,
         cuda_graph_runner_for_draft_extend=None,
+        gpu_memory_gb=gpu_memory_gb,
     )
 
 
 class _FakeWorker:
-    def __init__(self, initial_steps: int = 3):
+    def __init__(self, initial_steps: int = 3, cost_gb: dict[int, float] | None = None):
         self.speculative_num_steps = initial_steps
+        self.cost_gb = cost_gb or {}
         self.build_calls = []
         self.applied_steps = []
 
@@ -37,7 +39,9 @@ class _FakeWorker:
         self.build_calls.append(
             (speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs)
         )
-        return _make_state(speculative_num_steps)
+        return _make_state(
+            speculative_num_steps, self.cost_gb.get(speculative_num_steps, 0.0)
+        )
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         self.speculative_num_steps = state.speculative_num_steps
@@ -45,8 +49,8 @@ class _FakeWorker:
 
 
 class _FakePolicy:
-    def __init__(self):
-        self.candidate_steps = [1, 3]
+    def __init__(self, candidate_steps: list[int] | None = None):
+        self.candidate_steps = candidate_steps or [1, 3]
         self.cuda_graph_bs = None
         self.feedback_step = None
 
@@ -126,6 +130,40 @@ class TestAdaptiveController(unittest.TestCase):
             ValueError, "Missing adaptive runtime state for steps=1"
         ):
             controller.activate_step_by_batch(batch_size=8)
+
+    def test_memory_budget_defers_tiers_past_the_budget(self):
+        """Pre-building stops at the budget, counting the previous tier's cost
+        as the lower bound for the next; deferred tiers are built on activation,
+        once, and the initial registered tier is not charged."""
+        worker = _FakeWorker(initial_steps=3, cost_gb={1: 2.0, 5: 3.0, 7: 4.0})
+        policy = _FakePolicy(candidate_steps=[1, 3, 5, 7])
+        controller = AdaptiveController(worker, policy)
+        controller.register(_make_state(3, gpu_memory_gb=100.0))
+
+        controller.init_states(memory_budget_gb=5.0)
+
+        # 1 (2.0) fits; 5 fits since 2.0 + 2.0 <= 5; 7 does not since 5.0 >= 5.
+        self.assertEqual([c[0] for c in worker.build_calls], [1, 5])
+        self.assertEqual(worker.applied_steps, [3])
+
+        policy.feedback_step = 7
+        controller.on_verify_complete([1], batch_size=1)
+        self.assertEqual([c[0] for c in worker.build_calls], [1, 5, 7])
+        self.assertEqual(worker.applied_steps, [3, 7])
+        controller.activate_step_by_batch(batch_size=8)
+        controller.on_verify_complete([1], batch_size=1)
+        self.assertEqual([c[0] for c in worker.build_calls], [1, 5, 7])
+
+    def test_zero_memory_budget_defers_every_other_tier(self):
+        worker = _FakeWorker(initial_steps=3, cost_gb={1: 0.0, 5: 0.0})
+        controller = AdaptiveController(worker, _FakePolicy(candidate_steps=[1, 3, 5]))
+        controller.register(_make_state(3))
+
+        controller.init_states(memory_budget_gb=0.0)
+
+        self.assertEqual(worker.build_calls, [])
+        controller.activate_step_by_batch(batch_size=8)
+        self.assertEqual([c[0] for c in worker.build_calls], [1])
 
 
 if __name__ == "__main__":
