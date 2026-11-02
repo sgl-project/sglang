@@ -1,0 +1,94 @@
+PR #47965: mixed-batch E2E / KV resume checklist
+Prepared 2026-11-02. GPU remains OFF. No Linux build or model test executed during preparation.
+
+Pinned image:
+lmsysorg/sglang@sha256:77ff63ee69fd7ebef20df3a6d036ee4b8a4ffe0734efb0028c3b7643386e3ccf
+Previously GPU-unit-tested head: 3b04001f53cca2d8b618dab476b31478af75c050
+Keep the PR draft. Use the reviewed current PR head for OPT_OUT_EXPECTED_COMMIT;
+the script verifies it and rejects tracked source changes.
+
+Cause and correction
+The PR checkout shadows the image's installed SGLang package. Its Rust cache
+extension was absent and SGLANG_RUST_BUILD_MODE=never prohibited compilation.
+Run the production TreeCore wrapper with auto, then test never in a NEW Python
+process. The wrapper sets libtorch paths/ABI, compatibility header, C++20 and
+rpath; a bare cargo build or generic load_rust_extension call misses that setup.
+The source supports Linux and torch 2.11 through 2.14; the image previously used
+torch 2.14.1+cu130. Do not upgrade torch or copy an unverified image .so.
+
+Before resuming (no GPU startup is authorized by this preparation step)
+1. Recheck actual prior charges and displayed current GPU/disk hourly rate.
+   Last cumulative estimate was $0.60; estimated remaining $4.40, not a billing
+   statement. Use min(35 minutes, (remaining budget - $0.50 reserve)/hourly rate)
+   as the Pod wall-clock deadline, including provisioning, builds/downloads and
+   log export. If insufficient, stop rather than adding spend.
+2. The old Pod start command automatically reruns tests, lacks Rust preparation
+   and ends in sleep infinity. Replace it with bash -lc 'sleep infinity' BEFORE
+   starting the Pod again. Do not blindly restart that old command.
+3. Container-only /workspace and caches may be lost on stop. Recreate preparation
+   on a fresh Pod; do not assume the prior auto-build retry left usable artifacts.
+   A persistent volume/custom image is optional, requires separate cost planning.
+4. Prefer preparing in the same pinned Linux x86_64 image on an existing CPU
+   machine if available. Rust compilation and model downloads do not need a GPU.
+   Keep the same interpreter/torch paths when reusing build cache; the cache
+   fingerprint includes torch version, ABI and absolute torch path. No such CPU
+   environment was built or tested in this turn.
+
+Execution inside the pinned container
+Clone the branch, review the full commit SHA against the PR head, and set it
+explicitly. Do not reuse the old GPU-tested SHA for a newer checkout:
+
+  git clone --depth 1 --branch feat/per-request-spec-opt-out https://github.com/anencore94/sglang.git /workspace/sglang-47965
+  cd /workspace/sglang-47965
+  git rev-parse HEAD
+  export OPT_OUT_EXPECTED_COMMIT='REPLACE_WITH_REVIEWED_FULL_PR_HEAD_SHA'
+
+Replace the placeholder above with the actual SHA before executing. For an
+existing checkout, inspect its status/head first instead of cloning over it.
+Run prepare and run from the same shell, preserving OPT_OUT_EXPECTED_COMMIT:
+
+  bash test/manual/spec/prepare_per_request_spec_opt_out_e2e.sh prepare
+
+Require PREFLIGHT_PASS plus RUST_BUILD_OK, RUST_CACHE_LOAD_OK, PROBE_IMPORT_OK,
+and both MODEL_CACHE_READY lines. Rust toolchain 1.92, a C++20-capable compiler,
+network access to Rust/crates/model registries, and the image's Python packages
+are required. Missing tools or failed compilation are environment failures:
+save preflight.log and stop; do not bypass ABI checks. Each build/download has
+a 10-minute timeout, but the independent Pod spending deadline takes precedence.
+
+Only after successful preparation and adequate budget/time remaining:
+
+  bash test/manual/spec/prepare_per_request_spec_opt_out_e2e.sh run
+
+This is capped at 15 minutes and cleans up the test's separate server process
+groups on exit. No repeat of the already-passed GPU unit suites is needed unless
+code/environment changes justify it. The script never starts or stops a Pod.
+
+Pass criteria
+- Driver prints MODEL_E2E_AND_KV_SMOKE_PASS and writes summary.json.
+- Target, eager and graph modes complete, real mixed/all-opt-out batches appear.
+- Opted-out rows retain exactly one token; enabled rows sometimes accept >1.
+- Tested greedy opted-out token IDs match the target-only baseline in this setup.
+- Page/pool checks and draft-extend probes complete; graph mode observes forward
+  graph rounds, eager mode does not. Short rows finish while longer rows remain;
+  prefixes/cache slots are reused and cache is flushed before another wave.
+- No assertion failures, leaks, illegal CUDA accesses or server exceptions.
+
+Scope limits
+Dense STANDALONE only, Qwen2.5 1.5B target / 0.5B draft, greedy output with EOS
+ignored. This does NOT cover EOS/cancellation transport, stochastic E2E, EAGLE3,
+HiSparse, TP/PP/DP, or a performance benchmark. Diagnostic synchronizations and
+page/pool invariants do not prove every draft KV tensor value is correct. Do not
+convert these bounded checks into a general cross-server determinism guarantee.
+
+Shutdown and evidence
+Before stopping, download preflight.log and the entire unique e2e-* directory
+(driver.log, target/eager/graph logs and JSONL traces, serve_probe.py, summary.json).
+Record commit, image, model snapshot IDs, elapsed time and nvidia-smi output.
+Export evidence before stopping ephemeral storage. Stop the Pod even after a
+failed test or timeout, verify compute/storage Not running and $0.00/hr. Keep PR
+draft; report partial execution accurately if the deadline prevents completion.
+
+Validation of these resume artifacts
+bash syntax check and source/API review only. The Linux Rust build, model
+downloads, timeout cleanup and complete GPU harness remain execution-unverified.
