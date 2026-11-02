@@ -389,6 +389,40 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
         )
 
 
+def apply_unlimited_ocr_v2_cuda_graph_default(server_args: Any):
+    """Disable prefill graphs; leave decode graphs opt-in.
+
+    Runs before CUDA graph parsing; prefill block-table width varies per request.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.disable_cuda_graph or parse_connector_type(cfg.model_path) == (
+        ConnectorType.INSTANCE
+    ):
+        return
+    from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
+
+    if model_config_of(server_args).hf_config.architectures[0] != UNLIMITED_OCR_V2_ARCH:
+        return
+    if cfg.cuda_graph_backend_decode is None and not cfg.disable_decode_cuda_graph:
+        logger.warning(
+            "Unlimited-OCR v2: decode CUDA graphs are opt-in. Pass "
+            "--cuda-graph-backend-decode full to enable them, and validate with "
+            "a run whose decode batch SHRINKS mid-flight (a fixed batch hides "
+            "cross-graph buffer reuse)."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_unlimited_ocr_v2_cuda_graph_default",
+            cuda_graph_backend_decode=Backend.DISABLED,
+        )
+    if cfg.cuda_graph_backend_prefill is None:
+        declare_resolution(
+            server_args,
+            "_apply_unlimited_ocr_v2_cuda_graph_default",
+            cuda_graph_backend_prefill=Backend.DISABLED,
+        )
+
+
 def handle_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
 

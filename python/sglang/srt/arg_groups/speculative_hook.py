@@ -548,8 +548,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
-        if cfg.enable_pdmux:
-            raise ValueError("UNO tree mode does not yet support PDMux.")
         if cfg.enable_two_batch_overlap:
             raise ValueError("UNO tree mode does not yet support two-batch overlap.")
         if (
