@@ -17,8 +17,8 @@ import requests
 from test_per_request_spec_opt_out_e2e import install_probes as base_probes
 from test_per_request_spec_opt_out_e2e import response_token_ids
 
-TARGET = "Qwen/Qwen3-1.7B"
-DRAFT = "AngelSlim/Qwen3-1.7B_eagle3"
+TARGET = os.environ.get("LIFECYCLE_TARGET", "Qwen/Qwen3-1.7B")
+DRAFT = os.environ.get("LIFECYCLE_DRAFT", "AngelSlim/Qwen3-1.7B_eagle3")
 
 
 def check_stream(previous, current):
@@ -296,6 +296,12 @@ def run():
                 "isolated", body("isolated", prompts[0], n=80, ignore_eos=True)
             )
             baseline = response_token_ids(isolated, 80)
+            flush()
+            enabled = post(
+                "enabled-only",
+                body("enabled-only", prompts[0], flag=False, n=80, ignore_eos=True),
+            )
+            response_token_ids(enabled, 80)
             flush()
             for wave, flags, limits in [
                 ("mixed", [True, False], [80, 40]),
