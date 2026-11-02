@@ -35,6 +35,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
+    set_global_graph_memory_pool,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
@@ -239,3 +240,4 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs.clear()
         self._output_buffer = None
         self._pool = None
+        set_global_graph_memory_pool(None)
