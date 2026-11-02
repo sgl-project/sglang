@@ -1,4 +1,5 @@
-"""DSA DCP resolves unset backends to the platform's DCP path."""
+"""DSA DCP resolves unset backends to the platform's DCP path, and the resolved
+backends are checked against what the pinned flashinfer can actually run."""
 
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _PLATFORM = "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform"
+_CAPABILITY = "torch.cuda.get_device_capability"
 
 
 def _cfg(**kw):
@@ -79,6 +81,21 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
         _check_dsa_backend_constraints(
             "fp8_e4m3", "tilelang", "tilelang", hip=True, dcp_size=1
         )
+
+    def test_trtllm_allowed_only_where_pinned_flashinfer_builds_it(self):
+        # Matches the pinned flashinfer's own answer text so a probe failure
+        # cannot pass as a rejection; loosening this gate to `major == 10`
+        # turns the (10, 1) case red.
+        refusal = "requires SM100/SM103/SM107"
+        with patch(_CAPABILITY, return_value=(10, 0)):
+            _check_dsa_backend_constraints("fp8_e4m3", "trtllm", "trtllm", hip=False)
+        for capability in ((12, 0), (12, 1), (11, 0), (10, 1), (9, 0)):
+            with self.subTest(capability=capability):
+                with patch(_CAPABILITY, return_value=capability):
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        _check_dsa_backend_constraints(
+                            "fp8_e4m3", "trtllm", "trtllm", hip=False
+                        )
 
 
 if __name__ == "__main__":

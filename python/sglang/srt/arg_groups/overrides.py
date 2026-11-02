@@ -563,7 +563,7 @@ def _check_dsa_backend_constraints(
         raise ValueError(
             f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
             "ROCm/HIP. Pick an alternative DSA backend for CUDA "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "(flashmla_kv on Hopper, trtllm on SM10.x Blackwell)."
         )
 
     if hip and dcp_size > 1:
@@ -573,6 +573,29 @@ def _check_dsa_backend_constraints(
                 f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
                 "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
                 "triton with --dcp-size > 1."
+            )
+
+    # Ordered after the device-free rules so nothing that reports without a GPU
+    # is masked by this probe. A tilelang + trtllm mix is refused below as a
+    # layout error before reaching here. trtllm is the auto-selected FP8 default
+    # on every SM >= 10, so this also covers a launch with no DSA flag at all on
+    # SM11x/SM12x. The accepted set is the pinned flashinfer's own dispatch
+    # condition (_resolve_dsv4_sparse_mla_backend, mla/_core.py): 0.7.2 builds
+    # TRT-LLM-GEN MLA for SM100/SM103/SM107, 0.7.1 only for SM100/SM103 -- move
+    # this set when the pin moves.
+    if not hip and "trtllm" in chosen and "tilelang" not in chosen:
+        import torch
+
+        major, minor = torch.cuda.get_device_capability()
+        if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+            raise ValueError(
+                "The trtllm DSA backend dispatches flashinfer's TRT-LLM-GEN "
+                "MLA kernels, which the flashinfer pinned here builds for "
+                f"SM100/SM103/SM107 only; this device is SM{major}{minor}, "
+                'where that dispatch answers "requires SM100/SM103/SM107" '
+                "mid-forward. GlmMoeDsa with FP8 KV is resolved to "
+                "flashinfer_sparse_mla on this device; other DSA models have "
+                "no validated CUDA backend here yet."
             )
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
