@@ -75,9 +75,19 @@ def split_audio_energy_aware(
     """
     if not audio_data:
         raise ValueError("audio_data is empty")
-    audio = load_audio(audio_data, sr=sample_rate, mono=True)
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+
     chunk_size = int(sample_rate * max_clip_s)
     search_size = int(sample_rate * SPLIT_SEARCH_WINDOW_S)
+    if chunk_size <= search_size:
+        raise ValueError(
+            "max_clip_s must span more samples than the "
+            f"{SPLIT_SEARCH_WINDOW_S}-second split search window; "
+            f"got max_clip_s={max_clip_s}, sample_rate={sample_rate}"
+        )
+
+    audio = load_audio(audio_data, sr=sample_rate, mono=True)
     total = audio.shape[-1]
 
     raw_chunks: List[np.ndarray] = []
