@@ -6259,9 +6259,17 @@ class MiniMaxSparseKVPool(KVCache):
             layer_ids=sorted(self.sparse_layer_id_mapping)
         )
 
+    def get_kv_layer_ids(self) -> list[int]:
+        """Global layer id of each get_sparse_kv_buf_infos() entry (K, then V)."""
+        return sorted(self.sparse_layer_id_mapping) * 2
+
     def get_dense_kv_state_buf_infos(self):
         # Dense KV uses logical device slots, independently of sparse host slots.
         return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
+
+    def get_dense_kv_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_dense_kv_state_buf_infos() entry (K, then V)."""
+        return sorted(self._dense_layer_ids) * 2
 
     def _get_layer_kv_buf_infos(self, *, layer_ids):
         buffers = [self.get_key_buffer(layer_id) for layer_id in layer_ids] + [
@@ -6271,6 +6279,12 @@ class MiniMaxSparseKVPool(KVCache):
             [buffer.data_ptr() for buffer in buffers],
             [buffer.nbytes for buffer in buffers],
             [buffer[0].nbytes * self.page_size for buffer in buffers],
+        )
+
+    def get_index_k_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_index_k_state_buf_infos() entry."""
+        return sorted(
+            self.index_k_layer_id_mapping, key=self.index_k_layer_id_mapping.get
         )
 
     def get_index_k_state_buf_infos(self):
