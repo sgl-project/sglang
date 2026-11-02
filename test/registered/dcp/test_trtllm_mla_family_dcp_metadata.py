@@ -44,7 +44,7 @@ class _RealVerifyPath(Exception):
     """Raised by the stubs the real verify path reaches first."""
 
 
-def _make_backend(backend_cls, bs: int):
+def _make_backend(backend_cls, bs: int, forward_mode: ForwardMode):
     backend = object.__new__(backend_cls)
     backend.num_draft_tokens = NUM_DRAFT_TOKENS
     metadata = TRTLLMMLADecodeMetadata(
@@ -52,7 +52,8 @@ def _make_backend(backend_cls, bs: int):
         seq_lens_k=torch.zeros(bs, dtype=torch.int32, device="cuda"),
         global_seq_lens_k=torch.zeros(bs, dtype=torch.int32, device="cuda"),
     )
-    backend.decode_cuda_graph_metadata = {bs: metadata}
+    # Capture metadata is keyed by (batch size, mode), as the backend stores it.
+    backend.decode_cuda_graph_metadata = {(bs, forward_mode): metadata}
     return backend, metadata
 
 
@@ -78,7 +79,9 @@ class _DCPMetadataTests:
 
     def test_target_verify_splits_global_and_local_lengths(self):
         bs = 3
-        backend, metadata = _make_backend(self.backend_cls, bs)
+        backend, metadata = _make_backend(
+            self.backend_cls, bs, ForwardMode.TARGET_VERIFY
+        )
         prefix_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
 
         fill = _apply(
@@ -99,7 +102,7 @@ class _DCPMetadataTests:
 
     def test_decode_does_not_add_draft_tokens(self):
         bs = 3
-        backend, metadata = _make_backend(self.backend_cls, bs)
+        backend, metadata = _make_backend(self.backend_cls, bs, ForwardMode.DECODE)
         seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
 
         fill = _apply(
