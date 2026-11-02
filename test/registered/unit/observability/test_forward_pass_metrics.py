@@ -1045,8 +1045,10 @@ class TestIdleMetrics(CustomTestCase):
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(queue=[])
-        self.scheduler.disagg_prefill_inflight_queue = []
-        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        self.scheduler.disagg_prefill_transfer_queue = []
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+        )
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
         )
@@ -1071,7 +1073,9 @@ class TestIdleMetrics(CustomTestCase):
                         types.SimpleNamespace(
                             update_scheduler_stats=lambda stats: setattr(
                                 stats, "token_usage", token_usage
-                            )
+                            ),
+                            full_capacity=1,
+                            is_hybrid_swa=False,
                         )
                     )
                     with patch(

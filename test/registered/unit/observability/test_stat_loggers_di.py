@@ -504,7 +504,9 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         )
         tree_cache.host_pool_group = SimpleNamespace(entry_map=entry_map)
         reporter.scheduler = SimpleNamespace(
-            enable_hierarchical_cache=True, tree_cache=tree_cache
+            enable_hierarchical_cache=True,
+            tree_cache=tree_cache,
+            kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
         )
         reporter.stats = SchedulerStats()
         return reporter
