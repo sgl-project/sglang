@@ -116,6 +116,7 @@ def test_idle_scheduler_wait_policy(worker, cli_args, tp_size, should_sleep):
         tp_size=tp_size,
         enable_cfg_parallel=False,
         sleep_on_idle=parsed.sleep_on_idle,
+        stage_role=parsed.stage_role,
     )
     scheduler.worker = worker
     scheduler._disagg_role = RoleType.MONOLITHIC
