@@ -104,7 +104,7 @@ elif [ -r "${cache_archive}" ]; then
       && [ -f "${restore_stage}/.cache-key" ] \
       && [ "$(<"${restore_stage}/.cache-key")" = "${cache_key}" ]; then
     if [ -d "${EVALSCOPE_VENV}" ]; then
-      python3 -m venv --clear "${EVALSCOPE_VENV}"
+      python3 -m venv --clear --without-pip "${EVALSCOPE_VENV}"
       cp -a "${restore_stage}/." "${EVALSCOPE_VENV}/"
     else
       mkdir -p "$(dirname "${EVALSCOPE_VENV}")"
