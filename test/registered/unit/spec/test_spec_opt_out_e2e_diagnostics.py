@@ -20,6 +20,36 @@ spec = importlib.util.spec_from_file_location("opt_out_e2e_diagnostics", path)
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
+analysis_spec = importlib.util.spec_from_file_location(
+    "prefix_analysis", path.with_name("analyze_spec_opt_out_prefix.py")
+)
+analysis = importlib.util.module_from_spec(analysis_spec)
+analysis_spec.loader.exec_module(analysis)
+
+
+class TestPrefixAnalysis(unittest.TestCase):
+    def test_same_last_token_does_not_establish_same_prefix(self):
+        self.assertTrue(analysis.same_prefix([1, 2], [3, 4], [1, 2, 3]))
+        self.assertFalse(analysis.same_prefix([9, 2], [3, 4], [1, 2, 3]))
+        self.assertFalse(analysis.same_prefix([1], [2], [1, 2, 3]))
+
+    def test_exact_ties_and_small_positive_margins_remain_distinct(self):
+        tied = analysis.score_summary([22.875, 22.875], 0, [22.75, 22.875])
+        self.assertEqual(tied["tied_max_ids"], [0, 1])
+        self.assertTrue(tied["greedy_argmax_correct"])
+        self.assertEqual(tied["top_margin"], 0)
+        self.assertFalse(
+            analysis.score_summary([1, 1], 1, [1, 1])["greedy_argmax_correct"]
+        )
+        near = analysis.score_summary([1, 1.000001], 0, [1, 1.000001])
+        self.assertFalse(near["greedy_argmax_correct"])
+        self.assertGreater(near["top_margin"], 0)
+
+    def test_invalid_logits_are_not_numerical_success(self):
+        for values in ([float("nan"), 1], [1, float("inf")], [1]):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                analysis.score_summary(values, 0, [1, 1])
+
 
 class TestOptOutE2EDiagnostics(unittest.TestCase):
     def test_failed_response_is_saved_before_validation(self):

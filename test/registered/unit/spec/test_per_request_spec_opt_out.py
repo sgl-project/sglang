@@ -210,6 +210,11 @@ class TestPerRequestSpecOptOut(CustomTestCase):
     def test_greedy_root_sampler_matches_ordinary_logprob_sampling(self):
         self._check_root_sampling(seeded=False, greedy=True)
 
+    def test_greedy_root_sampler_exact_ties_choose_lowest_token_id(self):
+        # BF16 warm-decode divergence had exact ties, not a sampling error.
+        # Include a near tie that must NOT be rounded into an exact tie.
+        self._check_root_sampling(seeded=False, greedy=True, ties=True)
+
     def test_root_sampler_matches_ordinary_seeded_sampling(self):
         if (
             not torch.cuda.is_available()
@@ -218,7 +223,7 @@ class TestPerRequestSpecOptOut(CustomTestCase):
             self.skipTest("seeded sampling requires native sgl_kernel on CPU or CUDA")
         self._check_root_sampling(seeded=True)
 
-    def _check_root_sampling(self, seeded, greedy=False):
+    def _check_root_sampling(self, seeded, greedy=False, ties=False):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         batch, verify, output = fixture(device=device)
         output.next_token_logits.copy_(
@@ -238,6 +243,15 @@ class TestPerRequestSpecOptOut(CustomTestCase):
             features=SimpleNamespace(sampling_mask_max_tokens=32),
         )
         roots = verify.retrieve_index[:, 0]
+        if ties:
+            output.next_token_logits[roots] = torch.tensor(
+                [
+                    [0, 22.875, 22.875, 0, 0, 0, 0, 0],
+                    [0, 24.625, 0, 24.625, 0, 0, 0, 0],
+                    [0, 22.75, 22.875, 0, 0, 0, 0, 0],
+                ],
+                device=device,
+            )
         original_logits = output.next_token_logits.clone()
         with (
             patch.object(sampler_impl, "get_parallel", return_value=parallel()),
@@ -275,6 +289,8 @@ class TestPerRequestSpecOptOut(CustomTestCase):
                     batch.seq_lens,
                 )
                 torch.testing.assert_close(actual, expected)
+                if ties:
+                    self.assertEqual(actual.tolist(), [1, 1, 2])
                 torch.testing.assert_close(output.next_token_logits, original_logits)
 
     def test_mixed_all_out_mixed_keeps_draft_runtime_layout(self):

@@ -89,10 +89,14 @@ PREFIX_OUTPUTS = {
 
 def install_probes():
     import numpy as np
+    import torch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative import eagle_utils
 
     root = Path(os.environ["PREFIX_RESULTS"])
+    if os.environ.get("PREFIX_DTYPE") == "float32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     def capture(logits, positions, inputs, seq_lens, pool_indices, kind):
         case = json.loads((root / "active.json").read_text())
@@ -225,6 +229,8 @@ def run():
             "--disable-prefill-cuda-graph",
             "--disable-decode-cuda-graph",
         ]
+        if os.environ.get("PREFIX_DTYPE"):
+            args += ["--dtype", os.environ["PREFIX_DTYPE"]]
         if os.environ.get("PREFIX_NO_OVERLAP") == "1":
             args += ["--disable-overlap-schedule"]
         if mode == "spec":
