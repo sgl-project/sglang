@@ -244,6 +244,23 @@ def _split_hicache_size(
     )
 
 
+def _split_hicache_size_with_mamba(
+    *,
+    hicache_size: int,
+    hicache_mamba_size_gb: Optional[float],
+    kv_pools: tuple[Any, ...],
+    mamba_pool: Any,
+) -> tuple[float, ...]:
+    if hicache_mamba_size_gb is None:
+        return _split_hicache_size(
+            hicache_size=hicache_size, kv_pools=(*kv_pools, mamba_pool)
+        )
+    kv_host_sizes = _split_hicache_size(
+        hicache_size=hicache_size - hicache_mamba_size_gb, kv_pools=kv_pools
+    )
+    return (*kv_host_sizes, hicache_mamba_size_gb)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1231,8 +1248,11 @@ def build_hybrid_mamba_stack(
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            hicache_size=get_memory().hicache_size,
+            hicache_mamba_size_gb=get_memory().hicache_mamba_size_gb,
+            kv_pools=(kv_pool,),
+            mamba_pool=mamba_pool,
         )
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1358,8 +1378,11 @@ def build_hybrid_mamba_swa_stack(
     mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            hicache_size=get_memory().hicache_size,
+            hicache_mamba_size_gb=get_memory().hicache_mamba_size_gb,
+            kv_pools=(full_kv_pool, swa_kv_pool),
+            mamba_pool=mamba_pool,
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=page_size,

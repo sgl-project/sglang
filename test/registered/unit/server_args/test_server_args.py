@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
+    validate_hicache_mamba_size,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_allowed_backends,
@@ -2689,6 +2690,57 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_hicache_mamba_size_must_leave_a_kv_share(self):
+        """A Mamba share must be positive and leave --hicache-size a KV share."""
+        for hicache_size, mamba_size in (
+            (192, 192),
+            (192, 250),
+            (0, 70),
+            (192, -1),
+            (192, 0),
+        ):
+            with self.subTest(hicache_size=hicache_size, mamba_size=mamba_size):
+                args = ServerArgs(
+                    model_path="dummy",
+                    enable_hierarchical_cache=True,
+                    hicache_size=hicache_size,
+                    hicache_mamba_size_gb=mamba_size,
+                )
+                with self.assertRaises(ValueError):
+                    validate_hicache_mamba_size(args)
+        validate_hicache_mamba_size(
+            ServerArgs(
+                model_path="dummy",
+                enable_hierarchical_cache=True,
+                hicache_size=192,
+                hicache_mamba_size_gb=70.5,
+            )
+        )
+
+    def test_hicache_mamba_size_needs_hierarchical_cache(self):
+        """Without HiCache there is no host pool to size, so the flag must not
+        be accepted and silently ignored."""
+        args = ServerArgs(
+            model_path="dummy", hicache_size=192, hicache_mamba_size_gb=70
+        )
+        with self.assertRaises(ValueError) as context:
+            validate_hicache_mamba_size(args)
+        self.assertIn("--enable-hierarchical-cache", str(context.exception))
+
+    def test_hicache_mamba_size_rejects_unified_memory(self):
+        """The unified host stack splits --hicache-size by sub-pool size;
+        a Mamba pin there must fail at startup instead of being ignored."""
+        args = ServerArgs(
+            model_path="dummy",
+            enable_hierarchical_cache=True,
+            hicache_size=192,
+            hicache_mamba_size_gb=70,
+            enable_unified_memory=True,
+        )
+        with self.assertRaises(ValueError) as context:
+            validate_hicache_mamba_size(args)
+        self.assertIn("--enable-unified-memory", str(context.exception))
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (
