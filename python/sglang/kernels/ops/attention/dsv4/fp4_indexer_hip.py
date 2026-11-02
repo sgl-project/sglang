@@ -23,12 +23,15 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_row,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
         CompressorDecodePlan,
         CompressorPrefillPlan,
     )
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import MqaLogitsBuffers, MqaLogitsPlan
+
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
         PrefillScheduleBuffers,
     )
@@ -110,11 +113,25 @@ class FP4RowgroupPrefillWorkspace(NamedTuple):
     request_page_table: torch.Tensor
     max_seq_len: int
     query_start_locs: Dict[Tuple[int, int], torch.Tensor]
+class FP4OpusWorkspace(NamedTuple):
+    guarded_page_table: torch.Tensor
+    # Plan-owned copy of the row windows: a graph replay reads this pointer.
+    local_ends: torch.Tensor
+    max_seq_len: int
+    batch: int
+    buffers: MqaLogitsBuffers
+    plan: MqaLogitsPlan
 
 
 class FP4KWriteMetadata(NamedTuple):
     positions: torch.Tensor
     slots: torch.Tensor
+
+
+def fp4_natural_layout() -> bool:
+    """gfx1250 keeps FP4 index rows and E8M0 scales in natural order for the OPUS
+    MQA-logits kernel; gfx950 keeps the FlyDSL preshuffled layout."""
+    return is_gfx1250_supported()
 
 
 def aiter_q_indexer_fp4(
@@ -139,8 +156,15 @@ def aiter_q_indexer_fp4(
         dtype=aiter.dtypes.fp4x2,
         device=q.device,
     )
+    natural = fp4_natural_layout()
     q_scale = torch.empty(
-        (num_tokens, *_Q_SCALE_SHAPE), dtype=torch.uint8, device=q.device
+        (
+            (num_tokens, _HEADS, _HEAD_DIM // _GROUP_SIZE)
+            if natural
+            else (num_tokens, *_Q_SCALE_SHAPE)
+        ),
+        dtype=torch.uint8,
+        device=q.device,
     )
     aiter.rope_rotate_activation(
         q_fp4,
@@ -151,7 +175,7 @@ def aiter_q_indexer_fp4(
         rope_dim=_ROPE_DIM,
         out_scale=q_scale,
         group_size=_GROUP_SIZE,
-        shuffle_scale=True,
+        shuffle_scale=not natural,
         do_rotate_act=True,
     )
     return q_fp4, q_scale
@@ -260,7 +284,7 @@ def prepare_fp4_decode_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
     page_table_bucket: int = 4,
-) -> FP4DecodeWorkspace:
+) -> Union[FP4DecodeWorkspace, FP4OpusWorkspace]:
     """Build the decode page-table, schedule, and logits buffers.
 
     Safe to run under CUDA-graph capture: every tensor the captured schedule
@@ -271,10 +295,14 @@ def prepare_fp4_decode_workspace(
         build_decode_schedule,
     )
 
+    c4_seq_lens = _as_int32_1d(c4_seq_lens)
+    if fp4_natural_layout():
+        return prepare_opus_fp4_workspace(
+            page_table, c4_seq_lens, page_table_bucket=page_table_bucket
+        )
     guarded, max_seq_len = _guard_page_table(
         page_table, page_table_bucket=page_table_bucket
     )
-    c4_seq_lens = _as_int32_1d(c4_seq_lens)
     num_queries = guarded.shape[0]
     cta_count = _decode_cta_count(num_queries, max_seq_len)
     cta_info = torch.empty(
@@ -292,7 +320,10 @@ def prepare_fp4_decode_workspace(
 
 @functools.lru_cache(maxsize=1)
 def aiter_has_fp4_rowgroup() -> bool:
-    """Whether the installed AITER ships the row-group FP4 MQA logits kernel (#6145)."""
+    """Whether the installed AITER ships the row-group FP4 MQA logits kernel (#6145)
+    and the pool uses its preshuffled layout."""
+    if fp4_natural_layout():
+        return False
     try:
         from aiter.ops.flydsl import make_fp4_mqa_plan  # noqa: F401
     except Exception:
@@ -376,9 +407,10 @@ def rowgroup_prefill_query_start_loc(
 def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
-    workspace: Optional[FP4PrefillWorkspace] = None,
+    workspace: Optional[Union[FP4PrefillWorkspace, FP4OpusWorkspace]] = None,
     page_table_bucket: int = 4,
-) -> FP4PrefillWorkspace:
+    cu_seq_q: Optional[torch.Tensor] = None,
+) -> Union[FP4PrefillWorkspace, FP4OpusWorkspace]:
     """Build or refresh the prefill page-table, schedule, and logits buffers.
 
     Must run OUTSIDE CUDA-graph capture. Rows past the fused builder's limit
@@ -399,6 +431,14 @@ def prepare_fp4_prefill_workspace(
     )
 
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
+    if fp4_natural_layout():
+        return prepare_opus_fp4_workspace(
+            page_table,
+            c4_seq_lens,
+            cu_seq_q=cu_seq_q,
+            workspace=workspace,
+            page_table_bucket=page_table_bucket,
+        )
     if workspace is None:
         rows, _, padded_width = padded_page_table_shape(page_table, page_table_bucket)
         cta_count = max(_PREFILL_BASE_CTA_TARGET, rows)
@@ -533,6 +573,62 @@ def rowgroup_paged_mqa_logits(
         plan=plan,
     )
     return logits
+def prepare_opus_fp4_workspace(
+    page_table: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    *,
+    cu_seq_q: Optional[torch.Tensor] = None,
+    workspace: Optional[FP4OpusWorkspace] = None,
+    page_table_bucket: int = 4,
+) -> FP4OpusWorkspace:
+    """Pad the page table and build the OPUS MQA-logits plan once per forward.
+
+    With ``cu_seq_q`` (query-row prefix sums, rows of one request contiguous)
+    four rows share a KV tile; without it every row is its own tile. A
+    ``workspace`` of the same shapes is refilled in place, so a graph that
+    captured its launch reads the refreshed plan.
+    """
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+        pa_mqa_logits_mxfp4_plan,
+        pa_mqa_logits_mxfp4_plan_buffers,
+    )
+
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+        padded_page_table_shape,
+    )
+
+    rows, _, padded_width = padded_page_table_shape(page_table, page_table_bucket)
+    batch = rows if cu_seq_q is None else cu_seq_q.shape[0] - 1
+    variant = "qlen1_kv64" if cu_seq_q is None else "qlen4_kv64"
+    if not (
+        isinstance(workspace, FP4OpusWorkspace)
+        and workspace.guarded_page_table.shape == (rows, padded_width + 4)
+        and workspace.batch == batch
+        and workspace.buffers.variant.name == variant
+    ):
+        workspace = None
+    guarded, max_seq_len = _guard_page_table(
+        page_table,
+        out=None if workspace is None else workspace.guarded_page_table,
+        page_table_bucket=page_table_bucket,
+    )
+    if workspace is None:
+        local_ends = c4_seq_lens.clone()
+        buffers = pa_mqa_logits_mxfp4_plan_buffers(
+            page_table.device, rows, batch, variant=variant
+        )
+    else:
+        local_ends = workspace.local_ends
+        local_ends.copy_(c4_seq_lens)
+        buffers = workspace.buffers
+    plan = pa_mqa_logits_mxfp4_plan(
+        # not read at one row per tile
+        local_ends if cu_seq_q is None else cu_seq_q,
+        local_ends,
+        buffers=buffers,
+        total_q=rows,
+    )
+    return FP4OpusWorkspace(guarded, local_ends, max_seq_len, batch, buffers, plan)
 
 
 def aiter_fp4_paged_mqa_logits(
@@ -546,22 +642,16 @@ def aiter_fp4_paged_mqa_logits(
     c4_seq_lens: torch.Tensor,
     weight_scale: float,
     is_decode: bool,
-    decode_workspace: Optional[
-        Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
-    ] = None,
-    prefill_workspace: Optional[FP4PrefillWorkspace] = None,
+    decode_workspace: Optional[Union[FP4DecodeWorkspace, FP4OpusWorkspace]] = None,
+    prefill_workspace: Optional[Union[FP4PrefillWorkspace, FP4OpusWorkspace]] = None,
     page_table_bucket: int = 4,
     page8: bool = False,
     rowgroup_table_columns: Optional[int] = None,
 ) -> torch.Tensor:
-    """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel. A page8 pool
-    is read by the row-group kernel only: without a row-group decode workspace every row
-    scores as its own sequence, on a table of ``rowgroup_table_columns`` columns."""
-    from aiter.ops.flydsl import (
-        flydsl_pa_mqa_logits_fp4,
-        flydsl_pa_mqa_logits_fp4_prefill,
-    )
-
+    """Compute FP4 Q/K indexer logits: OPUS on gfx1250, else the decode or prefill
+    FlyDSL kernel. A page8 pool is read by the row-group kernel only: without a row-group
+    decode workspace every row scores as its own sequence, on a table of
+    ``rowgroup_table_columns`` columns."""
     num_tokens = q_fp4.shape[0]
     c4_seq_lens = _as_int32_1d(c4_seq_lens)
     workspace = decode_workspace if is_decode else prefill_workspace
@@ -604,6 +694,35 @@ def aiter_fp4_paged_mqa_logits(
             page8=page8,
             is_decode=is_decode,
         )
+    if fp4_natural_layout():
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
+
+        if workspace is None:
+            workspace = prepare_opus_fp4_workspace(
+                page_table, c4_seq_lens, page_table_bucket=page_table_bucket
+            )
+        # Only in-window cells are written; the length-aware top-k reads no others.
+        logits = _alloc_logits(
+            num_tokens, workspace.max_seq_len, q_fp4.device, is_decode
+        )
+        return pa_mqa_logits_mxfp4(
+            q_fp4.view(torch.uint8),
+            q_scale,
+            k_payload.view(torch.uint8),
+            k_scale,
+            workspace.guarded_page_table,
+            weights,
+            workspace.plan,
+            workspace.max_seq_len,
+            weight_scale=weight_scale,
+            kv_block_size=_KV_BLOCK_SIZE,
+            out=logits,
+        )
+    from aiter.ops.flydsl import (
+        flydsl_pa_mqa_logits_fp4,
+        flydsl_pa_mqa_logits_fp4_prefill,
+    )
+
     # Built on the fallback path below; kept in scope so the schedule scratch
     # outlives the logits kernel that reads it.
     fallback_schedule = None
@@ -807,7 +926,7 @@ def aiter_k_indexer_fp4_cache_write(
         rope_dim=_ROPE_DIM,
         kv_block_size=_KV_BLOCK_SIZE,
         group_size=_GROUP_SIZE,
-        shuffle_scale=True,
+        shuffle_scale=not fp4_natural_layout(),
         do_rotate_act=True,
     )
 
