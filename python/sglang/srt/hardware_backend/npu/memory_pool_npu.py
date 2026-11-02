@@ -4,6 +4,11 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SparseKVOffloadMode,
+    get_sparsity_driven_kv_offload_fixed_memory_size,
+    resolve_sparse_kv_offload_mode,
+)
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
@@ -13,16 +18,50 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+        MemoryPoolConfigurator,
+    )
 
 if is_npu():
     import torch_npu
+
+
+def adjust_sparse_kv_config(
+    kvc: "KVCacheConfigurator",
+    configurator: "MemoryPoolConfigurator",
+    config: "MemoryPoolConfig",
+    budget_bytes: int,
+) -> "MemoryPoolConfig":
+    """Size the index pool alongside sparse device KV and PD staging buffers."""
+    max_running_requests = get_schedule().max_running_requests
+    sparse_buffer_bytes = get_sparsity_driven_kv_offload_fixed_memory_size(
+        model_config=kvc.model_config,
+        use_mla_backend=kvc.use_mla_backend,
+        num_layers=kvc.layer_info.num_effective_layers,
+        element_size=torch._utils._element_size(kvc.kv_cache_dtype),
+        max_running_requests_per_worker=(
+            0
+            if max_running_requests is None
+            else int(max_running_requests) // kvc.attn_dp_size
+        ),
+    )
+    if sparse_buffer_bytes is None:
+        return config
+
+    # Reuse the original byte budget so the configurator charges upstream
+    # scratch exactly once and applies page alignment after sparse buffers.
+    return configurator.calculate_pool_sizes(
+        budget_bytes - sparse_buffer_bytes, get_schedule().page_size
+    )
 
 
 def _mla_fia_nz_scatter_indices(
@@ -667,10 +706,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
-        self.enable_sparsity_driven_kv_offload = (
-            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
-        )
-        if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
+        sparse_kv_offload_mode = resolve_sparse_kv_offload_mode()
+        if (
+            sparse_kv_offload_mode is not SparseKVOffloadMode.DISABLED
+            and self.index_head_dim is None
+        ):
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
             self.indexer_layer_ids = ()
@@ -725,7 +765,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            if self.enable_sparsity_driven_kv_offload:
+            if sparse_kv_offload_mode.uses_host_kv_offload:
                 self.k_buffer = None
                 self.v_buffer = None
             else:
@@ -943,6 +983,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        if resolve_sparse_kv_offload_mode().uses_pd_decode_staging:
+            if getattr(self, "index_k_buffer", None) is None:
+                raise RuntimeError(
+                    "Sparse KV PD decode transfer requires native NPU MLA "
+                    "index_k_buffer for DSA top-k."
+                )
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+                get_sparse_kv_manager,
+            )
+
+            sparse_kv_manager = get_sparse_kv_manager()
+            if sparse_kv_manager is None:
+                raise RuntimeError(
+                    "Sparse KV PD decode transfer requires SparseKVCacheManager "
+                    "before registering decode transfer buffers."
+                )
+            sparse_kv_manager.ensure_pd_decode_staging_buffers(
+                slot_count=1,
+                page_size=self.page_size,
+            )
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                sparse_kv_manager.get_pd_decode_transfer_buf_infos(
+                    page_size=self.page_size,
+                )
+            )
+            state_ptrs, state_lens, state_item_lens = self.get_state_buf_infos()
+            kv_data_ptrs += state_ptrs
+            kv_data_lens += state_lens
+            kv_item_lens += state_item_lens
+            return kv_data_ptrs, kv_data_lens, kv_item_lens
+
         entries = self._get_disagg_buffer_entries()
         return (
             [buffer.data_ptr() for buffer, _ in entries],
