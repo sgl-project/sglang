@@ -59,7 +59,7 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, get_routed_experts_layer_ids
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -2753,6 +2753,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+                    # Clients reshape the flat ids to (token, layer, top_k).
+                    meta_info["routed_experts_num_layers"] = len(
+                        get_routed_experts_layer_ids(self.model_config.hf_text_config)
+                    )
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

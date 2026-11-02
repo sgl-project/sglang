@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
     UocrDocumentConfig,
@@ -601,6 +602,17 @@ def get_num_indexer_layers(config) -> int:
         compress_ratios = getattr(config, "compress_ratios", None) or []
         return sum(1 for r in compress_ratios if r == 4)
     return getattr(config, "num_indexer_layers", 0)
+
+
+def get_routed_experts_layer_ids(config) -> list[int]:
+    """Layers whose routed experts are captured and returned, in layer order.
+
+    Nemotron-H routes only in its MoE layers; other models keep every layer,
+    dense ones included.
+    """
+    if isinstance(config, NemotronHConfig):
+        return config.moe_layer_ids
+    return list(range(config.num_hidden_layers))
 
 
 class ModelConfig:

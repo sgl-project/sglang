@@ -423,11 +423,9 @@ class NemotronHConfig(PretrainedConfig):
 
     @property
     def moe_layer_ids(self):
-        return [
-            i
-            for i in range(self.num_hidden_layers)
-            if self.hybrid_override_pattern[i] == MOE
-        ]
+        # The pattern property rebuilds its string on each read; read it once.
+        pattern = self.hybrid_override_pattern
+        return [i for i in range(self.num_hidden_layers) if pattern[i] == MOE]
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:

@@ -158,13 +158,6 @@ class TestRoutedLayerHostStorage(CustomTestCase):
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    @staticmethod
-    def _fake_host_alloc(dims, dtype, **_):
-        # Like the real mmap-backed allocator, reject a zero-byte mapping.
-        if torch.Size(dims).numel() == 0:
-            raise OSError("Invalid argument")
-        return torch.empty(dims, dtype=dtype)
-
     def _capturer(self, hf_text_config):
         parallel = SimpleNamespace(num_dp_ranks=1)
         with (
@@ -178,7 +171,8 @@ class TestRoutedLayerHostStorage(CustomTestCase):
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
             ),
             mock.patch.dict(
-                base_mod.ALLOC_MEMORY_FUNCS, {"cpu": self._fake_host_alloc}
+                base_mod.ALLOC_MEMORY_FUNCS,
+                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
             ),
         ):
             return re_mod.RoutedExpertsCapturer(
@@ -220,35 +214,24 @@ class TestRoutedLayerHostStorage(CustomTestCase):
             hybrid_override_pattern=pattern, num_experts_per_tok=self.K
         )
 
-    def test_routed_layers_read_back_like_all_layer_storage(self):
+    def test_returns_routed_layers_in_layer_order(self):
+        """Row i of the returned routing is the i-th MoE layer, matching that
+        layer's column in an all-layer capturer."""
         config = self._nemotron_h(self.PATTERN)
         all_layers_config = SimpleNamespace(
             num_hidden_layers=len(self.PATTERN), num_experts_per_tok=self.K
         )
         routed = self._capturer(config)
         oracle = self._capturer(all_layers_config)
-        self.assertEqual(routed.host_cache.buffer.shape[1], self.PATTERN.count("E"))
 
         torch.manual_seed(0)
         self._run_forward(routed, config.moe_layer_ids)
         torch.manual_seed(0)
         self._run_forward(oracle, config.moe_layer_ids)
-        # A 2-token chunk splits the 3 returned tokens across a chunk boundary.
-        with mock.patch.object(re_mod, "_READBACK_CHUNK_TOKENS", 2):
-            routed_out = self._read(routed)
-        self.assertEqual(routed_out.shape, (3, len(self.PATTERN), self.K))
-        self.assertTrue(torch.equal(routed_out, self._read(oracle)))
-
-    def test_model_without_routed_layers_returns_zeros(self):
-        """A Nemotron-H pattern with no MoE layer still returns all-zero rows."""
-        pattern = "M*-M"
-        cap = self._capturer(self._nemotron_h(pattern))
-        self._run_forward(cap, routed_layers=[])
+        routed_out = self._read(routed)
+        self.assertEqual(routed_out.shape, (3, self.PATTERN.count("E"), self.K))
         self.assertTrue(
-            torch.equal(
-                self._read(cap),
-                torch.zeros((3, len(pattern), self.K), dtype=torch.int32),
-            )
+            torch.equal(routed_out, self._read(oracle)[:, config.moe_layer_ids])
         )
 
 

@@ -397,6 +397,10 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         return payload
 
     def _routed_experts(self, resp_json: dict):
+        self.assertEqual(
+            resp_json["meta_info"]["routed_experts_num_layers"],
+            _QWEN3_30B_A3B_NUM_LAYERS,
+        )
         return extract_routed_experts_from_meta_info(resp_json).reshape(
             -1, _QWEN3_30B_A3B_NUM_LAYERS, _QWEN3_30B_A3B_TOPK
         )
