@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    BitsAndBytesLinearMethod,
     _maybe_shard_bitsandbytes_4bit_quant_state,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
@@ -1163,6 +1164,30 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(sharded.shape, torch.Size((2, 8)))
         torch.testing.assert_close(sharded.absmax, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+
+    def test_bitsandbytes_single_shard_calls_matmul_4bit_directly(self):
+        # The common (unfused) case has exactly one quant state; apply() must
+        # call matmul_4bit directly instead of allocating and copying into an
+        # intermediate output buffer, as the multi-shard (fused QKV) path does.
+        import sys
+        import types
+
+        weight = torch.zeros(4, 8, dtype=torch.uint8)
+        weight.bnb_quant_state = {0: MagicMock()}
+        layer = torch.nn.Module()
+        layer.weight = weight
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        fake_result = torch.ones(2, 4, dtype=torch.bfloat16)
+        mock_matmul = MagicMock(return_value=fake_result)
+        fake_module = types.ModuleType("bitsandbytes")
+        fake_module.matmul_4bit = mock_matmul
+
+        method = BitsAndBytesLinearMethod.__new__(BitsAndBytesLinearMethod)
+        with patch.dict(sys.modules, {"bitsandbytes": fake_module}):
+            out = method.apply(layer, x)
+
+        mock_matmul.assert_called_once()
+        self.assertTrue(torch.equal(out, fake_result))
 
     def test_assign_load_preserves_bitsandbytes_tp_attrs(self):
         class TinyModule(torch.nn.Module):
