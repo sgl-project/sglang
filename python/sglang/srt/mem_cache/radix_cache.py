@@ -202,16 +202,33 @@ class RadixKey:
             if max_rows <= 0:
                 return 0
             if page_size > 1:
-                pages = max_rows // page_size
-                matched_pages = 0
-                for p in range(pages):
-                    start = p * page_size
-                    end = start + page_size + 1
-                    if t0[start:end] == t1[offset + start : offset + end]:
-                        matched_pages += 1
-                    else:
-                        break
-                return matched_pages * page_size
+                num_pages = max_rows // page_size
+                lo_page = 0
+                step_pages = 1
+                while lo_page < num_pages:
+                    hi_page = (
+                        lo_page + step_pages
+                        if lo_page + step_pages < num_pages
+                        else num_pages
+                    )
+                    lo_tok = lo_page * page_size
+                    hi_tok = hi_page * page_size + 1
+                    if t0[lo_tok:hi_tok] != t1[offset + lo_tok : offset + hi_tok]:
+                        while hi_page - lo_page > 1:
+                            mid_page = (lo_page + hi_page) // 2
+                            mid_tok = mid_page * page_size + 1
+                            if (
+                                t0[lo_tok:mid_tok]
+                                == t1[offset + lo_tok : offset + mid_tok]
+                            ):
+                                lo_page = mid_page
+                                lo_tok = mid_page * page_size
+                            else:
+                                hi_page = mid_page
+                        return lo_page * page_size
+                    lo_page = hi_page
+                    step_pages *= 2
+                return num_pages * page_size
 
             n = min(len0, len1 - offset)
             lo = 0
@@ -235,16 +252,30 @@ class RadixKey:
             return 0
 
         if page_size > 1:
-            pages = n // page_size
-            matched_pages = 0
-            for p in range(pages):
-                start = p * page_size
-                end = start + page_size
-                if t0[start:end] == t1[offset + start : offset + end]:
-                    matched_pages += 1
-                else:
-                    break
-            return matched_pages * page_size
+            num_pages = n // page_size
+            lo_page = 0
+            step_pages = 1
+            while lo_page < num_pages:
+                hi_page = (
+                    lo_page + step_pages
+                    if lo_page + step_pages < num_pages
+                    else num_pages
+                )
+                lo_tok = lo_page * page_size
+                hi_tok = hi_page * page_size
+                if t0[lo_tok:hi_tok] != t1[offset + lo_tok : offset + hi_tok]:
+                    while hi_page - lo_page > 1:
+                        mid_page = (lo_page + hi_page) // 2
+                        mid_tok = mid_page * page_size
+                        if t0[lo_tok:mid_tok] == t1[offset + lo_tok : offset + mid_tok]:
+                            lo_page = mid_page
+                            lo_tok = mid_tok
+                        else:
+                            hi_page = mid_page
+                    return lo_page * page_size
+                lo_page = hi_page
+                step_pages *= 2
+            return num_pages * page_size
 
         lo = 0
         step = 1
