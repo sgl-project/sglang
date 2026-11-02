@@ -282,13 +282,14 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
+        self, *, window_lengths: Optional[Dict[str, int]] = None
     ) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slots, one per sub-pool, in drive order with the
         windows in `windows` order: the tree's first window slot is the
-        target's window. ``window_reaches`` names the storage sub-pools
-        additional readers use, and how far back from the committed length
-        each reader needs them."""
+        target's window. A window slot keeps ``window_lengths[name]``, the
+        tail a running request keeps of it (`KVStorage.retained_window_lengths`);
+        without it, the window its layers declare (for a slot's identity
+        only)."""
         for sub_pool in self.sub_pools:
             lifetime = sub_pool.lifetime
             if isinstance(lifetime, StateLifetime) and (
@@ -304,9 +305,8 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                 component=s.external.tree_component,
                 family=_TREE_FAMILY[type(s.lifetime)],
                 window=(
-                    max(s.lifetime.window, (window_reaches or {}).get(s.name, 0))
+                    (window_lengths or {}).get(s.name, s.lifetime.window)
                     if isinstance(s.lifetime, WindowLifetime)
-                    and s.lifetime.window is not None
                     else None
                 ),
                 checkpoint_interval=(

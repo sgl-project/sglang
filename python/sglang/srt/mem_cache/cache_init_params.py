@@ -87,14 +87,10 @@ class CacheInitParams:
         # Cache history required by every reader of the SWA sub-pool. Retention,
         # tree locks, prefix matching and host transfers must use the same span.
         # The model's attention window remains sliding_window_size.
-        if self.sliding_window_size is None:
-            return None
-        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
-        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+        from sglang.srt.mem_cache.base_prefix_cache import retained_target_window
 
-        allocator = self.token_to_kv_pool_allocator
-        return (
-            kv_storage_of(self.req_to_token_pool, allocator)
-            .retained_window_lengths()
-            .get(window_sub_pool_of(allocator), self.sliding_window_size)
+        return retained_target_window(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.sliding_window_size,
         )

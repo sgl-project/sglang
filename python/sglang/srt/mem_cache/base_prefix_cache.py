@@ -166,6 +166,22 @@ class InsertResult:
             ranges.append((start, end))
 
 
+def retained_target_window(
+    req_to_token_pool, allocator, sliding_window_size: Optional[int]
+) -> Optional[int]:
+    """The tail a running request keeps of the target's window (the storage's
+    retained length), or None for a model without a sliding window."""
+    if sliding_window_size is None:
+        return None
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    return (
+        kv_storage_of(req_to_token_pool, allocator)
+        .retained_window_lengths()
+        .get(window_sub_pool_of(allocator), sliding_window_size)
+    )
+
+
 def window_sub_pool_of(allocator) -> str:
     """The sub-pool the model's sliding-window layers write: a unified
     pool's target window, else the static pools' window pool."""
@@ -781,15 +797,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_retain_window(self) -> Optional[int]:
         # What the frees and unlocks of a running request's SWA keep behind it;
         # every other SWA rule uses sliding_window_size.
-        if self.sliding_window_size is None:
-            return None
-        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-
-        allocator = self.token_to_kv_pool_allocator
-        return (
-            kv_storage_of(self.req_to_token_pool, allocator)
-            .retained_window_lengths()
-            .get(window_sub_pool_of(allocator), self.sliding_window_size)
+        return retained_target_window(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.sliding_window_size,
         )
 
     def swa_retain_floor(self, req) -> int | None:
