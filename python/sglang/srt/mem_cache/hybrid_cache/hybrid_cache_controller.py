@@ -990,7 +990,8 @@ class HybridCacheController(BaseHiCacheController):
             if self.is_kv_sharded
             else len(op.device_indices)
         )
-        num_bytes = kv_tokens * anchor.host_pool.size_per_token
+        pool = anchor.host_pool
+        num_bytes = kv_tokens // getattr(pool, "dcp_size", 1) * pool.size_per_token
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -1010,7 +1011,8 @@ class HybridCacheController(BaseHiCacheController):
                     if t.host_indices is not None
                     else 0
                 )
-            num_bytes += num_slots * entry.host_pool.size_per_token
+            pool = entry.host_pool
+            num_bytes += num_slots // getattr(pool, "dcp_size", 1) * pool.size_per_token
         return num_bytes
 
     def load(
