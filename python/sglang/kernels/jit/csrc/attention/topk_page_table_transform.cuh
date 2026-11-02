@@ -23,16 +23,16 @@ struct TopkPageTableTransformParams {
   const int32_t* __restrict__ row_batch;   // [rows]
   int64_t indices_stride;
   int64_t page_table_stride;
-  uint32_t num_quads;    // topk / 4
-  uint32_t total_quads;  // rows * num_quads
+  uint32_t total_quads;  // rows * topk / 4
 };
 
-template <uint32_t kPageSize, bool kUsePDL>
+template <uint32_t kPageSize, uint32_t kTopK, bool kUsePDL>
 __global__ void topk_page_table_transform_kernel(const __grid_constant__ TopkPageTableTransformParams params) {
   using namespace device;
+  constexpr uint32_t kNumQuads = kTopK / 4;
   const uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
-  const auto row = q / params.num_quads;
-  const auto q4 = q % params.num_quads;
+  const auto row = q / kNumQuads;
+  const auto q4 = q % kNumQuads;
   PDLWaitPrimary<kUsePDL>();
   if (q < params.total_quads) {
     const auto page_row = params.page_table + params.row_batch[row] * params.page_table_stride;
@@ -48,17 +48,18 @@ __global__ void topk_page_table_transform_kernel(const __grid_constant__ TopkPag
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <uint32_t kPageSize, bool kUsePDL>
+template <uint32_t kPageSize, uint32_t kTopK, bool kUsePDL>
 struct TopkPageTableTransformKernel {
+  static_assert(kTopK > 0 && kTopK % 4 == 0, "topk must be a positive multiple of 4");
   static constexpr uint32_t kBlockSize = 128;
-  static constexpr auto kernel = topk_page_table_transform_kernel<kPageSize, kUsePDL>;
+  static constexpr auto kernel = topk_page_table_transform_kernel<kPageSize, kTopK, kUsePDL>;
 
   static void
   run(const tvm::ffi::TensorView indices, const tvm::ffi::TensorView page_table, const tvm::ffi::TensorView row_batch) {
     using namespace host;
     auto R = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
-    TensorMatcher({R, -1})  // indices
+    TensorMatcher({R, kTopK})  // indices
         .with_strides({-1, 1})
         .with_dtype<int32_t>()
         .with_device<kDLGPU>(device)
@@ -74,18 +75,15 @@ struct TopkPageTableTransformKernel {
         .with_device(device)
         .verify(row_batch);
     const auto num_rows = static_cast<uint32_t>(R.unwrap());
-    const auto topk = static_cast<uint32_t>(indices.size(1));
-    CHECK_HOST(topk % 4 == 0) << "topk " << topk << " is not a multiple of 4";
-    if (num_rows == 0 || topk == 0) return;
-    const auto total_quads = static_cast<uint64_t>(num_rows) * (topk / 4);
-    CHECK_HOST(total_quads <= UINT32_MAX) << "too many indices: " << num_rows << " x " << topk;
+    if (num_rows == 0) return;
+    const auto total_quads = static_cast<uint64_t>(num_rows) * (kTopK / 4);
+    CHECK_HOST(total_quads <= UINT32_MAX) << "too many indices: " << num_rows << " x " << kTopK;
     const auto params = TopkPageTableTransformParams{
         .indices = static_cast<int32_t*>(indices.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .row_batch = static_cast<const int32_t*>(row_batch.data_ptr()),
         .indices_stride = indices.stride(0),
         .page_table_stride = page_table.stride(0),
-        .num_quads = topk / 4,
         .total_quads = static_cast<uint32_t>(total_quads),
     };
     const auto grid = div_ceil(params.total_quads, kBlockSize);

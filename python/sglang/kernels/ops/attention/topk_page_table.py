@@ -20,8 +20,10 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_topk_page_table_transform_module(page_size: int) -> Module:
-    args = make_cpp_args(page_size, is_arch_support_pdl())
+def _jit_topk_page_table_transform_module(page_size: int, topk: int) -> Module:
+    if topk <= 0 or topk % 4:
+        raise ValueError(f"topk must be a positive multiple of 4, got {topk}")
+    args = make_cpp_args(page_size, topk, is_arch_support_pdl())
     return load_jit(
         "topk_page_table_transform",
         *args,
@@ -39,5 +41,7 @@ def topk_page_table_transform_(
     """``indices`` int32 ``[rows, topk]`` (``topk`` a multiple of 4) holds request-relative key
     positions; each ``p >= 0`` becomes ``page_table[row_batch[r], p // page_size] * page_size +
     p % page_size``, ``-1`` stays. Returns ``indices``."""
-    _jit_topk_page_table_transform_module(page_size).run(indices, page_table, row_batch)
+    _jit_topk_page_table_transform_module(page_size, indices.shape[1]).run(
+        indices, page_table, row_batch
+    )
     return indices
