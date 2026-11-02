@@ -64,15 +64,20 @@ class BaseHostCache:
     def __init__(
         self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
     ):
-        alloc = ALLOC_MEMORY_FUNCS[device]
-        self.buffer = alloc(
-            (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-            allocator=HostTensorAllocator(),
-        )
-        self.buffer.zero_()
+        dims = (num_tokens, num_layers, topk_size)
+        if num_layers == 0:
+            # mmap rejects a zero-byte mapping; an empty buffer has nothing to pin.
+            self.buffer = torch.empty(dims, dtype=torch.int32)
+        else:
+            alloc = ALLOC_MEMORY_FUNCS[device]
+            self.buffer = alloc(
+                dims,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+                allocator=HostTensorAllocator(),
+            )
+            self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -82,7 +87,7 @@ class BaseHostCache:
     def destroy(self):
         if self.buffer is None:
             return
-        if _is_cuda or _is_hip:
+        if (_is_cuda or _is_hip) and self.num_layers > 0:
             _cuda_host_unregister(self.buffer)
         self.buffer = None
 
@@ -177,15 +182,29 @@ class BaseTopkCapturer:
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ) -> torch.Tensor:
+        cache_pool_idx = self._get_cache_pool_idx(
+            req_pool_idx=req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=req_to_token_pool,
+            start_len=start_len,
+        )
+        return self.host_cache.buffer[cache_pool_idx]
+
+    def _get_cache_pool_idx(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+        start_len: int,
+    ) -> torch.Tensor:
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
         start_len = min(start_len, seqlen - 1)
-        cache_pool_idx = (
+        return (
             req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
             .cpu()
             .clone()
         )
-        return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(
         self,

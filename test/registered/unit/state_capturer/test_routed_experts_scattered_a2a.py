@@ -1,4 +1,5 @@
-"""RoutedExpertsCapturer: DeepEP-family backend recognition and capture width."""
+"""RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
+and routed-layer host storage."""
 
 import unittest
 from types import SimpleNamespace
@@ -6,8 +7,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -75,6 +78,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
     def _capturer(self):
         cap = object.__new__(re_mod.RoutedExpertsCapturer)
         cap.num_fused_shared_experts = 1
+        cap._slot_of_layer = {0: 0, 1: 1}
         cap.device_cache = BaseDeviceCache(
             max_batch_size=8,
             num_layers=2,
@@ -146,6 +150,106 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 device="cpu",
             )
         self.assertEqual(seen["num_fused_shared_experts"], 1)
+
+
+class TestRoutedLayerHostStorage(CustomTestCase):
+    PATTERN = "ME*EM"
+    K = 2
+    NUM_TOKENS = 16
+    OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
+
+    @staticmethod
+    def _fake_host_alloc(dims, dtype, **_):
+        # Like the real mmap-backed allocator, reject a zero-byte mapping.
+        if torch.Size(dims).numel() == 0:
+            raise OSError("Invalid argument")
+        return torch.empty(dims, dtype=dtype)
+
+    def _capturer(self, hf_text_config):
+        parallel = SimpleNamespace(num_dp_ranks=1)
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(
+                re_mod,
+                "get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=8),
+            ),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.dict(
+                base_mod.ALLOC_MEMORY_FUNCS, {"cpu": self._fake_host_alloc}
+            ),
+        ):
+            return re_mod.RoutedExpertsCapturer(
+                SimpleNamespace(hf_text_config=hf_text_config),
+                num_tokens=self.NUM_TOKENS,
+                max_running_requests=4,
+                num_fused_shared_experts=0,
+                device="cpu",
+            )
+
+    def _run_forward(self, cap, routed_layers):
+        with (
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+        ):
+            for layer_id in routed_layers:
+                topk = torch.randint(
+                    0, 64, (len(self.OUT_CACHE_LOC), self.K), dtype=torch.int32
+                )
+                cap.capture(layer_id=layer_id, topk_indices=topk)
+            return cap.on_forward_end(
+                SimpleNamespace(
+                    out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
+                ),
+                can_run_graph=False,
+                cuda_graph_batch=None,
+            )
+
+    def _read(self, cap):
+        pool = SimpleNamespace(req_to_token=self.OUT_CACHE_LOC.unsqueeze(0))
+        return cap.get_topk(
+            req_pool_idx=0, seqlen=5, req_to_token_pool=pool, start_len=1
+        )
+
+    def _nemotron_h(self, pattern):
+        return NemotronHConfig(
+            hybrid_override_pattern=pattern, num_experts_per_tok=self.K
+        )
+
+    def test_routed_layers_read_back_like_all_layer_storage(self):
+        config = self._nemotron_h(self.PATTERN)
+        all_layers_config = SimpleNamespace(
+            num_hidden_layers=len(self.PATTERN), num_experts_per_tok=self.K
+        )
+        routed = self._capturer(config)
+        oracle = self._capturer(all_layers_config)
+        self.assertEqual(routed.host_cache.buffer.shape[1], self.PATTERN.count("E"))
+
+        torch.manual_seed(0)
+        self._run_forward(routed, config.moe_layer_ids)
+        torch.manual_seed(0)
+        self._run_forward(oracle, config.moe_layer_ids)
+        # A 2-token chunk splits the 3 returned tokens across a chunk boundary.
+        with mock.patch.object(re_mod, "_READBACK_CHUNK_TOKENS", 2):
+            routed_out = self._read(routed)
+        self.assertEqual(routed_out.shape, (3, len(self.PATTERN), self.K))
+        self.assertTrue(torch.equal(routed_out, self._read(oracle)))
+
+    def test_model_without_routed_layers_returns_zeros(self):
+        """A Nemotron-H pattern with no MoE layer still returns all-zero rows."""
+        pattern = "M*-M"
+        cap = self._capturer(self._nemotron_h(pattern))
+        self._run_forward(cap, routed_layers=[])
+        self.assertTrue(
+            torch.equal(
+                self._read(cap),
+                torch.zeros((3, len(pattern), self.K), dtype=torch.int32),
+            )
+        )
 
 
 if __name__ == "__main__":

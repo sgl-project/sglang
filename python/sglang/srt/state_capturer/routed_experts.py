@@ -6,12 +6,14 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_dp_local_slice_cpu,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_exec,
@@ -28,6 +30,16 @@ def _is_scattered_a2a_backend() -> bool:
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
 
 
+# Arbitrary; bounds the compact readback temporary to ~16 MiB at 48 layers x topk 22.
+_READBACK_CHUNK_TOKENS = 4096
+
+
+def _routed_layer_ids(hf_text_config) -> list[int]:
+    if isinstance(hf_text_config, NemotronHConfig):
+        return hf_text_config.moe_layer_ids
+    return list(range(hf_text_config.num_hidden_layers))
+
+
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
@@ -36,6 +48,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     slicing. The device cache also holds extra columns for any fused shared
     experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
+
+    Both caches keep one row per routed layer; get_topk returns all model
+    layers, with zeros for layers that never route.
     """
 
     @staticmethod
@@ -70,7 +85,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
         topk_size = model_config.hf_text_config.num_experts_per_tok
-        num_layers = model_config.hf_text_config.num_hidden_layers
+        self.num_model_layers = model_config.hf_text_config.num_hidden_layers
+        self.routed_layer_ids = _routed_layer_ids(model_config.hf_text_config)
+        self._slot_of_layer = {
+            layer_id: slot for slot, layer_id in enumerate(self.routed_layer_ids)
+        }
+        self._routed_layer_index = torch.tensor(self.routed_layer_ids, dtype=torch.long)
+        self._unrouted_layer_index = torch.tensor(
+            sorted(set(range(self.num_model_layers)) - set(self.routed_layer_ids)),
+            dtype=torch.long,
+        )
 
         # Scale by num_dp_ranks so the buffer covers the full DP-concatenated batch.
         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
@@ -85,7 +109,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         super().__init__(
             num_tokens=num_tokens,
             max_batch_size=max_batch_size,
-            num_layers=num_layers,
+            num_layers=len(self.routed_layer_ids),
             topk_size=topk_size,
             device=device,
             name="routed_experts",
@@ -119,13 +143,51 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             topk_indices = F.pad(
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
+        slot = self._slot_of_layer.get(layer_id)
+        if slot is None:
+            raise RuntimeError(
+                f"Layer {layer_id} captured routed experts, but this model's "
+                f"routed layers are {self.routed_layer_ids}."
+            )
         if _is_scattered_a2a_backend():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
-        super().capture(layer_id, topk_indices)
+        super().capture(slot, topk_indices)
+
+    def get_topk(
+        self,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
+    ) -> torch.Tensor:
+        if len(self._unrouted_layer_index) == 0:
+            return super().get_topk(
+                req_pool_idx=req_pool_idx,
+                seqlen=seqlen,
+                req_to_token_pool=req_to_token_pool,
+                start_len=start_len,
+            )
+        cache_pool_idx = self._get_cache_pool_idx(
+            req_pool_idx=req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=req_to_token_pool,
+            start_len=start_len,
+        )
+        out = torch.empty(
+            (len(cache_pool_idx), self.num_model_layers, self.topk_size),
+            dtype=self.host_cache.buffer.dtype,
+        )
+        out.index_fill_(1, self._unrouted_layer_index, 0)
+        for start in range(0, len(cache_pool_idx), _READBACK_CHUNK_TOKENS):
+            chunk = cache_pool_idx[start : start + _READBACK_CHUNK_TOKENS]
+            out[start : start + len(chunk)].index_copy_(
+                1, self._routed_layer_index, self.host_cache.buffer[chunk]
+            )
+        return out
 
     def _get_local_slice(
         self,
