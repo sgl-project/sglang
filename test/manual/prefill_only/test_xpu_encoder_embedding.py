@@ -81,11 +81,15 @@ class TestXPUEncoderEmbeddingModels(CustomTestCase):
             disable_radix_cache=True,
             trust_remote_code=True,
         ) as srt_runner:
-            srt_outputs = srt_runner.forward(truncated_prompts)
+            # One request per prompt, so the check does not depend on batch packing.
+            srt_embeds = [
+                srt_runner.forward([prompt]).embed_logits[0]
+                for prompt in truncated_prompts
+            ]
 
         for i in range(len(truncated_prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
-            srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
+            srt_logits = torch.Tensor(srt_embeds[i])
 
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
 
