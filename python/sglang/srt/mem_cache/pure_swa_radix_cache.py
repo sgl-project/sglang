@@ -30,19 +30,15 @@ class PureSWARadixCache(RadixCache):
         )
         return True
 
-    def swa_evictable_size(self):
-        return self.evictable_size_
+    def _keeps(self, sub_pool: str) -> bool:
+        # Every layer is a window layer: the tree's one pool is the window's.
+        return sub_pool in self.token_to_kv_pool_allocator.window_pool_names()
 
     def window_evictable_size(self, sub_pool: str) -> int:
-        # Every layer is a window layer: the tree's one pool is the window's.
-        return (
-            self.evictable_size_
-            if sub_pool in self.token_to_kv_pool_allocator.window_pool_names()
-            else 0
-        )
+        return self.evictable_size_ if self._keeps(sub_pool) else 0
 
-    def swa_protected_size(self):
-        return self.protected_size_
+    def window_protected_size(self, sub_pool: str) -> int:
+        return self.protected_size_ if self._keeps(sub_pool) else 0
 
     def full_evictable_size(self):
         return 0
@@ -64,7 +60,7 @@ class PureSWARadixCache(RadixCache):
     def available_and_evictable_str(self) -> str:
         allocator = self.token_to_kv_pool_allocator
         swa_available = allocator.swa_available_size()
-        swa_evictable = self.swa_evictable_size()
+        swa_evictable = self.evictable_size_
         return (
             f"SWA available tokens: {swa_available + swa_evictable} "
             f"({swa_available=} + {swa_evictable=})\n"

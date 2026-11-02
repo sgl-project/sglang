@@ -550,7 +550,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         cache = mock.Mock()
         cache.supports_prefix_sharing.return_value = True
         cache.full_evictable_size.return_value = 0
-        cache.swa_evictable_size.return_value = 0
+        cache.window_evictable_size.return_value = 0
         cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
 
         alloc.flush_deferred_full_frees()

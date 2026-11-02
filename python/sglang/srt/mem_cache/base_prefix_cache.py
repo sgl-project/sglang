@@ -697,9 +697,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
-    def swa_evictable_size(self):
-        return 0
-
     def window_evictable_size(self, sub_pool: str) -> int:
         """Evictable tokens of one window sub-pool."""
         return 0
@@ -710,13 +707,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_protected_size(self):
         return 0
 
-    def swa_protected_size(self):
-        return 0
-
     def window_protected_size(self, sub_pool: str) -> int:
-        """Locked tokens of one window sub-pool; a cache keeping its one window
-        without slots answers for it under any name."""
-        return self.swa_protected_size()
+        """Locked tokens of one window sub-pool."""
+        return 0
 
     def total_size(self):
         raise NotImplementedError()
@@ -839,8 +832,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             for sub_pool, seqlen in kv.evicted_seqlens().items()
         }
 
-    def swa_reprefill_tail_tokens(self, req=None) -> int:
-        # Caches whose matched SWA is not reusable as is override this.
+    def window_reprefill_tail_tokens(self, req=None) -> int:
+        # Caches whose matched window rows are not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:

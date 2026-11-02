@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -216,7 +217,7 @@ class _Workload:
                 for _, key in sorted(self.inserted_keys.items())
             )
             state["swa sizes"] = (
-                cache.swa_evictable_size(),
+                cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
                 self.swa_allocator.swa_available_size(),
                 self.swa_host_pool.available_size(),
             )
@@ -237,7 +238,8 @@ class _Workload:
         if extend > self._full_available() + cache.full_evictable_size() or (
             self.swa
             and extend + WINDOW + PAGE
-            > self.swa_allocator.swa_available_size() + cache.swa_evictable_size()
+            > self.swa_allocator.swa_available_size()
+            + cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
         ):
             cache.unlock(admit_lock)
             return None

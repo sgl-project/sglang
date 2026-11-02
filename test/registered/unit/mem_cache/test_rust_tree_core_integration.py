@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import core_window_evictable, core_window_protected
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -1845,7 +1846,7 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
         return  # A Rust ownership violation poisons the core.
     core.dec_host_lock_ref(leaf, params)
     if swa:
-        assert core.swa_protected_size() == 1
+        assert core_window_protected(core) == 1
     core.dec_lock_ref(leaf, device_lock.to_dec_params())
     core.sanity_check([], [])
 
@@ -4257,7 +4258,7 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
         (0, 8)
     ]
     assert core.full_evictable_size() == 16
-    assert core.swa_evictable_size() == 8
+    assert core_window_evictable(core) == 8
     core.sanity_check([], [])
 
 
@@ -4322,7 +4323,7 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
             == []
         )
     assert core.full_evictable_size() == 8
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4351,12 +4352,12 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
         assert action.old_node_id == leaf
         assert action.new_child_node_id == leaf
     assert actions[0].new_node_id != actions[1].new_node_id
-    assert core.swa_protected_size() == 4
-    assert core.swa_evictable_size() == 0
+    assert core_window_protected(core) == 4
+    assert core_window_evictable(core) == 0
     core.finish_write_through([action.new_node_id for action in actions] + [leaf], leaf)
     core.dec_lock_ref(leaf, receipt.to_dec_params())
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 4
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4390,7 +4391,7 @@ def test_swa_window_repair_rejects_invalid_publication_without_partial_changes()
         (0, 2),
         (6, 8),
     ]
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4537,7 +4538,7 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     assert core.mamba_protected_size() == 1
     core.dec_lock_ref(node, owner.to_dec_params())
     assert core.protected_size() == 0
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     assert core.mamba_protected_size() == 0
 
 
@@ -5196,15 +5197,15 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert result.component_lock_uuids[ComponentType.SWA] is not None
     assert not result.component_host_lock_uuids
     # The locked window is protected SWA accounting, visible through the binding.
-    assert core.swa_protected_size() == 2
-    assert core.swa_evictable_size() == 1
+    assert core_window_protected(core) == 2
+    assert core_window_evictable(core) == 1
     core.dec_lock_ref(
         node,
         result.to_dec_params(),
     )
     # The uuid-bounded release returned the window to evictable.
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 3
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 3
     # A repeat acquire reuses the stamped uuid.
     again = core.inc_lock_ref(node)
     assert (
@@ -5214,7 +5215,7 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.SWA,))
     assert ComponentType.SWA not in skipped.component_lock_uuids
     core.dec_lock_ref(node, skipped.to_dec_params())
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     core.dec_lock_ref(node, again.to_dec_params())
     core.sanity_check([], [])
 
@@ -5235,7 +5236,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
     )
     result = core.inc_lock_ref(leaf)
     assert result.component_lock_uuids[ComponentType.SWA] is None
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     release = core.dec_swa_lock_only if swa_only else core.dec_lock_ref
     if missing_receipt:
         missing = DecLockRefParams(node_id=leaf)
@@ -5247,7 +5248,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
         assert error.value.__cause__ is None
         return  # A Rust ownership violation poisons the core.
     release(leaf, result.to_dec_params())
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     if swa_only:
         core.dec_lock_ref(leaf, DecLockRefParams(node_id=leaf), skip_swa=True)
     core.sanity_check([], [])

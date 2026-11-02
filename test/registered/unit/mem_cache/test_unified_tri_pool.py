@@ -454,7 +454,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                 tree_core = MagicMock()
                 tree_core.full_evictable_size.return_value = len(full_leaves)
                 tree_core.mamba_evictable_size.return_value = 0
-                tree_core.swa_evictable_size.return_value = 0
+                tree_core.window_evictable_size.return_value = 0
                 tree_core.component_evictable_size.side_effect = lambda ct: (
                     len(full_leaves) if ct == ComponentType.FULL else 0
                 )
@@ -1596,7 +1596,6 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         """A prefix tree with nothing evictable."""
         return SimpleNamespace(
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
             mamba_evictable_size=lambda: 0,
             supports_mamba=lambda: True,
