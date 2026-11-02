@@ -136,6 +136,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         backend.state_layer_cache = state.at_layer_idx
         backend.state_pool = SimpleNamespace(
             replayssm_is_kda=ring,
+            replayssm_request_ring=False,
+            enable_linear_replayssm=False,
             get_speculative_mamba2_params_all_layers=lambda: state,
         )
         backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])

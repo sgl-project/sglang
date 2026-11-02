@@ -407,6 +407,9 @@ def test_prompt_cache_skips_processor_and_weight_preparation(device):
             data={
                 "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+                "pixel_values": torch.tensor(
+                    list(kwargs["images"][0].getdata()), dtype=torch.float32
+                ),
             }
         )
 

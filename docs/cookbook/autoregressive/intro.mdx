@@ -118,7 +118,7 @@ metatags:
   <Card
     title="Baidu"
     mode="card"
-    href="/cookbook/autoregressive/Baidu/PaddleOCR-VL"
+    href="/cookbook/autoregressive/Baidu/Unlimited-OCR-2"
     img="/cards/logos/baidu.svg"
   />
   <Card

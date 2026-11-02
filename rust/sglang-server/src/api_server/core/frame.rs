@@ -216,6 +216,8 @@ pub(crate) enum HealthStatus {
     Healthy,
     NotReady,
     Stalled,
+    /// A graceful drain has begun; no probe was sent.
+    Draining,
 }
 
 /// A semantic generation event before any transport-specific framing.

@@ -634,6 +634,7 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
+        uocr_graph_io_deferred: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -660,6 +661,7 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                uocr_graph_io_deferred=uocr_graph_io_deferred,
                 pp_loras=pp_loras,
             )
             if folded is not None:
@@ -791,31 +793,3 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
-
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            batch.split_forward_batch = forward_batch
-
-        out = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
-        )
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        if logits_output:
-            next_token_ids = self.model_runner.sample(
-                logits_output, batch.split_forward_batch
-            )
-        else:
-            next_token_ids = None
-        self._maybe_finalize_elastic_cuda_graph_scale()
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            expert_distribution_metrics=out.expert_distribution_metrics,
-        )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result

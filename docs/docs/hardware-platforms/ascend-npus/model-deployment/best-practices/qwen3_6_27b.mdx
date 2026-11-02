@@ -14,14 +14,14 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-27B | Ascend A3 Series Products | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in64k-out1k-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 2 | PD Mixed | 128k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 2 | PD Mixed | 16k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
-| Qwen3.6-27B | Ascend A3 Series Products | 2 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
+| Qwen3.6-27B | A3 Series Products | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-27B | A3 Series Products | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
+| Qwen3.6-27B | A3 Series Products | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
+| Qwen3.6-27B | A3 Series Products | 1 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in64k-out1k-50ms) |
+| Qwen3.6-27B | A3 Series Products | 2 | PD Mixed | 128k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
+| Qwen3.6-27B | A3 Series Products | 2 | PD Mixed | 16k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
+| Qwen3.6-27B | A3 Series Products | 2 | PD Mixed | 64k+1k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -31,7 +31,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -133,7 +133,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -234,7 +234,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -332,7 +332,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -428,7 +428,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -517,7 +517,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 
@@ -609,7 +609,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 
@@ -705,7 +705,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.6-27B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 

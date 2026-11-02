@@ -18,10 +18,25 @@ impl CoreHandle {
     /// signal rather than this probe's own result, matching Python's
     /// `last_receive_tstamp` behavior on a busy server.
     pub(crate) async fn probe_health(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
+        // Checked first, as Python checks `gracefully_exit`: a draining
+        // server sends no probe.
+        if self.is_draining() {
+            return Ok(HealthStatus::Draining);
+        }
         if !self.is_serving() {
             return Ok(HealthStatus::NotReady);
         }
+        // Detached, as Python's handler runs to completion after its client
+        // disconnects: a prober that gives up before `timeout` must not
+        // cancel the outcome the drain reads (Python's `UnHealthy`).
+        let core = self.clone();
+        tokio::spawn(async move { core.run_health_probe(timeout).await })
+            .await
+            .map_err(|error| CoreError::Internal(format!("health probe task: {error}")))?
+    }
 
+    async fn run_health_probe(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let baseline = self.response_activity();
         let probe = GenerateRequest {
             rid: Rid::new_health_check(),
@@ -42,14 +57,23 @@ impl CoreHandle {
         // The probe is intentionally not drained. Its call stays alive while
         // the heartbeat is observed, then aborts on drop to clean up a probe
         // that a busy scheduler skipped without producing a terminal frame.
-        let _probe = self.generate_internal(probe, false).await?;
+        // A wedged scheduler can leave the intake full: the submission counts
+        // against the same deadline, and the heartbeat still decides, as
+        // Python judges only `last_receive_tstamp`.
+        let _probe =
+            match tokio::time::timeout_at(deadline, self.generate_internal(probe, false)).await {
+                Ok(probe) => Some(probe?),
+                Err(_) => None,
+            };
 
-        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.response_activity() != baseline {
+                self.inner.drain.set_unhealthy(false);
                 return Ok(HealthStatus::Healthy);
             }
             if tokio::time::Instant::now() >= deadline {
+                // Python's `UnHealthy`: a drain begun now skips the wait.
+                self.inner.drain.set_unhealthy(true);
                 return Ok(HealthStatus::Stalled);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -100,12 +124,14 @@ impl CoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::core::DrainEnd;
+    use crate::api_server::handlers::AbortEnding::CancelledError;
     use crate::api_server::handlers::test_utils::*;
     use crate::message::request::RequestKind;
     use crate::message::response::{ChunkEvent, ResponseItem, frame_health_ack};
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::from_scheduler::{ActivityCounter, Dispatcher};
-    use crate::tokenizer_manager::wiring::{AbortSource, Senders};
+    use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 
     /// A busy scheduler skips the probe and acknowledges it after its next step.
     /// The dispatcher counts the acknowledgement as scheduler output, so the
@@ -140,7 +166,7 @@ mod tests {
         let rid = request.rid.clone();
         assert!(rid.as_str().starts_with("HEALTH_CHECK_"));
         assert!(
-            !handle.abort(None),
+            !handle.abort(None, CancelledError),
             "internal probes must not enter the public abort-all registry"
         );
         assert!(from_scheduler_tx.push(frame_health_ack()));
@@ -157,6 +183,195 @@ mod tests {
             detok_rx.try_recv().is_err(),
             "an acknowledgement routes nothing"
         );
+    }
+
+    /// The drain waits for client calls but not for health probes, and the
+    /// last probe's outcome decides whether it waits at all: a stall (Python's
+    /// `UnHealthy`) skips the wait, a later healthy probe restores it. Once
+    /// draining, health answers without probing the scheduler.
+    #[tokio::test]
+    async fn drain_tracks_client_calls_and_the_last_probe_outcome() {
+        async fn settles<F: std::future::Future>(future: F) -> Option<F::Output> {
+            tokio::time::timeout(Duration::from_millis(100), future)
+                .await
+                .ok()
+        }
+        async fn probe(
+            handle: &CoreHandle,
+            intake_rx: &flume::Receiver<TmEvent>,
+            activity: Option<&ActivityCounter>,
+        ) -> HealthStatus {
+            let task = tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    handle
+                        .probe_health(Duration::from_millis(50))
+                        .await
+                        .unwrap()
+                }
+            });
+            let _probe = accept_intake(intake_rx.recv_async().await.unwrap());
+            if let Some(activity) = activity {
+                activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            task.await.unwrap()
+        }
+
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let activity: ActivityCounter = Default::default();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            activity.clone(),
+            true,
+            false,
+            Vec::new(),
+        );
+        let call = handle
+            .generate(GenerateRequest {
+                rid: "client".into(),
+                input_ids: Some(vec![1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _client = accept_intake(intake_rx.recv_async().await.unwrap());
+
+        assert_eq!(
+            probe(&handle, &intake_rx, None).await,
+            HealthStatus::Stalled
+        );
+        assert_eq!(
+            probe(&handle, &intake_rx, Some(&activity)).await,
+            HealthStatus::Healthy
+        );
+        handle.begin_drain(false);
+        assert_eq!(
+            settles(handle.drain_ended()).await,
+            None,
+            "a client call is in flight"
+        );
+        assert_eq!(
+            handle
+                .probe_health(Duration::from_millis(50))
+                .await
+                .unwrap(),
+            HealthStatus::Draining
+        );
+        assert!(
+            intake_rx.try_recv().is_err(),
+            "a draining server sends no probe"
+        );
+        drop(call);
+        assert_eq!(settles(handle.drain_ended()).await, Some(DrainEnd::Drained));
+
+        // A stalled last probe: the drain skips the in-flight call.
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            Default::default(),
+            true,
+            false,
+            Vec::new(),
+        );
+        let _call = handle
+            .generate(GenerateRequest {
+                rid: "client".into(),
+                input_ids: Some(vec![1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _client = accept_intake(intake_rx.recv_async().await.unwrap());
+        assert_eq!(
+            probe(&handle, &intake_rx, None).await,
+            HealthStatus::Stalled
+        );
+        handle.begin_drain(false);
+        assert_eq!(settles(handle.drain_ended()).await, Some(DrainEnd::Forced));
+    }
+
+    /// A router's probe client gives up long before the probe's own timeout;
+    /// the stall must still be recorded for the drain (Python's handler also
+    /// runs on after its client left). A wedged scheduler can leave the intake
+    /// full: that counts against the same deadline instead of hanging, and the
+    /// heartbeat still decides the outcome.
+    #[tokio::test]
+    async fn probe_outcome_survives_the_client_and_a_full_intake() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            Default::default(),
+            true,
+            false,
+            Vec::new(),
+        );
+        let _call = handle
+            .generate(GenerateRequest {
+                rid: "client".into(),
+                input_ids: Some(vec![1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _client = accept_intake(intake_rx.recv_async().await.unwrap());
+        // The client disconnects after 20 ms; the probe's timeout is 100 ms.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                handle.probe_health(Duration::from_millis(100))
+            )
+            .await
+            .is_err()
+        );
+        let _probe = accept_intake(intake_rx.recv_async().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.begin_drain(false);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), handle.drain_ended())
+                .await
+                .ok(),
+            Some(DrainEnd::Forced)
+        );
+
+        // Nobody drains this intake. The heartbeat still decides: responses
+        // to calls already admitted keep the server healthy.
+        let (intake_tx, _intake_rx) = flume::bounded(0);
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let activity: ActivityCounter = Default::default();
+        let handle = configured_handle(
+            intake_tx,
+            abort_tx,
+            8,
+            activity.clone(),
+            true,
+            false,
+            Vec::new(),
+        );
+        let probe = || async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                handle.probe_health(Duration::from_millis(50)),
+            )
+            .await
+            .expect("the probe hung on a full intake")
+            .unwrap()
+        };
+        assert_eq!(probe().await, HealthStatus::Stalled);
+        let heartbeat = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(probe().await, HealthStatus::Healthy);
+        heartbeat.await.unwrap();
     }
 
     #[tokio::test]
@@ -209,7 +424,7 @@ mod tests {
         assert_eq!(warmup.sampling_params.max_new_tokens, Some(8));
         assert_eq!(warmup.bootstrap_host, None);
         assert!(
-            !harness.handle.abort(None),
+            !harness.handle.abort(None, CancelledError),
             "startup warmup must not enter the public abort-all registry"
         );
         request

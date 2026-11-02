@@ -25,9 +25,11 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
+    get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_unlimited_ocr_v2,
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
@@ -368,6 +370,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     use_mla_backend=kvc.use_mla_backend,
                     num_layers=num_layers,
                     element_size=kv_size,
+                    start_layer=kvc.layer_info.start_layer,
+                    is_draft_worker=kvc.is_draft_worker,
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size
@@ -488,6 +492,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes * full_pool_ratio
+        elif is_unlimited_ocr_v2(model_config.hf_config):
+            # Mirrors _build_unlimited_ocr_v2_kv_pool: main K+V on every layer
+            # plus the DASH router's single-head index K (never a V).
+            sparse_cfg = get_unlimited_ocr_v2_sparse_config(model_config.hf_config)
+            kv_heads = model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size,
+                get_parallel().attn_dcp_size,
+            )
+            main_bytes = (
+                effective_num_layers * 2 * kv_heads * model_config.head_dim * kv_size
+            )
+            index_bytes = (
+                effective_num_layers
+                * int(sparse_cfg["sparse_index_dim"])
+                * torch._utils._element_size(kvc.model_dtype)
+            )
+            return main_bytes + index_bytes
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (

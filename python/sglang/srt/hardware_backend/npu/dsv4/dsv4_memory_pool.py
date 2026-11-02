@@ -24,6 +24,10 @@ import torch_npu
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4IndexerBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -54,6 +58,13 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # create_buffer(), which reads self.kernel_page_size.
         self.kernel_page_size = kernel_page_size
         super().__init__(*args, **kwargs)
+
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        if self.store_dtype != torch.bfloat16:
+            return super().paged_buffer_info()
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.kernel_page_size, layout="pa_nd"
+        )
 
     @property
     def a5_packed_kv_dim(self) -> int:
@@ -220,6 +231,20 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 )
                 for _ in range(self.layer_num)
             ]
+
+    def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
+        return DSV4IndexerBufferInfo(
+            key=DSV4PagedBufferInfo.from_buffers(
+                self.index_k_buffer,
+                page_slots=self._kernel_page_size,
+                layout="pa_nd",
+            ),
+            scale=DSV4PagedBufferInfo.from_buffers(
+                self.index_scale_buffer,
+                page_slots=self._kernel_page_size,
+                layout="pa_nd",
+            ),
+        )
 
     @property
     def has_npu_storage(self) -> bool:

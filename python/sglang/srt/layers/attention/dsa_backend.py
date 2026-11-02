@@ -2312,8 +2312,8 @@ class DeepseekSparseAttnBackend(
             raise NotImplementedError(
                 "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
                 f"batches only; got forward_mode={forward_batch.forward_mode.name} "
-                "(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under "
-                "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
+                "(DLLM_EXTEND under --dllm-algorithm; --enable-mixed-chunk is "
+                "rejected at launch)."
             )
 
         if self.use_fused_topk:

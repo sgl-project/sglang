@@ -1208,6 +1208,29 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
         self.assertEqual(profile.sink_frames, MANIFEST.sink_frames)
         self.assertEqual(profile.max_steps, 4)
 
+    def test_auto_follows_the_training_window(self):
+        """auto slides over the artifact window only when the training config recorded
+        one and the artifact agrees; explicit modes still override (frustum needs full)."""
+        config = CosmosDreamsConfig()
+        self.assertEqual(config.history_mode, "auto")
+        # Exports without a recorded window keep whole-clip history, as before.
+        profile = config.inference_profile(MANIFEST, trained_window=(None, 0))
+        self.assertEqual((profile.history_mode, profile.window_frames), ("full", 226))
+        window, sink = MANIFEST.window_frames, MANIFEST.sink_frames
+        profile = config.inference_profile(MANIFEST, trained_window=(window, sink))
+        self.assertEqual(
+            (profile.history_mode, profile.cache_size, profile.sink_frames),
+            ("sliding", window, sink),
+        )
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            config.inference_profile(MANIFEST, trained_window=(window, sink + 1))
+        # An artifact without a window cannot have trained with one.
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            config.inference_profile(UNIFIED_MANIFEST, trained_window=(64, 8))
+        config.update_pipeline_config({"history_mode": "full"})
+        profile = config.inference_profile(MANIFEST, trained_window=(window, sink))
+        self.assertEqual(profile.history_mode, "full")
+
     def test_artifact_schedule_on_every_chunk_is_an_explicit_override(self):
         config = CosmosDreamsConfig()
         config.update_pipeline_config(

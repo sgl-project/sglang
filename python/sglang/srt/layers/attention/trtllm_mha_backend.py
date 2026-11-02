@@ -790,8 +790,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
         # Target verify runs the decode kernel, causal within each request's rows; a
-        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
-        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+        # topk-1 chain needs no mask (SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY), while a tree would.
+        if not envs.SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY.get() or self.topk > 1:
             return None
         return maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,

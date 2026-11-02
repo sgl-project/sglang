@@ -107,6 +107,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             q_b_scale.view(1, -1).to(torch.float) if q_b_scale is not None else None
         )
         self.is_npu_arch35 = is_npu_arch35()
+        self.no_rope_mlaprolog = None
+        if rotary_emb is None:
+            # MLAProlog V4 supports no-RoPE with BF16 or FP8 KV.
+            from sgl_kernel_npu.operators.attention import mlaprolog_v4
+
+            self.no_rope_mlaprolog = mlaprolog_v4
 
         # Resolve the MLAProlog mode once from the loaded projection methods.
         # INT8 dtype alone cannot distinguish static from dynamic W8A8.
@@ -297,7 +303,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             (self.q_lora_rank, self.num_local_heads * self.qk_head_dim),
         )
         if self.weight_quant_mode == 2:
-            if self.rotary_emb.is_neox_style:
+            if self.rotary_emb is not None and self.rotary_emb.is_neox_style:
                 raise RuntimeError("Dynamic INT8 MLAProlog requires interleaved RoPE")
             # ModelSlim has already transposed INT8 weights to [K, N].
             for norm in (self.q_a_layernorm, self.kv_a_layernorm):
@@ -566,7 +572,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         if not self.has_preprocess_weights:
             self.mlaprolog_preprocess_weight()
             self.has_preprocess_weights = True
-        self.cos, self.sin = self.get_sin_cos(positions)
+        if self.no_rope_mlaprolog is not None:
+            self.cos = self.sin = None
+        else:
+            self.cos, self.sin = self.get_sin_cos(positions)
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
         pool = get_token_to_kv_pool()
         packed = pool.dsa_kv_cache_store_fp8
@@ -647,8 +656,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             )
         import torch_npu
 
-        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = (
-            torch_npu.npu_mla_prolog_v3(**mla_prolog_input_args)
+        mlaprolog = self.no_rope_mlaprolog or torch_npu.npu_mla_prolog_v3
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = mlaprolog(
+            **mla_prolog_input_args
         )
         if self.weight_quant_mode == 0:
             dequant_q_norm = None
@@ -672,16 +682,24 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
 
     def uses_mlaprolog(self) -> bool:
         _is_dsa_mlaprolog = (
-            self.is_npu_arch35 or self.weight_quant_mode == 2
-        ) and get_token_to_kv_pool().index_head_dim is not None
-        return _is_dsa_mlaprolog or (
-            hasattr(self.quant_config, "ignore")
-            and any(re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore)
-            # Other ModelSlim projections retain the legacy MLAPO path.
-            and not (
-                hasattr(self.qkv_a_proj.quant_method, "quantization_config")
-                and self.qkv_a_proj.quant_method.quantization_config.get_name()
-                == "modelslim"
+            self.weight_quant_mode == 2
+            and get_token_to_kv_pool().index_head_dim is not None
+        )
+        return (
+            self.is_npu_arch35
+            or (self.no_rope_mlaprolog is not None and self.weight_quant_mode in (0, 2))
+            or _is_dsa_mlaprolog
+            or (
+                hasattr(self.quant_config, "ignore")
+                and any(
+                    re.fullmatch(r".*kv_b_proj", l) for l in self.quant_config.ignore
+                )
+                # Other ModelSlim projections retain the legacy MLAPO path.
+                and not (
+                    hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+                    and self.qkv_a_proj.quant_method.quantization_config.get_name()
+                    == "modelslim"
+                )
             )
         )
 

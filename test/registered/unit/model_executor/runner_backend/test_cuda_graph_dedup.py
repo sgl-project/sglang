@@ -42,14 +42,16 @@ class TestCudaGraphDedup(CustomTestCase):
         self.assertEqual(graphs[0].group.current_raw_graph, graphs[1].raw_graph)
         registry.seal()
         registry.seal()
-        for value in (3, 7):
-            for graph, (_, inputs, outputs) in zip(graphs, captures):
-                inputs.fill_(value)
-                graph.replay()
-                torch.cuda.synchronize()
-                self.assertTrue(
-                    torch.equal(outputs, torch.full_like(outputs, value + 1))
-                )
+        with patch.object(registry, "upload", wraps=registry.upload) as upload:
+            for value in (3, 7):
+                for graph, (_, inputs, outputs) in zip(graphs, captures):
+                    inputs.fill_(value)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(
+                        torch.equal(outputs, torch.full_like(outputs, value + 1))
+                    )
+        self.assertEqual(upload.call_count, 1)
 
     def test_rejected_registration_preserves_live_executable(self):
         registry = dedup.DedupedCudaGraphRegistry()

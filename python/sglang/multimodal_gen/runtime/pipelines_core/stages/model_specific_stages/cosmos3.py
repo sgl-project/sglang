@@ -30,7 +30,12 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     quality_allows,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
 )
@@ -117,6 +122,18 @@ COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
 # Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
 COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
+
+
+def _cosmos3_video_hash(video: torch.Tensor) -> tuple:
+    from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensor_blake3
+
+    return (
+        str(video.dtype),
+        str(video.device),
+        tuple(video.shape),
+        tuple(video.stride()),
+        gpu_tensor_blake3(video),
+    )
 
 
 def _inject_caption_metadata(
@@ -802,7 +819,40 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         WanVAE returns a ``DiagonalGaussianDistribution``; ``mode()`` keeps
         the encoding deterministic for I2V conditioning.
         """
-        latent = self.vae.encode(video).mode()
+        cache = _inference_cache(self.vae)
+        if (
+            cache is not None
+            and cache.max_bytes > 0
+            and video.is_cuda
+            and (not model_parallel_is_initialized() or get_world_size() == 1)
+        ):
+            settings = {
+                name: value
+                for name, value in vars(self.vae).items()
+                if name.startswith(
+                    (
+                        "use_",
+                        "tile_",
+                        "blend_",
+                        "parallel_",
+                        "spatial_compression",
+                        "temporal_compression",
+                    )
+                )
+                and type(value) in (int, float, bool, str, type(None))
+            }
+            # Pass only the GPU content hash and metadata to the shared cache.
+            # Its compute scope disables the VAE's nested pixel fingerprint.
+            posterior = cache.run(
+                self.vae,
+                "cosmos3_encode",
+                (_cosmos3_video_hash(video), settings),
+                {},
+                lambda: self.vae.encode(video),
+            )
+        else:
+            posterior = self.vae.encode(video)
+        latent = posterior.mode()
         mean = (
             torch.as_tensor(self.vae.config.latents_mean)
             .view(1, -1, 1, 1, 1)
@@ -1971,6 +2021,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
                 )
 
+            self.check_cancelled(batch)
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
 
