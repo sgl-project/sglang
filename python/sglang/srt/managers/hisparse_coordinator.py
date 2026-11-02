@@ -30,10 +30,12 @@ else:
     from sglang.kernels.ops.kvcache.hisparse import (
         HiSparseSpecState,
         copy_cache_planned_mla,
+        finalize_hisparse_spec,
         load_blocks_to_device_buffer_mha,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
         load_cache_to_device_buffer_spec_mla,
+        prepare_hisparse_spec_verify,
     )
 
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
@@ -41,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseSpecLayout,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
@@ -143,8 +146,6 @@ class HiSparseSpecSwapManager:
     """Own HiSparse speculative-swap state and request lifecycle."""
 
     HASH_MULTIPLIER = 2654435761
-    MIN_SCRATCH_CAPACITY = 1024
-    NUM_METADATA_VALUES_PER_OCCURRENCE = 5
     NUM_COUNTERS_PER_REQUEST = 4
 
     def __init__(
@@ -173,28 +174,26 @@ class HiSparseSpecSwapManager:
 
         if _is_xpu:
             raise ValueError("HiSparse speculative swap is unsupported on XPU.")
-        if coordinator.is_dsv4_hisparse:
-            raise ValueError("HiSparse spec swap currently supports DSA caches only.")
-        if not 2 <= num_draft_tokens <= 4 or coordinator.top_k < 1024:
+        if coordinator.is_dsv4_hisparse and _is_hip:
+            raise ValueError("HiSparse C4 speculative transfers require NVIDIA CUDA.")
+        if coordinator.is_dsv4_hisparse and coordinator.mem_pool_device.page_size != 64:
             raise ValueError(
-                "HiSparse spec swap requires 2-4 draft tokens and top_k >= 1024."
+                "HiSparse C4 speculative transfers require 64-slot V4 pages."
             )
-        workspace_capacity = num_draft_tokens * coordinator.top_k
-        if workspace_capacity > 8192:
-            raise ValueError("HiSparse spec swap supports at most 8192 occurrences.")
+        self.layout = HiSparseSpecLayout(
+            hot_slots=coordinator.device_buffer_size,
+            page_size=coordinator.mem_pool_device.page_size,
+            compress_ratio=4 if coordinator.is_dsv4_hisparse else 1,
+            verify_width=num_draft_tokens,
+            top_k=coordinator.top_k,
+        )
         if max_num_req_slots > coordinator.device_buffer_size:
             raise ValueError(
                 "HiSparse spec request capacity must not exceed device_buffer_size."
             )
 
-        self.scratch_capacity = min(
-            workspace_capacity,
-            max(
-                self.MIN_SCRATCH_CAPACITY,
-                workspace_capacity - coordinator.device_buffer_size,
-            ),
-        )
-        hash_size = 1 << max(1, (2 * coordinator.device_buffer_size - 1).bit_length())
+        self.scratch_capacity = self.layout.scratch_slots
+        hash_size = self.layout.hash_slots
         self._cache_index = torch.full(
             (layer_num, max_num_req_slots, 2, hash_size),
             -1,
@@ -206,10 +205,7 @@ class HiSparseSpecSwapManager:
             dtype=torch.int32,
             device=coordinator.device,
         )
-        metadata_width = max(
-            self.NUM_COUNTERS_PER_REQUEST * max_num_req_slots,
-            self.NUM_METADATA_VALUES_PER_OCCURRENCE * workspace_capacity,
-        )
+        metadata_width = self.layout.metadata_width(max_num_req_slots)
         self._scratch_state = torch.full(
             (max_num_req_slots + 1, metadata_width),
             -1,
@@ -247,6 +243,14 @@ class HiSparseSpecSwapManager:
             dtype=torch.int32,
             device=coordinator.device,
         )
+        if coordinator.is_dsv4_hisparse:
+            self._finalize_req_indices = torch.empty(
+                max_num_req_slots, dtype=torch.int64, device=coordinator.device
+            )
+            self._finalize_prefix_lens = torch.empty_like(self._finalize_req_indices)
+            self._finalize_commit_lens = torch.empty(
+                max_num_req_slots, dtype=torch.int32, device=coordinator.device
+            )
 
     @property
     def miss_plan_capacity(self) -> int:
@@ -322,6 +326,11 @@ class HiSparseSpecSwapManager:
 
         if not self.enabled:
             raise RuntimeError("HiSparse spec is not initialized.")
+        coordinator.reserve_spec_host_slots(batch)
+        # C4 locations exist only after the attention backend materializes its
+        # compression metadata, including during CUDA graph capture/replay.
+        if coordinator.is_dsv4_hisparse:
+            return
         if self.num_draft_tokens > coordinator.page_size - 1:
             raise ValueError(
                 f"HiSparse spec needs {self.num_draft_tokens} verify slots, but the "
@@ -333,21 +342,6 @@ class HiSparseSpecSwapManager:
                 f"HiSparse verify slot mismatch: expected {expected_slots}, "
                 f"got {verify_cache_locs.numel()}."
             )
-
-        # CPU-side logical reservations cover verify even when overlap lags seq_lens.
-        for req in batch.reqs:
-            req_pool_idx = req.kv.req_pool_idx
-            allocated_len = int(
-                coordinator.req_to_host_pool_allocated_len[req_pool_idx]
-            )
-            if req.kv.kv_allocated_len > allocated_len:
-                coordinator.mem_pool_host.alloc_paged_token_slots(
-                    coordinator.req_to_host_pool,
-                    coordinator.req_to_host_pool_allocated_len,
-                    req_pool_idx,
-                    allocated_len,
-                    req.kv.kv_allocated_len - allocated_len,
-                )
 
         extra_start = coordinator.device_buffer_size + 1
         row_indices = torch.repeat_interleave(req_pool_indices, self.num_draft_tokens)
@@ -411,6 +405,13 @@ class HiSparseSpecSwapManager:
         if batch.forward_mode.is_idle():
             return
         coordinator = self._coordinator
+        if coordinator.is_dsv4_hisparse:
+            self.commit_compressed_tokens(
+                batch,
+                prefix_lens=batch.seq_lens,
+                commit_lens=(accept_indices >= 0).sum(dim=1).to(torch.int32),
+            )
+            return
         req_pool_indices = batch.req_pool_indices[:, None]
         verify_cache_locs = batch.out_cache_loc
 
@@ -486,6 +487,83 @@ class HiSparseSpecSwapManager:
         for req in batch.reqs:
             coordinator._skip_first_backup[req.kv.req_pool_idx] = True
 
+    def prepare_compressed_verify(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        compressed_out_locs: torch.Tensor,
+    ) -> None:
+        coordinator = self._coordinator
+        layout = self.layout
+        prepare_hisparse_spec_verify(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens.to(torch.int64),
+            hisparse_out_locs=compressed_out_locs,
+            req_to_device_buffer=coordinator.req_to_device_buffer,
+            device_buffer_tokens=coordinator.req_device_buffer_tokens,
+            num_real_reqs=coordinator.num_real_reqs,
+            logical_to_device_mapping=coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
+            verify_width=layout.verify_width,
+            hot_buffer_size=layout.hot_slots,
+        )
+
+    def commit_compressed_tokens(
+        self,
+        batch: ScheduleBatch,
+        *,
+        prefix_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Back up completed C4 entries before reusing the verify tail."""
+        if batch.forward_mode.is_idle():
+            return
+        req_pool_indices = batch.req_pool_indices
+        coordinator = self._coordinator
+        coordinator.wait_for_pending_backup()
+        batch_size = req_pool_indices.numel()
+        if batch_size == 0:
+            return
+        # The caller reuses these tensors on the next iteration. Copy them on
+        # the producer stream before launching the backup on its side stream.
+        req_snapshot = self._finalize_req_indices[:batch_size]
+        prefix_snapshot = self._finalize_prefix_lens[:batch_size]
+        commit_snapshot = self._finalize_commit_lens[:batch_size]
+        req_snapshot.copy_(req_pool_indices)
+        prefix_snapshot.copy_(prefix_lens)
+        commit_snapshot.copy_(commit_lens)
+        layout = self.layout
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(coordinator.decode_backup_stream):
+            coordinator.decode_backup_stream.wait_stream(schedule_stream)
+            if coordinator.decode_producer_stream is not None:
+                coordinator.decode_backup_stream.wait_stream(
+                    coordinator.decode_producer_stream
+                )
+            finalize_hisparse_spec(
+                device_ptrs=coordinator.mem_pool_device.data_ptrs,
+                host_ptrs=coordinator.mem_pool_host.data_ptrs,
+                req_pool_indices=req_snapshot,
+                prefix_lens=prefix_snapshot,
+                commit_lens=commit_snapshot,
+                req_to_host_pool=coordinator.req_to_host_pool,
+                device_buffer_locs=coordinator.req_device_buffer_token_locs,
+                req_to_token=coordinator.req_to_token_pool.req_to_token,
+                device_buffer_tokens=coordinator.req_device_buffer_tokens,
+                logical_to_device_mapping=coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
+                verify_width=layout.verify_width,
+                hot_buffer_size=layout.hot_slots,
+            )
+            coordinator._backup_done_event.record()
+        coordinator._has_pending_backup = True
+
+        # Rejection cleanup can free logical pages immediately after this call.
+        # It must see the cleared provisional routes rather than return the
+        # request-owned verify tail to the physical allocator.
+        coordinator._backup_done_event.wait(schedule_stream)
+        for req in batch.reqs:
+            coordinator._skip_first_backup[req.kv.req_pool_idx] = True
+
     def swap_in(
         self,
         req_pool_indices: torch.Tensor,
@@ -518,6 +596,7 @@ class HiSparseSpecSwapManager:
             seq_lens=compressed_seq_lens,
             state=self.states[layer_id],
             num_real_reqs=coordinator.num_real_reqs,
+            is_dsv4_layout=coordinator.is_dsv4_hisparse,
             **plan,
         )
         return top_k_indices
@@ -699,11 +778,10 @@ class HiSparseCoordinator:
             self,
             num_draft_tokens=num_draft_tokens,
         )
-        if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
-            self.token_to_kv_pool_allocator.configure_spec_scratch(
-                self.spec_swap.scratch_capacity,
-                device_buffer_size=self.padded_buffer_size,
-            )
+        self.token_to_kv_pool_allocator.configure_spec_scratch(
+            self.spec_swap.scratch_capacity,
+            device_buffer_size=self.padded_buffer_size,
+        )
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
         )
@@ -723,6 +801,10 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        if self.is_dsv4_hisparse and self.spec_swap.enabled:
+            self.verify_raw_indices_buffer = torch.full_like(
+                self.spec_swap.top_k_device_locs, -1
+            )
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1091,6 +1173,22 @@ class HiSparseCoordinator:
 
     def prepare_spec_verify(self, batch: ScheduleBatch) -> None:
         self.spec_swap.prepare_verify(batch)
+
+    def reserve_spec_host_slots(self, batch: ScheduleBatch) -> None:
+        """Cover verify's allocation watermark even when CPU seq_lens lag."""
+        ratio = self.compress_ratio
+        for req in batch.reqs:
+            rid = req.kv.req_pool_idx
+            target_len = req.kv.kv_allocated_len // ratio
+            allocated_len = int(self.req_to_host_pool_allocated_len[rid])
+            if target_len > allocated_len:
+                self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    rid,
+                    allocated_len,
+                    target_len - allocated_len,
+                )
 
     def commit_spec_accept_tokens(
         self, batch: ScheduleBatch, accept_indices: torch.Tensor

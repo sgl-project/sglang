@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -189,7 +190,9 @@ class RelayPayload:
         )
 
     @classmethod
-    def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
+    def from_draft_input(
+        cls, draft_input: EagleDraftInput | DFlashDraftInputV2
+    ) -> RelayPayload:
         return cls(
             bonus_tokens=draft_input.bonus_tokens,
             topk_p=draft_input.topk_p,
@@ -444,9 +447,27 @@ class FutureMap:
 
     def make_staged_spec_input(self, future_indices: torch.Tensor):
         """Build the relay handle for a request leaving HiSparse staging."""
+        if self.spec_algo.is_dspark():
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+            # DSpark has already injected target features into the draft KV
+            # pool during prefill. Its input carries no EAGLE hidden state or
+            # top-k relay; use the same empty feature layout as its worker.
+            # Bonus tokens and batch.seq_lens are resolved from future_indices
+            # at forward entry, after the publish fence.
+            draft_input = make_draft_input_v2(
+                bonus_tokens=torch.empty_like(future_indices, dtype=torch.int64),
+                new_seq_lens=torch.empty_like(future_indices, dtype=torch.int64),
+            )
+            draft_input.future_indices = future_indices
+            draft_input.future_dsa_topk_indices_available = (
+                self.dsa_topk_indices_buf is not None
+            )
+            return draft_input
+
         if not (self.spec_algo.is_eagle() or self.spec_algo.is_standalone()):
             raise RuntimeError(
-                "HiSparse staging only supports EAGLE-family speculative inputs."
+                "HiSparse staging only supports EAGLE-family and DSPARK speculative inputs."
             )
 
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -484,7 +505,7 @@ class FutureMap:
             draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
             draft_input.accept_lens = self.accept_lens_buf[indices]
             return
-        draft_input: EagleDraftInput = batch.spec_info
+        draft_input: EagleDraftInput | DFlashDraftInputV2 = batch.spec_info
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return

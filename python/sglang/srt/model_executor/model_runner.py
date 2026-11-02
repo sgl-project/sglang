@@ -1792,10 +1792,9 @@ class ModelRunner:
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
 
-        Runs the DP/MLP-sync padding, the attn-tp num_token_non_padded
-        normalization, and the hisparse-coordinator refresh that the eager
-        forward path needs — the cuda-graph path does the equivalent inside the
-        runner's capture/replay, so this is skipped there.
+        Runs the DP/MLP-sync padding and the attn-tp num_token_non_padded
+        normalization the eager forward path needs — the cuda-graph path does
+        the equivalent inside the runner's capture/replay, so this is skipped there.
         """
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -1820,10 +1819,6 @@ class ModelRunner:
                     and not is_mla_cp_enabled()
                 ),
             )
-
-        # Hisparse coordinator — backends now read it from self.model_runner.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
     def _pp_kwargs(self, pp_proxy_tensors) -> dict:
         """Build the pp_proxy_tensors forward kwarg, in one place.
@@ -1865,6 +1860,12 @@ class ModelRunner:
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
+        if self.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator = self.hisparse_coordinator
+            self.hisparse_coordinator.wait_for_pending_backup()
+            # Keep the real request count before eager or graph padding.
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         self.forward_pass_id += 1
 
@@ -2039,14 +2040,6 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
-
-            if (
-                forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
-                forward_batch.hisparse_coordinator = self.hisparse_coordinator
-                self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             if self.uocr_greedy_graph is not None:
                 self.uocr_greedy_graph.before_forward(
