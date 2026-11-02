@@ -80,11 +80,10 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        if self.joint_head_config is not None or self.pointer_head is not None:
-            return self._validate_joint_schema_request(request)
         if self._startlux_config is None:
-            # Only a StartLux checkpoint reads a none candidate, and ignoring the
-            # request for one would answer without it.
+            # Only a StartLux checkpoint reads a none candidate, and no other family
+            # honors these controls, so accepting one would answer without it. Checked
+            # before the branches below, whose early return would skip it.
             for field, value in (
                 ("none_check", request.none_check),
                 ("allow_none", request.allow_none),
@@ -94,6 +93,8 @@ class SystemOneServing(OpenAIServingDecisions):
                         f"{field} reads a StartLux-Decision none candidate, which only "
                         "a checkpoint with a lodestar decision_config.json has"
                     )
+        if self.joint_head_config is not None or self.pointer_head is not None:
+            return self._validate_joint_schema_request(request)
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -583,7 +584,13 @@ class SystemOneServing(OpenAIServingDecisions):
     ) -> ORJSONResponse:
         """Read every question at its own trained temperature, in as few passes as that allows."""
         temperatures = (self._startlux_config or {})["temperature_by_type"]
-        encoded = list(adapted_request)
+        # Collect one question at a time, letting other requests run in between: the
+        # encoder renders and tokenizes the whole state for each question, which would
+        # block the event loop if every prompt were built in one go.
+        encoded: List[EncodedQuestion] = []
+        for item in adapted_request:
+            encoded.append(item)
+            await asyncio.sleep(0)
         question_temperatures = [
             temperatures[startlux.TEMPERATURE_KEYS[view.kind]] for view in views
         ]

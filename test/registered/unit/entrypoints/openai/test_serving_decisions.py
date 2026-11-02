@@ -1563,6 +1563,57 @@ class TestStartLuxSystemOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("longer choice list", json.loads(response.body)["message"])
 
+    async def test_the_startlux_questions_yield_to_other_requests(self):
+        """Encoding one question renders the whole state, so it must not run in one go."""
+        self.manager = self._manager(self._startlux())
+        events = []
+        encoding_started = asyncio.Event()
+        handler = self._serving(self.manager)
+        original = handler._encode_startlux_question
+
+        def recorded(*args, **kwargs):
+            events.append("encode")
+            encoding_started.set()
+            return original(*args, **kwargs)
+
+        async def other_request():
+            await encoding_started.wait()
+            for _ in range(3):
+                events.append("other")
+                await asyncio.sleep(0)
+
+        handler._encode_startlux_question = recorded
+        request = _systemone_request(
+            {name: {"type": "noul", "instructions": "x"} for name in "abc"}
+        )
+        other = asyncio.create_task(other_request())
+        response = await handler.handle_request(request, None)
+        await asyncio.wait_for(other, timeout=5)
+        self.assertEqual(response.status_code, 200, response.body[:300])
+        self.assertEqual(events, ["encode", "other"] * 3)
+
+    async def test_the_none_controls_are_refused_for_the_other_families(self):
+        """A Clef or Kev checkpoint reads no none candidate, so accepting it would lie."""
+        for config in ("joint_head_config", "pointer_head"):
+            with self.subTest(config):
+                manager = self._manager(None)
+                setattr(
+                    manager.model_config,
+                    config,
+                    {"system": "s", "prompt": "p", "options": "o"},
+                )
+                for field in ("allow_none", "none_check"):
+                    with self.subTest(field):
+                        request = _systemone_request(
+                            {"q": {"type": "noul", "instructions": "x"}},
+                            **{field: True},
+                        )
+                        response = await self._serving(manager).handle_request(
+                            request, None
+                        )
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(field, json.loads(response.body)["message"])
+
     async def test_a_none_read_out_needs_a_startlux_checkpoint(self):
         manager = self._manager(None)
         request = _systemone_request(
