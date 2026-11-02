@@ -196,6 +196,8 @@ def _verify_plan_uniform_q_len(spec_info) -> Optional[int]:
     None keeps plan() unchanged."""
     if spec_info is None or spec_info.spec_input_type != SpecInputType.EAGLE_VERIFY:
         return None
+    # SpecInput defaults num_tokens_per_req to -1 ("not set"). EagleVerifyInput
+    # sets it to draft_token_num (>= 1), so real verify batches never return here.
     if spec_info.num_tokens_per_req <= 0:
         return None
     return int(spec_info.num_tokens_per_req)
@@ -2415,9 +2417,8 @@ class FlashInferIndicesUpdaterPrefill:
         ):
             paged_plan_kwargs["window_left"] = window.window_left
 
-        # Capture fixes the kernel's query tile from the hint, so every plan
-        # through a captured verify wrapper carries the same hint -- the real
-        # plan() and fast_prefill_plan replays alike.
+        # A captured kernel keeps the tile size FlashInfer picked from this hint,
+        # so every replay must pass the same hint, including fast_prefill_plan.
         uniform_q_len = _verify_plan_uniform_q_len(spec_info)
         if uniform_q_len is not None:
             paged_plan_kwargs["uniform_q_len"] = uniform_q_len
