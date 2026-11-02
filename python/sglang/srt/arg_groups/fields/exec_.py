@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import (
+    Any,
+    Dict,
     List,
     Literal,
     Optional,
@@ -123,6 +126,38 @@ class ExecFeatures(msgspec.Struct):
             choices=["last", "full"],
         ),
     ] = None
+    # Changes what --speculative-algorithm means: with this flag it only names
+    # the capture convention (EAGLE3, DFLASH or DSPARK) and
+    # handle_aux_hidden_state_capture resets it to None, so no draft is loaded,
+    # nothing is reserved for one, and the speculative stack stays off.
+    enable_return_aux_hidden_states: A[
+        bool,
+        "Capture auxiliary hidden states on the target model without running a "
+        "speculative draft. --speculative-algorithm then only names the capture "
+        "convention (EAGLE3, DFLASH or DSPARK) and is reset to None. Requests "
+        "with return_hidden_states receive the concatenated aux hidden states in "
+        "place of the last-layer hidden states. Sets --return-hidden-states-mode "
+        "to full when unset. Requires pp_size == 1.",
+    ] = False
+    # The capture convention behind --enable-return-aux-hidden-states, taken from
+    # --speculative-algorithm. It stays an enum because the models' capture hooks
+    # still differ by draft family (layer-id conventions, mHC contraction).
+    # TODO: unify the per-family capture hooks, then collapse this to the bool.
+    aux_hidden_state_capture: A[
+        Optional[str],
+        Arg(
+            help="Resolved from --enable-return-aux-hidden-states and "
+            "--speculative-algorithm.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = None
+    return_aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target-model layer ids for the selected capture convention. These may "
+        "differ from draft-checkpoint layer ids. Required for DFLASH and DSPARK; "
+        "EAGLE3 defaults to the model's EAGLE3 layers.",
+    ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
@@ -147,6 +182,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -194,7 +233,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     enable_nvidia_megakernel: A[
         bool,
-        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package, or for MiniMax-M3.1 from the SGLang plugin of the MSA package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
     enable_amd_monokernel: A[
         bool,
@@ -291,9 +330,17 @@ class ExecKernel(msgspec.Struct):
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'cutedsl_h16' enables experimental DeepSeek-V4 BF16 sparse "
+                "prefill for 16 TP-local query heads on SM90. Only ordinary "
+                "eager prefill uses H16; graph, speculative, TBO, CP and "
+                "bounded-replay paths retain the existing backend. "
+                "DeepSeek-V4.1 is not supported. Padded combined TOPK is limited "
+                "to 16384 (including the SWA window); the default 1M context "
+                "fits this limit. Sparse-prefill threshold and environment "
+                "selection remain unchanged."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8", "cutedsl_h16"],
         ),
     ] = "auto"
     dsa_triton_union: A[
@@ -330,7 +377,9 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
@@ -762,7 +811,7 @@ class ExecComm(msgspec.Struct):
         Arg(
             help=(
                 "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "(EXTEND / MIXED) while keeping it for decode. "
                 "Only meaningful with --enable-aiter-allreduce-fusion."
             ),
             resolvable=True,
@@ -810,7 +859,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer",
             "megamoe",
             "deepep_v2",
-            "ascend_tp",
+            "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
         ],
@@ -827,7 +876,7 @@ class ExecMoe(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
                 "flashinfer_megamoe",
             ],
             resolvable=True,
@@ -913,6 +962,14 @@ class ExecMoe(msgspec.Struct):
     deepep_config: A[
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+    ] = None
+    moe_ascend_ops_config: A[
+        Optional[str],
+        (
+            "Configuration for the ascend_ops MoE backend used by the main "
+            "model and/or speculative draft as a JSON object, "
+            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+        ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
@@ -1080,6 +1137,17 @@ class ExecOffload(msgspec.Struct):
             "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
             "The file is sparse and reused across restarts; put it on fast "
             "local storage (NVMe).",
+        ),
+    ] = None
+    engram_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
+            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
+            "takes the first value. "
+            "See docs/advanced_features/engram.",
+            type_parser=json.loads,
         ),
     ] = None
 

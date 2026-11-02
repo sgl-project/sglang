@@ -13,13 +13,9 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
-    fused_rmsnorm_interleaved_rope_,
-    fused_rmsnorm_interleaved_rope_into_blocks,
     fused_temb_table_slices,
-    rmsnorm_interleaved_rope_block_cols,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -82,10 +78,18 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_device_stream_capturing
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+if _is_cuda:
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_rmsnorm_interleaved_rope,
+        fused_rmsnorm_interleaved_rope_,
+        fused_rmsnorm_interleaved_rope_into_blocks,
+        rmsnorm_interleaved_rope_block_cols,
+    )
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -735,7 +739,8 @@ class WanTransformerBlock(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None,
     ) -> bool:
         return (
-            rope_cos_sin_cache is not None
+            _is_cuda
+            and rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
             and all(
@@ -768,35 +773,34 @@ class WanTransformerBlock(nn.Module):
         q2d, k2d = (x.view(-1, x.shape[-1]) for x in (query, key))
         block_cols = rmsnorm_interleaved_rope_block_cols(q2d.shape[-1])
 
-        def fill_all(blocks) -> None:
+        def fill_all(blocks, part: int) -> None:
+            x, norm = ((q2d, self.norm_q), (k2d, self.norm_k))[part]
             tables = self._qk_block_tables(blocks, block_cols, q2d.shape[-1])
             if tables is None:
                 # blocks the kernel cannot address: norm in place, then copy them
-                for x, norm in ((q2d, self.norm_q), (k2d, self.norm_k)):
-                    fused_rmsnorm_interleaved_rope_(
-                        x,
-                        norm.weight,
-                        rope_cos_sin_cache,
-                        norm.variance_epsilon,
-                        self.dim_head,
-                    )
-                for head_start, head_count, q_dst, k_dst in blocks:
-                    cols = slice(
-                        head_start * self.dim_head,
-                        (head_start + head_count) * self.dim_head,
-                    )
-                    q_dst.copy_(q2d[:, cols].view_as(q_dst))
-                    k_dst.copy_(k2d[:, cols].view_as(k_dst))
-                return
-            for x, norm, table in zip((q2d, k2d), (self.norm_q, self.norm_k), tables):
-                fused_rmsnorm_interleaved_rope_into_blocks(
+                fused_rmsnorm_interleaved_rope_(
                     x,
                     norm.weight,
                     rope_cos_sin_cache,
                     norm.variance_epsilon,
                     self.dim_head,
-                    table,
                 )
+                for block in blocks:
+                    head_start, head_count, dst = block[0], block[1], block[2 + part]
+                    cols = slice(
+                        head_start * self.dim_head,
+                        (head_start + head_count) * self.dim_head,
+                    )
+                    dst.copy_(x[:, cols].view_as(dst))
+                return
+            fused_rmsnorm_interleaved_rope_into_blocks(
+                x,
+                norm.weight,
+                rope_cos_sin_cache,
+                norm.variance_epsilon,
+                self.dim_head,
+                tables[part],
+            )
 
         return self.attn1.forward_qk_filled(
             *(
@@ -1433,7 +1437,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             or not isinstance(source, torch.Tensor)
             or self.layerwise_offload_managers
             or torch.compiler.is_compiling()
-            or torch.cuda.is_current_stream_capturing()
+            or is_device_stream_capturing(context.device)
             or not self._plain_blocks()
             or not all(
                 type(block.attn2) is WanT2VCrossAttention

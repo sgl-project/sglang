@@ -119,7 +119,7 @@ Use Python 3.11 or higher in an activated Python environment, with CUDA dependen
 Clone a release tag (the example below pins one); choose another from [GitHub releases](https://github.com/sgl-project/sglang/releases) as needed:
 
 ```bash
-git clone -b v0.5.21 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.23 https://github.com/sgl-project/sglang.git
 cd sglang
 ```
 
