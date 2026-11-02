@@ -12,10 +12,10 @@ graph launch.
 Correctness contract:
 
 - The caller only routes here when TBO / LoRA are off and the replay is
-  padding-free (raw_bs == padded bs) or, under
-  SGLANG_OPT_DSV41_PADDED_METADATA_GLUE, a padded replay of a backend-declared
-  DSV4 glue whose prep reads only the padded slots; so every Python-visible
-  branch inside the backends is constant per key.
+  padding-free (raw_bs == padded bs) or, outside ragged verify mode, a padded
+  replay of a backend-declared DSV4 glue whose prep reads only the padded
+  slots; so every Python-visible branch inside the backends is constant per
+  key.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.

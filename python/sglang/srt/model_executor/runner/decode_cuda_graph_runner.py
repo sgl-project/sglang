@@ -603,10 +603,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         self._padded_glue = (
-            envs.SGLANG_OPT_DSV41_PADDED_METADATA_GLUE.get()
-            and (self._draft_metadata_glue or self._target_metadata_glue)
-            and not self.ragged_verify_mode
-        )
+            self._draft_metadata_glue or self._target_metadata_glue
+        ) and not self.ragged_verify_mode
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
         self._early_verify_metadata: Optional[EarlyVerifyMetadata] = (

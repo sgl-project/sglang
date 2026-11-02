@@ -2028,12 +2028,6 @@ class Envs:
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # DSV4 draft / target verify metadata glue: route padded replays (raw bs below
-    # the graph bs) through the glue graph; the padded slot tails make the prep
-    # identical per key.
-    SGLANG_OPT_DSV41_PADDED_METADATA_GLUE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(
