@@ -121,6 +121,7 @@ def _apply_attention_output_gate(module, attn_output, gate):
 class DeepseekMLAForwardMixin:
     # Set by subclasses whose prepare_mla_qkv needs the absorbed query
     # materialized: disables deferred BMM fusion and born-FP8 query packing.
+    # Applies only to this mixin's absorbed path, not MLA_ROCM.
     needs_unfused_mla_qkv = False
 
     def is_dcp_mla_decode_phase(
@@ -315,6 +316,11 @@ class DeepseekMLAForwardMixin:
         *,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        """Run the indexer for shared MLA and CUDA/ROCm dense MHA preparation.
+
+        The separate MLA_ROCM absorbed path calls the indexer directly and does
+        not dispatch this hook. Overrides do not apply to that path.
+        """
         return self.indexer(
             x=hidden_states,
             q_lora=q_lora,
@@ -336,6 +342,9 @@ class DeepseekMLAForwardMixin:
         """Prepare absorbed Q and normalized KV on the unfused rotary path.
 
         Overrides that transform ``q`` must set ``needs_unfused_mla_qkv``.
+        This hook and the flag apply only to this mixin's absorbed path.
+        MLA_ROCM uses its own preparation, bypasses the hook, and ignores the
+        flag. Fused rotary paths also bypass this hook.
         """
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         return q, q_pe, k, k_pe
@@ -945,7 +954,11 @@ class DeepseekMLAForwardMixin:
         attn_output: torch.Tensor,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        """Expand latent values before LoRA correction and output gating."""
+        """Expand latent values before LoRA correction and output gating.
+
+        Applies only to this mixin's absorbed path. MLA_ROCM uses its own value
+        projection and does not dispatch this hook.
+        """
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 
