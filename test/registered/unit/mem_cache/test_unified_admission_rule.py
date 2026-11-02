@@ -127,7 +127,6 @@ def _empty_tree():
     """A prefix tree with nothing evictable."""
     return SimpleNamespace(
         full_evictable_size=lambda: 0,
-        swa_evictable_size=lambda: 0,
         window_evictable_size=lambda component: 0,
         mamba_evictable_size=lambda: 0,
         supports_mamba=lambda: True,

@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows, token_demand
+from sglang.test.tree_slots import window_evictable
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
     release_band,
@@ -1243,7 +1244,12 @@ class TestDeclaredParts(CustomTestCase):
                     receipts.append((node, receipt))
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
-                    self.assertEqual(cache.swa_evictable_size(), 0)
+                    self.assertEqual(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        0,
+                    )
                     self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
                     self.assertEqual(cache.mamba_evictable_size(), 16)
                     phases = []
@@ -1325,7 +1331,9 @@ class TestDeclaredParts(CustomTestCase):
                             KVDemand(4, demand_windows(a, 4, 4)),
                             evictable={
                                 a.full_attn_allocator.sub_pool_name: cache.full_evictable_size(),
-                                a.swa_attn_allocator.sub_pool_name: cache.swa_evictable_size(),
+                                a.swa_attn_allocator.sub_pool_name: window_evictable(
+                                    cache
+                                ),
                             },
                         )
                     )
@@ -2087,7 +2095,12 @@ class TestDeclaredParts(CustomTestCase):
                 try:
                     self.assertEqual(cache.full_evictable_size(), 0)
                     self.assertEqual(cache.window_evictable_size("draft_swa"), 0)
-                    self.assertEqual(cache.swa_evictable_size(), 144)
+                    self.assertEqual(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        144,
+                    )
                     self.assertFalse(a.ensure_capacity(token_demand(a, 4, 4)))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
                     original = cache.evict_until
@@ -2110,7 +2123,12 @@ class TestDeclaredParts(CustomTestCase):
                     # A four-token request therefore needs 16 or 24 target
                     # donor tokens, regardless of physical retention order.
                     self.assertEqual(sum(evicted), 16 if draft_dim == 16 else 24)
-                    self.assertGreater(cache.swa_evictable_size(), 0)
+                    self.assertGreater(
+                        cache.window_evictable_size(
+                            cache.token_to_kv_pool_allocator.target_window_pool()
+                        ),
+                        0,
+                    )
                     fresh = a.alloc(4)
                     self.assertIsNotNone(fresh)
                     a.free(fresh)
@@ -2300,7 +2318,6 @@ class TestDeclaredParts(CustomTestCase):
             # The target's window slot retains its own window; the draft's more.
             window_retain_size=lambda name: 16 if name == "window_16" else 32,
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
             supports_mamba=lambda: False,
             supports_prefix_sharing=lambda: True,
@@ -2485,7 +2502,9 @@ class TestDeclaredParts(CustomTestCase):
         queue.tree_cache = cache
         queue.token_to_kv_pool_allocator = a
         full_budget = a.full_available_size() + cache.full_evictable_size()
-        swa_budget = a.swa_available_size() + cache.swa_evictable_size()
+        swa_budget = a.swa_available_size() + cache.window_evictable_size(
+            a.swa_attn_allocator.sub_pool_name
+        )
         for full, swa, fits in (
             (full_budget, swa_budget, True),
             (need - 1, swa_budget, False),
@@ -2582,7 +2601,7 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(
             (
                 cache.full_evictable_size(),
-                cache.swa_evictable_size(),
+                cache.window_evictable_size(a.swa_attn_allocator.sub_pool_name),
                 cache.window_evictable_size("draft_swa"),
             ),
             (80, 8, 4),

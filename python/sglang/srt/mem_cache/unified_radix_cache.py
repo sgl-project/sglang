@@ -4119,9 +4119,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.components[windows[0]].sliding_window_size
 
-    def swa_reprefill_tail_tokens(self, req=None) -> int:
-        """Tokens at the end of a matched prefix to re-prefill because their SWA
-        cannot be reused as is.
+    def window_reprefill_tail_tokens(self, req=None) -> int:
+        """Tokens at the end of a matched prefix to re-prefill because a window's
+        rows cannot be reused as is: the longest such window's, since one key
+        limit serves every window.
 
         unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
         stores, so a reused window would read another request's stale slots; a
@@ -4133,16 +4134,22 @@ class UnifiedRadixCache(BasePrefixCache):
             is_unified_kv_triton,
         )
 
-        swa = self.component_of(TREE_WINDOW)
-        if swa is None or not swa.sliding_window_size:
+        window = max(
+            (
+                self.components[slot].sliding_window_size or 0
+                for slot in self.window_slots()
+            ),
+            default=0,
+        )
+        if not window:
             return 0
         if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
-            return swa.sliding_window_size
+            return window
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
             return 0
-        return swa.sliding_window_size
+        return window
 
     def swa_retain_floor(self, req, *, window: int) -> int | None:
         """The lowest position ``window``'s retirement must keep for the
@@ -4297,9 +4304,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size()
 
-    def swa_evictable_size(self) -> int:
-        return self.tree_core.swa_evictable_size()
-
     def window_evictable_size(self, sub_pool: str) -> int:
         try:
             component = self.window_slot_of(sub_pool)
@@ -4309,9 +4313,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
-
-    def swa_protected_size(self) -> int:
-        return self.tree_core.swa_protected_size()
 
     def window_protected_size(self, sub_pool: str) -> int:
         try:

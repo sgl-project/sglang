@@ -73,7 +73,6 @@ class TestPrefillAdder(CustomTestCase):
     ) -> MagicMock:
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
-        tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.window_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False

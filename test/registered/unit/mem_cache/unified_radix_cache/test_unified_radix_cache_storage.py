@@ -85,7 +85,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF
+from sglang.test.tree_slots import FAMILY_OF, window_evictable
 
 
 def _window_hit(req):
@@ -1767,7 +1767,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             + ps
             + (surfaced_swa_hit + ps - 1) // ps * ps
         )
-        budget = cons_alloc.swa_available_size() + cons.swa_evictable_size()
+        budget = cons_alloc.swa_available_size() + window_evictable(cons)
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = self._make_req(cons.req_to_token_pool)
@@ -1788,7 +1788,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.ready_to_load_host_cache()
         cons.inc_lock_ref(last_node)  # the admission lock
 
-        self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
+        self.assertEqual(window_evictable(cons), 0)  # window is protected
         self.assertGreaterEqual(cons_alloc.full_available_size(), extend_need + ps)
 
         if reserved <= budget:

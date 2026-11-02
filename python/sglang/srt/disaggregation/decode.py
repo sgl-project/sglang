@@ -688,6 +688,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return tails.get(window_sub_pool_of(self.token_to_kv_pool_allocator), seq_len)
 
+    def _window_evictable_sizes(self) -> Dict[str, int]:
+        """Each window pool's evictable tokens, by name."""
+        return {
+            name: self.tree_cache.window_evictable_size(name)
+            for name in self.token_to_kv_pool_allocator.window_pool_names()
+        }
+
     def _window_tails(self, seq_len: int) -> Dict[str, int]:
         """The tail every window pool keeps of ``seq_len`` tokens, by name (the
         storage's), or the whole sequence without tail preallocation."""
@@ -2796,7 +2803,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
             f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
-            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"window_evictable={self._window_evictable_sizes() if swa_pages_charged else -1}, "
             f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
             f"page_size={allocator.page_size}, "
             f"req={req.rid}"

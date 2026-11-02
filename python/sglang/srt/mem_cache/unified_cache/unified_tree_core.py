@@ -3629,14 +3629,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         slot_id = self._family_slot_ids.get(family)
         return None if slot_id is None else self.components_by_type[slot_id]
 
-    def swa_evictable_size(self) -> int:
-        return self.component_evictable_size_.get(self.slot_id(TREE_WINDOW), 0)
-
     def mamba_evictable_size(self) -> int:
         return self.component_evictable_size_.get(self.slot_id(TREE_STATE), 0)
-
-    def swa_protected_size(self) -> int:
-        return self.component_protected_size_.get(self.slot_id(TREE_WINDOW), 0)
 
     def mamba_protected_size(self) -> int:
         return self.component_protected_size_.get(self.slot_id(TREE_STATE), 0)

@@ -1448,7 +1448,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     component.cache = cache
     component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
-    assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
+    assert cache.window_reprefill_tail_tokens() == (128 if unified_kv else 0)
     node = SimpleNamespace(
         component_data={
             ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
@@ -1463,7 +1463,7 @@ def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
     index_slots(cache, cache.components)
-    assert cache.swa_reprefill_tail_tokens() == 0
+    assert cache.window_reprefill_tail_tokens() == 0
 
 
 @pytest.mark.parametrize("swa_stored", [True, False])

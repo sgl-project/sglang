@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _swa_allocation_callbacks,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -55,7 +56,11 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import (
+    only_window,
+    storage_tree_slots,
+    window_evictable,
+)
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
@@ -67,7 +72,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 PAGE = 4
 D2H = ("controller", "write")
 H2D = ("controller", "load")
-FULL, SWA = ComponentType.FULL, ComponentType.SWA
+FULL = ComponentType.FULL
 
 
 def _python_inspector(params, components):
@@ -429,9 +434,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA), window=self.window
-            ),
+            tree_slots=storage_tree_slots(self.allocator.storage, window=self.window),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
@@ -445,6 +448,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
         controller = cache.cache_controller
         self.cache = cache
         self.controller = controller
+        # The window sub-pool names its host pool; the tree numbers its slot.
+        self.window_pool = only_window(cache)
+        self.window_slot = cache.slot_id(TREE_WINDOW)
         # Compaction and frees wait through this stand-in stream.
         stream = _recorded_stream()
         stream.__enter__()
@@ -488,7 +494,7 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
         # span. Hold that spare span so this test exercises eviction on retry.
         spare = swa.alloc_physical(swa.available_size())
         self.assertIsNotNone(spare)
-        entry = self.controller.mem_pool_host.entry_map[PoolName.SWA]
+        entry = self.controller.mem_pool_host.entry_map[self.window_pool]
         evict = entry.device_evict_fn
         evictions = []
 
@@ -496,7 +502,9 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
             evictions.append(need_size)
             return evict(need_size)
 
-        transfer = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(2 * PAGE))
+        transfer = PoolTransfer(
+            name=self.window_pool, host_indices=torch.arange(2 * PAGE)
+        )
         with mock.patch.object(entry, "device_evict_fn", side_effect=recorded_evict):
             result = self.controller._resolve_device_transfers(
                 [transfer], kv_device_indices=torch.empty(0, dtype=torch.int64)
@@ -568,7 +576,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         return (
             core.get_component_device_lock_ref(node, FULL),
             core.get_component_host_lock_ref(node, FULL),
-            core.get_component_host_lock_ref(node, SWA),
+            core.get_component_host_lock_ref(node, self.window_slot),
         )
 
     def _host_pressure(self):
@@ -630,13 +638,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
         # can be reclaimed.
@@ -646,7 +648,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.writing_check()
         running_node = self._match(running).last_device_node
         pin = self.cache.inc_lock_ref(running_node).to_dec_params()
-        reclaimable_swa = self.cache.swa_evictable_size()
+        reclaimable_swa = window_evictable(self.cache)
         # The batch's decode tokens are pending demand on both bands. With
         # them, the load fits the shared gap only after that SWA is reclaimed.
         decode = 6 * PAGE
@@ -669,7 +671,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertEqual(len(moves), moved)
         # That room came from reclaiming the running request's out-of-window
         # SWA; its FULL rows and its window stay.
-        self.assertLess(self.cache.swa_evictable_size(), reclaimable_swa)
+        self.assertLess(window_evictable(self.cache), reclaimable_swa)
         self._assert_rows(running_ids, running_expected, swa_tail=self.window)
 
         self.cache.ready_to_load_host_cache()
@@ -724,20 +726,14 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         # Submitted after the move: the copy reads where the rows went.
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         req = self._request(tokens + list(range(17, 21)))
         verdict = self._adder().add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
         )
         self.assertIs(verdict, AddReqResult.CONTINUE)
         (op,) = self.controller.load_queue
-        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
         owner = self.cache.prefix_device_indices(req)[-len(window.device_indices) :]
         # The load-back's bound rows go by the owner's ids until submission.
         self.assertTrue(torch.equal(window.device_indices, owner.to(torch.int64)))
@@ -760,13 +756,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         ids, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(ComponentType.SWA): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         # Window rows that end up below the load's reservation, freed once the
         # load is queued so that compaction moves the reserved rows into them.
         gap = self.allocator.alloc(2 * PAGE)
@@ -776,7 +766,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         )
         self.assertIs(verdict, AddReqResult.CONTINUE)
         (op,) = self.controller.load_queue
-        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
         prefix = self.cache.prefix_device_indices(req)
         owner = prefix[-len(window.device_indices) :].to(torch.int64)
         self.assertTrue(torch.equal(window.device_indices, owner))

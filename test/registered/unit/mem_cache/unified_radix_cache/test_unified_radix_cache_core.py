@@ -100,7 +100,13 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import FAMILY_OF, index_slots, tree_slots_of
+from sglang.test.tree_slots import (
+    FAMILY_OF,
+    index_slots,
+    tree_slots_of,
+    window_evictable,
+    window_protected,
+)
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
@@ -695,7 +701,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             full_avail,
         )
         self.assertEqual(
-            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            allocator.swa_attn_allocator.available_size() + window_evictable(cache),
             swa_avail,
         )
 
@@ -1169,7 +1175,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
                 lock_result = cache.inc_lock_ref(leaf)
                 # SWA pins one window; full attention pins everything.
-                self.assertEqual(cache.swa_protected_size(), len(swa_val))
+                self.assertEqual(window_protected(cache), len(swa_val))
                 self.assertEqual(cache.full_protected_size(), len(seq))
                 cache.sanity_check()
                 cache.dec_lock_ref(
@@ -1523,7 +1529,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         if self.cfg.has_mamba:
             self.assertEqual(cache.mamba_evictable_size(), 0)
         if self.cfg.has_swa:
-            self.assertEqual(cache.swa_evictable_size(), 0)
+            self.assertEqual(window_evictable(cache), 0)
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
@@ -1593,7 +1599,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, base)
         self._insert(cache, allocator, req_to_token_pool, leaf)
 
-        swa_before = cache.swa_evictable_size()
+        swa_before = window_evictable(cache)
         result = cache.evict(
             EvictParams(
                 window_num_tokens={
@@ -1601,7 +1607,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                 }
             )
         )
-        self.assertEqual(cache.swa_evictable_size(), 0)
+        self.assertEqual(window_evictable(cache), 0)
         cache.sanity_check()
 
     @requires(
@@ -2394,7 +2400,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             allocator.full_available_size() + cache.full_evictable_size(), full_total
         )
         self.assertEqual(
-            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+            allocator.swa_available_size() + window_evictable(cache), swa_total
         )
         cache.sanity_check()
 
@@ -2423,7 +2429,7 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(
                 # 200 of 260 cached: a plain hit would leave a 60-row extend
                 prompt = cached + list(range(1001, 1061))
                 self.assertEqual(
-                    cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
+                    cache.window_reprefill_tail_tokens(), 128 if bounded_replay else 0
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
 

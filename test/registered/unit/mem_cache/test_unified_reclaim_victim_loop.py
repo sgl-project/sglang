@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows, token_demand
+from sglang.test.tree_slots import window_evictable
 from sglang.test.unified_allocator_fixtures import (
     build_tri_cache,
     setup_allocator_context,
@@ -30,7 +31,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 def _evictable(cache):
     return (
         cache.full_evictable_size(),
-        cache.swa_evictable_size(),
+        window_evictable(cache),
         cache.mamba_evictable_size(),
     )
 

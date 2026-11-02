@@ -203,12 +203,18 @@ class SWAPrefillBudget(PrefillBudget):
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
 
+    def _window_evictable(self) -> int:
+        """Evictable tokens of the static pools' one window."""
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        return self.tree_cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
+
     def _available_and_evictable(self):
         if self.all_swa:
             global_swa_available_size = self.allocator.swa_available_size()
             if is_cp_sharded_padded():
                 global_swa_available_size = from_cp_sharded(global_swa_available_size)
-            return global_swa_available_size + self.tree_cache.swa_evictable_size()
+            return global_swa_available_size + self._window_evictable()
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
@@ -216,7 +222,7 @@ class SWAPrefillBudget(PrefillBudget):
 
     @property
     def remaining_window_tokens(self):
-        evictable = 0 if self.req_ring else self.tree_cache.swa_evictable_size()
+        evictable = 0 if self.req_ring else self._window_evictable()
         global_swa_available_size = self.allocator.swa_available_size()
         if is_cp_sharded_padded():
             global_swa_available_size = from_cp_sharded(global_swa_available_size)

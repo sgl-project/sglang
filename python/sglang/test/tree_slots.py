@@ -93,3 +93,35 @@ def index_slots(cache, components: Iterable[ComponentType]) -> None:
             for c in components
         )
     )
+
+
+def only_window(cache) -> str:
+    """The window sub-pool of a cache keeping one window (the static pools'
+    name when the cache keeps no window slot)."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    names = [name for name, _ in cache.window_sub_pools()]
+    if not names:
+        return BaseSWAKVPool.WINDOW_SUB_POOL
+    (name,) = names
+    return name
+
+
+def window_evictable(cache) -> int:
+    """Evictable tokens of a one-window cache's window."""
+    return cache.window_evictable_size(only_window(cache))
+
+
+def window_protected(cache) -> int:
+    """Locked tokens of a one-window cache's window."""
+    return cache.window_protected_size(only_window(cache))
+
+
+def core_window_evictable(core) -> int:
+    """Evictable tokens of a tree core's window-family slot."""
+    return core.component_evictable_size(core.slot_id(TREE_WINDOW))
+
+
+def core_window_protected(core) -> int:
+    """Locked tokens of a tree core's window-family slot."""
+    return core.component_protected_size(core.slot_id(TREE_WINDOW))

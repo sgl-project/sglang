@@ -76,7 +76,6 @@ def _cache():
         # The target's window slot retains its own window; a draft window more.
         window_retain_size=lambda name: 8 if name == "window" else 32,
         full_evictable_size=lambda: 0,
-        swa_evictable_size=lambda: 0,
         window_evictable_size=lambda component: 0,
         supports_prefix_sharing=lambda: True,
     )
@@ -407,11 +406,11 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
     def test_prefix_lock_changes_admission_without_rebuilding_budget(self):
         self.assertIsNotNone(self.allocator.alloc(24))
         self.cache.full_evictable_size = lambda: 24
-        self.cache.swa_evictable_size = lambda: 24
+        self.cache.window_evictable_size = lambda name: 24
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         # Locking the cached prefix removes its eviction credit.
         self.cache.full_evictable_size = lambda: 0
-        self.cache.swa_evictable_size = lambda: 0
+        self.cache.window_evictable_size = lambda name: 0
         self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
 
     def test_final_chunk_reserves_decode_headroom(self):
@@ -491,7 +490,6 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             window_retain_size=lambda component: page_size,
             disable=True,
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
             window_evictable_size=lambda component: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
@@ -611,7 +609,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator._swa_req_ring = True
         allocator._swa_ring_cost = 32
         cache = _cache()
-        cache.swa_evictable_size = lambda: 1000
+        cache.window_evictable_size = lambda name: 1000
         budget = create_prefill_budget(allocator, cache)
         budget.reserve(12, 4, chunk_limit=16)
         self.assertEqual(budget.remaining_window_tokens, 32)

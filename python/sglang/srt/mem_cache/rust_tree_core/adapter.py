@@ -832,14 +832,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         slot_id = self.slot_id(family)
         return 0 if slot_id is None else size_of(self._ids.core(slot_id))
 
-    def swa_evictable_size(self) -> int:
-        return self._slot_size(self._binding.component_evictable_size, TREE_WINDOW)
-
     def mamba_evictable_size(self) -> int:
         return self._slot_size(self._binding.component_evictable_size, TREE_STATE)
-
-    def swa_protected_size(self) -> int:
-        return self._slot_size(self._binding.component_protected_size, TREE_WINDOW)
 
     def mamba_protected_size(self) -> int:
         return self._slot_size(self._binding.component_protected_size, TREE_STATE)

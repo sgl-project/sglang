@@ -120,13 +120,10 @@ def _sizes(cache, storage):
 def _reprefill(cache):
     """Tokens a match must leave to re-prefill when a matched window cannot be
     reused as is (forced on: the decoder's bounded window replay)."""
-    read = getattr(cache, "window_reprefill_tail_tokens", None)
-    if read is None:
-        read = cache.swa_reprefill_tail_tokens
     saved = cache.decoder_swa_bounded_replay
     cache.decoder_swa_bounded_replay = True
     try:
-        return read(None)
+        return cache.window_reprefill_tail_tokens(None)
     finally:
         cache.decoder_swa_bounded_replay = saved
 

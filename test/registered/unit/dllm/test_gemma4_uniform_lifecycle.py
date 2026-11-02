@@ -161,7 +161,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         cache = SimpleNamespace(
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda name: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)
         adder = object.__new__(PrefillAdder)
