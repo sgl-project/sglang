@@ -162,7 +162,7 @@ class BailingMMMultimodalProcessor(BaseMultimodalProcessor):
         image_processor = getattr(processor, "image_processor", None)
         device: Optional[str] = None
         if isinstance(image_processor, BaseImageProcessor):
-            device = self._fast_image_processor_device(processor)
+            device = self._resolve_mm_preprocessing_device(processor)
         if device is not None:
             processor_kwargs["device"] = device
 

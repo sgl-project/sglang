@@ -7,7 +7,6 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
-from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -305,13 +304,10 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         # Take the worker pool's per-thread clone when it hands one over; falling
         # back to self._processor would put every worker on one shared object.
         processor, _ = self._resolve_processor(processor)
-        if (
-            hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessor)
-            and not self.disable_fast_image_processor
-        ):
-            if not _is_npu:
-                kwargs["device"] = "cuda"
+        if self._uses_fast_image_processor(processor) and not _is_npu:
+            device = self._resolve_mm_preprocessing_device(processor)
+            if device is not None:
+                kwargs["device"] = device
 
         result = processor.__call__(
             text=[input_text],

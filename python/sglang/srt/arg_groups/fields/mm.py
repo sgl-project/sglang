@@ -130,6 +130,15 @@ class Mm(msgspec.Struct):
         "Image processor backend. 'auto' lets Transformers select the best "
         "available backend.",
     ] = "auto"
+    mm_preprocessing_device: A[
+        Literal["auto", "cpu", "cuda"],
+        "Device for fast visual (image and video) preprocessing, which runs in "
+        "the tokenizer process. 'auto' preserves platform defaults. 'cpu' runs "
+        "shared HF preprocessing and JPEG decode on CPU without changing the "
+        "image processor backend. 'cuda' selects the serving GPU. Model-specific "
+        "video placement still takes precedence. Custom processors and GPU "
+        "feature transports may still use CUDA; this is not a VRAM limit.",
+    ] = "auto"
     mm_global_cache_backend: A[
         str,
         Arg(
