@@ -250,6 +250,46 @@ class TestBeamGroup(CustomTestCase):
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
 
+    def test_finalize_materializes_only_top_k_and_preserves_ties(self):
+        from unittest.mock import patch
+
+        from sglang.srt.beam_search.beam_group import BeamGroupState, CompletedBeam
+
+        group = self._make_group(beam_width=2, length_penalty=1.0)
+        group.state = BeamGroupState.FINISHED
+        n_low = BeamNode(40, BeamNode(30))
+        n_tie1 = BeamNode(11, BeamNode(10))
+        n_tie2 = BeamNode(21, BeamNode(20))
+        n_low2 = BeamNode(50, BeamNode(30))
+        group.completed = [
+            CompletedBeam(leaf=n_low, cum_logprob=-2.0, num_tokens=2, matched_token=99),
+            CompletedBeam(
+                leaf=n_tie1, cum_logprob=-0.4, num_tokens=2, matched_token=99
+            ),
+            CompletedBeam(
+                leaf=n_tie2, cum_logprob=-0.4, num_tokens=2, matched_token=None
+            ),
+            CompletedBeam(
+                leaf=n_low2, cum_logprob=-3.0, num_tokens=2, matched_token=99
+            ),
+        ]
+
+        visited_leaves = []
+
+        def tracking_materialize(leaf):
+            visited_leaves.append(leaf)
+            return materialize_tokens(leaf)
+
+        with patch(
+            "sglang.srt.beam_search.beam_group.materialize_tokens",
+            side_effect=tracking_materialize,
+        ):
+            results = group.finalize()
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual([r.tokens for r in results], [[10, 11], [20, 21]])
+        self.assertEqual(visited_leaves, [n_tie1, n_tie2])
+
 
 if __name__ == "__main__":
     unittest.main()
