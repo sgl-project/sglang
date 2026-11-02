@@ -113,6 +113,8 @@ _use_fp8_prefill_attn = (
 _MLA_ASM_PS_MAX_QLEN = 4
 # 16 padded heads times the window must fit aiter's 128-row fold.
 _MLA_FP8_Q_ASM_FOLD_MAX_QLEN = 8
+# The fp8-Q kernels return wrong output for these verify windows (ROCm/aiter#7007).
+_MLA_FP8_Q_ASM_BROKEN_QLENS = frozenset(range(2, 4 + 1))
 
 
 def _fp8_q_asm_mla_selected(
@@ -146,6 +148,7 @@ def _fp8_q_asm_mla_selected(
         and dcp_world_size <= 1
         and gfx95
         and 1 <= verify_qlen <= max_verify_qlen
+        and verify_qlen not in _MLA_FP8_Q_ASM_BROKEN_QLENS
     )
 
 

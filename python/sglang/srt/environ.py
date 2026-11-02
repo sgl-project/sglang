@@ -1110,7 +1110,7 @@ class Envs:
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
     # gfx950 h12 fp8 MLA: decode and short verify on the persistent fp8-Q asm kernel,
-    # this backend only; 2-4 token windows are wrong until ROCm/aiter#7007 is fixed.
+    # this backend only; 2-4 token windows stay off until ROCm/aiter#7007 is fixed.
     SGLANG_OPT_HIP_MLA_FP8_Q_ASM = EnvBool(False)
     # Widest verify window (1-8) that SGLANG_OPT_HIP_MLA_FP8_Q_ASM takes; on MI355X,
     # aiter's folded 5-8 token kernel beats Gluon only from about 128K context.

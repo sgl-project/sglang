@@ -460,7 +460,7 @@ class TestFp8QAsmSelection(CustomTestCase):
             decode_backend="asm",
             verify_backend="asm",
             dcp_world_size=1,
-            verify_qlen=4,
+            verify_qlen=1,
             gfx95=True,
         )
         kwargs.update(overrides)
@@ -471,12 +471,18 @@ class TestFp8QAsmSelection(CustomTestCase):
         self.assertFalse(self._selected(enabled=False))
 
     def test_verify_window_bound(self):
-        for qlen in (1, 2, 3, 4):
-            with self.subTest(qlen=qlen):
-                self.assertTrue(self._selected(verify_qlen=qlen))
+        self.assertTrue(self._selected(verify_qlen=1))
         for qlen in (0, 5, 8):
             with self.subTest(qlen=qlen):
                 self.assertFalse(self._selected(verify_qlen=qlen))
+
+    def test_refuses_broken_2_to_4_token_windows(self):
+        for max_qlen in (4, 8):
+            for qlen in (2, 3, 4):
+                with self.subTest(qlen=qlen, max_qlen=max_qlen):
+                    self.assertFalse(
+                        self._selected(verify_qlen=qlen, max_verify_qlen=max_qlen)
+                    )
 
     def test_folded_window_is_opt_in(self):
         self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(), 4)
@@ -576,6 +582,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
 
         with (
             envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.override(True),
+            envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.override(8),
             envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(False),
@@ -583,10 +590,10 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             mock.patch.object(aiter_backend, "fast_mode", False),
             mock.patch.object(aiter_backend, "intra_batch_mode", False),
         ):
-            # DSpark block 3: a four-token verify window takes the opt-in.
-            eligible = self._build(num_draft_tokens=4)
-            # DSpark block 7: an eight-token window keeps PERSIST=0 routing.
-            other = self._build(num_draft_tokens=8)
+            # DSpark block 7: an eight-token verify window takes the opt-in.
+            eligible = self._build(num_draft_tokens=8)
+            # DSpark block 3: a four-token window keeps PERSIST=0 routing.
+            other = self._build(num_draft_tokens=4)
 
             self.assertFalse(aiter_backend._use_mla_ps_kernel)
             self.assertFalse(aiter_backend.fast_mode)
