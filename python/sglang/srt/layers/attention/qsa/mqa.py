@@ -3,7 +3,6 @@ the torch implementations are the fallback and the reference."""
 
 import functools
 import math
-import warnings
 from typing import Optional
 
 import torch
@@ -649,20 +648,14 @@ def qsa_mqa_prefill(
         and k.ndim == 3
         and k.shape[1:] == (1, 128)
     ):
-        import sgl_kernel  # noqa: F401
+        import sgl_kernel
 
-        if hasattr(torch.ops.sgl_kernel, "qsa_mqa_prefill"):
-            return torch.ops.sgl_kernel.qsa_mqa_prefill(
-                q.contiguous(),
-                k.contiguous(),
-                row_starts.to(device=q.device, dtype=torch.int32).contiguous(),
-                row_ends.to(device=q.device, dtype=torch.int32).contiguous(),
-                score_scale,
-            )
-        warnings.warn(
-            "sgl-kernel-xpu was built without QSA MQA; using the slow prefill reference",
-            RuntimeWarning,
-            stacklevel=2,
+        return sgl_kernel.qsa_mqa_prefill(
+            q.contiguous(),
+            k.contiguous(),
+            row_starts.to(device=q.device, dtype=torch.int32).contiguous(),
+            row_ends.to(device=q.device, dtype=torch.int32).contiguous(),
+            score_scale,
         )
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
@@ -717,21 +710,15 @@ def qsa_mqa_decode(
         and k_cache.ndim == 4
         and k_cache.shape[2:] == (1, 128)
     ):
-        import sgl_kernel  # noqa: F401
+        import sgl_kernel
 
-        if hasattr(torch.ops.sgl_kernel, "qsa_mqa_decode"):
-            return torch.ops.sgl_kernel.qsa_mqa_decode(
-                q.contiguous(),
-                k_cache.contiguous(),
-                page_table.to(device=q.device, dtype=torch.int32).contiguous(),
-                context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
-                max_model_len,
-                score_scale,
-            )
-        warnings.warn(
-            "sgl-kernel-xpu was built without QSA MQA; using the slow decode reference",
-            RuntimeWarning,
-            stacklevel=2,
+        return sgl_kernel.qsa_mqa_decode(
+            q.contiguous(),
+            k_cache.contiguous(),
+            page_table.to(device=q.device, dtype=torch.int32).contiguous(),
+            context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+            max_model_len,
+            score_scale,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

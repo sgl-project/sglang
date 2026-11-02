@@ -154,8 +154,6 @@ class QSAIndexer(MultiPlatformOp):
                 and self.index_head_dim in (64, 128, 256)
                 and 2 <= self.compress_ratio <= 16
                 and cache.is_xpu
-                and hasattr(torch.ops.sgl_kernel, "qsa_index_q_norm_rope_store")
-                and hasattr(torch.ops.sgl_kernel, "qsa_index_k_compress_store")
             )
         return False
 

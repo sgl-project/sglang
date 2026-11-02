@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import Optional
 
 import torch
@@ -388,18 +387,12 @@ def qsa_sparse_attention(
     ):
         import sgl_kernel
 
-        if hasattr(torch.ops.sgl_kernel, "qsa_sparse_attention"):
-            return sgl_kernel.qsa_sparse_attention(
-                q.contiguous(),
-                k_cache.contiguous(),
-                v_cache.contiguous(),
-                token_slots.contiguous(),
-                softmax_scale,
-            )
-        warnings.warn(
-            "sgl-kernel-xpu was built without QSA; using the slow QSA reference",
-            RuntimeWarning,
-            stacklevel=2,
+        return sgl_kernel.qsa_sparse_attention(
+            q.contiguous(),
+            k_cache.contiguous(),
+            v_cache.contiguous(),
+            token_slots.contiguous(),
+            softmax_scale,
         )
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
