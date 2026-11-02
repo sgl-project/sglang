@@ -22,7 +22,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
@@ -105,7 +104,6 @@ def _queued_scheduler(req):
     scheduler.output_streamer = MagicMock()
     scheduler.grammar_manager = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
-    scheduler.prefill_launched_reqs = RequestList()
     return scheduler
 
 

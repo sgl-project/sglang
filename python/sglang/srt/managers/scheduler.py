@@ -6152,26 +6152,21 @@ class Scheduler(
 
             # Abort retracted requests held for rebootstrap until generation
             # resumes; they hold no KV and no step uses them.
-            if self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                remaining_held = []
-                for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
-                    if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                        req.finish_outside_step(FINISH_ABORT())
-                        self._release_aborted_request(req)
-                        self.send_abort_output(
-                            _make_abort_req(
-                                req, finished_reason=recv_req.finished_reason
-                            ),
-                            req,
-                        )
-                    else:
-                        remaining_held.append(req)
-                self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = remaining_held
+            remaining_held = []
+            for req in self.disagg_decode_prealloc_queue.held_rebootstrap_reqs:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    req.finish_outside_step(FINISH_ABORT())
+                    self._release_aborted_request(req)
+                    self.send_abort_output(
+                        _make_abort_req(req, finished_reason=recv_req.finished_reason),
+                        req,
+                    )
+                else:
+                    remaining_held.append(req)
+            self.disagg_decode_prealloc_queue.held_rebootstrap_reqs = remaining_held
 
-        # Delete requests in the running batch, and launched prefill requests no
-        # batch lists anymore (a PD optimistic request that yielded the chunked
-        # slot with a chunk in flight): that chunk's result retires them.
-        for req in self.collect_inflight_reqs().union(self.prefill_launched_reqs):
+        # Delete requests in the running batch
+        for req in self.collect_inflight_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
