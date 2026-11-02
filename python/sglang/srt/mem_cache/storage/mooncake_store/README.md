@@ -43,6 +43,34 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### Optional page-wise Direct Linker reads
+
+The Mooncake Direct Linker keeps layer-wise reads by default. To read every
+layer and physical pool in one range-get call, add these keys to the JSON
+object passed through `--unified-cache-external-linker-config`:
+
+```json
+{
+  "page_wise_load": true,
+  "page_wise_load_threshold": 10,
+  "local_buffer_size": 67108864
+}
+```
+
+Merge these keys with your existing Mooncake connection settings. The
+threshold counts physical object keys in the queued load batch; smaller
+batches retain layer-wise loading. Page-wise reads publish layer readiness
+only after all ranges and session cleanup succeed, so they trade per-layer
+overlap for fewer calls. This uses the existing Mooncake session/range API;
+it does not enable waiting-queue prefetch or native ReadPlan.
+
+`local_buffer_size` controls the client-local buffer in bytes for embedded
+and standalone clients. Its default remains 16777216 bytes (16 MiB); zero is
+accepted, and negative/non-integer values are rejected. Select a capacity
+for your backend and workload rather than assuming a larger buffer improves
+serving performance. These options do not change the Store's shared segment
+capacity.
+
 ## Install Mooncake
 
 **Method 1: with pip**
