@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -47,7 +48,10 @@ class TransferTensorBuffer:
         actual_size = self._allocator.pool_size
 
         if device == "cpu":
-            self._pool = torch.empty(actual_size, dtype=torch.uint8, pin_memory=True)
+            pin_memory = torch.cuda.is_available()
+            self._pool = torch.empty(
+                actual_size, dtype=torch.uint8, pin_memory=pin_memory
+            )
         else:
             self._pool = torch.empty(actual_size, dtype=torch.uint8, device=device)
         self._pool_ptr = self._pool.data_ptr()
@@ -137,10 +141,7 @@ class TransferTensorBuffer:
         stream: torch.Stream | None = None,
     ) -> torch.Tensor:
         """Read a tensor from the pool slot. Returns a clone on target device."""
-        nbytes = 1
-        for s in shape:
-            nbytes *= s
-        nbytes *= torch.tensor([], dtype=dtype).element_size()
+        nbytes = math.prod(shape) * dtype.itemsize
 
         raw = self._pool[
             handle.offset + byte_offset : handle.offset + byte_offset + nbytes
