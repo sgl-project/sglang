@@ -58,7 +58,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             use_cutedsl_w4a16 = (
                 cfg.moe_runner_backend == "flashinfer_cutedsl"
                 and cfg.moe_a2a_backend in ("none", "flashinfer")
-                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
             )
             if (
                 cfg.moe_runner_backend not in ("auto", "marlin")

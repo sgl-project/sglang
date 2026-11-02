@@ -46,6 +46,9 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # Independent of attention's speculative mode and the communication
+    # is_extend_in_batch flag (which graph capture may deliberately clear).
+    moe_forward_phase: str = "decode"
 
 
 _current: Optional[ForwardContext] = None
@@ -88,16 +91,33 @@ def get_req_to_token_pool() -> ReqToTokenPool:
     return get_attn_backend().req_to_token_pool
 
 
+def moe_forward_phase_from_batch(forward_batch: ForwardBatch) -> str:
+    """Classify prompt work as prefill and speculative/generated work as decode."""
+    phase = getattr(forward_batch, "moe_forward_phase_override", None)
+    if phase is not None:
+        return phase
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode is None:
+        return _current.moe_forward_phase if _current is not None else "decode"
+    return "prefill" if mode.is_extend_without_speculative() else "decode"
+
+
 @contextmanager
 def forward_context(
     ctx: ForwardContext, *, forward_batch: Optional[ForwardBatch] = None
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            moe_forward_phase=moe_forward_phase_from_batch(forward_batch),
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            moe_forward_phase=_current.moe_forward_phase,
+        )
     prev = set_forward_context(ctx)
     try:
         yield

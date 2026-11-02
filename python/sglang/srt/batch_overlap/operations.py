@@ -18,6 +18,7 @@ from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
+    moe_forward_phase_from_batch,
 )
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
@@ -128,6 +129,7 @@ class _StageExecutor:
         self._child_ctx = replace(
             child_ctx if child_ctx is not None else get_forward_context(),
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            moe_forward_phase=moe_forward_phase_from_batch(forward_batch),
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len

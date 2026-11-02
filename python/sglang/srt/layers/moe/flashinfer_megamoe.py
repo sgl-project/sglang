@@ -208,12 +208,21 @@ def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.T
 
 
 def _validate_nvfp4_fc1_alpha(layer: FusedMoE) -> None:
-    """MegaMOE reuses ``g1_alphas`` as fc1_alpha; the kernel takes one alpha per
-    expert, so the gate and up FC1 alphas must agree."""
+    """The kernel takes one FC1 alpha per expert, shared by gate and up."""
     if not layer.moe_runner_config.is_gated:
         return
-    gate_alpha = _local_expert_vector(layer.g1_alphas, layer.num_local_experts)
-    up_alpha = _local_expert_vector(layer.g1_alphas_up, layer.num_local_experts)
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all():
+        # W4A16 ignores activation calibration. Checking calibrated alphas can
+        # hide unequal weight scales below allclose's absolute tolerance.
+        weight_scale = layer.w13_weight_scale_2
+        if weight_scale.ndim == 2 and weight_scale.shape[1] >= 2:
+            gate_alpha, up_alpha = weight_scale[:, 0], weight_scale[:, 1]
+        else:
+            gate_alpha = up_alpha = weight_scale.reshape(layer.num_local_experts)
+    else:
+        gate_alpha, up_alpha = layer.g1_alphas, layer.g1_alphas_up
+    gate_alpha = _local_expert_vector(gate_alpha, layer.num_local_experts)
+    up_alpha = _local_expert_vector(up_alpha, layer.num_local_experts)
     if not torch.allclose(gate_alpha, up_alpha):
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "
@@ -368,7 +377,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         return mega
 
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
-    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
         megakernel_config = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
@@ -495,7 +504,7 @@ def make_nvfp4_megamoe_weight_loader(
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
     # Both NVFP4 modes reload into the same prepared allocations. Preserve the
     # live layer, tuned profiles and pooled workspace owner for CUDA graphs.
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)

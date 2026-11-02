@@ -114,7 +114,7 @@ def handle_moe_kernel_config(server_args: Any):
         )
         if view.moe_a2a_backend == "deepep" and (
             view.quantization == "nvfp4_online"
-            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.enabled_for_any()
         ):
             raise ValueError(
                 "flashinfer_cutedsl per-token NVFP4 activation requires "
@@ -214,7 +214,10 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
 
 def validate_flashinfer_megamoe_envs() -> None:
     combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
-    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() and combine_dtype != "bf16":
+    if (
+        envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_any()
+        and combine_dtype != "bf16"
+    ):
         raise ValueError(
             "FlashInfer MegaMOE NVFP4 W4A16 requires "
             "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=bf16."
@@ -267,7 +270,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         quantization in ("mxfp8", "modelopt_fp4")
         or (
             quantization == "nvfp4_online"
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
         )
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
@@ -369,7 +372,7 @@ def handle_a2a_moe(server_args: Any):
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
         validate_flashinfer_megamoe_envs()
-        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+        if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_any():
             import torch
 
             if model_config_of(server_args).dtype != torch.bfloat16:
@@ -535,7 +538,7 @@ def handle_a2a_moe(server_args: Any):
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
         use_cutedsl_w4a16 = (
             resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_any()
         )
         if use_cutedsl_w4a16 and envs.SGLANG_MOE_NVFP4_DISPATCH.get():
             raise ValueError(

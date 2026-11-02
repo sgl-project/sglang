@@ -60,8 +60,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     """Load-time NVFP4 expert weights with online activation handling.
 
     `--quantization nvfp4_online` uses per-token FP32 activation scales by
-    default. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
-    and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
+    default, unless `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION` selects a
+    phase or explicitly disables them. With
+    `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
     for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
     This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
     layers retain their source precision or quantization.
@@ -113,9 +114,17 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping or {},
         )
         self.fp4_ignored_layers = fp4_ignored_layers
-        # NVFP4 weight scales are fixed at load time; FlashInfer computes one
-        # FP32 activation scale per token at runtime.
-        self.use_per_token_activation = self._use_per_token_activation
+        # Preserve nvfp4_online's per-token default when the env is unset.
+        per_token_activation = (
+            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            if self._use_per_token_activation
+            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.is_set()
+            else self._use_per_token_activation
+        )
+        self.use_per_token_activation = bool(per_token_activation)
+        self.per_token_activation_phase = (
+            per_token_activation if isinstance(per_token_activation, str) else None
+        )
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
         self.dequant_fp4_to_fp8 = False
@@ -177,7 +186,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             source_layer_ignored = is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix)
-            if source_layer_ignored and not self.use_per_token_activation:
+            if source_layer_ignored and not self._use_per_token_activation:
                 return None
             if is_layer_skipped(
                 prefix, self.fp4_ignored_layers, self.packed_modules_mapping
@@ -239,14 +248,14 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             or self._is_cutedsl_v2_standard
             or (
                 get_moe_runner_backend().is_flashinfer_megamoe()
-                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
             )
         ):
             raise ValueError(
                 "--quantization nvfp4_online supports flashinfer_trtllm, "
                 "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
                 "or FlashInfer A2A, or flashinfer_megamoe with "
-                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1. "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 (both phases). "
                 "Use --quantization modelopt_fp4 for "
                 "per-tensor FP32 activation scales."
             )

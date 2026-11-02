@@ -84,6 +84,17 @@ def _align_fp4_moe_weights_for_flashinfer_trtllm(layer) -> None:
 class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """Prepare Muse FP4 experts without process-global mutation or duplication."""
 
+    def __init__(self, quant_config):
+        # The W4A16 flag is scoped to CuTe DSL and FlashInfer MegaMoE. Muse's
+        # custom TRT-LLM experts keep their W4A4 path regardless of that flag.
+        if getattr(quant_config, "per_token_activation_phase", None) is not None:
+            raise ValueError(
+                "Muse Spark custom NVFP4 experts do not support phase-specific "
+                "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION settings. "
+                "Use a boolean setting for this model."
+            )
+        super().__init__(quant_config)
+
     def create_weights(
         self,
         layer,
