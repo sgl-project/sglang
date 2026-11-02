@@ -10,6 +10,10 @@ from typing import Iterator, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -68,11 +72,13 @@ def flat_index_logits_rows_per_tile(
     """Rows per logits tile within ``budget_bytes``, at the kernel's row alignment.
     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
     half the budget, which leaves room for the per-row selection scratch that
-    grows with the tile."""
+    grows with the tile. FP32 logits on SM100 also hold DeepGEMM's BF16 output
+    while it widens."""
     row_alignment = 128 // heads
+    widens = index_logits_dtype() == torch.float32 and _is_sm100()
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
+        row_bytes=mqa_logits_row_bytes(width) * (3 if widens else 2) // 2,
         budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
@@ -101,8 +107,6 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
@@ -117,14 +121,13 @@ def flat_index_logits_tiles(
         tile_starts = starts[tile]
         yield (
             tile,
-            fp8_fp4_mqa_logits(
+            fp8_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
-                False,
-                width,
+                max_seqlen_k=width,
                 logits_dtype=logits_dtype,
             ),
         )
@@ -140,12 +143,10 @@ def deep_gemm_fp4_paged_mqa_logits(
     max_seq_len: int,
 ) -> torch.Tensor:
     """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
-    from deep_gemm import fp8_fp4_paged_mqa_logits
-
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
-    return fp8_fp4_paged_mqa_logits(
+    return fp8_paged_mqa_logits(
         q_fp4,
         k_cache,
         weights.to(index_weights_dtype()),
@@ -153,7 +154,6 @@ def deep_gemm_fp4_paged_mqa_logits(
         page_table,
         deep_gemm_metadata,
         max_seq_len,
-        False,
         logits_dtype=index_logits_dtype(),
     )
 

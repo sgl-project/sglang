@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    pd_kv_layouts_match,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -1342,7 +1343,9 @@ class CommonKVManager(BaseKVManager):
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
-            response = requests.get(url, timeout=5)
+            response = requests.get(
+                url, params={"decode_kv_layout": self.kv_layout or ""}, timeout=5
+            )
             if response.status_code == 200:
                 data = response.json()
                 info = PrefillServerInfo(**data)
@@ -1384,15 +1387,14 @@ class CommonKVManager(BaseKVManager):
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
-        if (
-            info.kv_layout is not None
-            and self.kv_layout is not None
-            and info.kv_layout != self.kv_layout
-        ):
+        if not pd_kv_layouts_match(info.kv_layout, self.kv_layout):
             raise RuntimeError(
                 f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
-                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT, "
+                f"and both or neither must keep the index-K cache in DeepGEMM's "
+                f"SM100 UE8M0 format (same GPU arch, --dsa-paged-mqa-logits-backend "
+                f"and indexer env overrides)."
             )
 
         local_layout = self.dsv41_spec_layout
@@ -3259,6 +3261,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     text=f"Prefill server not fully registered yet"
                     f" ({self._registered_count} workers registered).",
                     status=503,
+                )
+            # A decoder that does not report its layout predates the UE8M0 index-K
+            # cache and would accept these pages without checking
+            if "decode_kv_layout" not in request.query and not pd_kv_layouts_match(
+                self.kv_layout, None
+            ):
+                return web.Response(
+                    text=f"Prefill server has kv_layout={self.kv_layout}, which a "
+                    "decode server from before the UE8M0 index-K cache cannot read. "
+                    "Upgrade the decode server.",
+                    status=400,
                 )
             info = PrefillServerInfo(
                 attn_tp_size=self.attn_tp_size,

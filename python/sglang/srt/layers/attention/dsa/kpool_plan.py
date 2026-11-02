@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    get_paged_mqa_logits_metadata,
+)
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     build_kpool_topk_v2_plan,
@@ -568,7 +571,7 @@ def _compute_pool_schedule_metadata(
     deep_gemm = _get_deep_gemm()
     if deep_gemm is None:
         return None
-    return deep_gemm.get_paged_mqa_logits_metadata(
+    return get_paged_mqa_logits_metadata(
         pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
         index_page_size,
         deep_gemm.get_num_sms(),

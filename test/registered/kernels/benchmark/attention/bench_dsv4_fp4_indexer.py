@@ -7,6 +7,12 @@ import triton
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    pack_ue8m0_x4,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -38,7 +44,10 @@ shape_range = get_benchmark_range(
 def _pack_fp8_cache(k: torch.Tensor, *, num_blocks: int) -> torch.Tensor:
     k = k.view(num_blocks, BLOCK_KV, 1, HEAD_DIM)
     scale = k.abs().float().amax(dim=3, keepdim=True).clamp(1.0e-4) / 448.0
+    scale = torch.exp2(torch.ceil(torch.log2(scale)))
     k_fp8 = (k * (1.0 / scale)).to(torch.float8_e4m3fn)
+    if uses_mx_mqa_logits(k.device):
+        scale = pack_ue8m0_x4(scale)
     buf = torch.empty(
         (num_blocks, BLOCK_KV * (HEAD_DIM + 4)), dtype=torch.uint8, device="cuda"
     )
@@ -81,8 +90,8 @@ def _make_case(batch: int, seq_len_kv: int):
     context_lens = torch.full(
         (batch, NEXT_N), seq_len_kv, dtype=torch.int32, device="cuda"
     )
-    schedule = deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens, BLOCK_KV, deep_gemm.get_num_sms(), indices=None
+    schedule = get_paged_mqa_logits_metadata(
+        context_lens, BLOCK_KV, deep_gemm.get_num_sms()
     )
 
     q = torch.randn(
@@ -140,7 +149,7 @@ def _make_case(batch: int, seq_len_kv: int):
 def benchmark(batch: int, seq_len_kv: int, provider: str):
     case = _make_case(batch, seq_len_kv)
     if provider == "fp8":
-        fn = lambda: deep_gemm.fp8_paged_mqa_logits(
+        fn = lambda: fp8_paged_mqa_logits(
             case["q_fp8"],
             case["k_cache_fp8"],
             case["weights_fp8"],
@@ -148,11 +157,9 @@ def benchmark(batch: int, seq_len_kv: int, provider: str):
             case["page_table"],
             case["schedule"],
             case["padded_len"],
-            clean_logits=False,
-            indices=None,
         )
     elif provider == "fp4":
-        fn = lambda: deep_gemm.fp8_fp4_paged_mqa_logits(
+        fn = lambda: fp8_paged_mqa_logits(
             (case["q_fp4"], case["q_sf"]),
             case["k_cache_fp4"],
             case["weights"],
@@ -160,9 +167,6 @@ def benchmark(batch: int, seq_len_kv: int, provider: str):
             case["page_table"],
             case["schedule"],
             case["padded_len"],
-            clean_logits=False,
-            logits_dtype=torch.float32,
-            indices=None,
         )
     else:
         raise ValueError(f"Unknown provider: {provider}")

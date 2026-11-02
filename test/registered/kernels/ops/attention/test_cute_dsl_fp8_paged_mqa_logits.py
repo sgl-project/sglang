@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+from itertools import product
 
 import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsa import cutedsl_paged_mqa_logits, pick_dsl_expand
+from sglang.srt.layers.attention.dsa.utils import resolve_paged_mqa_logits_metadata_fn
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.paged_mqa import (
@@ -21,12 +23,17 @@ register_cuda_ci(est_time=180, stage="nightly", runner_config="4-gpu-b200")
 
 
 def _run_cutedsl_paged_mqa_logits(
-    data, batch_size, next_n, num_heads, max_model_len, is_target_verify
+    data,
+    batch_size,
+    next_n,
+    num_heads,
+    max_model_len,
+    is_target_verify,
+    draft_extend=False,
 ):
     """Mirrors the CUTEDSL dispatch in
     sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged."""
-    import deep_gemm
-
+    get_metadata = resolve_paged_mqa_logits_metadata_fn(cutedsl=True)
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     if is_target_verify and next_n >= 2:
         dsl_expand_factor, dsl_atom = pick_dsl_expand(
@@ -46,28 +53,30 @@ def _run_cutedsl_paged_mqa_logits(
         - next_n
         + torch.arange(1, next_n + 1, device=context_lens.device, dtype=torch.int32)
     ).flatten()
-    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-        expanded_ctx.unsqueeze(-1), BLOCK_KV, num_sms
-    )
     block_tables_expanded = data["block_table"].repeat_interleave(next_n, dim=0)
-
+    q_rows = data["q_fp8"].view(batch_size * next_n, num_heads, HEAD_DIM)
+    schedule_metadata = (
+        None
+        if draft_extend
+        else get_metadata(expanded_ctx.unsqueeze(-1), BLOCK_KV, num_sms)
+    )
     return cutedsl_paged_mqa_logits(
-        data["q_fp8"].view(batch_size * next_n, num_heads, HEAD_DIM),
+        q_rows,
         data["kv_fused"],
         data["weights"],
-        context_lens,
+        expanded_ctx if draft_extend else context_lens,
         block_tables_expanded,
         schedule_metadata,
         max_model_len,
         q_offset=batch_size * next_n,
-        B=batch_size,
-        next_n=next_n,
-        is_target_verify=is_target_verify,
-        dsl_expand_factor=dsl_expand_factor,
-        dsl_atom=dsl_atom,
+        B=batch_size * next_n if draft_extend else batch_size,
+        next_n=1 if draft_extend else next_n,
+        is_target_verify=is_target_verify and not draft_extend,
+        dsl_expand_factor=1 if draft_extend else dsl_expand_factor,
+        dsl_atom=1 if draft_extend else dsl_atom,
         blocksize=BLOCK_KV,
         sm_count=num_sms,
-        get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+        get_paged_mqa_logits_metadata_fn=get_metadata,
     )
 
 
@@ -75,11 +84,24 @@ def _run_cutedsl_paged_mqa_logits(
     not is_sm100_supported(),
     reason="CuTe DSL FP8 Paged MQA Logits only supports SM 100 family.",
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6])
-@pytest.mark.parametrize("num_heads", [32, 64])
-@pytest.mark.parametrize("avg_ctx", [128, 1024, 4096, 16384])
-def test_cutedsl_paged_mqa_logits(batch_size, next_n, num_heads, avg_ctx):
+@pytest.mark.parametrize(
+    "batch_size,next_n,num_heads,avg_ctx,draft_extend",
+    [
+        (*shape, False)
+        for shape in product(
+            [1, 2, 4, 8], [1, 2, 3, 4, 5, 6], [32, 64], [128, 1024, 4096, 16384]
+        )
+    ]
+    # Draft-extend changes row layout, not kernel tuning: cover both head counts,
+    # multiple requests, odd/even draft lengths, and short/long contexts.
+    + [
+        (1, 2, 32, 128, True),
+        (2, 3, 64, 1024, True),
+        (4, 5, 32, 4096, True),
+        (8, 6, 64, 16384, True),
+    ],
+)
+def test_cutedsl_paged_mqa_logits(batch_size, next_n, num_heads, avg_ctx, draft_extend):
     max_model_len = max(avg_ctx * 2, 2048)
     data = generate_paged_mqa_test_data(
         batch_size, next_n, num_heads, avg_ctx, max_model_len
@@ -92,6 +114,7 @@ def test_cutedsl_paged_mqa_logits(batch_size, next_n, num_heads, avg_ctx):
         num_heads,
         max_model_len,
         is_target_verify=next_n >= 2,
+        draft_extend=draft_extend,
     )
 
     ref_logits = ref_fp8_paged_mqa_logits(

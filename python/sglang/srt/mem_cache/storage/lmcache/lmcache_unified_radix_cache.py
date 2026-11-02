@@ -6,6 +6,7 @@ LMCache owns external storage; retrieved KV is published after reaching GPU.
 from __future__ import annotations
 
 import atexit
+import copy
 import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Optional
@@ -19,6 +20,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
 
+from sglang.srt.layers.attention.dsa.utils import with_index_k_storage_tag
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,
@@ -56,9 +58,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
         self._mamba_component = self._find_mamba_component()
+        # LMCache namespaces stored pages by model_config.model_path
+        storage_model_config = copy.copy(model_config)
+        storage_model_config.model_path = with_index_k_storage_tag(
+            model_config.model_path, self.token_to_kv_pool_allocator.get_kvcache()
+        )
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
-            model_config=model_config,
+            model_config=storage_model_config,
             tp_size=tp_size,
             tp_rank=tp_rank,
             tp_group=params.tp_cache_group,
