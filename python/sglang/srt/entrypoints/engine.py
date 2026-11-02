@@ -40,6 +40,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Tuple,
     Union,
@@ -73,6 +74,7 @@ from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
+    CheckpointReqOutput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
@@ -1879,6 +1881,26 @@ class Engine(EngineScoreMixin, EngineBase):
         return self.loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
+
+    def checkpoint_prepare(
+        self, mode: Literal["abort", "retract"] = "abort"
+    ) -> CheckpointReqOutput:
+        """Start preparing for an external process checkpoint: pause generation
+        with `mode` as pause_generation does, then release the KV cache. Poll
+        checkpoint_state() until its state is PREPARED. If the engine cannot
+        prepare now, success is False and nothing changed."""
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.checkpoint_prepare(mode)
+        )
+
+    def checkpoint_restore(self) -> CheckpointReqOutput:
+        """Bring back what preparing released and continue generation, in a
+        process started from the capture or in place."""
+        return self.loop.run_until_complete(self.tokenizer_manager.checkpoint_restore())
+
+    def checkpoint_state(self) -> CheckpointReqOutput:
+        """The lifecycle state of every DP rank, with the error if FAILED."""
+        return self.loop.run_until_complete(self.tokenizer_manager.checkpoint_state())
 
     def freeze_gc(self):
         """

@@ -6,7 +6,7 @@ import hashlib
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import fastapi
 
@@ -19,12 +19,17 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
+    CheckpointReqInput,
+    CheckpointReqOutput,
+    CheckpointReqType,
+    CheckpointState,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -56,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
@@ -89,6 +95,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_lora,
     get_parallel,
     get_serving,
@@ -129,6 +136,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("checkpoint", CheckpointReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -887,6 +895,71 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def checkpoint_state(self: TokenizerManager) -> CheckpointReqOutput:
+        """The process checkpoint state of every DP rank, and whether prepare
+        would be refused. See scheduler_components/checkpoint_manager.py."""
+        self.auto_create_handle_loop()
+        return await self._call_checkpoint(CheckpointReqType.STATE)
+
+    async def checkpoint_prepare(
+        self: TokenizerManager, mode: Literal["abort", "retract"]
+    ) -> CheckpointReqOutput:
+        """Pause generation as /pause_generation does, then release the KV
+        cache once the scheduler drains. Clients see a paused server."""
+        self.auto_create_handle_loop()
+        async with self.checkpoint_lock:
+            out = await self._call_checkpoint(CheckpointReqType.STATE)
+            if not out.success or out.state != CheckpointState.RUNNING:
+                return out
+            if self.is_pause:
+                return CheckpointReqOutput(
+                    success=False,
+                    message="Preparing for a checkpoint requires unpaused generation",
+                    state=out.state,
+                )
+            await self.pause_generation(PauseGenerationReqInput(mode=mode))
+            # Check again while every DP rank is still running: a retract pause
+            # may leave a rank unable to drain.
+            out = await self._call_checkpoint(CheckpointReqType.STATE)
+            if out.success:
+                out = await self._call_checkpoint(CheckpointReqType.PREPARE)
+            if not out.success and out.state == CheckpointState.RUNNING:
+                await self.continue_generation(ContinueGenerationReqInput())
+            return out
+
+    async def checkpoint_restore(self: TokenizerManager) -> CheckpointReqOutput:
+        """Bring the KV cache back and continue generation."""
+        self.auto_create_handle_loop()
+        async with self.checkpoint_lock:
+            before = await self._call_checkpoint(CheckpointReqType.STATE)
+            out = await self._call_checkpoint(CheckpointReqType.RESTORE)
+            # Continue only the pause this cycle started, not a later user pause.
+            # With DP ranks restored by an earlier call, `before` is mixed.
+            if (
+                before.state != CheckpointState.RUNNING
+                and out.state == CheckpointState.RUNNING
+            ):
+                await self.continue_generation(ContinueGenerationReqInput())
+            return out
+
+    async def _call_checkpoint(
+        self: TokenizerManager, req_type: CheckpointReqType
+    ) -> CheckpointReqOutput:
+        results = await self.checkpoint_communicator(
+            CheckpointReqInput(req_type=req_type)
+        )
+        # DP ranks move independently.
+        return CheckpointReqOutput.merge(results)
+
+    async def _refuse_continue_during_checkpoint(self: TokenizerManager) -> None:
+        # Continuing while the KV cache is released would schedule requests
+        # without one. Preparing requires the memory saver, so check only then.
+        if not get_exec().features.enable_memory_saver:
+            return
+        out = await self._call_checkpoint(CheckpointReqType.STATE)
+        if out.state != CheckpointState.RUNNING:
+            raise RuntimeError("Cannot continue generation during a process checkpoint")
 
     async def check_weights(
         self: TokenizerManager,
