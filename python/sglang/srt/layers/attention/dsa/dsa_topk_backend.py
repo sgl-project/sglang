@@ -237,7 +237,7 @@ class DSATopKBackend(Enum):
                     num_rows=logits.shape[0],
                 )
                 return flashinfer.top_k_page_table_transform(
-                    logits.contiguous(),
+                    logits,
                     attn_metadata.page_table_1.contiguous(),
                     lengths.contiguous(),
                     topk,
