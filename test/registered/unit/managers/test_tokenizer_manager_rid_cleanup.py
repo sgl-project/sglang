@@ -17,6 +17,7 @@ Covers:
 import asyncio
 import time
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -35,11 +36,14 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
-    wrap_as_pickle,
+    RequestOutputStats,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
+    CudaIpcTensorTransportProxy,
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
@@ -63,11 +67,8 @@ _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
 _PER_REQUEST_INT_FIELDS = frozenset(
     {
-        "prompt_tokens",
         "completion_tokens",
         "reasoning_tokens",
-        "cached_tokens",
-        "retraction_counts",
         # Speculative-decoding int-scalar fields (current and historical names)
         "spec_verify_ct",
         "spec_accepted_drafts",
@@ -83,7 +84,6 @@ _PER_REQUEST_FLOAT_FIELDS = frozenset(
 
 _PER_REQUEST_NESTED_LIST_FIELDS = frozenset(
     {
-        "output_ids",
         # Logprob fields
         "input_token_logprobs_val",
         "input_token_logprobs_idx",
@@ -178,6 +178,20 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
+def _request_stats(**overrides) -> RequestOutputStats:
+    fields = dict(
+        prompt_tokens=0,
+        cached_tokens=0,
+        cached_tokens_details=None,
+        retraction_count=0,
+        image_tokens=0,
+        audio_tokens=0,
+        video_tokens=0,
+        time_stats=None,
+    )
+    return RequestOutputStats(**{**fields, **overrides})
+
+
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
@@ -202,6 +216,12 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [fr]
         elif f.name == "output_strs":
             kwargs[f.name] = ["hello"]
+        elif f.name == "output_ids_flat":
+            kwargs[f.name] = array("q")
+        elif f.name == "output_ids_offsets":
+            kwargs[f.name] = [0, 0]
+        elif f.name == "request_stats":
+            kwargs[f.name] = [_request_stats()]
         elif f.name in _PER_REQUEST_INT_FIELDS:
             kwargs[f.name] = [0]
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
@@ -524,6 +544,44 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestStoredRequestStats(CustomTestCase):
+    def test_rows_without_request_stats_read_the_latest_request_stats(self):
+        """A row without request stats reports the latest received, and a row
+        before any is dropped."""
+        tm = _make_tokenizer_manager(self)
+        rid = "request_stats_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        tm.rid_to_state[rid] = state
+        first = _request_stats(prompt_tokens=5, cached_tokens=2)
+        retracted = _request_stats(prompt_tokens=5, cached_tokens=3, retraction_count=1)
+        for request_stats, finished_reason in (
+            ([first], _NOT_FINISHED),
+            (None, _NOT_FINISHED),
+            ([retracted], _NOT_FINISHED),
+            ([None], None),
+        ):
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.request_stats = request_stats
+            asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(
+            [
+                (m["prompt_tokens"], m["cached_tokens"], m["num_retractions"])
+                for m in (out["meta_info"] for out in state.out_list)
+            ],
+            [(5, 2, 0), (5, 2, 0), (5, 3, 1), (5, 3, 1)],
+        )
+
+        # A late row of an aborted request whose rid a new request reused.
+        reused = tm.rid_to_state[rid] = _make_req_state(rid)
+        batch_output = _make_batch_str_output(rid, _NOT_FINISHED)
+        batch_output.request_stats = None
+        asyncio.run(tm._handle_batch_output(batch_output))
+        self.assertEqual(reused.out_list, [])
+        self.assertIs(tm.rid_to_state[rid], reused)
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
@@ -555,7 +613,9 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            batch_output.request_stats = [
+                _request_stats(time_stats=sched_stats.to_output_time_stats())
+            ]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
@@ -606,7 +666,9 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        batch_output.request_stats = [
+            _request_stats(time_stats=sched_stats.to_output_time_stats())
+        ]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))
         return state.time_stats, arrival
@@ -714,7 +776,7 @@ class TestInitReqStateAtomicity(CustomTestCase):
                     tm._release_lora_once.assert_not_called()
                     tm._tokenize_one_request.assert_not_called()
                     tm._send_one_request.assert_not_called()
-                    tm.send_to_scheduler.send_pyobj.assert_not_called()
+                    self.assertEqual(tm.send_to_scheduler.method_calls, [])
                     self.assertFalse(live_state.abort_sent)
                     self.assertFalse(live_state.lora_released)
 
@@ -1278,6 +1340,201 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
         self.assertTrue(aborts, "disconnect must send an AbortReq to the scheduler")
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestAbortBeforeDispatch(CustomTestCase):
+    """An abort that lands before dispatch must finish the request as aborted.
+
+    The scheduler drops an AbortReq for a rid it has not received, and
+    abort_request sends only one, so a request dispatched after its abort
+    would run unaborted while its caller waits.
+    """
+
+    @staticmethod
+    def _make_tm(case) -> TokenizerManager:
+        tm = _make_tm_for_generate(case)
+        tm._dispatch_to_scheduler = Mock()
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm.positional_embeds_transport = Mock()
+        # --mm-feature-transport=cuda_ipc: preprocessing published the features.
+        tm.mm_processor = SimpleNamespace(cudaipc_mmfeature_pool=Mock())
+        return tm
+
+    @staticmethod
+    def _mm_inputs():
+        item = SimpleNamespace(
+            feature=Mock(spec=CudaIpcTensorTransportProxy),
+            precomputed_embeddings=Mock(spec=CudaIpcTensorTransportProxy),
+        )
+        return SimpleNamespace(mm_items=[item])
+
+    def _assert_cuda_ipc_cancelled(self, tm, mm_inputs):
+        item = mm_inputs.mm_items[0]
+        cancelled = tm.mm_processor.cudaipc_mmfeature_pool.cancel_proxy.call_args_list
+        self.assertEqual(
+            [c.args[0] for c in cancelled], [item.feature, item.precomputed_embeddings]
+        )
+
+    def _assert_finished_as_aborted(self, tm, rid, out):
+        self.assertEqual(out["meta_info"]["id"], rid)
+        self.assertEqual(out["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_abort_during_preprocessing_is_not_dispatched(self, _wrap_shm):
+        # Feature publication is the last await before dispatch.
+        for stage in ("tokenize", "publish"):
+            with self.subTest(stage=stage):
+                tm = self._make_tm(self)
+                rid = f"abort_during_{stage}"
+                obj = GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+                tokenized = MagicMock()
+                tokenized.rid = rid
+                tokenized.mm_inputs = self._mm_inputs()
+                prepared = [Mock()]
+
+                async def drive():
+                    entered, release = asyncio.Event(), asyncio.Event()
+
+                    async def run_stage(name, result):
+                        if name == stage:
+                            entered.set()
+                            await release.wait()
+                        return result
+
+                    tm._tokenize_one_request = lambda _obj: run_stage(
+                        "tokenize", tokenized
+                    )
+                    tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = (
+                        lambda _mm_inputs: run_stage("publish", prepared)
+                    )
+                    task = asyncio.create_task(tm.generate_request(obj).__anext__())
+                    await asyncio.wait_for(entered.wait(), timeout=2)
+                    tm.abort_request(rid)
+                    release.set()
+                    return await asyncio.wait_for(task, timeout=2)
+
+                out = asyncio.run(drive())
+
+                self._assert_finished_as_aborted(tm, rid, out)
+                tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+                    prepared
+                )
+                self._assert_cuda_ipc_cancelled(tm, tokenized.mm_inputs)
+                sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+                self.assertEqual([type(m) for m in sent], [AbortReq])
+                self.assertEqual(sent[0].rid, rid)
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    def test_abort_all_skips_preprocessing_requests_but_not_paused_ones(
+        self, _wrap_shm
+    ):
+        """pause_generation(mode="abort") aborts the requests in flight; those
+        that arrive during the pause run after it."""
+        tm = self._make_tm(self)
+        objs = {
+            rid: GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+            for rid in ("in_flight", "held")
+        }
+        tokenized = {}
+        for rid in objs:
+            tokenized[rid] = MagicMock()
+            tokenized[rid].rid = rid
+            tokenized[rid].mm_inputs = None
+
+        async def drive():
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def tokenize(obj):
+                if obj.rid == "in_flight":
+                    entered.set()
+                    await release.wait()
+                return tokenized[obj.rid]
+
+            async def until_dispatched(rid):
+                while not tm.rid_to_state[rid].dispatched:
+                    await asyncio.sleep(0)
+
+            tm._tokenize_one_request = tokenize
+            in_flight = asyncio.create_task(
+                tm.generate_request(objs["in_flight"]).__anext__()
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            async with tm.is_pause_cond:
+                tm.is_pause = True
+            held = asyncio.create_task(tm.generate_request(objs["held"]).__anext__())
+            while "held" not in tm.rid_to_state:
+                await asyncio.sleep(0)
+            tm.abort_request(abort_all=True)
+            release.set()
+            out = await asyncio.wait_for(in_flight, timeout=2)
+            sent_during_pause = [
+                c.args[0] for c in tm._dispatch_to_scheduler.call_args_list
+            ]
+
+            async with tm.is_pause_cond:
+                tm.is_pause = False
+                tm.is_pause_cond.notify_all()
+            await asyncio.wait_for(until_dispatched("held"), timeout=2)
+            held.cancel()
+            return out, sent_during_pause
+
+        out, sent = asyncio.run(drive())
+
+        self._assert_finished_as_aborted(tm, "in_flight", out)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].abort_all)
+        self.assertIs(
+            tm._dispatch_to_scheduler.call_args_list[1].args[0], tokenized["held"]
+        )
+
+    def test_batch_dispatches_only_requests_not_aborted(self):
+        tm = self._make_tm(self)
+        kept, aborted = "batch_kept", "batch_aborted"
+        for rid in (kept, aborted):
+            tm.rid_to_state[rid] = _make_req_state(rid)
+        tokenized_objs = []
+        for rid in (kept, aborted):
+            tokenized = MagicMock()
+            tokenized.rid = rid
+            tokenized.mm_inputs = self._mm_inputs()
+            tokenized_objs.append(tokenized)
+
+        async def publish(_mm_inputs):
+            # The abort lands while the batch's features are being published.
+            tm.abort_request(aborted)
+            return []
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+
+        async def drive():
+            await tm._send_batch_request(tokenized_objs)
+            waiter = tm._wait_one_response(tm.rid_to_state[aborted].obj, None)
+            return await asyncio.wait_for(waiter.__anext__(), timeout=2)
+
+        out = asyncio.run(drive())
+
+        self._assert_finished_as_aborted(tm, aborted, out)
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+            tokenized_objs[1].mm_inputs.mm_items
+        )
+        # Only the skipped request's: the scheduler acknowledges the other's.
+        self._assert_cuda_ipc_cancelled(tm, tokenized_objs[1].mm_inputs)
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertIsInstance(sent[0], AbortReq)
+        self.assertEqual(sent[0].rid, aborted)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(list(sent[1].batch), [tokenized_objs[0]])
+        self.assertTrue(tm.rid_to_state[kept].dispatched)
 
 
 class TestLoRARequestLifecycle(CustomTestCase):

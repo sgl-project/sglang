@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, Family, MAMBA, SWA, native_family};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 
@@ -286,6 +286,10 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -408,6 +412,10 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -499,6 +507,10 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         MAMBA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn eviction_priority(&self, _is_leaf: bool) -> i64 {
         0
     }
@@ -578,6 +590,10 @@ struct SwaComponentForTest;
 impl TreeComponent<Vec<i64>> for SwaComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn create_match_validator(
@@ -669,6 +685,10 @@ impl SwaEvictionComponentForTest {
 impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn eviction_priority(&self, is_leaf: bool) -> i64 {
@@ -2140,6 +2160,8 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -3812,6 +3834,8 @@ fn bigram_insert_events_carry_pair_token_payloads() {
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
         mamba_value: None,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -7413,6 +7437,8 @@ fn size_accessors_mirror_the_full_component_state() {
 #[test]
 fn swa_size_accessors_mirror_the_swa_component_state() {
     let mut tc = core();
+    // The accessors read the tree's window slot, so the tree needs one.
+    tc.register_component_(Arc::new(SwaComponentForTest));
     tc.component_state_mut(SWA).evictable_size = 2;
     tc.component_state_mut(SWA).protected_size = 1;
     assert_eq!(tc.swa_evictable_size(), 2);
@@ -9232,6 +9258,8 @@ fn sequence_insert_params<'k>(
         namespace: Default::default(),
         value: Tensor::from_slice(&kv),
         mamba_value,
+        mamba_host_value: None,
+        allow_missing_mamba: false,
         prev_prefix_len,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
