@@ -3127,6 +3127,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if _is_npu:
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,

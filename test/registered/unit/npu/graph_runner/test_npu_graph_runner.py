@@ -73,6 +73,67 @@ def test_dflash_replay_metadata_lengths_are_not_double_added():
     assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
 
 
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("algorithm", ["eagle", "dflash", "dspark"])
+def test_mla_dcp_replay_uses_live_local_lengths(verify, hybrid, algorithm):
+    backend, runner, attention = make_backend(
+        dflash=algorithm == "dflash", dspark=algorithm == "dspark", width=3
+    )
+    attention.dense_mla_dcp_target = True
+    attention.forward_metadata = SimpleNamespace(seq_lens_cpu_list=[0, 68, 99, 99])
+    if hybrid:
+        runner.attn_backend = SimpleNamespace(full_attn_backend=attention)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: verify),
+        seq_lens_cpu=torch.tensor([128, 132, 999]),
+        seq_lens=mock.Mock(),
+    )
+
+    assert backend._decode_update_lengths(batch) == [0, 68, 0, 0]
+    attention.forward_metadata.seq_lens_cpu_list = [4, 69, 88, 88]
+    assert backend._decode_update_lengths(batch) == [4, 69, 0, 0]
+    batch.seq_lens.cpu.assert_not_called()
+
+
+@pytest.mark.parametrize("dcp", [False, True])
+def test_dspark_mla_dcp_uses_the_captured_fia_v1_update_key(dcp):
+    backend, _, attention = make_backend(dspark=True)
+    attention.dense_mla_dcp_target = dcp
+    with mock.patch.object(
+        mod.envs.SGLANG_NPU_USE_FIAS_V2_BSND, "get", return_value=True
+    ):
+        assert backend._decode_update_attr_name() == (
+            "actual_seq_lengths_kv" if dcp else "actual_seq_kvlen"
+        )
+
+
+def test_mla_dcp_replay_updates_local_lengths_with_fia_v1_payload():
+    backend, runner, attention = make_backend(dspark=True, width=3)
+    attention.dense_mla_dcp_target = True
+    attention.forward_metadata = SimpleNamespace(seq_lens_cpu_list=[68, 64, 99, 99])
+    runner.attn_backend = SimpleNamespace(full_attn_backend=attention)
+    backend.replay_with_input_update = mock.Mock(return_value="output")
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        seq_lens_cpu=torch.tensor([132, 128]),
+    )
+    with (
+        mock.patch.object(mod, "is_deepseek_dsa", return_value=False),
+        mock.patch.object(mod, "is_deepseek_v4", return_value=False),
+        mock.patch.object(
+            mod.envs.SGLANG_NPU_USE_FIAS_V2_BSND, "get", return_value=True
+        ),
+    ):
+        assert backend.replay("dcp-key", batch) == "output"
+    backend.replay_with_input_update.assert_called_once_with(
+        "dcp-key",
+        seq_lens=[68, 64, 0, 0],
+        attr_name="actual_seq_lengths_kv",
+        attr_type=[],
+    )
+
+
 def test_v2_update_key_comes_from_capture_protocol():
     backend, runner, _ = make_backend()
     runner.model_runner.model_config.hf_config.architectures = ["MiMoV2ForCausalLM"]

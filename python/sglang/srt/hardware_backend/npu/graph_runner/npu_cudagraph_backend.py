@@ -29,6 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -135,11 +136,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and runner.model_runner.spec_algorithm.is_dspark()
             and runner.capture_forward_mode.is_target_verify()
+            and not getattr(
+                get_mla_dcp_backend(getattr(runner, "attn_backend", None)),
+                "dense_mla_dcp_target",
+                False,
+            )
         )
         return "actual_seq_kvlen" if use_v2 else "actual_seq_lengths_kv"
 
     def _decode_update_lengths(self, forward_batch):
         runner = self._decode_runner
+        mla_backend = get_mla_dcp_backend(getattr(runner, "attn_backend", None))
+        if getattr(mla_backend, "dense_mla_dcp_target", False):
+            seq_lens = list(
+                mla_backend.forward_metadata.seq_lens_cpu_list[: runner.raw_bs]
+            )
+            return seq_lens + [0] * (runner.bs - len(seq_lens))
         if forward_batch.forward_mode.is_target_verify():
             # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
             # replay; other algorithms keep the capture-time list, so
