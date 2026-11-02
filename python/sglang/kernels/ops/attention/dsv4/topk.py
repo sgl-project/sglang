@@ -11,10 +11,187 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
+
+
+def deterministic_topk() -> bool:
+    """Whether a selection must come out the same, in the same order, on every
+    run (SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK). The fused kernels below emit
+    in thread-arrival order, and bf16 ties make even their selected set vary;
+    sparse attention sums in index order, so either changes its output."""
+    return envs.SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK.get()
+
+
+def _deep_select_takes(
+    scores: torch.Tensor,
+    out: torch.Tensor,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+) -> bool:
+    """Whether DeepSelect accepts these operands (its single-CTA kernel picks
+    the same set in the same order on every run)."""
+    from sglang.kernels.ops.attention import deep_select
+
+    if not (scores.is_cuda and deep_select.is_deep_select_supported()):
+        return False
+    if scores.dtype not in (torch.float32, torch.bfloat16) or out.dtype != torch.int32:
+        return False
+    in_align = deep_select.get_input_stride_alignment_bytes()
+    out_align = deep_select.get_output_stride_alignment_bytes()
+    if scores.dim() != 2 or scores.stride(1) != 1 or scores.data_ptr() % in_align:
+        return False
+    rows, width = scores.shape
+    item = scores.element_size()
+    if not 0 < out.shape[1] <= 4096 or width >= 1 << 23:
+        return False
+    if rows > 1 and scores.stride(0) * item % in_align:
+        return False
+    # DeepSelect reads the last row in whole 128-byte lines.
+    storage = scores.untyped_storage().nbytes() - scores.storage_offset() * item
+    if (
+        rows
+        and (rows - 1) * scores.stride(0) * item + -(-width * item // 128) * 128
+        > storage
+    ):
+        return False
+    if out.dim() != 2 or out.stride(1) != 1 or out.data_ptr() % out_align:
+        return False
+    if (
+        out.shape[1] * 4 % out_align
+        or out.shape[0] > 1
+        and out.stride(0) * 4 % out_align
+    ):
+        return False
+    if page_table is not None:
+        if (
+            page_size <= 0
+            or page_size & (page_size - 1)
+            or page_table.dtype != torch.int32
+        ):
+            return False
+        if page_table.dim() != 2 or page_table.shape[0] != rows:
+            return False
+        pages = page_table.shape[1]
+        if page_table.stride(1) != 1 or pages == 0 or pages * page_size < width:
+            return False
+    return out.shape[0] == rows
+
+
+def _select_positions_torch(
+    scores: torch.Tensor,
+    lens: torch.Tensor,
+    topk: int,
+    starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Positions within ``scores[b, starts[b] : starts[b] + lens[b]]`` (``starts``
+    0 when omitted) of the ``topk`` largest scores, ascending, ``-1`` past
+    ``min(topk, lens[b])``. Scores equal to the k-th value go to the lowest
+    positions, so the result never depends on scheduling."""
+    rows, width = scores.shape
+    out = torch.full((rows, topk), -1, dtype=torch.int32, device=scores.device)
+    if rows == 0 or width == 0:
+        return out
+    cols = torch.arange(width, dtype=torch.int32, device=scores.device)
+    lo = (
+        torch.zeros((rows, 1), dtype=torch.int32, device=scores.device)
+        if starts is None
+        else starts.reshape(-1, 1).to(torch.int32)
+    )
+    inside = (cols >= lo) & (cols < lo + lens.reshape(-1, 1).to(torch.int32))
+    # Any in-window score, -inf included, must beat the window's outside.
+    s = torch.where(inside, scores.float().clamp(min=-3.0e38), -torch.inf)
+    k = min(topk, width)
+    kth = s.topk(k, dim=-1, sorted=True).values[:, -1:]
+    above = s > kth
+    tie = (s == kth) & inside
+    need = k - above.sum(dim=-1, keepdim=True, dtype=torch.int32)
+    take = (above | (tie & (tie.cumsum(dim=-1, dtype=torch.int32) <= need))) & inside
+    key = torch.where(take, cols, width)
+    picked = key.topk(k, dim=-1, largest=False, sorted=True).values
+    out[:, :k] = torch.where(picked < width, picked - lo, -1)
+    return out
+
+
+def _page_transform(
+    positions: torch.Tensor, page_table: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """``page_table[b, i // page_size] * page_size + i % page_size``, ``-1`` kept."""
+    valid = positions >= 0
+    i = positions.clamp_min(0).long()
+    slots = page_table.gather(1, i // page_size).long() * page_size + i % page_size
+    return torch.where(valid, slots, -1).to(torch.int32)
+
+
+def _deterministic_paged(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: Optional[torch.Tensor],
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """The deterministic stand-in for the paged entry points below."""
+    from sglang.kernels.ops.attention import deep_select
+
+    topk = out_page_indices.shape[1]
+    lens = seq_lens.reshape(-1).to(torch.int32)
+    if out_raw_indices is None and page_table is not None:
+        if _deep_select_takes(scores, out_page_indices, page_table, page_size):
+            deep_select.topk_page_transform(
+                scores,
+                topk,
+                page_table=page_table,
+                page_size=page_size,
+                end=lens,
+                output_idx=out_page_indices,
+            )
+            return
+    raw = out_raw_indices if page_table is None else None
+    target = out_page_indices if page_table is None else out_raw_indices
+    if target is not None and _deep_select_takes(scores, target):
+        deep_select.topk(
+            scores, topk, end=lens, output_idx=target, idx_oob_fill_value=-1
+        )
+        positions = target
+    else:
+        positions = _select_positions_torch(scores, lens, topk)
+        if target is not None:
+            target.copy_(positions)
+    if page_table is not None:
+        out_page_indices.copy_(_page_transform(positions, page_table, page_size))
+    elif raw is not None:
+        raw.copy_(positions)
+
+
+def _deterministic_ragged(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+    row_starts: Optional[torch.Tensor],
+) -> None:
+    """The deterministic stand-in for :func:`topk_transform_ragged_v2`."""
+    from sglang.kernels.ops.attention import deep_select
+
+    topk = out_indices.shape[1]
+    lens = seq_lens.reshape(-1).to(torch.int32)
+    if row_starts is None and _deep_select_takes(scores, out_indices):
+        deep_select.topk(
+            scores,
+            topk,
+            end=lens,
+            output_idx=out_indices,
+            output_idx_offset=out_offsets.reshape(-1).to(torch.int32),
+            idx_oob_fill_value=-1,
+        )
+        return
+    positions = _select_positions_torch(scores, lens, topk, row_starts)
+    shifted = positions + out_offsets.reshape(-1, 1).to(torch.int32)
+    out_indices.copy_(torch.where(positions >= 0, shifted, -1))
 
 
 @cache_once
@@ -111,6 +288,11 @@ def topk_transform_paged(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    if deterministic_topk() and scores.is_cuda and not is_hip_runtime():
+        _deterministic_paged(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
+        return
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
@@ -193,6 +375,9 @@ def topk_transform_ragged_v2(
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
+    if deterministic_topk() and scores.is_cuda and not is_hip_runtime():
+        _deterministic_ragged(scores, seq_lens, out_offsets, out_indices, row_starts)
+        return
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_ragged(
             scores,
@@ -236,6 +421,11 @@ def topk_transform_paged_v2(
     A length of 0 is the valid way to express "no tokens": the row takes the
     trivial path and the output is guaranteed to be all -1.
     """
+    if deterministic_topk() and scores.is_cuda and not is_hip_runtime():
+        _deterministic_paged(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
+        return
     if is_xpu():
         if out_raw_indices is not None:
             topk_transform_paged(
@@ -389,6 +579,11 @@ def topk_transform_sparse(
     ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
     published blocks as pool slots / 8, compressed positions for logical ids."""
+    if deterministic_topk() and logits.is_cuda and not is_hip_runtime():
+        _deterministic_paged(
+            logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+        )
+        return
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )

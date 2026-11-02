@@ -214,11 +214,20 @@ class _CachedModuleDispatch:
 
     def __call__(self, rows: int, vocab_size: int):
         # NOTE: deficiency: cluster + sorted_index supports up to 1M context
-        if vocab_size > _CLUSTER_MIN_VOCAB_SIZE:
+        if vocab_size > _CLUSTER_MIN_VOCAB_SIZE and not _deterministic():
             for max_rows, module in self._clusters:
                 if rows <= max_rows:
                     return module
         return self._fallback
+
+
+def _deterministic() -> bool:
+    """The cluster kernels merge their CTAs' picks in arrival order, so a row's
+    order (and, on bf16 ties, its set) varies between runs; the single-CTA
+    kernel's does not. SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK keeps to it."""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK.get()
 
 
 @cache_once
