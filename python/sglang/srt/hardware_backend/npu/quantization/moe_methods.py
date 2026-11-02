@@ -607,8 +607,10 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
             layer, f"{weight_prefix}_weight_offset", None
         )
         if offset is not None:
-            offset = torch.nn.Parameter(offset.data.squeeze(-1), requires_grad=False)
-        setattr(layer, f"{weight_prefix}_weight_offset", offset)
+            processed_offset = torch.nn.Parameter(
+                offset.data.squeeze(-1), requires_grad=False
+            )
+            setattr(layer, f"{weight_prefix}_weight_offset", processed_offset)
 
         # Process weight
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
