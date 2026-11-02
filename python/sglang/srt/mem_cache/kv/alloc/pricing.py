@@ -10,7 +10,7 @@ serves every chain shape.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, FrozenSet, Optional, Tuple
 
 import msgspec
 
@@ -409,9 +409,11 @@ def plan(
     step: str,
     *,
     growth: Optional[Dict[str, int]] = None,
+    keep_ends: FrozenSet[str] = frozenset(),
 ) -> Optional[TakePlan]:
     """A layout of the chain serving ``demands`` (pages per band) with the
-    rearrangement ``step`` allows, or None if there is none.
+    rearrangement ``step`` allows, or None if there is none. Ends named in
+    ``keep_ends`` stay as they are (no compaction) whatever the step.
 
     Counts and frontiers only: a band in place reuses holes wherever they are
     and extends one side; it never relies on releasing boundary holes. Bands are
@@ -447,7 +449,12 @@ def plan(
         movers_here = tuple(movers)
         choices = [
             t
-            for t in _fixed_takes(b, pages, step=step, total_bytes=total)
+            for t in _fixed_takes(
+                b,
+                pages,
+                step=NO_MOVE if b.name in keep_ends else step,
+                total_bytes=total,
+            )
             if t.low_byte >= frontier
             and _segment_fits(frontier, movers_here, t.low_byte)
         ]
@@ -485,7 +492,11 @@ def plan(
     flush = (
         ()
         if step == NO_MOVE
-        else tuple(b.name for b in snapshot.bands if b.grow != "float")
+        else tuple(
+            b.name
+            for b in snapshot.bands
+            if b.grow != "float" and b.name not in keep_ends
+        )
     )
     return TakePlan(step=step, flush=flush, targets=targets, takes=takes)
 
@@ -504,12 +515,26 @@ def first_plan(
     growth: Optional[Dict[str, int]] = None,
 ) -> Optional[TakePlan]:
     """The least rearrangement serving ``demands``: in place, then with the
-    ends compacted, then with floats relocated. None exactly when not
-    `feasible`."""
+    ends compacted, then with floats relocated. Compacting the ends only, it
+    compacts just the ends it needs (each end, in chain order, is left as it
+    is when the demand still fits that way). Relocating floats, it compacts
+    every end: the floats are placed in the room between the ends, and an end
+    left with its holes would leave them less of it, so the next relocation
+    would come sooner. None exactly when not `feasible`."""
     for step in PLAN_STEPS:
         found = plan(snapshot, demands, step, growth=growth)
-        if found is not None:
+        if found is None:
+            continue
+        if step == RELAYOUT:
             return found
+        keep: FrozenSet[str] = frozenset()
+        for name in found.flush:
+            fewer = plan(
+                snapshot, demands, step, growth=growth, keep_ends=keep | {name}
+            )
+            if fewer is not None:
+                keep, found = keep | {name}, fewer
+        return found
     return None
 
 
