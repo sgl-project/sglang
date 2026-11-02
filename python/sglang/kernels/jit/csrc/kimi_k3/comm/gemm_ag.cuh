@@ -40,7 +40,7 @@ template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL>
 __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const __grid_constant__ ProducerParams params,
     const bf16_t* __restrict__ x,         // [M, K]
-    const bf16_t* __restrict__ weight) {  // [N, K] FULL replicated weight
+    const bf16_t* __restrict__ weight) {  // [N/TP, K] local weight rows
   using namespace device;
   using vec_t = AlignedVector<bf16_t, kVecSize>;
   constexpr uint32_t kNLocal = N / kWorld;  // columns computed by this rank
@@ -56,9 +56,9 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  // this rank's rows of the replicated [N, K] weight, sliced HERE (the
-  // Python side always hands the full weight)
-  const bf16_t* weight_tile = weight + (params.rank * kNLocal + bx * N_SPLIT) * K;
+  // The host entry already selects this rank's local rows for either
+  // replicated or physically column-sharded storage. Arithmetic is unchanged.
+  const bf16_t* weight_tile = weight + bx * N_SPLIT * K;
 
   // weight prefetch before the PDL wait (input-independent addresses)
   vec_t weight_vec[N_SPLIT];
@@ -236,7 +236,11 @@ struct GEMMAGKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
     TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device).verify(x);
-    TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(weight);
+    auto WeightRows = SymbolicSize{"weight_rows"};
+    TensorMatcher({WeightRows, K}).with_dtype<bf16_t>().with_device(device).verify(weight);
+    const auto weight_rows = static_cast<uint32_t>(WeightRows.unwrap());
+    CHECK_HOST(weight_rows == N || weight_rows == kNLocal)
+        << "up-projection weight must be replicated or a contiguous TP8 output-column shard";
     TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b);
     if (c.has_value()) {
       TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(c.value());
@@ -258,12 +262,11 @@ struct GEMMAGKernel {
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
     };
+    const auto* local_weight =
+        static_cast<const bf16_t*>(weight.data_ptr()) + (weight_rows == N ? push.rank * kNLocal * K : 0);
     LaunchKernel(kNumProducerBlocks, kGemvBlock, device.unwrap())
         .enable_pdl(kUsePDL)(
-            kGemvTable[num_tokens],
-            producer_params,
-            static_cast<const bf16_t*>(x.data_ptr()),
-            static_cast<const bf16_t*>(weight.data_ptr()));
+            kGemvTable[num_tokens], producer_params, static_cast<const bf16_t*>(x.data_ptr()), local_weight);
 
     // consumer: spin + add3
     const auto consumer_params = gemm_ag::ConsumerParams{

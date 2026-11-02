@@ -341,8 +341,8 @@ def gemm_ag_up_proj(
     c: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """``up_proj(x) + b (+ c)`` via column-parallel GEMV + multicast all-gather +
-    fused add3. ``weight`` is the FULL replicated up_proj (the kernel slices this
-    rank's rows). Caller checked :func:`gemm_ag_up_fits`."""
+    fused add3. ``weight`` is replicated or this rank's output-column shard.
+    Caller checked :func:`gemm_ag_up_fits`."""
     from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
