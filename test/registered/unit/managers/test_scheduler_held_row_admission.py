@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -100,6 +101,7 @@ class TestHeldRowAdmission(CustomTestCase):
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.running_reqs = RunningReqs()
         return s
 
     def _admitted(self, disaggregation_mode):

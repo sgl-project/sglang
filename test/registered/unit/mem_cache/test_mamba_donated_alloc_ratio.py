@@ -116,7 +116,7 @@ class TestMambaRatioEnvGate(unittest.TestCase):
     ratio can never drift out of sync with whether the decode lock is skipped."""
 
     @staticmethod
-    def _ratio(*, extra_buffer, lazy, disable_overlap, skip):
+    def _ratio(*, extra_buffer, lazy, disable_overlap, skip, host_only=False):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
@@ -133,11 +133,15 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         )
         from sglang.srt import runtime_context as rc
 
-        with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
+        with (
+            envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(host_only),
+        ):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
                 mamba_radix_cache_strategy=strategy,
+                enable_hierarchical_cache=host_only,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
@@ -208,6 +212,58 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                         cache.dec_lock_ref(req.lock.node, req.lock.receipt)
                         self.assertEqual(len(full.released), released + 1)
                     self.assertEqual(len(full.released), N)
+
+    def test_host_only_drops_gpu_prefix_floor(self):
+        """Host checkpoints keep no GPU donate or locked-prefix slot.
+
+        The pool is the live slot plus ping-pong slots extra-buffer still
+        writes: no_buffer 1, lazy 2, overlap 3.
+        """
+
+        def r(**kwargs):
+            return self._ratio(skip=False, host_only=True, **kwargs)
+
+        self.assertEqual(r(extra_buffer=False, lazy=False, disable_overlap=True), 1)
+        self.assertEqual(r(extra_buffer=True, lazy=True, disable_overlap=False), 2)
+        self.assertEqual(r(extra_buffer=True, lazy=False, disable_overlap=False), 3)
+
+    def _cleanup(self, *, host_only: bool, mamba_exist: bool):
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+
+        freed = []
+
+        class _Storage:
+            def quantizes_checkpoints(self, sub_pool):
+                return False
+
+            def tree_sub_pool(self, name):
+                return name
+
+            def release_state(self, sub_pool, req, keep=None):
+                freed.append(req)
+
+        component = object.__new__(MambaComponent)
+        component.host_only_checkpoint = host_only
+        component.cache = SimpleNamespace(
+            kv_storage=lambda: _Storage(),
+            enable_mamba_extra_buffer=False,
+        )
+        req = SimpleNamespace()
+        component.cleanup_after_caching_req(
+            req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=mamba_exist),
+            insert_params=InsertParams(),
+        )
+        return freed, req
+
+    def test_flag_off_keeps_a_donated_gpu_slot(self):
+        freed, _req = self._cleanup(host_only=False, mamba_exist=False)
+        self.assertEqual(freed, [])
+
+    def test_host_only_no_buffer_frees_the_request_slot(self):
+        freed, req = self._cleanup(host_only=True, mamba_exist=False)
+        self.assertEqual(freed, [req])
 
 
 class _RecordingComp:

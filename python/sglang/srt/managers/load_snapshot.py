@@ -14,7 +14,13 @@ transport backends are supported:
     TokenizerManager  ──ShmLoadSnapshotReader───┘  (for /v1/loads)
     DataParallelController  ──ShmLoadSnapshotReader─┘  (for dispatch)
 
-**ZMQ mode** (multi-node DP attention, or ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
+With the embedded Rust server (``SGLANG_RUST_SERVER``), each DP rank's
+listener runs in that rank's scheduler process and reads only that rank's
+slot, so SHM mode also covers multi-node DP attention: every node's ranks
+write a node-local file.
+
+**ZMQ mode** (multi-node DP attention without the Rust server, or
+``SGLANG_LOAD_SNAPSHOT_USE_ZMQ=1``)::
 
     Scheduler (any node)  ──ZmqLoadSnapshotWriter (PUSH)──▶  network
                                                                │
@@ -26,7 +32,7 @@ transport backends are supported:
     TokenizerManager / DataParallelController  ──ShmLoadSnapshotReader──┘
 
 Shared memory does not work across nodes, so multi-node DP attention
-requires the ZMQ transport.  The ``ZmqShmLoadSnapshotReader`` on node 0
+requires the ZMQ transport to reach node 0.  The ``ZmqShmLoadSnapshotReader`` on node 0
 receives snapshots from all schedulers via zmq PUSH/PULL and writes them
 into the local SHM file.  All readers (TokenizerManager,
 DataParallelController) on
@@ -71,11 +77,15 @@ def should_use_zmq() -> bool:
 
     Shared memory (mmap) only works within a single node.  When schedulers
     run on multiple nodes (multi-node DP attention), they cannot write to
-    the SHM file on node 0, so we fall back to zmq transport.  The env var
-    ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ`` forces zmq mode for testing.
+    the SHM file on node 0, so we fall back to zmq transport.  The Rust
+    server needs no collector: each listener reads its own rank's slot from
+    the file on its own node.  The env var ``SGLANG_LOAD_SNAPSHOT_USE_ZMQ``
+    forces zmq mode for testing.
     """
     return (
-        get_parallel().attn_dp_enabled and get_parallel().nnodes > 1
+        get_parallel().attn_dp_enabled
+        and get_parallel().nnodes > 1
+        and not envs.SGLANG_RUST_SERVER.get()
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 

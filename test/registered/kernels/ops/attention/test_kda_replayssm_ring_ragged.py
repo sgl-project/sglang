@@ -144,6 +144,79 @@ def test_ragged_pad_slot():
     _run_case(bs, gamma, HV, H, K, V, lens, acc=lens.clone(), L=L, pad_last=True)
 
 
+@pytest.mark.parametrize("is_kda", [False, True], ids=["gdn", "kda"])
+def test_replay_clears_padding_without_changing_valid_rows(is_kda):
+    """Zero-length Graph rows must not retain stale output or alter state."""
+    torch.manual_seed(0)
+    batch, heads, dim = 8, 2, 128
+    shape = (1, batch, heads, dim)
+    q, k, v = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.1 for _ in range(3)
+    ]
+    beta = torch.randn(1, batch, heads, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(batch, heads, dim, dim, device="cuda") * 0.1
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    a_log = torch.zeros(heads, device="cuda")
+
+    gate = torch.zeros_like(q) if is_kda else torch.zeros_like(beta)
+    bias = torch.zeros(heads * dim if is_kda else heads, device="cuda")
+    state = initial.clone()
+
+    def run(q, k, v, gate, beta, state, slots, cu):
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=a_log,
+            a=gate,
+            dt_bias=bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=beta,
+            initial_state_source=state,
+            initial_state_indices=slots,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=is_kda,
+            lower_bound=-5.0 if is_kda else None,
+        )
+
+    cu.copy_(torch.arange(batch + 1, device="cuda", dtype=torch.int32))
+    slots.copy_(torch.arange(batch, device="cuda", dtype=torch.int32))
+    run(q, k, v, gate, beta, state, slots, cu)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run(q, k, v, gate, beta, state, slots, cu)
+
+    for valid in (8, 7, 5, 0):
+        cu.copy_(
+            torch.arange(batch + 1, device="cuda", dtype=torch.int32).clamp_max(valid)
+        )
+        slots.copy_(torch.arange(batch, device="cuda", dtype=torch.int32))
+        slots[valid:] = -1
+        state.copy_(initial)
+        # Force stale NaNs into the captured output allocation.
+        output.fill_(float("nan"))
+        graph.replay()
+        assert torch.isfinite(output).all().item()
+        assert torch.count_nonzero(output[:, valid:]).item() == 0
+        expected_state = initial.clone()
+        if valid:
+            expected = run(
+                q[:, :valid],
+                k[:, :valid],
+                v[:, :valid],
+                gate[:, :valid],
+                beta[:, :valid],
+                expected_state,
+                slots[:valid],
+                cu[: valid + 1],
+            )
+            torch.testing.assert_close(output[:, :valid], expected)
+        torch.testing.assert_close(state, expected_state)
+
+
 if __name__ == "__main__":
     import sys
 

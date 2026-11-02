@@ -56,7 +56,8 @@ def hash_tiles32_kernel_blocked(
     USE_CG: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    base = pid * TILE
+    # int64: pid * TILE overflows int32 past 2**31 words (8 GiB).
+    base = pid.to(tl.int64) * TILE
 
     s1 = tl.full((), seed1, tl.uint32)
     s2 = tl.full((), seed2, tl.uint32)

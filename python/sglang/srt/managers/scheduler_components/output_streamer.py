@@ -10,6 +10,7 @@ from typing import (
     Any,
     Callable,
     ClassVar,
+    Dict,
     List,
     Optional,
 )
@@ -37,13 +38,22 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
@@ -92,6 +102,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
+    uocr_doc_hooks: Optional[UocrDocHooks] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
     enable_metrics: bool = field(init=False)
@@ -190,6 +201,33 @@ class SchedulerOutputStreamer:
         if req.detokenize_header_sent:
             self.send_to_detokenizer.send_output(DetokenizeReleaseReq(rid=req.rid))
 
+    def get_request_stats(self, req: Req, completion_tokens: int) -> Dict[str, Any]:
+        """A finished request's ``meta_info`` keys that Python's
+        TokenizerManager derives from scheduler state, built with the helpers
+        it uses, for the Rust frontend to report as they are: the retraction
+        count, the scheduler's timings when metrics are on, and the
+        speculative-decoding stats. TokenizerManager also reports the first
+        two on intermediate frames; the frontend reports them only on the
+        terminal one."""
+        stats: Dict[str, Any] = {"num_retractions": req.retraction_count}
+        if get_observability().enable_metrics:
+            output_time_stats = req.time_stats.to_output_time_stats()
+            if output_time_stats is not None:
+                stats.update(output_time_stats.to_meta_info())
+        if not self.spec_algorithm.is_none():
+            populate_spec_info(
+                stats,
+                num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                completion_tokens=completion_tokens,
+                verify_ct=req.spec_verify_ct,
+                num_correct_drafts=req.spec_num_correct_drafts,
+                num_cap_tokens=req.spec_num_cap_tokens,
+                num_block_accept_tokens=req.spec_num_block_accept_tokens,
+                correct_drafts_histogram=req.spec_correct_drafts_histogram,
+                cap_lens_histogram=req.spec_cap_lens_histogram,
+            )
+        return stats
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -255,8 +293,12 @@ class SchedulerOutputStreamer:
             ),
             output_sink=self.output_sink,
             current_weight_version=get_serving().weight_version,
+            uocr_doc_hooks=self.uocr_doc_hooks,
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
+            ),
+            get_request_stats=(
+                self.get_request_stats if self.rust_server is not None else None
             ),
         )
         for req in reqs:
@@ -303,6 +345,7 @@ class SchedulerOutputStreamer:
                         if acc.cached_tokens_split and self.enable_hicache_storage()
                         else None
                     ),
+                    acc.rust_request_stats,
                 )
             else:
                 self.send_to_detokenizer.send_output(payload)
@@ -341,6 +384,8 @@ class SchedulerOutputStreamer:
 
         embeddings = []
         request_stats = []
+        tensor_embeddings = []
+        has_tensor_embeddings = False
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -348,7 +393,13 @@ class SchedulerOutputStreamer:
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
+                if isinstance(req.embedding, torch.Tensor):
+                    embeddings.append([])
+                    tensor_embeddings.append(req.embedding)
+                    has_tensor_embeddings = True
+                else:
+                    embeddings.append(req.embedding)
+                    tensor_embeddings.append(None)
                 request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
@@ -388,6 +439,9 @@ class SchedulerOutputStreamer:
                 request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                tensor_embeddings=(
+                    tensor_embeddings if has_tensor_embeddings else None
+                ),
                 pooled_hidden_states=stacked_phs,
             )
         )
@@ -435,6 +489,9 @@ class _GenerationStreamAccumulator:
     spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
+    # Spliced document-overlap tokens per request (Unlimited-OCR v2 only).
+    uocr_forced_tokens: list = field(default_factory=list)
+    uocr_doc_hooks: Optional[UocrDocHooks] = None
     weight_versions: list = field(default_factory=list)
     prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
@@ -470,6 +527,12 @@ class _GenerationStreamAccumulator:
     # request's cached tokens per tier, as (device, host, storage). None
     # otherwise.
     cached_tokens_split: Optional[list] = None
+    # Rust server mode: builds a finished request's `request_stats` from it and
+    # its completion tokens (`SchedulerOutputStreamer.get_request_stats`).
+    # None otherwise.
+    get_request_stats: Optional[Callable[[Req, int], Dict[str, Any]]] = None
+    # By row, the finished requests' `request_stats`.
+    rust_request_stats: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.output_sink is OutputSink.RUST:
@@ -570,7 +633,9 @@ class _GenerationStreamAccumulator:
 
         if self.output_sink is OutputSink.DETOKENIZER:
             if req.take_detokenize_header_due():
-                self.detokenize_headers.append(build_detokenize_header(req))
+                self.detokenize_headers.append(
+                    build_detokenize_header(req, output_prefix_len=send_token_offset)
+                )
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
@@ -581,6 +646,11 @@ class _GenerationStreamAccumulator:
             self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
+
+        forced_tokens = 0
+        if self.uocr_doc_hooks is not None:
+            forced_tokens = self.uocr_doc_hooks.forced_tokens(req)
+            self.uocr_forced_tokens.append(forced_tokens)
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.
@@ -604,7 +674,8 @@ class _GenerationStreamAccumulator:
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
-                else len(output_ids_)
+                # copied document-overlap text was not generated by this request
+                else len(output_ids_) - forced_tokens
             )
 
             if req.take_request_stats_due():
@@ -626,6 +697,15 @@ class _GenerationStreamAccumulator:
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
             self.prefill_weight_versions.append(req.prefill_weight_versions)
+            if self.get_request_stats is not None:
+                self.rust_request_stats[len(self.rids) - 1] = self.get_request_stats(
+                    req,
+                    (
+                        beam_completion_tokens(beam_output)
+                        if beam_output is not None
+                        else len(output_ids_)
+                    ),
+                )
         else:
             self.weight_versions.append(None)
             self.prefill_weight_versions.append(None)
@@ -796,6 +876,11 @@ class _GenerationStreamAccumulator:
     ) -> Optional[BatchTokenIDOutput]:
         if not (self.rids or is_idle_batch):
             return None
+        customized_info = self.customized_info
+        if self.uocr_doc_hooks is not None:
+            customized_info = self.uocr_doc_hooks.with_forced_tokens(
+                customized_info, self.uocr_forced_tokens
+            )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
@@ -863,11 +948,11 @@ class _GenerationStreamAccumulator:
             # The Rust egress encodes the per-token lists itself.
             customized_info=(
                 (
-                    self.customized_info
+                    customized_info
                     if self.output_sink is OutputSink.RUST
-                    else wrap_as_pickle(self.customized_info)
+                    else wrap_as_pickle(customized_info)
                 )
-                if self.customized_info
+                if customized_info
                 else None
             ),
             placeholder_tokens_idx=None,

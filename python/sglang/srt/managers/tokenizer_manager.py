@@ -32,7 +32,6 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
 from http import HTTPStatus
 from typing import (
     Any,
@@ -138,6 +137,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -174,7 +174,10 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
-from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    supports_sampling_mask,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_secrets,
@@ -183,6 +186,9 @@ from sglang.srt.sampling.watermarking.core import (
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+)
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
 )
 from sglang.srt.utils import (
     configure_gc_warning,
@@ -254,18 +260,6 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
         )
 
 
-@lru_cache(maxsize=1)
-def _ragged_verify_cap_accept() -> bool:
-    # The mode env is fixed at server launch; cache to keep it off the
-    # per-request metrics path.
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
-
-    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
-
-
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -293,6 +287,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # Held at generate_request's pause gate; an abort_all leaves it to run
+    # after the pause.
+    waiting_at_pause_gate: bool = False
 
     # Prevent duplicate releases after completion or ownership transfer.
     lora_released: bool = False
@@ -969,6 +966,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rid: self.rid_to_state[rid]
             for rid in ([obj.rid] if obj.is_single else obj.rid)
         }
+        for state in request_states.values():
+            state.waiting_at_pause_gate = True
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -978,6 +977,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+                for state in request_states.values():
+                    state.waiting_at_pause_gate = False
 
             async with self.model_update_lock.reader_lock:
                 await self._validate_and_resolve_lora(obj)
@@ -1453,6 +1454,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 obj.custom_logit_processor
                 and not get_exec().features.enable_custom_logit_processor
+                and obj.custom_logit_processor != UOCR_PAGE_GUARD_PROCESSOR
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "
@@ -1688,6 +1690,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                encoding_format=obj.encoding_format,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1820,6 +1823,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            if self._skip_dispatch_if_aborted(tokenized_obj.rid):
+                self._cancel_cuda_ipc_features((tokenized_obj,))
+                return
             prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
                 (tokenized_obj,)
             )
@@ -1843,6 +1849,70 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+
+    def _drop_aborted_before_dispatch(self, tokenized_objs):
+        """Return *tokenized_objs* without the requests aborted before dispatch.
+
+        Call it after a batch's last await before dispatch; it releases the
+        dropped requests' multimodal features.
+        """
+        aborted_rids = {
+            tokenized_obj.rid
+            for tokenized_obj in tokenized_objs
+            if self._skip_dispatch_if_aborted(tokenized_obj.rid)
+        }
+        if not aborted_rids:
+            return tokenized_objs
+        aborted = [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if tokenized_obj.rid in aborted_rids
+        ]
+        # Cancelled items are skipped if a failed dispatch cancels them again.
+        self.cuda_vmm_feature_transport.cancel_for_dispatch(
+            [
+                item
+                for tokenized_obj in aborted
+                if tokenized_obj.mm_inputs is not None
+                for item in tokenized_obj.mm_inputs.mm_items
+            ]
+        )
+        self._cancel_cuda_ipc_features(aborted)
+        return [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if tokenized_obj.rid not in aborted_rids
+        ]
+
+    def _skip_dispatch_if_aborted(self, rid: str) -> bool:
+        """Return True if *rid* was aborted before it could be dispatched.
+
+        The scheduler drops an AbortReq for a rid it has not received yet, and
+        abort_request never resends one, so dispatching such a request would let
+        it run unaborted. It is not dispatched (its encoder hand-off is released
+        as on a failed dispatch); _wait_one_response finishes it.
+        """
+        state = self.rid_to_state.get(rid)
+        if state is None or not state.abort_sent:
+            return False
+        dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
+        if dispatch_ready is not None:
+            dispatch_ready.set()
+        return True
+
+    def _cancel_cuda_ipc_features(self, tokenized_objs) -> None:
+        """Return the CUDA IPC feature slices preprocessing published for
+        requests that are never dispatched: no scheduler acknowledges them."""
+        pool = getattr(self.mm_processor, "cudaipc_mmfeature_pool", None)
+        if pool is None:
+            return
+        for tokenized_obj in tokenized_objs:
+            if tokenized_obj.mm_inputs is None:
+                continue
+            for item in tokenized_obj.mm_inputs.mm_items:
+                for tensor in (item.feature, item.precomputed_embeddings):
+                    if isinstance(tensor, CudaIpcTensorTransportProxy):
+                        pool.cancel_proxy(tensor)
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -1870,6 +1940,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
+            if not tokenized_objs:
+                return
             prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
                 tokenized_objs
             )
@@ -1991,6 +2064,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Batch dispatch builds every waiter before advancing any.
         # Both removers append the output after the del, so the ReqState stays valid.
         state = self.rid_to_state[obj.rid]
+        if state.abort_sent and not state.dispatched:
+            # Skipped by _skip_dispatch_if_aborted. Finish it here, once the
+            # waiter holds its state, as the scheduler finishes a queued abort.
+            self._handle_abort_req(AbortReq(rid=obj.rid))
         return self._stream_one_response(obj=obj, state=state, request=request)
 
     async def _stream_one_response(
@@ -2308,6 +2385,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state is not None:
                 state.abort_sent = False
             raise
+        if abort_all:
+            # The scheduler aborts only the requests it has received. Mark the
+            # rest, except those a pause holds, so they are not dispatched.
+            for pending in self.rid_to_state.values():
+                if not pending.dispatched and not pending.waiting_at_pause_gate:
+                    pending.abort_sent = True
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -2400,10 +2483,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
 
-    def _server_args_for_dump(self) -> Union[ServerArgs, Dict[str, Any]]:
-        if not get_exec().features.enable_watermark:
-            return self.server_args
-        return redact_watermark_secrets(self.server_args.resolved_dict())
+    def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
+        # Redact even with watermarking off: the Python API accepts a server
+        # key without --enable-watermark.
+        try:
+            return redact_watermark_secrets(self.server_args.resolved_dict())
+        except Exception as e:
+            logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
+            return None
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
@@ -2772,8 +2859,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
+                embedding = recv_obj.embeddings[i]
+                if (
+                    recv_obj.tensor_embeddings is not None
+                    and recv_obj.tensor_embeddings[i] is not None
+                ):
+                    embedding = recv_obj.tensor_embeddings[i]
                 out_dict = {
-                    "embedding": recv_obj.embeddings[i],
+                    "embedding": embedding,
                     "meta_info": meta_info,
                 }
                 # Unpack pooled hidden states (PHS).
@@ -2820,7 +2913,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else 0
                     )
                     meta_info.update(
-                        state.time_stats.convert_to_output_meta_info(completion_tokens)
+                        state.time_stats.convert_to_output_meta_info(
+                            _scheduler_time_stats(request_stats),
+                            completion_tokens,
+                            num_retractions=request_stats.retraction_count,
+                        )
                     )
 
                 del self.rid_to_state[rid]
@@ -3201,67 +3298,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
+        if not (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                get_spec().speculative_num_draft_tokens - 1
-            )
-            num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
+            return
 
-            # Calculate per-request acceptance rate and average acceptance length.
-            if num_proposed_drafts > 0:
-                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
-                # accept_length: completion_tokens / verify_ct (includes bonus token).
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
-                )
+        def row(name: str) -> Any:
+            values = getattr(recv_obj, name, None)
+            return values[i] if values is not None and len(values) > i else None
 
-                meta_info["spec_num_correct_drafts"] = num_correct_drafts
-                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-
-                if (
-                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
-                    and len(recv_obj.spec_num_cap_tokens) > i
-                    and recv_obj.spec_num_cap_tokens[i] > 0
-                ):
-                    meta_info["spec_cap_length"] = (
-                        recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
-                    )
-                if (
-                    _ragged_verify_cap_accept()
-                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
-                    is not None
-                    and len(recv_obj.spec_num_block_accept_tokens) > i
-                ):
-                    meta_info["spec_block_accept_length"] = (
-                        recv_obj.spec_num_block_accept_tokens[i]
-                        / recv_obj.spec_verify_ct[i]
-                    )
-
-            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
-            if (
-                recv_obj.spec_correct_drafts_histogram
-                and len(recv_obj.spec_correct_drafts_histogram) > i
-                and recv_obj.spec_correct_drafts_histogram[i]
-            ):
-                meta_info["spec_correct_drafts_histogram"] = (
-                    recv_obj.spec_correct_drafts_histogram[i]
-                )
-            if (
-                getattr(recv_obj, "spec_cap_lens_histogram", None)
-                and len(recv_obj.spec_cap_lens_histogram) > i
-                and recv_obj.spec_cap_lens_histogram[i]
-            ):
-                meta_info["spec_cap_lens_histogram"] = recv_obj.spec_cap_lens_histogram[
-                    i
-                ]
+        populate_spec_info(
+            meta_info,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            completion_tokens=recv_obj.completion_tokens[i],
+            verify_ct=recv_obj.spec_verify_ct[i],
+            num_correct_drafts=recv_obj.spec_num_correct_drafts[i],
+            num_cap_tokens=row("spec_num_cap_tokens"),
+            num_block_accept_tokens=row("spec_num_block_accept_tokens"),
+            correct_drafts_histogram=row("spec_correct_drafts_histogram"),
+            cap_lens_histogram=row("spec_cap_lens_histogram"),
+        )
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (

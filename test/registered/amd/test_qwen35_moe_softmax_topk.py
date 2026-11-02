@@ -1,5 +1,6 @@
-"""ROCm coverage for the decode-sized Qwen3.5 MoE softmax router."""
+"""ROCm coverage for the decode-sized Qwen3.5 and Qwen3-Next MoE softmax router."""
 
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(
@@ -21,11 +22,12 @@ class TestQwen35MoeSoftmaxTopK(CustomTestCase):
     def test_triton_dispatch_matches_aiter(self):
         from aiter.fused_moe import fused_topk as aiter_fused_topk
 
-        for num_tokens in (4, 12, 128):
-            with self.subTest(num_tokens=num_tokens):
+        # hidden 4096 is Qwen3.5, hidden 2048 is Qwen3-Next.
+        for hidden_size, num_tokens in itertools.product((2048, 4096), (4, 12, 128)):
+            with self.subTest(hidden_size=hidden_size, num_tokens=num_tokens):
                 torch.manual_seed(num_tokens)
                 hidden_states = torch.randn(
-                    num_tokens, 4096, device="cuda", dtype=torch.bfloat16
+                    num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
                 )
                 router_logits = torch.randn(
                     num_tokens, 512, device="cuda", dtype=torch.bfloat16
@@ -91,9 +93,14 @@ class TestQwen35MoeSoftmaxTopK(CustomTestCase):
                     hidden_states, logits.float(), 10, None, 0, None
                 )
             )
-            self.assertFalse(
+            self.assertTrue(
                 topk_module._use_rocm_triton_softmax_topk(
                     hidden_states[:, :2048], logits, 10, None, 0, None
+                )
+            )
+            self.assertFalse(
+                topk_module._use_rocm_triton_softmax_topk(
+                    hidden_states[:, :3072], logits, 10, None, 0, None
                 )
             )
             self.assertFalse(

@@ -691,6 +691,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -712,12 +718,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
-            self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
-            )
-            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            )
             self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -790,8 +790,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
         # Target verify runs the decode kernel, causal within each request's rows; a
-        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
-        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+        # topk-1 chain needs no mask (SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY), while a tree would.
+        if not envs.SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY.get() or self.topk > 1:
             return None
         return maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -846,12 +846,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cu_seqlens_q = torch.arange(
-                    0, bs + 1, dtype=torch.int32, device=device
-                )
-                metadata.cu_seqlens_k = torch.zeros(
-                    bs + 1, dtype=torch.int32, device=device
-                )
+                # All variants read/write the backend-owned storage, including
+                # the in-graph refresh recorded before attention.
+                metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
@@ -890,10 +892,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 verify_rows = bs * metadata.max_seq_len_q
                 # Static per-capture row map (expanded row i -> request i // L);
                 # the recorded refresh in _apply_cuda_graph_metadata uses it.
-                metadata.encoder_row_map = (
-                    torch.arange(verify_rows, device=self.device)
-                    // metadata.max_seq_len_q
-                )
+                row_map_key = ("encoder_row_map", metadata.max_seq_len_q)
+                row_map = self.target_verify_metadata.get(row_map_key)
+                if row_map is None:
+                    # Keep capture-time gather indices alive across variants.
+                    row_map = (
+                        torch.arange(
+                            self.target_verify_metadata[
+                                "encoder_cache_seqlens"
+                            ].numel(),
+                            device=device,
+                        )
+                        // metadata.max_seq_len_q
+                    )
+                    self.target_verify_metadata[row_map_key] = row_map
+                metadata.encoder_row_map = row_map[:verify_rows]
                 metadata.encoder_cache_seqlens = self.target_verify_metadata[
                     "encoder_cache_seqlens"
                 ][:verify_rows]

@@ -366,6 +366,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
                             * audio_vel
                         )
 
+                    self.check_cancelled(batch)
                     if progress_bar is not None:
                         progress_bar.update()
 
