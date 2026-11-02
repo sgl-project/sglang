@@ -65,8 +65,8 @@ pub(super) struct SubmittedChoice {
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
-    /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`; unrecognized scheduler finish types are preserved as well.
+    /// Dynamo's enum covers the standard values; unrecognized scheduler
+    /// finish types are preserved.
     finish_reason_override: Option<String>,
 }
 
@@ -446,7 +446,8 @@ fn completion_choice(
     let reason = output.finish_reason.as_ref();
     let (finish_reason, finish_reason_override) = {
         match reason.and_then(|reason| reason.kind_name()) {
-            Some("stop") => (Some(CompletionFinishReason::Stop), None),
+            // OpenAI defines no "abort"; one without an error status is a stop.
+            Some("stop" | "abort") => (Some(CompletionFinishReason::Stop), None),
             Some("length") => (Some(CompletionFinishReason::Length), None),
             Some("content_filter") => (Some(CompletionFinishReason::ContentFilter), None),
             Some(other) => (None, Some(other.into())),
@@ -726,14 +727,15 @@ fn append_top_logprobs(
 mod tests {
     use super::super::test_utils::{chunk, submitted};
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        ChoiceExtensions, PromptSpec, completion_choice, completion_event_stream,
+        completion_logprobs, completion_prompt_specs, completion_response_value, unary_completion,
     };
+    use crate::api_server::core::CoreOutput;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use futures::StreamExt;
     use sglang_processor::dynamo_protocols::types::{
-        Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
+        Choice, CompletionFinishReason, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
 
     #[test]
@@ -769,6 +771,20 @@ mod tests {
     fn token_prompt_is_normalized_without_echo_state() {
         let specs = completion_prompt_specs(&Prompt::IntegerArray(vec![1, 2])).unwrap();
         assert_eq!(specs, [PromptSpec::TokenIds(vec![1, 2])]);
+    }
+
+    #[test]
+    fn abort_without_status_is_reported_as_stop() {
+        let output = CoreOutput {
+            text: "x".into(),
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({"type": "abort"})).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let (choice, extension) = completion_choice(0, "x".into(), &output, false, false);
+        assert_eq!(choice.finish_reason, Some(CompletionFinishReason::Stop));
+        assert!(extension.finish_reason_override.is_none());
     }
 
     #[test]

@@ -1290,11 +1290,12 @@
       "openai": {
         "status": 400,
         "body": {
-          "object": "error",
-          "message": "Requested token count exceeds the model's maximum context length of 1048576 tokens. You requested a total of 2000001 tokens: 1 tokens from the input messages and 2000000 tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.",
-          "type": "BadRequestError",
-          "param": null,
-          "code": 400
+          "error": {
+            "message": "Requested token count exceeds the model's maximum context length of 1048576 tokens. You requested a total of 2000001 tokens: 1 tokens from the input messages and 2000000 tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null
+          }
         }
       }
     },
@@ -1326,11 +1327,12 @@
       "openai": {
         "status": 400,
         "body": {
-          "object": "error",
-          "message": "Requested token count exceeds the model's maximum context length of 1048576 tokens. You requested a total of 2000001 tokens: 1 tokens from the input messages and 2000000 tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.",
-          "type": "BadRequestError",
-          "param": null,
-          "code": 400
+          "error": {
+            "message": "Requested token count exceeds the model's maximum context length of 1048576 tokens. You requested a total of 2000001 tokens: 1 tokens from the input messages and 2000000 tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null
+          }
         }
       }
     },
@@ -1367,7 +1369,7 @@
       "openai": {
         "events": [
           {"id": "r", "object": "text_completion", "created": 1791964722, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "text": " there", "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"error": {"object": "error", "message": "Out of memory.", "type": "SERVICE_UNAVAILABLE", "param": null, "code": 503}},
+          {"error": {"message": "Out of memory.", "type": "service_unavailable_error", "param": null, "code": null}},
           {"id": "r", "object": "text_completion", "created": 1791964722, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 2, "total_tokens": 3, "completion_tokens": 1, "reasoning_tokens": 0}},
           "[DONE]"
         ]
@@ -2456,7 +2458,7 @@
         "events": [
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "<｜end▁of▁sentence｜>"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"error": {"object": "error", "message": "Out of memory.", "type": "SERVICE_UNAVAILABLE", "param": null, "code": 503}},
+          {"error": {"message": "Out of memory.", "type": "service_unavailable_error", "param": null, "code": null}},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964724, "model": "deepseek-ai/DeepSeek-V4-Flash-0731", "choices": [], "usage": {"prompt_tokens": 2, "total_tokens": 3, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 0, "completion_tokens_details": null}},
           "[DONE]"
         ]
