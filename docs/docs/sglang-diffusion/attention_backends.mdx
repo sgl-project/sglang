@@ -42,7 +42,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`fa` / `fa3` / `fa4`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`FA`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FlashAttention. <code>fa3/fa4</code> are normalized to <code>fa</code> during argument parsing (<code>ServerArgs.__post_init__</code>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FlashAttention. <code>fa3/fa4</code> are normalized to <code>fa</code> during argument parsing (<code>ServerArgs.__post_init__</code>). On Ascend NPU, <code>fa</code> selects Ascend FA; MiniMax-H3 supports <a href="#ascend-quantized-attention-with-mindie-sd">quantized attention through MindIE-SD</a> using an explicit precision.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`torch_sdpa`</td>
@@ -649,7 +649,7 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA requires SM80+ and fp16/bf16. XPU uses its own flash attention backend. FlashAttention is only used when the required runtime is installed; otherwise it falls back to <code>torch_sdpa</code>. No extra installations are required for NPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA requires SM80+ and fp16/bf16. XPU uses its own flash attention backend. FlashAttention is only used when the required runtime is installed; otherwise it falls back to <code>torch_sdpa</code>. Native Ascend FA requires no additional attention package. Quantized Ascend FA requires the optional MindIE-SD SDK.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`torch_sdpa`</td>
@@ -994,6 +994,113 @@ sglang generate \
 ```
 
 Both `sage_attn` and `sol_attn` are approximate. The default DiT backend remains `fa`.
+
+### Ascend quantized attention with MindIE-SD
+
+On Ascend NPU, `fa` can use the public `mindiesd.quant_attention` API for
+FP8, MXFP8, and MXFP4 attention. This integration targets MiniMax-H3;
+Wan/FLUX support is out of scope. Omitting `precision` preserves the existing
+native Ascend FA behavior and does not require MindIE-SD.
+
+#### Install the optional SDK
+
+Install the official [MindIE-SD 3.2.0 wheel](https://pypi.org/project/mindiesd/3.2.0/#files)
+in your existing Linux Ascend environment:
+
+```bash
+python3 -m pip install --no-deps --only-binary=:all: "mindiesd==3.2.0"
+```
+
+Wheels are available for Python 3.11/3.12 on x86_64 (glibc 2.34+) and Python 3.12
+on aarch64 (glibc 2.35+). `--no-deps` preserves your installed Torch/TorchNPU.
+Use a compatible CANN/TorchNPU stack as described in the upstream
+[installation guide](https://gitcode.com/Ascend/MindIE-SD/blob/dev/docs/en/installation.md).
+For installation from source, follow the upstream
+[build guide](https://gitcode.com/Ascend/MindIE-SD/blob/dev/docs/en/developer_guide/build_guide.md).
+
+Source-build validation used Ascend 950, PyTorch 2.10.0, TorchNPU 2.10.0,
+and CANN 9.2.0-beta.2. The published 3.2.0 wheel has not yet been rerun with
+this integration.
+
+On the target NPU host, activate the CANN environment and check the public API:
+
+```bash
+python3 -c 'from mindiesd import quant_attention; assert callable(quant_attention)'
+```
+
+This import check does not verify native execution. Missing SDKs, incompatible
+libraries, and operator failures raise errors rather than falling back to native FA.
+
+#### Configure attention
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `precision` | Native FA when omitted | `fp8`, `mxfp8`, or `mxfp4`; selects MindIE-SD. |
+| `fp8_fa_mode` | `HIGH_PRECISION` | FP8 only; `C8V16_TILING512` is the alternate mode for head dimension 128. |
+| `head_chunk_size` | `4` | MHA heads per SD call. Use `0` to disable chunking, or another positive integer. |
+| `qk_rotation` | `true` for H3 | Apply online Q/K rotation before quantization. |
+
+For example, run MiniMax-H3 on two NPUs with FP8 C8V16 and the default chunk size:
+
+```bash
+sglang generate \
+  --model-path /models/MiniMax-H3 \
+  --model-variant fl2va \
+  --performance-mode manual \
+  --num-gpus 2 --tp-size 2 \
+  --vae-config.use-parallel-tiling false \
+  --attention-backend fa \
+  --attention-backend-config '{"precision":"fp8","fp8_fa_mode":"C8V16_TILING512"}' \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+For MXFP8 or MXFP4, use `'{"precision":"mxfp8"}'` or
+`'{"precision":"mxfp4"}'`. H3 defaults its text encoder to `torch_sdpa` for this
+configuration; explicit component/role overrides take precedence. Attention
+precision is independent of linear-weight quantization. Add `--quantization mxfp8`
+only if online MXFP8 linear weights are also wanted.
+
+The SD path uses `attention_backend_config`; it does not need the native
+`SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION` or
+`SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE` variables. Head chunking applies to
+dense and packed MHA, including a smaller final chunk. GQA is delegated to the
+SDK without head chunking. Packed sequences remain isolated and H3 trailing
+padding is zeroed. Ordinary Ulysses is supported; causal attention, nonzero dropout,
+Ring attention, and softmax LSE are unsupported.
+
+Online rotation follows native Ascend FA's deterministic rotation and is applied
+once by the SDK, before quantization. Checkpoints with offline Q/K rotation
+default to no online rotation; explicitly enabling both is rejected.
+
+<Warning>
+  MindIE-SD 3.2.0 pads MXFP4 sequence lengths to multiples of 512. The padded
+  K/V positions participate in softmax. SGLang preserves this SDK behavior;
+  validate numerical quality with the sequence lengths used by your workload.
+</Warning>
+
+#### Validate the installation
+
+Run from an installed SGLang checkout in the target Linux environment:
+
+```bash
+# CPU adapter tests with a mocked SDK.
+pytest python/sglang/multimodal_gen/test/unit/test_ascend_fa.py
+
+# Ascend 950: execute all three precisions, chunking, and packed/GQA cases.
+SGLANG_TEST_ASCEND_QUANT_FA=1 \
+  pytest python/sglang/multimodal_gen/test/unit/test_ascend_fa.py::TestAscendFAQuantizedNPU
+
+# H3 end-to-end collection with one unquantized BF16 checkpoint.
+SGLANG_TEST_H3_BF16_MODEL_PATH=/models/MiniMax-H3 \
+SGLANG_TEST_H3_OUTPUT_DIR=/tmp/h3-quant-comparison \
+  pytest -s python/sglang/multimodal_gen/test/server/ascend/test_ascend_quant_fa_h3.py
+```
+
+The native tests check adapter/SDK agreement. The H3 suite collects outputs and
+performance with the same online MXFP8 linear weights in every case; only
+attention changes. Neither test establishes model-quality parity. Inspect the
+generated outputs for your workload.
 
 ### Using Sliding Tile Attention (STA)
 
