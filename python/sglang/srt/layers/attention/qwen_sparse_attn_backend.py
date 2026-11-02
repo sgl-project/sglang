@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
+    sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
@@ -1419,8 +1420,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.shape[0] != rows
         ):
             return None
-        kc = pool.get_key_buffer(layer.layer_id)
-        vc = pool.get_value_buffer(layer.layer_id)
+        kc = pool.layer_router.read(layer.layer_id).key()
+        vc = pool.layer_router.read(layer.layer_id).value()
         if (
             kc.ndim != 3
             or vc.shape != kc.shape
@@ -1480,7 +1481,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1505,8 +1506,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
             output = qsa_sparse_attention(
                 q,
-                pool.get_key_buffer(layer.layer_id),
-                pool.get_value_buffer(layer.layer_id),
+                pool.layer_router.read(layer.layer_id).key(),
+                pool.layer_router.read(layer.layer_id).value(),
                 slots,
                 layer.scaling,
             )
@@ -1541,8 +1542,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
-            k=pool.get_key_buffer(layer.layer_id),
-            v=pool.get_value_buffer(layer.layer_id),
+            k=pool.layer_router.read(layer.layer_id).key(),
+            v=pool.layer_router.read(layer.layer_id).value(),
             req_to_token=self.req_to_token_pool.req_to_token,
             req_indices=forward_batch.req_pool_indices,
             cu_k=cu_seqlens_k,
@@ -1618,7 +1619,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             # out_cache_loc was trimmed to the full extend token count by
             # prepare_cp_forward; write all new tokens on every rank.
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k_full, v_full
             )
         num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
@@ -1627,13 +1628,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        if any(prefix_lens) and save_kv_cache and q.is_cuda:
+            # Every selected token, prefix or new, is in the pool now (the
+            # gathered new K/V was just written), so read it in place instead of
+            # packing each request's whole context per layer.
+            pool = self.token_to_kv_pool
+            output = sparse_gqa_paged_prefill_triton(
+                q,
+                pool.layer_router.read(layer.layer_id).key(),
+                pool.layer_router.read(layer.layer_id).value(),
+                metadata.token_slot_table[: meta.bs],
+                indices,
+                meta.cu_seqlens_q_combined_tensor,
+                meta.kv_len_combined_tensor,
+                layer.scaling,
+                max_q=meta.max_seqlen_q_combined,
+            )
+            if pending is not None:
+                # Keep the prefetched K/V alive through the cache write above.
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
+            return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
             # replicated on each CP rank; pack prefix + new tokens per request
             # so absolute logical top-k indices address the full context.
             pool = self.token_to_kv_pool
-            k_buffer = pool.get_key_buffer(layer.layer_id)
-            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_buffer = pool.layer_router.read(layer.layer_id).key()
+            v_buffer = pool.layer_router.read(layer.layer_id).value()
             # Row i holds request i's req_to_token slots; indexing it by row
             # avoids a device sync on req_pool_indices in every layer.
             slot_table = metadata.token_slot_table
@@ -1887,7 +1908,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1901,8 +1922,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_buffer = pool.layer_router.read(layer.layer_id).key()
+        v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
         if not q.is_cuda:

@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 
 def _quant(name: str):
@@ -49,6 +49,23 @@ _QUARK_BLOCK_FP8 = {
         "dtype": "fp8_e4m3",
         "qscheme": "per_group",
         "group_size": 128,
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+_QUARK_MXFP8 = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_block",
+        "block_size": [1, 32],
+        "is_dynamic": False,
+        "scale_type": "float8_e8m0fnu",
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_group",
+        "group_size": 32,
         "is_dynamic": True,
     },
     "output_tensors": None,
@@ -589,6 +606,93 @@ class TestMiniMaxGates(_FusionGateCase):
         self.assertIn(
             "No shared experts",
             self._reason(MiniMaxM3SparseForConditionalGeneration, wrapper),
+        )
+
+    def test_a_quant_config_that_cannot_fuse_blocks_fusion(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        self._seed()
+        text = SimpleNamespace(n_shared_experts=1)
+        mixed = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
+        )
+        matched = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
+        )
+        for model_class, hf_config in (
+            (MiniMaxM3SparseForCausalLM, text),
+            (
+                MiniMaxM3SparseForConditionalGeneration,
+                SimpleNamespace(text_config=text),
+            ),
+        ):
+            with self.subTest(model_class.__name__):
+                self.assertIn(
+                    "higher precision", self._reason(model_class, hf_config, mixed)
+                )
+                self.assertNotIn(
+                    "higher precision",
+                    self._reason(model_class, hf_config, matched) or "",
+                )
+
+    def _m31_quark(self, shared_spec):
+        """A Quark export shaped like amd/MiniMax-M3.1-Flash-Quark-MXFP4: layers
+        0-2 dense, MXFP4 routed experts from the global spec, and every MoE layer
+        naming its shared expert in layer_quant_config, mapped by the loader."""
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        quant = QuarkConfig.from_config(
+            {
+                "quant_method": "quark",
+                "export": {"kv_cache_group": [], "pack_method": "reorder"},
+                "global_quant_config": _QUARK_MXFP4,
+                "layer_quant_config": {
+                    f"language_model.model.layers.{layer}.block_sparse_moe."
+                    f"shared_experts.{proj}": shared_spec
+                    for layer in range(3, 6)
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                },
+                "layer_type_quant_config": {},
+                "exclude": [],
+                "packed_modules_mapping": dict(
+                    MiniMaxM3SparseForConditionalGeneration.packed_modules_mapping
+                ),
+            }
+        )
+        quant.apply_weight_name_mapper(
+            MiniMaxM3SparseForConditionalGeneration.hf_to_sglang_mapper
+        )
+        return quant
+
+    def test_a_quark_mxfp8_shared_expert_beside_mxfp4_experts_cannot_fuse(self):
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        self._seed()
+        wrapper = SimpleNamespace(text_config=SimpleNamespace(n_shared_experts=1))
+        self.assertIn(
+            "higher precision",
+            self._reason(
+                MiniMaxM3SparseForConditionalGeneration,
+                wrapper,
+                self._m31_quark(_QUARK_MXFP8),
+            ),
+        )
+        self.assertNotIn(
+            "higher precision",
+            self._reason(
+                MiniMaxM3SparseForConditionalGeneration,
+                wrapper,
+                self._m31_quark(_QUARK_MXFP4),
+            )
+            or "",
         )
 
 

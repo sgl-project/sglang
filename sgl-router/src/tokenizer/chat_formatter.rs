@@ -279,6 +279,11 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// The `sglang_processor` formatter, for models that render through it.
+    pub fn processor(&self) -> Option<&ProcessorFormatter> {
+        self.processor.as_ref()
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
