@@ -52,7 +52,6 @@ import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
 
-from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -125,7 +124,15 @@ class MMInputsProcessError(msgspec.Struct, frozen=True):
 
 
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
-    sequences: List[BeamSearchSequence]
+    """A finished group's returned sequences, best score first, as columns:
+    a few lists cross IPC rather than one struct per sequence."""
+
+    tokens: List[List[int]]  # generated only, no prompt
+    cum_logprobs: List[float]
+    beam_scores: List[float]  # length-normalized; the sort key
+    # JSON; sequences that finished alike share one dict.
+    finish_reasons: List[Dict[str, Any]]
+    texts: Optional[List[str]] = None  # filled by the detokenizer
 
 
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
