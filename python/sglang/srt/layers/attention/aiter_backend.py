@@ -172,6 +172,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
         self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
+        self._configure_grouped_pa_swa(model_runner)
 
         self.page_size = model_runner.server_args.page_size
 
@@ -312,11 +313,10 @@ class AiterAttnBackend(AttentionBackend):
             self.device
         )
 
-        self._flydsl_pa_decode_tile = None
-        self._flydsl_compile_pa_decode_tile = None
-        self._flydsl_compile_pa_decode_reduce = None
-        self._flydsl_pa_decode_kv_dtype_parameter = None
-        self._flydsl_pa_decode_reduce_uses_runtime_query_length = False
+        self._flydsl_pa_decode = None
+        self._flydsl_pa_decode_query_splits = None
+        self._flydsl_plan_pa_decode = None
+        self._flydsl_pa_work_plans = {}
         self._flydsl_pa_decode_pmax = None
         self._flydsl_pa_decode_psum = None
         self._flydsl_pa_decode_pout = None
@@ -426,6 +426,25 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+    def _configure_grouped_pa_swa(self, model_runner: ModelRunner) -> None:
+        self._grouped_pa_swa_first_layer = None
+        if not envs.SGLANG_MIMO_GROUPED_PA_SWA.get() or self.is_draft_worker:
+            return
+        pattern = getattr(
+            model_runner.model_config.hf_config, "hybrid_layer_pattern", None
+        )
+        args = model_runner.server_args
+        if (
+            args.pp_size != 1
+            or not pattern
+            or 1 not in pattern
+            or args.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "Grouped MiMo PA SWA requires single-stage DFlash hybrid attention"
+            )
+        self._grouped_pa_swa_first_layer = pattern.index(1)
+
     def _configure_flydsl_pa_decode(self, max_bs: int) -> None:
         requested_impl = envs.SGLANG_AITER_PA_DECODE_IMPL.get().strip().lower()
         if requested_impl not in ("gluon", "flydsl"):
@@ -495,25 +514,32 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         kernels = load_flydsl_pa_decode_kernels()
-        self._flydsl_pa_decode_tile = kernels.pa_decode_tile
-        self._flydsl_compile_pa_decode_tile = kernels.compile_pa_decode_tile
-        self._flydsl_compile_pa_decode_reduce = kernels.compile_pa_decode_reduce
-        self._flydsl_pa_decode_kv_dtype_parameter = kernels.kv_dtype_parameter
-        self._flydsl_pa_decode_reduce_uses_runtime_query_length = (
-            kernels.reduce_uses_runtime_query_length
+        self._flydsl_pa_decode = kernels.pa_decode
+        self._flydsl_plan_pa_decode = kernels.plan_pa_decode
+        # Keep MiMo block4 queries together on gfx942: split-query CTAs reread
+        # the same long KV cache. This BF16 D192/V128 geometry fits 64 KiB LDS.
+        # Older plan APIs retain their automatic policy when no override exists.
+        self._flydsl_pa_decode_query_splits = (
+            1
+            if is_gfx942_supported()
+            and self.kv_cache_dtype == torch.bfloat16
+            and self._flydsl_pa_decode_query_length == 4
+            and getattr(kernels, "supports_query_splits", False)
+            else None
         )
         self._ensure_flydsl_pa_decode_workspace(max_bs)
         logger.info(
             "Enabled MiMo FlyDSL PA decode on target worker: full "
             "TARGET_VERIFY=FlyDSL, SWA/sink TARGET_VERIFY=%s, "
             "ordinary full decode=FlyDSL; runtime=%s (%s), kernel=%s, "
-            "partitions=%d, workspace_max_bs=%d",
+            "partitions=%d, workspace_max_bs=%d, block4_query_splits=%s",
             "FlyDSL" if flydsl_target_verify_swa_enabled() else "AITER",
             kernels.version,
             kernels.runtime_path,
             kernels.kernel_path,
             self._flydsl_pa_decode_num_partitions,
             self._flydsl_pa_decode_workspace_max_bs,
+            self._flydsl_pa_decode_query_splits or "auto",
         )
 
     def _ensure_flydsl_pa_decode_workspace(self, max_bs: int) -> None:
@@ -542,63 +568,23 @@ class AiterAttnBackend(AttentionBackend):
             dtype=torch.bfloat16,
             device=self.device,
         )
-        self._flydsl_pa_decode_context_lengths = torch.empty(
+        self._flydsl_pa_decode_context_lengths = torch.zeros(
             max_bs, dtype=torch.int32, device=self.device
         )
         self._flydsl_pa_decode_workspace_max_bs = max_bs
 
     def _compile_flydsl_pa_decode(self) -> None:
+        """Warm the public plan-based API before graph capture.
+
+        Real graph batches also run their normal eager warmups. The native
+        wrapper owns kernel/reducer compilation for each scheduling shape.
+        """
         if not self._use_flydsl_pa_decode or self._flydsl_pa_decode_compiled:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "FlyDSL PA decode must be compiled before CUDA graph capture"
+                "FlyDSL PA decode must be warmed before CUDA graph capture"
             )
-
-        compile_kwargs = dict(
-            head_dim=FLYDSL_MIMO_HEAD_DIM,
-            v_head_dim=FLYDSL_MIMO_VALUE_HEAD_DIM,
-            query_group_size=16,
-            block_size=64,
-            num_partitions=self._flydsl_pa_decode_num_partitions,
-            softmax_scale=FLYDSL_MIMO_HEAD_DIM**-0.5,
-            query_dtype="bf16",
-            per_token_kv=False,
-            query_length=self._flydsl_pa_decode_query_length,
-            trans_v=True,
-        )
-        if self._flydsl_pa_decode_kv_dtype_parameter == "kv_dtype":
-            compile_kwargs["kv_dtype"] = (
-                "bf16" if self.kv_cache_dtype == torch.bfloat16 else "fp8"
-            )
-        elif self._flydsl_pa_decode_kv_dtype_parameter == "bf16_kv":
-            compile_kwargs["bf16_kv"] = self.kv_cache_dtype == torch.bfloat16
-        else:
-            raise RuntimeError("FlyDSL PA decode KV dtype API is not initialized")
-        reduce_kwargs = dict(
-            max_context_partition_num=self._flydsl_pa_decode_num_partitions,
-            query_group_size=16,
-            head_size=FLYDSL_MIMO_VALUE_HEAD_DIM,
-            output_dtype_str="bf16",
-            logits_dtype_str="bf16",
-        )
-        if self._flydsl_pa_decode_reduce_uses_runtime_query_length:
-            reduce_kwargs.update(
-                sink_dtype_str="f32",
-                use_sinks=False,
-                use_work_plan=False,
-            )
-        else:
-            reduce_kwargs["query_seq_len"] = self._flydsl_pa_decode_query_length
-        # Ordinary decode can run eagerly inside a mixed DP prefill forward,
-        # even when the target's captured phase is multi-token verification.
-        # Prepare qlen=1 as well, so that path does not introduce a cold kernel.
-        for query_length in sorted({1, self._flydsl_pa_decode_query_length}):
-            compile_kwargs["query_length"] = query_length
-            if not self._flydsl_pa_decode_reduce_uses_runtime_query_length:
-                reduce_kwargs["query_seq_len"] = query_length
-            self._flydsl_compile_pa_decode_tile(**compile_kwargs)
-            self._flydsl_compile_pa_decode_reduce(**reduce_kwargs)
         warmup_flydsl_full_decode(self)
         self._flydsl_pa_decode_compiled = True
 
@@ -1687,9 +1673,8 @@ class AiterAttnBackend(AttentionBackend):
     ):
         if self._use_flydsl_pa_decode:
             self._ensure_flydsl_pa_decode_workspace(max_bs)
-            # Compile both the tile and split reducer before capture. The
-            # Python wrapper's cache then makes every captured layer call a
-            # launch-only operation with caller-owned workspaces.
+            # Warm the public API before graph setup. Per-shape eager model
+            # warmups populate plans and kernel specializations before capture.
             self._compile_flydsl_pa_decode()
         if self._flydsl_dflash_swa_enabled:
             prepare_flydsl_dflash_swa(
@@ -1731,7 +1716,14 @@ class AiterAttnBackend(AttentionBackend):
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
-        if kv_indices_buf is None:
+        # Unified decode/draft-extend and unified verification use page tables.
+        # Keep flat token indices only when at least one metadata path needs
+        # them; allocating max_bs * max_context_len otherwise wastes GiBs.
+        needs_legacy_kv_indices = self.use_mla or not (
+            self.use_triton_unified_attention and self._use_unified_verify
+        )
+        self.cuda_graph_kv_indices = kv_indices_buf
+        if kv_indices_buf is None and needs_legacy_kv_indices:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
@@ -1759,8 +1751,6 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-        else:
-            self.cuda_graph_kv_indices = kv_indices_buf
 
         if self._use_unified_verify:
             # Keep a distinct page-table buffer for unified attention.  Sharing
@@ -1775,7 +1765,9 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if not self.skip_prefill:
+        # Only the legacy target-verify branch reads the custom mask.
+        self.cuda_graph_custom_mask = None
+        if not self.skip_prefill and not self._use_unified_verify:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -1816,8 +1808,10 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.cuda_graph_swa_kv_indices = torch.zeros_like(
-                self.cuda_graph_kv_indices
+            self.cuda_graph_swa_kv_indices = (
+                torch.zeros_like(self.cuda_graph_kv_indices)
+                if needs_legacy_kv_indices
+                else None
             )
             # SWA write-target buffer; refilled and bound onto forward_metadata
             # in init_forward_metadata_out_graph before each replay.
@@ -1826,6 +1820,22 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+
+        def allocated_bytes(name):
+            buffer = getattr(self, name, None)
+            return 0 if buffer is None else buffer.numel() * buffer.element_size()
+
+        logger.info(
+            "AITER graph allocation: legacy_workspace_bytes=%d, "
+            "legacy_kv_indices_bytes=%d, legacy_swa_kv_indices_bytes=%d, "
+            "legacy_custom_mask_bytes=%d, page_table_bytes=%d",
+            allocated_bytes("workspace_buffer"),
+            allocated_bytes("cuda_graph_kv_indices"),
+            allocated_bytes("cuda_graph_swa_kv_indices"),
+            allocated_bytes("cuda_graph_custom_mask"),
+            allocated_bytes("cuda_graph_page_table")
+            + allocated_bytes("cuda_graph_swa_page_table"),
+        )
 
     def _apply_cuda_graph_metadata(
         self,

@@ -74,23 +74,11 @@ case "${ENABLE_DFLASH}" in
     ;;
   *) echo "ENABLE_DFLASH must be 0 or 1" >&2; exit 2 ;;
 esac
-ENABLE_DP_ENCODER="${ENABLE_DP_ENCODER:-0}"
-encoder_args=()
-warmup_args=(--skip-server-warmup)
-case "${ENABLE_DP_ENCODER}" in
-  0) ;;
-  1)
-    encoder_args=(--mm-enable-dp-encoder)
-    # Also exercise the default image warmup once vision DP is enabled.
-    warmup_args=()
-    ;;
-  *) echo "ENABLE_DP_ENCODER must be 0 or 1" >&2; exit 2 ;;
-esac
+# MiMo vision stays within each attention TP4 replica.
 
 server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
   --model-path "${MODEL_PATH}"
-  "${warmup_args[@]}"
-  "${encoder_args[@]}"
+  --skip-server-warmup
   --tp-size 8 --dp-size 2 --ep-size 1
   --enable-dp-attention --enable-dp-lm-head
   --moe-a2a-backend none --moe-runner-backend aiter
@@ -112,7 +100,7 @@ server_cmd=("${PYTHON_BIN}" -u -m sglang.launch_server
 )
 
 echo "Experimental MiMo DP attention: global TP8 / attention DP2 x TP4 / EP1"
-echo "FP8 experts; DP LM head; DFlash=${ENABLE_DFLASH}; encoder DP=${ENABLE_DP_ENCODER}; TBO disabled"
+echo "FP8 experts; DP LM head; DFlash=${ENABLE_DFLASH}; vision attention TP=4; TBO disabled"
 echo "Requested chunk=${CHUNKED_PREFILL_SIZE}, requests=${MAX_RUNNING_REQUESTS}; each is divided by DP2"
 printf 'Command:'
 printf ' %q' "${server_cmd[@]}"

@@ -3621,6 +3621,32 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
+            if (
+                self.server_args.disaggregation_mode == "decode"
+                and self.server_args.disaggregation_transfer_backend == "fake"
+                and envs.SGLANG_FAKE_PREFILL_ZERO_KV_ON_FLUSH.get()
+            ):
+                from sglang.srt.disaggregation.fake.kv_reset import (
+                    zero_fake_mha_kv_cache,
+                )
+
+                draft_runner = None
+                if self.draft_worker is not None:
+                    draft_runner = getattr(
+                        self.draft_worker, "draft_model_runner", None
+                    )
+                    if draft_runner is None:
+                        draft_runner = getattr(self.draft_worker, "draft_runner", None)
+                    if draft_runner is None:
+                        raise TypeError(
+                            "Fake-prefill KV reset cannot locate draft runner"
+                        )
+                reset = zero_fake_mha_kv_cache(
+                    self.tp_worker.model_runner.token_to_kv_pool,
+                    draft_runner.token_to_kv_pool if draft_runner is not None else None,
+                )
+                logger.info("Fake-prefill KV contents reset: %s", reset)
+
             if empty_cache:
                 current_platform.empty_cache()
             # Per-DP-group leader logs once: ranks within a DP group are

@@ -50,6 +50,7 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -94,12 +95,19 @@ class Qwen2_5_VLMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        if use_data_parallel:
+            self.tp_size, self.tp_rank = 1, 0
+        elif use_dp_attention_reduce:
+            self.tp_size, self.tp_rank = (
+                get_attention_tp_size(),
+                get_attention_tp_rank(),
+            )
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_tensor_model_parallel_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -117,6 +125,7 @@ class Qwen2_5_VLMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         self.hidden_act = hidden_act
         if self.hidden_act == "silu":
@@ -221,12 +230,18 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = RMSNorm(context_dim, eps=1e-6)
-        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        if use_data_parallel:
+            tp_size, tp_rank = 1, 0
+        elif use_dp_attention_reduce:
+            tp_size, tp_rank = get_attention_tp_size(), get_attention_tp_rank()
+        else:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -247,6 +262,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
                     prefix=add_prefix("mlp.2", prefix),
                     tp_size=tp_size,
                     tp_rank=tp_rank,
+                    use_dp_attention_reduce=use_dp_attention_reduce,
                 ),
             ]
         )

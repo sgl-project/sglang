@@ -75,14 +75,13 @@ cd /sgl-workspace/sglang/evaluation/
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 
 The standalone fake-prefill launcher defines the Flash baseline settings:
-TP4 x DP2, EP1, DFlash block 8, load-time MXFP4-to-FP8 MoE conversion,
-FlyDSL attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
-It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
-Acceptance is simulated at length 4 using `SGLANG_SIMULATE_ACC_LEN=4` and
-`SGLANG_SIMULATE_ACC_METHOD=match-expected`, matching the Pro fake-prefill
-reference. This gives a controlled acceptance length for decode throughput
-comparisons. Fake prefill skips prompt computation, so these runs measure
-performance; use the accuracy launcher with real prefill to evaluate accuracy.
+
+- TP4 x DP2, EP1, DFlash block 8, native MXFP4 weights with FlyDSL A8W4 decode kernel.
+- FlyDSL attention, BF16 target/draft KV, and disabled Quick Reduce/mixed router.
+- It adds `--disaggregation-mode decode --disaggregation-transfer-backend fake`.
+- Acceptance is simulated at length 8 using `SGLANG_SIMULATE_ACC_LEN=3.5` and
+  `SGLANG_SIMULATE_ACC_METHOD=match-expected`, Fake prefill skips prompt computation,
+- so these runs measure performance; use the accuracy launcher with real prefill to evaluate accuracy.
 
 The fake-prefill decode capacity must fit both the full-token and SWA-token
 pools:

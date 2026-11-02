@@ -2672,7 +2672,7 @@ def test_flydsl_full_attention_uses_correct_context_lengths(
     scalar_numel = batch_size * partitions * configured_query_length * 16
     captured = {}
 
-    def fake_pa_decode_tile(**kwargs):
+    def fake_pa_decode(**kwargs):
         captured.update(kwargs)
         kwargs["output"].fill_(3.0)
 
@@ -2681,7 +2681,11 @@ def test_flydsl_full_attention_uses_correct_context_lengths(
         block_tables = torch.cat((block_tables, torch.zeros_like(block_tables)))
     backend = SimpleNamespace(
         _use_flydsl_pa_decode=True,
-        _flydsl_pa_decode_tile=fake_pa_decode_tile,
+        _flydsl_pa_decode=fake_pa_decode,
+        _flydsl_plan_pa_decode=lambda lengths, heads, **kw: SimpleNamespace(
+            capacity=lengths.numel() * kw["max_partitions"]
+        ),
+        _flydsl_pa_work_plans={},
         _flydsl_pa_decode_num_partitions=partitions,
         _flydsl_pa_decode_pmax=torch.empty(scalar_numel, dtype=torch.float32),
         _flydsl_pa_decode_psum=torch.empty(scalar_numel, dtype=torch.float32),
@@ -2745,10 +2749,11 @@ def test_flydsl_full_attention_uses_correct_context_lengths(
     ]
     assert captured["query"].shape == (batch_size * query_length, 16, 192)
     assert captured["output"].shape == (batch_size * query_length, 16, 128)
-    assert captured["pout"].shape == (
-        batch_size,
+    assert captured["query_length"] == query_length
+    assert captured["work_plan"].capacity == batch_size * partitions
+    assert captured["temporary_output"].shape == (
         1,
-        partitions,
+        batch_size * partitions,
         query_length * 16,
         128,
     )
@@ -3598,24 +3603,16 @@ def _make_flydsl_bf16_backend(query_length=4):
 def _patch_flydsl_backend_dependencies(monkeypatch, *, gfx942, gfx950):
     captured = {}
 
-    def fake_compile_pa_decode_tile(**kwargs):
-        captured["tile"] = kwargs
-        captured.setdefault("tiles", []).append(kwargs)
-
-    def fake_compile_pa_decode_reduce(**kwargs):
-        captured["reduce"] = kwargs
-        captured.setdefault("reduces", []).append(kwargs)
-
     kernels = SimpleNamespace(
-        pa_decode_tile=lambda **kwargs: None,
-        compile_pa_decode_tile=fake_compile_pa_decode_tile,
-        compile_pa_decode_reduce=fake_compile_pa_decode_reduce,
-        kv_dtype_parameter="kv_dtype",
-        reduce_uses_runtime_query_length=True,
+        pa_decode=lambda **kwargs: None,
+        plan_pa_decode=lambda *args, **kwargs: None,
+        supports_query_splits=True,
         version="test",
         runtime_path="test-runtime",
         kernel_path="test-kernel",
     )
+    captured["kernels"] = kernels
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         aiter_backend.envs,
         "SGLANG_AITER_PA_DECODE_IMPL",
@@ -3657,35 +3654,27 @@ def test_flydsl_bf16_decode_configuration_accepts_supported_arches(
 
     assert backend._use_flydsl_pa_decode
     assert backend._flydsl_pa_decode_num_partitions == 8
-    assert backend._flydsl_pa_decode_tile is not None
-    assert captured["tile"]["kv_dtype"] == "bf16"
-    assert captured["tile"]["head_dim"] == 192
-    assert captured["tile"]["v_head_dim"] == 128
-    assert captured["tile"]["query_length"] == query_length
-    assert [item["query_length"] for item in captured["tiles"]] == sorted(
-        {1, query_length}
+    assert backend._flydsl_pa_decode_query_splits == (
+        1 if gfx942 and query_length == 4 else None
     )
-    assert captured["reduce"]["head_size"] == 128
-    assert captured["reduce"]["query_group_size"] == 16
-    assert "query_seq_len" not in captured["reduce"]
+    assert backend._flydsl_pa_decode is captured["kernels"].pa_decode
+    assert backend._flydsl_plan_pa_decode is captured["kernels"].plan_pa_decode
     # The prepared flag prevents duplicate work on subsequent graph setup calls.
-    count = len(captured["tiles"])
     backend._compile_flydsl_pa_decode()
-    assert len(captured["tiles"]) == count
     assert captured["warmups"] == [backend]
 
 
-def test_flydsl_fp8_decode_compile_disables_bf16_kv(monkeypatch):
+def test_flydsl_fp8_decode_uses_public_api(monkeypatch):
     captured = _patch_flydsl_backend_dependencies(
         monkeypatch, gfx942=False, gfx950=True
     )
     backend = _make_flydsl_bf16_backend()
     backend.kv_cache_dtype = fp8_dtype
-
     backend._configure_flydsl_pa_decode(max_bs=1)
     backend._compile_flydsl_pa_decode()
-
-    assert captured["tile"]["kv_dtype"] == "fp8"
+    assert backend._flydsl_pa_decode is captured["kernels"].pa_decode
+    assert captured["warmups"] == [backend]
+    assert backend._flydsl_pa_decode_query_splits is None
 
 
 def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
@@ -3709,36 +3698,36 @@ def test_flydsl_pa_decode_loader_rejects_legacy_compile_api(monkeypatch):
     aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
     try:
-        with pytest.raises(RuntimeError, match="v_head_dim"):
+        with pytest.raises(RuntimeError, match="plan-based"):
             aiter_utils.load_flydsl_pa_decode_kernels()
     finally:
         aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
 
-def test_flydsl_pa_decode_loader_accepts_optimized_tile_api(monkeypatch):
-    def compile_pa_decode_tile(*, v_head_dim, kv_dtype):
+def test_flydsl_pa_decode_loader_accepts_public_plan_api(monkeypatch):
+    def pa_decode(*, work_plan, query_length, temporary_output):
+        pass
+
+    def plan_pa_decode(*, plan, max_partitions, workgroup_budget):
         pass
 
     modules = {
         "flydsl": SimpleNamespace(__version__="0.3.2", __file__="test-runtime"),
         "aiter.ops.flydsl.pa_decode": SimpleNamespace(
-            __file__="pa-decode-tile-032",
-            pa_decode_tile=lambda **kwargs: None,
-            compile_pa_decode_tile=compile_pa_decode_tile,
-        ),
-        "aiter.ops.flydsl.kernels.pa_decode_reduce": SimpleNamespace(
-            compile_pa_decode_ps_reduce=lambda *, query_seq_len, **kwargs: None
+            __file__="pa-decode-plan",
+            pa_decode=pa_decode,
+            plan_pa_decode=plan_pa_decode,
         ),
     }
     monkeypatch.setattr(
         aiter_utils.importlib, "import_module", lambda name: modules[name]
     )
     aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
-
     try:
         kernels = aiter_utils.load_flydsl_pa_decode_kernels()
-        assert kernels.kv_dtype_parameter == "kv_dtype"
-        assert not kernels.reduce_uses_runtime_query_length
+        assert kernels.pa_decode is pa_decode
+        assert kernels.plan_pa_decode is plan_pa_decode
+        assert not kernels.supports_query_splits
     finally:
         aiter_utils.load_flydsl_pa_decode_kernels.cache_clear()
 
@@ -3928,3 +3917,21 @@ def test_mimo_multimodal_aux_capture_embeds_placeholders_first(monkeypatch, capt
         torch.testing.assert_close(auxiliary[0], embedded + 2)
     else:
         assert auxiliary is None
+
+
+@pytest.mark.parametrize("query_length", [1, 4, 8])
+@pytest.mark.parametrize("splits", [None, 1])
+def test_full_pa_query_split_kwargs_are_scoped(query_length, splits):
+    backend = SimpleNamespace(_flydsl_pa_decode_query_splits=splits)
+    expected = {"query_splits": 1} if query_length == 4 and splits == 1 else {}
+    assert aiter_utils._full_pa_query_split_kwargs(backend, query_length) == expected
+
+
+def test_full_pa_keeps_automatic_policy_without_override_api(monkeypatch):
+    captured = _patch_flydsl_backend_dependencies(
+        monkeypatch, gfx942=True, gfx950=False
+    )
+    captured["kernels"].supports_query_splits = False
+    backend = _make_flydsl_bf16_backend(4)
+    backend._configure_flydsl_pa_decode(max_bs=1)
+    assert backend._flydsl_pa_decode_query_splits is None

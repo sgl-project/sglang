@@ -178,6 +178,25 @@ class DFlashDraftInputV2(SpecInput):
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
+        staging_buffers = (
+            committed_kv_lens_cpu_t,
+            batch_seq_lens_cpu_t,
+            cur_kv_lens_cpu_t,
+            planning_kv_lens_cpu_t,
+            nxt_kv_lens_cpu_t,
+        )
+        if envs.SGLANG_DFLASH_FAST_CPU_STAGING.get():
+            # These are contiguous CPU int32 tensors. NumPy views write the
+            # same storage synchronously, before the existing stream-ordered
+            # copies below. Allocation, eviction and KV ownership are unchanged.
+            staging_buffers = tuple(t.numpy() for t in staging_buffers)
+        (
+            committed_stage,
+            batch_stage,
+            current_stage,
+            planning_stage,
+            next_stage,
+        ) = staging_buffers
         committed_seq_lens_sum = 0
         planning_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
@@ -196,11 +215,11 @@ class DFlashDraftInputV2(SpecInput):
             reserved_lens[i] = reserved_len
             top_k = int(req.sampling_params.top_k)
 
-            committed_kv_lens_cpu_t[i] = committed_len
-            batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur_alloc_len
-            planning_kv_lens_cpu_t[i] = planning_len
-            nxt_kv_lens_cpu_t[i] = reserved_len
+            committed_stage[i] = committed_len
+            batch_stage[i] = committed_len
+            current_stage[i] = cur_alloc_len
+            planning_stage[i] = planning_len
+            next_stage[i] = reserved_len
 
             committed_seq_lens_sum += committed_len
             planning_seq_lens_sum += planning_len

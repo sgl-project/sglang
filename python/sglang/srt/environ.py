@@ -310,6 +310,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Benchmark-only: reset dummy KV contents at an idle fake-decode flush.
+    SGLANG_FAKE_PREFILL_ZERO_KV_ON_FLUSH = EnvBool(False)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
@@ -366,6 +368,7 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_SCHEDULER_MQ_BROADCAST = EnvBool(False)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
@@ -662,6 +665,10 @@ class Envs:
     SGLANG_DFLASH_PREFILL_REFILL_TARGET = EnvInt(None)
     # Fuse compact-window request-table preparation without reading GPU sizes.
     SGLANG_DFLASH_FUSED_COMPACT_KV = EnvBool(False)
+    # Fill the existing CPU length buffers through shared NumPy views.
+    SGLANG_DFLASH_FAST_CPU_STAGING = EnvBool(False)
+    # Opt-in grouped PA for MiMo target DFlash SWA verification.
+    SGLANG_MIMO_GROUPED_PA_SWA = EnvBool(False)
     # Keep target graphs enabled while comparing eager and captured DP drafts.
     SGLANG_DFLASH_DISABLE_DRAFT_CUDA_GRAPH = EnvBool(False)
 

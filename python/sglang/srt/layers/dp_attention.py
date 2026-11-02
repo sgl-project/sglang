@@ -49,6 +49,7 @@ _DP_MAX_LEN_WITH_IDLE = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_FUSED_DP_PAD_COPY = _is_hip and get_bool_env_var("SGLANG_DPA_FUSED_PAD_COPY")
 
 
 class DpPaddingMode(IntEnum):
@@ -469,6 +470,52 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+@triton.jit
+def _pad_copy_triton_kernel(
+    dst_ptr, src_ptr, offset_ptr, size_ptr,
+    GLOBAL_SIZE: tl.constexpr, CHUNK_SIZE: tl.constexpr,
+    ELEMENT_BITS: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    # This operation copies bits. Integer pointers also allow masked zero loads
+    # for FP8 FNUZ, which has no direct integer-to-FP8 cast in Triton.
+    if ELEMENT_BITS == 8:
+        dst_ptr = dst_ptr.to(tl.pointer_type(tl.uint8))
+        src_ptr = src_ptr.to(tl.pointer_type(tl.uint8))
+    elif ELEMENT_BITS == 16:
+        dst_ptr = dst_ptr.to(tl.pointer_type(tl.uint16))
+        src_ptr = src_ptr.to(tl.pointer_type(tl.uint16))
+    elif ELEMENT_BITS == 32:
+        dst_ptr = dst_ptr.to(tl.pointer_type(tl.uint32))
+        src_ptr = src_ptr.to(tl.pointer_type(tl.uint32))
+    else:
+        dst_ptr = dst_ptr.to(tl.pointer_type(tl.uint64))
+        src_ptr = src_ptr.to(tl.pointer_type(tl.uint64))
+    index = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offset = tl.load(offset_ptr).to(tl.int64) * CHUNK_SIZE
+    size = tl.load(size_ptr).to(tl.int64) * CHUNK_SIZE
+    local_index = index - offset
+    value = tl.load(
+        src_ptr + local_index,
+        mask=(index < GLOBAL_SIZE) & (local_index >= 0) & (local_index < size),
+        other=0,
+    )
+    tl.store(dst_ptr + index, value, mask=index < GLOBAL_SIZE)
+
+
+def pad_copy_triton(dst, src, offset, size):
+    """Write a zero-padded DP slice, preserving GPU metadata on graph replay."""
+    assert dst.is_contiguous() and src.is_contiguous()
+    assert dst.shape[1:] == src.shape[1:]
+    assert dst.dtype == src.dtype
+    assert src.untyped_storage() is not dst.untyped_storage()
+    if dst.numel() == 0:
+        return
+    block_size = 8192
+    _pad_copy_triton_kernel[(triton.cdiv(dst.numel(), block_size),)](
+        dst, src, offset, size, dst.numel(), prod(src.shape[1:]), src.element_size()*8, block_size,
+    )
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -477,11 +524,19 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+    copy_local = local_tokens.shape[0] > 0 and (
+        is_partial or get_attention_tp_rank() == 0
+    )
+    fused_copy = _FUSED_DP_PAD_COPY and copy_local and global_tokens.dtype == local_tokens.dtype
+    if fused_copy:
+        pad_copy_triton(global_tokens, local_tokens, local_start_pos, local_num_tokens)
+    else:
+        global_tokens.fill_(0)
+
+    if copy_local and not fused_copy:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"

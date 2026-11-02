@@ -177,6 +177,8 @@ class MiMoVisionBlock(nn.Module):
             use_sink=use_sink,
             window_size=window_size,
             use_data_parallel=use_data_parallel,
+            # Image inputs belong to one attention replica, not the global MoE TP group.
+            use_dp_attention_reduce=not use_data_parallel,
         )
         self.mlp = Qwen2_5_VLMLP(
             dim,
@@ -185,6 +187,7 @@ class MiMoVisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=not use_data_parallel,
         )
 
     def forward(
@@ -306,6 +309,7 @@ class MiMoVisionTransformer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=self.use_data_parallel,
+            use_dp_attention_reduce=not self.use_data_parallel,
         )
         self._post_init()
 

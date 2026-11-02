@@ -55,6 +55,21 @@ class Mxfp4AiterA16W4MoEMethod:
     def create_moe_runner(
         self, layer: Module, moe_runner_config: MoeRunnerConfig
     ) -> None:
+        # The native A16W4/A8W4 SiLU epilogue does not apply an activation
+        # clamp. A positive swiglu_limit can also override our separated
+        # weight layout in the shared runner. Reject either config spelling
+        # before runner setup rather than silently changing the model.
+        if any(
+            limit is not None and limit != 0
+            for limit in (
+                moe_runner_config.swiglu_limit,
+                moe_runner_config.gemm1_clamp_limit,
+            )
+        ):
+            raise ValueError(
+                "Native MXFP4 A16W4/A8W4 does not support activation clamps; "
+                "swiglu_limit and gemm1_clamp_limit must be unset or 0."
+            )
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 

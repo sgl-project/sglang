@@ -15,6 +15,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -132,6 +133,18 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    @staticmethod
+    def _broadcast_in_group(data, group, cpu_group):
+        # Preserve the same source/group and per-rank call order. The existing
+        # process-group queue uses local source rank0; broadcast_pyobj takes
+        # global ranks. Keep its established path when a queue is unavailable.
+        if (
+            envs.SGLANG_SCHEDULER_MQ_BROADCAST.get()
+            and group.mq_broadcaster is not None
+        ):
+            return group.broadcast_object(data, src=0)
+        return broadcast_pyobj(data, group.rank, cpu_group, src=group.ranks[0])
+
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
         if self.server_args.enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -141,19 +154,13 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
+                work_reqs = self._broadcast_in_group(
+                    work_reqs, self.attn_tp_group, self.attn_tp_cpu_group
                 )
 
             if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
+                work_reqs = self._broadcast_in_group(
+                    work_reqs, self.attn_cp_group, self.attn_cp_cpu_group
                 )
 
             # When dp_attention_local_control_broadcast is enabled, each DP
@@ -164,33 +171,21 @@ class SchedulerRequestReceiver:
             _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
+                    control_reqs = self._broadcast_in_group(
+                        control_reqs, self.attn_tp_group, self.attn_tp_cpu_group
                     )
                 if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
+                    control_reqs = self._broadcast_in_group(
+                        control_reqs, self.attn_cp_group, self.attn_cp_cpu_group
                     )
             elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                control_reqs = self._broadcast_in_group(
+                    control_reqs, self.tp_group, self.tp_cpu_group
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
+            recv_reqs = self._broadcast_in_group(
+                recv_reqs, self.tp_group, self.tp_cpu_group
             )
         return recv_reqs
 

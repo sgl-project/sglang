@@ -3,10 +3,9 @@ set -euo pipefail
 
 # Eight GPUs: global MoE TP8, two attention TP4 groups, EP1, DFlash.
 # Fake-prefill decode launcher for gfx942 with simulated acceptance mean 3.5.
-# Default: convert checkpoint MXFP4 experts at load time to FP8 blockscale.
-# Native MXFP4 A16W4/A8W4: set SGLANG_MXFP4_TO_FP8_128BLOCK=0 and
-# AITER_CONFIG_FMOE=/path/to/flash_tp8_mxfp4_tuned_fmoe.csv. The CSV selects
-# A16W4/A8W4 kernels per token count; a mixed recipe need not use A8W4 in decode.
+# Default: native MXFP4 weights with adaptive A8W4 decode row tiles.
+# AITER_CONFIG_FMOE selects the MoE recipe; override it to compare another CSV.
+# Set SGLANG_MXFP4_TO_FP8_128BLOCK=1 for static FP8 blockscale conversion.
 # Requires AITER's gfx942 MXFP4 kernels (aiter PR #16) alongside Flash attention
 # support. Recipes must match Flash MoE TP8: model_dim=4096, inter_dim=256,
 # expert=256, topk=8; Pro TP8 recipes have different shapes.
@@ -36,24 +35,21 @@ export SPECULATIVE_DRAFT_MODEL_PATH="${SPECULATIVE_DRAFT_MODEL_PATH:-${MODEL_PAT
 export DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-8}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-30001}"
-export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT:-/root/workspace/aiter}${PYTHONPATH:+:${PYTHONPATH}}"
+export AITER_ROOT="${AITER_ROOT:-/sgl-workspace/aiter}"
+export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-1}"
+export SGLANG_MXFP4_TO_FP8_128BLOCK="${SGLANG_MXFP4_TO_FP8_128BLOCK:-0}"
 export SGLANG_INT4_WEIGHT=0
 case "${SGLANG_MXFP4_TO_FP8_128BLOCK}" in
   1)
     moe_weight_description="static FP8 blockscale MoE weights converted from MXFP4 at load time"
     ;;
   0)
-    if [[ -z "${AITER_CONFIG_FMOE:-}" ]]; then
-      echo "Native MXFP4 requires AITER_CONFIG_FMOE with Flash MoE TP8 A16W4/A8W4 recipes" >&2
-      exit 2
-    fi
+    export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${AITER_ROOT}/mimo_v2.6_flash_decode_adaptive_a8w4.csv}"
     if [[ "${DRY_RUN:-0}" != "1" && ! -r "${AITER_CONFIG_FMOE}" ]]; then
       echo "AITER_CONFIG_FMOE is not readable: ${AITER_CONFIG_FMOE}" >&2
       exit 2
     fi
-    export AITER_CONFIG_FMOE
     # The fused MoE RMSNorm path produces per-1x128 FP8 activations, not the
     # BF16 input expected by the native A16W4/A8W4 MoE wrappers.
     export SGLANG_MIMO_FUSED_RMS_MOE_QUANT=0
