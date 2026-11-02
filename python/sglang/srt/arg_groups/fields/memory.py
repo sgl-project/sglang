@@ -265,7 +265,7 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori", "dynamic"],
+            choices=["mooncake", "mori", "lmcache", "dynamic"],
         ),
     ] = "mooncake"
     unified_cache_external_linker_config: A[

@@ -94,14 +94,14 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
         self.pools = {}
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, key, device_hit_len, transfers):
         return list(self.restorable)
 
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
         return True
 
-    def prefetch(self, transfers):
+    def prefetch(self, rid, transfers):
         return None
 
     def start_layer_wise_loading(self):
@@ -116,7 +116,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
         self.offload_sessions.append(session_id)
         return True
@@ -212,7 +212,10 @@ class TestMooncakePrefetch(CustomTestCase):
         self.addCleanup(stop)
 
         future = linker.submit_lookup(
-            "rid", [PoolTransfer(name=PoolName.KV, keys=["page"])]
+            "rid",
+            RadixKey([1]),
+            0,
+            [PoolTransfer(name=PoolName.KV, keys=["page"])],
         )
 
         assert future is not None
@@ -264,7 +267,7 @@ class TestMooncakePrefetch(CustomTestCase):
         )
         ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
         with patch.object(linker, "record_transfer_ready", return_value=ready):
-            return linker.prefetch([transfer])
+            return linker.prefetch("rid", [transfer])
 
     def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
         """Neither publication nor reset may overtake the final device write."""
@@ -361,12 +364,12 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         backend.lookup_futures = []
         backend.prefetch_futures = []
 
-        def submit_lookup(rid, transfers):
+        def submit_lookup(rid, key, device_hit_len, transfers):
             future = Future()
             backend.lookup_futures.append(future)
             return future
 
-        def submit(transfers):
+        def submit(rid, transfers):
             future = Future()
             backend.prefetch_futures.append(future)
             return future
@@ -487,7 +490,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 for request in requests:
                     self._enqueue(cache, request)
                 transfers = [
-                    {t.name: t for t in submitted.args[0]}
+                    {t.name: t for t in submitted.args[1]}
                     for submitted in backend.prefetch.call_args_list
                 ]
                 if mamba:
@@ -672,7 +675,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             self._enqueue(cache, req)
             assert backend.prefetch_futures[-1].set_running_or_notify_cancel()
         first, second, third = backend.prefetch_futures
-        new_slots = backend.prefetch.call_args.args[0][0].device_indices.clone()
+        new_slots = backend.prefetch.call_args.args[1][0].device_indices.clone()
         anchor = old.last_node
         cache.linker.release_request(old.cache_request_handle)
         cache.linker.check_prefetch_events()
@@ -852,7 +855,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def _clone_transfers(cls, transfers):
         return [cls._clone_transfer(transfer) for transfer in transfers]
 
-    def lookup(self, rid, transfers):
+    def lookup(self, rid, key, device_hit_len, transfers):
         transfers = self._clone_transfers(transfers)
         self.lookup_calls.append((rid, transfers))
         by_pool = {transfer.name: transfer for transfer in transfers}
@@ -884,7 +887,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.queued_loads[rid] = self._clone_transfers(transfers)
         return True
 
-    def prefetch(self, transfers):
+    def prefetch(self, rid, transfers):
         return None
 
     def start_layer_wise_loading(self):
@@ -902,7 +905,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers, session_id=None):
+    def offload(self, node_id, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
@@ -2371,7 +2374,7 @@ class TestTransferReadyEvents(CustomTestCase):
                     linker.pool_group = SimpleNamespace(
                         resolve_transfers=lambda *args, **kwargs: ["transfer"]
                     )
-                    completion = linker.prefetch(["transfer"])
+                    completion = linker.prefetch("rid", ["transfer"])
                 else:
                     self.assertEqual(linker.start_layer_wise_loading(), 3)
                 linker.load_queue.put(None)

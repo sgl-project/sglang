@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
 )
@@ -52,7 +53,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         server_args,
         params: CacheInitParams,
         *,
-        components,
+        cache,
         extra_config=None,
         storage=None,
         forward_stream=None,
@@ -64,7 +65,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             kvcache=kvcache,
             page_size=self.page_size,
             params=params,
-            components=components,
+            components=set(cache.components),
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
@@ -146,7 +147,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.lookup_queue: Queue[
-            tuple[Future[list[int]], str, list[PoolTransfer]] | None
+            tuple[Future[list[int]], str, RadixKey, int, list[PoolTransfer]] | None
         ] = Queue()
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object]
@@ -195,7 +196,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self,
+        rid,
+        _key,
+        _device_hit_len,
+        transfers: list[PoolTransfer],
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -216,12 +223,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def submit_lookup(
-        self, rid: str, transfers: list[PoolTransfer]
+        self,
+        rid: str,
+        key: RadixKey,
+        device_hit_len: int,
+        transfers: list[PoolTransfer],
     ) -> Future[list[int]] | None:
         if self.lookup_thread is None or not self.lookup_thread.is_alive():
             return None
         future = Future()
-        self.lookup_queue.put((future, rid, list(transfers)))
+        self.lookup_queue.put((future, rid, key, device_hit_len, list(transfers)))
         return future
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -238,7 +249,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
-    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+    def prefetch(self, _rid: str, transfers: list[PoolTransfer]) -> Future[bool] | None:
         if self.load_mode != "prefetch" or not self.load_thread.is_alive():
             return None
         expanded = self.pool_group.resolve_transfers(
@@ -384,11 +395,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                future, rid, transfers = task
+                future, rid, key, device_hit_len, transfers = task
                 if not future.set_running_or_notify_cancel():
                     continue
                 try:
-                    future.set_result(self.lookup(rid, transfers))
+                    future.set_result(self.lookup(rid, key, device_hit_len, transfers))
                 except BaseException as error:
                     future.set_exception(error)
             finally:
@@ -459,7 +470,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        _node_id: int,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
     ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
