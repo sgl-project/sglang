@@ -15,6 +15,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.weight_versions import (
@@ -199,6 +202,7 @@ def test_held_responses_do_not_change_idle_state():
     # Only the output rank holds responses under TP; cache flush and memory
     # release must still see the same idle state on every rank.
     scheduler = _scheduler()
+    scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
     scheduler._engine_paused = False
     scheduler.enable_overlap = False
     scheduler.last_batch = None

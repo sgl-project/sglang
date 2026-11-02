@@ -503,6 +503,25 @@ class SchedulerInvariantChecker:
             chunked_req=self.get_chunked_req(),
         )
 
+    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
+        the requests it was launched with."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        launched = batch.launched_reqs or ()
+        if len(batch.reqs) != len(launched) or any(
+            req is not launched_req for req, launched_req in zip(batch.reqs, launched)
+        ):
+            raise RuntimeError(
+                f"Step processed with requests {[req.rid for req in batch.reqs]}, "
+                f"launched with {[req.rid for req in launched]}"
+            )
+        uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
+        if uncounted:
+            raise RuntimeError(
+                f"Requests processed by a step they were not launched in: {uncounted}"
+            )
+
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
             return

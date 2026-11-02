@@ -522,6 +522,9 @@ class SchedulerPPMixin:
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
+                    else:
+                        # No result to process, but its launch was counted.
+                        self._on_step_processed(self.mbs[next_mb_id])
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:

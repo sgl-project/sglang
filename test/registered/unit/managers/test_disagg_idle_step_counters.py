@@ -227,6 +227,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         batches[:2] + [None] * idle_iterations + batches[2:] + [None]
                     )
                 scheduler = self.make_scheduler(schedule)
+                scheduler.scripted_scheduler_hook = None
                 scheduler.future_map = None
                 scheduler.result_queue = deque()
                 scheduler._prepare_mlx_launch = MethodType(
@@ -237,9 +238,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 )
                 scheduler._mlx_batch_chain_safe = MethodType(
                     mixin._mlx_batch_chain_safe, scheduler
-                )
-                scheduler.profiler_manager = SimpleNamespace(
-                    _profile_batch_predicate=Mock()
                 )
                 launch = SimpleNamespace(
                     mode="decode" if chained else "extend",
@@ -258,7 +256,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         return_value=SimpleNamespace(mlx_enable_sampling=False),
                     ),
                     patch.object(
-                        module.time, "monotonic", side_effect=LAUNCH_TIMESTAMPS
+                        scheduler_module.time,
+                        "monotonic",
+                        side_effect=LAUNCH_TIMESTAMPS,
                     ),
                 ):
                     self.run_and_check(
@@ -426,7 +426,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
-            reqs=[SimpleNamespace(rid="request", finished=Mock(return_value=False))],
+            reqs=[
+                SimpleNamespace(
+                    rid="request", finished=Mock(return_value=False), inflight_steps=0
+                )
+            ],
             forward_mode=mode,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             launch_ts=launch_ts,
@@ -556,6 +560,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
+        scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6
@@ -591,7 +596,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.get_next_disagg_decode_batch_to_run = next_plan
         scheduler.get_next_batch_to_run = next_plan
         scheduler.get_new_batch_prefill = next_plan
-        scheduler.is_disable_overlap_for_batch = Mock(return_value=False)
+        scheduler.should_process_last_batch_early = Mock(return_value=False)
         scheduler._war_barrier_is_coarse = Mock(return_value=True)
         scheduler._apply_war_barrier = Mock()
         scheduler.process_disagg_prefill_inflight_queue = Mock()

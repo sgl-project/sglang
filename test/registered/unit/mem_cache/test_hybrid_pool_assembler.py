@@ -56,10 +56,15 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MambaPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
+)
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -86,6 +91,107 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
 
 
 class TestHybridStageLayerMappings(CustomTestCase):
+    def test_minimax_rejects_unrestorable_modes_before_host_allocation(self):
+        for pp_size, index_kv_pool, error, message in (
+            (2, None, NotImplementedError, "pipeline parallelism"),
+            (1, object(), ValueError, "value-bearing"),
+        ):
+            with (
+                self.subTest(pp_size=pp_size),
+                patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,
+                self.assertRaisesRegex(error, message),
+            ):
+                try:
+                    hybrid_pool_assembler.build_minimax_sparse_hicache_stack(
+                        params=SimpleNamespace(pp_size=pp_size),
+                        sparse_pool=SimpleNamespace(index_kv_pool=index_kv_pool),
+                        load_cache_event=None,
+                        storage_backend=None,
+                    )
+                finally:
+                    allocate.assert_not_called()
+
+    def test_minimax_routes_index_layers_from_buffer_info(self):
+        """Sparse model layers must map to compact host rows without a second map."""
+        for start_layer in (0, 4):
+            with self.subTest(start_layer=start_layer):
+                pool = MiniMaxSparseKVPool(
+                    size=8,
+                    page_size=4,
+                    dtype=torch.float32,
+                    head_num=1,
+                    head_dim=2,
+                    idx_head_dim=3,
+                    dense_layer_ids=[start_layer, start_layer + 2],
+                    sparse_layer_ids=[start_layer + 1, start_layer + 3],
+                    disable_value_sparse_layer_ids=[start_layer + 1, start_layer + 3],
+                    device="cpu",
+                    start_layer=start_layer,
+                    end_layer=start_layer + 4,
+                )
+                del pool.index_k_layer_id_mapping
+                host = MHATokenToKVPoolHost(
+                    buffer_info=pool.main_pool.get_device_pool_infos()[0].buffer_info,
+                    device_capacity_tokens=pool.main_pool.size,
+                    start_layer=pool.main_pool.start_layer,
+                    end_layer=pool.main_pool.end_layer,
+                    write_back_staging=pool.main_pool.hicache_write_back_staging,
+                    host_to_device_ratio=2,
+                    host_size=0,
+                    page_size=4,
+                    layout="layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                )
+                self.addCleanup(host.destroy)
+                params = SimpleNamespace(
+                    pp_size=1,
+                    page_size=4,
+                    token_to_kv_pool_allocator=None,
+                    tp_cache_group=None,
+                    attn_cp_cache_group=None,
+                    attn_tp_cache_group=None,
+                    pp_cache_group=None,
+                )
+                with (
+                    patch.object(
+                        hybrid_pool_assembler, "build_kv_host_pool", return_value=host
+                    ),
+                    patch.object(
+                        hybrid_pool_assembler,
+                        "MHATokenToKOnlyPoolHost",
+                        partial(
+                            MHATokenToKOnlyPoolHost, pin_memory=False, device="cpu"
+                        ),
+                    ),
+                    patch.object(
+                        hybrid_pool_assembler,
+                        "_get_allocator_type",
+                        return_value="default",
+                    ),
+                    patch.object(hybrid_pool_assembler, "get_memory") as memory,
+                    patch.object(hybrid_pool_assembler, "HybridCacheController"),
+                ):
+                    memory.return_value = SimpleNamespace(
+                        hicache_mem_layout="layer_first",
+                        hicache_write_policy="write_through",
+                        hicache_io_backend="kernel",
+                        hicache_size=0,
+                    )
+                    group, _ = hybrid_pool_assembler.build_minimax_sparse_hicache_stack(
+                        params=params,
+                        sparse_pool=pool,
+                        load_cache_event=None,
+                        storage_backend=None,
+                    )
+                index_entry = group.get_entry(PoolName.INDEXER)
+                self.addCleanup(index_entry.host_pool.destroy)
+                self.assertEqual(
+                    [index_entry.layer_mapper(layer) for layer in range(4)],
+                    [None, 0, None, 1],
+                )
+                self.assertEqual(index_entry.host_pool.layer_num, 2)
+
     def test_strategies_pass_stage_local_maps_without_changing_device_maps(self):
         """Later pipeline stages must transfer every layer before signaling completion."""
         cases = [
@@ -382,7 +488,12 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800, start_layer=0)
+        draft_kv_pool = SimpleNamespace(
+            layer_num=1,
+            size=800,
+            start_layer=0,
+            get_device_pool_infos=lambda: (SimpleNamespace(buffer_info=object()),),
+        )
         draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
@@ -474,12 +585,16 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             seen["mapping"] = config.device_to_host_layer
             return SimpleNamespace(layer_num=1)
 
+        infos = draft_kv_pool.get_device_pool_infos()
         with (
+            patch.object(
+                draft_kv_pool, "get_device_pool_infos", return_value=infos
+            ) as provider,
             patch.object(
                 hybrid_pool_assembler,
                 "_build_mha_mla_host_pool",
                 return_value=draft_host_pool,
-            ),
+            ) as primary_builder,
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
@@ -491,6 +606,17 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 draft_kv_pool=draft_kv_pool,
                 tree_cache=tree_cache,
             )
+            self.assertEqual(provider.call_count, 1)
+            self.assertIs(
+                primary_builder.call_args.kwargs["buffer_info"], infos[0].buffer_info
+            )
+            primary_builder.reset_mock()
+            provider.return_value = (infos[0], infos[0])
+            with self.assertRaisesRegex(ValueError, "duplicate device pool names"):
+                build_full_draft_pools(
+                    draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+                )
+            primary_builder.assert_not_called()
 
         self.assertEqual(seen["mapping"], {0: 0})
         self.assertEqual(specs[1], SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
