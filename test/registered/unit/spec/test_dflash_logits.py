@@ -212,6 +212,66 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
+@pytest.mark.parametrize("has_own_lm_head,expected_token", [(False, 0), (True, 2)])
+def test_sampling_head_selects_the_checkpoint_vocabulary(
+    has_own_lm_head, expected_token
+):
+    from sglang.srt.lora.layers import BaseLayerWithLoRA
+    from sglang.srt.speculative.dflash_worker_v2 import _resolve_dflash_sampling_head
+
+    target_head = torch.nn.Linear(2, 3, bias=False)
+    draft_head = torch.nn.Linear(2, 3, bias=False)
+    with torch.no_grad():
+        target_head.weight.copy_(torch.tensor([[3.0, 0.0], [0.0, 0.0], [-3.0, 0.0]]))
+        draft_head.weight.copy_(torch.tensor([[-3.0, 0.0], [0.0, 0.0], [3.0, 0.0]]))
+    head = _resolve_dflash_sampling_head(
+        SimpleNamespace(own_lm_head=draft_head),
+        SimpleNamespace(lm_head=BaseLayerWithLoRA(target_head, lora_backend=None)),
+        has_own_lm_head=has_own_lm_head,
+        draft_tp_size=2,
+    )
+    if not has_own_lm_head:
+        assert head is target_head
+    tokens = torch.argmax(
+        torch.nn.functional.linear(torch.tensor([[1.0, 0.0]]), head.weight), dim=-1
+    )
+    assert tokens.tolist() == [expected_token]
+
+
+@pytest.mark.parametrize("weight_name", ["weight", "qweight"])
+def test_quantized_draft_head_is_rejected_before_tp_sampling(weight_name):
+    from sglang.srt.speculative.dflash_worker_v2 import _resolve_dflash_sampling_head
+
+    head = torch.nn.Module()
+    head.register_parameter(
+        weight_name,
+        torch.nn.Parameter(torch.zeros(3, 2, dtype=torch.uint8), requires_grad=False),
+    )
+    draft = SimpleNamespace(own_lm_head=head)
+    target = SimpleNamespace(lm_head=torch.nn.Linear(2, 3, bias=False))
+    assert (
+        _resolve_dflash_sampling_head(
+            draft, target, has_own_lm_head=True, draft_tp_size=1
+        )
+        is head
+    )
+    with pytest.raises(
+        ValueError, match="quantized draft lm_head.*draft_tp_size=1.*draft_tp_size=2"
+    ):
+        _resolve_dflash_sampling_head(
+            draft, target, has_own_lm_head=True, draft_tp_size=2
+        )
+
+
+def test_sampling_head_requires_the_target_interface_when_borrowed():
+    from sglang.srt.speculative.dflash_worker_v2 import _resolve_dflash_sampling_head
+
+    with pytest.raises(AttributeError, match="lm_head"):
+        _resolve_dflash_sampling_head(
+            SimpleNamespace(), SimpleNamespace(), has_own_lm_head=False, draft_tp_size=1
+        )
+
+
 def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     """The pre-capture screen decides whether a quantized head reaches the
     graph-folded selector sampler or silently degrades to the eager per-round

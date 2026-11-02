@@ -231,6 +231,25 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
     return target_model.get_input_embeddings()
 
 
+def _resolve_dflash_sampling_head(
+    draft_model, target_model, *, has_own_lm_head: bool, draft_tp_size: int
+):
+    if not has_own_lm_head:
+        return unwrap_lora_layer(target_model.lm_head)
+
+    lm_head = draft_model.own_lm_head
+    if lm_head is None:
+        raise ValueError("DFLASH drafter declares an lm_head but has no loaded head.")
+    if draft_tp_size != 1:
+        weight = dict(lm_head.named_parameters(recurse=False)).get("weight")
+        if not is_dense_head_weight(weight):
+            raise ValueError(
+                "DFLASH with a quantized draft lm_head is only supported at "
+                f"draft_tp_size=1, got draft_tp_size={draft_tp_size}."
+            )
+    return lm_head
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -452,12 +471,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if draft_config.has_own_lm_head:
-            self._sampling_lm_head = self.draft_model.own_lm_head
-        else:
-            self._sampling_lm_head = unwrap_lora_layer(
-                getattr(target_worker.model_runner.model, "lm_head", None)
-            )
+        self._sampling_lm_head = _resolve_dflash_sampling_head(
+            self.draft_model,
+            target_worker.model_runner.model,
+            has_own_lm_head=draft_config.has_own_lm_head,
+            draft_tp_size=self.draft_parallel_layout.attn_tp_size,
+        )
         self._is_domino = draft_config.is_domino
         if get_parallel().attn_dp_enabled and not _is_npu:
             if self._is_domino or self.lilicorr is not None:
@@ -1574,7 +1593,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         chunk_size: int,
     ) -> torch.Tensor:
-        """Greedy argmax over a target LM head that has no dense ``weight``.
+        """Greedy argmax over a sampling LM head that has no dense ``weight``.
 
         A GGUF head stores packed ``qweight`` plus a type tag, so the dense path's
         ``weight[:num_org]`` slicing has nothing to slice. Logits come from the
@@ -1585,7 +1604,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         tp_size = int(get_parallel().tp_group.world_size)
         if tp_size != 1:
             raise RuntimeError(
-                "DFLASH with a quantized target lm_head is only supported at "
+                "DFLASH with a quantized sampling lm_head is only supported at "
                 f"tp=1, got tp_size={tp_size}."
             )
 
@@ -1610,7 +1629,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         chunk_size: int = 256,
     ) -> torch.Tensor:
-        """Greedy argmax over the target LM head in a TP-safe way.
+        """Greedy argmax over the sampling LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
