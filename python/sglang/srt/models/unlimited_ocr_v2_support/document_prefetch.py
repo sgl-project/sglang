@@ -266,6 +266,10 @@ class DocPrefetch:
         """Follow-up windows held off the waiting queue."""
         return len(self._parked) + len(self._released)
 
+    def held_reqs(self) -> List[Req]:
+        """Follow-up windows held off the waiting queue, parked then released."""
+        return [*self._parked.values(), *self._released]
+
     def release_early(self, rid: str) -> None:
         """Free a window's early embeddings once it no longer needs them."""
         if self._early is not None:
