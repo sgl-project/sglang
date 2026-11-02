@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::core::HealthStatus;
-use crate::api_server::handlers::{CoreHandle, HiCacheManager};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -151,6 +151,9 @@ impl SglangService for GrpcService {
             Ok(HealthStatus::Stalled) => Err(Status::unavailable(
                 "no scheduler output within the health-check timeout",
             )),
+            Ok(HealthStatus::Draining) => {
+                Err(Status::unavailable("server is draining before shutdown"))
+            }
             Err(error) => Err(native_api::status(error)),
         }
     }
@@ -257,9 +260,10 @@ impl SglangService for GrpcService {
             ));
         }
         Ok(Response::new(api::AbortResponse {
-            success: self
-                .core
-                .abort((!request.abort_all).then_some(request.rid.as_str())),
+            success: self.core.abort(
+                (!request.abort_all).then_some(request.rid.as_str()),
+                AbortEnding::CancelledError,
+            ),
         }))
     }
 }

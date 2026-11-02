@@ -5,14 +5,10 @@ Same distilled Cosmos3 Omni checkpoint layout as Cosmos-Dreams, with a
 ``control_video`` conditioning contract instead of an action contract.
 """
 
-import os
 from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CONTROL_VIDEO_CONDITIONING_MODE,
-    HISTORY_MODE_AUTO,
-    HISTORY_MODE_FULL,
-    HISTORY_MODE_SLIDING,
     TRANSFER_RESIZE_DIRECT,
     TRANSFER_RESIZE_MODES,
     CosmosDreamsManifest,
@@ -22,6 +18,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
+    resolve_history_mode,
 )
 
 
@@ -43,11 +40,6 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
                 "the action pipelines only."
             )
         self.transfer_history_profile(manifest)
-
-    # "auto" follows the export's training config: the reference slides only when
-    # kv_cache_inference_size was set (Sim-Transfer: 51 frames, 1 sink) and keeps the
-    # whole clip otherwise. The artifact's no_eviction flag is an exporter constant.
-    history_mode: str = HISTORY_MODE_AUTO
 
     # How the control clip reaches the trained canvas. The current Hub export
     # (``*_direct_resize_caption_mix*``) trained without reflection padding: full
@@ -82,22 +74,12 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
         ``trained_window`` is ``(kv_cache_inference_size, attention_sink_size)`` of
         the training config; ``None`` reads it from the export's root ``config.json``.
         """
-        mode = self.history_mode
-        if mode == HISTORY_MODE_AUTO:
-            if trained_window is None:
-                trained_window = training_kv_window(self.model_path)
-            window, sink = trained_window
-            if window is None:
-                mode = HISTORY_MODE_FULL
-            else:
-                if (window, sink) != (manifest.window_frames, manifest.sink_frames):
-                    raise ValueError(
-                        "Cosmos-Dreams control_video export disagrees with its training "
-                        f"config: artifact window_frames={manifest.window_frames}, "
-                        f"sink_frames={manifest.sink_frames}; training "
-                        f"kv_cache_inference_size={window}, attention_sink_size={sink}."
-                    )
-                mode = HISTORY_MODE_SLIDING
+        mode = resolve_history_mode(
+            manifest,
+            history_mode=self.history_mode,
+            model_path=self.model_path,
+            trained_window=trained_window,
+        )
         return resolve_transfer_history_profile(manifest, history_mode=mode)
 
     def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
@@ -113,32 +95,6 @@ class CosmosDreamsTransferConfig(CosmosDreamsConfig):
     # The transfer stages tokenize with the Transfer system prompt themselves;
     # recorded here so generic prompt plumbing reports the truth.
     use_system_prompt: bool = True
-
-
-def training_kv_window(model_path: str | None) -> tuple[int | None, int]:
-    """``(kv_cache_inference_size, attention_sink_size)`` from ``model.config`` of the
-    export's root ``config.json`` (the imaginaire4 training config the exporter dumps);
-    ``(None, 0)`` when the export has no such record."""
-    if not model_path:
-        return None, 0
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        load_dict,
-        prepare_diffusers_component_path_for_loading,
-    )
-
-    root = prepare_diffusers_component_path_for_loading(model_path)
-    config_path = os.path.join(root, "config.json")
-    if not os.path.isfile(config_path):
-        return None, 0
-    model_config = load_dict(config_path).get("model", {}).get("config", {})
-    window = model_config.get("kv_cache_inference_size")
-    sink = model_config.get("attention_sink_size", 0) or 0
-    if window is not None and (isinstance(window, bool) or not isinstance(window, int)):
-        raise ValueError(
-            "Cosmos-Dreams training config kv_cache_inference_size must be an int, "
-            f"got {window!r}."
-        )
-    return window, int(sink)
 
 
 def register():

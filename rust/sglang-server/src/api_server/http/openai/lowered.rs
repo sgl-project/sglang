@@ -185,7 +185,7 @@ pub(super) async fn chat(
     let timing = RequestTiming::new();
     let request_states: Vec<RequestState> = requests
         .iter()
-        .map(|request| RequestState::new(state, request, timing.clone()))
+        .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
     let calls: Vec<_> = match state.core.generate_batch(requests).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),

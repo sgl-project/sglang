@@ -43,7 +43,7 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="extra-a", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
