@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.operators.dsv4 import moe_gating_top_k
+from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
