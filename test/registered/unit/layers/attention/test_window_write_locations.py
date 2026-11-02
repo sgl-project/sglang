@@ -183,12 +183,14 @@ def _rail(indptr, indices, bs):
 
 
 def _reads(backend, bs):
+    """The full rail, the rail of the runner's window storage ("window"), and
+    every other window sub-pool's rail by name."""
     meta = backend.forward_metadata
     out = {"full": _rail(meta.kv_indptr, meta.kv_indices, bs)}
-    if meta.window_kv_indptr is not None:
-        out["window"] = _rail(meta.window_kv_indptr, meta.window_kv_indices, bs)
-    for name, rail in sorted((meta.other_windows or {}).items()):
-        out[f"window:{name}"] = _rail(rail.kv_indptr, rail.kv_indices, bs)
+    storage = backend.runner_ids.window_storage
+    for name, rail in sorted(meta.windows.items()):
+        key = "window" if name == storage else f"window:{name}"
+        out[key] = _rail(rail.kv_indptr, rail.kv_indices, bs)
     return out
 
 
