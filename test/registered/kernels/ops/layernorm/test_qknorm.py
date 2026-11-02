@@ -142,5 +142,23 @@ def test_qknorm_packed_qkv(head_dim: int, dtype: torch.dtype) -> None:
     torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
 
 
+def test_apply_qk_norm_empty_batch() -> None:
+    """An idle DP-attention rank passes zero tokens, which cannot be viewed per head."""
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.utils import apply_qk_norm
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy"), role="test")
+    head_dim = 128
+    norm = RMSNorm(head_dim).to(DEVICE, DTYPE)
+    q = torch.empty(0, 32 * head_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.empty(0, 8 * head_dim, device=DEVICE, dtype=DTYPE)
+
+    q_out, k_out = apply_qk_norm(q, k, norm, norm, head_dim)
+
+    assert q_out.shape == q.shape and k_out.shape == k.shape
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
