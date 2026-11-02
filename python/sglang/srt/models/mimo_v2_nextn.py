@@ -20,6 +20,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -39,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
@@ -101,18 +103,14 @@ class MiMoV2MTPLayer(nn.Module):
         self.is_layer_sparse = False
         is_next_layer_sparse = False
 
-        if is_dense_ffn_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
-        else:
-            mlp_tp_rank, mlp_tp_size = None, None
+        mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
         self.mlp = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
+            parallel_group=mlp_parallel_group,
             reduce_results=False,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -312,6 +310,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                         expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
                             self.config
                         ),
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -345,7 +344,12 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 if name in params_dict.keys():
                     param = params_dict[name]
                     if "attention_sink_bias" in name:
-                        start = get_parallel().attn_tp_rank * param.numel()
+                        projection = unwrap_lora_layer(
+                            self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                        )
+                        start = (
+                            get_group_rank_size(projection.tp_group)[0] * param.numel()
+                        )
                         param.data.copy_(loaded_weight[start : start + param.numel()])
                     else:
                         weight_loader = getattr(

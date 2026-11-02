@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import upload_without_sync
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision_override,
@@ -411,11 +412,7 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: (
-                not batch.do_classifier_free_guidance
-                or V.string_not_none(x)
-                or isinstance(x, str)
-            ),
+            lambda x: not batch.do_classifier_free_guidance or isinstance(x, str),
         )
         result.add_check(
             "do_classifier_free_guidance",
@@ -641,7 +638,7 @@ class TextEncodingStage(ConditionEncodingStage):
             )
 
             def encode_conditioning():
-                text_inputs = host_inputs.to(target_device, non_blocking=True)
+                text_inputs = upload_without_sync(host_inputs, target_device)
 
                 input_ids = text_inputs["input_ids"]
                 attention_mask = (

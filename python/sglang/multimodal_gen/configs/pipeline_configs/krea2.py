@@ -6,6 +6,9 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -94,11 +97,11 @@ class Krea2PipelineConfig(ImagePipelineConfig):
             return {"pos": torch.cat([txt_pos, img_pos], dim=1), "mask": None}
 
         pos = torch.cat([txt_pos, img_pos], dim=1)
+        # decided once per request: a mask check in every forward syncs each step
+        if text_mask is None or bool(text_mask.all()):
+            return {"pos": pos, "mask": None}
         img_mask = torch.ones(b, h_tok * w_tok, dtype=torch.bool, device=device)
-        if text_mask is None:
-            txt_mask = torch.ones(b, txt_len, dtype=torch.bool, device=device)
-        else:
-            txt_mask = text_mask.to(device=device).bool()
+        txt_mask = text_mask.to(device=device).bool()
         mask = torch.cat([txt_mask, img_mask], dim=1)
         return {"pos": pos, "mask": mask}
 
@@ -146,16 +149,9 @@ class Krea2PipelineConfig(ImagePipelineConfig):
 
     # --- VAE decode (same as Qwen-Image: latents * std + mean) ---
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        vae_arch = self.vae_config.arch_config
-        scaling_factor = 1.0 / torch.tensor(vae_arch.latents_std, device=device).view(
-            1, vae_arch.z_dim, 1, 1, 1
-        ).to(device, dtype)
-        shift_factor = (
-            torch.tensor(vae_arch.latents_mean)
-            .view(1, vae_arch.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-        return scaling_factor, shift_factor
 
     def post_denoising_loop(self, latents, batch):
         latents, batch_size, channels, height, width = self._unpad_and_unpack_latents(

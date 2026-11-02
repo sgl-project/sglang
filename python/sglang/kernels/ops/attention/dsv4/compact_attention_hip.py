@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import _qkpv_fp8
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -90,6 +89,74 @@ def _read_compact_gluon(
     return (value * scale).to(gl.bfloat16)
 
 
+# Kernel from aiter, which removed it in ROCm/aiter#4919:
+# https://github.com/ROCm/aiter/blob/acf8fdf9307431ece8ee275971c41cb3d1a7020b/aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode_sparse.py#L321-L384
+@gluon.jit
+def _qkpv_fp8(
+    k_nope,
+    k_rope,
+    valid,
+    q_dot,
+    m_i,
+    l_i,
+    acc,
+    head_mask,
+    qk_scale,
+    kv_smem,
+    qk_layout: gl.constexpr,
+    pv_layout: gl.constexpr,
+    k_layout: gl.constexpr,
+    v_layout: gl.constexpr,
+    p_layout: gl.constexpr,
+    NOPE_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    HEAD_ALIGNED: gl.constexpr,
+    UNIFORM: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
+):
+    """Write a prefetched bf16 tile to LDS, then QK -> softmax -> PV. UNIFORM skips
+    the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID, mask the
+    columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
+    neg_inf = float("-inf")
+    kv_smem.store(k_nope)
+    if not UNIFORM:
+        kv_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(k_rope)
+    k = kv_smem.permute([1, 0]).load(k_layout)
+    S = gl.amd.cdna4.mfma(
+        q_dot, k, gl.zeros([BLOCK_M, BLOCK_K], gl.float32, layout=qk_layout)
+    )
+    NEED_MASK: gl.constexpr = HAS_INVALID or (not HEAD_ALIGNED)
+    if NEED_MASK:
+        if HAS_INVALID:
+            col_mask = gl.convert_layout(valid, gl.SliceLayout(0, qk_layout))[None, :]
+            if not HEAD_ALIGNED:
+                col_mask = (
+                    gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
+                    & col_mask
+                )
+        else:
+            col_mask = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[
+                :, None
+            ]
+        S = gl.where(col_mask, S, neg_inf)
+    m_block = gl.max(S, axis=1)
+    m_new = gl.maximum(m_i, m_block)
+    m_new = gl.where(m_new > neg_inf, m_new, 0.0)
+    m_new_s = m_new * qk_scale
+    p = gl.exp2(S * qk_scale - m_new_s[:, None])
+    alpha = gl.exp2(m_i * qk_scale - m_new_s)
+    l_new = l_i * alpha + gl.sum(p, axis=1)
+    v = kv_smem.load(v_layout)
+    p_dot = gl.convert_layout(p.to(gl.bfloat16), p_layout)
+    alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, pv_layout))
+    acc = acc * alpha_pv[:, None]
+    acc = gl.amd.cdna4.mfma(p_dot, v, acc)
+    return m_new, l_new, acc
+
+
 @gluon.jit
 def _compact_qkpv(
     kv,
@@ -105,7 +172,6 @@ def _compact_qkpv(
     BLOCK: gl.constexpr,
     SCALE: gl.constexpr,
 ):
-    # aiter's private helper, by keyword: a renamed or reordered parameter fails to compile
     return _qkpv_fp8(
         k_nope=kv,
         k_rope=kv,

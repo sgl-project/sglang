@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Streaming video / audio input and output helpers of Kandinsky 6 video SR.
+# Frame selection and resize adapted from the Kandinsky 6 SR inference reference
+# (k6_video / sr_core, Apache-2.0).
+"""Bounded-memory SR video/audio I/O, preserving reference frame selection and resize."""
 
-Decoding follows the reference CLI (``read_video_tchw_uint8`` ->
-``resample_to_target_fps`` -> ``clip_to_aligned_frames``) frame for frame, but streams:
-only the frames that survive fps resampling and the 121-frame cap are converted to RGB
-and kept, and decoding stops as soon as the outcome is known.  PyAV is imported lazily
-(it is part of the ``diffusion`` extra).
-"""
+import logging
 
 import msgspec
 import numpy as np
 import torch
+from torch.nn import functional as F
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.video_utils import (
-    MAX_NUM_FRAMES,
-    RESAMPLE_FPS_TOLERANCE,
-    TARGET_FPS,
-    clip_to_aligned_frames,
+from sglang.multimodal_gen.configs.sample.kandinsky6_sr_resolution import (
+    ASPECT_MISMATCH_TOLERANCE,
 )
 
+logger = logging.getLogger(__name__)
+# trained on 5 s at 24 fps; select at most 121 frames, aligned to 1+8k
+TARGET_FPS = 24
+MAX_NUM_FRAMES = 121
+RESAMPLE_FPS_TOLERANCE = 1.5
 SOURCE_AUDIO_SAMPLE_RATE = 44100
 OUTPUT_FRAME_CHUNK = 8
 
@@ -32,16 +32,10 @@ class DecodedClip(msgspec.Struct, frozen=True):
 
 
 class FrameSelector:
-    """Streaming form of ``resample_to_target_fps`` + the first-121-frames cap.
+    """Stream reference indices round(i*step), capped at int(total/step) and max_frames.
 
-    Feed source frames in order: :meth:`keep` says whether frame ``index`` is one of the
-    selected ones (call :meth:`mark_kept` for each), :meth:`enough` says when no further
-    frame can change the result, and :meth:`limit` trims the selection once the source
-    length is known.  For a source faster than the target the selected indices are
-    ``round(i * step)``, ``step = source_fps / target_fps``, of which there are
-    ``int(total / step)`` (those below ``total``), exactly as in the reference;
-    otherwise every frame is selected.
-    """
+    In-tolerance and slower sources keep every frame. Stop only once the source
+    length guarantees that no retained frame will be trimmed by limit()."""
 
     def __init__(
         self,
@@ -116,9 +110,9 @@ def decode_clip(
     kept = selector.limit(seen, len(frames))
     if kept == 0:
         raise ValueError(f"Video {path} has no readable frames.")
-    video = torch.stack(frames[:kept]).contiguous()
+    kept = 1 + 8 * ((kept - 1) // 8)
     return DecodedClip(
-        frames=clip_to_aligned_frames(video, max_frames),
+        frames=torch.stack(frames[:kept]).contiguous(),
         fps=selector.effective_fps,
         source_fps=source_fps,
     )
@@ -187,4 +181,49 @@ def to_output_video(video: torch.Tensor) -> torch.Tensor:
         out[0, :, start : start + OUTPUT_FRAME_CHUNK] = (
             (chunk.float() + 0.5) / 255.0
         ).to(torch.float16)
+    return out
+
+
+def resize_to_target(video: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+    """Downscale [C, T, H, W] uint8 video in bounded-memory chunks, without cropping."""
+    channels, frames, height, width = video.shape
+    target_h, target_w = target_hw
+    if (height, width) == (target_h, target_w):
+        return video
+    if target_h > height or target_w > width:
+        raise ValueError(
+            f"target {target_w}x{target_h} exceeds the SR result {width}x{height}; "
+            "pick a lower tier or a higher --resolution-scale for this source."
+        )
+    source_ratio, target_ratio = width / height, target_w / target_h
+    if abs(source_ratio - target_ratio) / target_ratio > ASPECT_MISMATCH_TOLERANCE:
+        logger.warning(
+            "Aspect mismatch: SR %sx%s is %.3f, target %sx%s is %.3f; resizing "
+            "anisotropically (no crop), the picture will be squeezed by %.1f%%.",
+            width,
+            height,
+            source_ratio,
+            target_w,
+            target_h,
+            target_ratio,
+            abs(source_ratio / target_ratio - 1) * 100,
+        )
+    out = torch.empty((channels, frames, target_h, target_w), dtype=torch.uint8)
+    for start in range(0, frames, OUTPUT_FRAME_CHUNK):
+        chunk = video[:, start : start + OUTPUT_FRAME_CHUNK].permute(1, 0, 2, 3).float()
+        resized = F.interpolate(
+            chunk, size=target_hw, mode="bilinear", antialias=True, align_corners=False
+        )
+        out[:, start : start + OUTPUT_FRAME_CHUNK] = (
+            resized.clamp(0, 255).round().to(torch.uint8).permute(1, 0, 2, 3)
+        )
+    logger.info(
+        "Final output: %sx%s -> %sx%s (downscale x%.2f / x%.2f)",
+        width,
+        height,
+        target_w,
+        target_h,
+        width / target_w,
+        height / target_h,
+    )
     return out

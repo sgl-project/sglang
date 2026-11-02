@@ -38,6 +38,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -263,20 +264,34 @@ class Glm4DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            post_self_attn_layernorm=self.post_self_attn_layernorm,
+            post_mlp_layernorm=self.post_mlp_layernorm,
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    output_transform=OutputTransform(self.post_self_attn_layernorm)
-                ),
-                self.input_layernorm,
-            ),
-            (
-                declare_ffn(
-                    sparse=False,
-                    next_layer_sparse=False,
-                    output_transform=OutputTransform(self.post_mlp_layernorm),
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(
+        config: Glm4Config,
+        layer_id: int,
+        *,
+        post_self_attn_layernorm=None,
+        post_mlp_layernorm=None,
+    ):
+        """The stages a GLM-4 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). Its output norms are the output transforms."""
+        return (
+            declare_attn(output_transform=OutputTransform(post_self_attn_layernorm)),
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
+                output_transform=OutputTransform(post_mlp_layernorm),
             ),
         )
 
@@ -318,6 +333,7 @@ class Glm4Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -342,6 +358,7 @@ class Glm4Model(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -399,8 +416,7 @@ class Glm4Model(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -508,46 +524,6 @@ class Glm4ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

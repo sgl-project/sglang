@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import Any, Callable, Dict, List, Sequence, TypeVar
 
@@ -23,6 +24,16 @@ def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
     if should_run_full_tests():
         return full_range
     return ci_range if is_in_ci() else full_range
+
+
+_NO_GUARD = contextlib.nullcontext()
+
+
+def device_guard(t: torch.Tensor) -> contextlib.AbstractContextManager:
+    """``torch.cuda.device(t.device)``, skipped when ``t`` is already on the current device."""
+    if t.get_device() == torch.cuda.current_device():
+        return _NO_GUARD
+    return torch.cuda.device(t.device)
 
 
 def cache_once(fn: F) -> F:
@@ -59,6 +70,13 @@ def is_hip_runtime() -> bool:
 @cache_once
 def is_musa_runtime() -> bool:
     return getattr(torch.version, "musa", None) is not None
+
+
+@cache_once
+def is_sail_runtime() -> bool:
+    # T-HEAD SAIL device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_sail so all layers agree on what "running on SAIL" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
 
 
 _REGISTERED_CLASSES: Dict[type, type] = {}

@@ -1,6 +1,8 @@
 /// Index-K write of `fp4_indexer_rope.cuh` into the split FlyDSL layout: payload `[npages, 1, 4, kPageSize, 16]`
 /// (chunk `c` holds elements `[32c, 32c + 32)`) and ue8m0 exponents `[npages, 1, 4, kPageSize]` with
 /// the slot axis transposed as a 16 x 4 tile -- the bytes `store_fp4_index_k_cache_split` writes.
+/// With kPage8 the same bytes of a page hold eight 8-slot pages in aiter's row-group layout
+/// (`pack_kv_cache(page_size=8)`): payload `[8, 4 (t % 4), 4 (chunk), 2 (t / 4), 16]`, scales `[8, 4, 8]`.
 
 #pragma once
 
@@ -24,7 +26,14 @@ struct IndexKSplitParams {
   float eps;
 };
 
-template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, typename PosT>
+template <
+    bool kUsePDL,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    uint32_t kRatio,
+    bool kPage8,
+    typename PosT>
 __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_k_split_kernel(
     const IndexKSplitParams params) {
   using namespace device;
@@ -75,6 +84,23 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void fla
 
   // slot 0 is reserved: padded graph rows and, at ratio > 1, rows completing no group publish nothing
   if (slot_id <= 0) return;
+  if constexpr (kPage8) {
+    constexpr int64_t kP8 = 8;
+    const auto page8 = slot_id / kP8;
+    const auto t = slot_id % kP8;
+    // payload [t % 4][chunk][t / 4][16 B] and scales [chunk][t] of the slot's 8-slot page
+    const auto payload_ptr = params.payload + page8 * (kP8 * kHeadDim / 2) + (t / 4) * 16;
+    const auto chunk_row = (t % 4) * 4;
+    payload_ptr[(chunk_row + lane / 16) * 32 + lane % 16] = static_cast<uint8_t>(packed.payload[0]);
+    payload_ptr[(chunk_row + 2 + lane / 16) * 32 + lane % 16] = static_cast<uint8_t>(packed.payload[1]);
+    if (lane % (kWarpThreads / 2) == 0) {
+      const auto scale_ptr = params.scale + page8 * (kP8 * kHeadDim / 32) + t;
+      const auto first = lane / (kWarpThreads / 2);
+      scale_ptr[first * kP8] = static_cast<uint8_t>(packed.exponent[0]);
+      scale_ptr[(2 + first) * kP8] = static_cast<uint8_t>(packed.exponent[1]);
+    }
+    return;
+  }
   const auto page = slot_id / kPageSize;
   const auto slot = slot_id % kPageSize;
 
@@ -94,12 +120,13 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void fla
 }
 
 /// \brief Host side of `flash_index_k_split_kernel`.
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kUsePDL>
+template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kPage8, bool kUsePDL>
 struct FlashIndexKSplitKernel {
   static constexpr uint32_t kBlockSize = kFp4RopeWarpsPerCTA * device::kWarpThreads;
 
   template <typename PosT>
-  static constexpr auto kernel = flash_index_k_split_kernel<kUsePDL, kHeadDim, kRopeDim, kPageSize, kRatio, PosT>;
+  static constexpr auto kernel =
+      flash_index_k_split_kernel<kUsePDL, kHeadDim, kRopeDim, kPageSize, kRatio, kPage8, PosT>;
 
   /// `IndexKKernel::run_index_k`'s arguments, the cache replaced by
   /// \param payload `[npages, 1, 4, kPageSize, 16]` uint8 (the pool's

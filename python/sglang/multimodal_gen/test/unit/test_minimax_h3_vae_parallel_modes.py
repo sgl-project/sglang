@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -14,9 +15,16 @@ import torch.nn as nn
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae.audio_vae import (
     CausalAttention,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+    _attn_fast_compatible,
+    _fused_qknorm_rope,
+    _install_fast_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
@@ -25,13 +33,27 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention im
     Attention,
     _apply_qk_norm,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+    RotaryEmbeddingND,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
     ViT3DDecoder,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
     apply_rotary_pos_emb_qk,
+    create_token_ids,
+    prepare_rotary_pos_emb,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+
+# torch.cuda.is_available() is also true on ROCm, where these JIT/Triton
+# kernels do not compile; gate on the platform instead.
+requires_cuda = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="fused VAE kernels need CUDA"
+)
 
 
 def _init_kwargs(config: MiniMaxH3VideoVAEConfig):
@@ -95,6 +117,77 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
     output = _apply_qk_norm(norm, hidden_states)
 
     assert output.shape == hidden_states.shape
+
+
+@requires_cuda
+def test_vit_fast_path_is_gated_and_matches_reference():
+    """Gate closed: bit-identical to the original forward. Gate open: the fused
+    qk-norm+RoPE kernel and cuDNN SDPA run and match to rounding level."""
+    device = torch.device("cuda")
+    dtype = torch.float16
+    heads, dim_head, rope_dim = 4, 64, 48
+    attention = Attention(
+        heads=heads, dim_head=dim_head, qk_norm_type="rms_norm", eps=1e-5
+    ).to(device=device, dtype=dtype)
+    assert _attn_fast_compatible(attention)
+
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
+    ids = create_token_ids((2, 4, 4), device, dtype)
+    ids = torch.cat([ids, torch.zeros((1, 5, 3), device=device, dtype=dtype)], 1)
+    rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    hidden = torch.randn((1, ids.shape[1], heads * dim_head), generator=generator)
+    hidden = hidden.to(device=device, dtype=dtype)
+
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=dtype),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
+        reference = attention(hidden, rotary)
+        gate = VaeFastPathGate()
+        _install_fast_attention([attention], gate)
+        assert torch.equal(attention(hidden, rotary), reference)
+        gate.enabled = True
+        fused = attention(hidden, rotary)
+    assert attention._sgl_unit_weight is not None, "fused qk-norm+RoPE did not run"
+    assert attention._sgl_cudnn_failed is False, "cuDNN SDPA fell back"
+    torch.testing.assert_close(fused, reference, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
+def test_vit_rope_batched_tiles_match_per_tile():
+    """Stacked decoder tiles share one RoPE row; the fused (quality) and native
+    (exact) RoPE kernels over the flattened batch are bit-identical to one
+    tile at a time."""
+    device, dtype = torch.device("cuda"), torch.float16
+    tiles, heads, dim_head, rope_dim = 3, 4, 64, 48
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
+    ids = create_token_ids((2, 4, 4), device, dtype)
+    rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
+    batched_rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype, batch=tiles)
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    qkv = torch.randn(
+        (tiles, ids.shape[1], heads, 3 * dim_head), generator=generator
+    ).to(device=device, dtype=dtype)
+    attn = SimpleNamespace(
+        dim_head=dim_head, _sgl_unit_weight=None, norm_q=SimpleNamespace(eps=1e-5)
+    )
+
+    per_tile = qkv.clone()
+    for tile in range(tiles):
+        query, key, _ = per_tile[tile : tile + 1].chunk(3, dim=-1)
+        assert _fused_qknorm_rope(attn, query, key, rotary)
+    query, key, _ = qkv.chunk(3, dim=-1)
+    assert _fused_qknorm_rope(attn, query, key, batched_rotary)
+    assert torch.equal(qkv, per_tile)
+
+    query, key, _ = qkv.chunk(3, dim=-1)
+    batched = apply_rotary_pos_emb_qk(query, key, batched_rotary)
+    for tile in range(tiles):
+        query, key, _ = qkv[tile : tile + 1].chunk(3, dim=-1)
+        for got, want in zip(batched, apply_rotary_pos_emb_qk(query, key, rotary)):
+            assert torch.equal(got[tile : tile + 1], want)
 
 
 def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
@@ -218,7 +311,7 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@requires_cuda
 def test_fused_decoder_matches_unfused_forward():
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
@@ -239,18 +332,12 @@ def test_fused_decoder_matches_unfused_forward():
                 "h3_vae_scale_add_rmsnorm",
                 wraps=diffusion_ops.h3_vae_scale_add_rmsnorm,
             ) as scale_add,
-            mock.patch.object(
-                diffusion_ops,
-                "h3_vae_qk_rmsnorm_rope",
-                wraps=diffusion_ops.h3_vae_qk_rmsnorm_rope,
-            ) as qk_rope,
         ):
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "0"
             eager = decoder(latent)
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "1"
             fused = decoder(latent)
             assert scale_add.call_count == 3
-            assert qk_rope.call_count == 2
     finally:
         if previous is None:
             os.environ.pop("MINIMAX_H3_VAE_DECODER_FUSED_NORM", None)
@@ -258,3 +345,24 @@ def test_fused_decoder_matches_unfused_forward():
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = previous
 
     torch.testing.assert_close(fused, eager, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_fused_decoder_is_disabled_off_nvidia():
+    # On ROCm tensor.is_cuda is true, but the fused Triton norms decoded to NaN
+    # on MI300; the decoder must keep the unfused path there.
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
+    from sglang.kernels.ops import diffusion as diffusion_ops
+
+    vae_dir = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae"
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.float16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        mock.patch.dict(os.environ, {"MINIMAX_H3_VAE_DECODER_FUSED_NORM": "1"}),
+        mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
+        mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
+    ):
+        decoder(latent)
+    scale_add.assert_not_called()

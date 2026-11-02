@@ -23,6 +23,8 @@ src/
     models/        model-specific SGLang code
     legacy/        conversation.py templates
   parser/          engine output -> chat events
+  deepseek_output.rs  DeepSeek-V4 / V4.1 output ids -> reasoning, content, tool calls
+  openai/          OpenAI requests over /generate
 ```
 
 ## model_files
@@ -57,8 +59,13 @@ setting and picks one per request.
 select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<String>)
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
+ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, Qwen3.8
+ChatFormatter::deepseek_v4(v41, tokenizer_json) -> Result<ChatFormatter, String>
+ChatFormatter::encode_request(serde_json::Value, &default_kwargs) -> Option<Result<Vec<u32>, TemplateError>>  // DeepSeek-V4, V4.1
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
+requested_effort(&body) -> Option<&Value>
+requested_thinking(&body) -> Option<bool>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -67,7 +74,11 @@ native formatters.
 
 | Model | Formatter |
 |---|---|
-| DeepSeek V4, V3.2, Kimi K3, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
+| DeepSeek V4, V4.1 | `models/deepseek_v4.rs` on deepseek-recipe |
+| GLM-5.3, GLM-5.3-Flash | `models/glm53.rs` on the checkpoint's Jinja template, picked by the template |
+| Kimi K3 | `models/kimi_k3.rs` on Dynamo's K3 formatter |
+| Qwen3.8 (Max, 27B, Flash-Next) | `models/qwen38.rs` on the checkpoint's Jinja template, picked by the template |
+| DeepSeek V3.2, Inkling, other Dynamo native models | Dynamo native formatter, with SGLang's thinking defaults |
 | Everything else | `load_chat_formatter` |
 
 `load_chat_formatter` (`loader.rs`) follows Python's `template_manager.py`
@@ -78,17 +89,43 @@ error string is returned so the host can report it per request.
 
 `render_prompt` is pass-through to `OAIPromptFormatter::render_prompt` for
 Jinja and native formatters. It keeps Dynamo's segments so Kimi K3 can encode
-with `encode_segments`. The SGLang additions hook in as follows:
+with `encode_segments`.
+`render_request` takes the SGLang request body, because DeepSeek-V4 and V4.1 read
+`task`, `continue_final_message` and the `reasoning` object, which
+`OAIChatLikeRequest` lacks, and GLM-5.3 and Qwen3.8 build their template context from it as
+SGLang does. It returns the continuation prefix separately, since
+SGLang tokenizes it on its own. `default_kwargs` are the server's
+`--default-chat-template-kwargs`, which apply after the request's own values.
+On a DeepSeek formatter, `render_prompt` rebuilds the body from the trait; on
+Kimi K3 it keeps Dynamo's request semantics, which typed hosts rely on.
+DeepSeek prompts are segmented at their special tokens, and `encode_request`
+encodes them with the checkpoint's `tokenizer.json`, plain text without the
+added vocabulary, as SGLang's recipe path does; `deepseek_v4` lets a host that
+fetches model files itself, such as sgl-router, build the formatter with that
+file. `requested_effort` and
+`requested_thinking` (`reasoning.rs`) port `protocol.py`'s `reasoning` handling
+once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook in as follows:
 
 | Code | Mirrors | Hook |
 |---|---|---|
 | `thinking.rs` | `parser/template_detection.py` | Reads the Jinja template's thinking toggle and its default; `resolve_thinking` writes that default into the kwargs before rendering. |
 | `legacy/` | `parser/conversation.py` | Replaces Dynamo: a native port of `Conversation.get_prompt()`, the built-in templates, and model-path inference. |
-| `models/deepseek_v4.rs` | `entrypoints/openai/chat_encoding.py` | Detects the checkpoint's preview or official effort profile, then maps the request effort onto Dynamo's tier before `DeepSeekV4Formatter`. |
+| `models/deepseek_v4.rs` | `entrypoints/openai/serving_deepseek_recipe.py`, `parser/deepseek_recipe_renderer.py` | Replaces the OAI formatter. It applies SGLang's request semantics (thinking, request and default effort, the env effort, V4.1 numeric budgets, the final assistant turn, `task`, the handler's tool dumps) around deepseek-recipe's Chat Completions conversion and V4 / V4.1 encodings. Media is left to the engine. |
+| `models/pydantic_dump.rs` | `protocol.py` | The message, tool-call and tool dumps that GLM-5.3, Kimi K3 and Qwen3.8 render from. |
+| `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
+| `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
+| `models/qwen38.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `jinja_template_utils.py` | Picked by the template. Builds the template context SGLang builds (message, tool and tool-call dumps, content as the template's content format takes it, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter. A later system turn fails as the template makes it fail, where Dynamo would demote it. Media, a `chat_template` kwarg, and text or numbers that Python's `trim` or `json.dumps` treat unlike Dynamo's are left to the engine. |
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
+
+**Parity.** Each `tests/fixtures/parity/<model>.json` holds requests that
+SGLang's Python serving path rendered and tokenized, written by
+`tests/scripts/generate_parity.py`. `tests/parity.rs` checks every fixture. To
+add a model, follow the
+[`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
+skill.
 
 ## parser
 
@@ -96,22 +133,84 @@ formatters have none, as in Python.
 ChatResponseProcessor::new(tool_parser, reasoning_parser, tools, tool_choice, uses_tool_call_structural_tag, parallel_tool_calls, choices)
     .with_reasoning_state(thinking)
     .process_stream(Stream<DecodedChatEvent>) -> Stream<ChatEvent>
+split_reasoning(reasoning_parser, &options, text, token_ids) -> (reasoning, normal)
+ReasoningStreamSplitter::new(reasoning_parser, options).split(text, token_ids)
+tool_constraint(tool_parser, &dynamo_tool_choice(&tool_choice), &tools, parallel_tool_calls)
+    -> Result<Option<ToolConstraint>, ProcessorError>
+tool_call_stream(tool_parser, tool_choice, tools, uses_tool_call_structural_tag, Stream<chunk>) -> Stream<chunk>
+parse_tool_calls(tool_parser, text, tools).await -> Result<(calls, normal), String>
 dynamo_tool_parser_name(sglang_name) -> &str
 ```
 
+`mod.rs` holds the events and the stream processor, `reasoning.rs` the
+reasoning split, and `tools.rs` tool schemas, constraints and call deltas.
+`src/think/models/` and `src/tool_call/models/` list the parser names SGLang
+ports from Python because Dynamo's parsers split them differently; `src/think/`
+is the port of SGLang's `BaseReasoningFormatDetector` they configure and
+`src/tool_call/` of its `BaseFormatDetector`, both free of Dynamo so `openai`
+needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
+`tool_call/models/mod.rs` check them against SGLang's `ReasoningParser` and
+`FunctionCallParser`. To port another model, add `think/models/<model>.rs` or
+`tool_call/models/<model>.rs` and its names in that `models/mod.rs`. A detector
+that overrides the base splitting, as Kimi-K3's does, is its own `ThinkConfig`
+variant. Tool detectors get the request's tools: Qwen3-Coder's types argument
+values by their schemas. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
+`tests/fixtures/openai_parity/kimi-k3.json` checks it byte for byte.
+
 Pass-through for parsing:
-- Reasoning goes through `ReasoningParserType::get_reasoning_parser_from_name`
-  and `parse_reasoning_streaming_incremental`.
-- Tool calls go through `apply_tool_calling_jail`. Decoded output is wrapped as
-  OpenAI stream chunks only to feed the jail, then unwrapped into `ChatEvent`.
+- Other reasoning parsers go through
+  `ReasoningParserType::get_reasoning_parser_from_name` and
+  `parse_reasoning_streaming_incremental`.
+- Other tool parsers go through `apply_tool_calling_jail`. Decoded output is
+  wrapped as OpenAI stream chunks only to feed the parser, then unwrapped into
+  `ChatEvent`.
 
 SGLang additions:
-- **`aliases.rs`** maps SGLang parser names onto Dynamo's before
-  construction, mirroring `parser/reasoning_parser.py` and
+- **Parser names** from SGLang are mapped onto Dynamo's before construction,
+  mirroring `parser/reasoning_parser.py` and
   `function_call/function_call_parser.py`.
 - **Special tokens after a tool call** (qwen25 and glm47 terminators) are
   dropped.
 - **`parallel_tool_calls=false`** keeps only the first call.
+- **`tool_constraint`** turns `tool_choice` into the parser's structural tag,
+  or a `json_schema` array of calls for `required` and named choices.
+
+## openai
+
+```rust
+lower_completion(body, &headers, &settings, tokenizer) -> Result<(GenerateRequest, CompletionResponder), Unsupported>
+lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Unsupported>
+responder.unary(items) / responder.stream_data(item) -> OpenAI JSON or SSE events
+// item is Result<GenerateResponse, GenerateStreamError>; unary accepts a Vec of items
+responder.stream_end() // after the transport receives [DONE]
+```
+
+SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
+`/generate`, for hosts that send generation there. Lowering returns the shared `sglang_api_types::api::v1::GenerateRequest`,
+which hosts serialize to JSON at the transport boundary. It represents the
+`GenerateReqInput` SGLang's handler would build. The responder turns `/generate`
+output into the response SGLang's handler would return. Anything not reproduced
+exactly is `Unsupported`, and the host sends it to the engine's own route.
+`tests/openai_parity.rs` replays fixtures recorded by
+`tests/scripts/generate_openai_parity.py`, which runs SGLang's handler on the
+`/generate` output of a live engine, or on hand-written (`synthetic`) output.
+Chat splits reasoning with `think/`, and serves only the parser names
+`think/models/` ports.
+
+```rust
+chat_model.deepseek_output(reasoning_parser, tool_call_parser)? // Option<&DeepSeekOutput>
+    .for_request(&body, &default_kwargs, separate_reasoning, parse_tool_calls)? // DeepSeekOutputOptions
+    .parser() // one per choice: .step(ids, finish) -> DeepSeekDelta
+```
+
+DeepSeek-V4 and V4.1 output is parsed by `deepseek_output.rs` instead, once a
+DeepSeek parser is configured, as `serving_deepseek_recipe.py` does: the
+engine's `output_ids` go through deepseek-recipe's `StreamProcessor`, which
+recognizes `</think>` and the DSML tags by token id. It decodes with the
+checkpoint tokenizer, which `ChatModel::for_formatter` attaches as
+`ChatModel::deepseek`; without it the chat is `Unsupported`. The tests decode
+with the tokenizers the fixtures pin, which
+`tests/scripts/cache_deepseek_files.sh` caches.
 
 ## Host example
 

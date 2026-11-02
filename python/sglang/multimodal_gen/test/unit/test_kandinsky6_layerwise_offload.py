@@ -19,10 +19,6 @@ from sglang.multimodal_gen.configs.models.vaes.kandinsky6_sr import (
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6 import (
     Kandinsky6TI2VAPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     global_force_attn_backend_context_manager,
 )
@@ -40,31 +36,22 @@ from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_audio import (
     Kandinsky6AudioVAE,
 )
 from sglang.multimodal_gen.runtime.models.vaes.kandinsky6_sr_vae import Kandinsky6SRVAE
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils import precision
 from sglang.multimodal_gen.test.unit.kandinsky6_sr_tiny_components import (
     TINY_KVAE,
     TINY_LU_MODEL,
 )
-from sglang.srt.utils.network import get_free_port_below_ephemeral
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 @pytest.fixture(autouse=True)
-def single_gpu(monkeypatch, default_global_server_args):
-    if not model_parallel_is_initialized():
-        port = get_free_port_below_ephemeral()
-        for key, value in dict(
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT=str(port),
-            RANK="0",
-            LOCAL_RANK="0",
-            WORLD_SIZE="1",
-        ).items():
-            monkeypatch.setenv(key, value)
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+def single_gpu(monkeypatch, default_global_server_args, single_process_model_parallel):
     monkeypatch.setattr(
         precision._mixed_precision_state,
         "state",
@@ -235,6 +222,11 @@ def test_layerwise_groups_preserve_repeated_forwards(component, resident_layers)
     assert set(groups) <= set(model.layer_names)
     assert model.layerwise_offload_dit_group_enabled == component.endswith("dit")
     state = {name: value.cpu().clone() for name, value in model.state_dict().items()}
+    tolerance = dict(rtol=0, atol=0)
+    if component == "audio-vae" and current_platform.is_rocm():
+        # On MI300 the offloaded fp32 audio VAE differs from the resident run by
+        # ~1e-6 (CUDA is bit-exact); the weights are still compared exactly below.
+        tolerance = dict(rtol=1e-4, atol=1e-5)
     with (
         torch.inference_mode(),
         set_forward_context(current_timestep=0, attn_metadata=None),
@@ -257,12 +249,12 @@ def test_layerwise_groups_preserve_repeated_forwards(component, resident_layers)
         } == set(groups)
         for _ in range(2):
             model.prepare_for_next_req()
-            torch.testing.assert_close(forward(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(forward(), expected, **tolerance)
             for manager in model.layerwise_offload_managers:
                 assert manager._last_forwarded_layer == manager.num_layers - 1
                 manager.release_all()
         model.disable_offload()
-        torch.testing.assert_close(forward(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(forward(), expected, **tolerance)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value.cpu(), state[name], rtol=0, atol=0)
 

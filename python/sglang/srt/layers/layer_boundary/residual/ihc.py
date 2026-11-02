@@ -101,10 +101,15 @@ class IHCState:
 class _AttnReadout:
     """The gated mix of the streams and the input norm, from streams that
     already hold the previous layer's output: an iHC layer takes its input
-    written back."""
+    written back. A ``post_residual_addition`` is not applied."""
+
+    bind = None
 
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: IHCState):
         self.state = state
@@ -126,9 +131,14 @@ class _AttnUpdate:
     It is not a plain add, so it runs only once the sum it writes in is
     complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: IHCState):
         self.state = state
@@ -147,8 +157,13 @@ class _FfnReadout:
     """The attention output's write-back and the FFN input's gated mix and
     norm, fused in post_pre when the layer provides it."""
 
+    bind = None
+
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, state: IHCState):
         self.state = state
@@ -173,9 +188,14 @@ class _FfnUpdate:
     layer stack's terminal read is a learned head rather than a contraction,
     so it belongs to the final norm."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = True
     outlives_layer = False
+    writes_stream = False
+    quantized_sum = False
 
     def __init__(self, state: IHCState):
         self.state = state

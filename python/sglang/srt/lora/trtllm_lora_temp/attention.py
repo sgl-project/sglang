@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.lora.trtllm_lora_temp import (
     get_lora_side_stream,
@@ -25,7 +26,6 @@ from sglang.srt.lora.trtllm_lora_temp import (
     lora_overlap_alloc_stream,
     supports_two_stream_dense_lora,
 )
-from sglang.srt.runtime_context import get_parallel
 
 
 def qkv_proj_lora_forward(self, input_: torch.Tensor):
@@ -96,13 +96,11 @@ def row_parallel_lora_forward(
     """
     # We need ``input_parallel`` to gate the per-batch decode check (its
     # token-count drives the threshold, not the unsplit ``input_``).
+    tp_rank, tp_size = get_group_rank_size(self.base_layer.tp_group)
     if self.base_layer.input_is_parallel:
         input_parallel = input_
     else:
-        tp_rank = get_parallel().tp_rank
-        splitted_input = split_tensor_along_last_dim(
-            input_, num_partitions=self.base_layer.tp_size
-        )
+        splitted_input = split_tensor_along_last_dim(input_, num_partitions=tp_size)
         input_parallel = splitted_input[tp_rank].contiguous()
 
     if (
@@ -113,9 +111,7 @@ def row_parallel_lora_forward(
         return get_original_row_forward()(self, input_, skip_all_reduce, forward_batch)
 
     bias_ = (
-        None
-        if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
-        else self.base_layer.bias
+        None if (tp_rank > 0 or self.base_layer.skip_bias_add) else self.base_layer.bias
     )
 
     side_stream = get_lora_side_stream()
@@ -146,7 +142,7 @@ def row_parallel_lora_forward(
 
     should_reduce = (
         self.base_layer.reduce_results
-        and self.base_layer.tp_size > 1
+        and tp_size > 1
         and not skip_all_reduce
         and not should_skip_mlp_all_reduce()
     )

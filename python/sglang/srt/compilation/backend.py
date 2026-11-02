@@ -26,6 +26,7 @@ from sglang.srt.compilation.pass_manager import PostGradPassManager
 from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.utils.common import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -52,14 +53,19 @@ def make_backend(
     sglang_backend,
 ):
 
-    if current_platform.is_out_of_tree():
-        backend_cls = current_platform.get_piecewise_backend_cls()
-    elif is_xpu():
-        backend_cls = XPUPiecewiseBackend
-    elif is_npu():
-        backend_cls = NPUPiecewiseBackend
-    else:
-        backend_cls = CUDAPiecewiseBackend
+    backend_cls = current_platform.get_piecewise_backend_cls()
+    if backend_cls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_piecewise_backend_cls()",
+            subsystem="piecewise compilation backend",
+        )
+        if is_xpu():
+            backend_cls = XPUPiecewiseBackend
+        elif is_npu():
+            backend_cls = NPUPiecewiseBackend
+        else:
+            backend_cls = CUDAPiecewiseBackend
     return backend_cls(
         graph,
         compile_config,

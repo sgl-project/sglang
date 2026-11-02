@@ -50,8 +50,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -145,6 +145,7 @@ class Step3TextMoEMLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -189,7 +190,6 @@ class Step3TextAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -219,8 +219,7 @@ class Step3TextAttention(nn.Module):
             [self.q_size, self.kv_size, self.kv_size],
             bias=False,
             quant_config=quant_config,
-            tp_rank=0,  # In fact, we need a MergedReplicatedLinear
-            tp_size=1,
+            parallel_group="replicated",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -229,8 +228,7 @@ class Step3TextAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -242,8 +240,7 @@ class Step3TextAttention(nn.Module):
             self.head_dim * self.total_num_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("wq", prefix),
         )
         self.rotary_emb = get_rope(
@@ -524,15 +521,13 @@ class Step3VisionMLP(nn.Module):
         # Since this is a dense model,
         # the MLP component likewise adopts a DP-MLP approach modeled after DP Attention.
         # This choice may not represent the optimal solution and remains open to further deliberation.
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.fc1 = ColumnParallelLinear(
             dim,
             intermediate_size,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("gate_proj", prefix),
         )
         self.act = ACT2FN[hidden_act]  # quick_gelu
@@ -550,8 +545,7 @@ class Step3VisionMLP(nn.Module):
             dim,
             bias=bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("down_proj", prefix),
         )
 
@@ -892,8 +886,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def forward(

@@ -4,6 +4,7 @@ import unittest
 from functools import partial
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
@@ -14,8 +15,11 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant
-from sglang.srt.layers.layer_boundary.exit import ExitPolicy
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
+from sglang.srt.layers.layer_boundary.exit import (
+    _sum_deferral_allowed,
+    exit_facts,
+)
 from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -146,6 +150,55 @@ class TestPostExpertsAllReduceMerge(CustomTestCase):
 
     def test_skipped_when_deferred_to_fusion(self):
         self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2, skip=True), [])
+
+
+class TestFp4AllgatherAbsorbsPostExpertsReductions(CustomTestCase):
+    """The flashinfer cutlass FP4 path reduce-scatters expert outputs over _TP.
+
+    Its standard dispatcher all-gathers tokens and reduce-scatters the expert
+    outputs over _TP, which spans the whole EP group, so neither the EP nor the
+    TP post-experts all-reduce may follow: each rank then holds its own
+    DP-local tokens, whose counts differ across ranks.
+    """
+
+    def _calls(self, *, fp4_allgather, moe_ep_size, moe_tp_size):
+        called = []
+        # Pin the gate's other skip reasons off so only the FP4 path decides.
+        no_a2a = MagicMock()
+        no_a2a.is_flashinfer.return_value = False
+        no_a2a.is_pplx.return_value = False
+        no_a2a.is_flashinfer_megamoe.return_value = False
+        with (
+            patch.object(moe_utils, "should_skip_mlp_all_reduce", return_value=False),
+            patch.object(moe_utils, "get_moe_a2a_backend", return_value=no_a2a),
+            patch.object(
+                moe_utils,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=fp4_allgather,
+            ),
+            _recorded_all_reduces(
+                called,
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                moe_dp_size=1,
+            ),
+            get_parallel().override(dwdp_size=1),
+        ):
+            post_experts_all_reduce(torch.zeros(2, 2))
+        return called
+
+    def test_pure_ep_issues_no_reduction(self):
+        self.assertEqual(
+            self._calls(fp4_allgather=True, moe_ep_size=4, moe_tp_size=1), []
+        )
+        self.assertEqual(
+            self._calls(fp4_allgather=False, moe_ep_size=4, moe_tp_size=1), ["ep"]
+        )
+
+    def test_pure_tp_issues_no_reduction(self):
+        self.assertEqual(
+            self._calls(fp4_allgather=True, moe_ep_size=1, moe_tp_size=4), []
+        )
 
 
 class TestDeferredPostExpertsAllReduce(CustomTestCase):
@@ -310,12 +363,11 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
-            return ExitPolicy(
-                _fake_communicator(ffn_sum_is_movable)
-            )._sum_deferral_allowed(
-                ExitPolicy(_fake_communicator(ffn_sum_is_movable)).plan.path_for(
-                    forward_batch
-                )
+            communicator = _fake_communicator(ffn_sum_is_movable)
+            return _sum_deferral_allowed(
+                communicator,
+                communicator.path_for(forward_batch).output,
+                scattered=False,
             )
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
@@ -469,6 +521,14 @@ class TestDeferFfnReduction(CustomTestCase):
                 return_value=tp_group_object if tp_group else object(),
             ),
         ):
+            # What the exit decides from fixed facts is recorded on the path.
+            path = communicator.paths[BatchVariant.ORDINARY]
+            communicator.paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
+                path,
+                exit=exit_facts(
+                    StageKind.FFN, communicator, BatchVariant.ORDINARY, path
+                ),
+            )
             return communicator.output._defers_sum(
                 forward_batch,
                 communicator.output.plan.path_for(forward_batch),

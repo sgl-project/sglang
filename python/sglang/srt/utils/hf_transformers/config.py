@@ -13,8 +13,9 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import copy
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -47,6 +48,10 @@ from .common import (
 from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
+# The base and revision that get_config read for each Kev LoRA checkpoint, which
+# has no model config of its own, keyed by checkpoint path and revision.
+POINTER_ADAPTER_BASES: Dict[Tuple[str, Optional[str]], Tuple[str, str]] = {}
+
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
@@ -64,6 +69,7 @@ _GEMMA4_MODEL_TYPES = (
     "gemma4_unified",
     "gemma4_unified_assistant",
     "diffusion_gemma",
+    "embedding_gemma2",
 )
 
 
@@ -369,9 +375,32 @@ def get_config(
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
     parser = get_model_config_parser(model_config_parser)
-    config = parser.parse(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    try:
+        config = parser.parse(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except (OSError, ValueError):
+        # A Kev LoRA checkpoint has no model config. It serves the text backbone
+        # of the base its head.pt pins.
+        from sglang.srt.configs.model_config import load_pointer_adapter
+
+        meta = load_pointer_adapter(model, revision)
+        if meta is None:
+            raise
+        base = parser.parse(
+            meta["base"],
+            trust_remote_code=trust_remote_code,
+            revision=meta["base_revision"],
+            **kwargs,
+        )
+        if base.model_type != "qwen3_5":
+            raise ValueError(
+                f"Kev checkpoints on a {base.model_type} base are not supported, "
+                "only on Qwen3.5 and Qwen3.8 bases"
+            )
+        config = copy.deepcopy(base.text_config)
+        _set_architectures(config, "Qwen3_5ForCausalLM")
+        POINTER_ADAPTER_BASES[(model, revision)] = (meta["base"], meta["base_revision"])
 
     if model_override_args:
         if isinstance(config, DeepseekV41Config):
@@ -383,6 +412,14 @@ def get_config(
             current = getattr(config, key, None)
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
+            elif (
+                key in ("rope_scaling", "rope_parameters")
+                and isinstance(value, dict)
+                and isinstance(current, dict)
+            ):
+                # v5's rope_scaling setter replaces rope_parameters wholesale;
+                # merge so partial overrides keep rope_theta (#41227).
+                setattr(config, key, {**current, **value})
             else:
                 setattr(config, key, value)
 

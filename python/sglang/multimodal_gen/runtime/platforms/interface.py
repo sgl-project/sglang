@@ -42,6 +42,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     AITER_SAGE = enum.auto()
+    AITER_QUANT = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
@@ -129,8 +130,6 @@ class Platform:
     # NOTE: for the forward part of the model, vLLM has another separate
     # compilation strategy.
     simple_compile_backend: str = "inductor"
-
-    supported_quantization: list[str] = []
 
     def init_backend(self) -> None:
         """One-time backend initialization, in each worker; raising aborts startup.
@@ -305,6 +304,16 @@ class Platform:
         torch.get_device_module(device).set_device(device)
 
     @classmethod
+    def synchronize(cls) -> None:
+        """Synchronize pending device work for the current platform."""
+        torch.get_device_module().synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release cached device memory for the current platform."""
+        torch.get_device_module().empty_cache()
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
@@ -411,13 +420,6 @@ class Platform:
         )
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        """
-        Check if the current platform supports async output.
-        """
-        raise NotImplementedError
-
-    @classmethod
     def inference_mode(cls):
         """A device-specific wrapper of `torch.inference_mode`.
 
@@ -452,16 +454,6 @@ class Platform:
         - By default all models are considered supported.
         """
         pass
-
-    @classmethod
-    def verify_quantization(cls, quant: str) -> None:
-        """
-        Verify whether the quantization is supported by the current platform.
-        """
-        if cls.supported_quantization and quant not in cls.supported_quantization:
-            raise ValueError(
-                f"{quant} quantization is currently not supported in {cls.device_name}."
-            )
 
     @classmethod
     def get_current_memory_usage(
@@ -536,8 +528,3 @@ class Platform:
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         """Check if a tensor is on the current platform's device."""
         return t.is_cuda
-
-
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""

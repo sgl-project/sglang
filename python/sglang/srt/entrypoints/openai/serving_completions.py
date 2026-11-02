@@ -140,6 +140,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            mm_processor_kwargs=request.mm_processor_kwargs,
         )
 
         return adapted_request, request
@@ -170,6 +171,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "watermark": request.watermark,
         }
 
         # Handle response_format constraints

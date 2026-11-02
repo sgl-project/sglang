@@ -264,9 +264,7 @@ class JetBlock(nn.Module):
         assert isinstance(get_attn_backend().linear_attn_backend, MambaAttnBackendBase)
         linear_attn_backend = get_attn_backend().linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
-        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
-            self.layer_id
-        )
+        layer_cache = linear_attn_backend.state_layer_cache(self.layer_id)
 
         qkvabz, _ = self.qkvabz_proj(hidden_states)
         q, k, v, a, beta, z = qkvabz.split(
@@ -460,6 +458,12 @@ class JetNemotronDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    @staticmethod
+    def stage_facts(config: JetNemotronConfig, layer_id: int):
+        """None: the layer adds its own residual, so it declares no stages.
+        The model's shared declaration function (see make_layers)."""
+        return ()
 
     def forward(
         self,
