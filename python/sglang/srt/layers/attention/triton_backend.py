@@ -463,7 +463,7 @@ class TritonAttnBackend(AttentionBackend):
         names = [
             name
             for name in self.runner_ids.window_sub_pools
-            if name != self.runner_ids.window_kv_sub_pool
+            if name != self.runner_ids.window_storage
         ]
         if not names:
             return {}
@@ -497,7 +497,7 @@ class TritonAttnBackend(AttentionBackend):
         router = model_runner.token_to_kv_pool.layer_router
         widths = {
             router.view(name).get_v_head_dim()
-            for name in (self.runner_ids.window_kv_sub_pool, *self.other_windows)
+            for name in (self.runner_ids.window_storage, *self.other_windows)
         }
         return len(widths) == 1 and None not in self.other_windows.values()
 
@@ -3039,7 +3039,7 @@ def update_sliding_window_buffer(
         indptr=window_kv_indptr,
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        kind=runner_ids.window_kv_kind if kind is None else kind,
+        kind=runner_ids.window_storage if kind is None else kind,
         token_mapping=token_mapping,
     )
     if not translated and runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None:

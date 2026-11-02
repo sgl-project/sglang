@@ -60,7 +60,11 @@ def resolve_window_id_space(
         return None
     allocator = model_runner.token_to_kv_pool_allocator
     if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
-        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+        # The runner's ids resolve the sliding-window role to the storage its
+        # window layers live in: the target's window for the target, and for
+        # a fused draft its host, which is a band of its own when the draft's
+        # window differs from every target window.
+        return model_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
     return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 

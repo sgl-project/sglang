@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     flush_deferred_free_group,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, estimate_window_tokens
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.invariants import (
     WINDOW_SEGMENT_BOUND,
     WINDOW_SEGMENT_RELEASED,
@@ -1061,13 +1061,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 (window.sub_pool_name, id(self)),
                 widened_writes=True,
                 defer_reads=defer_reads,
-            )
-        if self.swa_attn_allocator is not None:
-            # Backends ask for the sliding-window layers' ids by their role:
-            # the target's window.
-            spaces.setdefault(
-                IdSpaceKind.SLIDING_WINDOW,
-                spaces[self.swa_attn_allocator.sub_pool_name],
             )
         return spaces
 

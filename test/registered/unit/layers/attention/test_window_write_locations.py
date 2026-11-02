@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_decls
@@ -426,7 +427,7 @@ def _static_rig(window, *, deterministic=False):
 
 def _draft_write_loc(batch, runner_ids):
     """The write loc a backend bundles for a fused draft's layers."""
-    window = runner_ids.write_ids(batch, runner_ids.window_kv_kind)
+    window = runner_ids.write_ids(batch, runner_ids.window_storage)
     return KVWriteLoc.for_batch(
         batch, window_locs=window_write_locs(runner_ids, window)
     )
@@ -537,8 +538,10 @@ def _fused_draft():
     torch.cuda.synchronize()
     return {
         "routes": routes,
-        "window_kind": str(
-            getattr(runner_ids.window_kv_kind, "value", runner_ids.window_kv_kind)
+        # Which kind of storage the window layers use: a window sub-pool, or
+        # the full sub-pool.
+        "window_kind": (
+            "full" if runner_ids.window_storage == IdSpaceKind.FULL else "swa"
         ),
         "writes": _written_rows(pool, [0, 1], sum(seq), 5),
     }

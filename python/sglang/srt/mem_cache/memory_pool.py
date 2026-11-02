@@ -1814,9 +1814,9 @@ class KVWriteLoc:
 def window_write_locs(
     runner_ids, ids: Optional[torch.Tensor]
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """``ids``, the write ids a backend resolved for its runner's window
-    storage, keyed by the sub-pool that storage is
-    (``RunnerIds.window_kv_sub_pool``); None when ``ids`` is. A backend with no
+    """``ids``, the write ids a backend with one window rail resolved for its
+    runner's window storage, keyed by the sub-pool that storage is
+    (``RunnerIds.window_storage``); None when ``ids`` is. A backend with no
     RunnerIds serves a static pool, whose window sub-pool is
     ``SWAKVPool.WINDOW_SUB_POOL``."""
     if ids is None:
@@ -1826,7 +1826,7 @@ def window_write_locs(
 
         name = SWAKVPool.WINDOW_SUB_POOL
     else:
-        name = runner_ids.window_kv_sub_pool
+        name = runner_ids.window_storage
     return {getattr(name, "value", name): ids}
 
 

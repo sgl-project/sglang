@@ -62,7 +62,8 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional, Tuple
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Tuple
 
 import msgspec
 import torch
@@ -118,6 +119,10 @@ class ReadTable(msgspec.Struct, frozen=True):
 class RunnerIds:
     """Built once per ModelRunner."""
 
+    # The sub-pool playing each attention role this runner's pool names by
+    # role; none unless the constructor finds one.
+    _role_sub_pools: Mapping[str, str] = MappingProxyType({})
+
     def __init__(
         self,
         *,
@@ -153,7 +158,8 @@ class RunnerIds:
         self._spaces: Dict[str, IdSpace] = {}
         self.window_sub_pools: Tuple[str, ...] = ()
         # The sub-pool playing each attention role this runner's pool names
-        # by role (a unified target's window).
+        # by role: the one place a role becomes a sub-pool name. Id spaces are
+        # keyed by sub-pool name only.
         self._role_sub_pools: Dict[str, str] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
@@ -243,13 +249,11 @@ class RunnerIds:
                         if p.window is not None
                     )
                 )
-                # The window sub-pool this runner's pool names by role: its id
-                # space answers for the role too, as the target's does.
+                # The window sub-pool this runner's pool names by role.
                 window = token_to_kv_pool.layer_router.sub_pool(
                     IdSpaceKind.SLIDING_WINDOW
                 )
                 if window is not None and window.name != IdSpaceKind.SLIDING_WINDOW:
-                    self._spaces[IdSpaceKind.SLIDING_WINDOW] = self._spaces[window.name]
                     self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = window.name
             self._full_v2p_table = self._spaces[IdSpaceKind.FULL].table
         else:
@@ -303,18 +307,24 @@ class RunnerIds:
             else None
         )
 
+    def sub_pool_name(self, kind: str) -> str:
+        """The sub-pool ``kind`` names: a role (the window storage of a backend
+        with one window rail) resolved to the sub-pool playing it, a sub-pool
+        name as it is."""
+        return self._role_sub_pools.get(kind, kind)
+
     def space(self, kind: str) -> Optional[IdSpace]:
-        """How this runner's ``kind`` sub-pool (a kind or a sub-pool name)
+        """How this runner's ``kind`` sub-pool (a role or a sub-pool name)
         names the iteration's slots, or None when its pool has no such
         sub-pool."""
-        return self._spaces.get(kind)
+        return self._spaces.get(self.sub_pool_name(kind))
 
     def ids_in(self, kind: str, virtual_ids: torch.Tensor) -> torch.Tensor:
         """``virtual_ids`` as this runner's ``kind`` sub-pool indexes them, for
         a consumer outside an iteration's plan (a static pool's per-call read,
         a transfer). Reads inside an iteration take the plan's tables."""
         spaces = self._spaces if self._call_spaces is None else self._call_spaces
-        return spaces[kind].ids(virtual_ids)
+        return spaces[self.sub_pool_name(kind)].ids(virtual_ids)
 
     @functools.cached_property
     def _state_spaces(self) -> Dict[str, IdSpace]:
@@ -330,23 +340,16 @@ class RunnerIds:
         return state_id_space(self._state_spaces, sub_pool)
 
     @property
-    def window_kv_kind(self) -> IdSpaceKind:
-        """Storage used by window attention, independent of its attention mask.
-
-        A fused window draft may live in FULL when SWA cannot host its window.
-        Such a draft still clips its reads, but uses FULL physical addresses.
-        """
-        return (
-            IdSpaceKind.SLIDING_WINDOW
-            if IdSpaceKind.SLIDING_WINDOW in self._spaces
-            else IdSpaceKind.FULL
-        )
-
-    @property
-    def window_kv_sub_pool(self) -> str:
-        """The sub-pool `window_kv_kind` reads, by its name."""
-        kind = self.window_kv_kind
-        return self._role_sub_pools.get(kind, kind)
+    def window_storage(self) -> str:
+        """The sub-pool a backend with one window rail reads and writes its
+        window layers through, by name: the sub-pool playing the sliding-window
+        role, or the full sub-pool when the window layers store there (a
+        fused window draft the window sub-pools cannot host still clips its
+        reads, but uses full physical addresses). A backend with a rail per
+        window sub-pool reads `window_sub_pools` instead."""
+        if self.space(IdSpaceKind.SLIDING_WINDOW) is not None:
+            return self.sub_pool_name(IdSpaceKind.SLIDING_WINDOW)
+        return IdSpaceKind.FULL.value
 
     def write_ids(
         self, forward_batch, kind: IdSpaceKind = IdSpaceKind.FULL
@@ -574,7 +577,7 @@ class RunnerIds:
     # -- readers ---------------------------------------------------------------
 
     def _reads_translated(self, kind: IdSpaceKind) -> bool:
-        space = self._spaces.get(kind)
+        space = self.space(kind)
         return space is not None and space.read_v2p is not None
 
     def read_source(
