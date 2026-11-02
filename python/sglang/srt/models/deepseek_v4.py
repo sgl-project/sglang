@@ -3292,8 +3292,9 @@ class DeepseekV4DecoderLayerBase(nn.Module):
 
             if get_platform().is_sm90 or get_platform().is_sm120:
                 # Hopper's compensated projection does not require DeepGEMM.
-                # SM120 takes the same pure-Triton route: the tf32 DeepGEMM
-                # branch below has no verified SM120 kernel.
+                # SM120 takes the same pure-Triton route: the tf32 branch below
+                # is less accurate on this card, and it builds parts at every
+                # row count.
                 self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
             else:
