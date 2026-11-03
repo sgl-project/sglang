@@ -145,7 +145,7 @@ class TestMamba2ReplaySizing(CustomTestCase):
                     self.assertGreater(costs.bytes_for(slots + 1, cap, ratio), budget)
 
     def test_gates(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.server_args import ServerArgs
 
         valid = dict(
