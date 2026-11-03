@@ -62,6 +62,26 @@ logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
 
+def _encoder_decoder_graph_limits(model_runner):
+    parallel = get_parallel()
+    # Keep distributed and speculative admission unchanged. The bounded path
+    # currently relies on a local ordinary-decode length check in NPUGraphRunner.
+    if (
+        not model_runner.model_config.is_encoder_decoder
+        or (parallel.tp_size, parallel.pp_size, parallel.dp_size) != (1, 1, 1)
+        or not model_runner.spec_algorithm.is_none()
+    ):
+        return (None, None)
+    config = model_runner.model_config.hf_config
+    return tuple(
+        value if type(value) is int and value > 0 else None
+        for value in (
+            getattr(config, "max_target_positions", None),
+            getattr(config, "max_source_positions", None),
+        )
+    )
+
+
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
         spec_info is not None
@@ -356,6 +376,9 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 self.use_native_sdpa = True
         self.native_attn = AscendTorchNativeAttnBackend()
+        self.encoder_decoder_graph_max_tokens = _encoder_decoder_graph_limits(
+            model_runner
+        )
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         # Pool refs — captured at construction so they survive deletion of the
@@ -3250,6 +3273,14 @@ class AscendAttnBackend(AttentionBackend):
                     ),
                     logit_cap=layer.logit_cap,
                     logit_capping_method=layer.logit_capping_method,
+                    is_encoder_decoder_graph=(
+                        self.graph_mode
+                        and forward_batch.encoder_lens is not None
+                        and layer.logit_cap == 0
+                    ),
+                    max_kv_tokens=self.encoder_decoder_graph_max_tokens[
+                        int(layer.is_cross_attention)
+                    ],
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:

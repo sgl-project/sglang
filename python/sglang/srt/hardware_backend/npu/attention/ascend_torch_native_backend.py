@@ -230,6 +230,8 @@ class AscendTorchNativeAttnBackend:
         full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
+        is_encoder_decoder_graph: bool = False,
+        max_kv_tokens: int | None = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -250,6 +252,39 @@ class AscendTorchNativeAttnBackend:
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+
+        if is_encoder_decoder_graph:
+            assert encoder_lens is not None and logit_cap == 0 and not causal
+            cache_span = req_to_token.shape[1]
+            if max_kv_tokens is not None:
+                cache_span = min(cache_span, max_kv_tokens)
+            positions = torch.arange(cache_span, device=query.device)[None, :]
+            if is_cross_attention:
+                columns = positions
+                lengths = encoder_lens
+            else:
+                columns = encoder_lens[:, None] + positions
+                lengths = seq_lens
+            valid = (positions < lengths[:, None]) & (seq_lens[:, None] > 0)
+            columns = torch.where(valid, columns, 0)
+            token_ids = req_to_token[req_pool_indices.long()[:, None], columns].long()
+            token_ids = torch.where(valid, token_ids, 0)
+            if full_to_swa_mapping is not None:
+                token_ids = full_to_swa_mapping[token_ids]
+                token_ids = torch.where(valid, token_ids, 0)
+            keys = k_cache[token_ids].masked_fill(~valid[:, :, None, None], 0)
+            values = v_cache[token_ids].masked_fill(~valid[:, :, None, None], 0)
+            output.copy_(
+                scaled_dot_product_attention(
+                    query.unsqueeze(2),
+                    keys.transpose(1, 2).to(query.dtype),
+                    values.transpose(1, 2).to(query.dtype),
+                    attn_mask=valid[:, None, None, :],
+                    scale=scaling,
+                    enable_gqa=enable_gqa,
+                ).squeeze(2)
+            )
+            return output
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)

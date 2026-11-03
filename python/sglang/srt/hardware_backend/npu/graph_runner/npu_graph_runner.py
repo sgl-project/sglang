@@ -160,6 +160,26 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
 
+    def can_run_graph(self, forward_batch: ForwardBatch):
+        if self.is_encoder_decoder:
+            limits = getattr(
+                self.attn_backend, "encoder_decoder_graph_max_tokens", (None, None)
+            )
+            if limits == (None, None):
+                return super().can_run_graph(forward_batch)
+            # Configured position limits bound the captured attention tensors,
+            # but some model entry points allow longer requests. Use the
+            # unbounded eager path when CPU metadata cannot prove they fit.
+            for limit, lengths in zip(
+                limits,
+                (forward_batch.seq_lens_cpu, forward_batch.encoder_lens_cpu),
+            ):
+                if limit is not None and (
+                    lengths is None or any(length > limit for length in lengths)
+                ):
+                    return False
+        return super().can_run_graph(forward_batch)
+
     def _uses_v2_seq_len_update(self):
         # IDLE DP ranks replay the same target-verify graph as active ranks.
         # Select the handler from the captured graph, not the runtime mode;

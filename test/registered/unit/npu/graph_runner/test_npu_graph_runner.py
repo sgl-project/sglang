@@ -13,6 +13,48 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+@pytest.mark.parametrize(
+    "decoder,encoder,expected",
+    [
+        ([448], [1500], True),
+        ([449], [1500], False),
+        ([448], [1501], False),
+        (None, [1500], False),
+        ([448], None, False),
+        ([2, 449], [1500, 1500], False),
+    ],
+)
+def test_bounded_attention_graph_admission(decoder, encoder, expected):
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.is_encoder_decoder = True
+    runner.attn_backend = SimpleNamespace(encoder_decoder_graph_max_tokens=(448, 1500))
+    batch = SimpleNamespace(
+        seq_lens_cpu=None if decoder is None else torch.tensor(decoder),
+        encoder_lens_cpu=encoder,
+    )
+    with mock.patch.object(
+        mod.DecodeCudaGraphRunner, "can_run_graph", return_value=True
+    ) as base:
+        assert runner.can_run_graph(batch) is expected
+        assert base.call_count == int(expected)
+
+
+@pytest.mark.parametrize("encoder_decoder", [False, True])
+@pytest.mark.parametrize("bounded_backend", [False, True])
+def test_unbounded_graph_admission_unchanged(encoder_decoder, bounded_backend):
+    runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
+    runner.is_encoder_decoder = encoder_decoder
+    runner.attn_backend = SimpleNamespace()
+    if bounded_backend:
+        runner.attn_backend.encoder_decoder_graph_max_tokens = (None, None)
+    batch = SimpleNamespace()
+    with mock.patch.object(
+        mod.DecodeCudaGraphRunner, "can_run_graph", return_value=False
+    ) as base:
+        assert runner.can_run_graph(batch) is False
+        base.assert_called_once_with(batch)
+
+
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner = mod.NPUGraphRunner.__new__(mod.NPUGraphRunner)
     runner.require_mlp_tp_gather = False
