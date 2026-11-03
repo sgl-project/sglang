@@ -439,7 +439,7 @@ class TboDPAttentionPreparer:
         # (e.g. MIXED from enable_mixed_chunk).
         # Rows of this rank's first micro-batch, gathered so each micro-batch's
         # dispatch can be bounded by its own per-rank rows; 0 when the MoE a2a
-        # backend neither uses them nor caps micro-batch B.
+        # backend does not use them.
         self.local_tbo_split_num_tokens = 0
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
@@ -475,10 +475,9 @@ class TboDPAttentionPreparer:
                 and not tbo_splits_extend_in_low_latency
                 and (resolved_deepep_mode.is_low_latency())
             )
-            child_cap = get_moe_a2a_backend().tbo_child_dispatch_cap()
             if (
                 local_can_run_tbo
-                and (self._uses_micro_batch_rows or child_cap is not None)
+                and self._uses_micro_batch_rows
                 and not local_batch.forward_mode.is_prebuilt()
             ):
                 self.local_tbo_split_num_tokens = compute_split_token_index(
@@ -487,14 +486,6 @@ class TboDPAttentionPreparer:
                     extend_seq_lens=local_batch.extend_lens,
                     token_num_per_seq=token_num_per_seq,
                 )
-                if (
-                    child_cap is not None
-                    and num_tokens - self.local_tbo_split_num_tokens > child_cap
-                ):
-                    # Micro-batch B dispatches through an op sized for child_cap
-                    # rows per rank; the gathered min keeps every rank unsplit.
-                    local_can_run_tbo = False
-                    self.local_tbo_split_num_tokens = 0
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True

@@ -3,9 +3,7 @@
 Every rank must agree on each micro-batch's bound: a receiver caps its MoE
 input by the sum, so one rank under-counting a sender's micro-batch drops rows.
 An idle or empty-split rank starts BOTH children at token 0, so the child must
-be identified by position, not by its start token. The MORI EPv2 op behind the
-second micro-batch holds about half a chunk, so a larger second micro-batch must
-keep the whole step unsplit. CPU-only.
+be identified by position, not by its start token. CPU-only.
 """
 
 import unittest
@@ -18,11 +16,6 @@ from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.batch_overlap.two_batch_overlap import (
     TboDPAttentionPreparer,
     TboForwardBatchPreparer,
-    compute_split_seq_index,
-    compute_split_token_index,
-)
-from sglang.srt.layers.moe.token_dispatcher.moriep import (
-    mori_tbo_child_max_dispatch_tokens_per_rank,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -103,36 +96,8 @@ class TestTboIdleRankChildRows(CustomTestCase):
         self.assertEqual(child_b.tbo_dp_global_num_tokens_bound, [0, 1080, 0, 0])
 
 
-def _micro_batch_b_rows(extend_lens) -> int:
-    split_seq = compute_split_seq_index(
-        ForwardMode.EXTEND, sum(extend_lens), extend_lens, None
-    )
-    split_tokens = compute_split_token_index(
-        split_seq, ForwardMode.EXTEND, extend_lens, None
-    )
-    return sum(extend_lens) - split_tokens
-
-
-class TestTboChildDispatchCap(CustomTestCase):
-    """MORI EPv2 sizes the op behind micro-batch B for about half a chunk; a step
-    whose micro-batch B would overflow it must run unsplit on every rank."""
-
-    def test_child_rows_cover_both_split_kinds(self):
-        self.assertEqual(mori_tbo_child_max_dispatch_tokens_per_rank(8192), 4352)
-        # Small ops keep their full size: 256-row rounding reaches it first.
-        self.assertEqual(mori_tbo_child_max_dispatch_tokens_per_rank(256), 256)
-        with patch.object(
-            two_batch_overlap, "get_tbo_token_distribution_threshold", return_value=0.48
-        ):
-            for m in (1024, 4096, 8192, 16384):
-                cap = mori_tbo_child_max_dispatch_tokens_per_rank(m)
-                # One long sequence: two-chunk split, B = ceil(M / 2).
-                self.assertLessEqual(_micro_batch_b_rows([m]), cap)
-                # Sequence-boundary split just inside the threshold: B ~ 0.52 M.
-                first = int(m * 0.48) + 1
-                self.assertLessEqual(_micro_batch_b_rows([first, m - first]), cap)
-
-    def _local_can_run_tbo(self, extend_lens, child_cap, uses_rows=True):
+class TestTboSplitRowsGather(CustomTestCase):
+    def _local_can_run_tbo(self, extend_lens, uses_rows):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             spec_info=None,
@@ -142,7 +107,6 @@ class TestTboChildDispatchCap(CustomTestCase):
         )
         backend = Mock(
             is_none=Mock(return_value=False),
-            tbo_child_dispatch_cap=Mock(return_value=child_cap),
             tbo_uses_micro_batch_rows=Mock(return_value=uses_rows),
         )
         preparer = TboDPAttentionPreparer()
@@ -158,16 +122,6 @@ class TestTboChildDispatchCap(CustomTestCase):
             can_run, mode = preparer.prepare_all_gather(batch)
         return preparer, can_run, mode
 
-    def test_oversized_micro_batch_b_keeps_every_rank_unsplit(self):
-        # Rank 0's micro-batch B (4500 rows) overflows a 4352-row op; rank 1's fits.
-        lens_by_rank = ([4000, 5000], [4096, 4096])
-        results = [self._local_can_run_tbo(lens, 4352) for lens in lens_by_rank]
-        self.assertEqual([r[1] for r in results], [False, True])
-        self.assertEqual(results[0][0].local_tbo_split_num_tokens, 0)
-        gathered = torch.tensor([[int(r[1]), r[2]] for r in results])
-        for preparer, _, _ in results:
-            self.assertEqual(preparer.compute_output(gathered), (None, None))
-
     def test_split_rows_reach_only_backends_that_use_them(self):
         """A backend that does not bound micro-batches by their own rows gets None,
         not the gathered zeros, which would bound the first micro-batch at 0 rows."""
@@ -179,7 +133,7 @@ class TestTboChildDispatchCap(CustomTestCase):
         ):
             with self.subTest(uses_rows=uses_rows):
                 preparer, can_run, _ = self._local_can_run_tbo(
-                    [4000, 5000], None, uses_rows=uses_rows
+                    [4000, 5000], uses_rows=uses_rows
                 )
                 self.assertTrue(can_run)
                 self.assertEqual(preparer.local_tbo_split_num_tokens, local_rows)

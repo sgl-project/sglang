@@ -114,17 +114,6 @@ class MoeA2ABackend(Enum):
         # does not have to block TBO on them.
         return self.is_mori_epv2()
 
-    def tbo_child_dispatch_cap(self) -> Optional[int]:
-        # Rows per rank TBO micro-batch B may dispatch; None when unbounded. MORI
-        # EPv2 sizes B's op for about half a chunk.
-        if not self.is_mori_epv2():
-            return None
-        from sglang.srt.layers.moe.token_dispatcher.moriep import (
-            mori_tbo_child_dispatch_cap,
-        )
-
-        return mori_tbo_child_dispatch_cap()
-
     def tbo_uses_micro_batch_rows(self) -> bool:
         # Whether TBO gathers every rank's first-micro-batch rows: MORI EPv2 bounds
         # each micro-batch's MoE receive by its own per-rank rows.
