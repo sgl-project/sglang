@@ -11,7 +11,7 @@ from typing import ClassVar
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,

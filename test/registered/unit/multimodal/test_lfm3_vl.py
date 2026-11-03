@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.lfm3_vl import Lfm3VlImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci

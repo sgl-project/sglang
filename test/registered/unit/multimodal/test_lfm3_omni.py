@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.configs.lfm3_omni import Lfm3OmniConfig
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.lfm3_omni import Lfm3OmniMultimodalProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -72,7 +72,7 @@ def test_config_round_trip_preserves_modalities(lfm3_omni_reference):
 
 def test_interleaved_soundtrack_is_not_split_into_mel_bins():
     from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
 
     # As many disjoint spans as mel bins must still represent one audio clip.
     item = MultimodalDataItem(

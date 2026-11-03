@@ -28,7 +28,7 @@ Two things make this thinner than the Qwen-VL processor:
 import asyncio
 from typing import Any, List, Optional, Union
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.lfm3_vl import Lfm3VlForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
