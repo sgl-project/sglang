@@ -62,7 +62,32 @@ def _pad_page_table_tile(
     tl.store(dst_ptr + row * dst_stride + cols, vals, mask=inside)
 
 
-@triton.jit
+# Each call brings its own row count, table widths and strides, and its row metadata
+# sits at offsets that move with the row count; specializing on those values or on
+# 16-byte alignment compiles a new variant mid-serving for every new combination, as
+# AITER notes for its own schedule kernels. BLOCK_T is the only shape key left.
+@triton.jit(
+    do_not_specialize=[
+        "pt_src_stride",
+        "pt_dst_stride",
+        "T",
+        "P",
+        "s_max",
+        "w_src",
+        "w_dst",
+        "pt_tiles_per_row",
+    ],
+    do_not_specialize_on_alignment=[
+        "le_ptr",
+        "chunks_ptr",
+        "incl_ptr",
+        "excl_ptr",
+        "rb_ptr",
+        "ls_ptr",
+        "scalars_ptr",
+        "pt_src_ptr",
+    ],
+)
 def _prefill_schedule_prep_kernel(
     le_ptr,  # [T] int32  local_ends (== c4_seq_lens)
     chunks_ptr,  # [T] int32  out
@@ -379,6 +404,36 @@ def build_prefill_schedule(
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers
+
+
+_warm_prefill_devices: set = set()
+
+
+def warm_prefill_schedule(device: torch.device) -> None:
+    """Compile every BLOCK_T variant of the fused prefill schedule (one per power of two
+    up to MAX_FUSED_ROWS) once per device, so no prefill call compiles one while
+    serving; prefill calls of any row count then reuse these. Skipped inside CUDA-graph
+    capture, which must not record the warm-up launches."""
+    if device in _warm_prefill_devices or torch.cuda.is_current_stream_capturing():
+        return
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        CTA_INFO_WIDTH,
+    )
+
+    rows = 16
+    while rows <= MAX_FUSED_ROWS:
+        page_table = torch.zeros((rows, 4), dtype=torch.int32, device=device)
+        build_prefill_schedule(
+            page_table=page_table,
+            local_ends=torch.ones(rows, dtype=torch.int32, device=device),
+            cta_info_out=torch.empty(
+                (rows, CTA_INFO_WIDTH), dtype=torch.int32, device=device
+            ),
+            parallel_unit_num=rows,
+            max_seq_len=page_table.shape[1] * _KV_BLOCK_SIZE,
+        )
+        rows *= 2
+    _warm_prefill_devices.add(device)
 
 
 # Rows per block of the decode prep kernel's loops: its registers stay fixed as the
