@@ -82,7 +82,7 @@ class _RequestList(RequestList):
         kind: ListKind,
         *,
         abort: Optional[Callable[[AbortReq], None]] = None,
-        req_of: Callable[[Any], Req] = lambda req: req,
+        req_of: Callable[[Any], Req] = lambda x: x,
     ) -> None:
         self.kind = kind
         self._abort = abort

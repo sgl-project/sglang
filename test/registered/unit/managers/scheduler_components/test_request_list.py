@@ -43,10 +43,8 @@ _NOT_YET_LISTS = {
     "Scheduler.waiting_queue",
     # Shares its entries with `queue`.
     "DecodePreallocQueue.pending_reqs",
-    "DecodeTransferQueue._deferred_releases",
     # A subset of `waiting_queue`.
     "DllmManager.staging_queue",
-    "DeferredResponses.held",
 }
 
 _HOLDS_REQUESTS = re.compile(r"\b(Req|DecodeRequest)\b")

@@ -499,7 +499,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = _RequestList(
             ListKind.PD_PREALLOC,
             abort=self._abort_prealloc,
-            req_of=lambda decode_req: decode_req.req,
+            req_of=lambda x: x.req,
         )
         self.retracted_queue = _RequestList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
@@ -2860,7 +2860,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue = _RequestList(
             ListKind.PD_RECEIVING,
             abort=self._abort_receiving,
-            req_of=lambda decode_req: decode_req.req,
+            req_of=lambda x: x.req,
         )
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -2885,15 +2885,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        self._deferred_releases = _RequestList(
+            ListKind.PD_RELEASING, req_of=lambda x: x[0].req
+        )
 
     def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
         return {
             ListKind.PD_RECEIVING: self.queue,
             # Aborted, with KV held until the transfer drains.
-            ListKind.PD_RELEASING: [
-                decode_req.req for decode_req, *_ in self._deferred_releases
-            ],
+            ListKind.PD_RELEASING: self._deferred_releases,
         }
 
     def _abort_receiving(self, recv_req: AbortReq) -> None:
@@ -3413,14 +3413,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             or not decode_req.kv_receiver.abort_notified
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
-        self._deferred_releases.append(
-            (
-                decode_req,
-                start_time,
-                deadline,
-                decode_req.metadata_buffer_index,
-                required_acks,
-            )
+        self._deferred_releases.join(
+            [
+                (
+                    decode_req,
+                    start_time,
+                    deadline,
+                    decode_req.metadata_buffer_index,
+                    required_acks,
+                )
+            ]
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
@@ -3458,7 +3460,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         now = time.monotonic()
         drained = []
         ready = []
-        for decode_req, _, deadline, _, required_acks in self._deferred_releases:
+        releases = list(self._deferred_releases.items())
+        for decode_req, _, deadline, _, required_acks in releases:
             if self._is_host_destination(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
                 is_drained = decode_req.kv_receiver.is_abort_release_safe()
@@ -3477,9 +3480,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ready = all_reduce_flags(
             flags=ready, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
         )
-        still_held = []
         to_release = []
-        for entry, is_ready, is_drained in zip(self._deferred_releases, ready, drained):
+        for entry, is_ready, is_drained in zip(releases, ready, drained):
             decode_req, start_time, _, idx, _ = entry
             if is_ready:
                 to_release.append(
@@ -3491,11 +3493,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         is_drained,
                     )
                 )
-            else:
-                still_held.append(entry)
-        # Commit the survivors before releasing so a _do_release exception can't
-        # leave a released entry in the list (double-free / None receiver on retry).
-        self._deferred_releases = still_held
+        # Drop the released entries before releasing so a _do_release exception
+        # can't leave one in the list (double-free / None receiver on retry).
+        self._deferred_releases.leave([decode_req.req for decode_req, *_ in to_release])
         for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
