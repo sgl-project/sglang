@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.rotary_embedding.utils import rotary_embedding_cpu
 from sglang.srt.model_executor.cpu_graph_runner import (
@@ -28,16 +28,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
     default_prefill_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
