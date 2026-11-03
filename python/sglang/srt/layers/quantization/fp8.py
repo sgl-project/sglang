@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
+    can_use_xpu_fp8_moe,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
@@ -3034,6 +3035,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif (
+            _is_xpu
+            and moe_runner_backend.is_intel_xpu()
+            and not self.is_fp4_expert
+            and not can_use_xpu_fp8_moe(
+                moe_runner_config,
+                self.weight_block_size,
+                use_mxfp8=self.use_mxfp8,
+            )
+        ):
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_flashinfer_cutlass()
@@ -3162,7 +3174,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if _is_xpu and not get_moe_runner_backend().is_triton():
+        if (
+            _is_xpu
+            and not get_moe_runner_backend().is_triton()
+            and (
+                self.is_fp4_expert
+                or can_use_xpu_fp8_moe(
+                    moe_runner_config,
+                    self.weight_block_size,
+                    use_mxfp8=self.use_mxfp8,
+                )
+            )
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -3193,10 +3216,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 block_shape=(
                     self.weight_block_size
-                    if self.block_quant and use_fp8_w8a8
+                    if self.block_quant and use_fp8_w8a8 and not self.use_mxfp8
                     else None
                 ),
-                activation=moe_runner_config.activation,
+                # XPU "gelu" uses the tanh approximation.
+                activation=(
+                    "gelu"
+                    if use_fp8_w8a8 and moe_runner_config.activation == "gelu_tanh"
+                    else moe_runner_config.activation
+                ),
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,

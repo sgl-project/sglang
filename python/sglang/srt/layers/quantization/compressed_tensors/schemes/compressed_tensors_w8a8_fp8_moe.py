@@ -20,7 +20,10 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.layers.quantization.fp8_utils import (
+    can_use_xpu_fp8_moe,
+    normalize_e4m3fn_to_e4m3fnuz,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -358,8 +361,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
         elif (
-            moe_runner_backend.is_intel_xpu()
-            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            _is_xpu
+            and moe_runner_backend.is_intel_xpu()
+            and (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                or not can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
+            )
         ):
             moe_runner_backend = MoeRunnerBackend.TRITON
 
@@ -389,6 +396,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             _is_xpu
             and not get_moe_runner_backend().is_triton()
             and self.weight_quant.strategy != QuantizationStrategy.CHANNEL
+            and can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
         ):
             from sgl_kernel import fused_experts
 
@@ -407,7 +415,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 block_shape=self.weight_block_size if self.block_quant else None,
-                activation=moe_runner_config.activation,
+                # XPU "gelu" uses the tanh approximation.
+                activation=(
+                    "gelu"
+                    if moe_runner_config.activation == "gelu_tanh"
+                    else moe_runner_config.activation
+                ),
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,

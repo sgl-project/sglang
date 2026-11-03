@@ -8,8 +8,11 @@ from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.kernels.ops.quantization.fp8_utils import ue8m0_to_fp32
 from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import (
@@ -17,16 +20,27 @@ from sglang.srt.layers.moe.token_dispatcher import (
     StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, resolve_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    resolve_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
     CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
+
+
+@triton.jit
+def _decode_ue8m0_kernel(scales, output, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    tl.store(output + offsets, ue8m0_to_fp32(tl.load(scales + offsets)))
 
 
 class TestXpuMoeWna16(CustomTestCase):
@@ -47,6 +61,15 @@ class TestXpuMoeWna16(CustomTestCase):
 
     def setUp(self):
         torch.manual_seed(42)
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="xpu")
+        )
+        self.enterContext(
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.AUTO, a2a_backend=MoeA2ABackend.NONE
+            )
+        )
+        self.enterContext(get_parallel().override(tp_group=None))
 
     def _reference_moe(
         self,
@@ -60,7 +83,10 @@ class TestXpuMoeWna16(CustomTestCase):
         b1=None,
         b2=None,
         routed_scaling_factor=None,
+        runner_config=None,
     ):
+        config = runner_config or MoeRunnerConfig()
+        activation_fn = {"silu": F.silu, "gelu": F.gelu}[config.activation]
         x = dispatch_output.hidden_states.float().cpu()
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         topk_weights = topk_weights.float().cpu()
@@ -72,7 +98,12 @@ class TestXpuMoeWna16(CustomTestCase):
         b1_cpu = b1.float().cpu() if b1 is not None else None
         b2_cpu = b2.float().cpu() if b2 is not None else None
         rsf = 1.0 if routed_scaling_factor is None else routed_scaling_factor
-        reference = torch.zeros(self.num_tokens, self.hidden, dtype=torch.float32)
+        reference = torch.zeros(
+            (self.num_tokens, topk_ids.shape[1], self.hidden)
+            if config.no_combine
+            else (self.num_tokens, self.hidden),
+            dtype=torch.float32,
+        )
 
         def reference_gemm(activation, weight, scale, expert_id, bias):
             weight = weight[expert_id]
@@ -101,26 +132,36 @@ class TestXpuMoeWna16(CustomTestCase):
             return activation @ scaled_weight.transpose(0, 1) + expert_bias
 
         for token_id in range(self.num_tokens):
-            for topk_id in range(self.topk):
+            for topk_id in range(topk_ids.shape[1]):
                 expert_id = int(topk_ids[token_id, topk_id])
+                expert_input = x[token_id]
+                if config.apply_router_weight_on_input:
+                    expert_input = expert_input * topk_weights[token_id, topk_id]
                 gate_up = reference_gemm(
-                    x[token_id], w13_weight, w13_scale, expert_id, b1_cpu
+                    expert_input, w13_weight, w13_scale, expert_id, b1_cpu
                 )
                 intermediate = (
-                    F.silu(gate_up[: self.intermediate]) * gate_up[self.intermediate :]
+                    activation_fn(gate_up[: self.intermediate])
+                    * gate_up[self.intermediate :]
                 )
                 expert_output = reference_gemm(
                     intermediate, w2_weight, w2_scale, expert_id, b2_cpu
                 )
-                reference[token_id] += (
-                    topk_weights[token_id, topk_id] * expert_output * rsf
-                )
+                if config.no_combine:
+                    reference[token_id, topk_id] = expert_output
+                else:
+                    weight = (
+                        1.0
+                        if config.apply_router_weight_on_input
+                        else topk_weights[token_id, topk_id]
+                    )
+                    reference[token_id] += weight * expert_output * rsf
 
         return reference
 
     def _assert_output_matches_reference(self, output, reference, rtol=0.03, atol=0.03):
         self.assertIsInstance(output, StandardCombineInput)
-        self.assertEqual(output.hidden_states.shape, (self.num_tokens, self.hidden))
+        self.assertEqual(output.hidden_states.shape, reference.shape)
         self.assertEqual(output.hidden_states.dtype, torch.bfloat16)
         torch.testing.assert_close(
             output.hidden_states.float().cpu(), reference, rtol=rtol, atol=atol
@@ -149,8 +190,10 @@ class TestXpuMoeWna16(CustomTestCase):
         params_dtype=torch.float8_e4m3fn,
         with_bias=False,
         routed_scaling_factor=None,
+        runner_config=None,
     ):
-        runner_config = MoeRunnerConfig(routed_scaling_factor=routed_scaling_factor)
+        if runner_config is None:
+            runner_config = MoeRunnerConfig(routed_scaling_factor=routed_scaling_factor)
         layer = nn.Module()
         layer.moe_tp_size = 1
         layer.moe_runner_config = runner_config
@@ -269,6 +312,11 @@ class TestXpuMoeWna16(CustomTestCase):
         self._assert_output_matches_reference(output, reference)
 
     def test_mxfp8_moe_method_serialized(self):
+        from sgl_kernel import fused_experts
+
+        self.enterContext(
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.INTEL_XPU)
+        )
         dispatch_output = self._create_dispatch_output()
         quant_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -299,7 +347,10 @@ class TestXpuMoeWna16(CustomTestCase):
             block_shape=[1, 32],
             mxfp8=True,
         )
-        output = method.apply(layer, dispatch_output)
+        with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+            output = method.apply(layer, dispatch_output)
+            native.assert_called_once()
+            self.assertIsNone(native.call_args.kwargs["block_shape"])
         self._assert_output_matches_reference(output, reference)
 
     def test_mxfp8_moe_method_online_quant(self):
@@ -440,6 +491,237 @@ class TestXpuMoeWna16(CustomTestCase):
             ) as mock_fp8_run:
                 method.apply(fp8_layer, dispatch_output)
                 mock_fp8_run.assert_called_once()
+
+    def test_compressed_tensors_runner_config_fallback(self):
+        from sgl_kernel import fused_experts
+
+        self.enterContext(
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.INTEL_XPU)
+        )
+        configs = (
+            MoeRunnerConfig(inplace=False, apply_router_weight_on_input=True),
+            MoeRunnerConfig(inplace=False, no_combine=True),
+            MoeRunnerConfig(inplace=False, activation="gelu"),
+        )
+        for config in configs:
+            with self.subTest(
+                activation=config.activation,
+                no_combine=config.no_combine,
+                apply_router_weight_on_input=config.apply_router_weight_on_input,
+            ):
+                scheme = CompressedTensorsW8A8Fp8MoE(
+                    MagicMock(strategy=QuantizationStrategy.TENSOR),
+                    MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True),
+                )
+                layer, _, _ = self._build_moe_layer(scheme, runner_config=config)
+                layer.to(self.device)
+                scheme.process_weights_after_loading(layer)
+                dispatch = self._create_dispatch_output()
+                if config.apply_router_weight_on_input:
+                    dispatch = StandardDispatchOutput(
+                        dispatch.hidden_states * 2,
+                        None,
+                        StandardTopKOutput(
+                            dispatch.topk_output.topk_weights[:, :1].contiguous(),
+                            dispatch.topk_output.topk_ids[:, :1].contiguous(),
+                            None,
+                        ),
+                    )
+                reference = self._reference_moe(
+                    dispatch,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale,
+                    runner_config=config,
+                )
+                with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+                    output = scheme.apply_weights(layer, dispatch)
+                    native.assert_not_called()
+                self._assert_output_matches_reference(
+                    output, reference, rtol=0.1, atol=0.1
+                )
+
+    def test_compressed_tensors_block32_fallback(self):
+        from sgl_kernel import fused_experts
+
+        scheme = CompressedTensorsW8A8Fp8MoE(
+            MagicMock(
+                strategy=QuantizationStrategy.BLOCK,
+                block_structure=[32, 32],
+                dynamic=False,
+            ),
+            MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True),
+        )
+        layer, _, _ = self._build_moe_layer(scheme)
+        layer.to(self.device)
+        scheme.process_weights_after_loading(layer)
+        dispatch = self._create_dispatch_output()
+        reference = self._reference_moe(
+            dispatch,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            block_shape=[32, 32],
+        )
+        with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+            output = scheme.apply_weights(layer, dispatch)
+            native.assert_not_called()
+        self._assert_output_matches_reference(output, reference, rtol=0.1, atol=0.1)
+
+    def test_mxfp8_default_config_device_scope(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config as configs,
+        )
+
+        for is_xpu, is_hip, expected_n in (
+            (True, False, 16),
+            (False, False, 1),
+            (False, True, 1),
+        ):
+            with self.subTest(is_xpu=is_xpu, is_hip=is_hip):
+                with patch.multiple(configs, _is_xpu=is_xpu, _is_hip=is_hip):
+                    config = configs.get_default_config(
+                        self.num_tokens,
+                        self.num_experts,
+                        self.intermediate,
+                        self.hidden,
+                        self.topk,
+                        "fp8_w8a8",
+                        False,
+                        block_shape=[1, 32],
+                    )
+                    self.assertEqual(config["BLOCK_SIZE_N"], expected_n)
+
+    def test_mxfp8_scale_decode(self):
+        scales = torch.arange(256, dtype=torch.int16).to(torch.uint8)
+        reference = scales.view(torch.float8_e8m0fnu).float()
+        output = torch.empty(256, dtype=torch.float32, device=self.device)
+        _decode_ue8m0_kernel[(1,)](scales.to(self.device), output, BLOCK_SIZE=256)
+        torch.testing.assert_close(
+            output.cpu(), reference, rtol=0, atol=0, equal_nan=True
+        )
+
+    def test_mxfp8_fallback(self):
+        from sgl_kernel import fused_experts
+
+        # Exercise 32-element groups without 128-element block alignment.
+        self.hidden = 288
+        self.intermediate = 160
+        cases = (
+            (MoeRunnerBackend.TRITON, {}),
+            (MoeRunnerBackend.TRITON, dict(activation="gelu")),
+            (MoeRunnerBackend.AUTO, dict(no_combine=True)),
+            (MoeRunnerBackend.AUTO, dict(activation="gelu")),
+            (MoeRunnerBackend.INTEL_XPU, dict(activation="gelu")),
+            (MoeRunnerBackend.INTEL_XPU, dict(apply_router_weight_on_input=True)),
+        )
+        for backend, settings in cases:
+            with self.subTest(backend=backend, **settings):
+                with get_flags().moe.override(runner_backend=backend):
+                    serialized = backend.is_triton()
+                    method = Fp8MoEMethod(
+                        Fp8Config(
+                            is_checkpoint_fp8_serialized=serialized, use_mxfp8=True
+                        )
+                    )
+                    config = MoeRunnerConfig(inplace=False, **settings)
+                    layer, w13_bf16, w2_bf16 = self._build_moe_layer(
+                        method,
+                        params_dtype=(
+                            torch.float8_e4m3fn if serialized else torch.bfloat16
+                        ),
+                        runner_config=config,
+                    )
+                    layer.to(self.device)
+                    if serialized:
+                        for weight, scale, original in (
+                            (
+                                layer.w13_weight,
+                                layer.w13_weight_scale_inv,
+                                w13_bf16,
+                            ),
+                            (
+                                layer.w2_weight,
+                                layer.w2_weight_scale_inv,
+                                w2_bf16,
+                            ),
+                        ):
+                            qweight, qscale = mxfp8_group_quantize(
+                                original.to(self.device).flatten(0, 1)
+                            )
+                            weight.data.copy_(qweight.view_as(weight))
+                            scale.data.copy_(qscale.view_as(scale))
+                    method.process_weights_after_loading(layer)
+                    self.assertTrue(method.runner.runner_backend.is_triton())
+                    dispatch = self._create_dispatch_output()
+                    if config.apply_router_weight_on_input:
+                        topk = dispatch.topk_output
+                        dispatch = StandardDispatchOutput(
+                            dispatch.hidden_states * 2,
+                            None,
+                            StandardTopKOutput(
+                                topk.topk_weights[:, :1].contiguous(),
+                                topk.topk_ids[:, :1].contiguous(),
+                                None,
+                            ),
+                        )
+                    reference = self._reference_moe(
+                        dispatch,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                        block_shape=[1, 32],
+                        mxfp8=True,
+                        runner_config=config,
+                    )
+                    with patch(
+                        "sgl_kernel.fused_experts", wraps=fused_experts
+                    ) as native:
+                        output = method.apply(layer, dispatch)
+                        native.assert_not_called()
+                    self._assert_output_matches_reference(
+                        output, reference, rtol=0.1, atol=0.1
+                    )
+
+    def test_xpu_native_backends_and_gelu_tanh(self):
+        from sgl_kernel import fused_experts
+
+        for backend in (MoeRunnerBackend.AUTO, MoeRunnerBackend.INTEL_XPU):
+            with get_flags().moe.override(runner_backend=backend):
+                methods = (
+                    Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True)),
+                    CompressedTensorsW8A8Fp8MoE(
+                        MagicMock(strategy=QuantizationStrategy.TENSOR),
+                        MagicMock(strategy=QuantizationStrategy.TENSOR, dynamic=True),
+                    ),
+                )
+                for method in methods:
+                    with self.subTest(backend=backend, method=type(method).__name__):
+                        layer, _, _ = self._build_moe_layer(
+                            method,
+                            runner_config=MoeRunnerConfig(activation="gelu_tanh"),
+                        )
+                        layer.to(self.device)
+                        method.process_weights_after_loading(layer)
+                        dispatch = self._create_dispatch_output()
+                        with patch(
+                            "sgl_kernel.fused_experts", wraps=fused_experts
+                        ) as native:
+                            output = (
+                                method.apply_weights(layer, dispatch)
+                                if isinstance(method, CompressedTensorsW8A8Fp8MoE)
+                                else method.apply(layer, dispatch)
+                            )
+                            native.assert_called_once()
+                            self.assertEqual(
+                                native.call_args.kwargs["activation"], "gelu"
+                            )
+                        self.assertEqual(
+                            output.hidden_states.shape, dispatch.hidden_states.shape
+                        )
 
 
 if __name__ == "__main__":

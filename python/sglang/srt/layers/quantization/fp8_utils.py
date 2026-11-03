@@ -57,6 +57,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -800,6 +801,21 @@ def torch_w8a8_block_fp8_linear(
         output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def can_use_xpu_fp8_moe(
+    config: MoeRunnerConfig,
+    weight_block_size: Optional[List[int]],
+    *,
+    use_mxfp8: bool = False,
+) -> bool:
+    """Check FP8 layouts and runner options supported by native XPU MoE."""
+    return (
+        (use_mxfp8 or weight_block_size in (None, [128, 128]))
+        and not config.apply_router_weight_on_input
+        and not config.no_combine
+        and config.activation != "gelu"
+    )
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
