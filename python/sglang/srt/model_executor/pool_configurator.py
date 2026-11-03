@@ -1429,16 +1429,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 compressed_kv_layout=self._dsv4_compressed_kv_layout,
                 packed_specs=self._dsv41_main_kv_layout_specs,
             )
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            resolve_compressed_kv_layout,
-            select_dsv4_kv_layout,
-        )
-
-        layout, compressed_option = select_dsv4_kv_layout()
+        layout = self._dsv4_kv_layout
         page_size = self.page_size
         if compress_ratio:
             layout = resolve_compressed_kv_layout(
-                layout, compress_ratio, compressed_option
+                layout, compress_ratio, self._dsv4_compressed_kv_layout
             )
             page_size = self.page_size // compress_ratio
         return layout.page_bytes(page_size) / page_size
