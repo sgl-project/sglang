@@ -426,7 +426,8 @@ mod tests {
     async fn warm_up_succeeds_on_finished_generation() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
-        let warm_up = tokio::spawn(async move { handle.warm_up(false, Duration::from_secs(5)).await });
+        let warm_up =
+            tokio::spawn(async move { handle.warm_up(false, Duration::from_secs(5)).await });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {
@@ -466,7 +467,8 @@ mod tests {
             true,
             Vec::new(),
         );
-        let warm_up = tokio::spawn(async move { handle.warm_up(true, Duration::from_secs(5)).await });
+        let warm_up =
+            tokio::spawn(async move { handle.warm_up(true, Duration::from_secs(5)).await });
 
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {
@@ -481,6 +483,7 @@ mod tests {
 
         assert!(warm_up.await.unwrap().is_err());
     }
+
     #[tokio::test]
     async fn warm_up_times_out_and_aborts_without_terminal() {
         let harness = Harness::unbounded(8);
