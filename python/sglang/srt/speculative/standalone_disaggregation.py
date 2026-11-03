@@ -4,15 +4,43 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.utils.common import async_h2d_stack
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+
+class StandaloneDraftSeedError(ValueError):
+    """A transferred STANDALONE seed cannot initialize the next draft step."""
+
+
+def validate_standalone_disagg_draft_seed(
+    probabilities, indices, *, topk: int, vocab_size: int, rid: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate a metadata row before committing or publishing its draft seed."""
+    if probabilities is None or indices is None:
+        raise StandaloneDraftSeedError(
+            f"Missing STANDALONE PD draft seed for request {rid}"
+        )
+    probabilities = torch.as_tensor(probabilities, dtype=torch.float32)
+    indices = torch.as_tensor(indices, dtype=torch.int64)
+    if (
+        probabilities.ndim != 1
+        or indices.shape != probabilities.shape
+        or not 0 < topk <= probabilities.shape[0]
+    ):
+        raise StandaloneDraftSeedError("Invalid STANDALONE PD draft seed shape")
+    probabilities = probabilities[:topk]
+    indices = indices[:topk]
+    if (
+        not bool(torch.all(torch.isfinite(probabilities) & (probabilities >= 0)))
+        or not bool(torch.any(probabilities > 0))
+        or not bool(torch.all((indices >= 0) & (indices < vocab_size)))
+    ):
+        raise StandaloneDraftSeedError("Invalid or unwritten STANDALONE PD draft seed")
+    return probabilities, indices
 
 
 def build_standalone_disagg_draft_input(
@@ -25,30 +53,22 @@ def build_standalone_disagg_draft_input(
     The draft KV is transferred through the existing PD buffers; this only
     initializes the next draft step after decode admits the transferred request.
     """
+    from sglang.srt.managers.overlap_utils import RelayPayload
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.utils.common import async_h2d_stack
+
     topk = get_spec().speculative_eagle_topk
     topk_p_rows = []
     topk_index_rows = []
     for req in batch.reqs:
-        if req.output_topk_p is None or req.output_topk_index is None:
-            raise ValueError(f"Missing STANDALONE PD draft seed for request {req.rid}")
-        probabilities = torch.as_tensor(req.output_topk_p, dtype=torch.float32)
-        indices = torch.as_tensor(req.output_topk_index, dtype=torch.int64)
-        if (
-            probabilities.ndim != 1
-            or indices.shape != probabilities.shape
-            or not 0 < topk <= probabilities.shape[0]
-        ):
-            raise ValueError("Invalid STANDALONE PD draft seed shape")
-        probabilities = probabilities[:topk]
-        indices = indices[:topk]
-        if (
-            not bool(torch.all(torch.isfinite(probabilities) & (probabilities >= 0)))
-            or not bool(torch.any(probabilities > 0))
-            or not bool(
-                torch.all((indices >= 0) & (indices < batch.model_config.vocab_size))
-            )
-        ):
-            raise ValueError("Invalid or unwritten STANDALONE PD draft seed")
+        probabilities, indices = validate_standalone_disagg_draft_seed(
+            req.output_topk_p,
+            req.output_topk_index,
+            topk=topk,
+            vocab_size=batch.model_config.vocab_size,
+            rid=req.rid,
+        )
         topk_p_rows.append(probabilities)
         topk_index_rows.append(indices)
 

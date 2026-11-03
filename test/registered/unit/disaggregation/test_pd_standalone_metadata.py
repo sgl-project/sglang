@@ -99,6 +99,7 @@ class TestPdStandaloneMetadata(unittest.TestCase):
         queue.spec_algorithm = algorithm
         queue.scheduler = SimpleNamespace(
             kv_checksum_computer=None,
+            model_config=SimpleNamespace(vocab_size=11),
             batch_result_processor=SchedulerBatchResultProcessor(**fields),
         )
         receiver = Mock()
@@ -193,9 +194,10 @@ class TestPdStandaloneMetadata(unittest.TestCase):
         self.transfer_row(source, destination, 0, 0)
         req = self.req("seedless", 10)
         self.commit(destination, req, 0)
-        self.assertEqual(req.output_topk_p.count_nonzero().item(), 0)
-        with self.assertRaisesRegex(ValueError, "Invalid or unwritten"):
-            self.draft_input([req])
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIn("Invalid or unwritten", req.finished_reason.message)
+        self.assertEqual(list(req.output_ids), [])
+        self.assertIsNone(req.output_topk_p)
 
     def test_valid_zero_token_is_not_an_unwritten_seed(self):
         source, destination = self.buffers(), self.buffers()
