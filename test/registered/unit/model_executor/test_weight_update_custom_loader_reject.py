@@ -45,7 +45,10 @@ class TestCustomLoaderReject(CustomTestCase):
         )
 
     def _update(self, loader):
+        # monkey_patch_torch_reductions() would patch torch's tensor pickling
+        # for the rest of the process; the plain tensors here do not need it.
         with (
+            patch(f"{_MODULE}.monkey_patch_torch_reductions"),
             patch(f"{_MODULE}.dynamic_import", return_value=loader),
             patch(
                 f"{_MODULE}.get_model",
