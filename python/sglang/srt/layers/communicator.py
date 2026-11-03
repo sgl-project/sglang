@@ -19,7 +19,6 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -65,6 +64,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang.srt.layers.quantization.fp8_blockwise_all_gather import (
+    Fp8BlockwisePacket,
+    all_gather_fp8_blockwise,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
@@ -124,7 +127,6 @@ if _use_aiter:
         mimo_rmsnorm_fp8_group_quant as _aiter_mimo_rmsnorm_fp8_group_quant,
     )
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
-
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
 
     if _is_fused_rms_qkv_quant_supported:
@@ -610,6 +612,38 @@ class LayerCommunicator:
             )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
+        elif (
+            _use_aiter
+            and _use_aiter_ck_blockscale_bpreshuffle_gfx942
+            and quant_format == "fp8"
+            and self._communicate_simple_fn
+            is CommunicateSimpleFn._scattered_to_tp_attn_full
+            and not get_attn_tp_context().is_dsa
+            and post_residual_addition is None
+            and not getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
+        ):
+            # The FP8-QKV opt-in also selects one packed attention-TP AG. Keep
+            # the residual BF16, including DFlash's separate hidden-state capture.
+            source = hidden_states
+            with use_symmetric_memory(
+                get_attention_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                packet = Fp8BlockwisePacket.allocate(
+                    source.shape[0], source.shape[1], _aiter_fp8_dtype, source.device
+                )
+            _, _, _, residual_out = fused_rms_fp8_group_quant(
+                source,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                res1=residual,
+                group_size=128,
+                dtype_quant=_aiter_fp8_dtype,
+                transpose_scale=False,
+                out_fp8=packet.quantized,
+                out_scale=packet.scales,
+            )
+            residual = source if residual is None else residual_out
+            hidden_states = packet
         else:
             if (
                 residual is not None
@@ -985,10 +1019,19 @@ class CommunicateSimpleFn:
 
     @staticmethod
     def _scattered_to_tp_attn_full(
-        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        hidden_states: Union[
+            torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Fp8BlockwisePacket
+        ],
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(hidden_states, Fp8BlockwisePacket):
+            with use_symmetric_memory(
+                get_attention_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                return all_gather_fp8_blockwise(
+                    hidden_states, context.attn_tp_size, attn_tp_all_gather_into_tensor
+                )
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:

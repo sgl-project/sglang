@@ -46,6 +46,17 @@ Install FlyDSL runtime version that compatible with aiter
 pip install flydsl==0.3.2
 ```
 
+### Install MORI
+
+For MORI expert parallelism, replace the Docker image's pre-installed MORI
+1.1.1 with the 1.2.4 release wheel.
+
+```bash
+pip uninstall -y amd_mori
+rm -rf /sgl-workspace/mori
+pip install amd_mori==1.2.4
+```
+
 ## 3. Run DP2/TP8 with dp attention baseline single node prefill benchmark
 
 The main baseline follows the current launchers: FlyPA paged prefill enabled, FlyDSL target/draft attention, and BF16 KV cache.
@@ -71,6 +82,52 @@ SGLANG_AITER_PA_DECODE_IMPL=flydsl \
 cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
+
+### Run DP2 + attention TP4 + EP8 prefill benchmark
+
+Launch global TP8 with DP attention, MORI EP8,
+and DFlash block 8. TBO is disabled in this launcher. The global prefill chunk
+is 32768, giving 16384 tokens per DP; the default MORI dispatch capacity is
+also 16384 tokens per rank.
+
+```bash
+cd /sgl-workspace/sglang/evaluation/mimo_v26_flash
+CHUNKED_PREFILL_SIZE=32768 \
+MEM_FRACTION_STATIC=0.75 \
+SWA_FULL_TOKENS_RATIO=0.03 \
+MAX_RUNNING_REQUESTS=192 \
+DISABLE_RADIX_CACHE=1 \
+ENABLE_DFLASH=1 \
+PERFORMANCE_MODE=1 \
+./launch_mimo_v26_flash_dp2_tp4_ep8_dflash_accuracy_baseline.sh
+```
+
+`PERFORMANCE_MODE=1` enables fake expert routing. The server uses ordinary
+serving, and the client requests one output token to measure prefill performance.
+
+`SGLANG_MIMO_FUSED_RMS_QKV_QUANT=1` is the default: fused QKV RMSNorm/FP8
+quantization packs activations and FP32 scales into one attention-TP all-gather.
+Set it to `0` for the BF16 all-gather baseline. This requires the matching AITER
+fused-quant wrapper with caller-owned output buffers.
+In another terminal, run the full `mimo_v26_flash` preset:
+
+```bash
+cd /sgl-workspace/sglang/evaluation
+BENCHMARK_PRESET=mimo_v26_flash \
+HOST=127.0.0.1 \
+LOG_DIR=./logs/mimo_v26_flash_dp2_attn_tp4_ep8_prefill \
+./run_benchmark_mimo_pro_prefill.sh
+```
+
+The client keeps `TOKENIZE_PROMPT=0` by default and uses the preset's input
+lengths, concurrency, and request counts. Each point runs four warmup requests
+and flushes the cache before measurement. The client reports TTFT and input
+token throughput for the whole server.
+
+For **accuracy tests**, stop the performance server and rerun the launch command
+with **`PERFORMANCE_MODE=0`** to enable real expert routing. Set `ENABLE_DFLASH=0`
+for target-only accuracy or `ENABLE_DFLASH=1` for DFlash accuracy, then follow
+the GSM8K evaluation steps in section 8.
 
 ## 4. Run DP2/TP8 with dp attention baseline single node decode benchmark with fake prefill
 

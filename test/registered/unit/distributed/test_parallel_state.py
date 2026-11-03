@@ -36,10 +36,13 @@ not the per-rank group membership logic.
 
 from __future__ import annotations
 
+import contextlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -50,7 +53,8 @@ register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
-def test_parallel_group_construction_tp8_attn_cp2():
+@pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
+def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """
     Test parallel group construction for 8 GPU configuration with:
     - tensor_model_parallel_size = 8
@@ -79,18 +83,26 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch.object(parallel_state, "_ATTN_CP", None),
         patch.object(parallel_state, "_ATTN_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(
+            parallel_state, "_ENABLE_CUSTOM_ALL_REDUCE", custom_allreduce_enabled
+        ),
+        patch.object(
+            parallel_state, "_ENABLE_MSCCLPP_ALL_REDUCE", custom_allreduce_enabled
+        ),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
 
-        # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
+        created_policies = {}
 
-        def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
-            group_name = kwargs.get("group_name", "unknown")
+        def mock_group_coordinator(
+            *, group_ranks, group_name, use_custom_allreduce, use_pymscclpp, **kwargs
+        ):
             created_groups[group_name] = group_ranks
+            created_policies[group_name] = (use_custom_allreduce, use_pymscclpp)
 
             # Create a mock group object
             mock_group = Mock()
@@ -100,8 +112,8 @@ def test_parallel_group_construction_tp8_attn_cp2():
         with (
             patch.object(
                 parallel_state,
-                "init_model_parallel_group",
-                side_effect=mock_init_model_parallel_group,
+                "GroupCoordinator",
+                side_effect=mock_group_coordinator,
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
@@ -149,6 +161,10 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
 
             print("TP=8, Attn CP=2 group construction verified")
+            assert created_policies["attention_tp"] == (
+                custom_allreduce_enabled,
+                custom_allreduce_enabled,
+            )
 
             # Cleanup
             parallel_state.destroy_model_parallel()
@@ -268,21 +284,166 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("attention_aliases_tp", [False, True])
+def test_graph_capture_includes_attention_tp_once(attention_aliases_tp):
+    entered = []
+    shared_context = object()
+
+    class CaptureGroup:
+        def __init__(self, name):
+            self.name = name
+
+        @contextlib.contextmanager
+        def graph_capture(self, context=None, stream=None):
+            entered.append(self.name)
+            yield shared_context
+
+    tp_group = CaptureGroup("tp")
+    pp_group = CaptureGroup("pp")
+    attention_group = tp_group if attention_aliases_tp else CaptureGroup("attention")
+    with (
+        patch.multiple(
+            parallel_state,
+            _TP=tp_group,
+            _PP=pp_group,
+            _ATTN_TP=attention_group,
+            _MOE_EP=attention_group,
+            _MOE_TP=tp_group,
+        ),
+        patch.object(parallel_state, "get_tp_group", return_value=tp_group),
+        patch.object(parallel_state, "get_pp_group", return_value=pp_group),
+    ):
+        with parallel_state.graph_capture() as context:
+            assert context is shared_context
+    assert entered == (
+        ["tp", "pp"] if attention_aliases_tp else ["tp", "pp", "attention"]
+    )
+
+
+@pytest.fixture
+def aiter_group(monkeypatch):
+    group = parallel_state.GroupCoordinator.__new__(parallel_state.GroupCoordinator)
+    group.world_size = 4
+    group.unique_name = "test_attention_tp"
+    group.ca_comm = SimpleNamespace(
+        disabled=False,
+        should_custom_ar=Mock(return_value=True),
+        reduce_scatter=Mock(),
+        should_custom_ag=Mock(return_value=True),
+        all_gather_reg=Mock(),
+        all_gather_unreg=Mock(),
+        _IS_CAPTURING=False,
+    )
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    for name, value in {
+        "SGLANG_DP_USE_REDUCE_SCATTER": "1",
+        "SGLANG_USE_AITER_AG": "1",
+        "SGLANG_USE_1STAGE_ALLREDUCE": "0",
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "0",
+        "SGLANG_AITER_CAPTURE_COPY_IN": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+    return group
+
+
+@pytest.mark.parametrize(
+    "capturing,live_capture,piecewise,copy_in,memory_saver,registered",
+    [
+        (False, False, False, False, False, False),
+        (True, True, False, False, False, True),
+        (True, True, False, True, False, False),
+        (True, True, False, False, True, False),
+        (True, False, True, False, False, False),
+        (True, False, False, False, False, None),
+    ],
+)
+def test_aiter_reduce_scatter_capture_modes(
+    aiter_group,
+    monkeypatch,
+    capturing,
+    live_capture,
+    piecewise,
+    copy_in,
+    memory_saver,
+    registered,
+):
+    aiter_group.ca_comm._IS_CAPTURING = capturing
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: live_capture)
+    monkeypatch.setattr(
+        parallel_state, "is_in_tc_piecewise_cuda_graph", lambda: piecewise
+    )
+    monkeypatch.setenv("SGLANG_AITER_CAPTURE_COPY_IN", str(int(copy_in)))
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", str(int(memory_saver)))
+    source = torch.ones((32, 16), dtype=torch.bfloat16)
+    output = torch.full((8, 16), float("nan"), dtype=source.dtype)
+    assert aiter_group._maybe_aiter_reduce_scatter(output, source)
+    if registered is None:
+        aiter_group.ca_comm.reduce_scatter.assert_not_called()
+        assert torch.count_nonzero(output) == 0
+    else:
+        aiter_group.ca_comm.reduce_scatter.assert_called_once_with(
+            source, output, registered=registered
+        )
+
+
+@pytest.mark.parametrize(
+    "reason", ["alignment", "shape", "dtype", "deterministic", "disabled", "size"]
+)
+def test_aiter_reduce_scatter_falls_back(aiter_group, monkeypatch, reason):
+    source = torch.ones((4, 8), dtype=torch.bfloat16)
+    output = torch.empty((1, 8), dtype=source.dtype)
+    if reason == "alignment":
+        # The full tensor is aligned, but each rank's shard is not.
+        source, output = source[:, :2].contiguous(), output[:, :2].contiguous()
+    elif reason == "shape":
+        output = torch.empty((1, 16), dtype=source.dtype)
+    elif reason == "dtype":
+        output = output.float()
+    elif reason == "deterministic":
+        monkeypatch.setenv("SGLANG_USE_1STAGE_ALLREDUCE", "1")
+    elif reason == "disabled":
+        monkeypatch.setenv("SGLANG_DP_USE_REDUCE_SCATTER", "0")
+    else:
+        aiter_group.ca_comm.should_custom_ar.return_value = False
+    assert not aiter_group._maybe_aiter_reduce_scatter(output, source)
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+def test_aiter_reduce_scatter_empty_input_launches_no_kernel(aiter_group):
+    empty = torch.empty((0, 16), dtype=torch.bfloat16)
+    assert aiter_group._maybe_aiter_reduce_scatter(empty, empty)
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+def test_reduce_scatter_keeps_registered_compile_boundary(aiter_group, monkeypatch):
+    registered_op = Mock()
+    monkeypatch.setattr(parallel_state, "_is_npu", False)
+    monkeypatch.setattr(parallel_state, "reg_reduce_scatter_tensor", registered_op)
+    source, output = torch.ones((4, 8)), torch.empty((1, 8))
+    aiter_group.reduce_scatter_tensor(output, source)
+    registered_op.assert_called_once_with(
+        output, source, group_name="test_attention_tp"
+    )
+    aiter_group.ca_comm.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "memory_saver,copy_in", [(False, False), (False, True), (True, False)]
+)
+def test_aiter_all_gather_capture_copy_in(
+    aiter_group, monkeypatch, memory_saver, copy_in
+):
+    aiter_group.ca_comm._IS_CAPTURING = True
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", str(int(memory_saver)))
+    monkeypatch.setenv("SGLANG_AITER_CAPTURE_COPY_IN", str(int(copy_in)))
+    source, output = torch.ones((1, 8)), torch.empty((4, 8))
+    aiter_group._all_gather_into_tensor(output, source)
+    expected = "all_gather_unreg" if memory_saver or copy_in else "all_gather_reg"
+    getattr(aiter_group.ca_comm, expected).assert_called_once_with(
+        source, out=output, dim=0
+    )
+
+
 if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2()
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(pytest.main([__file__]))

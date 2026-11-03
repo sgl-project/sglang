@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import pickle
@@ -5,19 +6,30 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image
+from requests import HTTPError
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
+from sglang.bench_serving import (
+    RequestFuncOutput,
+    _finite_positive_float,
+    benchmark,
+    flush_server_cache,
+)
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
@@ -37,6 +49,141 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+
+
+class TestBenchmarkCacheFlush(unittest.TestCase):
+    def test_cache_flush_uses_the_backend_specific_request(self):
+        with (
+            patch("sglang.bench_serving.get_auth_headers", return_value={}),
+            patch("sglang.bench_serving.requests.post") as post,
+        ):
+            flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
+            post.assert_called_once_with(
+                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+            )
+            post.return_value.raise_for_status.assert_called_once_with()
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:30000", "sglang")
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 60.0},
+            )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:23333", "lmdeploy")
+            post.assert_called_once_with(
+                "http://127.0.0.1:23333/flush_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache(
+                "http://127.0.0.1:30000", "sglang-embedding", flush_cache_timeout=7.5
+            )
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 7.5},
+            )
+
+    def test_sglang_cache_flush_waits_for_idle(self):
+        request_received = threading.Event()
+        server_idle = threading.Event()
+
+        class DeferredFlushHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                url = urlparse(self.path)
+                timeout = float(parse_qs(url.query).get("timeout", ["0"])[0])
+                if timeout <= 0:
+                    status = 400
+                    request_received.set()
+                else:
+                    request_received.set()
+                    status = 200 if server_idle.wait(timeout) else 400
+                self.send_response(status)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), DeferredFlushHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                flush = executor.submit(flush_server_cache, base_url, "sglang", 5.0)
+                self.assertTrue(request_received.wait(timeout=5))
+                self.assertFalse(flush.done())
+                server_idle.set()
+                flush.result(timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+
+    def test_cli_rejects_invalid_flush_cache_timeout(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sglang.bench_serving",
+                "--flush-cache-timeout",
+                "inf",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("expected a finite float > 0", result.stderr)
+        for value in ("1e999", "0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _finite_positive_float(value)
+
+    def test_flush_failure_stops_before_measured_requests(self):
+        request_func = AsyncMock(return_value=RequestFuncOutput(success=True))
+        with (
+            patch(
+                "sglang.bench_serving.args",
+                SimpleNamespace(dataset_name="random", warmup_requests=1),
+                create=True,
+            ),
+            patch.dict(
+                "sglang.bench_serving.ASYNC_REQUEST_FUNCS", {"sglang": request_func}
+            ),
+            patch("sglang.bench_serving.requests.post") as post,
+        ):
+            post.return_value.raise_for_status.side_effect = HTTPError("flush refused")
+            with self.assertRaisesRegex(HTTPError, "flush refused"):
+                asyncio.run(
+                    benchmark(
+                        backend="sglang",
+                        api_url="http://127.0.0.1:30000/generate",
+                        base_url="http://127.0.0.1:30000",
+                        model_id="test",
+                        tokenizer=MagicMock(),
+                        input_requests=[
+                            DatasetRow(prompt="hello", prompt_len=1, output_len=64)
+                        ],
+                        request_rate=float("inf"),
+                        max_concurrency=1,
+                        disable_tqdm=True,
+                        lora_names=[],
+                        lora_request_distribution=None,
+                        lora_zipf_alpha=None,
+                        extra_request_body={},
+                        profile=False,
+                        flush_cache=True,
+                        flush_cache_timeout=7.5,
+                        warmup_requests=1,
+                    )
+                )
+            request_func.assert_awaited_once()
+            self.assertEqual(post.call_args.kwargs["params"], {"timeout": 7.5})
 
 
 class _DummyTokenTensor:

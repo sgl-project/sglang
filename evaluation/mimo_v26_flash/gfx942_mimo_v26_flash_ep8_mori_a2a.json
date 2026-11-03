@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi300x",
+  "kernel_type": "IntraNode",
+  "ep_size": 8,
+  "rules": [
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 2048,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 208,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 4096,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 296,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 8192,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 296,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 152,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 296,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 8192,
+      "hidden_dim": 4096,
+      "topk": 8,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 296,
+      "rdma_block_num": 0,
+      "warp_per_block": 16
+    }
+  ]
+}

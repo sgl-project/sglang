@@ -6,7 +6,6 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -116,7 +115,6 @@ if _use_aiter:
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
-
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -242,7 +240,6 @@ if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
-
     from sglang.srt.utils.custom_op import register_custom_op
 
     @register_custom_op(
@@ -859,13 +856,44 @@ def aiter_w8a8_block_fp8_linear(
     else:
         gemm_a8w8_blockscale_op = ck_gemm_a8w8_blockscale
 
-    output = gemm_a8w8_blockscale_op(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
+    if (
+        _use_aiter_ck_blockscale_bpreshuffle_gfx942
+        and use_bpreshuffle
+        and not q_input.is_contiguous()
+    ):
+        # Packed AG leaves padding between activation rows. CK/CKTile honor
+        # StrideA; some alternative tuned backends assume contiguous input.
+        from aiter.ops.gemm_op_a8w8 import (
+            AITER_CONFIGS,
+            gemm_a8w8_blockscale_bpreshuffle_ck,
+            gemm_a8w8_blockscale_bpreshuffle_cktile,
+            get_CKGEMM_config,
+        )
+
+        config = get_CKGEMM_config(
+            q_input.shape[0],
+            n,
+            k,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        )
+        ck_op = gemm_a8w8_blockscale_bpreshuffle_ck
+        kernel_name = ""
+        if config is not None and config["libtype"] in ("ck", "cktile"):
+            kernel_name = str(config["kernelName"])
+            if config["libtype"] == "cktile":
+                ck_op = gemm_a8w8_blockscale_bpreshuffle_cktile
+        output = torch.empty(
+            (q_input.shape[0], n), dtype=torch.bfloat16, device=q_input.device
+        )
+        ck_op(q_input, weight, x_scale, weight_scale, output, kernelName=kernel_name)
+    else:
+        output = gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
 
     if bias is not None:
         output += bias
