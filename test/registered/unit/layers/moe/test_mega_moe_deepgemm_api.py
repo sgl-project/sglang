@@ -397,27 +397,28 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
         self.assertNotIn("cumulative_local_expert_recv_stats", mega_call.kwargs)
 
-    def test_eplb_load_row_is_this_ranks_slice_of_the_recorder_row(self):
-        counts = torch.zeros(8, dtype=torch.int32)
-        buf = SimpleNamespace(
-            num_experts=8,
-            group=SimpleNamespace(size=lambda: 4, rank=lambda: 2),
+    def test_eplb_load_row_asks_the_recorder_for_this_ranks_slice(self):
+        row = torch.zeros(2, dtype=torch.int32)
+        recorder = MagicMock()
+        recorder.get_current_pass_local_count_buffer.return_value = row
+        group = SimpleNamespace(size=lambda: 4, rank=lambda: 2)
+        parallel = SimpleNamespace(moe_ep_group=SimpleNamespace(device_group=group))
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(num_experts=8), num_fused_shared_experts=0
         )
-        moe = SimpleNamespace(experts=SimpleNamespace(), num_fused_shared_experts=0)
-        recorder = SimpleNamespace(get_current_pass_count_buffer=lambda: counts)
         with (
             patch.object(
                 mega_moe,
                 "get_global_expert_distribution_recorder",
                 return_value=recorder,
             ),
-            patch.object(mega_moe, "_mega_moe_buffer", return_value=buf),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
             patch.object(mega_moe, "_device_sm", 100),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
         ):
-            mega_moe._local_eplb_load_row(moe).fill_(1)
-            torch.testing.assert_close(
-                counts, torch.tensor([0, 0, 0, 0, 1, 1, 0, 0], dtype=torch.int32)
+            self.assertIs(mega_moe._local_eplb_load_row(moe), row)
+            recorder.get_current_pass_local_count_buffer.assert_called_once_with(
+                num_experts=8, ep_rank=2, ep_size=4
             )
             for name, value in (
                 ("_device_sm", 90),
@@ -427,15 +428,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     self.assertIsNone(mega_moe._local_eplb_load_row(moe))
             shared = SimpleNamespace(experts=moe.experts, num_fused_shared_experts=1)
             self.assertIsNone(mega_moe._local_eplb_load_row(shared))
-            # No current layer (whole table), a recorder row of another width,
-            # recording off: the router keeps its histogram.
-            for table in (
-                torch.zeros((3, 8), dtype=torch.int32),
-                torch.zeros(12, dtype=torch.int32),
-                None,
-            ):
-                recorder.get_current_pass_count_buffer = lambda t=table: t
-                self.assertIsNone(mega_moe._local_eplb_load_row(moe))
 
     def test_v41_megamoe_selects_image_bias_on_local_rows(self):
         """Image rows must retain their router bias after attention-TP sharding.

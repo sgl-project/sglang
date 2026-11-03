@@ -459,23 +459,23 @@ def _run_mega_routed(
 def _local_eplb_load_row(moe: DeepseekV2MoE) -> Optional[torch.Tensor]:
     # MegaMoE adds the rows each local expert receives to this rank's slice of the
     # physical count row; the cross-rank sum at dump time gives the global counts.
-    counts = get_global_expert_distribution_recorder().get_current_pass_count_buffer()
     if (
-        counts is None
-        # No current layer: the recorder hands out the whole table.
-        or counts.dim() != 1
-        or _device_sm == 90
+        _device_sm == 90
         or _mega_moe_mma_type(moe.experts) != "fp8xfp4"
         # Per-rank shared slots are physical experts EPLB does not know about.
         or moe.num_fused_shared_experts > 0
     ):
         return None
-    buf = _mega_moe_buffer(moe)
-    if counts.numel() != buf.num_experts:
-        return None
-    num_local = buf.num_experts // buf.group.size()
-    start = buf.group.rank() * num_local
-    return counts[start : start + num_local]
+    from sglang.srt.runtime_context import get_parallel
+
+    group = get_parallel().moe_ep_group.device_group
+    return (
+        get_global_expert_distribution_recorder().get_current_pass_local_count_buffer(
+            num_experts=moe.experts.num_experts,
+            ep_rank=group.rank(),
+            ep_size=group.size(),
+        )
+    )
 
 
 def run_mega_routed_experts(
