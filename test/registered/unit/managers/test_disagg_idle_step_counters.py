@@ -21,7 +21,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import RequestList
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -544,7 +543,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.running_reqs = RunningReqs()
+        scheduler.running_reqs = RequestList()
         scheduler.prefill_launched_reqs = RequestList()
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
