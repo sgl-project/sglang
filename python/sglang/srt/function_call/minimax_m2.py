@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -13,6 +14,24 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_non_finite(literal: str) -> None:
+    raise json.JSONDecodeError("non-finite number", literal, 0)
+
+
+def _parse_finite_float(literal: str) -> float:
+    number = float(literal)
+    if not math.isfinite(number):
+        _reject_non_finite(literal)
+    return number
+
+
+def _loads_finite_json(value: str) -> Any:
+    """json.loads accepts 1e999 and NaN, which json.dumps would emit as invalid JSON."""
+    return json.loads(
+        value, parse_constant=_reject_non_finite, parse_float=_parse_finite_float
+    )
 
 
 class MinimaxM2Detector(BaseFormatDetector):
@@ -145,8 +164,13 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Normalize types
         normalized_types = [t.lower() for t in param_types]
 
-        # Try null first if it's in the list
-        if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+        # A nullable schema still accepts a real value, so only a null-only schema
+        # or a null literal maps to None.
+        if set(normalized_types) == {"null"} or value.lower() in (
+            "null",
+            "none",
+            "nil",
+        ):
             return None
 
         # Try each type in order of preference (most specific first, string as fallback)
@@ -180,7 +204,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                 try:
                     val = float(value)
                     return val if val != int(val) else int(val)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, OverflowError):
                     continue
             elif param_type in ["boolean", "bool"]:
                 lower_val = value.lower().strip()
@@ -191,13 +215,13 @@ class MinimaxM2Detector(BaseFormatDetector):
                 continue
             elif param_type in ["object", "array"]:
                 try:
-                    return json.loads(value)
+                    return _loads_finite_json(value)
                 except json.JSONDecodeError:
                     continue
 
         # Fallback: try JSON parse, then return as string
         try:
-            return json.loads(value)
+            return _loads_finite_json(value)
         except json.JSONDecodeError:
             return value
 
