@@ -2529,8 +2529,10 @@ def _nvfp4_main_host_size(
     mapping_lengths = [
         int(slots * rate) for rate in (main_bytes, index_bytes, *draft_byte_rates)
     ]
+    # Peek only: the pools bill their own mappings at construction, so booking
+    # the aggregate here would charge the shared scope twice.
     allocation_bytes, available_bytes = host_memory_preflight(
-        mapping_lengths, allocator, device
+        mapping_lengths, allocator, device, book=False
     )
     if allocation_bytes > available_bytes:
         raise ValueError(

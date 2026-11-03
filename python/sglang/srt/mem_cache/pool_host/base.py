@@ -272,6 +272,7 @@ def host_memory_preflight(
     device: Optional[Union[str, torch.device]] = None,
     *,
     auto_size: bool = False,
+    book: bool = True,
 ) -> HostMemoryPreflight:
     """Charge mapping_lengths against this rank's HiCache host-memory budget.
 
@@ -282,6 +283,10 @@ def host_memory_preflight(
     credited only when ``allocator`` maps MAP_HUGETLB for ``device``. The
     split is a snapshot, not a reservation: a mapping that loses the hugetlb
     race at mmap time still lands on plain RAM.
+
+    ``book=False`` only inspects the scope budget without charging it, for
+    aggregate stack-level checks whose constituent pools bill themselves at
+    construction.
     """
     available = _host_memory_budget.get()
     if available is not None:
@@ -300,9 +305,10 @@ def host_memory_preflight(
             plain_fallback = (
                 mode == HUGEPAGE_MODE_PREFER and plain_part > 0 and pool_part == 0
             )
-            if plain_fallback:
-                pool_rem = 0  # a plain fallback drains the live pool's rest
-            _host_memory_budget.set((plain_rem - plain_part, pool_rem - pool_part))
+            if book:
+                if plain_fallback:
+                    pool_rem = 0  # a plain fallback drains the live pool's rest
+                _host_memory_budget.set((plain_rem - plain_part, pool_rem - pool_part))
             # available_bytes predates the booking (and the pool-bucket close).
             if plain_fallback:
                 # An all-plain charge is measured unaligned, as outside a scope.
