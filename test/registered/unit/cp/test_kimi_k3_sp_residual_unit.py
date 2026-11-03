@@ -19,7 +19,7 @@ from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.layer_boundary import BatchVariant, TokenAxis
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank, AttnBankState
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import _sp_cp_rank_major_blocks
 from sglang.srt.runtime_context import get_context, get_parallel

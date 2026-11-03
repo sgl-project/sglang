@@ -328,7 +328,7 @@ class TestKimiK3CPMHAPreparation(CustomTestCase):
             self.assertFalse(pending, "Cache read raced a pending KV transfer")
             self.assertTrue(torch.isfinite(cache).all())
             events.append("read")
-            return cache
+            return SimpleNamespace(key=lambda: cache)
 
         kv_weight = torch.arange(64, dtype=torch.float32).view(4, 16) / 100
 
@@ -342,7 +342,7 @@ class TestKimiK3CPMHAPreparation(CustomTestCase):
         attention.q_b_proj_forward = Mock(side_effect=q_projection)
         attention.kv_b_proj = Mock(side_effect=kv_projection)
         attention.record_mla_cp_kv_producer_event = Mock(side_effect=record_ready)
-        pool = SimpleNamespace(get_key_buffer=read)
+        kv_layers = SimpleNamespace(read=read)
         context = SimpleNamespace(fetch_qkv_latent=lambda: local_latent)
 
         def parent_forward(positions, hidden_states, fb, zero_allocator, **kwargs):
@@ -358,7 +358,7 @@ class TestKimiK3CPMHAPreparation(CustomTestCase):
             patch(_MHA + "get_cp_strategy", return_value=strategy),
             patch(_MHA + "get_attn_tp_context", return_value=context),
             patch(_MHA + "resolve_attn_backend", return_value=SimpleNamespace()),
-            patch(_MHA + "get_token_to_kv_pool", return_value=pool),
+            patch(_MHA + "get_kv_layers", return_value=kv_layers),
             patch(_MHA + "_is_cuda", False),
             patch(_MHA + "_is_musa", False),
             patch(_MHA + "_use_aiter_gfx95", False),

@@ -18,11 +18,9 @@ from sglang.srt.layers.layer_boundary.adapters.overlap import (
     tbo_exit_rows,
 )
 from sglang.srt.layers.layer_boundary.boundary import _cp_moves
-from sglang.srt.layers.layer_boundary.construction import (
-    BatchVariant,
-    _bind_stage,
-)
+from sglang.srt.layers.layer_boundary.construction import _bind_stage
 from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
     EdgeContract,
     ExitRows,
     InputContract,
@@ -340,6 +338,7 @@ class StageDeclaration:
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
+    ordinary_tp_group: Optional[SumGroup] = None
     in_token_order: bool = False
     # The model keeps the residual replicated over CP and moves only the
     # attention operand (e.g. K3's full-sequence residual and snapshot bank).
@@ -444,6 +443,7 @@ def declare_attn(
     gathers_attn_tp_input=True,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
+    ordinary_tp_group=None,
     attn_tp_gather=None,
     in_token_order=False,
     replicated_cp_residual=False,
@@ -463,6 +463,8 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
+        ordinary_tp_group: Optional head partition on ordinary (unsharded)
+            batches, e.g. replicated prefill attention dispatched to TP decode.
         attn_tp_gather: Implementation of the gather over attention TP into
             this stage, tried before the boundary's own (see StageDeclaration).
         in_token_order: Compute scans the whole sequence in token order. On a
@@ -489,6 +491,7 @@ def declare_attn(
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
+        ordinary_tp_group=ordinary_tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
         replicated_cp_residual=replicated_cp_residual,
@@ -724,7 +727,12 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     owes = not sp and axes[TokenAxis.ATTN_TP] > 1
     group = SumGroup.ATTN_TP
     compute_rows = attention
-    if stage.tp_group is SumGroup.TP:
+    tp_group = (
+        stage.ordinary_tp_group
+        if variant is BatchVariant.ORDINARY and stage.ordinary_tp_group is not None
+        else stage.tp_group
+    )
+    if tp_group is SumGroup.TP:
         parallel = get_parallel()
         if parallel.attn_dp_size != 1 or sp or scattered:
             raise NotImplementedError(
@@ -739,7 +747,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             if parallel.attn_cp_size == parallel.tp_size and parallel.attn_cp_size > 1
             else SumGroup.TP
         )
-    elif stage.tp_group is not SumGroup.ATTN_TP:
+    elif tp_group is not SumGroup.ATTN_TP:
         raise ValueError("attention heads must be partitioned over ATTN_TP or TP")
     # On a CP extend a token-order stage takes the whole sequence.
     in_token_order = stage.in_token_order and variant is BatchVariant.CONTEXT_PARALLEL

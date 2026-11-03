@@ -52,7 +52,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -478,7 +478,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         ).split([k_dim, v_dim], dim=-1)
         key_cache_full = key_cache_full.contiguous()
         value_cache_full = value_cache_full.contiguous()
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(layer.layer_id).store(
             layer,
             KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
             key_cache_full,
@@ -600,7 +600,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 latent_full = torch.cat(
                     [chunks[index] for index in pending.cp_reverse_index], dim=0
                 )
-                get_token_to_kv_pool().set_mla_kv_buffer(
+                get_kv_layers().layer(layer.layer_id).store_mla(
                     layer,
                     pending.write_loc,
                     latent_full[..., : pending.kv_lora_rank],
@@ -626,7 +626,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         kv_lora_rank = k_nope.shape[-1]
         latent = torch.cat([k_nope, k_rope], dim=-1).contiguous()
         latent_full = self.gather_kv_cache(latent, forward_batch)
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(layer.layer_id).store_mla(
             layer,
             KVWriteLoc.for_batch(forward_batch),
             latent_full[..., :kv_lora_rank],

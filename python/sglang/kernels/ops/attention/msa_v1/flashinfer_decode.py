@@ -7,6 +7,8 @@ import math
 
 import torch
 
+from sglang.kernels.arch import current_arch
+
 WORKSPACE_BYTES = 256 * 1024 * 1024
 _PAGE_SIZE = 128
 _HEAD_DIM = 128
@@ -105,9 +107,7 @@ class FlashInferQ8K8Decode:
                 "FlashInfer workspace must be at least 256 MiB of contiguous device uint8"
             )
         self.workspace = workspace_buffer
-        sm_count = torch.cuda.get_device_properties(
-            compact_k.device
-        ).multi_processor_count
+        sm_count = current_arch().num_sms
         counter_bytes = ((max(query_rows * num_q_heads, sm_count) + 7) // 8) * 8 * 4
         self.counter = torch.zeros(counter_bytes, dtype=torch.uint8, **options)
         self.sm_scale = float(sm_scale)

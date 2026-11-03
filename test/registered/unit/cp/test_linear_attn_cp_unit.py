@@ -22,7 +22,7 @@ from sglang.srt.layers.layer_boundary import SumGroup, ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     DeepseekMLAForwardMixin,
 )
@@ -524,9 +524,9 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
             torch.cat([local, local])
         )
         self.pool = Mock()
-        self.enterContext(
-            patch(_ZIGZAG + "get_token_to_kv_pool", return_value=self.pool)
-        )
+        self.kv_layers = Mock()
+        self.kv_layers.layer.return_value = self.pool
+        self.enterContext(patch(_ZIGZAG + "get_kv_layers", return_value=self.kv_layers))
 
     @staticmethod
     def _batch():
@@ -557,7 +557,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         self.comm.wait_stream.assert_called_once_with(self.main)
         self.main.wait_event.assert_not_called()
         self.assertEqual(self.events, [])
-        self.pool.set_mla_kv_buffer.assert_not_called()
+        self.pool.store_mla.assert_not_called()
         pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
         self.assertIs(pending.inputs[0], self.key)
         self.assertIs(pending.inputs[2], self.batch.out_cache_loc)
@@ -586,8 +586,9 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         # Only the producer dependency is issued; finish must not wait for Q.
         self.comm.wait_stream.assert_called_once_with(self.main)
         self.assertEqual(self.gather.call_count, 2)
-        self.assertEqual(self.pool.set_mla_kv_buffer.call_count, 2)
-        first_write = self.pool.set_mla_kv_buffer.call_args.args
+        self.assertEqual(self.pool.store_mla.call_count, 2)
+        self.kv_layers.layer.assert_called_with(self.layer.layer_id)
+        first_write = self.pool.store_mla.call_args.args
         self.assertIs(first_write[0], self.layer)
         self.assertIsInstance(first_write[1], KVWriteLoc)
         self.assertIs(first_write[1].loc, self.batch.out_cache_loc)
@@ -608,10 +609,10 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
             next_batch, self.layer, self.key, self.rope
         )
         self.assertEqual(self.gather.call_count, 3)
-        self.assertEqual(self.pool.set_mla_kv_buffer.call_count, 3)
+        self.assertEqual(self.pool.store_mla.call_count, 3)
         self.main.wait_event.assert_called_with(self.events[1])
         torch.testing.assert_close(
-            self.pool.set_mla_kv_buffer.call_args.args[2],
+            self.pool.store_mla.call_args.args[2],
             self._expected_full(self.key + 20),
         )
 
@@ -628,7 +629,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         self.comm.wait_stream.assert_not_called()
         self.main.wait_event.assert_called_once_with(self.events[0])
         torch.testing.assert_close(
-            self.pool.set_mla_kv_buffer.call_args.args[2],
+            self.pool.store_mla.call_args.args[2],
             self._expected_full(self.key),
         )
 
@@ -645,7 +646,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
             )
         )
         self.gather.assert_not_called()
-        self.pool.set_mla_kv_buffer.assert_not_called()
+        self.pool.store_mla.assert_not_called()
         pending = self.batch.attn_cp_metadata.pending_mla_kv_materializations[1]
         self.assertFalse(pending.launched)
         self.assertIs(pending.group, self.group)
@@ -666,7 +667,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         self.comm.wait_event.assert_called_once_with(ready)
         self.comm.wait_stream.assert_not_called()
         torch.testing.assert_close(
-            self.pool.set_mla_kv_buffer.call_args.args[2], self._expected_full(self.key)
+            self.pool.store_mla.call_args.args[2], self._expected_full(self.key)
         )
 
     def test_unlaunched_preparation_is_drained_without_cache_write(self):
@@ -682,7 +683,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         )
         self.main.wait_stream.assert_called_once_with(self.comm)
         self.gather.assert_not_called()
-        self.pool.set_mla_kv_buffer.assert_not_called()
+        self.pool.store_mla.assert_not_called()
         self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
 
     def test_unlaunched_preparation_falls_back_to_synchronous_materialization(self):
@@ -698,9 +699,9 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         )
         self.main.wait_stream.assert_called_once_with(self.comm)
         self.gather.assert_called_once()
-        self.pool.set_mla_kv_buffer.assert_called_once()
+        self.pool.store_mla.assert_called_once()
         torch.testing.assert_close(
-            self.pool.set_mla_kv_buffer.call_args.args[2], self._expected_full(self.key)
+            self.pool.store_mla.call_args.args[2], self._expected_full(self.key)
         )
 
     def test_query_exception_cleans_unlaunched_preparation(self):
@@ -736,7 +737,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
             owner(None, None, self.batch, None)
         self.main.wait_stream.assert_called_once_with(self.comm)
         self.gather.assert_not_called()
-        self.pool.set_mla_kv_buffer.assert_not_called()
+        self.pool.store_mla.assert_not_called()
         self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
 
     def test_k3_records_readiness_only_for_eligible_cuda_overlap(self):
@@ -828,7 +829,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
         self.strategy.start_mla_kv_materialization(
             self.batch, self.layer, self.key, self.rope
         )
-        self.pool.set_mla_kv_buffer.side_effect = RuntimeError("cache write failed")
+        self.pool.store_mla.side_effect = RuntimeError("cache write failed")
         with self.assertRaisesRegex(RuntimeError, "cache write failed"):
             self.strategy.finish_mla_kv_materialization(self.batch, self.layer)
         self.gather.assert_called_once()
@@ -857,7 +858,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
                 self.batch, self.layer, self.key, self.rope
             )
         self.main.wait_stream.assert_called_once_with(self.comm)
-        self.pool.set_mla_kv_buffer.assert_not_called()
+        self.pool.store_mla.assert_not_called()
         self.assertEqual(self.events, [])
         self.assertFalse(self.batch.attn_cp_metadata.pending_mla_kv_materializations)
 
@@ -876,7 +877,7 @@ class TestKimiK3CPKVOverlap(CustomTestCase):
                 batch.attn_cp_metadata.reverse_split_len[:] = [1, 2, 1, 2]
                 batch.attn_cp_metadata.per_rank_actual_token[:] = [1, 5]
                 self.strategy.finish_mla_kv_materialization(batch, self.layer)
-                write = self.pool.set_mla_kv_buffer.call_args.args
+                write = self.pool.store_mla.call_args.args
                 self.assertIsInstance(write[1], KVWriteLoc)
                 self.assertIs(write[1].loc, original_loc)
                 self.assertEqual(write[1].physical, physical)
