@@ -20,13 +20,13 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
     _merge_glm_video_configs,

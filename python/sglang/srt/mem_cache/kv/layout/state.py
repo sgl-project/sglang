@@ -154,6 +154,7 @@ class StateView:
     replayssm_is_kda = False
     enable_linear_replayssm_spec = False
     replayssm_spec_fold = False
+    replayssm_request_ring = False
     replayssm_spec_write_pos = None
     replayssm_cache_base = None
     replayssm_is_flush = None

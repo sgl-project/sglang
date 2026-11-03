@@ -1101,7 +1101,6 @@ mod tests {
                 num_reserved_tokens: 0,
                 allow_auto_truncate,
                 enable_return_hidden_states: false,
-                default_priority: None,
             });
             let (input_ids, _) =
                 process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();
