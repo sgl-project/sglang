@@ -46,6 +46,9 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # Real rows per DP rank when the MoE input is a MAX_LEN DP gather; same
+    # resolution rule as moe_num_token_non_padded.
+    moe_dp_real_rows: Optional[Callable[[], Optional[torch.Tensor]]] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -94,10 +97,16 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            moe_dp_real_rows=forward_batch.moe_dp_real_rows,
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            moe_dp_real_rows=_current.moe_dp_real_rows,
+        )
     prev = set_forward_context(ctx)
     try:
         yield

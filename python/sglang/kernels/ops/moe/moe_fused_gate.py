@@ -11,6 +11,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
+from sglang.kernels.ops.moe.fill_padded_rows import _fill_dp_pad_rows
 
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -103,10 +104,12 @@ def _router_triton_kernel(
     bias_alt_ptr,
     input_ids_ptr,
     num_token_non_padded_ptr,
+    dp_real_rows_ptr,  # [num DP ranks] int64 (HAS_DP_ROWS)
     out_weights_ptr,  # [M, K] fp32
     out_indices_ptr,  # [M, K] int32
     out_packed_ptr,  # [M, K] int32 (HAS_PACKED)
     M,
+    dp_rows_per_rank,
     routed_scaling_factor,
     moe_softcapping,
     N: tl.constexpr,
@@ -128,6 +131,7 @@ def _router_triton_kernel(
     HAS_TOKEN_BIAS: tl.constexpr,
     BIAS_ALT_TOKEN_ID: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    HAS_DP_ROWS: tl.constexpr,  # rows form a MAX_LEN DP gather, real rows first
     HAS_PACKED: tl.constexpr,
     RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
@@ -176,6 +180,12 @@ def _router_triton_kernel(
     live_m = mask_m
     if HAS_PADDING:
         live_m = live_m & (offs_m < tl.load(num_token_non_padded_ptr))
+    if HAS_DP_ROWS:
+        # DP rank r owns rows [r * dp_rows_per_rank, (r + 1) * dp_rows_per_rank);
+        # the first dp_real_rows[r] of them are real.
+        dp_rank = offs_m // dp_rows_per_rank
+        dp_real = tl.load(dp_real_rows_ptr + dp_rank, mask=mask_m, other=0)
+        live_m = live_m & (offs_m - dp_rank * dp_rows_per_rank < dp_real)
     row_bias = bias[None, :]
     if HAS_TOKEN_BIAS:
         input_ids = tl.load(
@@ -310,7 +320,7 @@ def _router_triton_kernel(
         shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
         selected_vals = tl.where(is_shared, shared_weight, selected_vals)
         selected_idx = tl.where(is_shared, shared_idx, selected_idx)
-    if HAS_PADDING:
+    if HAS_PADDING or HAS_DP_ROWS:
         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
         selected_idx = tl.where(live_m[:, None], selected_idx, -1)
 
@@ -344,6 +354,17 @@ def _dummy_i32(device: torch.device) -> torch.Tensor:
     return t
 
 
+def _mask_dp_pad_routes(
+    routes: Tuple[torch.Tensor, torch.Tensor], dp_real_rows: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # The fast paths below have no padding mask; give them the Triton kernel's
+    # DP padding-row contract afterwards.
+    if dp_real_rows is not None:
+        _fill_dp_pad_rows(routes[0], dp_real_rows, 0.0)
+        _fill_dp_pad_rows(routes[1], dp_real_rows, -1)
+    return routes
+
+
 @debug_kernel_api
 def moe_fused_gate(
     scores: torch.Tensor,
@@ -362,6 +383,7 @@ def moe_fused_gate(
     input_ids: Optional[torch.Tensor] = None,
     bias_alt_token_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
+    dp_real_rows: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
@@ -374,6 +396,8 @@ def moe_fused_gate(
     partials ``[S, M, N]``, which the kernel sums over S in order first.
 
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
+    So do the padding rows of a MAX_LEN DP gather: with ``dp_real_rows`` (one integer
+    count per DP rank), the rows form one equal slot per rank, real rows first.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
     ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
@@ -453,13 +477,16 @@ def moe_fused_gate(
         and packed_out is None
         and not sqrtsoftplus_log1p
     ):
-        return _topk_gate_small_m(
-            scores,
-            bias,
-            topk=topk,
-            renormalize=renormalize,
-            routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        return _mask_dp_pad_routes(
+            _topk_gate_small_m(
+                scores,
+                bias,
+                topk=topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            ),
+            dp_real_rows,
         )
 
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
@@ -490,11 +517,15 @@ def moe_fused_gate(
             apply_routed_scaling_factor_on_output,
         )
         if moe_route_radix.covered(scores, bias, topk):
-            return moe_route_radix.route_radix(*radix_args, sorted=False)
+            return _mask_dp_pad_routes(
+                moe_route_radix.route_radix(*radix_args, sorted=False), dp_real_rows
+            )
 
     M, N = scores.shape
     K = topk
     K_routed = topk - num_fused_shared_experts
+    if dp_real_rows is not None and M % dp_real_rows.numel() != 0:
+        raise ValueError(f"{M} rows do not split into {dp_real_rows.numel()} DP slots")
     if num_expert_group > 1:
         assert N % num_expert_group == 0, "num_experts must be divisible by group count"
         assert 1 <= topk_group <= num_expert_group, "invalid topk_group"
@@ -534,10 +565,12 @@ def moe_fused_gate(
         bias_alt,
         input_ids,
         num_token_non_padded,
+        dp_real_rows,
         weights,
         indices,
         packed_out if packed_out is not None else _unused_i32,
         M,
+        M // dp_real_rows.numel() if dp_real_rows is not None else 1,
         float(routed_scaling_factor),
         float(moe_softcapping),
         N=N,
@@ -559,6 +592,7 @@ def moe_fused_gate(
         HAS_TOKEN_BIAS=input_ids is not None,
         BIAS_ALT_TOKEN_ID=bias_alt_token_id,
         HAS_PADDING=num_token_non_padded is not None,
+        HAS_DP_ROWS=dp_real_rows is not None,
         HAS_PACKED=packed_out is not None,
         RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,

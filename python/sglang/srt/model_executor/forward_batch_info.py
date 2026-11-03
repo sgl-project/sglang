@@ -66,6 +66,7 @@ from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
+    is_cuda,
     is_hip,
     is_npu,
     support_triton,
@@ -93,6 +94,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 
@@ -629,6 +631,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_token_non_padded: Optional[torch.Tensor] = None  # scalar, GLOBAL
     global_num_token_non_padded_cpu: int = None  # host int, GLOBAL
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar, LOCAL (derived)
+    # Real rows per DP rank (int64 [attn_dp_size]) when the MoE input is a
+    # MAX_LEN decode DP gather whose padding rows routing skips; None otherwise.
+    # See _dp_tp_moe_skips_pad_rows.
+    dp_real_rows_gpu: Optional[torch.Tensor] = None
 
     # Whether this forward's sequence is sharded across the attn-TP group (SP on)
     # vs. replicated; stamped per forward, defaults to replicated.
@@ -1359,6 +1365,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sharded=sharded,
         )
 
+    def moe_dp_real_rows(self) -> Optional[torch.Tensor]:
+        """Real rows per DP rank of a MAX_LEN DP-gathered MoE input, so routing
+        sends the padding rows to no expert; None for any other input layout."""
+        return self.dp_real_rows_gpu
+
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
@@ -1711,6 +1722,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        dp_real_rows = list(self.global_num_tokens_cpu)
         # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
         # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
         mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)
@@ -1899,11 +1911,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        if _kernel_writes_metadata(self.global_num_tokens_gpu.device):
+        device = self.global_num_tokens_gpu.device
+        if (
+            dp_padding_mode.is_max_len()
+            and not self.is_extend_in_batch
+            and self.spec_info is None
+            and _dp_tp_moe_skips_pad_rows()
+        ):
+            self.dp_real_rows_gpu = torch.empty(
+                len(dp_real_rows), dtype=torch.int64, device=device
+            )
+        if _kernel_writes_metadata(device):
             # One kernel writes the padded counts in place: a pinned host-to-device
             # copy would queue on the copy engine behind bulk transfers and hold up
             # this forward.
-            write_host_ints((self.global_num_tokens_gpu,), (global_num_tokens,))
+            if self.dp_real_rows_gpu is None:
+                write_host_ints((self.global_num_tokens_gpu,), (global_num_tokens,))
+            else:
+                write_host_ints(
+                    (self.global_num_tokens_gpu, self.dp_real_rows_gpu),
+                    (global_num_tokens, dp_real_rows),
+                )
         else:
             global_num_tokens_pinned = torch.tensor(
                 global_num_tokens, pin_memory=self.use_pin_memory
@@ -1911,6 +1939,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.global_num_tokens_gpu.copy_(
                 global_num_tokens_pinned, non_blocking=self.use_pin_memory
             )
+            if self.dp_real_rows_gpu is not None:
+                self.dp_real_rows_gpu.copy_(
+                    torch.tensor(
+                        dp_real_rows, dtype=torch.int64, pin_memory=self.use_pin_memory
+                    ),
+                    non_blocking=self.use_pin_memory,
+                )
         # Exchanged here, not in the model forward: every rank reaches this point
         # after reshaping its batch and before it picks a prefill graph or eager.
         if (
@@ -2242,6 +2277,30 @@ def enable_num_token_non_padded():
     # so the model needs the real count to zero the pad rows (see
     # deepseek_common.moe_transport).
     return _dp_tp_moe_masks_pad_rows()
+
+
+@lru_cache(maxsize=1)
+def _dp_tp_moe_skips_pad_rows() -> bool:
+    """CUDA: route the padding rows of a MAX_LEN decode DP gather to no expert.
+
+    DP attention + TP MoE gathers every rank's whole padded slot, and the router
+    would send each padding row to experts like a real token. Covers the layout
+    where each DP rank owns one contiguous slot of the gathered buffer.
+    """
+    from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+
+    parallel = get_parallel()
+    return (
+        _is_cuda
+        and envs.SGLANG_DP_MASK_PAD_ROWS.get()
+        and parallel.attn_dp_size > 1
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.moe_ep_size == 1
+        and not is_moe_input_scattered_across_dp_ranks()
+        and not world_dp_gather_enabled()
+        and not get_exec().overlap.enable_two_batch_overlap
+    )
 
 
 @lru_cache(maxsize=1)
