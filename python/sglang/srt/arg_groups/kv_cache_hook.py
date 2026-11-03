@@ -6,15 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -416,10 +415,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "--enable-prefill-weight-versions is not supported with SGLANG_RUST_SERVER"
             )
-        if cfg.enable_pdmux or cfg.dllm_algorithm is not None:
+        if cfg.dllm_algorithm is not None:
             raise ValueError(
                 "--enable-prefill-weight-versions is not supported with "
-                "--enable-pdmux or --dllm-algorithm"
+                "--dllm-algorithm"
             )
         if cfg.speculative_algorithm not in {None, "EAGLE", "EAGLE3", "DFLASH"}:
             raise ValueError(

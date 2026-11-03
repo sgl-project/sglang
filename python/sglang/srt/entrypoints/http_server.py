@@ -70,7 +70,7 @@ from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -81,8 +81,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
     node_hosts_rust_server,
-    run_detokenizer_process,
-    run_scheduler_process,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -126,6 +124,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -165,13 +164,16 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
-    TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_worker import (
+    TokenizerWorker,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
@@ -1876,8 +1878,10 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -3159,12 +3163,30 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
+        from sglang.srt.rust_server.server import drain_notify_name
+        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+        drain = None
+        # Without a local listener (the DP controller starts the schedulers),
+        # SIGTERM keeps its previous effect. Installed before the sidecar
+        # block, so SIGTERM stops the sidecar first and then reaches the drain.
+        if scheduler_init_result.rust_listener_procs:
+            drain = RustServerSigtermDrain(
+                scheduler_init_result.scheduler_procs,
+                scheduler_init_result.rust_listener_procs,
+                subprocess_watchdog,
+                drain_notify_name(port_args.instance_id),
+            )
+            drain.install()
         # Every listener is bound before its scheduler reports ready, so the
         # sidecar can connect at once.
         with rust_server_sidecar(node_hosts_rust_server()):
             if launch_callback is not None:
                 launch_callback()
-            scheduler_init_result.block_until_scheduler_exits()
+            if drain is not None:
+                drain.wait()
+            else:
+                scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,
