@@ -46,6 +46,13 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+    set_mla_kv_scale_buffer_triton,
+)
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -76,14 +83,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
-    set_mla_kv_buffer_dcp_sharded_triton,
-    set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
-    set_mla_kv_scale_buffer_triton,
-)
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (

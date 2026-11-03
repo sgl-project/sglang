@@ -8,18 +8,20 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     KVCache,
     MiniMaxSparseKVPool,
-    UnquantizedKVCacheMethod,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
