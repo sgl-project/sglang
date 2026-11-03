@@ -9,13 +9,17 @@ from torch import nn
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
     VocabParallelEmbeddingShardIndices,
 )
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpModel,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
+from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
@@ -241,6 +245,61 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
     assert emb.weight.device.type == "cpu" and emb.weight.is_pinned()
     assert emb.weight_scale.device.type == DEVICE
     assert not any(t.is_meta for t in (*layer.parameters(), *layer.buffers()))
+
+
+def test_qwen4_token_embedding_offload_matches_device_table(
+    single_rank_runtime_context,
+):
+    vocab_size, hidden_size = 4096, 256
+    config = SimpleNamespace(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        tie_word_embeddings=False,
+        ple_offload_token_embedding=True,
+    )
+    first_rank = SimpleNamespace(pp_group=SimpleNamespace(is_first_rank=True))
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    base = torch.accelerator.memory_allocated()
+    # The model loader builds every layer under the checkpoint dtype.
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        target = Qwen4ExpModel._build_embed_tokens(first_rank, config)
+    table_bytes = vocab_size * hidden_size * 2
+    assert torch.accelerator.max_memory_allocated() - base < table_bytes // 2
+    assert isinstance(target, Qwen4ExpPinnedHostEmbedding)
+    assert target.weight.device.type == "cpu" and target.weight.is_pinned()
+
+    rows = torch.randn(vocab_size, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    _load_rows(target, rows)
+    ids = torch.tensor([[0, vocab_size - 1, 5], [7, 7, 1]], device=DEVICE)
+    expected = nn.functional.embedding(ids, rows)
+    torch.testing.assert_close(target(ids), expected, rtol=0, atol=0)
+
+    # An MTP draft gathers from the target's host table instead of its own.
+    draft = Qwen4ExpForCausalLMMTP.__new__(Qwen4ExpForCausalLMMTP)
+    nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(tie_word_embeddings=False)
+    draft.model = nn.Module()
+    draft.lm_head = nn.Module()
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        draft.model.embed_tokens = VocabParallelEmbedding(vocab_size, hidden_size)
+        draft.lm_head.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
+        head = nn.Parameter(torch.empty(vocab_size, hidden_size), requires_grad=False)
+    draft.set_embed_and_head(target.weight, head)
+    draft_embed = draft.model.embed_tokens
+    assert isinstance(draft_embed, Qwen4ExpPinnedHostEmbedding)
+    assert draft_embed.weight.data_ptr() == target.weight.data_ptr()
+    assert draft.lm_head.weight is head
+    torch.testing.assert_close(draft_embed(ids), expected, rtol=0, atol=0)
+
+    with torch.device(DEVICE), set_default_torch_dtype(torch.bfloat16):
+        smaller = VocabParallelEmbedding(vocab_size // 2, hidden_size)
+    with pytest.raises(ValueError, match="shared host embedding table"):
+        Qwen4ExpPinnedHostEmbedding(smaller, host_table=target.weight)
+
+    config.tie_word_embeddings = True
+    with pytest.raises(ValueError, match="untied word embeddings"):
+        Qwen4ExpModel._build_embed_tokens(first_rank, config)
 
 
 def _file_backend_supported() -> bool:

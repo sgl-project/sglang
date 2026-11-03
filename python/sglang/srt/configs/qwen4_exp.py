@@ -33,6 +33,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ple_offload_embedding=False,
         ple_offload_backend="pinned",
         ple_offload_dir=None,
+        ple_offload_token_embedding=False,
         ple_embedding_dtype=None,
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
@@ -74,6 +75,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         # file-backed mmap for unified-memory devices); see --ple-offload-backend.
         self.ple_offload_backend = ple_offload_backend
         self.ple_offload_dir = ple_offload_dir
+        self.ple_offload_token_embedding = ple_offload_token_embedding
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
         # Draft decode steps reuse the draft-extend indexer top-k (IndexShare).
