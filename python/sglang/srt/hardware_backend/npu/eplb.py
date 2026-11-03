@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 
-def get_eplb_group():
+def get_eplb_group() -> dist.ProcessGroup | None:
     """Return a compatible TP device group, or None to select default WORLD."""
     if not dist.is_initialized():
         return None
@@ -50,7 +50,7 @@ def get_eplb_group():
     return tp_group.device_group
 
 
-def _warmup_eplb_communication(group):
+def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
     """Warm the selected TP group's collective and peer channels once."""
     resources = get_resources()
     if group is None or group is resources.npu_eplb_warmed_group:
@@ -78,8 +78,10 @@ def _warmup_eplb_communication(group):
 class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
     """Configure statistics communication and warm a reused TP group for migration."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self, expert_location_metadata: ExpertLocationMetadata, rank: int
+    ) -> None:
+        super().__init__(expert_location_metadata, rank)
         group = get_eplb_group()
         if get_exec().moe.enable_eplb:
             _warmup_eplb_communication(group)
