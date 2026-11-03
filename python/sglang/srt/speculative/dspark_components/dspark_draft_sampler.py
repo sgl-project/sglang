@@ -129,7 +129,7 @@ class DsparkDraftSampler:
     def _init_markov_walker(self, walker: MarkovWalker) -> None:
         assert walker.gamma == self.gamma, (walker.gamma, self.gamma)
         if not self.greedy_draft:
-            # The kernels write bf16 logits and leave temperature-0 rows' unwritten; a
+            # The kernel writes bf16 logits and leaves temperature-0 rows' unwritten; a
             # mixed accept still reads them.
             self.step_logits = torch.zeros(
                 (self.max_bs, self.gamma, walker.vocab),
@@ -305,7 +305,7 @@ def maybe_build_draft_sampler(
 def _int8_markov_walk_unsupported_reason(
     *, draft_model, megakernel: bool
 ) -> Optional[str]:
-    """None when the int8 kernels compute this drafter's default walk, up to the
+    """None when the int8 kernel computes this drafter's default walk, up to the
     int8 weights and bf16 rounding; MarkovWalker checks the GPU, rank and gamma."""
     if megakernel:
         return "the NVIDIA megakernel plugin runs the draft sampler"
@@ -327,7 +327,7 @@ def _int8_markov_walk_unsupported_reason(
         # The kernel reads base logits with row stride V, not a cropped slice.
         return f"lm_head vocab is padded to {lm_head.num_embeddings_padded}"
     if lm_head.weight.dtype != torch.bfloat16:
-        return f"lm_head is {lm_head.weight.dtype}, the kernels read bf16 base logits"
+        return f"lm_head is {lm_head.weight.dtype}, the kernel reads bf16 base logits"
     return None
 
 

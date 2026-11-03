@@ -76,8 +76,8 @@ register_kernel(
     )
 )
 
-# Exactly SM90: int8 mma.sync / wgmma kernels launched as cooperative grids,
-# tuned on H100.
+# Exactly SM90: an int8 wgmma kernel launched as a cooperative grid, tuned on
+# H100.
 register_kernel(
     KernelSpec(
         op="speculative.dspark_markov_walk",

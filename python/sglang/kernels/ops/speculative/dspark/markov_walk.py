@@ -2,7 +2,7 @@
 """Fused int8 DSpark markov walk for a vanilla markov head (rank 256) on Hopper.
 
 One persistent cooperative launch per round replaces the default walk's gamma x
-(W2 GEMV + add + sample) launches (``jit/csrc/speculative/dspark_markov_walk_*``)::
+(W2 GEMV + add + sample) launches (``jit/csrc/speculative/dspark_markov_walk.cuh``)::
 
     prev = anchor
     for k < gamma:
@@ -16,12 +16,8 @@ the default walk on the bf16 weights. The logits are rounded to bf16 once; argma
 and sampler read exactly those values, and ``corrected_out`` receives exactly
 those bits, which is what the verifier rebuilds q = softmax(corrected / T) from.
 
-Layout modes, from V and the SM count (tiles = ceil(V / (#SMs x 64)) wgmma tiles
-of 64 rows per CTA):
-
-* standard (tiles <= 18): bs 1..4 -> small_batch, bs 5..64 -> wgmma;
-* big vocabulary (18 < tiles <= 32): wgmma for every bs, its W2 partly streamed
-  from L2, since small_batch keeps all of W2 on chip.
+W2 is cut into 64-row wgmma tiles, max(18, ceil(V / (#SMs x 64))) <= 32 per CTA;
+each CTA keeps WGMMA_RES of them in shared memory and streams the others from L2.
 """
 
 from __future__ import annotations
@@ -36,15 +32,13 @@ from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-MARKOV_RANK = 256  # hard-wired in every kernel: 528-B W1 rows, 8 k32 chunks
+MARKOV_RANK = 256  # hard-wired in the kernel: 528-B W1 rows, 8 k32 chunks
 MAX_STEPS = 256  # kMaxSteps: the Philox counters pack the step into 8 bits
 MAX_BS = 64  # kMaxBatch
-SMALL_BATCH_MAX_BS = 4  # serving dispatch; the small_batch launcher takes up to 8
-ROWS_CTA = 1152  # standard: 72 16-row tiles (small_batch), 18 64-row (wgmma)
 W1_ROW_BYTES = 528  # 256 q_hi + 256 q_lo + s_hi f32 + s_lo f32 + 8 pad
 WGMMA_TILE_ROWS = 64  # one wgmma N = 64 B operand, 16 KiB
 WGMMA_RES, WGMMA_RING = 11, 2  # wgmma template parameters kRes, kRing
-WGMMA_TILES = ROWS_CTA // WGMMA_TILE_ROWS
+WGMMA_TILES = 18  # per CTA when V fits: 132 SMs x 18 x 64 = 152,064 rows
 WGMMA_MAX_TILES = 32  # the stream mask is a 32-bit word
 # Measured on H100 SXM (132 SMs): the 18-tile layout streams these tiles.
 WGMMA_MASK = sum(1 << t for t in (1, 2, 4, 7, 9, 11, 14))
@@ -63,34 +57,23 @@ WGMMA_RHO = [
 
 def _require_sm90() -> None:
     if torch.cuda.get_device_capability() != (9, 0):
-        raise RuntimeError("The DSpark markov-walk kernels need sm_90 (Hopper).")
+        raise RuntimeError("The DSpark markov-walk kernel needs sm_90 (Hopper).")
 
 
 @cache_once
-def _jit_small_batch_module() -> Module:
-    _require_sm90()
-    return load_jit(
-        "dspark_markov_walk_small_batch",
-        cuda_files=["speculative/dspark_markov_walk_small_batch.cuh"],
-        cuda_wrappers=[("walk", "dspark_markov_walk::small_batch::walk")],
-    )
-
-
-@cache_once
-def _jit_wgmma_module(tiles: int, stream_mask: int) -> Module:
+def _jit_walk_module(tiles: int, stream_mask: int) -> Module:
     _require_sm90()
     args = make_cpp_args(tiles, WGMMA_RES, WGMMA_RING, stream_mask)
     return load_jit(
-        "dspark_markov_walk_wgmma",
+        "dspark_markov_walk",
         *args,
-        cuda_files=["speculative/dspark_markov_walk_wgmma.cuh"],
-        cuda_wrappers=[("walk", f"dspark_markov_walk::wgmma::walk<{args}>")],
+        cuda_files=["speculative/dspark_markov_walk.cuh"],
+        cuda_wrappers=[("walk", f"dspark_markov_walk::walk<{args}>")],
     )
 
 
 def _wgmma_tiles_for(vocab: int, num_sms: int) -> int:
-    """wgmma tiles per CTA: the standard 18 whenever V fits (then small_batch
-    fits too), else the minimum."""
+    """wgmma tiles per CTA: the standard 18 whenever V fits, else the minimum."""
     need = -(-vocab // (num_sms * WGMMA_TILE_ROWS))
     if need > WGMMA_MAX_TILES:
         raise ValueError(
@@ -138,7 +121,7 @@ def _wgmma_stream_mask(tiles: int) -> int:
 def quantize_markov(
     w1: torch.Tensor, w2: torch.Tensor, *, chunk_rows: int = 16384
 ) -> dict[str, torch.Tensor]:
-    """The int8 planes every layout is cut from, chunk_rows rows at a time.
+    """The int8 planes the layouts are cut from, chunk_rows rows at a time.
 
     W2 [V, 256]: per-row scale max|w| / 127 (at least 1e-30), q_w2 =
     round(w / scale) clamped to +-127. W1 [V, 256]: u ~= s_hi q_hi + s_lo q_lo,
@@ -171,45 +154,20 @@ def quantize_markov(
     return out
 
 
-def _build_frag(qp: torch.Tensor) -> torch.Tensor:
-    """small_batch: padded int8 rows -> m16n8k32 A fragments [tiles, 8
-    chunks, 32 lanes, 16 B]; lane bytes 4q..4q+3 = row g + 8 (q & 1), cols
-    32 j + 4 tig + 16 (q >> 1) + i."""
-    lane = torch.arange(32, device=qp.device)
-    g, tig = lane // 4, lane % 4
-    byte = torch.arange(16, device=qp.device)
-    quad, i = byte // 4, byte % 4
-    rows = g[:, None] + 8 * (quad[None] & 1)
-    cols = 4 * tig[:, None] + 16 * (quad[None] >> 1) + i[None]
-    n_tiles = qp.shape[0] // 16
-    frag = qp.view(n_tiles, 16, 8, 32).permute(0, 2, 1, 3)[:, :, rows, cols]
-    return frag.contiguous().view(-1)
-
-
-def _w1_row(planes: dict[str, torch.Tensor], q: torch.Tensor) -> torch.Tensor:
-    """W1 rows: the 512 q bytes | s_hi f32 | s_lo f32 | pad."""
-    vocab, dev = q.shape[0], q.device
+def _build_w1f(planes: dict[str, torch.Tensor]) -> torch.Tensor:
+    """W1 rows [V, 528]: the 512 q bytes in A-fragment order (per chunk j and tig,
+    q_hi(32j+4tig..) | q_lo(..) | q_hi(32j+16+4tig..) | q_lo(..), 4 B each, so the
+    per-step gather is 8 LDG.128 straight into the fragment registers) | s_hi f32 |
+    s_lo f32 | pad."""
+    vocab, dev = planes["q_hi"].shape[0], planes["q_hi"].device
+    hi = planes["q_hi"].view(vocab, 8, 2, 4, 4)
+    lo = planes["q_lo"].view(vocab, 8, 2, 4, 4)
+    q = torch.stack([hi[:, :, 0], lo[:, :, 0], hi[:, :, 1], lo[:, :, 1]], dim=3)
     row = torch.zeros(vocab, W1_ROW_BYTES, dtype=torch.uint8, device=dev)
     row[:, :512] = q.reshape(vocab, 512).view(torch.uint8)
     scales = torch.stack([planes["s_hi"], planes["s_lo"]], 1).contiguous()
     row[:, 512:520] = scales.view(torch.uint8)
     return row
-
-
-def _build_w1q(planes: dict[str, torch.Tensor]) -> torch.Tensor:
-    """small_batch: q_hi[256] | q_lo[256]."""
-    return _w1_row(planes, torch.cat([planes["q_hi"], planes["q_lo"]], 1))
-
-
-def _build_w1f(planes: dict[str, torch.Tensor]) -> torch.Tensor:
-    """wgmma, A-fragment order: per chunk j and tig, q_hi(32j+4tig..) | q_lo(..) |
-    q_hi(32j+16+4tig..) | q_lo(..), 4 B each, so the per-step gather is 8 LDG.128
-    straight into the fragment registers."""
-    vocab = planes["q_hi"].shape[0]
-    hi = planes["q_hi"].view(vocab, 8, 2, 4, 4)
-    lo = planes["q_lo"].view(vocab, 8, 2, 4, 4)
-    q = torch.stack([hi[:, :, 0], lo[:, :, 0], hi[:, :, 1], lo[:, :, 1]], dim=3)
-    return _w1_row(planes, q)
 
 
 def _build_wgmma_tiles(
@@ -229,7 +187,7 @@ def _build_wgmma_tiles(
 
 
 class MarkovWalkWeights(msgspec.Struct, frozen=True):
-    """The int8 layouts the kernels read; small_batch ones in standard mode only."""
+    """The int8 layouts the kernel reads."""
 
     vocab: int
     tiles: int  # wgmma tiles per CTA
@@ -238,12 +196,6 @@ class MarkovWalkWeights(msgspec.Struct, frozen=True):
     w2_res: torch.Tensor  # int8 [grid, WGMMA_RES, 16384]
     w2_str: torch.Tensor  # int8 [grid, tiles - WGMMA_RES, 16384]
     w1f: torch.Tensor  # uint8 [V, 528]
-    frag: Optional[torch.Tensor]  # int8 [rows_pad * 256]
-    w1q: Optional[torch.Tensor]  # uint8 [V, 528]
-
-    @property
-    def big_vocab(self) -> bool:
-        return self.tiles != WGMMA_TILES
 
 
 def _build_weights(
@@ -251,15 +203,13 @@ def _build_weights(
 ) -> MarkovWalkWeights:
     vocab = w2.shape[0]
     tiles = _wgmma_tiles_for(vocab, num_sms)
-    big_vocab = tiles != WGMMA_TILES
-    stream_mask = _wgmma_stream_mask(tiles) if big_vocab else WGMMA_MASK
+    stream_mask = WGMMA_MASK if tiles == WGMMA_TILES else _wgmma_stream_mask(tiles)
     rows_cta = tiles * WGMMA_TILE_ROWS
     rows_pad = -(-vocab // rows_cta) * rows_cta
     planes = quantize_markov(w1, w2)
     qp = torch.zeros(rows_pad, MARKOV_RANK, dtype=torch.int8, device=w2.device)
     qp[:vocab] = planes.pop("q_w2")
     w2_res, w2_str = _build_wgmma_tiles(qp, tiles=tiles, stream_mask=stream_mask)
-    frag = None if big_vocab else _build_frag(qp)
     del qp
     row_scale = torch.full((rows_pad,), 1e-30, dtype=torch.float32, device=w2.device)
     row_scale[:vocab] = planes["row_scale"]
@@ -271,24 +221,15 @@ def _build_weights(
         w2_res=w2_res,
         w2_str=w2_str,
         w1f=_build_w1f(planes),
-        frag=frag,
-        w1q=None if big_vocab else _build_w1q(planes),
     )
 
 
-def _kernel_for(bs: int, *, big_vocab: bool) -> str:
-    if big_vocab or bs > SMALL_BATCH_MAX_BS:
-        return "wgmma"
-    return "small_batch"
-
-
-class MarkovWalkStates(msgspec.Struct, frozen=True):
-    """One exchange state per kernel, zeroed once and never reset: its round
-    counter advances in-kernel. small_batch exists in standard mode only."""
+class MarkovWalkState(msgspec.Struct, frozen=True):
+    """The kernel's exchange state, zeroed once and never reset: its round
+    counter advances in-kernel."""
 
     steps: int  # capacity: serves any num_steps <= steps
-    small_batch: Optional[torch.Tensor]
-    wgmma: torch.Tensor
+    buffer: torch.Tensor
 
     @staticmethod
     def words(steps: int) -> int:
@@ -297,37 +238,18 @@ class MarkovWalkStates(msgspec.Struct, frozen=True):
         return 16 + 2 * steps * MAX_BS * 16
 
     @classmethod
-    def zeros(
-        cls, *, steps: int, big_vocab: bool, device: torch.device
-    ) -> MarkovWalkStates:
-        def make(kind: str) -> Optional[torch.Tensor]:
-            if big_vocab and kind != "wgmma":
-                return None
-            return torch.zeros(cls.words(steps), dtype=torch.int64, device=device)
-
-        return cls(
-            steps=steps,
-            small_batch=make("small_batch"),
-            wgmma=make("wgmma"),
-        )
-
-    def tensors(self) -> list[torch.Tensor]:
-        return [t for t in (self.small_batch, self.wgmma) if t is not None]
+    def zeros(cls, *, steps: int, device: torch.device) -> MarkovWalkState:
+        buffer = torch.zeros(cls.words(steps), dtype=torch.int64, device=device)
+        return cls(steps=steps, buffer=buffer)
 
 
-# One Philox key per kernel: their counters overlap, and a request moving between
-# kernels (a batch of 4 growing to 5) must not replay noise.
-_SEED_SALTS = {
-    "small_batch": 0x2545F4914F6CDD1D,
-    "wgmma": 0x5851F42D4C957F2D,
-}
 _SEED_MASK = (1 << 63) - 1
 
 
 def markov_walk(
     *,
     weights: MarkovWalkWeights,
-    states: MarkovWalkStates,
+    state: MarkovWalkState,
     base_logits: torch.Tensor,
     anchor: torch.Tensor,
     temps: torch.Tensor,
@@ -335,46 +257,31 @@ def markov_walk(
     corrected_out: Optional[torch.Tensor],
     seed: int,
 ) -> None:
-    """One round of the int8 markov walk, the kernel picked by bs (module
-    docstring).
+    """One round of the int8 markov walk.
 
     base_logits bf16 [bs, num_steps, V], V = weights.vocab; anchor int64 [bs];
     temps fp32 [bs] (<= 0 or NaN: greedy, T > 0 clamped to [1e-5, 1e4]);
     tokens_out int64 [bs * num_steps], row-major; corrected_out None or bf16
-    shaped like base_logits, written for T > 0 only; num_steps <= states.steps.
-    The launchers check every tensor. No host sync and no allocation: capturable
-    into a CUDA graph once every kernel has run (MarkovWalker.warmup).
+    shaped like base_logits, written for T > 0 only; num_steps <= state.steps.
+    The launcher checks every tensor. No host sync and no allocation: capturable
+    into a CUDA graph once the kernel has run (MarkovWalker.warmup).
     """
-    bs, num_steps, _ = base_logits.shape
-    kind = _kernel_for(bs, big_vocab=weights.big_vocab)
-    seed = (seed ^ _SEED_SALTS[kind]) & _SEED_MASK
-    tail = (temps, num_steps, weights.vocab, seed)
-    if kind == "wgmma":
-        module = _jit_wgmma_module(weights.tiles, weights.stream_mask)
-        module.walk(
-            weights.w2_res,
-            weights.w2_str,
-            weights.row_scale,
-            weights.w1f,
-            base_logits,
-            anchor,
-            tokens_out,
-            corrected_out,
-            states.wgmma,
-            *tail,
-        )
-    else:
-        _jit_small_batch_module().walk(
-            weights.frag,
-            weights.row_scale,
-            weights.w1q,
-            base_logits,
-            anchor,
-            tokens_out,
-            corrected_out,
-            states.small_batch,
-            *tail,
-        )
+    num_steps = base_logits.shape[1]
+    _jit_walk_module(weights.tiles, weights.stream_mask).walk(
+        weights.w2_res,
+        weights.w2_str,
+        weights.row_scale,
+        weights.w1f,
+        base_logits,
+        anchor,
+        tokens_out,
+        corrected_out,
+        state.buffer,
+        temps,
+        num_steps,
+        weights.vocab,
+        seed & _SEED_MASK,
+    )
 
 
 class MarkovWalker:
@@ -392,7 +299,7 @@ class MarkovWalker:
     * tokens_out: int64 [bs * gamma], contiguous, row-major b * gamma + k.
     * corrected_out: None or bf16 [bs * gamma, V], written ONLY for requests with
       T > 0; other rows keep their contents.
-    * One zeroed state buffer per kernel; its round counter advances in-kernel, so every
+    * One zeroed state buffer; its round counter advances in-kernel, so every
       replay of a captured graph draws fresh noise from the fixed seed. Calls
       must be serialized on one stream.
     * No host sync and no allocation: capturable into a CUDA graph after
@@ -438,24 +345,17 @@ class MarkovWalker:
         )
         # Capacity in whole 16-step units: on H100 the exchange-line placement of
         # an exact-gamma state cost up to 1.7% against the 16-step one.
-        self.states = MarkovWalkStates.zeros(
-            steps=-(-self.gamma // 16) * 16,
-            big_vocab=self.weights.big_vocab,
-            device=self.device,
+        self.state = MarkovWalkState.zeros(
+            steps=-(-self.gamma // 16) * 16, device=self.device
         )
         self.anchor_buf = torch.zeros(MAX_BS, dtype=torch.int64, device=self.device)
         self._greedy_temps = torch.zeros(
             MAX_BS, dtype=torch.float32, device=self.device
         )
-        if not self.weights.big_vocab:
-            _jit_small_batch_module()
-        _jit_wgmma_module(self.weights.tiles, self.weights.stream_mask)
+        _jit_walk_module(self.weights.tiles, self.weights.stream_mask)
 
     def supports(self, bs: int) -> bool:
         return 1 <= bs <= self.max_bs
-
-    def kernel_for(self, bs: int) -> str:
-        return _kernel_for(bs, big_vocab=self.weights.big_vocab)
 
     def walk(
         self,
@@ -477,7 +377,7 @@ class MarkovWalker:
         anchors.copy_(anchor)
         markov_walk(
             weights=self.weights,
-            states=self.states,
+            state=self.state,
             base_logits=base_logits,
             anchor=anchors,
             temps=self._greedy_temps[:bs] if temps is None else temps,
@@ -490,10 +390,10 @@ class MarkovWalker:
         return tokens_out.view(bs, steps)
 
     def warmup(self, bs_list: Optional[Sequence[int]] = None) -> None:
-        """Run every kernel greedy and sampling once; required before any graph
+        """Run the kernel greedy and sampling once; required before any graph
         capture (see walk()). Every walk's tokens are range-checked."""
         if bs_list is None:
-            candidates = (1, min(4, self.max_bs), 5, 33, self.max_bs)
+            candidates = (1, 33, self.max_bs)
             bs_list = sorted({b for b in candidates if self.supports(b)})
         n, k, vocab = max(bs_list), self.gamma, self.vocab
         with torch.cuda.device(self.device), torch.no_grad():
@@ -526,7 +426,6 @@ class MarkovWalker:
 
     def memory_bytes(self) -> int:
         w = self.weights
-        tensors = [w.row_scale, w.w2_res, w.w2_str, w.w1f, w.frag, w.w1q]
-        tensors += [self.anchor_buf, self._greedy_temps]
-        tensors += self.states.tensors()
-        return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+        tensors = [w.row_scale, w.w2_res, w.w2_str, w.w1f]
+        tensors += [self.anchor_buf, self._greedy_temps, self.state.buffer]
+        return sum(t.numel() * t.element_size() for t in tensors)

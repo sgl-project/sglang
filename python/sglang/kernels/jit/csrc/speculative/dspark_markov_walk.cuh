@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Batched int8 DSpark markov walk (serving: bs 5..64 at the standard vocabulary, every bs 1..64 for big vocabularies):
-// wgmma with u as the register A operand and W2 as the SMEM B operand, so the register file holds no W2 and W2 may
-// partly stream from L2.
+// Int8 DSpark markov walk for bs 1..64: wgmma with u as the register A operand and W2 as the SMEM B operand, so the
+// register file holds no W2 and W2 may partly stream from L2. python/sglang/kernels/ops/speculative/dspark/
+// markov_walk.py builds the weight layouts.
 //
 //   for every request b:  prev_b = anchor_b;  for k < K:  logit = bf16(base[b, k] + W2 W1[prev_b]);
 //                         tok[b, k] = argmax(logit)  or  a sample of softmax(logit / T_b);  prev_b = tok[b, k]
@@ -32,13 +32,17 @@
 // Work split: ceil(nb / 32) request blocks, 4 / blocks warpgroups per block; warpgroup w serves block w / wpb and
 // tiles t = w (mod wpb). Rows reach a thread in increasing order, so strict > keeps the smallest row. After the tiles,
 // warp 0 runs the cross-CTA exchange for every request (lane l: requests l and l + 32, polled together). Vocabulary
-// rows [valid_rows, rows_pad), the last CTA's last tiles, are never loaded or stored. State: as
-// dspark_markov_walk_small_batch.cuh.
+// rows [valid_rows, rows_pad), the last CTA's last tiles, are never loaded or stored.
+// State: int64 [16 + 2 S kStepWords] = round | pad to 128 B | two sets of [S >= num_steps][64 requests] {key, count}
+// pairs. Round r uses set r & 1; CTA 0 clears the other set at the start and stores round + 1 after the last step.
+// Nothing is reset between launches.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/mbarrier.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -47,13 +51,122 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
 
-#include "dspark_markov_walk_common.cuh"
 #include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace sglang::device::ptx {
+
+SGL_DEVICE uint64_t ld_relaxed_u64(const uint64_t* ptr) {
+  uint64_t value;
+  asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+  return value;
+}
+
+SGL_DEVICE void st_relaxed_u64(uint64_t* ptr, uint64_t value) {
+  asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" ::"l"(ptr), "l"(value) : "memory");
+}
+
+// Cross-CTA exchange. Per (step, request) a 16-B aligned pair {key, count}: every CTA posts red.max(key, its best)
+// then red.release.add(count, 1), and polls the pair with ld_relaxed_v2_u64 until count == gridDim.x; that load's
+// key is the global max.
+// HARDWARE ASSUMPTION: a 16-B aligned ld.relaxed.gpu.v2.u64 observes both words at one point in L2, so the load that
+// sees the final count also sees every max ordered before it. PTX does not promise this (vector accesses are
+// unordered scalar accesses, and a relaxed load does not synchronize with the release); it holds on H100, where an
+// aligned 16-B load is one L2 sector access.
+SGL_DEVICE void ld_relaxed_v2_u64(const uint64_t* ptr, uint64_t (&value)[2]) {
+  asm volatile("ld.relaxed.gpu.global.v2.u64 {%0, %1}, [%2];" : "=l"(value[0]), "=l"(value[1]) : "l"(ptr) : "memory");
+}
+
+// CUDA has no atomicMax for uint64_t (unsigned long)
+SGL_DEVICE void red_relaxed_max_u64(uint64_t* ptr, uint64_t value) {
+  asm volatile("red.relaxed.gpu.global.max.u64 [%0], %1;" ::"l"(ptr), "l"(value) : "memory");
+}
+
+// No return value: a returning atom would make the following poll wait for its round trip
+SGL_DEVICE void red_release_add_u64(uint64_t* ptr, uint64_t value) {
+  asm volatile("red.release.gpu.global.add.u64 [%0], %1;" ::"l"(ptr), "l"(value) : "memory");
+}
+
+SGL_DEVICE uint64_t create_policy_evict_first() {
+  uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+  return policy;
+}
+
+SGL_DEVICE void prefetch_l2_evict_last(const void* ptr) {
+  asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(ptr));
+}
+
+SGL_DEVICE void fence_mbarrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+// mbar_wait_parity with a memory clobber, so the SMEM the barrier tracks is read after it
+SGL_DEVICE void mbar_wait(uint64_t* bar, uint32_t parity) {
+  uint32_t done = 0;
+  do {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, p;\n\t}"
+        : "=r"(done)
+        : "r"(to_shared(bar)), "r"(parity)
+        : "memory");
+  } while (!done);
+}
+
+// global -> this CTA's SMEM (the .shared::cluster destination is this CTA's SMEM without a cluster launch)
+SGL_DEVICE void cp_async_bulk_g2s(void* smem, const void* gmem, uint32_t bytes, uint64_t* bar, uint64_t policy) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::
+          "r"(to_shared(smem)),
+      "l"(gmem),
+      "r"(bytes),
+      "r"(to_shared(bar)),
+      "l"(policy)
+      : "memory");
+}
+
+// An 8-row run's bf16 logits as 4 packed pairs p0..p3 (pair i = rows 2i (low half), 2i + 1 (high half)).
+// bf16x8_max: their max in both halves; bf16x8_first_eq: the first row whose value equals m (ties take the smallest
+// row, as torch.argmax). HMNMX2 / HSETP2 on the packed values, no unpacking to fp32.
+SGL_DEVICE uint32_t bf16x8_max(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3) {
+  uint32_t m;
+  asm("{\n\t.reg .b32 a, b;\n\t"
+      "max.bf16x2 a, %1, %2;\n\tmax.bf16x2 b, %3, %4;\n\tmax.bf16x2 a, a, b;\n\t"
+      "prmt.b32 b, a, a, 0x1032;\n\tmax.bf16x2 %0, a, b;\n\t}"
+      : "=r"(m)
+      : "r"(p0), "r"(p1), "r"(p2), "r"(p3));
+  return m;
+}
+
+SGL_DEVICE int32_t bf16x8_first_eq(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t m) {
+  int32_t row;
+  asm("{\n\t.reg .pred e0, e1, e2, e3, e4, e5, e6, e7;\n\t"
+      "setp.eq.bf16x2 e0|e1, %1, %5;\n\tsetp.eq.bf16x2 e2|e3, %2, %5;\n\t"
+      "setp.eq.bf16x2 e4|e5, %3, %5;\n\tsetp.eq.bf16x2 e6|e7, %4, %5;\n\t"
+      "mov.b32 %0, 7;\n\t@e6 mov.b32 %0, 6;\n\t@e5 mov.b32 %0, 5;\n\t@e4 mov.b32 %0, 4;\n\t"
+      "@e3 mov.b32 %0, 3;\n\t@e2 mov.b32 %0, 2;\n\t@e1 mov.b32 %0, 1;\n\t@e0 mov.b32 %0, 0;\n\t}"
+      : "=r"(row)
+      : "r"(p0), "r"(p1), "r"(p2), "r"(p3), "r"(m));
+  return row;
+}
+
+// MUFU lg2 / ex2 without the denormal fix-up around every MUFU: for a normal argument .ftz returns the same bits, and
+// every caller passes normal numbers
+SGL_DEVICE float lg2_approx_ftz(float x) {
+  float y;
+  asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+SGL_DEVICE float ex2_approx_ftz(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
 
 SGL_DEVICE void wgmma_fence() {
   asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -150,7 +263,98 @@ SGL_DEVICE int32_t add_acq_rel_cta_s32(int32_t* ptr, int32_t value) {
 
 }  // namespace sglang::device::ptx
 
-namespace sglang::dspark_markov_walk::wgmma {
+namespace sglang::dspark_markov_walk {
+
+namespace ptx = device::ptx;
+
+// The Philox counters pack the step into 8 bits (step | request << 8)
+inline constexpr int32_t kMaxSteps = 256;
+// w1f row: the 512 q bytes in A-fragment order | s_hi f32 | s_lo f32 | 8 B pad
+inline constexpr int32_t kURowWords = 132;
+inline constexpr int32_t kURowBytes = kURowWords * 4;
+// State: one {key, count} pair per 128-B line, since atomics to one line serialize in its L2 slice
+inline constexpr int32_t kMaxBatch = 64;
+inline constexpr int32_t kPairWords = 16;
+inline constexpr int32_t kStepWords = kMaxBatch * kPairWords;
+
+// An out-of-range anchor would make the first W1 gather an illegal address
+SGL_DEVICE uint32_t clamp_row(int64_t row, int32_t valid_rows) {
+  return static_cast<uint32_t>(row < 0 ? 0 : row >= valid_rows ? valid_rows - 1 : row);
+}
+
+// 1 / T, with T clamped to [1e-5, 1e4] so +inf and denormals stay finite; 0 (greedy) for T <= 0 or NaN
+SGL_DEVICE float inv_temperature(float t) {
+  return t > 0.f ? 1.f / fminf(fmaxf(t, 1e-5f), 1e4f) : 0.f;
+}
+
+// Argmax key (order-preserving fp32 << 32) | (0xFFFFFFFF - row): the max is the best score, ties take the smallest row
+SGL_DEVICE uint64_t pack_key(float score, uint32_t row) {
+  const auto bits = __float_as_uint(score);
+  const auto ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return (static_cast<uint64_t>(ordered) << 32) | static_cast<uint64_t>(0xFFFFFFFFu - row);
+}
+
+SGL_DEVICE uint32_t key_row(uint64_t key) {
+  return 0xFFFFFFFFu - static_cast<uint32_t>(key & 0xFFFFFFFFu);
+}
+
+// The bits of a bf16 pair as F2FP packs them, .x in the low half
+SGL_DEVICE uint32_t bf16x2_bits(bf16x2_t value) {
+  return *reinterpret_cast<const uint32_t*>(&value);
+}
+
+// Philox4x32-10 (Salmon et al. 2011)
+SGL_DEVICE uint4 philox(uint4 c, uint2 k) {
+#pragma unroll
+  for (int32_t i = 0; i < 10; ++i) {
+    const uint32_t hi0 = __umulhi(0xD2511F53u, c.x), lo0 = 0xD2511F53u * c.x;
+    const uint32_t hi1 = __umulhi(0xCD9E8D57u, c.z), lo1 = 0xCD9E8D57u * c.z;
+    c = make_uint4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+    k.x += 0x9E3779B9u;
+    k.y += 0xBB67AE85u;
+  }
+  return c;
+}
+
+// The Gumbel transform takes v = (x + 0.5) 2^-32 in (0, 1) at full 32-bit resolution and needs E = -log(1 - v). For
+// x >= 2^31 it uses 1 - v = (~x + 0.5) 2^-32 directly, since 1 - v formed in fp32 drops v's low bits. So this
+// returns v for x < 2^31 and 1 - v otherwise, in [2^-33, 1/2]: E is finite and > 0 for every x.
+SGL_DEVICE float half_uniform(uint32_t x) {
+  constexpr float kTwoM32 = 2.3283064365386963e-10f;  // 2^-32
+  return (__uint2float_rn(x >> 31 ? ~x : x) + 0.5f) * kTwoM32;
+}
+
+// Base-2 Gumbel for keys compared in log2 units: -log2(-log2(1 - v)) = G / ln 2 + log2(ln 2), a constant shift that
+// does not change an argmax. One MUFU lg2 for E whichever half x is in (the half is a per-lane random bit, so a warp
+// calling a different log per half would run both); E by its series for v < 2^-7, so the large-Gumbel end stays
+// exact. Max |error| over all x: 1.3e-5 (log2 units). The lg2 arguments t in [2^-33, 1/2], 1 - t in [1/2, 1 - 2^-7]
+// and E in [2^-33, 34) are all normal.
+SGL_DEVICE float gumbel2_fast(uint32_t x) {
+  const float t = half_uniform(x);
+  const bool hi = x >> 31;
+  const float l = -ptx::lg2_approx_ftz(hi ? t : 1.f - t);
+  const float e =
+      !hi && t < 0.0078125f ? t * 1.4426950408889634f * (1.f + t * (0.5f + t * (0.33333334f + t * 0.25f))) : l;
+  return -ptx::lg2_approx_ftz(e);
+}
+
+// Uniform in (0, 1) for an inverse CDF (inside an 8-row item): u = ((x >> 9) + 0.5) 2^-23, every value exact
+// and in [2^-24, 1 - 2^-24], so u * c < c for every normal fp32 c and a row of zero mass is never drawn
+SGL_DEVICE float uniform23(uint32_t x) {
+  return (__uint2float_rn(x >> 9) + 0.5f) * 1.1920928955078125e-7f;
+}
+
+// Every CTA must be co-resident, since they spin on each other's exchange slots: with the cooperative attribute the
+// driver rejects a grid that is not, instead of letting it hang. kMaxSmem is the most any launch of kKernel uses.
+template <auto kKernel, std::size_t kMaxSmem, typename... Args>
+inline void
+launch_cooperative(DLDevice device, uint32_t num_ctas, uint32_t num_threads, std::size_t smem, Args&&... args) {
+  using namespace host;
+  CHECK_HOST(num_ctas <= runtime::get_sm_count(device.device_id)) << "markov walk: more CTAs than SMs";
+  runtime::set_max_dynamic_smem_per_device<kKernel>(device, kMaxSmem);
+  LaunchKernel(num_ctas, num_threads, device, smem)  //
+      .enable_cooperative()(kKernel, std::forward<Args>(args)...);
+}
 
 inline constexpr int32_t kCtaThreads = 512;
 inline constexpr int32_t kWarpgroups = 4;
@@ -158,7 +362,6 @@ inline constexpr int32_t kW2TileRows = 64;  // the wgmma N
 inline constexpr int32_t kW2TileBytes = kW2TileRows * 256;
 inline constexpr int32_t kChunkBytes = kW2TileBytes / 8;  // one k32 chunk
 inline constexpr int32_t kBlockRequests = 32;             // M = 64: the hi and lo rows of 32 requests
-// w1f rows have the size and the scale words of W1q rows, with the 512 q bytes in A-fragment order
 
 // K-major, no swizzle, LBO 128, SBO 256: the high word is the constant SBO field, the low word start address | LBO.
 // Offsets inside the 228 KiB window never carry out of the 14-bit address field, so they are 32-bit adds.
@@ -175,7 +378,7 @@ struct Smem {
 };
 
 template <int32_t kTiles, int32_t kRes, int32_t kRing, uint32_t kStreamMask>
-__global__ void __launch_bounds__(kCtaThreads, 1) markov_walk_wgmma_kernel(
+__global__ void __launch_bounds__(kCtaThreads, 1) markov_walk_kernel(
     const uint8_t* __restrict__ w2_res,
     const uint8_t* __restrict__ w2_str,
     const float* __restrict__ row_scale,
@@ -505,14 +708,14 @@ __global__ void __launch_bounds__(kCtaThreads, 1) markov_walk_wgmma_kernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) ptx::st_relaxed_u64(state, round + 1);
 }
 
-// One round of the wgmma walk (bs 1..64); grid = rows_pad / (64 kTiles):
+// One round of the walk (bs 1..64); grid = rows_pad / (64 kTiles):
 //   w2_res     int8 [grid, kRes, 16384], each CTA's resident tiles in tile order, canonical K-major B layout
 //              [k32 chunk][8-column group][k16 core][column][16 B], tile rows permuted as in the header
 //   w2_str     int8 [grid, kTiles - kRes, 16384], the streamed tiles (kStreamMask), same layout
 //   row_scale  fp32 [rows_pad], natural row order; w1f uint8 [V, 528], s_lo = s_hi / 256
 //   base       bf16 [B, >= num_steps, ld]; corrected: none, or shaped like base and written for T > 0 requests only
 //   anchor     int64 [B]; tokens int64 [B * num_steps], row-major; temps fp32 [B], <= 0 or NaN for greedy
-//   state      as dspark_markov_walk_small_batch.cuh
+//   state      int64 [16 + 2 S kStepWords] with num_steps <= S <= kMaxSteps, 128-B aligned, zeroed once
 template <int32_t kTiles, int32_t kRes, int32_t kRing, uint32_t kStreamMask>
 inline void walk(
     tvm::ffi::TensorView w2_res,
@@ -603,7 +806,7 @@ inline void walk(
   // 32-bit element offsets: every lane of the 32-request blocks forms (b kb + k) ld + row, dead lanes included
   const auto lanes = kBlockRequests * ((nb + kBlockRequests - 1) / kBlockRequests);
   CHECK_HOST(ld.unwrap() % 8 == 0 && lanes * base_steps.unwrap() * ld.unwrap() + rows_pad < (int64_t{1} << 31));
-  launch_cooperative<markov_walk_wgmma_kernel<kTiles, kRes, kRing, kStreamMask>, sizeof(Layout)>(
+  launch_cooperative<markov_walk_kernel<kTiles, kRes, kRing, kStreamMask>, sizeof(Layout)>(
       device.unwrap(),
       static_cast<uint32_t>(grid.unwrap()),
       kCtaThreads,
@@ -627,4 +830,4 @@ inline void walk(
       static_cast<uint64_t>(seed));
 }
 
-}  // namespace sglang::dspark_markov_walk::wgmma
+}  // namespace sglang::dspark_markov_walk
