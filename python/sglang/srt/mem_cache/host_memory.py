@@ -21,21 +21,27 @@ def _memory_stat(directory: Path) -> dict[str, int]:
     return {key: int(value) for key, value in map(str.split, lines)}
 
 
-def _has_protected_descendants(directory: Path) -> bool:
-    """Treat configured or unreadable descendant memory.min as protected."""
-    pending = [directory]
+def _protected_children_bytes(directory: Path) -> int | None:
+    """Usage that reclaim at ``directory`` must leave to its children's memory.min.
+
+    The kernel caps a child's protection at its usage, and a deeper cgroup's at
+    its ancestors', so only direct children count. A child without memory.min
+    has no memory controller and no protection. None when a value is unreadable.
+    """
+    protected = 0
     try:
-        while pending:
-            for child in pending.pop().iterdir():
-                if not S_ISDIR(child.stat().st_mode):
-                    continue
-                if int((child / "memory.min").read_text()) != 0:
-                    return True
-                pending.append(child)
+        for child in directory.iterdir():
+            if not S_ISDIR(child.stat().st_mode):
+                continue
+            try:
+                minimum = (child / "memory.min").read_text().strip()
+            except FileNotFoundError:
+                continue
+            usage = int((child / "memory.current").read_text())
+            protected += usage if minimum == "max" else min(int(minimum), usage)
     except (OSError, ValueError):
-        # Unknown protection only disables cache credit, not the cgroup bound.
-        return True
-    return False
+        return None
+    return protected
 
 
 def _cgroup_headroom(
@@ -120,13 +126,15 @@ def _cgroup_headroom(
                         stat = _memory_stat(directory)
                         page_cache = sum(stat[key] for key in page_cache_keys)
                         # Protection is relative to the reclaim target: its own
-                        # min does not prevent reclaim, but descendants' min can.
-                        if (
-                            filesystem == "cgroup2"
-                            and page_cache > 0
-                            and _has_protected_descendants(directory)
-                        ):
-                            page_cache = 0
+                        # min does not prevent reclaim, but its children's min
+                        # can. Unknown protection only disables cache credit.
+                        if filesystem == "cgroup2" and page_cache > 0:
+                            protected = _protected_children_bytes(directory)
+                            page_cache = (
+                                0
+                                if protected is None
+                                else max(0, page_cache - protected)
+                            )
                         # Charged page cache is reclaimed under the limit, not used.
                         usage = max(0, usage - page_cache)
                 remaining = max(0, limit - usage)
