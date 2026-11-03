@@ -647,35 +647,38 @@ async fn stream_outcomes_reach_the_breaker_by_status() {
                     Err(Status::resource_exhausted("queue full")),
                 ])
                 .boxed(),
-                // A rejected request is one finished chunk with its status; faults count.
-                _ => stream::iter([Ok(chunk(r#"{"object":"error"}"#, true, Some(500)))]).boxed(),
+                // A rejected request is one finished chunk with its status; faults
+                // count (502 — a 500 is a per-request engine error, neutral).
+                _ => stream::iter([Ok(chunk(r#"{"object":"error"}"#, true, Some(502)))]).boxed(),
             }
         })
         .start()
         .await;
-    let mut client = serve_grpc(router_ctx(&[(
-        WorkerMode::Plain,
-        "http://127.0.0.1:1",
-        Some(port),
-    )]))
-    .await;
+    let ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+    let mut client = serve_grpc(Arc::clone(&ctx)).await;
+    let breaker_state = || {
+        ctx.registry
+            .get(&WorkerId("http://127.0.0.1:1".into()))
+            .unwrap()
+            .breaker
+            .snapshot()
+            .state_code
+    };
 
     for _ in 0..3 {
         let result = collect(client.chat_complete(openai(chat(true))).await).await;
         assert_eq!(result.unwrap_err().code(), Code::ResourceExhausted);
     }
+    assert_eq!(breaker_state(), 0, "backpressure leaves the breaker closed");
     for _ in 0..3 {
         let chunks = collect(client.chat_complete(openai(chat(true))).await)
             .await
             .unwrap();
-        assert_eq!(chunks[0].status_code, Some(500));
+        assert_eq!(chunks[0].status_code, Some(502));
     }
-    let status = client.chat_complete(openai(chat(true))).await.unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::Unavailable,
-        "three 500s open the breaker"
-    );
+    // Checked on the breaker: with a single worker, the next request would
+    // fail open to it (`WorkerRegistry::healthy_workers_for`).
+    assert_eq!(breaker_state(), 1, "three 502s open the breaker");
     assert_eq!(*calls.lock().unwrap(), 6);
 }
 
