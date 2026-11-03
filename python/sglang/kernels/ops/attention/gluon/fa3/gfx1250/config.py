@@ -21,7 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile-time tile configuration shared by gfx1250 FA3 kernels."""
+"""Tile layouts and sequence geometry shared by gfx1250 FA3 kernels."""
 
 from __future__ import annotations
 
@@ -31,12 +31,13 @@ from triton.experimental import gluon
 
 @gluon.aggregate
 class _AttentionConfig:
-    SEQLEN_Q: gl.constexpr
-    SEQLEN_K: gl.constexpr
+    SEQLEN_Q: gl.tensor | gl.constexpr
+    SEQLEN_K: gl.tensor | gl.constexpr
     HEAD_SIZE: gl.constexpr
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_BUFFERS: gl.constexpr
+    NUM_WARPS: gl.constexpr
     FAST_EXP: gl.constexpr
     NORM_EXP: gl.constexpr
     FULL_TDM_WAIT: gl.constexpr
@@ -64,13 +65,19 @@ class _AttentionConfig:
         fast_exp=False,
         norm_exp=False,
         full_tdm_wait=False,
+        pipeline=False,
     ):
-        self.SEQLEN_Q = gl.constexpr(seqlen_q)
-        self.SEQLEN_K = gl.constexpr(seqlen_k)
+        self.SEQLEN_Q = (
+            seqlen_q if isinstance(seqlen_q, gl.tensor) else gl.constexpr(seqlen_q)
+        )
+        self.SEQLEN_K = (
+            seqlen_k if isinstance(seqlen_k, gl.tensor) else gl.constexpr(seqlen_k)
+        )
         self.HEAD_SIZE = gl.constexpr(head_size)
         self.BLOCK_M = gl.constexpr(block_m)
         self.BLOCK_N = gl.constexpr(block_n)
         self.NUM_BUFFERS = gl.constexpr(num_buffers)
+        self.NUM_WARPS = gl.constexpr(num_warps)
         self.FAST_EXP = gl.constexpr(fast_exp)
         self.NORM_EXP = gl.constexpr(norm_exp)
         self.FULL_TDM_WAIT = gl.constexpr(full_tdm_wait)
@@ -80,17 +87,32 @@ class _AttentionConfig:
             0 if block_m == 256 and seqlen_k >= 16_384 else 2
         )
 
-        assert num_warps == 4 or num_warps == 8
-        warp_bases = [[1, 0], [2, 0]]
+        assert num_warps in (2, 4, 8)
+        if num_warps == 2:
+            assert block_m == 32
+            warp_bases = [[1, 0]]
+        else:
+            warp_bases = [[1, 0], [2, 0]]
         if num_warps == 8:
             warp_bases.append([4, 0])
 
+        # Alternate row fragments to shorten four-wave operand live ranges.
+        register_bases = (
+            [[4, 0]]
+            if pipeline
+            and head_size == 128
+            and block_m == 128
+            and block_n == 128
+            and num_warps == 4
+            else None
+        )
         self.qk_layout = gl.constexpr(
             gl.amd.AMDWMMALayout(
                 3,
                 transposed=True,
                 warp_bases=warp_bases,
                 instr_shape=[16, 16, 32],
+                reg_bases=register_bases,
             )
         )
         self.pv_layout = gl.constexpr(
@@ -99,6 +121,7 @@ class _AttentionConfig:
                 transposed=True,
                 warp_bases=warp_bases,
                 instr_shape=[16, 16, 32],
+                reg_bases=register_bases,
             )
         )
         self.k_smem_layout = gl.constexpr(

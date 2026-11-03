@@ -30,6 +30,8 @@ def load_forward():
                 "SwizzledSharedLayout",
                 "allocate_shared_memory",
                 "shared_memory_descriptor",
+                "to_linear_layout",
+                "num_warps",
                 "amd.AMDWMMALayout",
                 "amd.warp_pipeline_stage",
                 "amd.slice",

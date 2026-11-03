@@ -94,7 +94,9 @@ def test_extended_launch_selection_cpu(dtype, head_size):
         dtype=dtype,
     )
     assert small_config.schedule == "pipeline"
-    assert small_config.llvm_fn_attrs == pipeline_scheduler
+    assert small_config.llvm_fn_attrs == (
+        pipeline_scheduler if head_size == 256 else ""
+    )
 
     config = select_launch_config(
         1,
@@ -158,7 +160,7 @@ def test_resolver_reports_persistent_scheduler():
         (65536, 2**31, None, False, 256, NumericalMode.ONLINE),
         (65536, 65536, 0.25, False, 256, NumericalMode.ONLINE),
         (65536, 65536, None, True, 256, NumericalMode.ONLINE),
-        (65536, 65536, None, False, 65536, NumericalMode.ONLINE),
+        (65536, 65536, None, False, 65536, NumericalMode.LOCAL_GUARDED),
     ],
 )
 def test_resolver_guarded_boundaries(sq, sk, scale, forced, num_cus, expected):
@@ -222,6 +224,25 @@ def test_resolver_rejects_invalid_launch_geometry(config, message):
         resolve_execution_policy(
             *_meta_inputs(sk=511), launch_config=config, num_cus=256
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("seqlen_k", [128, 256, 257])
+def test_resolver_reports_pipeline_numerical_mode(dtype, head_size, seqlen_k):
+    inputs = _meta_inputs(sq=129, sk=seqlen_k, head_size=head_size, dtype=dtype)
+    config = LaunchConfig("pipeline", 64, 128, 4, False, "")
+    policy = resolve_execution_policy(*inputs, launch_config=config, num_cus=256)
+    assert policy.launch_config == config
+    expected = NumericalMode.LOCAL_GUARDED if seqlen_k > 256 else NumericalMode.ONLINE
+    assert policy.numerical_mode == expected
+
+
+def test_resolver_rejects_wide_key_tile_for_d256():
+    inputs = _meta_inputs(sq=129, sk=257, head_size=256)
+    config = LaunchConfig("pipeline", 128, 128, 4, False, "")
+    with pytest.raises(ValueError, match="D256 pipeline requires"):
+        resolve_execution_policy(*inputs, launch_config=config, num_cus=256)
 
 
 if __name__ == "__main__":

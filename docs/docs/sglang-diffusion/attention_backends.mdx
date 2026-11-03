@@ -1009,9 +1009,8 @@ You need a Triton build with Gluon `amd.cdna5` support, including the TDM
 `async_load_fused`, `update_tensor_descriptor`, and `prefetch` APIs used by
 the persistent kernel. The `gfx1250-rocm1000` stage in
 [`docker/rocm.Dockerfile`](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile)
-pins the validated Triton revision
-`76940ad348795521b3dc9f6c79acd7309ff924e3`. Check compiler compatibility
-before comparing performance across ROCm images.
+defines the supported Triton revision. Run the numerical suite after changing
+that compiler or the ROCm image before comparing performance.
 
 For example, select the backend for the public Wan2.2 T2V checkpoint on one
 GPU:
@@ -1027,14 +1026,17 @@ sglang generate \
 Gluon accumulates scores, softmax state, and outputs in FP32. Dispatch depends on
 tensor geometry, layout, and device occupancy:
 
-- Head dimension 256 and small grids use the four-wave pipeline.
-- Other grids that fill the device use the eight-wave ping-pong kernel.
+- Short K/V inputs and underfilled D64/D128 grids use smaller query tiles,
+  with two or four waves per workgroup. One and two resident K/V tiles use a
+  short schedule with fused transfers.
+- Head dimension 256 retains the four-wave pipeline. Other grids that fill the
+  device generally use the eight-wave ping-pong kernel.
 - Contiguous BF16/D128 workloads with 257–512 K/V tokens can use persistent K/V
   reuse when the resulting grid fills the device. Noncontiguous inputs use
   ping-pong instead.
-- FP16 pipelines drain pending TDM loads before consuming K/V. Automatic FP16
-  pipeline selection uses the default scheduler; explicit scheduler overrides
-  retain the full waits.
+- FP16 and locally guarded BF16 pipelines drain pending TDM loads before
+  consuming K/V. Their automatic selection uses the default scheduler;
+  explicit scheduler overrides retain the full waits.
 
 #### Numerical contract
 
@@ -1045,15 +1047,16 @@ distinguishes those rounded probabilities from the FP32 denominator.
 | Numerical mode | Prerequisites and bounds | Softmax and probability rounding | Graph replay |
 | --- | --- | --- | --- |
 | Online (`online`) | All supported BF16/FP16 head dimensions; also the final guarded fallback. | Subtract the running maximum before scaling. Rescale FP32 accumulators as the maximum changes. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
+| First-tile fixed shift (`local_guarded`) | Selected D64/D128 pipeline tiles with at least three K/V tiles. Every valid row must have `abs(first_max*a) <= 64`, a positive FP32 denominator below `1e30`, and output within the input dtype’s finite range. | Keep the first tile’s maximum, defer denominator reductions, and omit accumulator rescaling. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | Check every launch and replay. A failed workgroup recomputes all its keys using online softmax before returning. |
 | Persistent (`persistent`) | Contiguous BF16/D128, 257–512 K/V tokens, and a valid persistent launch. | Subtract one maximum across all cached keys before scaling. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
 | Norm-bounded fixed shift (inside `guarded`) | Every Q/K row has squared L2 norm at most `(32/a) * (1 - 1e-4)`. Every V magnitude is zero or in `[2^-32, 2^64]`. | Use `exp2(score*a - 32)`, with exponent arguments in `[-64, 0]`. PV and the FP32 denominator use the same rounded BF16 probabilities. | Clear and recompute Q/K/V guard flags on every replay. |
 | Element-bounded fused exponent (inside `guarded`) | The norm route is unavailable, but every Q/K magnitude is at most `sqrt(1024/(128*a)) * (1 - 1e-5)`. | Use an online maximum and a fused scaled subtraction. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | Recompute the guards on every replay; use online subtraction if this bound fails too. |
 
 Automatic `guarded` policy is limited to BF16/D128 ping-pong, both sequence
 lengths at least 65,536, K/V length below `2^31`, and the default scale
-`128**-0.5`. An explicit launch configuration uses the stable schedule without
-these automatic guards. Nonfinite Q/K values reject both bounded routes;
-nonfinite V values reject the norm route. Guard fallback does not sanitize
+`128**-0.5`. An explicit ping-pong launch uses online softmax without these
+automatic guards; pipeline tiles can still use `local_guarded`. Nonfinite Q/K
+values reject both bounded routes; nonfinite V values reject the norm route. Guard fallback does not sanitize
 nonfinite inputs or make overflowing FP32 dot products finite.
 
 The device flags `NORM_UNSAFE` and `FUSED_EXP_UNSAFE` describe independent
@@ -1066,8 +1069,13 @@ The `resolve_execution_policy` helper in
 `sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy` reports the effective
 launch configuration, scale, and numerical mode after layout fallback.
 Supplying `num_cus` allows inspection with CPU or meta tensors. A reported
-`guarded` mode describes the available GPU routes; it does not read inputs or
-cache the route chosen for a particular tensor's values.
+`guarded` or `local_guarded` mode describes the available GPU routes; the
+helper does not read inputs or cache a decision about their values.
+
+The new 128-key pipeline tiles take sequence lengths at runtime and specialize
+on one-, two-, or three-or-more-key-tile schedules, so nearby lengths within the
+same configuration reuse compiled code. The legacy 64-key pipeline retains
+compile-time lengths to preserve its performance.
 
 #### Upstream validation
 
@@ -1084,9 +1092,9 @@ establish GPU compiler compatibility.
 
 Run the numerical suite on gfx1250 when changing these kernels or updating the
 supported Triton/ROCm image. It includes independent FP64 comparisons, guard
-boundaries, graph replay with mutated inputs, and repeated FP16 storage-offset
-regressions. Its CI entry point fails on the wrong architecture instead of
-reporting an entirely skipped run as success. From a source checkout in the
+boundaries, graph replay with mutated inputs, and repeated BF16/FP16
+storage-offset regressions. Its CI entry point fails on the wrong architecture
+instead of reporting an entirely skipped run as success. From a source checkout in the
 supported ROCm environment:
 
 ```bash

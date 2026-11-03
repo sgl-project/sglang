@@ -46,6 +46,7 @@ class NumericalMode(str, Enum):
     ONLINE = "online"
     PERSISTENT = "persistent"
     GUARDED = "guarded"
+    LOCAL_GUARDED = "local_guarded"
 
 
 class GuardFlag(IntFlag):
@@ -154,7 +155,21 @@ def select_launch_config(
         )
 
     wide_block_m = 256
-    workgroups = batch * num_heads * math.ceil(seqlen_q / wide_block_m)
+    batch_heads = batch * num_heads
+    workgroups = batch_heads * math.ceil(seqlen_q / wide_block_m)
+    if head_size in (64, 128) and seqlen_k is not None:
+        # Shrink query tiles only as far as needed to fill the device.
+        groups_128 = batch_heads * math.ceil(seqlen_q / 128)
+        groups_64 = batch_heads * math.ceil(seqlen_q / 64)
+        block_m = 128 if groups_128 >= num_cus else 64 if groups_64 >= num_cus else 32
+        short_kv = seqlen_k <= 128 or (seqlen_k <= 256 and groups_128 < num_cus)
+        underfilled = workgroups < num_cus and (
+            dtype == torch.float16 or groups_64 < num_cus
+        )
+        if short_kv or underfilled:
+            return LaunchConfig(
+                "pipeline", block_m, 128, 2 if block_m == 32 else 4, False, ""
+            )
     # D256 spills heavily with the wide eight-wave tile. The four-wave
     # pipeline keeps its larger output accumulator in registers.
     if head_size != 256 and workgroups >= num_cus:
@@ -191,8 +206,8 @@ def resolve_execution_policy(
 
     The caller validates the Q/K/V tensor contract. Supplying num_cus allows
     inspection with CPU or meta tensors without importing Gluon or querying a
-    device. GUARDED describes a device-side choice among fixed-shift, bounded
-    fused-exponent, and online softmax; it never caches an input-data decision.
+    device. GUARDED and LOCAL_GUARDED describe device-side numerical choices;
+    neither caches an input-data decision across launches or graph replays.
     """
     batch, seqlen_q, num_heads, head_size = query.shape
     seqlen_k = key.shape[1]
@@ -241,15 +256,41 @@ def resolve_execution_policy(
         )
     if config.schedule not in ("pipeline", "pingpong"):
         raise ValueError(f"unsupported FAv3 schedule: {config.schedule}")
-    expected_geometry = (128, 64, 4) if config.schedule == "pipeline" else (256, 64, 8)
+    expected_geometries = (
+        (
+            (128, 64, 4),
+            (32, 128, 2),
+            (64, 128, 4),
+            (128, 128, 4),
+        )
+        if config.schedule == "pipeline"
+        else ((256, 64, 8),)
+    )
     actual_geometry = (config.block_m, config.block_n, config.num_warps)
-    if actual_geometry != expected_geometry:
+    if actual_geometry not in expected_geometries:
         raise ValueError(
             f"{config.schedule} requires (block_m, block_n, num_warps)="
-            f"{expected_geometry}, got {actual_geometry}"
+            f"one of {expected_geometries}, got {actual_geometry}"
+        )
+
+    if (
+        config.schedule == "pipeline"
+        and head_size == 256
+        and actual_geometry != (128, 64, 4)
+    ):
+        raise ValueError(
+            "D256 pipeline requires (block_m, block_n, num_warps)=(128, 64, 4)"
         )
 
     mode = NumericalMode.ONLINE
+    if (
+        config.schedule == "pipeline"
+        and head_size in (64, 128)
+        and config.block_n == 128
+        and config.num_warps in (2, 4)
+        and seqlen_k > 2 * config.block_n
+    ):
+        mode = NumericalMode.LOCAL_GUARDED
     if (
         launch_config is None
         and config.schedule == "pingpong"

@@ -284,6 +284,8 @@ def gluon_modules():
     ("module_name", "api"),
     [
         ("triton.experimental.gluon", "aggregate"),
+        ("triton.experimental.gluon.language", "num_warps"),
+        ("triton.experimental.gluon.language", "to_linear_layout"),
         ("triton.experimental.gluon.language", "amd.cdna5"),
         ("triton.experimental.gluon.language", "amd.cdna5.wmma"),
         ("triton.experimental.gluon.language", "amd.cdna5.buffer_load"),

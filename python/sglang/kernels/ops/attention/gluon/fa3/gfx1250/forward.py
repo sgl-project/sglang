@@ -40,6 +40,11 @@ import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
 from sglang.kernels.ops.attention.gluon.fa3.gfx1250.config import _AttentionConfig
+from sglang.kernels.ops.attention.gluon.fa3.gfx1250.pipeline import (
+    process_fixed_shift,
+    process_online,
+    process_short,
+)
 from sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy import (
     GuardFlag,
     LaunchConfig,
@@ -100,8 +105,8 @@ class _AttentionProgram:
     v_desc: gl.amd.cdna5.tdm.tensor_descriptor
     v_buffer: gl.shared_memory_descriptor
     output_ptr: gl.tensor
-    output_offsets: gl.tensor
-    output_mask: gl.tensor
+    output_stride_s: gl.tensor | gl.constexpr
+    output_stride_d: gl.tensor | gl.constexpr
     output_uses_buffer: gl.constexpr
     softmax_scale_log2: gl.constexpr
 
@@ -115,8 +120,8 @@ class _AttentionProgram:
         v_desc,
         v_buffer,
         output_ptr,
-        output_offsets,
-        output_mask,
+        output_stride_s,
+        output_stride_d,
         softmax_scale,
         output_uses_buffer,
     ):
@@ -127,8 +132,16 @@ class _AttentionProgram:
         self.v_desc = v_desc
         self.v_buffer = v_buffer
         self.output_ptr = output_ptr
-        self.output_offsets = output_offsets
-        self.output_mask = output_mask
+        self.output_stride_s = (
+            output_stride_s
+            if isinstance(output_stride_s, gl.tensor)
+            else gl.constexpr(output_stride_s)
+        )
+        self.output_stride_d = (
+            output_stride_d
+            if isinstance(output_stride_d, gl.tensor)
+            else gl.constexpr(output_stride_d)
+        )
         self.output_uses_buffer = gl.constexpr(output_uses_buffer)
         self.softmax_scale_log2 = gl.constexpr(softmax_scale * 1.4426950408889634)
 
@@ -179,19 +192,6 @@ class _AttentionProgram:
             + stride_qh * head_id_i64
             + stride_qs * query_start.to(gl.int64)
         )
-        if use_query_buffer:
-            query_offsets = (
-                stride_qs * query_local_rows[:, None] + stride_qd * query_dims[None, :]
-            )
-            q = gl.amd.cdna5.buffer_load(
-                query_base, query_offsets, mask=query_mask, other=0.0
-            )
-        else:
-            # A sparse view can span the buffer range inside one query tile.
-            query_offsets = stride_qs * query_local_rows[:, None].to(
-                gl.int64
-            ) + stride_qd * query_dims[None, :].to(gl.int64)
-            q = gl.load(query_base + query_offsets, mask=query_mask, other=0.0)
 
         k_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=k_ptr + stride_kb * batch_id_i64 + stride_kh * head_id_i64,
@@ -218,23 +218,20 @@ class _AttentionProgram:
             layout=v_desc.layout,
         )
 
-        output_local_rows = gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
-        )
-        output_rows = query_start + output_local_rows
-        output_dims = gl.arange(
-            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout)
-        )
-        if use_output_buffer:
-            output_offsets = (
-                stride_os * output_local_rows[:, None]
-                + stride_od * output_dims[None, :]
+        if use_query_buffer:
+            query_offsets = (
+                stride_qs * query_local_rows[:, None] + stride_qd * query_dims[None, :]
+            )
+            q = gl.amd.cdna5.buffer_load(
+                query_base, query_offsets, mask=query_mask, other=0.0
             )
         else:
-            output_offsets = stride_os * output_local_rows[:, None].to(
+            # A sparse view can span the buffer range inside one query tile.
+            query_offsets = stride_qs * query_local_rows[:, None].to(
                 gl.int64
-            ) + stride_od * output_dims[None, :].to(gl.int64)
-        output_mask = output_rows[:, None] < cfg.SEQLEN_Q
+            ) + stride_qd * query_dims[None, :].to(gl.int64)
+            q = gl.load(query_base + query_offsets, mask=query_mask, other=0.0)
+
         output_base = (
             output_ptr
             + stride_ob * batch_id_i64
@@ -250,8 +247,8 @@ class _AttentionProgram:
             v_desc,
             v_buffer,
             output_base,
-            output_offsets,
-            output_mask,
+            stride_os,
+            stride_od,
             softmax_scale,
             use_output_buffer,
         )
@@ -276,7 +273,7 @@ class _AttentionProgram:
             self.k_desc,
             [sequence_start, 0],
             self.k_buffer.index(buffer_index),
-            warp_used_hint=0x0F,
+            warp_used_hint=0x03 if self.cfg.NUM_WARPS == 2 else 0x0F,
             cache_modifier=".cg",
         )
 
@@ -286,7 +283,7 @@ class _AttentionProgram:
             self.v_desc,
             [sequence_start, 0],
             self.v_buffer.index(buffer_index),
-            warp_used_hint=0x0F,
+            warp_used_hint=0x03 if self.cfg.NUM_WARPS == 2 else 0x0F,
             cache_modifier=".cg",
         )
 
@@ -388,20 +385,25 @@ class _AttentionProgram:
 
     @gluon.jit
     def store_output(self, output):
+        # Form store addresses after the loop; keep only scalar strides live
+        # across attention and its uncommon workgroup retry.
+        cfg = self.cfg
+        rows = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
+        dims = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+        query_start = gl.program_id(cfg.query_axis) * cfg.BLOCK_M
+        mask = (query_start + rows)[:, None] < cfg.SEQLEN_Q
         output = output.to(self.output_ptr.dtype.element_ty)
         if self.output_uses_buffer:
-            gl.amd.cdna5.buffer_store(
-                output,
-                self.output_ptr,
-                self.output_offsets,
-                mask=self.output_mask,
+            offsets = (
+                self.output_stride_s * rows[:, None]
+                + self.output_stride_d * dims[None, :]
             )
+            gl.amd.cdna5.buffer_store(output, self.output_ptr, offsets, mask=mask)
         else:
-            gl.store(
-                self.output_ptr + self.output_offsets,
-                output,
-                mask=self.output_mask,
-            )
+            offsets = self.output_stride_s * rows[:, None].to(
+                gl.int64
+            ) + self.output_stride_d * dims[None, :].to(gl.int64)
+            gl.store(self.output_ptr + offsets, output, mask=mask)
 
     @gluon.jit
     def store_output_tdm(self, output, stride_os, stride_od):
@@ -430,7 +432,7 @@ class _AttentionProgram:
         output_buffer._keep_alive()
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["SEQLEN_Q", "SEQLEN_K"])
 def _attention_forward_pipeline(
     q_ptr,
     k_ptr,
@@ -453,29 +455,38 @@ def _attention_forward_pipeline(
     stride_os,
     stride_od,
     SOFTMAX_SCALE: gl.constexpr,
-    SEQLEN_Q: gl.constexpr,
-    SEQLEN_K: gl.constexpr,
+    SEQLEN_Q,
+    SEQLEN_K,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     TDM_OUTPUT: gl.constexpr = False,
     USE_QUERY_BUFFER: gl.constexpr = True,
     USE_OUTPUT_BUFFER: gl.constexpr = True,
+    FIXED_SHIFT: gl.constexpr = False,
+    KV_TILES: gl.constexpr = 3,
+    STATIC_LENGTHS: gl.constexpr = None,
 ):
     NUM_BUFFERS: gl.constexpr = 2
-    NUM_WARPS: gl.constexpr = 4
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    # Preserve specialization for the legacy BN64 schedule; dynamic loop
+    # bounds regress its D256 and BF16/D64 configurations.
+    if STATIC_LENGTHS is not None:
+        seqlen_q, seqlen_k = STATIC_LENGTHS
+    else:
+        seqlen_q, seqlen_k = SEQLEN_Q, SEQLEN_K
     cfg = _AttentionConfig(
-        SEQLEN_Q,
-        SEQLEN_K,
+        seqlen_q,
+        seqlen_k,
         HEAD_SIZE,
         BLOCK_M,
         BLOCK_N,
         NUM_BUFFERS,
         NUM_WARPS,
-        # Partial TDM waits intermittently corrupt FP16 storage-offset inputs,
-        # including D64 with default scheduling. Drain pending loads before
-        # reading K/V until the underlying synchronization issue is understood.
-        full_tdm_wait=q_ptr.dtype.element_ty == gl.float16,
+        # Partial waits intermittently corrupt storage-offset inputs in FP16
+        # and in the guarded BF16 pipeline. Drain loads before reading K/V.
+        full_tdm_wait=q_ptr.dtype.element_ty == gl.float16 or FIXED_SHIFT,
+        pipeline=True,
     )
     program = _AttentionProgram.create(
         cfg,
@@ -504,97 +515,12 @@ def _attention_forward_pipeline(
         USE_OUTPUT_BUFFER,
     )
 
-    peeled_iterations: gl.constexpr = 3
-    loop_blocks = max((SEQLEN_K + BLOCK_N - 1) // BLOCK_N - peeled_iterations, 1)
-    has_remainder: gl.constexpr = SEQLEN_K < peeled_iterations * BLOCK_N
-    if has_remainder:
-        loop_blocks -= 1
-
-    row_max = gl.full(
-        [BLOCK_M],
-        float("-inf"),
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    row_sum = gl.full(
-        [BLOCK_M],
-        1.0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, cfg.pv_layout),
-    )
-    accumulator = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-
-    program.prefetch_k(0, 0)
-    program.prefetch_k(BLOCK_N, 1)
-    program.prefetch_v(0, 0)
-    k = program.load_k(0, 2)
-    scores = program.qk(k, 0)
-    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-    program.prefetch_k(2 * BLOCK_N, 0)
-    program.prefetch_v(BLOCK_N, 1)
-    k = program.load_k(1, 3)
-
-    iteration = 0
-    for block_start in range(0, loop_blocks * BLOCK_N, BLOCK_N):
-        next_v_start = block_start + 2 * BLOCK_N
-        next_k_start = block_start + 3 * BLOCK_N
-        scores = program.qk_full(k)
-        probabilities, row_sum, accumulator = program.softmax_part1(
-            probabilities, row_sum, accumulator, alpha
-        )
-        v = program.load_v(iteration % NUM_BUFFERS, 2)
-        program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
-        accumulator = program.pv(probabilities, v, accumulator)
-        probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-        k = program.load_k(iteration % NUM_BUFFERS, 2)
-        program.prefetch_v(next_v_start, iteration % NUM_BUFFERS)
-        iteration += 1
-
-    if has_remainder:
-        current_start = iteration * BLOCK_N + BLOCK_N
-        next_v_start = iteration * BLOCK_N + 2 * BLOCK_N
-        next_k_start = iteration * BLOCK_N + 3 * BLOCK_N
-        scores = program.qk(k, current_start)
-        probabilities, row_sum, accumulator = program.softmax_part1(
-            probabilities, row_sum, accumulator, alpha
-        )
-        v = program.load_v(iteration % NUM_BUFFERS, 2)
-        program.prefetch_k(next_k_start, (iteration + 1) % NUM_BUFFERS)
-        accumulator = program.pv(probabilities, v, accumulator)
-        probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-        k = program.load_k(iteration % NUM_BUFFERS, 2)
-        program.prefetch_v(next_v_start, iteration % NUM_BUFFERS)
-        iteration += 1
-
-    epilogue_base = (iteration - 1) * BLOCK_N
-    second_last_start = epilogue_base + 2 * BLOCK_N
-    last_start = epilogue_base + 3 * BLOCK_N
-
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
-    )
-    v = program.load_v(iteration % NUM_BUFFERS, 2)
-    accumulator = program.pv(probabilities, v, accumulator)
-
-    scores = program.qk(k, second_last_start)
-    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-    k = program.load_k(iteration % NUM_BUFFERS, 1)
-    program.prefetch_v(last_start, iteration % NUM_BUFFERS)
-
-    scores = program.qk(k, last_start)
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
-    )
-    v = program.load_v((iteration + 1) % NUM_BUFFERS, 1)
-    accumulator = program.pv(probabilities, v, accumulator)
-    probabilities, alpha, row_max = program.softmax_part0(scores, row_max)
-    probabilities, row_sum, accumulator = program.softmax_part1(
-        probabilities, row_sum, accumulator, alpha
-    )
-    v = program.load_v(iteration % NUM_BUFFERS, 0)
-    accumulator = program.pv(probabilities, v, accumulator)
-
-    program.store_output(accumulator * (1.0 / row_sum)[:, None])
+    if KV_TILES <= 2:
+        process_short(program, KV_TILES)
+    elif FIXED_SHIFT:
+        process_fixed_shift(program)
+    else:
+        process_online(program)
 
 
 @gluon.jit
@@ -1239,6 +1165,15 @@ def flash_attention(
         if config.block_m == 256 and seqlen_k >= 16_384
         else (batch, num_heads, query_tiles)
     )
+    pipeline_options = (
+        {
+            "FIXED_SHIFT": policy.numerical_mode == NumericalMode.LOCAL_GUARDED,
+            "KV_TILES": min(3, math.ceil(seqlen_k / config.block_n)),
+            "STATIC_LENGTHS": ((seqlen_q, seqlen_k) if config.block_n == 64 else None),
+        }
+        if config.schedule == "pipeline"
+        else {}
+    )
     with torch.cuda.device(query.device):
         if policy.numerical_mode == NumericalMode.GUARDED:
             invalid = torch.empty((), dtype=torch.int32, device=query.device)
@@ -1280,6 +1215,7 @@ def flash_attention(
             waves_per_eu=2 if config.schedule == "pingpong" else 1,
             llvm_fn_attrs=config.llvm_fn_attrs,
             enable_fp_fusion=True,
+            **pipeline_options,
         )
     return output
 

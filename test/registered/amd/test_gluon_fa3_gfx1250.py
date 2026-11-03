@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 
 # Match upstream's MI45x registration. Runner provisioning and workflow
 # consumption belong to upstream CI; this suite requires actual gfx1250 execution.
-register_amd_ci(est_time=120, suite="nightly-amd-1-gpu-mi45x", nightly=True)
+register_amd_ci(est_time=480, suite="nightly-amd-1-gpu-mi45x", nightly=True)
 
 
 def _is_gfx1250() -> bool:
@@ -109,7 +109,7 @@ def test_gluon_fa_matches_aiter(
     assert config.tdm_output is (expected_schedule in ("pingpong", "persistent"))
     if expected_schedule == "persistent":
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=iterative-ilp"
-    elif seqlen_k <= 512:
+    elif expected_schedule == "pingpong" and seqlen_k <= 512:
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=max-ilp"
     torch.testing.assert_close(
         actual.float(),
@@ -774,14 +774,15 @@ def _assert_extended_attention_fp64(query, key, value, output, scale):
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_size", [64, 128, 256])
 @pytest.mark.parametrize("shifted_inputs", ["q", "k", "v", "qkv"])
-def test_fp16_auto_pipeline_storage_offsets_repeated_fp64(head_size, shifted_inputs):
+def test_auto_pipeline_storage_offsets_repeated_fp64(dtype, head_size, shifted_inputs):
     from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import flash_attention
 
     torch.manual_seed(1)
-    query = torch.randn(2, 129, 3, head_size, device="cuda", dtype=torch.float16)
-    key = torch.randn(2, 257, 3, head_size, device="cuda", dtype=torch.float16)
+    query = torch.randn(2, 129, 3, head_size, device="cuda", dtype=dtype)
+    key = torch.randn(2, 257, 3, head_size, device="cuda", dtype=dtype)
     value = torch.randn_like(key)
     expected = _fp64_attention(query, key, value, head_size**-0.5)
     reference_rms = expected.square().mean().sqrt().item()
@@ -797,12 +798,13 @@ def test_fp16_auto_pipeline_storage_offsets_repeated_fp64(head_size, shifted_inp
             assert tensor.is_contiguous()
         inputs.append(tensor)
 
-    # max-ilp corruption was intermittent even on identical inputs. Check every
+    # TDM corruption was intermittent even on identical inputs. Check every
     # launch against independent FP64 attention, including separate Q/K/V shifts.
+    tolerance = 0.003 if dtype == torch.bfloat16 else 0.001
     for _ in range(500):
         actual = flash_attention(*inputs).double()
         assert torch.isfinite(actual).all()
-        assert (actual - expected).square().mean().sqrt() <= 0.001 * reference_rms
+        assert (actual - expected).square().mean().sqrt() <= tolerance * reference_rms
         torch.testing.assert_close(
             actual, expected, rtol=0.01, atol=0.01 * reference_rms
         )
@@ -917,6 +919,157 @@ def test_forced_persistent_rejects_other_dtypes_and_dimensions(dtype, head_size)
     key = torch.zeros(1, 257, 1, head_size, device="cuda", dtype=dtype)
     with pytest.raises(ValueError, match="persistent requires BF16 with head_size=128"):
         flash_attention(query, key, key, launch_config=_forced_config("persistent"))
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("geometry", [(32, 128, 2), (64, 128, 4), (128, 128, 4)])
+@pytest.mark.parametrize("seqlen_k", [1, 127, 128, 129, 255, 256, 257, 384, 769])
+def test_pipeline_tile_boundaries_fp64(dtype, head_size, geometry, seqlen_k):
+    """Short-tile and fixed-shift boundaries preserve every output row."""
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import (
+        LaunchConfig,
+        flash_attention,
+    )
+
+    torch.manual_seed(41970)
+    query = torch.randn(2, geometry[0] + 1, 3, head_size, device="cuda", dtype=dtype)
+    key = torch.randn(2, seqlen_k, 3, head_size, device="cuda", dtype=dtype)
+    value = torch.randn_like(key)
+    inputs = []
+    for tensor in (query, key, value):
+        shifted = torch.empty(tensor.numel() + 1, device=tensor.device, dtype=dtype)[1:]
+        inputs.append(shifted.view(tensor.shape).copy_(tensor))
+    config = LaunchConfig("pipeline", *geometry, False, "")
+    output = flash_attention(*inputs, softmax_scale=0.017, launch_config=config)
+    _assert_extended_attention_fp64(*inputs, output, 0.017)
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("block_m,num_warps", [(32, 2), (64, 4), (128, 4)])
+@pytest.mark.parametrize("seqlen_k", [128, 256, 769])
+def test_pipeline_recomputes_on_graph_replay(
+    dtype, head_size, block_m, num_warps, seqlen_k
+):
+    """A captured launch must handle late maxima, large shifts, and normal input."""
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import (
+        LaunchConfig,
+        flash_attention,
+    )
+
+    torch.manual_seed(41971)
+    inputs = []
+    for length in (block_m + 1, seqlen_k, seqlen_k):
+        shape = (2, length, 3, head_size)
+        tensor = torch.empty(
+            2 * length * 3 * head_size + 1, device="cuda", dtype=dtype
+        )[1:]
+        inputs.append(tensor.view(shape).normal_())
+    query, key, value = inputs
+    original = [tensor.clone() for tensor in inputs]
+    config = LaunchConfig("pipeline", block_m, 128, num_warps, False, "")
+    flash_attention(*inputs, launch_config=config)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = flash_attention(*inputs, launch_config=config)
+    for case in (
+        "random",
+        "late-key",
+        "zero-values",
+        "finite-denominator-overflow",
+        "large-uniform",
+        "random",
+    ):
+        for tensor, saved in zip(inputs, original):
+            tensor.copy_(saved)
+        if case in ("late-key", "zero-values"):
+            query.fill_(1)
+            key.zero_()
+            key[:, -2].fill_(8)
+            key[:, -1].fill_(16)
+            value.zero_()
+            if case == "late-key":
+                value[:, -1].fill_(1)
+        elif case == "finite-denominator-overflow":
+            # The denominator passes its guard. FP16 probability conversion
+            # or BF16 P*V overflows, so the output guard must trigger the retry.
+            query.fill_(1)
+            key.zero_()
+            key[:, -1].fill_(2 if dtype == torch.float16 else 1)
+            value.zero_()
+            value[:, -1].fill_(1 if dtype == torch.float16 else 2.0**120)
+        elif case == "large-uniform":
+            query.fill_(66048 if dtype == torch.bfloat16 else 60000)
+            query[1].neg_()
+            key.copy_(query[:, :1].expand_as(key))
+            value.fill_(1)
+        expected = _fp64_attention(*inputs, head_size**-0.5)
+        rms = expected.square().mean().sqrt().item()
+        tolerance = 0.01 if dtype == torch.bfloat16 else 0.003
+        for _ in range(20):
+            graph.replay()
+            torch.testing.assert_close(
+                output.double(),
+                expected,
+                rtol=tolerance,
+                atol=tolerance * max(rms, 1e-7),
+            )
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_pipeline_reuses_compilation_across_lengths(dtype, monkeypatch):
+    """Changing lengths within a tile bucket updates masks without compiling."""
+    import triton
+
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import (
+        LaunchConfig,
+        flash_attention,
+    )
+
+    config = LaunchConfig("pipeline", 64, 128, 4, False, "")
+
+    def run(sq, sk):
+        q = torch.randn(2, sq, 3, 128, device="cuda", dtype=dtype)
+        k = torch.randn(2, sk, 3, 128, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+        output = flash_attention(q, k, v, launch_config=config)
+        _assert_extended_attention_fp64(q, k, v, output, 128**-0.5)
+
+    run(65, 769)
+    compiled = []
+    monkeypatch.setattr(
+        triton.knobs.runtime,
+        "jit_post_compile_hook",
+        lambda **kwargs: compiled.append(kwargs),
+    )
+    for sq, sk in ((64, 768), (127, 770), (129, 895), (65, 257)):
+        run(sq, sk)
+    assert not compiled, "sequence lengths must not create new specializations"
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen_k", [128, 769])
+@pytest.mark.parametrize("broadcast_query", [False, True])
+def test_pipeline_independent_strides_fp64(dtype, seqlen_k, broadcast_query):
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import (
+        LaunchConfig,
+        flash_attention,
+    )
+
+    torch.manual_seed(41972)
+    q = torch.randn(2, 130, 3, 128, device="cuda", dtype=dtype)[:, ::2]
+    if broadcast_query:
+        q = q[:, :1].expand(-1, 65, -1, -1)
+    k = torch.randn(2, 3, seqlen_k, 128, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.randn(2, 2 * seqlen_k, 3, 128, device="cuda", dtype=dtype)[:, ::2]
+    config = LaunchConfig("pipeline", 64, 128, 4, False, "")
+    output = flash_attention(q, k, v, softmax_scale=0.017, launch_config=config)
+    _assert_extended_attention_fp64(q, k, v, output, 0.017)
 
 
 if __name__ == "__main__":
