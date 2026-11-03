@@ -1,5 +1,6 @@
 import functools
 import json
+import re
 import unittest
 import warnings
 from unittest.mock import patch
@@ -6262,6 +6263,121 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestNamedToolChoiceDropsOtherTools(unittest.TestCase):
+    """The grammar holds only the first call of a named tool_choice, so the
+    parsers can read calls to other tools from the rest of the output. The
+    client must get only the named tool, with consecutive indices and with each
+    call's arguments intact, in both the non-streaming and streaming paths."""
+
+    CALLS = [
+        ("sub", "Oslo"),
+        ("get_weather", "Paris"),
+        ("sub", "Lima"),
+        ("get_weather", "Rome"),
+    ]
+    NAMED = ToolChoice(function={"name": "get_weather"})
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                ),
+            )
+            for name in ("sub", "get_weather")
+        ]
+        self.outputs = {
+            "llama3": "<|python_tag|>"
+            + ";".join(
+                f'{{"name": "{name}", "arguments": {{"city": "{city}"}}}}'
+                for name, city in self.CALLS
+            ),
+            "deepseekv3": "<｜tool▁calls▁begin｜>"
+            + "".join(
+                f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\n```json\n"
+                f'{{"city": "{city}"}}\n```<｜tool▁call▁end｜>'
+                for name, city in self.CALLS
+            )
+            + "<｜tool▁calls▁end｜>",
+            "qwen3_coder": "".join(
+                f"<tool_call>\n<function={name}>\n<parameter=city>\n{city}\n"
+                "</parameter>\n</function>\n</tool_call>\n"
+                for name, city in self.CALLS
+            ),
+        }
+
+    def _stream(self, parser, output, text_chunk=r"\w+|\W"):
+        """The calls a streaming client assembles, by the index it sees."""
+        # Special tokens stay whole, as a tokenizer decodes them.
+        chunks = re.findall(rf"<[|｜].*?[|｜]>|{text_chunk}", output)
+        items = []
+        for chunk in chunks:
+            items += parser.parse_stream_chunk(chunk)[1]
+        items += parser.parse_stream_end()[1]
+        assembled = {}
+        for item in items:
+            if item.name:
+                assembled[item.tool_index] = (item.name, "")
+            name, arguments = assembled[item.tool_index]
+            assembled[item.tool_index] = (name, arguments + item.parameters)
+        return {i: (n, json.loads(a)) for i, (n, a) in assembled.items()}
+
+    def test_only_the_named_tool_reaches_the_client(self):
+        expected = [
+            ("get_weather", {"city": "Paris"}),
+            ("get_weather", {"city": "Rome"}),
+        ]
+        for tool_call_parser, output in self.outputs.items():
+            with self.subTest(parser=tool_call_parser, path="non-stream"):
+                parser = FunctionCallParser(
+                    self.tools, tool_call_parser, tool_choice=self.NAMED
+                )
+                _, calls = parser.parse_non_stream(output)
+                self.assertEqual(
+                    [(c.name, json.loads(c.parameters)) for c in calls], expected
+                )
+            with self.subTest(parser=tool_call_parser, path="stream"):
+                parser = FunctionCallParser(
+                    self.tools, tool_call_parser, tool_choice=self.NAMED
+                )
+                self.assertEqual(
+                    self._stream(parser, output), dict(enumerate(expected))
+                )
+
+    def test_other_tool_on_a_reused_index_is_dropped(self):
+        """After an undeclared tool, the llama3 detector restarts its indices, so
+        another tool can arrive on the index of a kept call. Its arguments must
+        not extend the kept call."""
+        output = "<|python_tag|>" + ";".join(
+            f'{{"name": "{name}", "arguments": {{"city": "{city}"}}}}'
+            for name, city in (
+                ("get_weather", "Paris"),
+                ("nope", "X"),
+                ("sub", "Oslo"),
+                ("sub", "Lima"),
+            )
+        )
+        parser = FunctionCallParser(self.tools, "llama3", tool_choice=self.NAMED)
+        self.assertEqual(
+            self._stream(parser, output, text_chunk=".{1,4}"),
+            {0: ("get_weather", {"city": "Paris"})},
+        )
+
+    def test_responses_tool_choice_shape_is_filtered_too(self):
+        parser = FunctionCallParser(
+            self.tools,
+            "llama3",
+            tool_choice={"type": "function", "name": "get_weather"},
+        )
+        _, calls = parser.parse_non_stream(self.outputs["llama3"])
+        self.assertEqual([c.name for c in calls], ["get_weather", "get_weather"])
 
 
 class TestToolCallParserNames(unittest.TestCase):

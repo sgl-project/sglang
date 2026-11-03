@@ -601,6 +601,85 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         )
         self.assertIn("city", args_obj, "Function arguments should have 'city'")
 
+    def test_function_call_specific_drops_other_tools(self):
+        """
+        Test: A named tool_choice returns only that tool when the model adds a
+        call to another tool, which the grammar does not hold after the first call.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "sub",
+                    "description": "Compute the difference of two integers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "int_a": {"type": "integer"},
+                            "int_b": {"type": "integer"},
+                        },
+                        "required": ["int_a", "int_b"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the latest weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            },
+        ]
+        request = dict(
+            model=self.model,
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "First call get_weather for Paris, then call sub "
+                    "with int_a=7 and int_b=2. Emit both calls.",
+                }
+            ],
+            temperature=0.8,
+            top_p=0.8,
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        )
+        for seed in range(3):
+            response = client.chat.completions.create(**request, seed=seed)
+            tool_calls = response.choices[0].message.tool_calls
+            self.assertEqual(
+                {call.function.name for call in tool_calls}, {"get_weather"}
+            )
+            self.assertEqual(
+                [call.index for call in tool_calls], list(range(len(tool_calls)))
+            )
+
+            names, arguments, finish_reason = {}, {}, None
+            for chunk in client.chat.completions.create(
+                **request, seed=seed, stream=True
+            ):
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                for delta in choice.delta.tool_calls or []:
+                    if delta.function.name:
+                        names[delta.index] = delta.function.name
+                    arguments[delta.index] = arguments.get(delta.index, "") + (
+                        delta.function.arguments or ""
+                    )
+            self.assertEqual(set(names.values()), {"get_weather"})
+            self.assertEqual(sorted(names), list(range(len(names))))
+            self.assertEqual(sorted(arguments), sorted(names))
+            for call_arguments in arguments.values():
+                json.loads(call_arguments)
+            self.assertEqual(finish_reason, "tool_calls")
+
     def test_streaming_multiple_choices_finish_reason(self):
         """
         Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
@@ -963,6 +1042,9 @@ class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
+
+    def test_function_call_specific_drops_other_tools(self):
+        self.skipTest("The Rust server parses tool calls without FunctionCallParser.")
 
 
 @unittest.skipUnless(

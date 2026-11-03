@@ -14,6 +14,7 @@ import asyncio
 import copy
 import gc
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
@@ -3384,6 +3385,60 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIsNone(
             result, "Should return None when parser has no tool call data"
         )
+
+    def test_named_tool_choice_stream_tail_follows_the_kept_call(self):
+        """At a token limit, the parser still holds arguments of the cut-off call.
+        Under a named tool_choice the end-of-stream tail must not name a call the
+        client never saw, and a kept call's tail must use the index it saw."""
+        self.chat.tool_call_parser = "llama3"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Call both."}],
+            tools=[
+                {"type": "function", "function": {"name": "sub"}},
+                {"type": "function", "function": {"name": "get_weather"}},
+            ],
+            tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            stream=True,
+        )
+        weather = '{"name": "get_weather", "arguments": {"city": "Paris"'
+        sub = '{"name": "sub", "arguments": {"city": "Oslo"'
+        for output, tail_index in (
+            (f'{weather}}}}};{sub}, "x": 1', None),
+            (f'{sub}}}}};{weather}, "x": 1', 0),
+        ):
+            with self.subTest(output=output):
+                parser_dict = {}
+
+                async def stream():
+                    for chunk in re.findall(r"\w+|\W", output):
+                        async for _ in self.chat._process_tool_call_stream(
+                            index=0,
+                            delta=chunk,
+                            parser_dict=parser_dict,
+                            content={"meta_info": {"id": "chatcmpl-test"}},
+                            request=req,
+                            has_tool_calls={},
+                            created=0,
+                        ):
+                            pass
+
+                get_or_create_event_loop().run_until_complete(stream())
+                tail = self.chat._check_for_unstreamed_tool_args(
+                    parser_dict[0],
+                    {"meta_info": {"id": "chatcmpl-test"}},
+                    req,
+                    0,
+                    created=0,
+                )
+                if tail_index is None:
+                    self.assertIsNone(tail)
+                else:
+                    tool_call = json.loads(tail[len("data: ") :])["choices"][0][
+                        "delta"
+                    ]["tool_calls"][0]
+                    self.assertEqual(tool_call["index"], tail_index)
+                    self.assertEqual(tool_call["function"]["arguments"], ', "x": 1}')
 
     # ------------- kimi_k2 tool_call_id formatting -------------
     def test_kimi_k2_non_streaming_tool_call_id_with_history(self):

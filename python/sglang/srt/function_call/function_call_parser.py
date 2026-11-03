@@ -158,6 +158,13 @@ class FunctionCallParser:
             tool_choice = ToolChoice(function={"name": tool_choice["name"]})
         self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
         self.detector = self._required_tool_parser or detector
+        self._named_tool = (
+            tool_choice.function.name if isinstance(tool_choice, ToolChoice) else None
+        )
+        # For each kept call under a named tool_choice, the detector's index and
+        # the index the client sees.
+        self._named_call_indices: Dict[int, int] = {}
+        self._next_named_call_index = 0
 
     def owns_tool_format(self) -> bool:
         return (
@@ -217,7 +224,7 @@ class FunctionCallParser:
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
         if tool_call_list or has_tool_call:
-            return parsed_result.normal_text, tool_call_list
+            return parsed_result.normal_text, self._keep_named_calls(tool_call_list)
         else:
             return full_text, []
 
@@ -245,7 +252,7 @@ class FunctionCallParser:
             final_calls.extend(sp_result.calls)
             final_normal_text = sp_result.normal_text
 
-        return final_normal_text, final_calls
+        return final_normal_text, self._keep_named_calls(final_calls)
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -256,7 +263,39 @@ class FunctionCallParser:
         if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+        return sp_result.normal_text, self._keep_named_calls(sp_result.calls)
+
+    def client_call_index(self, tool_index: int) -> Optional[int]:
+        """The index a client sees for the detector's call, None if it was dropped."""
+        if self._named_tool is None:
+            return tool_index
+        return self._named_call_indices.get(tool_index)
+
+    def _keep_named_calls(self, calls: list[ToolCallItem]) -> list[ToolCallItem]:
+        """Drop calls to other tools under a named tool_choice.
+
+        The grammar can leave free text after the forced call, or a string value
+        can hold another call, and the detector reads both. A stream names each
+        call once, and its argument deltas follow that decision. Kept calls get
+        consecutive indices, so the client sees no gap for a dropped call.
+        """
+        if self._named_tool is None:
+            return calls
+        kept = []
+        for call in calls:
+            if call.name == self._named_tool:
+                if call.tool_index not in self._named_call_indices:
+                    self._named_call_indices[call.tool_index] = (
+                        self._next_named_call_index
+                    )
+                    self._next_named_call_index += 1
+            elif call.name:
+                # A detector can reuse an index after it resets on an undeclared tool.
+                self._named_call_indices.pop(call.tool_index, None)
+            index = self.client_call_index(call.tool_index)
+            if index is not None:
+                kept.append(call.model_copy(update={"tool_index": index}))
+        return kept
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False

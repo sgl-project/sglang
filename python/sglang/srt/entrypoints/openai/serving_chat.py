@@ -3839,7 +3839,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else ""
         )
 
-        if remaining_call:
+        if isinstance(parser, FunctionCallParser):
+            # A named tool_choice can drop this call or move its index.
+            tool_index = parser.client_call_index(tool_index)
+
+        if remaining_call and tool_index is not None:
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
                 id=None,  # No ID for argument deltas
