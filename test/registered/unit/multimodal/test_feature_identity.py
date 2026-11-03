@@ -21,9 +21,10 @@ from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items, hash_feature_digest
 from sglang.srt.managers.req_types import (
     MultimodalDataItem,
+    MultimodalInputs,
     MultimodalProcessorOutput,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.mem_cache.radix_cache import RadixKey

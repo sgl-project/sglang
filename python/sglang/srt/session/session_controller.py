@@ -26,7 +26,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
