@@ -2349,6 +2349,28 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _wait_for_model_info(server_args: ServerArgs) -> dict:
+    # Polls once a second; after 120 tries, raises with the last failure.
+    headers = {}
+    if get_serving().api_key:
+        headers["Authorization"] = f"Bearer {get_serving().api_key}"
+    last_traceback = ""
+    for _ in range(120):
+        time.sleep(1)
+        try:
+            res = requests.get(
+                server_args.url() + "/model_info",
+                timeout=5,
+                headers=headers,
+                verify=ssl_verify_of(server_args),
+            )
+            assert res.status_code == 200, f"{res=}, {res.text=}"
+            return res.json()
+        except (AssertionError, requests.exceptions.RequestException):
+            last_traceback = get_exception_traceback()
+    raise TimeoutError(last_traceback)
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2357,27 +2379,12 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     ssl_verify = ssl_verify_of(server_args)
 
-    # Wait until the server is launched
-    success = False
-    for _ in range(120):
-        time.sleep(1)
-        try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
-            pass
-
-    if not success:
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
+    try:
+        model_info = _wait_for_model_info(server_args)
+    except TimeoutError as error:
+        logger.error(f"Initialization failed. warmup error: {error}")
         kill_process_tree(os.getpid())
-        return success
-
-    model_info = res.json()
+        return False
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     # A language-only worker may advertise VLM capability for encoder
@@ -2526,7 +2533,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    return success
+    return True
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
@@ -2540,6 +2547,15 @@ def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
             worker_id, server_args.gc_threshold
         ),
     )
+
+
+def _wait_for_server_before_gc_freeze(server_args: ServerArgs):
+    # The freeze is a request to this server, and with warmup skipped nothing
+    # else waits for it to listen; a refused freeze is only logged, never retried.
+    try:
+        _wait_for_model_info(server_args)
+    except TimeoutError as error:
+        logger.warning(f"No answer from the server before the GC freeze: {error}")
 
 
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
@@ -2578,15 +2594,20 @@ def _wait_and_warmup(
             get_exec().moe.ep_join_mode,
         )
 
-    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
-        if not execute_warmup_func(server_args):
-            return
-    else:
+    skip_warmup = get_serving().skip_server_warmup and not skip_elastic_joiner_warmup
+    if skip_elastic_joiner_warmup:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    elif skip_warmup:
+        _wait_for_server_before_gc_freeze(server_args)
+    elif not execute_warmup_func(server_args):
+        return
 
     if post_warmup_callback is not None:
         post_warmup_callback()
     _freeze_gc_after_server_warmup(server_args)
+    if skip_warmup:
+        # Up after the freeze, so no request waits on it walking the startup heap.
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
