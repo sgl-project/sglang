@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK,
+    BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
