@@ -2771,10 +2771,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_kpool_backend_support_follows_kv_dtype_and_gpu(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         hf_config = SimpleNamespace(
             architectures=["Glm5NextForConditionalGeneration"],
