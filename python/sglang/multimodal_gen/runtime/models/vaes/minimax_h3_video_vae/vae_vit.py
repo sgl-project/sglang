@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ViT3D decoder for the MiniMax H3 visual VAE (inference-only bundle).
+from __future__ import annotations
+
 from contextlib import nullcontext
 
 import torch
@@ -13,6 +15,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .base_module import RotaryEmbeddingND, TransformerBlock, _scaled_residual_add
+from .fused_decoder import block_forward, can_use_fused_decoder, finish
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
@@ -319,6 +322,13 @@ class ViT3DDecoder(ViTBase):
 
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        # Set by fp8.install_fp8_block_linears: the block linears are FP8, and
+        # the block layout lets fused_decoder run them on the fused producers.
+        self.fp8_installed = False
+        self.fused_decoder_ready = False
+        # fp16 unit weight that makes the fused RMSNorm+RoPE kernel the
+        # weightless Q/K norm of the fused FP8 blocks.
+        self._fused_qk_weight = None
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
@@ -327,6 +337,7 @@ class ViT3DDecoder(ViTBase):
         result = super()._apply(fn, recurse=recurse)
         self._rotary_pos_emb_cache = None
         self._autocast_linear_dtype = None
+        self._fused_qk_weight = None
         return result
 
     def prepare_autocast_linear_weights(self, dtype: torch.dtype) -> int:
@@ -339,6 +350,11 @@ class ViT3DDecoder(ViTBase):
         output projections stay FP32 because their calls explicitly disable
         autocast.
         """
+
+        if self.fp8_installed:
+            if dtype != torch.float16:
+                raise ValueError("The FP8 decoder requires FP16 autocast")
+            return 0
 
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
@@ -360,6 +376,27 @@ class ViT3DDecoder(ViTBase):
                     converted += 1
         self._autocast_linear_dtype = dtype
         return converted
+
+    def _qk_unit_weight(self, device: torch.device) -> torch.Tensor:
+        weight = self._fused_qk_weight
+        if weight is None or weight.device != device:
+            # The packed FP8 QKV GEMM output is fp16, so the Q/K norm weight is too.
+            weight = torch.ones(
+                self.config.dim_head, dtype=torch.float16, device=device
+            )
+            self._fused_qk_weight = weight
+        return weight
+
+    def _run_blocks(self, hidden_states, rotary_pos_emb):
+        if can_use_fused_decoder(self, hidden_states, rotary_pos_emb):
+            qk_weight = self._qk_unit_weight(hidden_states.device)
+            for block in self.transformer_blocks:
+                hidden_states = block_forward(
+                    block, hidden_states, rotary_pos_emb, qk_weight
+                )
+            return finish(hidden_states, self.norm_out)
+        hidden_states = self.forward_transformer_blocks(hidden_states, rotary_pos_emb)
+        return self.norm_out(hidden_states)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, latent_T, latent_H, latent_W = x.shape
@@ -444,9 +481,7 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        hidden_states = self.forward_transformer_blocks(hidden_states, rotary_pos_emb)
-
-        hidden_states = self.norm_out(hidden_states)
+        hidden_states = self._run_blocks(hidden_states, rotary_pos_emb)
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
