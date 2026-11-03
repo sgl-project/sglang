@@ -12,10 +12,9 @@ the host-side key ids keep their values.
 CPU-only: no engine, GPU or weights.
 """
 
-import sys
+import unittest
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 
@@ -28,6 +27,7 @@ from sglang.srt.managers.req_types import (
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -38,23 +38,6 @@ VIDEO_TOKEN_ID = 42
 # Two items per request; (start, end) offsets are inclusive, as processors emit them.
 OFFSETS = [(3, 6), (10, 12)]
 SEQ_LEN = 16
-
-
-@pytest.fixture(autouse=True)
-def single_process_runtime_context():
-    # The embedding path reads the config namespaces and the attention-TP rank.
-    override = get_context().override_server_args(tp_size=1)
-    override.install()
-    try:
-        with get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1):
-            yield
-    finally:
-        override.restore()
-
-
-@pytest.fixture(autouse=True)
-def cpu_embedding_cache():
-    mm_schedule.init_mm_embedding_cache(1 << 30)
 
 
 def _feature(item: MultimodalDataItem) -> torch.Tensor:
@@ -132,13 +115,12 @@ def _expected_embeds(mm_inputs_list, host_ids, embedding):
     return expected
 
 
-def test_pad_values_are_out_of_vocab():
+def _case_pad_values_are_out_of_vocab():
     _, ids, positions = _request(1, IMAGE_TOKEN_ID)
     assert bool((ids[positions[Modality.IMAGE]] >= MM_PAD_SHIFT_VALUE).all())
 
 
-@pytest.mark.parametrize("num_requests", [1, 2])
-def test_placeholder_token_id_written_in_place(num_requests):
+def _case_placeholder_token_id_written_in_place(num_requests):
     reqs = [_request(seed, IMAGE_TOKEN_ID) for seed in range(1, num_requests + 1)]
     mm_inputs_list = [mm for mm, _, _ in reqs]
     host_ids = torch.cat([ids for _, ids, _ in reqs])
@@ -158,7 +140,7 @@ def test_placeholder_token_id_written_in_place(num_requests):
     )
 
 
-def test_image_and_video_get_their_own_placeholder():
+def _case_image_and_video_get_their_own_placeholder():
     mm, host_ids, positions = _request(
         5,
         IMAGE_TOKEN_ID,
@@ -178,7 +160,7 @@ def test_image_and_video_get_their_own_placeholder():
     )
 
 
-def test_chunk_boundary_inside_an_image():
+def _case_chunk_boundary_inside_an_image():
     # Second chunk of a chunked prefill: it starts inside the first image.
     mm, ids, positions = _request(3, IMAGE_TOKEN_ID)
     prefix = 5
@@ -195,7 +177,7 @@ def test_chunk_boundary_inside_an_image():
     )
 
 
-def test_without_placeholder_token_id_falls_back_to_clamp():
+def _case_without_placeholder_token_id_falls_back_to_clamp():
     mm, ids, positions = _request(4, None)
     image_positions = positions[Modality.IMAGE]
     input_ids = ids.clone()
@@ -212,7 +194,7 @@ def test_without_placeholder_token_id_falls_back_to_clamp():
     )
 
 
-def test_split_path_mixed_precomputed():
+def _case_split_path_mixed_precomputed():
     # Adaptive encoder dispatch embeds a torch.cat copy per group; input_ids must
     # still end up with the placeholder ids.
     reqs = [
@@ -246,5 +228,41 @@ def test_split_path_mixed_precomputed():
     )
 
 
+class TestMMPlaceholderTokenIds(CustomTestCase):
+    def setUp(self):
+        # The embedding path reads the config namespaces and the attention-TP rank.
+        self._server_args = get_context().override_server_args(tp_size=1)
+        self._server_args.install()
+        self._parallel = get_parallel().override(
+            attn_tp_rank=0, attn_tp_size=1, tp_size=1
+        )
+        self._parallel.__enter__()
+        mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    def tearDown(self):
+        self._parallel.__exit__(None, None, None)
+        self._server_args.restore()
+
+    def test_pad_values_are_out_of_vocab(self):
+        _case_pad_values_are_out_of_vocab()
+
+    def test_placeholder_token_id_written_in_place(self):
+        for num_requests in (1, 2):
+            with self.subTest(num_requests=num_requests):
+                _case_placeholder_token_id_written_in_place(num_requests)
+
+    def test_image_and_video_get_their_own_placeholder(self):
+        _case_image_and_video_get_their_own_placeholder()
+
+    def test_chunk_boundary_inside_an_image(self):
+        _case_chunk_boundary_inside_an_image()
+
+    def test_without_placeholder_token_id_falls_back_to_clamp(self):
+        _case_without_placeholder_token_id_falls_back_to_clamp()
+
+    def test_split_path_mixed_precomputed(self):
+        _case_split_path_mixed_precomputed()
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    unittest.main()
