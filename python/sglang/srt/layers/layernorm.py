@@ -857,15 +857,16 @@ class RMSNorm(BaseFusedOp):
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
+        if x.numel() == 0:
+            # vLLM's HIP kernels fail to launch on an empty grid.
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            residual = residual.contiguous()
+            # vLLM fused_add_rms_norm(input, residual, weight, eps) updates both in place.
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -1292,19 +1293,19 @@ class GemmaRMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
         else:
             w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            # vllm API: rms_norm(out, input, weight, eps) -> None
+            #           fused_add_rms_norm(input, residual, weight, eps) -> None (in place)
             if not x.is_contiguous():
                 x = x.contiguous()
+            if x.numel() == 0:
+                # vLLM's HIP kernels fail to launch on an empty grid.
+                return self.forward_native(x, residual, post_residual_addition)
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
+                residual = residual.contiguous()
+                fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+                return x, residual
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
             return out
