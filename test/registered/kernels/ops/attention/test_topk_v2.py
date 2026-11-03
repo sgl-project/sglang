@@ -450,13 +450,12 @@ def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> 
 
 
 def _mode_check() -> None:
-    """Exactness checks of this process's mode, run by test_topk_v2_exact_modes in a
-    subprocess per mode (the mode is compiled in once per process). Shapes cover the
+    """Checks of this process's mode, run by test_topk_v2_modes in a subprocess per
+    non-default mode (the mode is compiled in once per process). Shapes cover the
     one-block paths and, on CUDA, the C16 / C8 small-batch cluster kernels and the
     persistent cluster pool (34 rows above the plan's smallest threshold); equal-value groups
-    larger than the tie buffer included."""
+    larger than the tie buffer included. FAST only promises a legal output."""
     mode = _topk_mode()
-    assert mode != MODE_FAST
     k = 2048
     for dist in NARROW_DISTRIBUTIONS:
         for batch, seq in [
@@ -473,6 +472,9 @@ def _mode_check() -> None:
             scores = _single_bin_scores(dist, batch, width, "cuda")[:, :seq]
             seq_lens = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
             scores_cpu, lens_cpu = scores.cpu(), seq_lens.cpu()
+            if mode == MODE_FAST:
+                _assert_topk_legal(_run_raw(scores, seq_lens, k), batch, lens_cpu, k)
+                continue
             runs = [_run_raw(scores, seq_lens, k) for _ in range(3)]
             ref_raw = _reference(scores, seq_lens, k)
             _assert_topk_close(
@@ -497,8 +499,8 @@ def _start_exact_mode_checks():
     if not torch.cuda.is_available():
         yield
         return
-    # ROCm runs EXACT in-process by default, so only DETERMINISTIC needs its own process there.
-    for mode in (MODE_DETERMINISTIC,) if is_hip() else (MODE_EXACT, MODE_DETERMINISTIC):
+    # This process runs the default EXACT mode; the other two each need their own process.
+    for mode in (MODE_FAST, MODE_DETERMINISTIC):
         log = tempfile.TemporaryFile(mode="w+")
         with envs.SGLANG_TOPK_V2_MODE.override(mode):
             proc = subprocess.Popen(
@@ -515,20 +517,9 @@ def _start_exact_mode_checks():
         log.close()
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        pytest.param(
-            MODE_EXACT,
-            marks=pytest.mark.skipif(
-                is_hip(), reason="ROCm runs EXACT in-process by default"
-            ),
-        ),
-        MODE_DETERMINISTIC,
-    ],
-)
-def test_topk_v2_exact_modes(mode: int) -> None:
-    """EXACT / DETERMINISTIC in their own process, since one process builds one mode."""
+@pytest.mark.parametrize("mode", [MODE_FAST, MODE_DETERMINISTIC])
+def test_topk_v2_modes(mode: int) -> None:
+    """FAST / DETERMINISTIC in their own process, since one process builds one mode."""
     proc, log = _EXACT_MODE_CHECKS[mode]
     proc.wait(timeout=1800)
     log.seek(0)
