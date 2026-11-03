@@ -255,7 +255,7 @@ class DocPrefetch:
 
     def take_released(self) -> List[Req]:
         """Follow-ups released since the last call, in release order."""
-        return self._released.take(lambda r: True)
+        return self._released.take()
 
     def request_lists(self) -> Dict[ListKind, RequestList]:
         return {

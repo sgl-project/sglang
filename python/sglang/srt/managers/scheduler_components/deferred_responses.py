@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    RequestList,
     _RequestList,
 )
 
@@ -40,7 +41,7 @@ class DeferredResponses:
             ListKind.DEFERRED, abort=self._abort, req_of=lambda x: x[0]
         )
 
-    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
         return {ListKind.DEFERRED: self.held}
 
     def defer(self, req: Req, completion: ResponseCompletion) -> None:

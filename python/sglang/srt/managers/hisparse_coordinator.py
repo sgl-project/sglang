@@ -5,7 +5,6 @@ import weakref
 from typing import (
     TYPE_CHECKING,
     Dict,
-    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -50,6 +49,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    RequestList,
     _RequestList,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -1072,7 +1072,7 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
         return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
     def has_ongoing_staging(self) -> bool:

@@ -34,7 +34,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterable,
     List,
     Optional,
     Tuple,
@@ -101,6 +100,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
+    RequestList,
     _RequestList,
 )
 from sglang.srt.managers.utils import (
@@ -1030,7 +1030,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
-        held = self.held_rebootstrap_reqs.take(lambda req: True)
+        held = self.held_rebootstrap_reqs.take()
         for req in held:
             self.add(req, is_rebootstrap=True)
 
@@ -1100,7 +1100,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
 
-    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
         return {
             ListKind.PD_PREALLOC: self.queue,
             ListKind.PD_RETRACTED: self.retracted_queue,
@@ -2889,7 +2889,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
 
-    def request_lists(self) -> Dict[ListKind, Iterable[Req]]:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
         return {
             ListKind.PD_RECEIVING: self.queue,
             # Aborted, with KV held until the transfer drains.

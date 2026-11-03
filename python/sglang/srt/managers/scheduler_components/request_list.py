@@ -59,9 +59,10 @@ class RequestList(ABC):
     def abort(self, recv_req: AbortReq) -> None:
         """Abort the requests `recv_req` names."""
 
-    def take(self, pred: Callable[[Req], bool]) -> List[Req]:
-        """Drop the requests matching `pred` and return them, in list order."""
-        taken = [req for req in self if pred(req)]
+    def take(self, pred: Optional[Callable[[Req], bool]] = None) -> List[Req]:
+        """Drop the requests matching `pred`, or all of them, and return them in
+        list order."""
+        taken = [req for req in self if pred is None or pred(req)]
         self.leave(taken)
         return taken
 
