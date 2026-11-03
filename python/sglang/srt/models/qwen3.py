@@ -274,6 +274,10 @@ class Qwen3Attention(nn.Module):
         self.table_rope_positions_ndim = (
             2 if type(self.rotary_emb) is MRotaryEmbedding else 1
         )
+        # Measured on B300: above ~3k (token, head) rows the split path is faster.
+        self.table_qk_norm_rope_max_tokens = 3072 // (
+            self.num_heads + self.num_kv_heads
+        )
 
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
@@ -319,11 +323,11 @@ class Qwen3Attention(nn.Module):
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.k_norm.weight.dtype == torch.bfloat16
             and positions.ndim == self.table_rope_positions_ndim
+            and qkv.shape[0] <= self.table_qk_norm_rope_max_tokens
         ):
+            axis_map = None
             if positions.ndim == 2:
-                # Decode MRoPE repeats one position on all three axes; GLM-Image's
-                # precomputed spatial decode positions don't reach Qwen3Attention.
-                positions = positions[0]
+                axis_map = self.rotary_emb.axis_map
                 self.rotary_emb._match_cos_sin_cache_dtype(qkv)
             table_qk_norm_rope_(
                 qkv,
@@ -336,6 +340,7 @@ class Qwen3Attention(nn.Module):
                 self.head_dim,
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
+                axis_map=axis_map,
             )
         else:
             q, k = apply_qk_norm(

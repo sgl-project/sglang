@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -12,6 +14,8 @@ def _table_qk_norm_rope_kernel(
     k_weight_ptr,
     cos_sin_ptr,
     pos_ptr,
+    axis_map_ptr,
+    pos_stride,
     row_stride,
     q_size,
     NHQ: tl.constexpr,
@@ -19,14 +23,19 @@ def _table_qk_norm_rope_kernel(
     EPS: tl.constexpr,
     MATCH_CUDA: tl.constexpr,
     BF16_TABLE: tl.constexpr,
+    MROPE: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
-    pos = tl.load(pos_ptr + t).to(tl.int64)
 
     HALF: tl.constexpr = D // 2
     half_ar = tl.arange(0, HALF)
     d_ar = tl.arange(0, D)
+    if MROPE:
+        axis = tl.load(axis_map_ptr + half_ar)
+        pos = tl.load(pos_ptr + axis * pos_stride + t).to(tl.int64)
+    else:
+        pos = tl.load(pos_ptr + t).to(tl.int64)
     cos = tl.load(cos_sin_ptr + pos * D + half_ar)
     sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar)
 
@@ -85,6 +94,7 @@ def table_qk_norm_rope_(
     eps: float,
     *,
     match_cuda: bool = False,
+    axis_map: Optional[torch.Tensor] = None,
 ) -> None:
     """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
 
@@ -96,8 +106,11 @@ def table_qk_norm_rope_(
     QK-norm and RoPE kernels for head dimensions 64/128/256. It requires BF16
     QKV with contiguous columns, contiguous BF16 weights, a contiguous FP32
     or BF16 rotary table, and contiguous int32/int64 positions on the same CUDA
-    device. Row-strided QKV is supported. A BF16 table rotates in BF16 to match
-    ``triton_mrope_fused`` on decode positions, where all three axes are equal.
+    device. Row-strided QKV is supported.
+
+    MRoPE passes [3, T] positions and ``MRotaryEmbedding.axis_map``, the axis
+    each rotary lane reads its position from. A BF16 table rotates in BF16 to
+    match ``triton_mrope_fused``.
     """
     if match_cuda:
         assert head_dim in (64, 128, 256)
@@ -109,11 +122,17 @@ def table_qk_norm_rope_(
         assert cos_sin_cache.ndim == 2 and cos_sin_cache.shape[1] == head_dim
         assert cos_sin_cache.dtype in (torch.float32, torch.bfloat16)
         assert cos_sin_cache.is_contiguous()
-        assert positions.shape == (qkv.shape[0],) and positions.is_contiguous()
+        num_axes = () if axis_map is None else (3,)
+        assert positions.shape == (*num_axes, qkv.shape[0])
+        assert positions.is_contiguous()
         assert positions.dtype in (torch.int32, torch.int64)
+        if axis_map is not None:
+            assert axis_map.shape == (head_dim // 2,) and axis_map.is_contiguous()
+            assert axis_map.dtype == torch.int64
         assert qkv.is_cuda and all(
             t.device == qkv.device
-            for t in (positions, q_weight, k_weight, cos_sin_cache)
+            for t in (positions, q_weight, k_weight, cos_sin_cache, axis_map)
+            if t is not None
         )
     T = qkv.shape[0]
     if T == 0:
@@ -125,6 +144,8 @@ def table_qk_norm_rope_(
         k_weight,
         cos_sin_cache,
         positions,
+        axis_map,
+        positions.stride(0),
         qkv.stride(0),
         num_q_heads * head_dim,
         NHQ=num_q_heads,
@@ -132,5 +153,6 @@ def table_qk_norm_rope_(
         EPS=eps,
         MATCH_CUDA=match_cuda,
         BF16_TABLE=cos_sin_cache.dtype == torch.bfloat16,
+        MROPE=axis_map is not None,
         num_warps=1 if match_cuda else 4,
     )
