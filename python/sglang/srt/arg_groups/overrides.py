@@ -33,12 +33,7 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
-
-# Compatibility re-exports; model providers import model_override_base directly.
-from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
-    _MODEL_OVERRIDE_FNS,
-    _PREDICATE_OVERRIDE_FNS,
-    MODEL_OVERRIDES,
+from sglang.srt.arg_groups.model_override_base import (
     ResolvedView,
     ResolvingConfig,
     _declaration_overlay,
@@ -47,10 +42,8 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
-    mamba_extra_buffer_of,
     model_config_of,
     record_of,
-    register_model_override,
     register_model_override_predicate,
     resolved_view,
     resolving_view,
@@ -1713,7 +1706,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+    from sglang.srt.utils.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -1958,7 +1951,7 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     # model never loads an HF config) is honored as-is; otherwise the memo
     # is only kept once the record is resolved, because `page_size` below
     # is resolution-written.
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
         try:
