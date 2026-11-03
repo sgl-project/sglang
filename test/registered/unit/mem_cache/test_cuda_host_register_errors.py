@@ -27,8 +27,11 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 def _clear_cuda_error() -> None:
     # The forced failures set the runtime's last error; reset it so later
-    # kernel-launch checks in this process do not report it.
-    ctypes.CDLL(find_loaded_library("libcudart")).cudaGetLastError()
+    # kernel-launch checks in this process do not report it. A statically
+    # linked runtime has no shared library to reach.
+    libcudart = find_loaded_library("libcudart")
+    if libcudart is not None:
+        ctypes.CDLL(libcudart).cudaGetLastError()
 
 
 @unittest.skipUnless(
