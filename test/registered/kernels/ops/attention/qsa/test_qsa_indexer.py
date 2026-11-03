@@ -487,7 +487,7 @@ def _decode_operands(rows, max_pages, page_size, context_lens, device):
 
 @pytest.mark.parametrize("rows", [6, 100, 700])
 def test_tilelang_mqa_decode_grid_covers_every_group(rows):
-    """The decode kernel strides 256, 16 or 1 CTAs per row (by row count) over the
+    """The decode kernel strides 256, 64 or 1 CTAs per row (by row count) over the
     row's 64-token groups. Every group of every row must be scored, and nothing
     is written past a row's context length."""
     from sglang.srt.layers.attention.qsa.mqa import (
@@ -512,6 +512,46 @@ def test_tilelang_mqa_decode_grid_covers_every_group(rows):
     finite = torch.isfinite(ref)
     assert torch.equal(finite, torch.isfinite(out))
     torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,ctas", [(1, 256), (37, 256), (38, 64), (607, 64), (608, 1), (5000, 1)]
+)
+def test_decode_ctas_per_row_by_row_count(monkeypatch, rows, ctas):
+    """CTAs per decode row on a 152-SM GPU (four waves = 608 CTAs): 256 below 38
+    rows, 64 up to four waves of rows, then one."""
+    from sglang.srt.layers.attention.qsa import mqa
+
+    monkeypatch.setattr(mqa, "_num_sms", lambda device_index: 152)
+    assert mqa._decode_ctas_per_row(rows, torch.device("cuda", 0)) == ctas
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_tilelang_mqa_decode_ctas_per_row_bitwise(monkeypatch, dtype):
+    """Each 64-token group is scored by exactly one CTA with the same
+    instructions, so the logits are bit-identical for every CTAs-per-row level."""
+    from sglang.srt.layers.attention.qsa import mqa
+
+    if not mqa.HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    rows, max_pages, page_size = 24, 512, 16
+    max_model_len = max_pages * page_size
+    lens = torch.randint(1, max_model_len + 1, (rows,))
+    lens[0] = max_model_len
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    q, cache = q.to(dtype), cache.to(dtype)
+    outs = []
+    for ctas in mqa._DECODE_CTAS_PER_ROW_LEVELS:
+        monkeypatch.setattr(mqa, "_decode_ctas_per_row", lambda r, d, c=ctas: c)
+        outs.append(
+            mqa.tilelang_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+        )
+    for out in outs[1:]:
+        assert torch.equal(out.view(torch.int32), outs[0].view(torch.int32))
 
 
 def test_tilelang_mqa_decode_skips_rows_that_fit_topk():

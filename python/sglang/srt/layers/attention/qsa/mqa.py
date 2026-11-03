@@ -536,9 +536,12 @@ def tilelang_qsa_mqa_prefill_relative(
     return logits
 
 
-# CTAs per decode row: few enough levels to bound the TileLang specializations, and
-# a grid of about four waves (at least one CTA per row).
-_DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+# CTAs per decode row: few enough levels to bound the TileLang specializations.
+# A row's CTAs stride over its 64-key groups, so each CTA scores about
+# groups / ctas of them back to back. Up to four waves' worth of rows take 256
+# CTAs per row (one CTA per row from four waves of rows on); in between, 64 CTAs
+# per row keep that serial walk short at long contexts.
+_DECODE_CTAS_PER_ROW_LEVELS = (1, 64, 256)
 
 
 @functools.lru_cache(maxsize=None)
@@ -547,11 +550,13 @@ def _num_sms(device_index: int) -> int:
 
 
 def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
-    wanted = -(-4 * _num_sms(device.index or 0) // max(rows, 1))
-    for level in _DECODE_CTAS_PER_ROW_LEVELS:
-        if level >= wanted:
-            return level
-    return _DECODE_CTAS_PER_ROW_LEVELS[-1]
+    four_waves = 4 * _num_sms(device.index or 0)
+    rows = max(rows, 1)
+    if rows >= four_waves:
+        return _DECODE_CTAS_PER_ROW_LEVELS[0]
+    if 16 * rows >= four_waves:
+        return _DECODE_CTAS_PER_ROW_LEVELS[1]
+    return _DECODE_CTAS_PER_ROW_LEVELS[2]
 
 
 def tilelang_qsa_mqa_decode(
