@@ -1,3 +1,9 @@
+import itertools
+import logging
+import math
+import time
+from functools import cache
+
 """Fused Q/K GemmaRMSNorm + NeoX RoPE + gate deinterleave (Triton).
 
 Single kernel launch fusing per-head GemmaRMSNorm, partial NeoX RoPE over 1-D or
@@ -10,6 +16,8 @@ mrope positions, and gate deinterleave for Qwen3.5's interleaved Q+Gate layout.
 from typing import Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
@@ -17,7 +25,8 @@ from triton.language.extra.cuda import libdevice
 from sglang.kernels.arch import current_arch
 
 
-@triton.jit
+# MRoPE axis stride is the request length, not a compile-time geometry.
+@triton.jit(do_not_specialize=["stride_pos_axis"])
 def _fused_qk_rmsnorm_rope_gate_kernel(
     q_gate_ptr,
     k_ptr,
@@ -221,3 +230,197 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     )
 
     return q_out, k_out, gate_out if has_gate else None
+
+
+def mrope_axis_map_values(
+    rotary_dim: int,
+    sections,
+    *,
+    interleaved: bool = False,
+    interleaved_glm: bool = False,
+):
+    """Mirror MRotaryEmbedding's lane ownership using configuration only."""
+    if (
+        rotary_dim <= 0
+        or rotary_dim % 2
+        or sections is None
+        or len(sections) != 3
+        or any(section < 0 for section in sections)
+        or sum(sections) != rotary_dim // 2
+    ):
+        return None
+    if interleaved and interleaved_glm:
+        counts = [0, 0, 0]
+        axes = []
+        for lane in range(rotary_dim // 2):
+            axis = lane % 3
+            while counts[axis] >= sections[axis]:
+                axis = (axis + 1) % 3
+            axes.append(axis)
+            counts[axis] += 1
+        return tuple(axes)
+    if interleaved:
+        return tuple(
+            (
+                1
+                if lane % 3 == 1 and lane < 3 * sections[1]
+                else 2
+                if lane % 3 == 2 and lane < 3 * sections[2]
+                else 0
+            )
+            for lane in range(rotary_dim // 2)
+        )
+    return tuple(axis for axis, count in enumerate(sections) for _ in range(count))
+
+
+def can_use_fused_qk_gemma_rmsnorm_rope_gate(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    has_gate: bool = True,
+    mrope_axis_map: Optional[torch.Tensor] = None,
+    *,
+    is_neox_style: bool = True,
+) -> bool:
+    """Check tensor metadata only; unsupported model paths keep separate ops.
+
+    Position values must index the supplied cache; axis-map values must be 0..2.
+    These are the same caller invariants as the separate RoPE implementation.
+    No device synchronization or capability query is needed for this check.
+    """
+    floating_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    if (
+        not is_neox_style
+        or q_gate.device.type != "cuda"
+        or torch.version.hip is not None
+        or q_gate.dtype not in (torch.float16, torch.bfloat16)
+        or k.dtype != q_gate.dtype
+        or q_weight.dtype not in floating_dtypes
+        or k_weight.dtype != q_weight.dtype
+        or cos_sin_cache.dtype not in floating_dtypes
+        or positions.dtype not in (torch.int32, torch.int64)
+        or not math.isfinite(eps)
+        or eps <= 0
+        or num_q_heads <= 0
+        or num_kv_heads <= 0
+        or head_dim <= 0
+        or head_dim > 1024
+        or not 0 < rotary_dim <= head_dim
+        or rotary_dim % 2
+        or q_gate.ndim != 2
+        or k.ndim != 2
+        or q_gate.shape[1] != num_q_heads * (1 + has_gate) * head_dim
+        or k.shape != (q_gate.shape[0], num_kv_heads * head_dim)
+        or q_gate.stride(-1) != 1
+        or k.stride(-1) != 1
+        or q_weight.shape != (head_dim,)
+        or k_weight.shape != (head_dim,)
+        or not q_weight.is_contiguous()
+        or not k_weight.is_contiguous()
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[1] != rotary_dim
+        or cos_sin_cache.stride(-1) != 1
+        or not positions.is_contiguous()
+    ):
+        return False
+    tensors = (k, q_weight, k_weight, cos_sin_cache, positions)
+    if any(tensor.device != q_gate.device for tensor in tensors):
+        return False
+    tokens = q_gate.shape[0]
+    if positions.ndim == 1:
+        return positions.shape == (tokens,) and mrope_axis_map is None
+    return (
+        positions.shape == (3, tokens)
+        and mrope_axis_map is not None
+        and mrope_axis_map.device == q_gate.device
+        and mrope_axis_map.dtype in (torch.int32, torch.int64)
+        and mrope_axis_map.shape == (rotary_dim // 2,)
+        and mrope_axis_map.is_contiguous()
+    )
+
+
+@cache
+def warmup_fused_qk_rmsnorm_rope_gate(
+    *,
+    device,
+    dtype,
+    weight_dtype,
+    cache_dtype,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    rotary_dim,
+    eps,
+    has_gate,
+    mrope_axes=None,
+):
+    """Compile the actual layer's QKV view geometry using private buffers.
+
+    The fused path reads the supplied cache directly, including FP32 MRoPE
+    caches. Its axes select the actual model path. MRoPE's 1-D native fallback
+    is not fused. The kernel does not specialize on token count or axis stride.
+    """
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+    started = time.monotonic()
+    with torch.cuda.device(device), torch.inference_mode():
+        q_weight = torch.zeros(head_size, dtype=weight_dtype, device=device)
+        k_weight = torch.zeros_like(q_weight)
+        axis_map = (
+            torch.tensor(mrope_axes, dtype=torch.int64, device=device)
+            if mrope_axes is not None
+            else None
+        )
+        q_width = num_heads * head_size * (1 + has_gate)
+        kv_width = num_kv_heads * head_size
+        mrope = axis_map is not None
+        rope_cache = torch.zeros((1, rotary_dim), dtype=cache_dtype, device=device)
+        for tokens, index_dtype in itertools.product(
+            (1, 64), (torch.int32, torch.int64)
+        ):
+            projection = torch.zeros(
+                (tokens, q_width + 2 * kv_width), dtype=dtype, device=device
+            )
+            q_gate, k, _ = projection.split((q_width, kv_width, kv_width), dim=-1)
+            positions = torch.zeros(
+                (3, tokens) if mrope else (tokens,), dtype=index_dtype, device=device
+            )
+            arguments = (
+                q_gate,
+                k,
+                q_weight,
+                k_weight,
+                rope_cache,
+                positions,
+                eps,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                rotary_dim,
+                has_gate,
+                axis_map,
+            )
+            if not can_use_fused_qk_gemma_rmsnorm_rope_gate(*arguments):
+                return False
+            fused_qk_gemma_rmsnorm_rope_gate(*arguments)
+        torch.cuda.synchronize(device)
+    logger.info(
+        "CP QK/RoPE warmup complete: heads=%d/%d head_size=%d rotary_dim=%d "
+        "mrope=%s scratch_only=True elapsed=%.3fs",
+        num_heads,
+        num_kv_heads,
+        head_size,
+        rotary_dim,
+        axis_map is not None,
+        time.monotonic() - started,
+    )
+    return True

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import logging
+import time
+from functools import cache
+
 import torch
+
+logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 
@@ -342,14 +348,53 @@ def fused_qkvzba_split_reshape_cat_contiguous(
 
 
 def qwen3_5_gdn_prefill_projection_views(
-    mixed_qkvz,
-    mixed_ba,
-    num_heads_qk,
-    num_heads_v,
-    head_qk,
-    head_v,
-):
-    """Return strided views accepted by the prefill GDN consumers."""
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_qk: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split packed GDN projections into read-only QKV/Z/B/A views.
+
+    Inputs use [all_q | all_k | all_v | all_z] and [all_b | all_a] order.
+    Consumers must accept row strides; Z keeps [tokens, heads, head_dim]
+    because flattening its first two axes would copy the projection tail.
+
+    Raises:
+        ValueError: Inputs do not satisfy the CUDA GDN prefill layout contract.
+    """
+    if min(num_heads_qk, num_heads_v, head_qk, head_v) <= 0:
+        raise ValueError("GDN projection head counts and dimensions must be positive")
+    if num_heads_v % num_heads_qk or num_heads_v // num_heads_qk not in (1, 2, 4):
+        raise ValueError("GDN projection views require a V/QK head ratio of 1, 2 or 4")
+    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
+        raise ValueError("GDN projection views require two-dimensional inputs")
+    if (
+        mixed_qkvz.device.type != "cuda"
+        or torch.version.hip is not None
+        or mixed_ba.device != mixed_qkvz.device
+    ):
+        raise ValueError("GDN projection views require inputs on the same CUDA device")
+    if mixed_qkvz.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ) or mixed_ba.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(
+            "GDN projection views require FP16/BF16 QKVZ and FP16/BF16/FP32 BA"
+        )
+    qkvz_dim = 2 * num_heads_qk * head_qk + 2 * num_heads_v * head_v
+    if mixed_qkvz.shape[1] != qkvz_dim or mixed_ba.shape != (
+        mixed_qkvz.shape[0],
+        2 * num_heads_v,
+    ):
+        raise ValueError(
+            "GDN projection widths or token counts do not match the head geometry"
+        )
+    if mixed_qkvz.stride(-1) != 1 or mixed_ba.stride(-1) != 1:
+        raise ValueError(
+            "GDN projection views require unit stride in the last dimension"
+        )
     tokens = mixed_qkvz.shape[0]
     qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = mixed_qkvz[:, :qkv_dim]
@@ -734,3 +779,95 @@ def fused_qkv_split_gdn_prefill(
         num_stages=3,
     )
     return q, k, v
+
+
+@cache
+def warmup_gdn_projection_norm(
+    *,
+    device,
+    dtype,
+    weight_dtype,
+    num_heads_qk,
+    num_heads_v,
+    head_qk,
+    head_v,
+    eps,
+    group_size,
+    norm_before_gate,
+    activation,
+):
+    """Compile 3-D Z normalization with the loaded GDN layer's actual layout."""
+    from sglang.kernels.ops.attention.fla.layernorm_gated import (
+        MAX_ROWS_PER_BLOCK,
+        rms_norm_gated,
+    )
+
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
+    started = time.monotonic()
+    with torch.cuda.device(device), torch.inference_mode():
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        # Cover the existing row-block heuristic's boundaries, including odd
+        # token counts and the same packed row strides as the real projection.
+        token_counts = {1, 17, 64}
+        rows = 1
+        while rows < MAX_ROWS_PER_BLOCK:
+            token_counts.add(triton.cdiv(2 * sm_count * rows + 1, num_heads_v))
+            rows *= 2
+        width = 2 * num_heads_qk * head_qk + 2 * num_heads_v * head_v
+        weight = torch.ones(head_v, dtype=weight_dtype, device=device)
+        for tokens in sorted(token_counts):
+            projection = torch.zeros((tokens, width), dtype=dtype, device=device)
+            gates = torch.zeros((tokens, 2 * num_heads_v), dtype=dtype, device=device)
+            _, z, _, _ = qwen3_5_gdn_prefill_projection_views(
+                projection, gates, num_heads_qk, num_heads_v, head_qk, head_v
+            )
+            x = torch.zeros((tokens * num_heads_v, head_v), dtype=dtype, device=device)
+            rms_norm_gated(
+                x=x,
+                weight=weight,
+                bias=None,
+                z=z,
+                eps=eps,
+                group_size=group_size,
+                norm_before_gate=norm_before_gate,
+                is_rms_norm=True,
+                activation=activation,
+            )
+        torch.cuda.synchronize(device)
+    logger.info(
+        "CP GDN projection-view warmup complete: heads=%d/%d head_dim=%d/%d "
+        "scratch_only=True elapsed=%.3fs",
+        num_heads_qk,
+        num_heads_v,
+        head_qk,
+        head_v,
+        time.monotonic() - started,
+    )
+    return True
+
+
+def warmup_gdn_projection(device, dtype, geometry, projection_stride):
+    """Compile projection and gate strides used by full-head prefill."""
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+
+    kh, vh, kd, vd = geometry
+    channels = 2 * kh * kd + vh * vd
+    if vh // kh in (1, 2, 4):
+        projection = torch.zeros((64, projection_stride), device=device, dtype=dtype)
+        gates = torch.zeros((64, 2 * vh), device=device, dtype=dtype)
+        fused_qkvzba_split_reshape_cat_contiguous(projection, gates, kh, vh, kd, vd)
+    for count in (0, 1, 17, 64):
+        if channels <= 16384:
+            for stride in sorted({channels, projection_stride}):
+                packed = torch.zeros((count, stride), device=device, dtype=dtype)[
+                    :, :channels
+                ]
+                fused_qkv_split_gdn_prefill(packed, kh, kh, vh, kd, kd, vd)
+        if count:
+            for gate_stride in (vh, 2 * vh):
+                gates = torch.zeros((count, gate_stride), device=device, dtype=dtype)
+                for parameter_dtype in (dtype, torch.float32):
+                    a_log = torch.zeros(vh, device=device, dtype=torch.float32)
+                    bias = torch.zeros(vh, device=device, dtype=parameter_dtype)
+                    fused_gdn_gating(a_log, gates[:, :vh], gates[:, :vh], bias)

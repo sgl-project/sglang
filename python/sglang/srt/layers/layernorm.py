@@ -14,7 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
@@ -459,6 +459,106 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
+@cache
+def _get_indexed_add_rmsnorm_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _indexed_add_rmsnorm_kernel(
+        X,
+        Residual,
+        Weight,
+        Indices,
+        Out,
+        ResidualOut,
+        stride_x: tl.constexpr,
+        stride_r: tl.constexpr,
+        width: tl.constexpr,
+        eps: tl.constexpr,
+        weight_offset: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        source = tl.load(Indices + row).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        x = tl.load(X + source * stride_x + cols, cols < width, 0).to(tl.float32)
+        r = tl.load(Residual + source * stride_r + cols, cols < width, 0).to(tl.float32)
+        value = x + r
+        variance = tl.sum(value * value, 0) / width
+        weight = tl.load(Weight + cols, cols < width, 0).to(tl.float32)
+        normalized = (value * tl.rsqrt(variance + eps)) * (weight + weight_offset)
+        tl.store(Out + row.to(tl.int64) * width + cols, normalized, cols < width)
+        tl.store(ResidualOut + row.to(tl.int64) * width + cols, value, cols < width)
+
+    return _indexed_add_rmsnorm_kernel
+
+
+def indexed_add_rmsnorm(x, residual, weight, indices, eps, *, weight_offset=0.0):
+    """Gather token rows, add residual and normalize without a reordered temporary.
+
+    Indices address both inputs in the same source order. Outputs own their
+    storage; source tensors are not modified. Indices must be valid source rows.
+    """
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or residual.shape != x.shape
+        or residual.device != x.device
+        or residual.dtype != x.dtype
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or x.stride(1) != 1
+        or residual.stride(1) != 1
+        or weight.shape != (x.shape[1],)
+        or weight.device != x.device
+        or not weight.is_contiguous()
+        or indices.ndim != 1
+        or indices.dtype not in (torch.int32, torch.int64)
+        or indices.device != x.device
+        or not indices.is_contiguous()
+    ):
+        raise ValueError(
+            "Indexed RMSNorm requires matching CUDA rows and integer indices"
+        )
+    import triton
+
+    out = x.new_empty((indices.numel(), x.shape[1]))
+    residual_out = torch.empty_like(out)
+    if indices.numel():
+        _get_indexed_add_rmsnorm_kernel()[(indices.numel(),)](
+            x,
+            residual,
+            weight,
+            indices,
+            out,
+            residual_out,
+            x.stride(0),
+            residual.stride(0),
+            x.shape[1],
+            eps,
+            weight_offset,
+            BLOCK=triton.next_power_of_2(x.shape[1]),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out, residual_out
+
+
+@cache
+def warmup_indexed_add_rmsnorm(*, device, dtype, hidden_size, eps):
+    """Compile both weight conventions using private, valid row permutations."""
+    with torch.cuda.device(device), torch.inference_mode():
+        x = torch.zeros((2, hidden_size), device=device, dtype=dtype)
+        for weight_dtype in {dtype, torch.float32}:
+            weight = torch.zeros(hidden_size, device=device, dtype=weight_dtype)
+            for index_dtype in (torch.int32, torch.int64):
+                indices = torch.tensor([1, 0], device=device, dtype=index_dtype)
+                for offset in (0.0, 1.0):
+                    indexed_add_rmsnorm(
+                        x, x, weight, indices, eps, weight_offset=offset
+                    )
+
+
 class RMSNorm(BaseFusedOp):
     # Explicit opt-in: implementations must honor use_attn_tp_group=False.
     supports_non_attn_tp_allreduce = True
@@ -556,9 +656,32 @@ class RMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
+        *,
+        row_indices: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if quant_linear is None:
             quant_linear = self._quant_linear
+        if row_indices is not None:
+            if (
+                residual is None
+                or quant_linear is not None
+                or post_residual_addition is not None
+                or self.variance_size_override is not None
+                or self.fp32_residual
+                or self.cast_x_before_out_mul
+                or self.override_orig_dtype is not None
+                or is_batch_invariant_mode_enabled()
+            ):
+                raise ValueError(
+                    "Indexed RMSNorm requires the standard residual normalization contract"
+                )
+            return indexed_add_rmsnorm(
+                x,
+                residual,
+                self.weight.data,
+                row_indices,
+                self.variance_epsilon,
+            )
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -1339,7 +1462,22 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        *,
+        row_indices: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if row_indices is not None:
+            if residual is None or post_residual_addition is not None:
+                raise ValueError(
+                    "Indexed Gemma RMSNorm requires residual and no extra addition"
+                )
+            return indexed_add_rmsnorm(
+                x,
+                residual,
+                self.weight.data,
+                row_indices,
+                self.variance_epsilon,
+                weight_offset=1.0,
+            )
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(

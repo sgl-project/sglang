@@ -26,6 +26,8 @@ def benchmark_layer_norm_fwd(
     benchmark_iters: int = 100,
     device: str = "cuda",
     verbose: bool = True,
+    projection_heads: int = 0,
+    projection_stride: int = 0,
 ):
     """
     Benchmark layer_norm_fwd with specified parameters.
@@ -43,6 +45,8 @@ def benchmark_layer_norm_fwd(
         warmup_iters: Number of warmup iterations
         benchmark_iters: Number of benchmark iterations
         device: Device to run on
+        projection_heads: Heads per token for a strided 3-D gate; zero uses 2-D.
+        projection_stride: Elements per token in the packed projection allocation.
     """
     if verbose:
         print("=" * 80)
@@ -53,7 +57,10 @@ def benchmark_layer_norm_fwd(
         print(f"  weight.shape: torch.Size([{N}])")
         print(f"  bias: {'torch.Size([{}])'.format(N) if has_bias else None}")
         print(f"  eps: {eps}")
-        print(f"  z: {'torch.Size([{}, {}])'.format(M, N) if has_z else None}")
+        gate_shape = (
+            (M // projection_heads, projection_heads, N) if projection_heads else (M, N)
+        )
+        print(f"  z: {torch.Size(gate_shape) if has_z else None}")
         print(f"  out: None")
         print(f"  group_size: {group_size}")
         print(f"  norm_before_gate: {norm_before_gate}")
@@ -69,12 +76,26 @@ def benchmark_layer_norm_fwd(
     bias = torch.randn(N, dtype=dtype, device=device) if has_bias else None
     z = torch.randn(M, N, dtype=dtype, device=device) if has_z else None
 
+    if projection_heads:
+        if (
+            not has_z
+            or M % projection_heads
+            or projection_stride < projection_heads * N
+        ):
+            raise ValueError("Invalid projection gate geometry")
+        packed = torch.randn(
+            M // projection_heads, projection_stride, device=device, dtype=dtype
+        )
+        z = packed[:, -projection_heads * N :].view(
+            M // projection_heads, projection_heads, N
+        )
+
     # Ensure contiguous memory layout
     x = x.contiguous()
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
-    if z is not None:
+    if z is not None and not projection_heads:
         z = z.contiguous()
 
     if verbose:
@@ -164,7 +185,7 @@ def benchmark_layer_norm_fwd(
     # Calculate memory bandwidth
     # Read: x, weight, z (if has_z)
     # Write: out, rstd, mean (if not rms_norm)
-    bytes_per_element = 2 if dtype == torch.float16 else 4  # fp16 or fp32
+    bytes_per_element = x.element_size()
     read_bytes = (M * N + N) * bytes_per_element  # x + weight
     if has_z:
         read_bytes += M * N * bytes_per_element  # z
@@ -218,7 +239,7 @@ def benchmark_layer_norm_fwd(
         x=x,
         weight=weight,
         bias=bias,
-        z=z,
+        z=z.reshape(M, N) if z is not None else None,
         eps=eps,
         group_size=group_size,
         norm_before_gate=norm_before_gate,
@@ -263,6 +284,21 @@ def benchmark_layer_norm_fwd(
 
 def main():
     """Run the benchmark with the specified configuration."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--projection-tokens", type=int, default=0)
+    args = parser.parse_args()
+    if args.projection_tokens:
+        benchmark_layer_norm_fwd(
+            M=args.projection_tokens * 64,
+            N=128,
+            dtype=torch.bfloat16,
+            projection_heads=64,
+            projection_stride=20480,
+        )
+        return
+
     # Configuration from user
     config = {
         "M": 65536,

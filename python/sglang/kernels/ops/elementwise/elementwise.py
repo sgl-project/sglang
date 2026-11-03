@@ -1,3 +1,5 @@
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -284,3 +286,26 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         do_add=True,
     )
+
+
+@cache
+@torch.no_grad()
+def warmup_fused_gate_sigmoid_mul(*, device, dtype, weight_dtype, hidden_dim):
+    """Load both token-count launch configurations before CP collectives."""
+    weight = torch.zeros(hidden_dim, device=device, dtype=weight_dtype)
+    for rows in (1, 1024):
+        hidden = torch.zeros((rows, hidden_dim), device=device, dtype=dtype)
+        shared = torch.zeros_like(hidden)
+        fused_gate_sigmoid_mul(hidden, weight, shared)
+        fused_gate_sigmoid_mul_add(hidden, weight, shared, torch.zeros_like(hidden))
+    torch.cuda.synchronize(device)
+
+
+@cache
+@torch.no_grad()
+def warmup_fused_sigmoid_mul(*, device, dtype, hidden_dim):
+    """Warm the flat output gate produced by fused CP QK/RoPE preparation."""
+    for rows in (1, 1024):
+        output = torch.zeros((rows, hidden_dim), device=device, dtype=dtype)
+        fused_sigmoid_mul(output, torch.zeros_like(output), inplace=True)
+    torch.cuda.synchronize(device)
