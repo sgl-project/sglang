@@ -24,6 +24,8 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
+  item feature cache, a sampled hit -> computed again, equal to the cache, not rewritten
+  item feature cache, a sampled hit computes to other features -> RuntimeError
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy and serving spec keep the legacy processor's loader and worker defaults
@@ -238,6 +240,7 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         mm_process_config=None,
         item_feature_cache=None,
         keep_mm_features_on_device=False,
+        hit_check_rate=0,
     ):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
@@ -249,6 +252,8 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             ),
             item_feature_cache=item_feature_cache,
         )
+        # Sampled hits would make the load counts below random.
+        processor.HIT_CHECK_RATE = hit_check_rate
         self.addCleanup(processor.shutdown)
         return processor
 
@@ -428,6 +433,28 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             processor.process([image], input_ids=[1, IMAGE], image_device="meta")
         )
         self.assertEqual(output["pixel_values"].device.type, "meta")
+
+    def test_item_feature_cache_sampled_hit_is_computed_again_and_checked(self):
+        """A checked hit is loaded like a miss, must equal the cache, and is not rewritten."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=item_feature_cache
+        )
+        expected = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        ((key, cached),) = item_feature_cache.items()
+
+        processor.HIT_CHECK_RATE = 1
+        load = AsyncMock(wraps=processor._load_media_lists)
+        with patch.object(processor, "_load_media_lists", load):
+            output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        self.assertEqual(load.await_args.args[0], [image])
+        self.assertTrue(torch.equal(output["pixel_values"], expected["pixel_values"]))
+        self.assertIs(item_feature_cache[key], cached)
+
+        cached["pixel_values"] = cached["pixel_values"] + 1
+        with self.assertRaisesRegex(RuntimeError, "other pixel_values"):
+            asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
 
     def test_item_feature_cache_is_shared_only_by_matching_processors(self):
         """A trainer and serving may share one map; another checkpoint, config or upgrade must miss."""

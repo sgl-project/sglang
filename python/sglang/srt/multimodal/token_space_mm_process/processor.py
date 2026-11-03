@@ -2,6 +2,7 @@ import asyncio
 import functools
 import itertools
 import logging
+import random
 
 import torch
 import transformers
@@ -29,6 +30,25 @@ def _device_type(device):
     return None if device is None else torch.device(device).type
 
 
+def _check_cached_features(media_item, cached, computed):
+    modality = media_item[0]
+    if cached.keys() != computed.keys():
+        raise RuntimeError(
+            f"The item feature cache holds fields {sorted(cached)} for a {modality.name}"
+            f" item that computes to {sorted(computed)}"
+        )
+    for name, value in computed.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        other = cached[name]
+        if other.dtype != value.dtype or not torch.equal(other.cpu(), value.cpu()):
+            raise RuntimeError(
+                f"The item feature cache holds other {name} for a {modality.name} item"
+                " than computing it now gives: its key leaves out something the"
+                " features depend on"
+            )
+
+
 class TokenSpaceProcessor(MultimodalProcessorMixin):
     """Turn caller input_ids and raw media into model inputs with a token-space strategy.
 
@@ -38,6 +58,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
     """
 
     strategy_class = None
+    HIT_CHECK_RATE = 1 / 100
 
     @classmethod
     @functools.cache
@@ -190,6 +211,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         can share one map.
         """
         item_features = [None] * len(media_items)
+        checked = {}
         if self._item_feature_cache is not None:
             media_options = self.strategy.resolve_media_options(
                 self._processor, **request_options
@@ -239,6 +261,14 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     for name in self.FEATURE_NAMES:
                         if isinstance(features.get(name), torch.Tensor):
                             features[name] = features[name].to(device)
+            # A key that leaves out something the features depend on fails here, not in training.
+            checked = {
+                index: features
+                for index, features in enumerate(item_features)
+                if features is not None and random.random() < self.HIT_CHECK_RATE
+            }
+            for index in checked:
+                item_features[index] = None
         missed = [
             index for index, features in enumerate(item_features) if features is None
         ]
@@ -267,6 +297,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         missed_features = await self._process_items(loaded_items, request_options)
         for index, features in zip(missed, missed_features):
             item_features[index] = features
+        for index, cached in checked.items():
+            _check_cached_features(media_items[index], cached, item_features[index])
         if self._item_feature_cache is not None:
             await asyncio.gather(
                 *(
@@ -276,6 +308,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         item_features[index],
                     )
                     for index in missed
+                    if index not in checked
                 )
             )
         return item_features
