@@ -8,7 +8,6 @@ CFG, co-batching, cache-dit), and decoding (pure unpatchify).
 from .generation import (
     HIDREAM_O1_BOI_TOKEN,
     HIDREAM_O1_MROPE_FIX_POINT,
-    HIDREAM_O1_NOISE_SCALE,
     HIDREAM_O1_T_EPS,
     HIDREAM_O1_TMS_TOKEN,
     HiDreamO1ImageBeforeDenoisingStage,
@@ -24,7 +23,6 @@ from .generation import (
 __all__ = [
     "HIDREAM_O1_BOI_TOKEN",
     "HIDREAM_O1_MROPE_FIX_POINT",
-    "HIDREAM_O1_NOISE_SCALE",
     "HIDREAM_O1_TMS_TOKEN",
     "HIDREAM_O1_T_EPS",
     "HiDreamO1ImageBeforeDenoisingStage",
