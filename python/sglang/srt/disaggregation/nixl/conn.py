@@ -651,9 +651,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> a later registration from the same decode process; the
         # transfer worker rebuilds the peer's endpoint from it before posting.
         self._peer_refresh_pending: Dict[str, KVArgsRegisterInfo] = {}
-        # (decode ip, decode rank port) -> peer_name, to spot a decode process
-        # that restarted under a new agent name at the same endpoint.
-        self._peer_by_endpoint: Dict[Tuple[str, int], str] = {}
+        # (decode ip, gpu, attention-tp rank, dcp rank) -> peer_name, to spot a
+        # decode process that restarted under a new agent name and port.
+        self._peer_by_endpoint: Dict[Tuple[str, int, int, int], str] = {}
         # Peers whose decode process was replaced: never reloaded or posted to.
         self._evicted_peers: Set[str] = set()
 
@@ -2074,10 +2074,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         d.setdefault("_peer_by_endpoint", {})
         d.setdefault("_evicted_peers", set())
 
+    @staticmethod
+    def _peer_identity(info: KVArgsRegisterInfo) -> Tuple[str, int, int, int]:
+        """What survives a decode restart: the decode's ip and the GPU rank it
+        serves. Its rank port is bound to a random port per process and its
+        agent name is a fresh uuid, so neither identifies the process."""
+        return (info.endpoint, info.gpu_id, info.decode_tp_rank, info.dst_dcp_rank)
+
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         self._peer_registry()
         agent_name = decode_kv_args.agent_name
-        endpoint_key = (decode_kv_args.endpoint, decode_kv_args.dst_port)
+        endpoint_key = self._peer_identity(decode_kv_args)
         if agent_name in self.decode_kv_args_table:
             if agent_name in self._evicted_peers:
                 logger.info(f"Peer {agent_name} was evicted, ignoring.")
@@ -2123,17 +2130,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self, old_name: str, decode_kv_args: KVArgsRegisterInfo
     ) -> None:
         """The decode process behind ``old_name`` restarted: a new agent
-        registered from the same ip and rank port. Nothing promised to the old
+        registered from the same ip for the same GPU rank. Nothing promised to the old
         process can land, so fail its rooms now instead of leaving them to the
         decode's waiting timeout, and drop its NIXL metadata so no further
         WRITE or notification is posted to it. The registration stays in the
         table (flagged evicted) so a late chunk still referencing it fails through the normal not-found path instead of a KeyError."""
         logger.warning(
-            "NIXL peer %s at %s:%s was replaced by %s; evicting it and failing "
-            "its rooms",
+            "NIXL peer %s at %s gpu %s was replaced by %s; evicting it and "
+            "failing its rooms",
             old_name,
             decode_kv_args.endpoint,
-            decode_kv_args.dst_port,
+            decode_kv_args.gpu_id,
             decode_kv_args.agent_name,
         )
         with self._peer_reload_lock:

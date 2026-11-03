@@ -1406,7 +1406,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
-    def _peer_info(self, name, endpoint="127.0.0.1", port=5555):
+    def _peer_info(self, name, endpoint="127.0.0.1", port=5555, gpu_id=0):
         return KVArgsRegisterInfo(
             room="None",
             endpoint=endpoint,
@@ -1417,7 +1417,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             dst_kv_mem_kinds=["VRAM", "VRAM"],
             dst_aux_ptrs=[0],
             dst_state_data_ptrs=[],
-            gpu_id=0,
+            gpu_id=gpu_id,
             decode_tp_size=1,
             decode_tp_rank=0,
             dst_kv_item_len=16,
@@ -1452,21 +1452,22 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         }
 
     def test_restarted_decode_evicts_the_old_peer_and_fails_its_rooms(self):
-        """A new agent from the same decode ip and rank port means the old
-        decode process is gone: its rooms fail now, its metadata is dropped,
-        and the new peer serves later rooms."""
+        """A new agent from the same decode ip and GPU rank, under a new
+        agent name and rank port, means the old decode process is gone: its
+        rooms fail now, its metadata is dropped, and the new peer serves
+        later rooms."""
         mgr = self._make_registering_manager()
         mgr._add_remote_peer(self._peer_info("old"))
         self._room(mgr, 41, ["old"])
         self._room(mgr, 42, ["old"])
         mgr.request_status[42] = KVPoll.Success
 
-        mgr._add_remote_peer(self._peer_info("new"))
+        mgr._add_remote_peer(self._peer_info("new", port=5556))
 
         self.assertIn("old", mgr._evicted_peers)
         self.assertFalse(mgr.agent.check_remote_metadata("old"))
         self.assertTrue(mgr.agent.check_remote_metadata("new"))
-        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 5555)], "new")
+        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 0, 0, 0)], "new")
         self.assertEqual(mgr.request_status[41], KVPoll.Failed)
         self.assertIn("replaced", mgr.failure_records[41])
         # A concluded room is left alone.
@@ -1481,13 +1482,13 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         # A late registration from the old process is ignored.
         mgr._add_remote_peer(self._peer_info("old"))
         self.assertFalse(mgr.agent.check_remote_metadata("old"))
-        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 5555)], "new")
+        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 0, 0, 0)], "new")
 
     def test_distinct_endpoints_do_not_evict_each_other(self):
         mgr = self._make_registering_manager()
         mgr._add_remote_peer(self._peer_info("a", port=5555))
-        mgr._add_remote_peer(self._peer_info("b", port=5556))
-        mgr._add_remote_peer(self._peer_info("c", endpoint="10.0.0.2", port=5555))
+        mgr._add_remote_peer(self._peer_info("b", gpu_id=1))
+        mgr._add_remote_peer(self._peer_info("c", endpoint="10.0.0.2"))
         self.assertEqual(mgr._evicted_peers, set())
         for name in ("a", "b", "c"):
             self.assertTrue(mgr.agent.check_remote_metadata(name))
