@@ -10,7 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -37,7 +38,7 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.spec_attn_is_decode = get_spec().speculative_attention_mode == "decode"
         self.spec_attn_is_prefill = get_spec().speculative_attention_mode == "prefill"
         # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens
@@ -56,10 +57,12 @@ class HybridAttnBackend(AttentionBackend):
     @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
-        backend = (
-            self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
-        )
-        return backend.supports_ragged_verify_graph
+        return self.target_verify_backend().supports_ragged_verify_graph
+
+    def target_verify_backend(self) -> AttentionBackend:
+        """The backend that runs target verify: the decode backend when
+        speculative_attention_mode is "decode", else the prefill backend."""
+        return self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -79,11 +82,7 @@ class HybridAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
         elif forward_mode.is_target_verify():
-            return (
-                self.decode_backend
-                if self.spec_attn_is_decode
-                else self.prefill_backend
-            )
+            return self.target_verify_backend()
         else:
             return self.prefill_backend
 

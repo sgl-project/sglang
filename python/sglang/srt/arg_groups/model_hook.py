@@ -143,6 +143,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_kimi_k3,
     )
 
     if cfg.enable_deterministic_inference:
@@ -166,11 +167,15 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
-    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+    if (
+        get_platform().is_npu
+        and cfg.dcp_size > 1
+        and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
+    ):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
-            "DeepSeek DSA models; got "
-            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+            "DeepSeek DSA and Kimi-K3 models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
@@ -672,7 +677,7 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
-            # (arg_groups/overrides.py: _exaone_overrides).
+            # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
@@ -680,8 +685,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
             )
     elif model_arch in ["Olmo2ForCausalLM"]:
-        # disable_hybrid_swa_memory + attention backend selection moved to
-        # the override registry (arg_groups/overrides.py: _olmo2_overrides).
+        # The attention backend selection moved to the override registry
+        # (arg_groups/model_overrides/olmo2.py).
 
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention

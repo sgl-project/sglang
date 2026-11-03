@@ -24,8 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE, NemotronHConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -65,12 +64,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -205,7 +201,7 @@ def _capture_prefill_shared_expert(module, hidden_states, call) -> None:
     # replay here: that graph has only been captured, not launched yet.
 
 
-@eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
+@eager_on_graph(True, on_capture=_capture_prefill_shared_expert)
 def _launch_prefill_shared_expert(module, hidden_states, call) -> None:
     # BCG retains this call, its graph, events and output until graph cleanup.
     # A replay launches on the same explicit stream for every layer.

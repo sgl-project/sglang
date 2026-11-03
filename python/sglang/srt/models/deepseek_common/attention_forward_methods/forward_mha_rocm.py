@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
@@ -329,7 +330,7 @@ class DeepseekMHARocmForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _use_aiter_gfx95:
-            get_token_to_kv_pool().set_mla_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
                 kv_a.unsqueeze(1),
@@ -338,7 +339,7 @@ class DeepseekMHARocmForwardMixin:
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
                 self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
@@ -349,14 +350,14 @@ class DeepseekMHARocmForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, dst_dtype)
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
