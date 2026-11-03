@@ -35,9 +35,9 @@ class TestHiCacheTopkRows(CustomTestCase):
         device slots are reused by another request."""
         self.capturer.host_cache.buffer[[5, 6, 7]] = self.expected
         self.rows.on_write(
-            torch.tensor([5, 6, 7], device="cuda"),
-            torch.tensor([10, 11, 12]),
-            self.stream,
+            device_indices=torch.tensor([5, 6, 7], device="cuda"),
+            host_indices=torch.tensor([10, 11, 12]),
+            stream=self.stream,
         )
         self.rows.apply_writes(1)
         self.capturer.host_cache.buffer[[5, 6, 7]] = -1
@@ -53,18 +53,18 @@ class TestHiCacheTopkRows(CustomTestCase):
     def test_load_back_restores_rows_before_read(self):
         self._write_prefix()
         self.rows.on_load(
-            torch.tensor([20, 21, 22], device="cuda"),
-            torch.tensor([10, 11, 12]),
-            self.stream,
+            device_indices=torch.tensor([20, 21, 22], device="cuda"),
+            host_indices=torch.tensor([10, 11, 12]),
+            stream=self.stream,
         )
         self.assertTrue(torch.equal(self._read([20, 21, 22]), self.expected))
 
     def test_load_ack_restores_rows(self):
         self._write_prefix()
         self.rows.on_load(
-            torch.tensor([30, 31, 32], device="cuda"),
-            torch.tensor([10, 11, 12]),
-            self.stream,
+            device_indices=torch.tensor([30, 31, 32], device="cuda"),
+            host_indices=torch.tensor([10, 11, 12]),
+            stream=self.stream,
         )
         self.rows.apply_loads(1)
         self.assertTrue(
@@ -74,9 +74,9 @@ class TestHiCacheTopkRows(CustomTestCase):
     def test_reset_drops_pending_copies(self):
         self._write_prefix()
         self.rows.on_load(
-            torch.tensor([40, 41, 42], device="cuda"),
-            torch.tensor([10, 11, 12]),
-            self.stream,
+            device_indices=torch.tensor([40, 41, 42], device="cuda"),
+            host_indices=torch.tensor([10, 11, 12]),
+            stream=self.stream,
         )
         self.rows.reset()
         self.rows.apply_loads()

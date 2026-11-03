@@ -388,7 +388,7 @@ class HiCacheController:
         from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
 
         self.topk_rows = HostTopkRows.create(
-            self.mem_pool_host.size, device=str(self.device)
+            host_size=self.mem_pool_host.size, device=str(self.device)
         )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
@@ -1010,9 +1010,9 @@ class HiCacheController:
         )
         if self.topk_rows is not None:
             self.topk_rows.on_write(
-                op.device_indices,
-                op.host_indices,
-                self.l2_transfer_engine.device_to_host_stream,
+                device_indices=op.device_indices,
+                host_indices=op.host_indices,
+                stream=self.l2_transfer_engine.device_to_host_stream,
             )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
@@ -1164,9 +1164,9 @@ class HiCacheController:
         )
         if self.topk_rows is not None:
             self.topk_rows.on_load(
-                op.device_indices,
-                op.host_indices,
-                self.l2_transfer_engine.host_to_device_stream,
+                device_indices=op.device_indices,
+                host_indices=op.host_indices,
+                stream=self.l2_transfer_engine.host_to_device_stream,
             )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(

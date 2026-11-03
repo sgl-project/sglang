@@ -41,9 +41,9 @@ class HostTopkRows:
         self._capturers = capturers
         self._host_caches = [
             BaseHostCache(
-                host_size,
-                c.num_layers,
-                c.topk_size,
+                num_tokens=host_size,
+                num_layers=c.num_layers,
+                topk_size=c.topk_size,
                 name=f"{c.host_cache.name}_hicache",
                 device=device,
             )
@@ -61,7 +61,11 @@ class HostTopkRows:
             for c in (get_global_experts_capturer(), get_global_indexer_capturer())
             if c is not None
         ]
-        return HostTopkRows(host_size, capturers, device) if capturers else None
+        return (
+            HostTopkRows(host_size=host_size, capturers=capturers, device=device)
+            if capturers
+            else None
+        )
 
     @staticmethod
     def _copy_indices(
@@ -83,11 +87,19 @@ class HostTopkRows:
 
     def on_write(self, device_indices, host_indices, stream) -> None:
         """A device-to-host KV write was submitted on stream."""
-        self._writes.append(self._copy_indices(device_indices, host_indices, stream))
+        self._writes.append(
+            self._copy_indices(
+                device_indices=device_indices, host_indices=host_indices, stream=stream
+            )
+        )
 
     def on_load(self, device_indices, host_indices, stream) -> None:
         """A host-to-device KV load into new device slots was submitted on stream."""
-        self._loads.append(self._copy_indices(device_indices, host_indices, stream))
+        self._loads.append(
+            self._copy_indices(
+                device_indices=device_indices, host_indices=host_indices, stream=stream
+            )
+        )
 
     def apply_writes(self, count: Optional[int] = None) -> None:
         """Copy device-slot rows to host slots for the oldest count writes
