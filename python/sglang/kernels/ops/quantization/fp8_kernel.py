@@ -29,7 +29,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
-    is_sm90_supported,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -38,7 +37,6 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_sm90 = _is_cuda and is_sm90_supported()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
@@ -592,8 +590,7 @@ def _run_per_token_group_quant_8bit_kernel(
         and x_s.dtype == torch.float32
         and not _is_musa
         and not (
-            _is_sm90
-            and x.dtype == torch.bfloat16
+            x.dtype == torch.bfloat16
             and x.ndim == 2
             and x.is_contiguous()
             and x_s.is_contiguous()

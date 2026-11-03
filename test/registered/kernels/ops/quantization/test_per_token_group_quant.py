@@ -30,6 +30,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
+    _jit_module,
     per_token_group_quant,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -174,18 +175,69 @@ def test_fp32_pow2_graph_replay():
 
 
 @pytest.mark.parametrize("offset", [0, 8])
-def test_fp32_pow2_compile(offset):
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_fp32_pow2_compile(offset, backend):
     # Dispatch must remain traceable, including the 16B-aligned v2 fallback.
     def quantize(x):
         return sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
 
     storage = torch.randn(33 * 160 + offset, device="cuda", dtype=torch.bfloat16)
     x = storage[offset:].view(33, 160)
-    compiled = torch.compile(quantize, backend="eager", fullgraph=True)
-    q, s = compiled(x)
-    q_ref, s_ref = ref_fp8_fp32_pow2(x)
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
-    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+    compiled = torch.compile(quantize, backend=backend, fullgraph=True)
+    for value in (0.0, float("nan")):
+        x.normal_()
+        x[0, :32] = value
+        q, s = compiled(x)
+        q_ref, s_ref = ref_fp8_fp32_pow2(x)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("offset", [0, 8])
+@pytest.mark.parametrize(
+    "buffer", ["q_shape", "s_shape", "q_stride", "cpu", "alias", "q_alignment"]
+)
+def test_fp32_pow2_rejects_invalid_buffers(offset, buffer):
+    # In particular, offset=8 used to bypass shape/device validation via v2.
+    storage = torch.zeros(3 * 160 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(3, 160)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.empty(3, 5, device="cuda")
+    if buffer == "q_shape":
+        q = torch.empty(4, 160, device="cuda", dtype=fp8_dtype)
+    elif buffer == "s_shape":
+        s = torch.empty(4, 5, device="cuda")
+    elif buffer == "q_stride":
+        q = torch.empty(3, 320, device="cuda", dtype=fp8_dtype)[:, ::2]
+    elif buffer == "cpu":
+        s = torch.empty(3, 5)
+    elif buffer == "alias":
+        q = x.view(fp8_dtype).flatten()[: x.numel()].view_as(x)
+    elif buffer == "q_alignment":
+        q = torch.empty(x.numel() + 1, device="cuda", dtype=fp8_dtype)[1:].view_as(x)
+    with pytest.raises(ValueError, match="FP32 power-of-two"):
+        per_token_group_quant(x, q, s, 32, scale_ue8m0=True)
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["column_major", "fused", "masked", "sorted", "dense"]
+)
+def test_fp32_pow2_factory_rejects_unsupported_layouts(unsupported):
+    with pytest.raises(ValueError, match="FP32 power-of-two scales require"):
+        _jit_module(
+            torch.bfloat16,
+            fp8_dtype,
+            32,
+            True,
+            False,
+            unsupported != "column_major",
+            True,
+            unsupported == "fused",
+            unsupported == "masked",
+            False,
+            unsupported == "sorted",
+            "dense" if unsupported == "dense" else "legacy",
+        )
 
 
 @pytest.mark.parametrize(
