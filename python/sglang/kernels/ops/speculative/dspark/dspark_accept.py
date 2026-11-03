@@ -287,11 +287,11 @@ def _deterministic_inference() -> bool:
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        if not inputs_on_cuda(*args, **kwargs):
+            return cls.torch(*args, **kwargs)
         # FlashInfer selects its launch from the row count, so a request's bits can
         # change with its batch.
-        if not inputs_on_cuda(*args, **kwargs) or _deterministic_inference():
-            return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        if _flashinfer_softmax is not None and not _deterministic_inference():
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
