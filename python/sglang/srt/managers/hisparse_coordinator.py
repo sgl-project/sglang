@@ -39,6 +39,7 @@ else:
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -1057,6 +1058,9 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    def request_lists(self) -> Dict[ListKind, List[Req]]:
+        return {ListKind.HISPARSE_STAGING: [act.req for act in self.ack_staging_queue]}
+
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
@@ -1552,8 +1556,8 @@ class HiSparseCoordinator:
             device_buffer_locs=self.req_device_buffer_token_locs[host_layer],
             host_cache_k=self.mem_pool_host.k_buffer[host_layer],
             host_cache_v=self.mem_pool_host.v_buffer[host_layer],
-            device_buffer_k=self.mem_pool_device.get_key_buffer(layer_id),
-            device_buffer_v=self.mem_pool_device.get_value_buffer(layer_id),
+            device_buffer_k=self.mem_pool_device.layer_router.read(layer_id).key(),
+            device_buffer_v=self.mem_pool_device.layer_router.read(layer_id).value(),
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
