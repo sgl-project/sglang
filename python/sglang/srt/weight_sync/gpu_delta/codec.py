@@ -112,9 +112,9 @@ class NvcompDecoder:
         cuda_major = torch.version.cuda.split(".")[0]
         package = f"nvidia-libnvcomp-cu{cuda_major}"
         distribution = importlib.metadata.distribution(package)
-        version = tuple(int(v) for v in distribution.version.split(".")[:2])
-        if not (5, 3) <= version < (6, 0) or ctypes.sizeof(ctypes.c_size_t) != 8:
-            raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 5.3+ ABI")
+        major_version = int(distribution.version.split(".")[0])
+        if major_version != 6 or ctypes.sizeof(ctypes.c_size_t) != 8:
+            raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 6 ABI")
         self.backend = "hardware"
         self._options = options_type()
         # Explicit backend selection: DEFAULT can silently select software.
@@ -127,11 +127,12 @@ class NvcompDecoder:
             self.device, self._algorithm
         )
         self._library = ctypes.CDLL(
-            str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.5"))
+            str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.6"))
         )
         pointer, size = ctypes.c_void_p, ctypes.c_size_t
         self._temporary = self._bind(
-            "GetTempSizeAsync", [size, size, options_type, ctypes.POINTER(size), size]
+            "GetTempSize",
+            [size, size, options_type, ctypes.POINTER(size), size, pointer],
         )
         required_alignments = self._bind(
             "GetRequiredAlignments", [options_type, ctypes.POINTER(_Alignments)]
@@ -154,7 +155,7 @@ class NvcompDecoder:
         )
         self.alignments = _Alignments()
         self._check(required_alignments(self._options, ctypes.byref(self.alignments)))
-        self._temporary_sizes: dict[tuple[int, int, int], int] = {}
+        self._temporary_sizes: dict[tuple[int, int, int, int], int] = {}
 
     def _bind(self, suffix, arguments):
         function = getattr(
@@ -170,10 +171,11 @@ class NvcompDecoder:
                 f"nvCOMP {self.inner_codec}/{self.backend} failed: status={status}"
             )
 
-    def temporary_bytes(self, geometry: tuple[int, int, int]) -> int:
+    def temporary_bytes(self, geometry: tuple[int, int, int], cuda_stream: int) -> int:
         if not geometry[0]:
             return 0
-        cached = self._temporary_sizes.get(geometry)
+        key = (*geometry, cuda_stream)
+        cached = self._temporary_sizes.get(key)
         if cached is not None:
             return cached
         size = ctypes.c_size_t()
@@ -185,17 +187,20 @@ class NvcompDecoder:
                     self._options,
                     ctypes.byref(size),
                     geometry[2],
+                    cuda_stream,
                 )
             )
-        self._temporary_sizes[geometry] = size.value
+        self._temporary_sizes[key] = size.value
         return size.value
 
-    def _allocate_workspace(self, geometry) -> DecodeWorkspace:
+    def _allocate_workspace(self, geometry, cuda_stream) -> DecodeWorkspace:
         """One DE stream shares scratch; statuses/sizes belong to two slots."""
         from sglang.srt.weight_sync.gpu_delta.memory import device_empty
 
         maximum_count = max((batch[0] for batch in geometry), default=0)
-        temporary = max((self.temporary_bytes(batch) for batch in geometry), default=0)
+        temporary = max(
+            (self.temporary_bytes(batch, cuda_stream) for batch in geometry), default=0
+        )
         workspace = DecodeWorkspace(
             device_empty((temporary,), dtype=torch.uint8, device=self.device),
             device_empty((2, maximum_count), dtype=torch.int64, device=self.device),
@@ -287,7 +292,7 @@ class NvcompDecoder:
             table, counts, input_base, host_input.numel()
         )
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
-            workspace = self._allocate_workspace(geometry)
+            workspace = self._allocate_workspace(geometry, stream.cuda_stream)
             host = torch.empty(
                 table.shape, dtype=torch.int64, device="cpu", pin_memory=True
             )

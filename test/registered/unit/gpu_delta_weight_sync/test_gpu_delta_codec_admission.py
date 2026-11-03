@@ -45,7 +45,7 @@ def _frame_table(batches):
 def test_codec_abi_and_frozen_hardware_options(
     monkeypatch, name, algorithm, options_type, reserved_offset, sorting
 ):
-    # Match nvCOMP 5.3 shared_types.h, snappy.h and lz4.h. In particular, LZ4
+    # Match nvCOMP 6 shared_types.h, snappy.h and lz4.h. In particular, LZ4
     # inserts two enums before reserved bytes despite both structs being 64B.
     assert ctypes.sizeof(options_type) == 64
     assert ctypes.alignment(options_type) == ctypes.alignment(ctypes.c_int)
@@ -99,13 +99,18 @@ def test_codec_abi_and_frozen_hardware_options(
 
     functions = {
         "nvcompBatched" + algorithm + "Decompress" + suffix: Function(suffix)
-        for suffix in ("GetRequiredAlignments", "GetTempSizeAsync", "Async")
+        for suffix in ("GetRequiredAlignments", "GetTempSize", "Async")
     }
-    distribution = SimpleNamespace(version="5.3.0.16", locate_file=lambda path: path)
+    distribution = SimpleNamespace(version="6.0.0.12", locate_file=lambda path: path)
     monkeypatch.setattr(
         codec.importlib.metadata, "distribution", lambda _: distribution
     )
-    monkeypatch.setattr(codec.ctypes, "CDLL", lambda _: SimpleNamespace(**functions))
+
+    def load_library(path):
+        assert path == "nvidia/libnvcomp/lib64/libnvcomp.so.6"
+        return SimpleNamespace(**functions)
+
+    monkeypatch.setattr(codec.ctypes, "CDLL", load_library)
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     for allocator_api in (
@@ -134,6 +139,7 @@ def test_codec_abi_and_frozen_hardware_options(
         options_type,
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.c_size_t,
+        ctypes.c_void_p,
     ]
     assert decoder._decode.argtypes == [
         ctypes.c_void_p,
@@ -151,13 +157,13 @@ def test_codec_abi_and_frozen_hardware_options(
     assert decoder._decode.restype is ctypes.c_int
     # Alignment and workspace queries must receive the same admitted options.
     geometry = (1, 64, 64)
-    assert decoder.temporary_bytes(geometry) == 64
+    assert decoder.temporary_bytes(geometry, 7) == 64
     assert [suffix for suffix, _ in calls] == [
         "GetRequiredAlignments",
-        "GetTempSizeAsync",
+        "GetTempSize",
     ]
     assert calls[0][1] == calls[1][1]
-    assert decoder.temporary_bytes(geometry) == 64
+    assert decoder.temporary_bytes(geometry, 7) == 64
     assert device_queries == [(136, 0), (137, 0)]
     # Allocation capability alone does not prove this codec exists. Frame
     # lengths are checked against the cached device limit during preparation.
@@ -170,9 +176,14 @@ def test_codec_abi_and_frozen_hardware_options(
     attributes[137] = 0
     with pytest.raises(RuntimeError, match="positive hardware decompression limit"):
         codec.NvcompDecoder(decoder.device, name)
+    distribution.version = "5.3.0.16"
+    with pytest.raises(RuntimeError, match="nvCOMP 6 ABI"):
+        codec.NvcompDecoder(decoder.device, name)
 
 
-def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeypatch):
+def test_workspace_query_cache_uses_geometry_and_stream_and_preserves_failure(
+    monkeypatch,
+):
     # Exercise the real query/cache code without a CUDA allocation or library.
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = torch.device("cuda", 0)
@@ -182,8 +193,8 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
     decoder._temporary_sizes = {}
     calls, fail = [], True
 
-    def query(count, maximum, options, size, total):
-        calls.append((count, maximum, total))
+    def query(count, maximum, options, size, total, stream):
+        calls.append((count, maximum, total, stream))
         if total == 31 and fail:
             return 1
         # Zero is also a valid cache entry; it must not trigger another query.
@@ -193,17 +204,21 @@ def test_workspace_query_cache_uses_exact_geometry_and_preserves_failure(monkeyp
     decoder._temporary = query
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
-    assert decoder.temporary_bytes((0, 0, 0)) == 0
-    assert decoder.temporary_bytes((2, 20, 30)) == 0
-    assert decoder.temporary_bytes((2, 20, 30)) == 0
-    assert calls == [(2, 20, 30)]
+    assert decoder.temporary_bytes((0, 0, 0), 7) == 0
+    assert decoder.temporary_bytes((2, 20, 30), 7) == 0
+    assert decoder.temporary_bytes((2, 20, 30), 7) == 0
+    assert calls == [(2, 20, 30, 7)]
     # Same count and maximum, different total: the native query must run again.
     with pytest.raises(RuntimeError, match="status=1"):
-        decoder.temporary_bytes((2, 20, 31))
+        decoder.temporary_bytes((2, 20, 31), 7)
     fail = False
-    assert decoder.temporary_bytes((2, 20, 31)) == 0
-    assert decoder.temporary_bytes((2, 20, 31)) == 0
-    assert calls == [(2, 20, 30), (2, 20, 31), (2, 20, 31)]
+    assert decoder.temporary_bytes((2, 20, 31), 7) == 0
+    assert decoder.temporary_bytes((2, 20, 31), 7) == 0
+    # Query the actual DE stream once, then retain its own zero-sized cache entry.
+    assert decoder.temporary_bytes((2, 20, 30), 9) == 0
+    assert decoder.temporary_bytes((2, 20, 30), 9) == 0
+    assert decoder.temporary_bytes((2, 20, 30), 7) == 0
+    assert calls == [(2, 20, 30, 7), (2, 20, 31, 7), (2, 20, 31, 7), (2, 20, 30, 9)]
 
 
 def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch):
@@ -213,7 +228,7 @@ def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch):
     decoder.device = torch.device("cpu")
     decoder.alignments = codec._Alignments(16, 16, 16)
     decoder._options = codec._SnappyOptions()
-    decoder.temporary_bytes = lambda geometry: geometry[0] * 13
+    decoder.temporary_bytes = lambda geometry, stream: geometry[0] * 13
     recorded = []
     monkeypatch.setitem(
         sys.modules,
@@ -231,7 +246,7 @@ def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch):
     stream = SimpleNamespace(device=decoder.device, cuda_stream=1)
     counts = [1, 2, 0, 3] * 3
     workspace = decoder._allocate_workspace(
-        [(count, 32, count * 32) for count in counts]
+        [(count, 32, count * 32) for count in counts], stream.cuda_stream
     )
     metadata = torch.zeros((4, sum(counts)), dtype=torch.int64)
     host_metadata = metadata.clone()
@@ -260,6 +275,8 @@ def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch):
         )
         assert batch.statuses.storage_offset() == slot * 3
         assert batch.actual_sizes.storage_offset() == slot * 3
+        assert batch._arguments[3] == batch.actual_sizes.data_ptr()
+        assert batch._arguments[9] == batch.statuses.data_ptr()
         if not counts[index]:
             batch.enqueue()  # Empty metadata must not call the native decoder.
     outputs = [torch.empty(128, dtype=torch.uint8) for _ in range(2)]
