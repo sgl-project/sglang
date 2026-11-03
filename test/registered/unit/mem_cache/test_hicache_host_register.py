@@ -291,9 +291,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
-                # 4 pages x 11 B x 3 layers, booked against the budget scope.
+                # 4 pages x 11 B x 3 layers in one mapping, booked once.
                 budget.assert_called_once_with(
-                    [44, 44, 44], allocator=pool.allocator, device=torch.device("cpu")
+                    [132], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -326,9 +326,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
-                # 4 pages x (ring 2 x 3 B slots) x 2 layers, scope-booked.
+                # 4 pages x (ring 2 x 3 B slots) x 2 layers, one mapping.
                 budget.assert_called_once_with(
-                    [24, 24], allocator=pool.allocator, device=torch.device("cpu")
+                    [48], allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
