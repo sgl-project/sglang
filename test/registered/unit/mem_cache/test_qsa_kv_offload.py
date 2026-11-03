@@ -267,6 +267,15 @@ class TestOffloadResolve(CustomTestCase):
             with self.subTest(rows_per_request=q):
                 self._run(rows_per_request=q, seed=10 + q)
 
+    def test_verify_check(self):
+        sim = _OffloadSim(rows_per_request=1, seed=5)
+        ref = torch.zeros(4)
+        sim.offload.check("gather", 0, (ref.clone(),), (ref,))
+        bad = ref.clone()
+        bad[1] = 1
+        with self.assertRaisesRegex(RuntimeError, "differs from the full pool"):
+            sim.offload.check("gather", 0, (bad,), (ref,))
+
     def test_selection_larger_than_hot_cache_raises(self):
         sim = _OffloadSim(rows_per_request=1, seed=3, hot_blocks=4)
         sim.extend(1, 300)

@@ -149,16 +149,18 @@ def offload_max_total_tokens(
     device_rows: int,
     page_size: int,
     host_size_gb: float,
+    verify: bool = False,
 ) -> int:
     """Logical KV pool size with the QSA K/V on the host.
 
     Per logical token the GPU keeps the cell minus the offloaded K/V (the QSA
-    index and any draft pool); the device rows hold full K/V rows. The host
-    budget caps the pool at its K/V rows (``size + page_size`` rows).
+    index and any draft pool; the whole cell in verify mode); the device rows
+    hold full K/V rows. The host budget caps the pool at its K/V rows
+    (``size + page_size`` rows).
     """
     if host_size_gb <= 0:
         raise ValueError("--qsa-kv-offload-host-size must be positive")
-    gpu_cell = cell_bytes - offloaded_bytes_per_token
+    gpu_cell = cell_bytes - (0 if verify else offloaded_bytes_per_token)
     if gpu_cell <= 0:
         raise ValueError(
             f"QSA K/V offload: per-token GPU cost {gpu_cell} B is not positive"
@@ -232,8 +234,12 @@ class QSAKVHostOffload:
         v_buffers: List[torch.Tensor],
         host_rows: int,
         pin_memory: bool = True,
+        verify: bool = False,
     ):
         self.layout = layout
+        # Debug: the full K/V pool stays on the GPU; see check().
+        self.verify = verify
+        self.verified_calls = 0
         self.cr = layout.compress_ratio
         self.hot_blocks = layout.hot_blocks
         self.region = layout.region_rows
@@ -279,6 +285,38 @@ class QSAKVHostOffload:
         self._arange = torch.arange(
             max(layout.scratch_rows, self.cr), dtype=torch.int64, device=self.device
         )
+
+    def mirror(
+        self,
+        layer_idx: int,
+        rows: torch.Tensor,
+        loc: torch.Tensor,
+        pool_k: torch.Tensor,
+        pool_v: torch.Tensor,
+    ) -> None:
+        """Verify mode: the new K/V the full pool holds at ``loc`` -> device
+        rows ``rows`` and host rows ``loc``."""
+        loc = loc.long()
+        _copy_rows(
+            self.dev_k[layer_idx], self.dev_v[layer_idx], rows.long(), pool_k, pool_v, loc
+        )
+        _copy_rows(
+            self.host_k[layer_idx], self.host_v[layer_idx], loc, pool_k, pool_v, loc
+        )
+
+    def check(self, what: str, layer_idx: int, actual, expected) -> None:
+        """Verify mode: offloaded tensors must equal the full pool's bit for bit."""
+        for got, ref in zip(actual, expected):
+            if not torch.equal(got.view(torch.uint8), ref.view(torch.uint8)):
+                raise RuntimeError(
+                    f"QSA K/V offload verify: {what} of QSA layer {layer_idx} "
+                    "differs from the full pool"
+                )
+        self.verified_calls += 1
+        if self.verified_calls % 10000 == 0:
+            logger.info(
+                "QSA K/V offload verify: %d checks, 0 mismatches", self.verified_calls
+            )
 
     def destroy(self) -> None:
         """Unpin the host K/V (see HostKVCache.destroy). Idempotent."""

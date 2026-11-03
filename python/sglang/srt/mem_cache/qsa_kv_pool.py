@@ -15,6 +15,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
     IndexKeyBufferInfo,
@@ -139,7 +140,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
-        full_kv_pool = None
+        full_kv_pool = offload_pool = None
         if kv_offload_layout is not None:
             if (
                 quant_method is not None
@@ -147,8 +148,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 or full_kv_pool_class not in (None, MHATokenToKVPool)
             ):
                 raise ValueError("QSA K/V offload needs a plain unquantized K/V pool")
-            # The GPU keeps only the hot-cache and scratch rows of the K/V.
-            full_kv_pool = MHATokenToKVPool(
+            # The GPU keeps only the hot-cache and scratch rows of the K/V (in
+            # verify mode next to the full pool).
+            offload_pool = MHATokenToKVPool(
                 size=kv_offload_layout.device_rows,
                 page_size=page_size,
                 dtype=dtype,
@@ -159,6 +161,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 enable_memory_saver=enable_memory_saver,
                 kv_cache_layout="nhd",
             )
+            if not envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get():
+                full_kv_pool = offload_pool
         super().__init__(
             size=size,
             dtype=dtype,
@@ -179,12 +183,13 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         self.kv_offload = (
             None
-            if kv_offload_layout is None
+            if offload_pool is None
             else QSAKVHostOffload(
                 layout=kv_offload_layout,
-                k_buffers=self.full_kv_pool.k_buffer,
-                v_buffers=self.full_kv_pool.v_buffer,
+                k_buffers=offload_pool.k_buffer,
+                v_buffers=offload_pool.v_buffer,
                 host_rows=size + page_size,
+                verify=offload_pool is not self.full_kv_pool,
             )
         )
         if (

@@ -168,6 +168,38 @@ class QSAKVGatherSource(msgspec.Struct, frozen=True):
     sequence_lengths: torch.Tensor
 
 
+def _pack_gathered_kv(source: QSAKVGatherSource, indices: torch.Tensor):
+    """(valid counts, packed K, packed V) of the decode gather, for verification."""
+    rows, width = indices.shape
+    device = indices.device
+    counts = torch.empty(rows, dtype=torch.int32, device=device)
+    cu = torch.arange(rows + 1, dtype=torch.int32, device=device) * width
+    packed_k = torch.empty(
+        (rows * width, *source.k_buffer.shape[1:]),
+        dtype=source.k_buffer.dtype,
+        device=device,
+    )
+    packed_v = torch.empty_like(packed_k)
+    qwen_sparse_valid_counts_triton(
+        source.sequence_lengths, indices, counts, rows, width
+    )
+    qwen_sparse_kv_extraction_compact_triton(
+        source.k_buffer,
+        source.v_buffer,
+        source.slot_table,
+        source.row_requests,
+        indices,
+        source.sequence_lengths,
+        cu,
+        packed_k,
+        packed_v,
+        rows,
+        width,
+        zero_fill_cols=width,
+    )
+    return counts, packed_k, packed_v
+
+
 class QSAMTPSharedSparseIndices:
     """Draft-extend top-k reused by one MTP iteration's decode steps,
     causally valid because a draft moves at most speculative_num_steps positions.
@@ -1385,12 +1417,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         else:
             rows = offload.extend_rows(forward_batch.out_cache_loc.numel())
+        pool = self.token_to_kv_pool
+        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
+        if offload.verify:
+            self.kv_layers.layer(layer.layer_id).store(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+            offload.mirror(
+                layer_idx,
+                rows,
+                forward_batch.out_cache_loc,
+                pool.full_kv_pool.k_buffer[layer_idx],
+                pool.full_kv_pool.v_buffer[layer_idx],
+            )
+            return
         self.kv_layers.layer(layer.layer_id).store(layer, rows, k, v)
-        offload.write_through(
-            self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id),
-            rows,
-            forward_batch.out_cache_loc,
-        )
+        offload.write_through(layer_idx, rows, forward_batch.out_cache_loc)
 
     def _gather_offloaded_context(
         self,
@@ -1417,22 +1459,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices.long()[owner], positions
         ]
         pool = self.token_to_kv_pool
-        k, v = self._kv_offload.gather_context(
-            pool._transfer_full_attention_id(layer.layer_id), slots
+        offload = self._kv_offload
+        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
+        k, v = offload.gather_context(layer_idx, slots)
+        pool_k = pool.layer_router.read(layer.layer_id).key()
+        pool_v = pool.layer_router.read(layer.layer_id).value()
+        packed = (
+            k.view(pool_k.dtype).to(output_dtype),
+            v.view(pool_k.dtype).to(output_dtype),
         )
-        dtype = pool.layer_router.read(layer.layer_id).key().dtype
-        return k.view(dtype).to(output_dtype), v.view(dtype).to(output_dtype)
+        if offload.verify:
+            expected = pack_qsa_prefill_kv(
+                k=pool_k,
+                v=pool_v,
+                req_to_token=self.req_to_token,
+                req_indices=forward_batch.req_pool_indices,
+                cu_k=cu_seqlens_k,
+                total_k=total_k,
+                max_k=int(sequence_lens.max()),
+                output_dtype=output_dtype,
+            )
+            offload.check("prefill context", layer_idx, packed, expected)
+        return packed
 
     def _forward_offloaded_attention(
         self, q: torch.Tensor, layer, forward_batch, topk_indices: torch.Tensor
     ) -> torch.Tensor:
         """Decode / target verify over the offload's per-forward device-row table."""
         pool = self.token_to_kv_pool
+        offload = self._kv_offload
+        layer_idx = pool._transfer_full_attention_id(layer.layer_id)
         metadata = self._resolve_metadata(forward_batch)
         positions = self._expand_block_indices(topk_indices, metadata)
         num_rows, width = positions.shape
-        rows = self._kv_offload.resolve_rows(
-            pool._transfer_full_attention_id(layer.layer_id),
+        rows = offload.resolve_rows(
+            layer_idx,
             positions,
             metadata.sequence_lengths,
             self._row_requests(forward_batch, metadata),
@@ -1440,18 +1501,29 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         # Valid positions lead each row, so column ids keep the packing order.
         columns = torch.arange(width, dtype=torch.int32, device=rows.device)
+        indices = torch.where(rows >= 0, columns, -1)
+        pool_k = pool.layer_router.read(layer.layer_id).key()
+        pool_v = pool.layer_router.read(layer.layer_id).value()
         source = QSAKVGatherSource(
-            k_buffer=pool.layer_router.read(layer.layer_id).key(),
-            v_buffer=pool.layer_router.read(layer.layer_id).value(),
+            k_buffer=offload.dev_k[layer_idx].view(pool_k.dtype),
+            v_buffer=offload.dev_v[layer_idx].view(pool_v.dtype),
             slot_table=rows,
             row_requests=torch.arange(num_rows, device=rows.device),
             sequence_lengths=torch.full(
                 (num_rows,), width, dtype=torch.int32, device=rows.device
             ),
         )
-        return self._forward_gathered_attention(
-            q, layer, metadata, torch.where(rows >= 0, columns, -1), source
-        )
+        if offload.verify:
+            reference = self._pool_gather_source(
+                pool_k, pool_v, forward_batch, metadata
+            )
+            offload.check(
+                "decode gather",
+                layer_idx,
+                _pack_gathered_kv(source, indices),
+                _pack_gathered_kv(reference, positions.to(torch.int32).contiguous()),
+            )
+        return self._forward_gathered_attention(q, layer, metadata, indices, source)
 
     @staticmethod
     def _logical_to_physical(

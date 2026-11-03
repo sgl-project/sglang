@@ -699,6 +699,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     device_rows=device_rows,
                     page_size=page_size,
                     host_size_gb=get_memory().qsa_kv_offload_host_size,
+                    verify=envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get(),
                 )
             )
         max_total_num_tokens = (
