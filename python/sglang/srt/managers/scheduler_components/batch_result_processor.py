@@ -16,7 +16,7 @@ from typing import (
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -25,9 +25,8 @@ from sglang.srt.layers.logits_processor import (
     TokenCustomizedInfo,
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
     mamba_lazy_spec_in_window,
@@ -38,10 +37,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -369,10 +368,9 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                is_middle_chunk = req is batch.chunked_req
                 should_commit_output = (
-                    not req.finished()
-                    and not req.is_retracted
-                    and req.inflight_middle_chunks <= 0
+                    not req.finished() and not req.is_retracted and not is_middle_chunk
                 )
                 # A reason here finishes the request without committing this
                 # forward's output: a failed KV load or an unusable sampling mask.
@@ -404,15 +402,13 @@ class SchedulerBatchResultProcessor:
                         store=(should_commit_output and discard_finish_reason is None),
                     )
 
-                if (
-                    req.finished() and req.inflight_middle_chunks <= 0
-                ) or req.is_retracted:
+                if (req.finished() and not is_middle_chunk) or req.is_retracted:
                     # Decode req in a mixed batch, or a retracted req. Keep an
-                    # aborted middle chunk in the chunked branch long enough to
-                    # drain its accounting without streaming it.
+                    # aborted middle chunk in the chunked branch so its logprob
+                    # offset is still accounted and it is not streamed.
                     continue
 
-                if req.inflight_middle_chunks <= 0:
+                if not is_middle_chunk:
                     req.time_stats.set_prefill_finished_time()
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
@@ -498,7 +494,6 @@ class SchedulerBatchResultProcessor:
 
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -542,10 +537,8 @@ class SchedulerBatchResultProcessor:
                 if req.is_retracted:
                     continue
 
-                if (
-                    req.discard_output_reason is not None
-                    and req.inflight_middle_chunks <= 0
-                ):
+                is_middle_chunk = req is batch.chunked_req
+                if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -557,7 +550,7 @@ class SchedulerBatchResultProcessor:
                 )
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.inflight_middle_chunks <= 0:
+                if not is_middle_chunk:
                     req.time_stats.set_prefill_finished_time()
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
@@ -572,7 +565,6 @@ class SchedulerBatchResultProcessor:
                         checkpoint_kv_cache(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.token_to_kv_pool_allocator.free_group_end()
@@ -700,10 +692,10 @@ class SchedulerBatchResultProcessor:
     ):
         """Validate PP skip output comm correctness.
 
-        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
+        - When skip=True: all reqs must run a middle chunk (be batch.chunked_req)
           so placeholder zeros are never consumed via req.output_ids.append().
         - When skip=False: at least one req should consume next_token_ids
-          (inflight_middle_chunks <= 0), otherwise warn.
+          (not be batch.chunked_req), otherwise warn.
         """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
@@ -711,25 +703,26 @@ class SchedulerBatchResultProcessor:
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    req.inflight_middle_chunks <= 0
+                    req is not batch.chunked_req
                     for req in batch.reqs
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
+                    chunked = batch.chunked_req
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                        f"num_reqs={len(batch.reqs)}, "
+                        f"chunked_rid={chunked.rid if chunked else None}"
                     )
             return
 
         for req in batch.reqs:
             if not req.finished() and not req.is_retracted:
-                assert req.inflight_middle_chunks > 0, (
+                assert req is batch.chunked_req, (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
-                    f"but output was skipped (contains_last_prefill_chunk="
+                    f"runs no middle chunk but output was skipped "
+                    f"(contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
@@ -1011,7 +1004,7 @@ class SchedulerBatchResultProcessor:
                     req.grammar is None
                     or req.is_retracted
                     or req.finished()
-                    or req.inflight_middle_chunks > 0
+                    or req is batch.chunked_req
                 ):
                     continue
                 self._accept_grammar_tokens(req, next_token_ids[i])
