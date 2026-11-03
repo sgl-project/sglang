@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.kvcacheio import NPU_KV_QUANT_PATH, kv_compress_epilog
+from sgl_kernel_npu.operators.kvcacheio import get_npu_kv_quant_path, kv_compress_epilog
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -67,7 +67,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     def a5_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        return NPU_KV_QUANT_PATH.packed_dim(nope_dim, rope_dim)
+        return get_npu_kv_quant_path().packed_dim(nope_dim, rope_dim)
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
@@ -609,10 +609,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             buf,
             cache_2d,
             slot_mapping,
-            quant_group_size=NPU_KV_QUANT_PATH.quant_group_size,
-            quant_mode="fp8_bf16",
-            round_scale=True,
-            x_scale=1.0,
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
