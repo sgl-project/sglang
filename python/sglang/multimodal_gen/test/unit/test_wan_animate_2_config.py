@@ -28,14 +28,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     Wan_Animate_2_14B_Distilled_SamplingParam,
     Wan_Animate_2_14B_SamplingParam,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -47,9 +45,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     get_sampling_request_extra_fields,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionBackendEnum,
 )
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -87,11 +82,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     build_clip_conditioning,
     build_schedule,
     generation_token_grid,
+    get_sampling_sigmas,
     request_state_from_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.denoising import (
     WanAnimate2DenoisingStage,
-    get_sampling_sigmas,
+    _clip_decoded_frames_to_uint8,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
     WanAnimate2VaeAdapter,
@@ -107,6 +103,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     write_reference_video,
     zigzag_padding,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -1989,3 +1986,12 @@ def test_before_denoising_stage_populates_the_standard_denoising_inputs(
         None, Req(sampling_params=Wan_Animate_2_14B_SamplingParam()), server_args
     )
     assert not bare.is_valid()
+
+
+def test_clip_decoded_frames_past_unit_range_saturate_instead_of_wrapping():
+    """``decode_raw`` does not clamp its output, so a VAE value a bit outside [-1, 1]
+    (e.g. -1.02) must saturate to 0/255, not wrap around to a bright/dark speckle."""
+    decoded = torch.tensor([-1.02, -1.0, 0.0, 1.0, 1.02]).reshape(1, 1, 1, 1, 5)
+    frames = _clip_decoded_frames_to_uint8(decoded)
+    assert frames.dtype == np.uint8
+    np.testing.assert_array_equal(frames.reshape(-1), [0, 0, 127, 255, 255])

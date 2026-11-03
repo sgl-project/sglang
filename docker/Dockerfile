@@ -19,7 +19,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.7.2
-ARG MOONCAKE_VERSION=0.3.13.post1
+ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -631,7 +631,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="6fd7ac30371a45ef246bb9db2e3559c398156feb"
+ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \

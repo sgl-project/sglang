@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.lightning_attention import (
     LightningAttentionCase,
