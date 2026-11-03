@@ -214,7 +214,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             sorted(tp_shared),
             sorted(self.offload_pools),
         )
-
         self.register_buffers()
         self.mla_broadcaster = None
         self.tp_group = tp_group

@@ -144,10 +144,25 @@ class DevicePoolEntry:
         Every row emits the same (size, offset) items, so all rows share one
         read-only list each; the pointers are affine in the row.
         """
-        mapped = self.layer_mapping.get(layer)
-        if mapped is None:
+        return self.get_prepared_layer_group_meta(locations, (layer,))
+
+    def get_prepared_layer_group_meta(
+        self, locations: list[int] | np.ndarray, layers: Sequence[int]
+    ):
+        """Ranges for a whole layer chunk, in transfer order.
+
+        Asking the store for several layers at once turns N serialized small
+        reads into one batched request: each key's slice list then carries every
+        layer of the chunk instead of being refilled once per layer.
+        """
+        buffer_indices = []
+        for layer in layers:
+            mapped = self.layer_mapping.get(layer)
+            if mapped is None:
+                continue
+            buffer_indices.extend([mapped] if isinstance(mapped, int) else list(mapped))
+        if not buffer_indices:
             return None
-        buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
         items = [
             (*component[buffer_index], offsets[buffer_index])
@@ -734,6 +749,57 @@ def _build_minimax_m3_nvfp4_device_pool_group(
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
     return DevicePoolGroup(entries, main_pool.layer_num, page_size)
+
+
+def _build_plain_kv_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """One full-attention pool, no side components: MLA or plain MHA KV."""
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
+
+    # TODO: DCP splits one logical page across ranks and packed MTP draft KV
+    # carries its own page size; neither has a device-pool layout here yet.
+    if get_parallel().attn_dcp_size > 1:
+        raise ValueError(
+            "The direct external linker does not support DCP on a plain KV pool."
+        )
+    if params.mtp_draft_device_pools:
+        raise ValueError(
+            "The direct external linker does not support packed draft KV on a "
+            "plain KV pool yet."
+        )
+
+    layer_mapping = {layer: layer for layer in range(kvcache.layer_num)}
+    if isinstance(kvcache, MLATokenToKVPool):
+        if kvcache.kv_scale_buffer is not None:
+            raise ValueError(
+                "The direct external linker does not support scaled MLA KV yet."
+            )
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[kvcache.kv_buffer],
+            layer_mapping=layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        )
+        # MLA latent KV is replicated across TP ranks, so keys carry no tp rank.
+        rank_replicated = True
+    elif isinstance(kvcache, MHATokenToKVPool):
+        entry = _mha_device_pool_entry(PoolName.KV, kvcache, layer_mapping, page_size)
+        rank_replicated = False
+    else:
+        raise ValueError(
+            "The direct external linker supports plain MLA and MHA KV pools; "
+            f"got {type(kvcache).__name__}."
+        )
+    return DevicePoolGroup(
+        [entry], kvcache.layer_num, page_size, rank_replicated=rank_replicated
+    )
 
 
 def resolve_hybrid_device_pool_group(
