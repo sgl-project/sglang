@@ -514,9 +514,12 @@ class BeamAttention(nn.Module):
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         # MergedColumnParallelLinear shards each projection independently, but
         # does not replicate KV heads. Keep the existing quantized/replicated
-        # paths until their loading and backend contracts are validated.
+        # paths until their loading and backend contracts are validated. LoRA
+        # wraps qkv_proj and gate_proj separately.
         self.use_packed_projection = (
-            quant_config is None and config.num_key_value_heads >= self.tp_size
+            quant_config is None
+            and config.num_key_value_heads >= self.tp_size
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -944,9 +947,11 @@ class BeamModel(nn.Module):
         )
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
-        # Deferred expert sums need the BF16 Triton runner's per-expert outputs.
+        # Deferred expert sums read base weights directly, bypassing LoRA.
         self.fuse_moe_all_reduce = (
-            quant_config is None and config.num_experts_per_tok == 8
+            quant_config is None
+            and config.num_experts_per_tok == 8
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
         self._beam_all_reduce_comm = None
         # Offload wrappers load weights through each layer's regular forward.
@@ -1286,6 +1291,18 @@ class BeamForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The attention output gate keeps its qualified name to distinguish it
+    # from the MLP gate, which is fused into gate_up_proj.
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "self_attn.gate_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
     def __init__(
         self,
         config: BeamConfig,
@@ -1293,7 +1310,8 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if get_beam_quantization(quant_config) is None:
+        quant_scheme = get_beam_quantization(quant_config)
+        if quant_scheme is None:
             raise NotImplementedError(
                 "Beam supports BF16, compressed-tensors FP8 (per-channel "
                 "weights and dynamic per-token activations), or ModelOpt "
@@ -1313,8 +1331,14 @@ class BeamForCausalLM(nn.Module):
                 "Beam has not been validated with expert relocation or "
                 "redundant experts; use trivial expert placement"
             )
-        if get_lora().enable_lora or get_lora().lora_paths:
-            raise NotImplementedError("LoRA adapters are not supported for Beam")
+        if (get_lora().enable_lora or get_lora().lora_paths) and (
+            quant_scheme == "nvfp4"
+            or get_lora().lora_backend not in ("csgmv", "triton")
+        ):
+            raise NotImplementedError(
+                "Beam LoRA supports BF16 or compressed-tensors FP8 with "
+                "--lora-backend csgmv or triton and --moe-runner-backend triton"
+            )
         self.config = config
         self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.start_layer = self.model.start_layer
