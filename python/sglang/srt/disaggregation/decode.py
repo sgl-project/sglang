@@ -1068,9 +1068,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
-        for req in self.retracted_queue.take(
-            lambda req: recv_req.abort_all or req.rid.startswith(recv_req.rid)
-        ):
+        for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
             discard_kv_cache_backup(
                 req,
                 self.tree_cache,
@@ -1081,10 +1079,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
-            lambda req: recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            lambda req: recv_req.matches(req.rid)
         ):
             req.finish_outside_step(FINISH_ABORT())
-            self.scheduler._release_aborted_request(req)
+            self.scheduler.release_aborted_request(req)
             self.scheduler.send_abort_output(
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )

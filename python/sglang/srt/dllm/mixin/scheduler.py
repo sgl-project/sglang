@@ -47,7 +47,7 @@ class SchedulerDllmMixin:
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(FINISH_ABORT())
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         self.send_abort_output(make_abort_req(req), req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -508,9 +508,7 @@ class DllmManager:
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
     def _abort(self, recv_req: AbortReq) -> None:
-        aborted_reqs = self.waiting_queue.take(
-            lambda req: recv_req.abort_all or req.rid.startswith(recv_req.rid)
-        )
+        aborted_reqs = self.waiting_queue.take(lambda req: recv_req.matches(req.rid))
         aborted = set(aborted_reqs)
         self.staging_queue = [req for req in self.staging_queue if req not in aborted]
         for req in aborted_reqs:

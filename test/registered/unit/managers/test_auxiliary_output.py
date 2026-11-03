@@ -554,7 +554,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
         disagg_prefill_transfer_queue=_RequestList(ListKind.PD_SENDING),
-        prefill_launched_reqs=_RequestList(ListKind.PD_PREFILLING),
+        prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),

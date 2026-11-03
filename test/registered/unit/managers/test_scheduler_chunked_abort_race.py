@@ -81,7 +81,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched._release_aborted_request = Mock()
+        sched.release_aborted_request = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
@@ -95,7 +95,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched._release_aborted_request = Mock()
+        sched.release_aborted_request = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 

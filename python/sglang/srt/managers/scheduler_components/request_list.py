@@ -27,7 +27,7 @@ class ListKind(enum.Enum):
     CHUNKED = enum.auto()
     PD_BOOTSTRAP = enum.auto()
     # Prefill requests out of the chunked slot whose launched steps are not done.
-    PD_PREFILLING = enum.auto()
+    PREFILL_LAUNCHED = enum.auto()
     PD_SENDING = enum.auto()
     PD_PREALLOC = enum.auto()
     PD_RETRACTED = enum.auto()

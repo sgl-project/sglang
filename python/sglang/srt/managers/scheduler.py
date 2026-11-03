@@ -1388,7 +1388,7 @@ class Scheduler(
         # Prefill requests out of the chunked slot whose launched steps their next
         # holder has not taken yet: the running batch at the merge, the PD
         # transfer queue, HiSparse staging, or a requeue.
-        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2664,8 +2664,6 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
-            get_running_reqs=lambda: self.running_reqs,
-            get_prefill_launched_reqs=lambda: self.prefill_launched_reqs,
             get_running_batches=lambda: (
                 self.running_batch,
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
@@ -3643,7 +3641,7 @@ class Scheduler(
         # `prefetch_from_storage` arms the paced-retry set for this attempt's
         # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
         # that, and a retired request reaches neither.
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
@@ -3653,7 +3651,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3661,7 +3659,7 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
-                self._release_aborted_request(req)
+                self.release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
@@ -3721,7 +3719,7 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, req: Req) -> None:
+    def release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
@@ -3738,7 +3736,7 @@ class Scheduler(
     ) -> None:
         """Abort document windows held off the waiting queue."""
         for req in reqs:
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             self.ipc_channels.send_to_tokenizer.send_output(
                 make_abort_req(req, finished_reason=finished_reason), req
             )
@@ -3769,7 +3767,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req)
+                self.release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -4014,7 +4012,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -4689,7 +4687,7 @@ class Scheduler(
             ListKind.WAITING: self.waiting_queue,
             ListKind.GRAMMAR: self.grammar_manager.grammar_queue,
             ListKind.CHUNKED: [] if self.chunked_req is None else [self.chunked_req],
-            ListKind.PD_PREFILLING: self.prefill_launched_reqs,
+            ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
             ListKind.DECODING: self.running_reqs,
         }
         # Read at call time: a PD role switch rebuilds the PD queues.
@@ -5691,7 +5689,7 @@ class Scheduler(
             busy_lists = lists.keys() - {
                 # Their steps are counted through the batches above.
                 ListKind.DECODING,
-                ListKind.PD_PREFILLING,
+                ListKind.PREFILL_LAUNCHED,
                 # Only its staging part is counted, above.
                 ListKind.DLLM,
                 # Held across a weight update, whose cache flush needs idle.
@@ -6021,7 +6019,7 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         self.deferred_responses.abort(recv_req)
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -6032,7 +6030,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 to_del.append(i)
 
         if self.uocr_runtime is not None:
@@ -6053,7 +6051,7 @@ class Scheduler(
             # Finished in place, so a later abort in the same intake skips it.
             if req.finished_reason is None:
                 req.finish_outside_step(FINISH_ABORT())
-            self._release_aborted_request(req)
+            self.release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
@@ -6086,7 +6084,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if get_parallel().pp_size > 1:
@@ -6094,7 +6092,7 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if decode_req.host_staged:
                         # Keep the host destination alive until prefill stops writing.
@@ -6107,10 +6105,8 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: `request_finish`
+            if not req.finished() and recv_req.matches(req.rid):
+                # Abort method 2: `request_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")

@@ -185,7 +185,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = _RequestList(ListKind.DECODING)
-        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
         self.waiting_queue = []
@@ -1160,7 +1160,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
 
                 class OptimisticScheduler(_Scheduler):
-                    _release_aborted_request = Scheduler._release_aborted_request
+                    release_aborted_request = Scheduler.release_aborted_request
 
                     def run_batch(self, batch):
                         if req in batch.reqs:
@@ -1275,7 +1275,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.dllm_config = None
         self.running_reqs = _RequestList(ListKind.DECODING)
-        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

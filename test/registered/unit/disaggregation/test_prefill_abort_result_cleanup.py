@@ -60,7 +60,7 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
-        self.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),

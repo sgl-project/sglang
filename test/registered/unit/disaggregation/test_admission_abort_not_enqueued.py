@@ -71,7 +71,7 @@ def _make_scheduler():
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
-        _release_aborted_request=MagicMock(),
+        release_aborted_request=MagicMock(),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
@@ -315,7 +315,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched._release_aborted_request.assert_called_once_with(req)
+        sched.release_aborted_request.assert_called_once_with(req)
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)

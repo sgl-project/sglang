@@ -352,7 +352,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
             clear_pending_chunk_send=Mock(),
-            prefill_launched_reqs=_RequestList(ListKind.PD_PREFILLING),
+            prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=[],
             disagg_prefill_bootstrap_queue=SimpleNamespace(
                 queue=_RequestList(ListKind.PD_BOOTSTRAP)
@@ -438,8 +438,8 @@ class TestAllocationIntegration(CustomTestCase):
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
-        scheduler._release_aborted_request = MethodType(
-            Scheduler._release_aborted_request, scheduler
+        scheduler.release_aborted_request = MethodType(
+            Scheduler.release_aborted_request, scheduler
         )
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
@@ -476,7 +476,9 @@ class TestAllocationIntegration(CustomTestCase):
                             check_bootstrap=Mock(return_value=False),
                             has_bootstrapped_waiting_req=Mock(return_value=True),
                             optimistic_release_and_requeue=Mock(),
-                            prefill_launched_reqs=_RequestList(ListKind.PD_PREFILLING),
+                            prefill_launched_reqs=_RequestList(
+                                ListKind.PREFILL_LAUNCHED
+                            ),
                         )
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
@@ -533,7 +535,7 @@ class TestAllocationIntegration(CustomTestCase):
             ),
             spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
             optimistic_release_and_requeue=Mock(),
-            prefill_launched_reqs=_RequestList(ListKind.PD_PREFILLING),
+            prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
             metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
             maybe_send_health_check_signal=Mock(),
         )

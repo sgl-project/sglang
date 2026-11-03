@@ -477,9 +477,9 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
+            release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
-            prefill_launched_reqs=_RequestList(ListKind.PD_PREFILLING),
+            prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",

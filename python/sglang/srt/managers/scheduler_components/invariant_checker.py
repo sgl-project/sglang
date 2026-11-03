@@ -76,8 +76,6 @@ class SchedulerInvariantChecker:
         default=lambda: {}
     )
     get_chunked_req: Callable = field(default=lambda: None)
-    get_running_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
-    get_prefill_launched_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
     get_running_batches: Callable = field(default=lambda: ())
     # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
@@ -487,8 +485,9 @@ class SchedulerInvariantChecker:
         live request is in exactly one list, one that matches its state."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
+        lists = self.get_request_lists()
         owners: Dict[Req, ListKind] = {}
-        for kind, reqs in self.get_request_lists().items():
+        for kind, reqs in lists.items():
             for req in reqs:
                 if req in owners:
                     raise RuntimeError(
@@ -509,14 +508,14 @@ class SchedulerInvariantChecker:
         in_step = {
             req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
         }
-        running = set(self.get_running_reqs())
+        running = set(lists.get(ListKind.DECODING, ()))
 
         _raise_if_any(
             live(in_running_batch | in_step) - owners.keys(),
             "Requests held by a running batch or a step but in no list",
         )
         _raise_if_any(
-            in_running_batch & set(self.get_prefill_launched_reqs()),
+            in_running_batch & set(lists.get(ListKind.PREFILL_LAUNCHED, ())),
             "Requests in prefill_launched but in a running batch",
         )
         _raise_if_any(

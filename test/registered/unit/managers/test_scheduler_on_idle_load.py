@@ -123,7 +123,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hisparse = False
-        scheduler.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None

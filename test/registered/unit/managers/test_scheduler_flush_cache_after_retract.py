@@ -63,7 +63,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
-        scheduler.prefill_launched_reqs = _RequestList(ListKind.PD_PREFILLING)
+        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None

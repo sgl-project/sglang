@@ -86,8 +86,6 @@ def _invariant_checker(s):
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
-        get_running_reqs=lambda: s.running_reqs,
-        get_prefill_launched_reqs=lambda: s.prefill_launched_reqs,
         get_running_batches=lambda: (s.running_batch,),
     )
 

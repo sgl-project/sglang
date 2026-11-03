@@ -484,9 +484,9 @@ class PrefillBootstrapQueue:
     def _abort(self, recv_req: AbortReq) -> None:
         # Abort requests that have not yet been bootstrapped
         for req in self.queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler._release_aborted_request(req)
+                self.scheduler.release_aborted_request(req)
 
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
@@ -1219,9 +1219,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     def _abort_prefill_transfer(self: Scheduler, recv_req: AbortReq) -> None:
-        # Abort in-flight requests
+        # Abort requests whose KV is being sent
         for req in self.disagg_prefill_transfer_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
@@ -1397,7 +1397,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.finish_outside_step(FINISH_LENGTH(length=0))
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self._release_aborted_request(req)
+        self.release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
