@@ -522,11 +522,6 @@ class DSparkDraftMixin:
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False
 
-    def bind_context_kv_writer(
-        self, *, write_loc_resolver: Callable[[torch.Tensor], KVWriteLoc]
-    ) -> Callable[..., None]:
-        return self.write_target_hidden_kv
-
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
@@ -856,6 +851,9 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_write_ids: Optional[
+            Callable[[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -863,18 +861,32 @@ class DSparkDraftMixin:
             else self.project_target_hidden(target_hidden)
         )
 
-        bundle = self._fused_kv_write_bundle(pool)
+        prefix_valid = cache_loc_2d is not None and commit_lens is not None
+        if prefix_valid:
+            columns = torch.arange(cache_loc_2d.shape[1], device=cache_loc_2d.device)
+            committed = columns[None, :] < commit_lens[:, None]
+            # Rejected rows may hold invalid ids; mask them before any table gather.
+            full_loc = torch.where(committed, cache_loc_2d, 0)
+        else:
+            full_loc = cache_loc
+        swa_loc = None if swa_write_ids is None else swa_write_ids(full_loc)
+        write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
+
+        # The fused writer takes one location vector for every layer. A routed
+        # SWA pool needs a different vector for its non-owner layers, so use the
+        # per-layer router whenever a secondary location was resolved.
+        bundle = None if swa_loc is not None else self._fused_kv_write_bundle(pool)
         if bundle is not None:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,
             )
 
-            if cache_loc_2d is not None and commit_lens is not None:
-                locs = cache_loc_2d.reshape(-1)
+            if prefix_valid:
+                locs = full_loc.reshape(-1)
                 write_commit_lens = commit_lens
                 locs_row_width = cache_loc_2d.shape[1]
             else:
-                locs = cache_loc
+                locs = full_loc
                 write_commit_lens = None
                 locs_row_width = None
             fused_kv_norm_rope_write(
@@ -921,22 +933,21 @@ class DSparkDraftMixin:
                 k = attn.apply_k_rope(positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
-                    attn.attn,
-                    cache_loc_2d,
-                    commit_lens,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
+            route = pool.layer_router.layer(attn.attn.layer_id)
+            if prefix_valid:
+                route.store_prefix_valid(
+                    layer=attn.attn,
+                    loc_info=write_loc,
+                    commit_lens=commit_lens,
+                    cache_k=k,
+                    cache_v=v,
+                    k_scale=attn.attn.k_scale,
+                    v_scale=attn.attn.v_scale,
                 )
             else:
-                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
-                # already in the ids the draft pool indexes.
-                pool.layer_router.layer(attn.attn.layer_id).store(
+                route.store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    write_loc,
                     k,
                     v,
                     attn.attn.k_scale,

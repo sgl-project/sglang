@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -106,13 +105,6 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
             if name.startswith("draft_model.")
         )
 
-    def bind_context_kv_writer(
-        self, *, write_loc_resolver: Callable[[torch.Tensor], KVWriteLoc]
-    ) -> Callable[..., None]:
-        return partial(
-            self.write_target_hidden_kv, write_loc_resolver=write_loc_resolver
-        )
-
     def write_target_hidden_kv(
         self,
         *,
@@ -120,11 +112,12 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
         pool,
         positions: torch.Tensor,
         cache_loc: torch.Tensor,
+        swa_write_ids: Optional[
+            Callable[[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
-        swa_loc: Optional[torch.Tensor] = None,
-        write_loc_resolver: Optional[Callable[[torch.Tensor], KVWriteLoc]] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -139,14 +132,8 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
             full_loc = torch.where(committed, cache_loc_2d, 0)
         else:
             full_loc = cache_loc
-        if swa_loc is not None:
-            write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
-        else:
-            write_loc = (
-                KVWriteLoc(full_loc, physical=True)
-                if write_loc_resolver is None
-                else write_loc_resolver(full_loc)
-            )
+        swa_loc = None if swa_write_ids is None else swa_write_ids(full_loc)
+        write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
         for layer in self.layers:
             attn = layer.self_attn
             qkv, _ = attn.q_k_v_proj(ctx_hidden)

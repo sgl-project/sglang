@@ -435,9 +435,6 @@ class TestSpark25DSpark(CustomTestCase):
                         iteration_ids=plan,
                     )
                 else:
-                    placement = injector.place_prefill(batch)
-                    positions = torch.tensor([0, 1, 0, 1])
-                    indices = torch.tensor([0, 2])
                     mapping = (
                         reader.space(reader.window_kv_kind).table
                         if unified
@@ -446,14 +443,18 @@ class TestSpark25DSpark(CustomTestCase):
                     saved_mapping = mapping.clone()
                     mapping.zero_()
                     try:
-                        injector.inject_prefill(
-                            placement,
-                            target_hidden=hidden[indices],
-                            token_indices=indices,
-                            target_hidden_is_projected=False,
-                        )
+                        placement = injector.place_prefill(batch)
                     finally:
                         mapping.copy_(saved_mapping)
+                    self.assertIsNone(placement.swa_loc)
+                    positions = torch.tensor([0, 1, 0, 1])
+                    indices = torch.tensor([0, 2])
+                    injector.inject_prefill(
+                        placement,
+                        target_hidden=hidden[indices],
+                        token_indices=indices,
+                        target_hidden_is_projected=False,
+                    )
                 projected = draft.project_target_hidden(hidden)
                 for layer_id, layer in enumerate(draft.layers):
                     qkv = F.linear(projected, layer.self_attn.q_k_v_proj.weight)
