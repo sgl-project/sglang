@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attach SGLang Engram gathers to an independent immutable table owner."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -11,11 +13,24 @@ from contextlib import suppress
 from pathlib import Path
 
 from sglang.srt.layers.engram_shared_vmm import TableHandles, TableMapping, import_table
+from sglang.srt.runtime_context import get_resources
 
 logger = logging.getLogger(__name__)
 MAX_MANIFEST_BYTES = 1 << 20
-_attachments: list["ExternalEngramTable"] = []
-_attachments_lock = threading.Lock()
+_RESOURCE_KEY = "external_engram_attachments"
+
+
+class _AttachmentState:
+    def __init__(self) -> None:
+        self.attachments: list[ExternalEngramTable] = []
+        self.lock = threading.Lock()
+
+
+def _attachment_state(*, create: bool) -> _AttachmentState | None:
+    buffers = get_resources().buffers
+    if create:
+        return buffers.setdefault(_RESOURCE_KEY, _AttachmentState())
+    return buffers.get(_RESOURCE_KEY)
 
 
 def _sha256(path: Path) -> str:
@@ -121,8 +136,10 @@ def attach_table(
             raise ValueError("external Engram byte extent mismatch")
         mapping = import_table(table, device)
         attachment = ExternalEngramTable(connection, mapping, lease, weight_bytes)
-        with _attachments_lock:
-            _attachments.append(attachment)
+        state = _attachment_state(create=True)
+        assert state is not None
+        with state.lock:
+            state.attachments.append(attachment)
         return attachment
     except BaseException as error:
         if mapping is not None:
@@ -144,11 +161,14 @@ def attach_table(
 
 def close_attached_tables() -> None:
     """Called after SGLang has stopped requests and graph replay."""
-    with _attachments_lock:
-        for attachment in reversed(_attachments[:]):
+    state = _attachment_state(create=False)
+    if state is None:
+        return
+    with state.lock:
+        for attachment in reversed(state.attachments[:]):
             try:
                 attachment.close()
             except Exception:
                 logger.exception("Cannot safely detach external Engram table")
             else:
-                _attachments.remove(attachment)
+                state.attachments.remove(attachment)
