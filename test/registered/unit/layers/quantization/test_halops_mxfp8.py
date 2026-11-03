@@ -275,5 +275,60 @@ class TestOfflineCheckpointScales(CustomTestCase):
         self.assertTrue(torch.equal(layer.weight_scale_inv.data, scale))
 
 
+class TestOnlineQuantizationBuffers(CustomTestCase):
+    """A BF16 checkpoint quantized at load is requantized on every load."""
+
+    @staticmethod
+    def _method():
+        method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        method.use_mxfp8 = True
+        method.mxfp8_dense_backend = Mxfp8DenseGemmBackend.HALOPS
+        return method
+
+    @staticmethod
+    def _quantized(value, scale_value, *, n, k):
+        scale = torch.full((n, k // SCALE_GROUP), scale_value, dtype=torch.uint8)
+        qweight = torch.full((n, k), value, dtype=torch.float8_e4m3fn)
+        return qweight, swizzle_scale_to_sfatom(scale), scale
+
+    def test_requantization_writes_through_the_captured_buffers(self):
+        """update_weights_from_disk does not recapture CUDA graphs, so a second
+        load must overwrite what the first load handed to dense_gemm."""
+        n, k = SF_ATOM_ROWS, 128
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                torch.zeros((n, k), dtype=torch.bfloat16), requires_grad=False
+            ),
+            # First load has no weight_scale_inv yet; the quantizer registers it.
+            register_parameter=lambda name, param: setattr(layer, name, param),
+        )
+        method = self._method()
+
+        with mock.patch.object(halops_mxfp8, "quantize_weight") as quantize_weight:
+            quantize_weight.side_effect = [
+                self._quantized(1.0, 127, n=n, k=k),
+                self._quantized(2.0, 128, n=n, k=k),
+            ]
+            method._quantize_mxfp8_weights(layer)
+            captured = {
+                name: getattr(layer, name).data_ptr()
+                for name in ("weight", "weight_scale_inv", "weight_scale_inv_halops")
+            }
+            method._quantize_mxfp8_weights(layer)
+
+        self.assertEqual(quantize_weight.call_count, 2)
+        for name, data_ptr in captured.items():
+            self.assertEqual(getattr(layer, name).data_ptr(), data_ptr, name)
+        self.assertTrue(torch.equal(layer.weight.data.float(), torch.full((n, k), 2.0)))
+        expected_scale = torch.full((n, k // SCALE_GROUP), 128, dtype=torch.uint8)
+        self.assertTrue(torch.equal(layer.weight_scale_inv.data, expected_scale))
+        self.assertTrue(
+            torch.equal(
+                layer.weight_scale_inv_halops.data,
+                swizzle_scale_to_sfatom(expected_scale),
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

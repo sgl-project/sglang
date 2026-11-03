@@ -1182,20 +1182,18 @@ class Fp8LinearMethod(LinearMethodBase):
 
             if weight_supported(n=weight.shape[0], k=weight.shape[1]):
                 qweight, sf_sfatom, weight_scale = quantize_weight(weight)
-                layer.weight.data = qweight
-                layer.weight.requires_grad_(False)
+                copy_or_rebind_param(layer, "weight", qweight)
                 if (
                     hasattr(layer, "weight_scale_inv")
                     and layer.weight_scale_inv is not None
                 ):
-                    layer.weight_scale_inv.data = weight_scale
-                    layer.weight_scale_inv.requires_grad_(False)
+                    copy_or_rebind_param(layer, "weight_scale_inv", weight_scale)
                 else:
                     layer.register_parameter(
                         "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                     )
                 layer.weight_scale_inv.format_ue8m0 = True
-                layer.weight_scale_inv_halops = sf_sfatom
+                copy_or_rebind_param(layer, "weight_scale_inv_halops", sf_sfatom)
                 layer.input_scale = None
                 return
         qweight, weight_scale = mxfp8_group_quantize(weight)
