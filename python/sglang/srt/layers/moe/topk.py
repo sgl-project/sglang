@@ -2062,8 +2062,14 @@ def _mask_topk_ids_dp_pad_rows(
     if _can_fuse_padded_region(topk_ids):
         _fill_dp_pad_rows(topk_ids, dp_real_rows, -1)
         return
-    rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
-    rows_per_rank = topk_ids.shape[0] // dp_real_rows.numel()
+    num_rows = topk_ids.shape[0]
+    num_ranks = dp_real_rows.numel()
+    if num_ranks == 0 or num_rows % num_ranks != 0:
+        raise ValueError(
+            f"{num_rows} rows do not split into {num_ranks} equal DP slots"
+        )
+    rows = torch.arange(num_rows, device=topk_ids.device)
+    rows_per_rank = num_rows // num_ranks
     live = rows % rows_per_rank < dp_real_rows[rows // rows_per_rank]
     topk_ids.masked_fill_(~live[:, None], -1)
 
