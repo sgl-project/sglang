@@ -18,28 +18,27 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
-class ListKind(enum.IntEnum):
-    """The lists that hold the live requests. Values below 16 are the core's own
-    lists; the lists of other owners take values from 16 up."""
+class ListKind(enum.Enum):
+    """The lists that hold the live requests."""
 
-    WAITING = 1
+    WAITING = enum.auto()
     # The running requests.
-    DECODING = 2
-    CHUNKED = 3
-    PD_BOOTSTRAP = 16
+    DECODING = enum.auto()
+    CHUNKED = enum.auto()
+    PD_BOOTSTRAP = enum.auto()
     # Prefill requests out of the chunked slot whose launched steps are not done.
-    PD_PREFILLING = 17
-    PD_SENDING = 18
-    PD_PREALLOC = 24
-    PD_RETRACTED = 25
-    PD_HELD = 26
-    PD_RECEIVING = 27
-    PD_RELEASING = 29
-    HISPARSE_STAGING = 32
-    GRAMMAR = 36
-    DLLM = 40
-    UOCR_PARKED = 48
-    DEFERRED = 56
+    PD_PREFILLING = enum.auto()
+    PD_SENDING = enum.auto()
+    PD_PREALLOC = enum.auto()
+    PD_RETRACTED = enum.auto()
+    PD_HELD = enum.auto()
+    PD_RECEIVING = enum.auto()
+    PD_RELEASING = enum.auto()
+    HISPARSE_STAGING = enum.auto()
+    GRAMMAR = enum.auto()
+    DLLM = enum.auto()
+    UOCR_PARKED = enum.auto()
+    DEFERRED = enum.auto()
 
 
 class RequestList(ABC):
