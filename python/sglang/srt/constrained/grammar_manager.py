@@ -116,9 +116,8 @@ class GrammarManager:
         return data
 
     def _abort(self, recv_req: AbortReq) -> None:
-        # Call `set_finish_with_abort`.
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
+        # An aborted request still runs one prefill pass, which
+        # `set_finish_with_abort` cuts to one token.
         for req in self.grammar_queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")

@@ -482,7 +482,6 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _abort(self, recv_req: AbortReq) -> None:
-        # Abort requests that have not yet been bootstrapped
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
@@ -1219,7 +1218,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     def _abort_prefill_transfer(self: Scheduler, recv_req: AbortReq) -> None:
-        # Abort requests whose KV is being sent
         for req in self.disagg_prefill_transfer_queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
