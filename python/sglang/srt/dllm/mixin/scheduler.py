@@ -66,7 +66,9 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.policy.calc_priority(self.waiting_queue)
+        waiting = list(self.waiting_queue)
+        self.policy.calc_priority(waiting)
+        self.waiting_queue.replace(waiting)
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
@@ -249,7 +251,7 @@ class SchedulerDllmMixin:
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
             self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue = self.waiting_queue[num_requests_to_add:]
+            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""

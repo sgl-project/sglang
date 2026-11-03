@@ -3793,7 +3793,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, running_batch)
+            waiting = list(self.waiting_queue)
+            self.policy.calc_priority(waiting, running_batch)
+            self.waiting_queue.replace(waiting)
 
         host_restore = get_disagg().disaggregation_decode_host_receive_threshold < 1
         restores_ready = set()
@@ -3809,7 +3811,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
 
         for req in self.waiting_queue:
             # we can only add at least `num_not_used_batch` new batch to the running queue;
@@ -3836,10 +3837,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv.kv_committed_len is not None:
                     req.extend_end = req.kv.kv_committed_len
-            else:
-                waiting_queue.append(req)
 
-        self.waiting_queue = waiting_queue
+        self.waiting_queue.leave(can_run_list)
         if len(can_run_list) == 0:
             return None
 
@@ -3957,7 +3956,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
+        self.waiting_queue.join(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -3979,7 +3978,7 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
+            self.waiting_queue.join(transferred_reqs)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()

@@ -655,10 +655,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-        if failed:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in failed
-            ]
+        self.waiting_queue.leave(failed)
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -715,7 +712,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.waiting_queue.join(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -844,7 +841,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if should_ingest_requests
                 else []
             )
-            self.waiting_queue.extend(bootstrapped_reqs)
+            self.waiting_queue.join(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -1978,4 +1975,4 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             src.leave([req])
-            self.waiting_queue.insert(0, req)
+            self.waiting_queue.prepend([req])

@@ -304,6 +304,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     RequestList,
+    WaitingQueue,
     _RequestList,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
@@ -1381,7 +1382,7 @@ class Scheduler(
         self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
-        self.waiting_queue: List[Req] = []
+        self.waiting_queue = WaitingQueue(abort=self._abort_waiting)
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # Requests merged into a running batch, until they finish or a retract,
@@ -3660,7 +3661,7 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
-                self.waiting_queue.append(req)
+                self.waiting_queue.join([req])
             elif not self.uocr_runtime.enqueue(
                 self.waiting_queue, req, is_retracted=is_retracted
             ):
@@ -3755,17 +3756,17 @@ class Scheduler(
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (
-                direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
+            key_fn = lambda req: (
+                direction * req.priority,
+                req.time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            candidate_req = max(self.waiting_queue, key=key_fn)
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
                 self.release_aborted_request(candidate_req)
-                self.waiting_queue.pop(idx)
+                self.waiting_queue.leave([candidate_req])
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -4337,8 +4338,9 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
+        waiting = list(self.waiting_queue)
         self.policy.calc_priority(
-            self.waiting_queue,
+            waiting,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
             bootstrap_queue=(
@@ -4347,6 +4349,7 @@ class Scheduler(
                 else []
             ),
         )
+        self.waiting_queue.replace(waiting)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4545,7 +4548,7 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        self.waiting_queue.leave(can_run_set)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -6005,28 +6008,12 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
-    def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
-            if recv_req.matches(chunked_req.rid):
-                self._pending_chunked_abort_req = chunked_req
-
-        # todo hisparse, release resources for abort requests in hisparse coordinator
-        # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
-            self.mm_receiver.abort_waiting_requests(recv_req)
-
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.waiting_queue):
-            if recv_req.matches(req.rid):
-                to_del.append(i)
-
-        # Sort in reverse order to avoid index issues when deleting
-        for i in reversed(to_del):
+    def _abort_waiting(self, recv_req: AbortReq) -> None:
+        """Abort the waiting requests `recv_req` names."""
+        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.waiting_queue.pop(i)
             # Finished in place, so a later abort in the same intake skips it.
             if req.finished_reason is None:
                 req.finish_outside_step(FINISH_ABORT())
@@ -6054,6 +6041,16 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, checkpoint=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+    def abort_request(self, recv_req: AbortReq):
+        if (chunked_req := self.chunked_req) is not None:
+            if recv_req.matches(chunked_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+
+        # todo hisparse, release resources for abort requests in hisparse coordinator
+        # Abort requests still waiting for encoder embeddings (EPD language-only)
+        if self.mm_receiver is not None:
+            self.mm_receiver.abort_waiting_requests(recv_req)
 
         for request_list in self.request_lists().values():
             if isinstance(request_list, RequestList):
@@ -6136,12 +6133,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
-            staged = [r for r in self.waiting_queue if r.kv.holds_kv]
-            if staged:
-                self.waiting_queue = [
-                    r for r in self.waiting_queue if not r.kv.holds_kv
-                ]
-                retract_reqs += staged
+            retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
 
         self.last_batch = None
         self.cur_batch_for_debug = None

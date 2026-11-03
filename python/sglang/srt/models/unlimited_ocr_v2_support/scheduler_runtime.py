@@ -9,6 +9,7 @@ from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     RequestList,
+    WaitingQueue,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     create_async_shm_materializer,
@@ -227,7 +228,7 @@ class UocrSchedulerRuntime:
         return len(self._reuse.held_slots())
 
     def enqueue(
-        self, waiting_queue: List[Req], req: Req, *, is_retracted: bool
+        self, waiting_queue: WaitingQueue, req: Req, *, is_retracted: bool
     ) -> bool:
         """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
@@ -236,9 +237,9 @@ class UocrSchedulerRuntime:
             return False
         pos = self._reuse.queue_position(waiting_queue, req)
         if pos is None:
-            waiting_queue.append(req)
+            waiting_queue.join([req])
         else:
-            waiting_queue.insert(pos, req)
+            waiting_queue.replace([*waiting_queue[:pos], req, *waiting_queue[pos:]])
         return True
 
     def close(self) -> None:

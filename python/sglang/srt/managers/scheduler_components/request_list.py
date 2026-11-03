@@ -135,6 +135,56 @@ class _RequestList(RequestList):
             }
 
 
+class WaitingQueue(RequestList):
+    """The requests waiting for prefill admission, in queue order. Held in a list,
+    which joining appends to in place: requests join one at a time and the policy
+    reorders the queue every pass, which a rebound dict would make linear per
+    request."""
+
+    kind = ListKind.WAITING
+
+    def __init__(self, *, abort: Optional[Callable[[AbortReq], None]] = None) -> None:
+        self._abort = abort
+        self._reqs: List[Req] = []
+
+    def join(self, reqs: Iterable[Req]) -> None:
+        """Add the given requests at the back, in order."""
+        self._reqs.extend(reqs)
+
+    def prepend(self, reqs: Iterable[Req]) -> None:
+        """Add the given requests at the front, in order."""
+        self._reqs[:0] = reqs
+
+    def replace(self, reqs: Iterable[Req]) -> None:
+        """Make the queue the given requests, in order."""
+        self._reqs = list(reqs)
+
+    def leave(self, reqs: Iterable[Req]) -> None:
+        """Drop the given requests; ones not in are ignored."""
+        leaving = set(reqs)
+        if leaving:
+            self._reqs = [req for req in self._reqs if req not in leaving]
+
+    def clear(self) -> None:
+        self._reqs = []
+
+    def abort(self, recv_req: AbortReq) -> None:
+        if self._abort is not None:
+            self._abort(recv_req)
+
+    def __iter__(self) -> Iterator[Req]:
+        return iter(self._reqs)
+
+    def __len__(self) -> int:
+        return len(self._reqs)
+
+    def __contains__(self, req: Req) -> bool:
+        return req in self._reqs
+
+    def __getitem__(self, index):
+        return self._reqs[index]
+
+
 def move(reqs: Iterable[Req], src: RequestList, dst: RequestList) -> None:
     """Move requests from `src` to `dst`; each must be in `src`."""
     reqs = list(reqs)
