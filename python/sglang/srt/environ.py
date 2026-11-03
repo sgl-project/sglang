@@ -1448,6 +1448,10 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # The padding rows of a MAX_LEN dp-attention gather (past each rank's real
+    # rows) before the MoE: CUDA routes them to no expert under TP MoE, ROCm
+    # zeroes them before the gather. Set to false to leave them as they are.
+    SGLANG_DP_MASK_PAD_ROWS = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
