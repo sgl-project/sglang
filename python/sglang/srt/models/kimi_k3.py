@@ -41,8 +41,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_shard_hidden_states,
-    cp_shard_position_ids,
+    cp_split_before_forward,
     is_cp_active,
 )
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
@@ -51,8 +50,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    BatchVariant,
+    Layout,
     ReadoutFusion,
     SumGroup,
+    TokenAxis,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -67,6 +69,11 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
+)
+from sglang.srt.layers.layer_boundary.row_transport import (
+    ComputeTransport,
+    RowTransport,
+    TransportRows,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -124,6 +131,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
+from sglang.srt.models.deepseek_common.moe_transport import _every_row_routed
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -292,6 +300,37 @@ def _dense_mlp_parallel_group() -> str:
         "attn_tp"
         if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled()
         else "tp"
+    )
+
+
+def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
+    return (
+        get_parallel().enable_cp_tp_group_sharing
+        and forward_batch.attn_cp_metadata is not None
+        and is_cp_active(forward_batch)
+    )
+
+
+class _K3LatentMoETransport(ComputeTransport):
+    """The latent MoE moves its narrow expert operand and returns local rows."""
+
+    def __init__(self, hidden_states, batch, context, rows, overlapped_rows):
+        self.rows = rows
+        self.input = hidden_states
+
+    def release(self):
+        self.input = None
+
+
+def _latent_moe_transport():
+    full = Layout(frozenset())
+    shard = Layout(frozenset({TokenAxis.ATTN_CP}))
+    return RowTransport(
+        {
+            BatchVariant.ORDINARY: TransportRows(full, full, full),
+            BatchVariant.CONTEXT_PARALLEL: TransportRows(shard, shard, shard),
+        },
+        _K3LatentMoETransport,
     )
 
 
@@ -1055,22 +1094,25 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        group = self._shared_experts_tp_group
+    def _gather_shared_expert_inputs(
+        self, hidden_states: torch.Tensor, *, group=None
+    ) -> torch.Tensor:
+        group = self._shared_experts_tp_group if group is None else group
         # The attention DP buffer spans the entire attention-TP replica.
         # Size this buffer from the subgroup's actual token shards instead.
         with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
             gathered = hidden_states.new_empty(
                 (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
             )
-        group.all_gather_into_tensor(gathered, hidden_states)
+        group.all_gather_into_tensor(gathered, hidden_states.contiguous())
         return gathered
 
     def _reduce_scatter_shared_experts(
-        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+        self, shared_output: torch.Tensor, hidden_states: torch.Tensor, *, group=None
     ) -> torch.Tensor:
+        group = self._shared_experts_tp_group if group is None else group
         output = torch.empty_like(hidden_states)
-        self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
+        group.reduce_scatter_tensor(output, shared_output.contiguous())
         return output
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1111,6 +1153,35 @@ class KimiK3MoE(nn.Module):
             and not is_in_breakable_cuda_graph()
             and not is_in_tc_piecewise_cuda_graph()
         )
+
+    def _forward_cp(self, hidden_states, forward_batch, *, prefix_sum=None):
+        """Keep the replicated latent down/up projections on this rank's rows.
+
+        Experts remain TP-sharded: gather their latent input and router logits
+        in rank order, then reduce-scatter before the local norm/up projection.
+        Shared experts keep their existing TP weights and use the same moves.
+        """
+        group = get_parallel().attn_cp_group
+        router_logits = self.gate(hidden_states)
+        routed_local, _ = self.routed_expert_down_proj(hidden_states)
+        routed_full = self._gather_shared_expert_inputs(routed_local, group=group)
+        router_full = self._gather_shared_expert_inputs(router_logits, group=group)
+        # Padding is interspersed between rank blocks, not a suffix of the
+        # gathered operand. Route all physical rows and discard padding on exit.
+        with _every_row_routed(forward_batch, routed_full.shape[0]):
+            topk_output = self.topk(routed_full, router_full)
+            expert_output = self.experts(routed_full, topk_output)
+        latent = self._reduce_scatter_shared_experts(
+            expert_output, routed_local, group=group
+        )
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
+        if self.shared_experts is not None:
+            shared_input = self._gather_shared_expert_inputs(hidden_states, group=group)
+            shared_output = self._reduce_scatter_shared_experts(
+                self.shared_experts(shared_input), hidden_states, group=group
+            )
+            return _add3(out, shared_output, prefix_sum)
+        return out if prefix_sum is None else out + prefix_sum
 
     def _forward_unfused(
         self,
@@ -1527,6 +1598,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1534,6 +1606,14 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if (
+            self.use_latent_moe
+            and forward_batch is not None
+            and _shards_rows_over_cp(forward_batch)
+        ):
+            return self._forward_cp(
+                hidden_states, forward_batch, prefix_sum=prefix_sum
+            ).view(num_tokens, hidden_size)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
@@ -2534,20 +2614,25 @@ def _stage_facts(
                 else bank.ffn_update
             ),
         )
-    linear_cp = get_parallel().attn_cp_size > 1 and get_parallel().enable_linear_attn_cp
+    latent_cp = (
+        get_parallel().enable_cp_tp_group_sharing
+        and is_moe
+        and _uses_latent_moe(config)
+    )
     return (
         declare_attn(
             **attn_ops,
             tp_group=(
                 SumGroup.TP
-                if linear_cp and config.is_kda_layer(layer_idx)
+                if config.is_kda_layer(layer_idx)
+                and linear_attn_parallel_group() == "tp"
                 else SumGroup.ATTN_TP
             ),
-            replicated_cp_residual=linear_cp,
+            in_token_order=config.is_kda_layer(layer_idx),
         ),
         declare_ffn(
             **ffn_ops,
-            replicated_cp_residual=linear_cp,
+            row_transport=_latent_moe_transport() if latent_cp else None,
             sparse=is_moe,
             next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
             # The TP width the dense MLP is built with.
@@ -2558,7 +2643,7 @@ def _stage_facts(
             ),
             # A latent MoE completes its output sum together with
             # the latent reduction its norm needs.
-            output_complete=is_moe and _uses_latent_moe(config),
+            output_complete=is_moe and _uses_latent_moe(config) and not latent_cp,
         ),
     )
 
@@ -2578,7 +2663,6 @@ class KimiK3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.is_kda_layer = config.is_kda_layer(layer_idx)
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
@@ -2729,33 +2813,21 @@ class KimiK3DecoderLayer(nn.Module):
             get_attn_tp_context,
         )
 
-        # Only MLA computes on the zigzag shard. Read and update the bank
-        # on full rows, including on the linear-attention and MoE stages.
-        mla_cp_active = not self.is_kda_layer and is_cp_active(forward_batch)
-        if mla_cp_active:
-            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
-            positions = cp_shard_position_ids(positions, forward_batch)
-
         qkv_latent_func = getattr(self.self_attn, "prepare_qkv_latent", None)
         if qkv_latent_func is not None:
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        try:
-            result = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-            )
-        finally:
-            if qkv_latent_func is not None:
-                get_attn_tp_context().clear_attn_inputs()
+        result = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
 
-        # Gather each attention-TP partial before the boundary completes its
-        # sum and adds the result to the full-sequence residual stream.
-        if mla_cp_active:
-            result = cp_gather_after_forward(result, forward_batch)
+        if qkv_latent_func is not None:
+            get_attn_tp_context().clear_attn_inputs()
+
         return result
 
     def forward(
@@ -2774,6 +2846,19 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if self.ffn_boundary.declaration.row_transport is not None:
+            with self.ffn_boundary.exit(forward_batch) as output:
+                return output.finish(
+                    self.mlp(
+                        hidden_states,
+                        forward_batch=forward_batch,
+                        prefix_sum=(
+                            residual_batch.written_residual(forward_batch)
+                            if self._ffn_writes_stream
+                            else None
+                        ),
+                    )
+                )
         if self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
@@ -2911,6 +2996,12 @@ class KimiK3LinearModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
+        shards_rows = _shards_rows_over_cp(forward_batch)
+        if shards_rows:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
         zero_allocator = BumpAllocator(
@@ -3006,6 +3097,8 @@ class KimiK3LinearModel(nn.Module):
         )
         if self.attn_bank is not None:
             self.attn_bank.close()
+        if shards_rows:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()
@@ -3052,8 +3145,6 @@ class KimiK3LinearModel(nn.Module):
 
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
-
-    supports_full_sequence_cp = True
 
     @staticmethod
     def get_model_config_for_expert_location(config):
@@ -3532,7 +3623,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         )
 
     supports_cuda_vmm_feature_transport = True
-    supports_full_sequence_cp = True
 
     # Fused runtime module -> checkpoint shard names, so quant configs can
     # match fused prefixes against per-shard exclude_modules

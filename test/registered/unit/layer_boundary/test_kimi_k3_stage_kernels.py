@@ -34,6 +34,7 @@ CONFIG = SimpleNamespace(
     moe_layer_freq=1,
     routed_expert_hidden_size=2,
     num_hidden_layers=4,
+    is_kda_layer=lambda _: False,
 )
 
 
@@ -68,9 +69,7 @@ def declare(layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG)
     config = SimpleNamespace(
         **{**vars(config), "attn_res_block_size": 4 if has_bank else None}
     )
-    parallel = fixture.parallel_of(
-        attn_dp=1, attn_tp=2, pp_size=1, enable_linear_attn_cp=False
-    )
+    parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1)
     with (
         patch.object(k3_sp_collective, "enabled", return_value=sp_collective),
         patch.object(k3_ar_fusion, "enabled", return_value=True),

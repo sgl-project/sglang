@@ -20,6 +20,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -586,7 +591,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                         if linear_attn_parallel_group() == "tp"
                         else SumGroup.ATTN_TP
                     ),
-                    in_token_order=get_parallel().enable_linear_attn_cp,
+                    in_token_order=True,
                 ),
                 self.input_layernorm,
             ),
@@ -985,18 +990,25 @@ class Qwen3NextModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         # mamba_cache_params: MambaCacheParams,
-        input_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
-        if input_embeds is not None:
-            hidden_states = input_embeds
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
 
         residual_batch.start(forward_batch)
+        cp_active = get_parallel().enable_cp_tp_group_sharing and is_cp_active(
+            forward_batch
+        )
+        if cp_active:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
         aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -1016,6 +1028,12 @@ class Qwen3NextModel(nn.Module):
             hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.norm
             )
+        if cp_active:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            aux_hidden_states = [
+                cp_gather_after_forward(hidden, forward_batch)
+                for hidden in aux_hidden_states
+            ]
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1111,10 +1129,10 @@ class Qwen3NextForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

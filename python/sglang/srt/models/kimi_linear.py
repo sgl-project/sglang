@@ -14,6 +14,11 @@ from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
@@ -53,7 +58,11 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_stream,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import is_xpu, make_pp_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
@@ -625,11 +634,10 @@ class KimiDecoderLayer(nn.Module):
                 tp_group=(
                     SumGroup.TP
                     if config.is_kda_layer(layer_idx)
-                    and get_parallel().enable_linear_attn_cp
+                    and linear_attn_parallel_group() == "tp"
                     else SumGroup.ATTN_TP
                 ),
-                in_token_order=config.is_kda_layer(layer_idx)
-                and get_parallel().enable_linear_attn_cp,
+                in_token_order=config.is_kda_layer(layer_idx),
             ),
             declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
@@ -712,12 +720,12 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if get_parallel().pp_group.is_first_rank:
-            if input_embeds is not None:
-                hidden_states = input_embeds
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
@@ -725,6 +733,14 @@ class KimiLinearModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
+            )
+
+        cp_active = get_parallel().enable_cp_tp_group_sharing and is_cp_active(
+            forward_batch
+        )
+        if cp_active:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
             )
 
         total_num_layers = self.end_layer - self.start_layer
@@ -768,6 +784,12 @@ class KimiLinearModel(nn.Module):
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
+        if cp_active:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+            aux_hidden_states = [
+                cp_gather_after_forward(hidden, forward_batch)
+                for hidden in aux_hidden_states
+            ]
 
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
@@ -826,14 +848,14 @@ class KimiLinearForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
-            input_embeds,
+            inputs_embeds,
             pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:

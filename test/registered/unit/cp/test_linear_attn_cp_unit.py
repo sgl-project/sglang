@@ -2,7 +2,7 @@
 
 import json
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -22,21 +22,18 @@ from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import kimi_k3
-from sglang.srt.models.kimi_k3 import (
-    KimiK3DecoderLayer,
-    KimiK3DeltaAttention,
-)
+from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention
 from sglang.srt.models.kimi_linear import KimiDecoderLayer, KimiDeltaAttention, KimiMoE
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.boundary_fixtures import build_stages, parallel_of, planning
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 _KIMI = "sglang.srt.models.kimi_linear."
 _K3 = "sglang.srt.models.kimi_k3."
-_COMM = "sglang.srt.layers.layer_boundary."
 
 
 class _Identity(nn.Module):
@@ -48,16 +45,18 @@ class TestLinearAttnCPBoundary(CustomTestCase):
     def setUp(self):
         super().setUp()
         override = get_context().override_server_args(
-            enable_prefill_cp=True, enable_linear_attn_cp=True, cp_strategy="zigzag"
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+            cp_strategy="zigzag",
         )
         override.install()
         self.addCleanup(override.restore)
         self.enterContext(
             get_parallel().override(
-                tp_size=4,
+                tp_size=2,
                 tp_rank=0,
-                moe_tp_size=4,
-                attn_tp_size=2,
+                moe_tp_size=2,
+                attn_tp_size=1,
                 attn_tp_rank=0,
                 attn_dp_size=1,
                 attn_cp_size=2,
@@ -74,7 +73,7 @@ class TestLinearAttnCPBoundary(CustomTestCase):
         self.batches, self.shards = [], []
         for rank in range(2):
             with get_parallel().override(
-                attn_cp_size=2, attn_cp_rank=rank, tp_rank=2 * rank
+                attn_cp_size=2, attn_cp_rank=rank, tp_rank=rank
             ):
                 meta = self.strategy.build_metadata(sum(lengths), lengths, lengths)
                 pad_logical_token_to_physical(meta)
@@ -87,111 +86,6 @@ class TestLinearAttnCPBoundary(CustomTestCase):
                 self.batches.append(batch)
                 self.shards.append(self.strategy.shard_hidden_states(self.full, batch))
 
-    def _group(self):
-        group = Mock()
-
-        def gather(output, local):
-            rows = output.shape[0] // 2
-            torch.cat([shard[:rows] for shard in self.shards], out=output)
-
-        group.all_gather_into_tensor.side_effect = gather
-        group.all_reduce.side_effect = lambda x: x + self.full
-        return group
-
-    def test_k3_mla_slices_before_projection_and_restores_ragged_output(self):
-        positions = torch.arange(len(self.full))
-        expected = self.full * 3 + positions[:, None]
-        for rank, batch in enumerate(self.batches):
-            with self.subTest(rank=rank):
-                group = Mock()
-
-                def gather(output, local):
-                    rows = output.shape[0] // 2
-                    shards = [
-                        self.strategy.shard_hidden_states(expected, other)[:rows]
-                        for other in self.batches
-                    ]
-                    torch.cat(shards, out=output)
-
-                group.all_gather_into_tensor.side_effect = gather
-                layer = KimiK3DecoderLayer.__new__(KimiK3DecoderLayer)
-                nn.Module.__init__(layer)
-                layer.is_kda_layer = False
-                layer.self_attn = Mock(
-                    side_effect=lambda hidden_states, positions, **kwargs: (
-                        hidden_states * 3 + positions[:, None]
-                    )
-                )
-                context = Mock()
-                with (
-                    get_parallel().override(
-                        tp_rank=2 * rank, attn_cp_rank=rank, attn_cp_group=group
-                    ),
-                    patch(_COMM + "AttentionInputs") as inputs,
-                    patch(_COMM + "get_attn_tp_context", return_value=context),
-                ):
-                    output = layer._run_self_attn(self.full, positions, batch, None)
-                torch.testing.assert_close(output, expected)
-                local_hidden, local_batch, prepare = inputs.call_args.args
-                torch.testing.assert_close(local_hidden, self.shards[rank])
-                self.assertIs(local_batch, batch)
-                self.assertIs(prepare, layer.self_attn.prepare_qkv_latent)
-                torch.testing.assert_close(
-                    layer.self_attn.call_args.kwargs["positions"],
-                    self.strategy.shard_position_ids(positions, batch),
-                )
-                group.all_gather_into_tensor.assert_called_once()
-                group.all_reduce.assert_not_called()
-                context.clear_attn_inputs.assert_called_once()
-
-    def test_k3_kda_and_inactive_mla_preserve_full_rows(self):
-        for kda, mode, length in (
-            (True, ForwardMode.EXTEND, len(self.full)),
-            (False, ForwardMode.EXTEND, 3),
-            (False, ForwardMode.DECODE, 3),
-        ):
-            with self.subTest(kda=kda, mode=mode):
-                hidden, positions = self.full[:length], torch.arange(length)
-                batch = (
-                    self.batches[0]
-                    if kda
-                    else SimpleNamespace(
-                        input_ids=positions,
-                        forward_mode=mode,
-                        extend_seq_lens_cpu=[length],
-                        attn_cp_metadata=None,
-                    )
-                )
-                layer = KimiK3DecoderLayer.__new__(KimiK3DecoderLayer)
-                nn.Module.__init__(layer)
-                layer.is_kda_layer = kda
-                layer.self_attn = Mock(
-                    side_effect=lambda hidden_states, **kw: hidden_states * 2
-                )
-                layer.self_attn.prepare_qkv_latent = None
-                group = Mock()
-                with get_parallel().override(attn_cp_group=group):
-                    output = layer._run_self_attn(hidden, positions, batch, None)
-                self.assertIs(layer.self_attn.call_args.kwargs["hidden_states"], hidden)
-                torch.testing.assert_close(output, hidden * 2)
-                group.all_gather_into_tensor.assert_not_called()
-
-    def test_k3_failed_mla_clears_lazy_projection_context(self):
-        layer = KimiK3DecoderLayer.__new__(KimiK3DecoderLayer)
-        nn.Module.__init__(layer)
-        layer.is_kda_layer = False
-        layer.self_attn = Mock(side_effect=RuntimeError("attention failed"))
-        context = Mock()
-        with (
-            patch(_COMM + "AttentionInputs"),
-            patch(_COMM + "get_attn_tp_context", return_value=context),
-            self.assertRaisesRegex(RuntimeError, "attention failed"),
-        ):
-            layer._run_self_attn(
-                self.full, torch.arange(len(self.full)), self.batches[0], None
-            )
-        context.clear_attn_inputs.assert_called_once()
-
     def test_ragged_sequences_are_gathered_reduced_and_resharded(self):
         for rank in range(2):
             with self.subTest(rank=rank):
@@ -202,9 +96,9 @@ class TestLinearAttnCPBoundary(CustomTestCase):
                     torch.cat([shard[:rows] for shard in self.shards], out=output)
 
                 cp_group.all_gather_into_tensor.side_effect = gather
-                tp_group.all_reduce.side_effect = lambda x: x * 4
+                tp_group.all_reduce.side_effect = lambda x: x * 2
                 with get_parallel().override(
-                    tp_rank=2 * rank,
+                    tp_rank=rank,
                     attn_cp_rank=rank,
                     attn_cp_group=cp_group,
                     tp_group=tp_group,
@@ -220,7 +114,7 @@ class TestLinearAttnCPBoundary(CustomTestCase):
                     )
                 torch.testing.assert_close(prepared, self.full)
                 expected = self.strategy.shard_hidden_states(
-                    self.full * 8, self.batches[rank]
+                    self.full * 4, self.batches[rank]
                 )
                 torch.testing.assert_close(output, expected)
                 self.assertIs(residual, self.shards[rank])
@@ -231,9 +125,108 @@ class TestLinearAttnCPBoundary(CustomTestCase):
                 )
                 cp_group.all_reduce.assert_not_called()
 
+    def test_k3_bank_stays_local_while_kda_reads_the_full_sequence(self):
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+        from sglang.srt.layers.layer_boundary.residual.attn_bank import (
+            AttnBank,
+            AttnBankState,
+        )
+
+        config = SimpleNamespace(
+            is_moe=False,
+            attn_res_block_size=4,
+            is_kda_layer=lambda _: True,
+            num_experts=8,
+            first_k_dense_replace=0,
+            moe_layer_freq=1,
+            routed_expert_hidden_size=4,
+        )
+        for rank, sparse in ((0, False), (1, False), (0, True), (1, True)):
+            with self.subTest(rank=rank, sparse=sparse):
+                config.is_moe = sparse
+                local, batch = self.shards[rank], self.batches[rank]
+                bank = AttnBank()
+                bank.open(local, block_num=2)
+                reads = []
+
+                def aggregate(value, residual, *args, rows=None, **kwargs):
+                    self.assertIsNone(rows)
+                    self.assertEqual(value.shape[0], len(local))
+                    self.assertEqual(bank.current.block_residual.shape[0], len(local))
+                    reads.append(value.shape[0])
+                    summed = value if residual is None else value + residual
+                    return summed * 2, summed
+
+                bank.current.forward = Mock(side_effect=aggregate)
+                bank_ops = AttnBankState(bank, None, None, None, None).residual_ops()
+                group = Mock(world_size=2, ranks=[0, 1])
+
+                def gather(output, value):
+                    scale = value.sum() / local.sum()
+                    count = output.shape[0] // 2
+                    output.copy_(torch.cat([x[:count] for x in self.shards]) * scale)
+
+                group.all_gather_into_tensor.side_effect = gather
+                group.all_reduce.side_effect = lambda x: x * 2
+                parallel = parallel_of(
+                    attn_dp=1,
+                    attn_tp=1,
+                    attn_cp=2,
+                    enable_prefill_cp=True,
+                    enable_cp_tp_group_sharing=True,
+                    tp_group=group,
+                    attn_cp_group=group,
+                    tp_rank=rank,
+                    attn_cp_rank=rank,
+                )
+                with (
+                    get_parallel().override(
+                        tp_rank=rank,
+                        attn_cp_rank=rank,
+                        tp_group=group,
+                        attn_cp_group=group,
+                    ),
+                    planning(parallel, dsa_cp=True),
+                    patch_communicator("dsa_use_prefill_cp", lambda batch: True),
+                ):
+                    attn, ffn = kimi_k3._stage_facts(
+                        config, 0, sp_collective=False, bank=bank_ops
+                    )
+                    attention, feed_forward = build_stages((attn, None), (ffn, None))
+                    residual_batch.start(batch)
+                    operand = attention.prepare(local, batch)
+                    torch.testing.assert_close(operand, self.full * 2)
+                    self.assertIs(batch.residual_stream.residual, local)
+                    output = attention.finish(operand * 1.5, batch)
+                    ffn_operand = feed_forward.prepare(output, batch)
+                    torch.testing.assert_close(
+                        batch.residual_stream.residual, local * 7
+                    )
+                    if sparse:
+                        torch.testing.assert_close(ffn_operand, local * 14)
+                        # Latent MoE returns its completed local result including
+                        # the prefix residual; the boundary must not add it twice.
+                        output = feed_forward.finish(
+                            ffn_operand / 2 + batch.residual_stream.residual, batch
+                        )
+                        self.assertIsNone(batch.residual_stream.transport)
+                        output = residual_batch.final_norm(
+                            output,
+                            batch,
+                            lambda x, residual=None: (
+                                x if residual is None else (x + residual, x + residual)
+                            ),
+                        )
+                        torch.testing.assert_close(output, local * 14)
+                    else:
+                        residual_batch.clear(batch)
+                self.assertEqual(reads, [len(local), len(local)])
+                self.assertEqual(bank.current.block_residual.shape[0], len(local))
+                group.all_reduce.assert_called_once()
+
     def test_completed_attention_sum_is_not_repeated(self):
         group = Mock()
-        with get_parallel().override(tp_rank=2, attn_cp_rank=1, tp_group=group):
+        with get_parallel().override(tp_rank=1, attn_cp_rank=1, tp_group=group):
             output, residual = ops.cp_take_back_in_token_order(
                 self.full * 3, self.shards[1], self.batches[1], group=None
             )
@@ -276,49 +269,49 @@ class TestLinearAttnCPBoundary(CustomTestCase):
 
 
 class TestKimiCPWeightGroups(CustomTestCase):
-    def test_k3_cp_stages_preserve_full_residual_rows_and_matching_head_sums(self):
-        for cp_size in (2, 8):
-            for kda in (False, True):
-                parallel = parallel_of(
-                    attn_dp=1,
-                    attn_tp=8 // cp_size,
-                    attn_cp=cp_size,
-                    enable_prefill_cp=True,
-                )
-                config = SimpleNamespace(
-                    is_moe=False,
-                    attn_res_block_size=None,
-                    is_kda_layer=lambda _: kda,
-                )
-                with (
-                    self.subTest(cp_size=cp_size, kda=kda),
-                    get_context().override_server_args(enable_linear_attn_cp=True),
-                    get_parallel().override(
-                        tp_size=8,
-                        tp_rank=0,
-                        moe_tp_size=8,
-                        attn_tp_size=8 // cp_size,
-                        attn_tp_rank=0,
-                        attn_cp_size=cp_size,
-                        attn_cp_rank=0,
-                    ),
-                    planning(parallel, dsa_cp=True),
-                ):
-                    attn, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
-                    attention, feed_forward = build_stages(
-                        (attn, _Identity()), (ffn, _Identity())
-                    )
-                    cp_attn = attention.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
-                    cp_ffn = feed_forward.plan.paths[
-                        BatchVariant.CONTEXT_PARALLEL
-                    ].entry
-                    self.assertEqual(cp_attn.input_rows.sharded, frozenset())
-                    self.assertEqual(cp_ffn.input_rows.sharded, frozenset())
-                    self.assertIsNone(cp_attn.input_move)
-                    expected = SumGroup.TP if kda else SumGroup.ATTN_TP
-                    if cp_size == 8:
-                        expected = SumGroup.ATTN_CP if kda else None
-                    self.assertIs(cp_ffn.declared_sum, expected)
+    def test_k3_latent_moe_boundary_keeps_local_cp_rows(self):
+        from sglang.srt.layers.layer_boundary import TokenAxis
+
+        config = SimpleNamespace(
+            is_moe=True,
+            num_experts=8,
+            first_k_dense_replace=0,
+            moe_layer_freq=1,
+            routed_expert_hidden_size=4,
+            attn_res_block_size=4,
+            is_kda_layer=lambda _: True,
+        )
+        parallel = parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        with (
+            get_context().override_server_args(enable_cp_tp_group_sharing=True),
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=0,
+                moe_tp_size=2,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_size=2,
+                attn_cp_rank=0,
+            ),
+            planning(parallel, dsa_cp=True),
+        ):
+            attn, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
+            _, feed_forward = build_stages((attn, None), (ffn, None))
+        for variant, expected in (
+            (BatchVariant.ORDINARY, frozenset()),
+            (BatchVariant.CONTEXT_PARALLEL, frozenset({TokenAxis.ATTN_CP})),
+        ):
+            path = feed_forward.plan.paths[variant]
+            self.assertEqual(path.entry.input_rows.sharded, expected)
+            self.assertEqual(path.output.layout.sharded, expected)
+            self.assertIsNone(path.entry.input_move)
+            self.assertIsNone(path.output.group)
 
     def test_k3_kda_projections_loaders_and_state_use_matching_tp_shards(self):
         config = KimiLinearConfig(
@@ -335,7 +328,7 @@ class TestKimiCPWeightGroups(CustomTestCase):
         def linear(*args, **kwargs):
             return SimpleNamespace(weight=nn.Parameter(torch.empty(8, 4)), bias=None)
 
-        for enabled, cp_size in ((False, 1), (False, 2), (True, 2), (True, 8)):
+        for enabled, cp_size in ((False, 1), (True, 8)):
             for full_rank_gate in (False, True):
                 with (
                     self.subTest(
@@ -345,7 +338,7 @@ class TestKimiCPWeightGroups(CustomTestCase):
                 ):
                     stack.enter_context(
                         get_context().override_server_args(
-                            enable_linear_attn_cp=enabled
+                            enable_cp_tp_group_sharing=enabled
                         )
                     )
                     stack.enter_context(
@@ -478,17 +471,20 @@ class TestKimiCPWeightGroups(CustomTestCase):
         ):
             with self.subTest(enabled=enabled, kda=kda):
                 config.is_kda_layer = lambda index: kda
-                with get_context().override_server_args(enable_linear_attn_cp=enabled):
+                with get_context().override_server_args(
+                    enable_cp_tp_group_sharing=enabled
+                ):
                     attn, ffn = KimiDecoderLayer.stage_facts(config, 0)
-                self.assertEqual(attn.in_token_order, enabled and kda)
+                self.assertEqual(attn.in_token_order, kda)
                 self.assertIs(
                     attn.tp_group, SumGroup.TP if enabled and kda else SumGroup.ATTN_TP
                 )
                 parallel = parallel_of(
                     attn_dp=1,
-                    attn_tp=2,
+                    attn_tp=1 if enabled else 2,
                     attn_cp=2 if enabled else 1,
                     enable_prefill_cp=enabled,
+                    enable_cp_tp_group_sharing=enabled,
                 )
                 with planning(parallel, dsa_cp=enabled):
                     attention, feed_forward = build_stages(
@@ -497,10 +493,197 @@ class TestKimiCPWeightGroups(CustomTestCase):
                 ordinary = feed_forward.plan.paths[BatchVariant.ORDINARY].entry
                 # Decode and short extends retain the full head-shard sum even
                 # though they do not gather CP token shards.
-                self.assertIs(ordinary.declared_sum, attn.tp_group)
+                self.assertIs(
+                    ordinary.declared_sum,
+                    (SumGroup.ATTN_CP if kda else None)
+                    if enabled
+                    else SumGroup.ATTN_TP,
+                )
                 if enabled and kda:
                     cp = attention.plan.paths[BatchVariant.CONTEXT_PARALLEL].entry
                     self.assertIs(cp.input_move, ops.cp_gather_in_token_order)
+
+
+class TestKimiK3CPMoE(CustomTestCase):
+    def test_latent_projections_stay_local_and_reduce_before_normalization(self):
+        hidden = torch.arange(24, dtype=torch.float32).reshape(4, 6) / 10
+        down = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 20
+        up = torch.arange(18, dtype=torch.float32).reshape(3, 6) / 30
+        router = torch.arange(24, dtype=torch.float32).reshape(6, 4) / 40
+        routed, logits = hidden @ down, hidden @ router
+        for rank in (0, 1):
+            for shared in (False, True):
+                with self.subTest(rank=rank, shared=shared):
+                    local = hidden.chunk(2)[rank]
+                    prefix = torch.full_like(local, 0.5)
+                    group = Mock(world_size=2)
+                    gathered = {3: routed, 4: logits, 6: hidden}
+
+                    def gather(output, value):
+                        full = gathered[value.shape[1]]
+                        torch.testing.assert_close(value, full.chunk(2)[rank])
+                        output.copy_(full)
+
+                    def scatter(output, value):
+                        full = routed if value.shape[1] == 3 else hidden
+                        torch.testing.assert_close(value, full * (rank + 1))
+                        output.copy_((full * 3).chunk(2)[rank])
+
+                    group.all_gather_into_tensor.side_effect = gather
+                    group.reduce_scatter_tensor.side_effect = scatter
+                    moe = kimi_k3.KimiK3MoE.__new__(kimi_k3.KimiK3MoE)
+                    nn.Module.__init__(moe)
+                    moe.use_latent_moe = True
+                    moe.gate = Mock(side_effect=lambda x: x @ router)
+                    moe.routed_expert_down_proj = Mock(
+                        side_effect=lambda x: (x @ down, None)
+                    )
+                    moe.routed_expert_up_proj = Mock(
+                        side_effect=lambda x: (x @ up, None)
+                    )
+                    moe._latent_norm = Mock(side_effect=lambda x: x.square())
+                    moe.shared_experts = (
+                        Mock(side_effect=lambda x: x * (rank + 1)) if shared else None
+                    )
+                    batch = SimpleNamespace(
+                        attn_cp_metadata=object(),
+                        num_token_non_padded=torch.tensor(3),
+                        global_num_token_non_padded_cpu=3,
+                    )
+                    original_count = batch.num_token_non_padded
+
+                    def topk(values, scores):
+                        torch.testing.assert_close(values, routed)
+                        torch.testing.assert_close(scores, logits)
+                        self.assertEqual(batch.num_token_non_padded.item(), 4)
+                        self.assertEqual(batch.global_num_token_non_padded_cpu, 4)
+                        return None
+
+                    moe.topk = Mock(side_effect=topk)
+                    moe.experts = Mock(side_effect=lambda x, _: x * (rank + 1))
+                    with (
+                        get_context().override_server_args(
+                            enable_cp_tp_group_sharing=True
+                        ),
+                        get_parallel().override(
+                            tp_size=2,
+                            tp_rank=rank,
+                            moe_tp_size=2,
+                            attn_tp_size=1,
+                            attn_tp_rank=0,
+                            attn_cp_size=2,
+                            attn_cp_rank=rank,
+                            attn_cp_group=group,
+                        ),
+                        patch(_K3 + "is_cp_active", return_value=True),
+                        patch(
+                            _K3 + "use_symmetric_memory",
+                            side_effect=lambda *a, **kw: nullcontext(),
+                        ),
+                    ):
+                        output = moe(local, forward_batch=batch, prefix_sum=prefix)
+                    latent = (routed * 3).chunk(2)[rank]
+                    expected = latent.square() @ up + prefix
+                    if shared:
+                        expected += local * 3
+                        torch.testing.assert_close(
+                            moe.shared_experts.call_args.args[0], hidden
+                        )
+                    torch.testing.assert_close(output, expected)
+                    torch.testing.assert_close(moe.gate.call_args.args[0], local)
+                    torch.testing.assert_close(
+                        moe.routed_expert_down_proj.call_args.args[0], local
+                    )
+                    torch.testing.assert_close(
+                        moe.routed_expert_up_proj.call_args.args[0], latent.square()
+                    )
+                    self.assertIs(batch.num_token_non_padded, original_count)
+                    self.assertEqual(batch.global_num_token_non_padded_cpu, 3)
+                    self.assertEqual(
+                        group.reduce_scatter_tensor.call_count, 2 if shared else 1
+                    )
+                    group.all_reduce.assert_not_called()
+
+
+class TestCPModelBoundaries(CustomTestCase):
+    def test_models_shard_once_before_layers_and_gather_after_final_norm(self):
+        from sglang.srt.models import kimi_linear, qwen3_next
+
+        full = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+        positions = torch.arange(8)
+        local, local_positions = full[::2], positions[::2]
+        for module, model_cls in (
+            (kimi_linear, kimi_linear.KimiLinearModel),
+            (qwen3_next, qwen3_next.Qwen3NextModel),
+            (kimi_k3, kimi_k3.KimiK3LinearModel),
+        ):
+            for active in (False, True):
+                with self.subTest(model=model_cls.__name__, active=active):
+                    layer = Mock(side_effect=lambda **kw: kw["hidden_states"] * 3)
+                    owner = SimpleNamespace(
+                        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+                        layers=[layer],
+                        start_layer=0,
+                        end_layer=1,
+                        norm=object(),
+                        _final_read=object(),
+                        attn_bank=None,
+                        dspark_layers_to_capture=None,
+                        packs_aux_hidden_states=False,
+                    )
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND, attn_cp_metadata=object()
+                    )
+                    recorder = Mock()
+                    recorder.with_current_layer.side_effect = lambda _: nullcontext()
+                    with (
+                        get_context().override_server_args(
+                            enable_cp_tp_group_sharing=True
+                        ),
+                        get_parallel().override(pp_group=owner.pp_group),
+                        patch.object(module, "is_cp_active", return_value=active),
+                        patch.object(
+                            module,
+                            "cp_split_before_forward",
+                            return_value=(local, local_positions),
+                        ) as split,
+                        patch.object(
+                            module, "cp_gather_after_forward", return_value=full * 3
+                        ) as gather,
+                        patch.object(
+                            module,
+                            "get_global_expert_distribution_recorder",
+                            return_value=recorder,
+                        ),
+                        patch.object(module.residual_batch, "start"),
+                        patch.object(
+                            module.residual_batch,
+                            "complete_output",
+                            side_effect=lambda x, *a, **kw: x,
+                        ),
+                        patch.object(
+                            module.residual_batch,
+                            "final_norm",
+                            side_effect=lambda x, *a, **kw: x,
+                        ) as norm,
+                    ):
+                        output = model_cls.forward(
+                            owner, torch.arange(8), positions, batch, full
+                        )
+                    expected_input = local if active else full
+                    torch.testing.assert_close(
+                        layer.call_args.kwargs["hidden_states"], expected_input
+                    )
+                    torch.testing.assert_close(
+                        norm.call_args.args[0], expected_input * 3
+                    )
+                    torch.testing.assert_close(output, full * 3)
+                    if active:
+                        split.assert_called_once_with(full, positions, batch)
+                        gather.assert_called_once_with(norm.call_args.args[0], batch)
+                    else:
+                        split.assert_not_called()
+                        gather.assert_not_called()
 
 
 class TestLinearAttnCPResolution(CustomTestCase):
@@ -524,6 +707,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
             linear_num_value_heads=32,
         )
         if kimi:
+            del config["linear_num_key_heads"], config["linear_num_value_heads"]
             config.update(
                 kv_lora_rank=512,
                 qk_nope_head_dim=128,
@@ -551,7 +735,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
             args = dict(
                 model_path=directory,
                 tp_size=4,
-                attn_cp_size=2,
+                attn_cp_size=4,
                 enable_prefill_cp=True,
                 cp_strategy="zigzag",
                 skip_tokenizer_init=True,
@@ -572,11 +756,11 @@ class TestLinearAttnCPResolution(CustomTestCase):
         ):
             with self.subTest(architecture=architecture):
                 args = self._resolve(architecture)
-                self.assertTrue(resolution_result(args, "enable_linear_attn_cp"))
+                self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
                 graph = resolution_result(args, "cuda_graph_config")
                 self.assertEqual(graph.prefill.backend, Backend.DISABLED)
         args = self._resolve(enable_prefill_cp=False, cp_strategy=None)
-        self.assertFalse(resolution_result(args, "enable_linear_attn_cp"))
+        self.assertFalse(resolution_result(args, "enable_cp_tp_group_sharing"))
 
     def test_unsupported_execution_paths_fail_at_startup(self):
         for overrides, message in (
@@ -585,7 +769,8 @@ class TestLinearAttnCPResolution(CustomTestCase):
             ({"attn_dp_size": 2}, "attn-dp-size"),
             ({"moe_dp_size": 2}, "moe-dp-size"),
             ({"dcp_size": 2}, "dcp-size"),
-            ({"tp_size": 64, "attn_cp_size": 8}, "linear_num_key_heads"),
+            ({"tp_size": 64, "attn_cp_size": 64}, "linear_num_key_heads"),
+            ({"attn_cp_size": 2}, "attn-cp-size == --tp-size"),
             ({"architecture": "UnsupportedKimiLinearForCausalLM"}, "not integrated"),
         ):
             with (
@@ -595,7 +780,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
                 self._resolve(**overrides)
 
     def test_k3_fa4_requires_blackwell_absorbed_mla_geometry(self):
-        platform_path = "sglang.srt.arg_groups.linear_attn_cp_hook.get_platform"
+        platform_path = "sglang.srt.arg_groups.cp_tp_group_sharing_hook.get_platform"
         for architecture in (
             "KimiK3LinearForCausalLM",
             "KimiK3ForConditionalGeneration",
@@ -615,7 +800,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
                     prefill_attention_backend="fa4",
                     config_overrides={"mla_use_nope": True},
                 )
-                self.assertTrue(resolution_result(args, "enable_linear_attn_cp"))
+                self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
                 for geometry in (
                     {"kv_lora_rank": 256},
                     {"qk_rope_head_dim": 0},
@@ -692,7 +877,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
                     {"prefill_attention_backend": "trtllm_mla"},
                     "prefill-attention-backend fa3",
                 ),
-                ({"tp_size": 32}, "num_heads=16"),
+                ({"tp_size": 32, "attn_cp_size": 32}, "num_heads=16"),
             ):
                 with (
                     self.subTest(architecture=architecture, overrides=overrides),
@@ -711,7 +896,7 @@ class TestLinearAttnCPResolution(CustomTestCase):
                 attention_backend="flashinfer",
                 prefill_attention_backend="fa3",
             )
-            self.assertTrue(resolution_result(args, "enable_linear_attn_cp"))
+            self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
 
 
 if __name__ == "__main__":

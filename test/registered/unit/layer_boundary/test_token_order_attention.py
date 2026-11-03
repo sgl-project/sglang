@@ -65,8 +65,7 @@ def _build_layers(parallel):
     with (
         fixture.planning(parallel),
         get_parallel().override(
-            enable_cp_tp_group_sharing=parallel.enable_cp_tp_group_sharing,
-            enable_linear_attn_cp=False,
+            enable_cp_tp_group_sharing=parallel.enable_cp_tp_group_sharing
         ),
         layer_stack(),
     ):

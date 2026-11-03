@@ -64,7 +64,7 @@ class TestQwen3NextPrefillCP(GSM8KMixin, DefaultServerBase):
         "4",
         "--enable-prefill-cp",
         "--attn-cp-size",
-        "2",
+        "4",
         "--cp-strategy",
         "zigzag",
     ]
