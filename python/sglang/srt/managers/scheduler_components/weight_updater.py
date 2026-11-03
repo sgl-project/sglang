@@ -242,18 +242,23 @@ class SchedulerWeightUpdaterManager:
                 recv_req.serialized_named_tensors
             )
             success, message = True, "Success"
-            for _, runner in self._select_runners(recv_req.selector):
+            target_updated = False
+            for role, runner in self._select_runners(recv_req.selector):
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
                 )
                 if not success:
                     break
-            if success:
+                target_updated |= role == "target"
+            if success or target_updated:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
                 )
+            if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
+            # the served weights changed even if a draft runner rejected afterwards
+            if success or target_updated:
                 success, message = self.flush_cache_after_weight_update(
                     recv_req, success, message
                 )

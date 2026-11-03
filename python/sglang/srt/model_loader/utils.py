@@ -21,6 +21,14 @@ from sglang.srt.utils import get_device_sm
 logger = logging.getLogger(__name__)
 
 
+class WeightUpdateRejected(ValueError):
+    """Raised by a custom weight loader before it writes any weight.
+
+    update_weights_from_tensor then returns success=False with this message,
+    and the served weights stay unchanged.
+    """
+
+
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
