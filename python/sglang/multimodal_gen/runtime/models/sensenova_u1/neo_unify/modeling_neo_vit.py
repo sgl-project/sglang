@@ -144,6 +144,10 @@ class NEOVisionEmbeddings(nn.Module):
         self.gelu = nn.GELU()
 
         self.rope_dim_part = self.embed_dim // 2
+        self.abs_positions_by_grid: dict[
+            tuple[tuple[tuple[int, ...], ...], torch.device],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         self.max_position_embeddings_vision = config.max_position_embeddings_vision
         self.rope_theta_vision = config.rope_theta_vision
 
@@ -176,9 +180,20 @@ class NEOVisionEmbeddings(nn.Module):
         """
         Apply 2D Rotary Position Embedding to the patch embeddings.
         """
-        abs_pos_x, abs_pos_y = build_abs_positions_from_grid_hw(
-            grid_hw, device=patch_embeds.device
-        )
+        if grid_hw.device.type == "cpu":
+            key = (tuple(map(tuple, grid_hw.tolist())), patch_embeds.device)
+            if key not in self.abs_positions_by_grid:
+                self.abs_positions_by_grid[key] = tuple(
+                    position.to(patch_embeds.device)
+                    for position in build_abs_positions_from_grid_hw(grid_hw)
+                )
+            else:
+                pass
+            abs_pos_x, abs_pos_y = self.abs_positions_by_grid[key]
+        else:
+            abs_pos_x, abs_pos_y = build_abs_positions_from_grid_hw(
+                grid_hw, device=patch_embeds.device
+            )
         embeddings = apply_2d_rotary_pos_emb(
             patch_embeds.to(
                 torch.float32

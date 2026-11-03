@@ -1464,4 +1464,7 @@ def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
         )
         keys = [layer.keys.to(device) for layer in prefix.past_key_values.layers]
         outputs.append((prefix.logits, denoise.last_hidden_state, keys))
+    # The split forward ends on its last device, so the primary can start the other CFG branch.
+    assert outputs[1][1].device == layer_devices[-1]
+    outputs[1] = (outputs[1][0], outputs[1][1].to(device), outputs[1][2])
     torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.models import (  # noqa: F401
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
+    move_to_device,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Model,
@@ -103,7 +104,16 @@ def place_model(model: NEOChatModel, device: torch.device) -> NEOChatModel:
         decoder.layers = layers
         for layer, layer_device in zip(layers, layer_devices):
             layer.to(layer_device)
-        _install_device_hooks(decoder=decoder, layer_devices=layer_devices)
+        # Ending each forward on the last device, instead of copying back to the
+        # primary, lets the primary start the next CFG branch while the last runs.
+        tail_modules = [decoder.norm, decoder.norm_mot_gen, model.fm_modules["fm_head"]]
+        for tail_module in tail_modules:
+            tail_module.to(layer_devices[-1])
+        _install_device_hooks(
+            decoder=decoder,
+            layer_devices=layer_devices,
+            input_moving_modules=[*tail_modules, model.language_model.lm_head],
+        )
         layer_counts = [layer_devices.count(split) for split in split_devices]
         logger.info(
             f"SenseNova-U1 weights ({total_weight_bytes / 2**30:.1f} GiB) exceed one "
@@ -136,7 +146,9 @@ def assign_layer_devices(
 
 
 def _install_device_hooks(
-    decoder: Qwen3Model, layer_devices: list[torch.device]
+    decoder: Qwen3Model,
+    layer_devices: list[torch.device],
+    input_moving_modules: list[torch.nn.Module],
 ) -> None:
     primary_device = layer_devices[0]
     device_by_layer = {
@@ -174,18 +186,18 @@ def _install_device_hooks(
             elif id(value) in copied_inputs and copied_inputs[id(value)][0] is value:
                 moved_kwargs[name] = copied_inputs[id(value)][1]
             else:
-                moved_kwargs[name] = value.to(layer_device, non_blocking=True)
+                moved_kwargs[name] = move_to_device(value, layer_device)
                 copied_inputs[id(value)] = (value, moved_kwargs[name])
-        hidden_states = args[0].to(layer_device, non_blocking=True)
+        hidden_states = move_to_device(args[0], layer_device)
         return (hidden_states, *args[1:]), moved_kwargs
 
-    def move_norm_input_to_primary(
-        norm: torch.nn.Module, args: tuple[torch.Tensor, ...]
+    def move_inputs_to_module_device(
+        module: torch.nn.Module, args: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
-        # norm is required by the forward pre-hook signature.
-        return tuple(hidden_states.to(primary_device) for hidden_states in args)
+        module_device = next(module.parameters()).device
+        return tuple(move_to_device(tensor, module_device) for tensor in args)
 
     for layer in device_by_layer:
         layer.register_forward_pre_hook(move_layer_inputs, with_kwargs=True)
-    for norm in (decoder.norm, decoder.norm_mot_gen):
-        norm.register_forward_pre_hook(move_norm_input_to_primary)
+    for module in input_moving_modules:
+        module.register_forward_pre_hook(move_inputs_to_module_device)
