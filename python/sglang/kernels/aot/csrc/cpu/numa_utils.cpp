@@ -39,6 +39,11 @@ std::string init_cpu_threads_env(const std::string& cpu_ids, int64_t node_mem_bi
 
     bitmask* mask =
         numa_parse_nodestring((std::to_string(mem_node_id_st) + "-" + std::to_string(mem_node_id_ed)).c_str());
+    TORCH_CHECK(
+        mask != nullptr,
+        "Invalid memory binding: NUMA nodes ", mem_node_id_st, "-", mem_node_id_ed,
+        " do not exist or are not allowed for this process. Check the node IDs configured in "
+        "SGLANG_CPU_MEM_BIND against `numactl -H` and `grep Mems_allowed_list /proc/self/status`.");
     bitmask* src_mask = numa_get_membind();
 
     int pid = getpid();
