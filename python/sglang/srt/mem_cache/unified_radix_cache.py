@@ -2337,19 +2337,18 @@ class UnifiedRadixCache(BasePrefixCache):
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
         prefetch_length = len(prefetch_key)
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
+        c128_component = self.components.get(ComponentType.C128)
+        if c128_component is not None:
             prefetch_length = min(
                 prefetch_length,
-                self.components[ct].align_storage_prefetch_length(
+                c128_component.align_storage_prefetch_length(
                     last_host_node_id, prefetch_length
                 ),
             )
-        prefetch_key = prefetch_key[:prefetch_length]
-        assume_stored = (
-            assume_stored and storage_start + prefetch_length == storage_hit_end
-        )
+            prefetch_key = prefetch_key[:prefetch_length]
+            assume_stored = (
+                assume_stored and storage_start + prefetch_length == storage_hit_end
+            )
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
