@@ -1325,6 +1325,9 @@ class Envs:
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    # SM120 NVFP4 SwiGLU MoE: run the fused two-launch kernel instead of FlashInfer's
+    # CUTLASS path (bitwise identical to the unfused finalize) for small batches.
+    SGLANG_OPT_SM120_NVFP4_FUSED_MOE = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
