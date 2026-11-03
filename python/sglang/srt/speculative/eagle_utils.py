@@ -54,6 +54,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
+_COMPACT_VERIFY_SAMPLING_SET = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.is_set()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 logger = logging.getLogger(__name__)
@@ -555,35 +556,24 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
-# Extra support slots past max_top_k, so tokens tied with the k-th logit stay in
-# the support as the dense top_k_renorm_prob keeps them.
-_SPARSE_TARGET_TIE_SLOTS = 32
-
-
 def _sparse_rejection_target_probs(
     next_token_logits: torch.Tensor,
     sampling_info: SamplingBatchInfo,
     rows_per_request: int,
     max_top_k: int,
 ) -> torch.Tensor:
-    """softmax -> top_k_renorm_prob -> top_p_renorm_prob of the dense rejection
-    branch, computed on the top (max_top_k + tie slots) logits of each row and
-    scattered into a zero (rows, vocab) fp32 tensor, without a vocabulary-wide sort.
-    Same pivot semantics as the dense renorms: every token at or above the k-th
-    probability, then every token at or above the top-p pivot of the ascending CDF.
-    """
+    """The dense rejection target probs (softmax, top-k and top-p renorm) built on
+    each row's top-k support, ties kept, without a vocabulary-wide sort."""
     rows, vocab_size = next_token_logits.shape
-    width = min(vocab_size, max_top_k + _SPARSE_TARGET_TIE_SLOTS)
+    # ties with the k-th logit stay in, as in top_k_renorm_prob
+    width = min(vocab_size, max_top_k + 32)
     logits, token_ids = torch.topk(next_token_logits, width, dim=-1, sorted=True)
     logits = logits.float() / sampling_info.temperatures.repeat_interleave(
         rows_per_request, dim=0
     ).view(rows, 1)
-    if sampling_info.need_top_k_sampling:
-        top_ks = sampling_info.top_ks.repeat_interleave(rows_per_request, dim=0)
-        pivots = logits.gather(
-            1, (top_ks.long() - 1).clamp_(0, width - 1).view(rows, 1)
-        )
-        logits.masked_fill_(logits < pivots, float("-inf"))
+    top_ks = sampling_info.top_ks.repeat_interleave(rows_per_request, dim=0)
+    pivots = logits.gather(1, (top_ks.long() - 1).clamp_(0, width - 1).view(rows, 1))
+    logits.masked_fill_(logits < pivots, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
     if sampling_info.need_top_p_sampling:
         top_ps = sampling_info.top_ps.repeat_interleave(rows_per_request, dim=0)
@@ -600,10 +590,15 @@ def _sparse_rejection_target_probs(
 
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
-    """The support for eagle_sample's compact top-k branch under
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
-    request must sample with a finite top-k within the compact limit."""
-    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+    """The support for eagle_sample's top-k branches, or None for the dense branch:
+    every request must sample with a finite top-k within the compact limit.
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING turns it on; when it is unset,
+    rejection sampling does too, since its top-k target probs equal the dense ones."""
+    enabled = _COMPACT_VERIFY_SAMPLING or (
+        not _COMPACT_VERIFY_SAMPLING_SET
+        and get_spec().speculative_use_rejection_sampling
+    )
+    if not enabled or batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
@@ -826,11 +821,8 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        if (
-            use_rejection_sampling
-            and uno_target_max_top_k is not None
-            and not sampling_info.need_min_p_sampling
-        ):
+        sparse_target = use_rejection_sampling and uno_target_max_top_k is not None
+        if sparse_target:
             target_probs = _sparse_rejection_target_probs(
                 next_token_logits,
                 sampling_info,
@@ -844,26 +836,22 @@ def eagle_sample(
                 rows_per_request=verify_input.draft_token_num,
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
+        if not sparse_target and sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if not sparse_target and sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs

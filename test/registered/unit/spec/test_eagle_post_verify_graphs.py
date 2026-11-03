@@ -179,6 +179,10 @@ def _eager(batch, verify_input, logits, sim_rng):
 
 
 class TestPostVerifyGraphs(CustomTestCase):
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
     def test_the_switch_turns_the_post_verify_graphs_on_for_every_verify(self):
         """Off, the default, the verify samples and commits eagerly as before; on,
         every verify hands its batch to SGLang's post-verify graphs. A setup they
@@ -391,6 +395,15 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertEqual(verify_kwargs(batch(20)), (20, True))
             self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
             self.assertEqual(verify_kwargs(batch(20)), (None, False))
+            # rejection sampling takes the top-k support unless the switch is set off
+            with patch.object(
+                eagle_utils,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_use_rejection_sampling=True),
+            ):
+                self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
+                with patch.object(eagle_utils, "_COMPACT_VERIFY_SAMPLING_SET", True):
+                    self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
 
         graphs = EaglePostVerifyGraphs(
             target_worker=_target_worker(),

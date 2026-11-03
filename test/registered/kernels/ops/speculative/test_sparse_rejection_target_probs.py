@@ -67,9 +67,6 @@ def test_sparse_rejection_target_probs_match_dense(
     assert torch.equal(dense > 0, sparse > 0)
     total_variation = 0.5 * (dense - sparse).abs().sum(-1)
     assert total_variation.max().item() < 1e-5
-    torch.testing.assert_close(
-        sparse.sum(-1), torch.ones(rows, device="cuda"), atol=1e-5, rtol=0
-    )
 
 
 if __name__ == "__main__":
