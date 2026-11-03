@@ -128,28 +128,27 @@ class AdaptiveController:
     ) -> None:
         """Build and register runtime states for the candidate steps.
 
-        *memory_budget_gb* bounds the device memory spent on states beyond the
-        required ones; ``None`` builds every candidate step.
+        The worker registers its initial state before calling this. The slots'
+        start steps are always built; *memory_budget_gb* bounds the device
+        memory spent on the other states, and ``None`` builds every candidate.
         """
         self.params.set_cuda_graph_bs(cuda_graph_bs)
-        required = set(self.params.start_steps) | {self.worker.speculative_num_steps}
+        start_steps = set(self.params.start_steps)
 
         spent_gb = 0.0
         for steps in self.params.prebuild_order():
             if steps in self._states:
                 continue
             if (
-                steps not in required
+                steps not in start_steps
                 and memory_budget_gb is not None
                 and spent_gb >= memory_budget_gb
             ):
-                # Not a break: the worker's initial step is required but may
-                # sort after optional steps when it is not a slot's start step.
-                continue
+                break
             # Cost is known only after capture, so the last optional build may
             # overshoot the budget by one state.
             state = self._build_state(steps)
-            if steps not in required:
+            if steps not in start_steps:
                 spent_gb += state.gpu_memory_gb
 
         dropped = self.params.restrict_candidates(set(self._states))
