@@ -11,10 +11,10 @@ drop-in replacement for joint top-k/top-p filtering. Prepared plans must remain
 valid when input contents and buffers change across calls and CUDA Graph replay.
 
 In `sampling.softmax`, SM100-family GPUs run the JIT softmax first. The Cake
-softmax runs only when the JIT softmax rejects the input and the logits are FP32
-and contiguous on SM100 or SM103, with a small batch and a large vocabulary. The
-sampler retains its existing filtering and random-number generation, and
-deterministic inference retains torch.softmax.
+softmax runs only when the JIT softmax rejects the call and the logits, after
+any temperature scaling, are FP32 and contiguous on SM100 or SM103, with a small
+batch and a large vocabulary. The sampler retains its existing filtering and
+random-number generation, and deterministic inference retains torch.softmax.
 Other operators require their own numerical and real-model performance evidence
 before being added here.
 
