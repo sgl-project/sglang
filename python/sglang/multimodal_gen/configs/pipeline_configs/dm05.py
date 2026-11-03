@@ -7,10 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 DM05_MODEL_IDS = (
     "Dexmal/DM05",
