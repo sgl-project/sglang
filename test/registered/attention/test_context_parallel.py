@@ -1129,8 +1129,7 @@ def _run_case(
         if defer_residual:
             assert frame.pending_residual is None
             needs_exchange = (
-                moe_tp
-                and residual_exchange is not None
+                residual_exchange is not None
                 and next_layout is not None
                 and frame.layout_names[next_layout] != frame.current
             )
@@ -1225,15 +1224,16 @@ def _moe_worker(rank, rendezvous):
                         defer_residual=defer_residual,
                         previous=frame,
                     )
-            _run_case(
-                rank,
-                2,
-                (129, 1),
-                dtype,
-                moe_tp=False,
-                residual_exchange=residual_exchange,
-                defer_residual=defer_residual,
-            )
+            for lengths in ((0,), (1,), (129, 1, 0), (513, 65), (16384,)):
+                _run_case(
+                    rank,
+                    2,
+                    lengths,
+                    dtype,
+                    moe_tp=False,
+                    residual_exchange=residual_exchange,
+                    defer_residual=defer_residual,
+                )
     torch.cuda.synchronize()
     dist.destroy_process_group()
 

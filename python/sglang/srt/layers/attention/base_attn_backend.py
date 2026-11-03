@@ -532,7 +532,7 @@ class AttentionBackend(ABC):
         )
         self.kv_index_translator = runner.kv_index_translator
         self.max_context_len = runner.model_config.context_len
-        if get_moe_tensor_parallel_world_size() > 1:
+        if get_moe_tensor_parallel_world_size() > 1 or get_exec().moe.enable_mxfp4_mega:
             self.residual_exchange = TokenExchangeStream(
                 group=get_attn_cp_group().device_group,
                 device=runner.device,

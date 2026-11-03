@@ -651,12 +651,15 @@ def prepare_sharded_cp_attention(
         and isinstance(norm, GemmaRMSNorm)
         and not norm.is_torch_compile
     )
+    pending = None
     if metadata.pending_residual is not None:
         target, pending = metadata.pending_residual
-        if target != destination or metadata.current != destination:
+        if (
+            target != destination
+            or metadata.current is None
+            or (metadata.moe_tp and metadata.current != destination)
+        ):
             raise ValueError("Prefetched residual does not match the next layer")
-        residual = pending.wait()
-        metadata.pending_residual = None
     if metadata.current is None:
         plan = metadata.gather_scatter_plans[destination]
         indices = plan.reduce_indices.narrow(
@@ -672,10 +675,15 @@ def prepare_sharded_cp_attention(
         plan = metadata.exchange_plan(metadata.current, destination)
         fuse_reorder_norm = fuse_reorder_norm and not plan.restore_identity
         hidden_states = plan.apply(hidden_states, restore_order=not fuse_reorder_norm)
-        if residual is not None:
+        if pending is not None:
+            residual = pending.wait(restore_order=not fuse_reorder_norm)
+        elif residual is not None:
             residual = plan.apply(residual, restore_order=not fuse_reorder_norm)
         if fuse_reorder_norm:
             row_indices = plan.restore_indices
+    elif pending is not None:
+        residual = pending.wait()
+    metadata.pending_residual = None
     metadata.current = destination
     forward_batch.num_token_non_padded = metadata.local_token_count(
         row_indices.numel() if row_indices is not None else hidden_states.shape[0]
@@ -713,41 +721,33 @@ def prepare_sharded_cp_ffn(
     if hidden_states.shape[0]:
         hidden_states, residual = norm(hidden_states, residual)
     metadata = forward_batch.prefill_cp_metadata
+    metadata.mlp_destination = metadata.current
+    residual_plan = None
+    if metadata.residual_exchange is not None and next_layout is not None:
+        destination = metadata.layout_names[next_layout]
+        if destination != metadata.current:
+            if (
+                metadata.pending_residual is not None
+                or metadata.queued_residual is not None
+            ):
+                raise RuntimeError("Previous residual exchange was not consumed")
+            metadata.mlp_destination = destination
+            if residual is not None:
+                residual_plan = metadata.exchange_plan(metadata.current, destination)
     if metadata.moe_tp:
-        # Norm and residual remain local; TP experts need all real rows.
-        # TP experts preserve rank order; RS writes the next attention layout.
-        metadata.mlp_destination = metadata.current
-        residual_plan = None
-        if metadata.residual_exchange is not None and next_layout is not None:
-            destination = metadata.layout_names[next_layout]
-            if destination != metadata.current:
-                if (
-                    metadata.pending_residual is not None
-                    or metadata.queued_residual is not None
-                ):
-                    raise RuntimeError("Previous residual exchange was not consumed")
-                metadata.mlp_destination = destination
-                if residual is not None:
-                    residual_plan = metadata.exchange_plan(
-                        metadata.current, destination
-                    )
         hidden_states = metadata.token_collectives().gather(
             hidden_states, rank_ordered=True
         )
-        if residual_plan is not None:
-            # This event opens the MoE compute window, including shared experts.
-            # The model submits the exchange after enqueueing shared/routing
-            # kernels, but keeps this GPU boundary. Waiting on its later compute
-            # stream would miss the shared GEMMs or serialize behind the experts.
-            ready = torch.cuda.current_stream(residual.device).record_event()
-            metadata.queued_residual = (
-                metadata.mlp_destination,
-                residual_plan,
-                residual,
-                ready,
-            )
-            if not defer_cp_residual:
-                launch_cp_residual_exchange(metadata)
         forward_batch.num_token_non_padded = metadata.total_non_padded
+    if residual_plan is not None:
+        ready = torch.cuda.current_stream(residual.device).record_event()
+        metadata.queued_residual = (
+            metadata.mlp_destination,
+            residual_plan,
+            residual,
+            ready,
+        )
+        if not defer_cp_residual:
+            launch_cp_residual_exchange(metadata)
     stream.write(residual)
     return hidden_states
