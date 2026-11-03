@@ -1,5 +1,6 @@
 """Focused contract checks for externally owned Engram tables."""
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ from safetensors.torch import save_file
 
 from sglang.srt.arg_groups.engram_config import EngramConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.layers import engram_external
+from sglang.srt.layers import engram_external, engram_shared_vmm
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context
@@ -214,6 +215,156 @@ class TestExternalEngram(CustomTestCase):
             imported.assert_not_called()
             self.assertTrue(connection.closed)
             self.assertIn(b'"op": "detach"', connection.sent[-1])
+
+    def test_failed_import_cleanup_retains_owner_lease(self):
+        class FakeConnection:
+            def __init__(self, reply):
+                self.reply = json.dumps(reply).encode() + b"\n"
+                self.sent = []
+                self.closed = False
+
+            def sendall(self, value):
+                self.sent.append(json.loads(value))
+
+            def recv(self, _size):
+                reply, self.reply = self.reply, b""
+                return reply
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            config_path = directory / "config.json"
+            index_path = directory / "model.safetensors.index.json"
+            config_path.write_text("{}")
+            index_path.write_text("{}")
+            token = directory / "token"
+            token.write_text("private-token")
+            manifest = {
+                "generation": "expected-generation",
+                "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                "index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(),
+                "schema": 1,
+                "format": "FP8_E4M3FN_E8M0_BLOCK32",
+                "tables": {
+                    "1": {
+                        "rows": 3,
+                        "dim": 64,
+                        "scale_width": 2,
+                        "head_sizes": [3],
+                        "table": {
+                            "size_bytes": 198,
+                            "padded_bytes": 256,
+                            "chunk_bytes": 256,
+                            "fabric_handles": ["00" * 64],
+                        },
+                    }
+                },
+            }
+            connection = FakeConnection(
+                {"ok": True, "lease": "lease-id", "manifest": manifest}
+            )
+            with (
+                mock.patch.object(
+                    engram_external.socket,
+                    "create_connection",
+                    return_value=connection,
+                ),
+                mock.patch.object(
+                    engram_external,
+                    "import_table",
+                    side_effect=engram_shared_vmm.IncompleteTableImportCleanup(
+                        "mapped pages remain"
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    engram_shared_vmm.IncompleteTableImportCleanup,
+                    "mapped pages remain",
+                ),
+            ):
+                engram_external.attach_table(
+                    endpoint="127.0.0.1:56000",
+                    token_file=token,
+                    generation="expected-generation",
+                    checkpoint_dir=directory,
+                    layer=1,
+                    rows=3,
+                    dim=64,
+                    head_sizes=(3,),
+                    device=0,
+                )
+            self.assertTrue(connection.closed)
+            self.assertEqual(len(connection.sent), 1)
+            self.assertEqual(connection.sent[0]["op"], "attach")
+
+    def test_partial_vmm_import_reports_failed_unmap(self):
+        class FakeDriver:
+            class CUmemAllocationHandleType:
+                CU_MEM_HANDLE_TYPE_FABRIC = 1
+
+            class CUmemLocationType:
+                CU_MEM_LOCATION_TYPE_DEVICE = 1
+
+            class CUmemAccess_flags:
+                CU_MEM_ACCESS_FLAGS_PROT_READ = 1
+
+            class CUresult:
+                CUDA_SUCCESS = 0
+
+            def __init__(self):
+                self.map_calls = 0
+                self.unmap_calls = 0
+
+            def CUmemAccessDesc(self):
+                return mock.Mock(location=mock.Mock())
+
+            def cuMemImportFromShareableHandle(self, *_args):
+                return (0, 123)
+
+            def cuMemAddressReserve(self, *_args):
+                return (0, 4096)
+
+            def cuMemMap(self, *_args):
+                self.map_calls += 1
+                return 0 if self.map_calls == 1 else 1
+
+            def cuMemSetAccess(self, *_args):
+                return 0
+
+            def cuMemUnmap(self, *_args):
+                self.unmap_calls += 1
+                return 1
+
+            def cuMemAddressFree(self, *_args):
+                return 1
+
+            def cuMemRelease(self, *_args):
+                return 0
+
+        def check(result, label):
+            values = result if isinstance(result, tuple) else (result,)
+            if values[0]:
+                raise RuntimeError(f"{label} failed")
+            return values[1] if len(values) > 1 else None
+
+        driver = FakeDriver()
+        table = engram_shared_vmm.TableHandles(
+            size_bytes=128,
+            padded_bytes=128,
+            chunk_bytes=64,
+            fabric_handles=(bytes(64), bytes(64)),
+        )
+        with (
+            mock.patch.object(
+                engram_shared_vmm, "_get_cuda_driver", return_value=driver
+            ),
+            mock.patch.object(engram_shared_vmm, "check_drv", side_effect=check),
+            self.assertRaises(engram_shared_vmm.IncompleteTableImportCleanup),
+        ):
+            engram_shared_vmm.import_table(table, 0)
+        self.assertEqual(driver.map_calls, 2)
+        self.assertEqual(driver.unmap_calls, 1)
 
 
 if __name__ == "__main__":

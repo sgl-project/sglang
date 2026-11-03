@@ -12,7 +12,12 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
-from sglang.srt.layers.engram_shared_vmm import TableHandles, TableMapping, import_table
+from sglang.srt.layers.engram_shared_vmm import (
+    IncompleteTableImportCleanup,
+    TableHandles,
+    TableMapping,
+    import_table,
+)
 from sglang.srt.runtime_context import get_resources
 
 logger = logging.getLogger(__name__)
@@ -142,6 +147,9 @@ def attach_table(
             state.attachments.append(attachment)
         return attachment
     except BaseException as error:
+        if isinstance(error, IncompleteTableImportCleanup):
+            connection.close()
+            raise
         if mapping is not None:
             try:
                 mapping.close()

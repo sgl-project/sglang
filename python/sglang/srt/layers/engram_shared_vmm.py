@@ -16,6 +16,10 @@ from sglang.srt.utils.cuda_vmm_utils import _get_cuda_driver, check_drv
 logger = logging.getLogger(__name__)
 
 
+class IncompleteTableImportCleanup(RuntimeError):
+    """A failed import may still hold owner pages through a local mapping."""
+
+
 @dataclass(frozen=True)
 class TableHandles:
     size_bytes: int
@@ -115,11 +119,26 @@ def import_table(table: TableHandles, device: int) -> TableMapping:
                 "cuMemSetAccess",
             )
         return TableMapping(address, table, mapped, device)
-    except BaseException:
+    except BaseException as error:
+        cleanup_error = None
         if address is not None:
             for offset, size in reversed(mapped):
-                drv.cuMemUnmap(address + offset, size)
-            drv.cuMemAddressFree(address, table.padded_bytes)
+                try:
+                    check_drv(drv.cuMemUnmap(address + offset, size), "cuMemUnmap")
+                except Exception as exc:
+                    cleanup_error = exc
+            try:
+                check_drv(
+                    drv.cuMemAddressFree(address, table.padded_bytes),
+                    "cuMemAddressFree",
+                )
+            except Exception as exc:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            error.add_note(f"external Engram cleanup failure: {cleanup_error}")
+            raise IncompleteTableImportCleanup(
+                "external Engram import cleanup failed; owner lease must be retained"
+            ) from error
         raise
     finally:
         for handle in handles:
