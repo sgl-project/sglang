@@ -441,6 +441,17 @@ class _DeepEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def prebuild_buffer(self) -> None:
+        # Leaves the dispatch mode unset; the first dispatch selects it as before.
+        DeepEPBuffer.get_deepep_buffer(
+            group=self.group,
+            hidden_size=self.hidden_size,
+            param_bytes=self.params_bytes,
+            deepep_mode=self.deepep_mode,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_experts=self.num_experts,
+        )
+
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
@@ -1099,6 +1110,17 @@ class DeepEPDispatcher(BaseDispatcher):
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
+
+    @property
+    def prebuild_pending(self) -> bool:
+        return DeepEPBuffer._state().buffer is None
+
+    def prebuild(self) -> None:
+        # Both impls size the process-wide buffer from the same deepep_mode.
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.prebuild_buffer()
+        else:
+            self._normal_dispatcher.prebuild_buffer()
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
