@@ -72,10 +72,8 @@ def swa_recompute_batches(batch: ScheduleBatch, runner) -> List[ScheduleBatch]:
 def run_swa_recompute(
     worker, batch: ScheduleBatch, capture_hidden_mode
 ) -> List[SWARecomputeOutput]:
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardBatch,
-    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
     runner = worker.model_runner
     outputs = []
