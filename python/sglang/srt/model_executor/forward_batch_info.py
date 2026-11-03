@@ -437,6 +437,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
     prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
+    gdn_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -991,6 +992,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             prefill_cp_metadata=batch.prefill_cp_metadata,
+            gdn_cp_metadata=batch.gdn_cp_metadata,
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,

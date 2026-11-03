@@ -651,6 +651,7 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
         request_stride=None,
         packed_kv=False,
         needs_kv_descale=True,
+        attention_indices=None,
     ):
         from sglang.srt.distributed import (
             get_attn_cp_group,
@@ -677,7 +678,11 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
             world_size=metadata.world,
             query_layout=query_layout,
         )
-        metadata.attention = metadata.layout.query_indices
+        metadata.attention = (
+            metadata.layout.query_indices
+            if attention_indices is None
+            else attention_indices
+        )
         metadata.token_layouts = {
             "contiguous": metadata.contiguous,
             "attention": metadata.attention,
@@ -922,7 +927,7 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
         return self.gather_scatter_plans[self.current]
 
 
-def is_sharded_cp_enabled(server_args=None):
+def is_gdn_cp_enabled(server_args=None):
     if server_args is not None:
         from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -941,6 +946,17 @@ def is_sharded_cp_enabled(server_args=None):
         and get_disagg().disaggregation_mode == "prefill"
         and not get_disagg().encoder_only
     )
+
+
+def is_sharded_cp_enabled(server_args=None):
+    """Physical KV sharding; QSA keeps replicated KV with independent GDN CP."""
+    if server_args is not None:
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        sharing = resolved_view(server_args).enable_cp_tp_group_sharing
+    else:
+        sharing = get_parallel().enable_cp_tp_group_sharing
+    return is_gdn_cp_enabled(server_args) and not sharing
 
 
 class ZigzagLayout(msgspec.Struct, frozen=True):

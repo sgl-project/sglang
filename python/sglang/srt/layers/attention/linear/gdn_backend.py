@@ -486,11 +486,11 @@ class GDNKernelDispatcher:
             from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
                 FlashQLAGDNKernel,
             )
-            from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+            from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
 
             group = None
             if prefill_backend == LinearAttnKernelBackend.FLASHQLA_CP:
-                self.use_context_parallel = is_sharded_cp_enabled()
+                self.use_context_parallel = is_gdn_cp_enabled()
                 group = (
                     get_attn_cp_group()
                     if self.use_context_parallel
@@ -736,6 +736,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
+        self._gdn_cp_plan = None
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -897,6 +898,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
+    def prepare_cp_metadata(self, batch, *, lengths=None, prefixes=None):
+        """Plan GDN's contiguous compute rows before the forward is submitted."""
+        from sglang.srt.distributed import get_attn_cp_group
+        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
+
+        if not batch.forward_mode.is_extend_without_speculative():
+            return
+        if batch.gdn_cp_metadata is not None:
+            return
+        lengths = batch.extend_lens if lengths is None else lengths
+        prefixes = batch.prefix_lens if prefixes is None else prefixes
+        world = get_attn_cp_group().world_size
+        attention_indices = tuple(
+            tuple(range(rank, sum(lengths), world)) for rank in range(world)
+        )
+        metadata = ShardedContextParallelMetadata.plan_prefill(
+            lengths,
+            prefixes,
+            self.device,
+            cp_mode="round-robin-split",
+            attention_indices=attention_indices,
+            previous=self._gdn_cp_plan,
+        )
+        metadata.gdn_conv_metadata = tuple(
+            make_gdn_cp_conv_metadata(metadata, device="cpu")
+        )
+        metadata.upload()
+        batch.gdn_cp_metadata = metadata
+        self._gdn_cp_plan = metadata
+
     def warmup(self, model_runner: ModelRunner):
         if not self.kernel_dispatcher.use_context_parallel:
             return
@@ -929,9 +960,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         cp_prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        if forward_batch.prefill_cp_metadata is not None and not cp_prefill:
+        cp_metadata = forward_batch.gdn_cp_metadata or forward_batch.prefill_cp_metadata
+        if cp_metadata is not None and not cp_prefill:
             raise ValueError("Sharded GDN metadata is only valid for ordinary prefill")
-        if cp_prefill and forward_batch.prefill_cp_metadata is not None:
+        if cp_prefill and cp_metadata is not None:
             if not self.kernel_dispatcher.use_context_parallel:
                 raise ValueError(
                     "GDN CP metadata requires the flashqla_cp prefill backend and sharded CP"
@@ -943,7 +975,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # tracking indices are unused here and their mask/nonzero queries
             # would synchronize the forward stream with the host.
             self.forward_metadata = None
-            self.cp_conv_metadata = forward_batch.prefill_cp_metadata.gdn_conv_metadata
+            cp_metadata.record_stream(torch.cuda.current_stream())
+            self.cp_metadata = cp_metadata
+            self.cp_conv_metadata = cp_metadata.gdn_conv_metadata
             if len(self.cp_conv_metadata) != forward_batch.batch_size:
                 raise ValueError(
                     "GDN convolution metadata must be prepared with the CP batch"
@@ -1436,7 +1470,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return core_attn_out
     def _forward_extend_cp(self, layer, batch, raw, a, b):
         """GDN core only: convolution halos, FlashQLA recurrence and radix state."""
-        frame = batch.prefill_cp_metadata
+        frame = self.cp_metadata
         kernel = self.kernel_dispatcher.extend_kernel
         cache = self.state_layer_cache(layer.layer_id)
         pool = self.state_pool
@@ -1567,6 +1601,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             results[0] if len(results) == 1 else torch.cat(results, dim=0)
         ).unsqueeze(0)
 
+    @profile_method("sglang.attention.gdn.extend")
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1581,7 +1616,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_batch.forward_mode.is_extend_without_speculative()
             and self.kernel_dispatcher.use_context_parallel
         ):
-            if forward_batch.prefill_cp_metadata is None:
+            if (
+                forward_batch.prefill_cp_metadata is None
+                and forward_batch.gdn_cp_metadata is None
+            ):
                 raise ValueError("GDN CP prefill requires initialized batch metadata")
             return self._forward_extend_cp(layer, forward_batch, mixed_qkv, a, b)
         seq_len = mixed_qkv.shape[0]

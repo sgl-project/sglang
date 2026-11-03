@@ -608,12 +608,19 @@ class FusedMoE(torch.nn.Module):
         self.supports_deferred_finalize = False
 
         if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.quantization.humming import HummingMoEMethod
             from sglang.srt.layers.quantization.w4afp8 import W4AFp8Mxfp4MegaMoEMethod
 
-            if not isinstance(self.quant_method, W4AFp8Mxfp4MegaMoEMethod):
+            native_mxfp4 = (
+                isinstance(self.quant_method, HummingMoEMethod)
+                and self.quant_method.native_mxfp4_mega
+            )
+            if not (
+                isinstance(self.quant_method, W4AFp8Mxfp4MegaMoEMethod) or native_mxfp4
+            ):
                 raise ValueError(
                     "This MegaMoE implementation supports only MXFP4 expert weights; "
-                    "enable the explicit W4AFP8-to-MXFP4 conversion when loading."
+                    "load native MXFP4 with Humming or enable explicit W4AFP8 conversion."
                 )
             if self.moe_tp_size != 1:
                 raise ValueError("MXFP4 MegaMoE requires pure EP")

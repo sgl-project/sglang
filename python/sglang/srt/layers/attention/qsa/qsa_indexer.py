@@ -413,6 +413,8 @@ class QSAIndexer(MultiPlatformOp):
         positions: torch.Tensor,
         tensor: torch.Tensor,
         ensure_cos_sin_cache: bool = True,
+        *,
+        rope_max_position: int | None = None,
     ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
@@ -427,7 +429,9 @@ class QSAIndexer(MultiPlatformOp):
             and not get_is_capture_mode()
             and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            if rope_max_position is None:
+                rope_max_position = int(positions.max().item())
+            self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
@@ -595,11 +599,11 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
         global_rope_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill CP: score only this rank's zigzag query rows.
+        """Prefill CP: score only this rank's query rows.
 
         ``hidden_states``/``positions`` are the local (padded) rows and their
         RoPE positions. Index q/k are projected for the local rows only; the raw
-        keys are all-gathered into global token order so the pending-group ring
+        keys are exchanged into global token order so the pending-group ring
         store and the block compression run on the batch's global write plan
         exactly as without CP (every rank ends up with the complete compressed-K
         cache). Selection then scores the local rows against all compressed
@@ -607,14 +611,23 @@ class QSAIndexer(MultiPlatformOp):
         with the local query rows the sparse attention consumes.
         """
         strategy = get_cp_strategy()
-        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+        if strategy is None or strategy.kind not in (
+            ContextParallelStrategyKind.ZIGZAG,
+            ContextParallelStrategyKind.INTERLEAVE,
+        ):
             strategy_name = strategy.name if strategy is not None else "none"
             raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
+                "QSA prefill CP supports zigzag and interleave strategies; "
                 f"got {strategy_name}."
             )
         meta = forward_batch.attn_cp_metadata
-        num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        num_global = indexer_metadata.get_token_to_batch_idx().numel()
+        interleave = strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+        num_local = (
+            len(range(strategy.cp_rank, num_global, strategy.cp_size))
+            if interleave
+            else int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        )
         global_logical = getattr(forward_batch, "positions", None)
         global_logical = (
             global_logical[0] if global_logical.ndim == 2 else global_logical
@@ -643,9 +656,26 @@ class QSAIndexer(MultiPlatformOp):
         # and compression use the global write plan unchanged. Cached prefix
         # groups already reside in the compressed-K pool on every rank.
         token_k_local = token_k.reshape(num_local, -1).contiguous()
-        token_k_full = cp_materialize_global_token_order(
-            token_k_local, forward_batch
-        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        if interleave:
+            exchange = indexer_metadata.cp_key_exchange
+            if exchange is None:
+                raise RuntimeError("QSA indexer ring workspace was not prepared")
+            local = token_k_local.reshape(-1, self.index_kv_heads, self.index_head_dim)
+            # Reuse the two-plane ring transport; indexer compression consumes
+            # global raw keys while attention consumes KV shards incrementally.
+            token_k_full = local.new_empty(
+                (num_global, self.index_kv_heads, self.index_head_dim)
+            )
+            active = (num_global + strategy.cp_size - 1) // strategy.cp_size
+            for owner, payload in exchange.shards(
+                torch.stack((local, local)), active_tokens=active
+            ):
+                count = len(range(owner, num_global, strategy.cp_size))
+                token_k_full[owner :: strategy.cp_size].copy_(payload[0, :count])
+        else:
+            token_k_full = cp_materialize_global_token_order(
+                token_k_local, forward_batch
+            ).reshape(-1, self.index_kv_heads, self.index_head_dim)
         global_rope = (
             global_rope_positions[:, :num_global]
             if global_rope_positions.ndim == 2
@@ -661,7 +691,9 @@ class QSAIndexer(MultiPlatformOp):
         )
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, local_logical, query_sequence_ids=local_sequence_ids
+                self.layer_id,
+                local_logical,
+                query_sequence_ids=local_sequence_ids,
             )
         )
         row_sequence_lengths = sequence_lengths.index_select(

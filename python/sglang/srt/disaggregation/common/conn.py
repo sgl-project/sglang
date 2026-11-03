@@ -129,6 +129,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     ring_cp_sharded: bool = False
+    state_cp_size: int = 1
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
@@ -392,10 +393,13 @@ class CommonKVManager(BaseKVManager):
         # CP-TP group sharing: CP rank r holds every KV head, the CP-replicated
         # state and linear-attention head shard r. It transfers as TP rank r of
         # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
-        cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        cp_tp_group_sharing = (
+            parallel.enable_cp_tp_group_sharing and self.kv_args.state_cp_size == 1
+        )
         self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or self.ring_cp_sharded
+            or self.kv_args.state_cp_size > 1
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
             # No sharded rank holds a full page, so every CP rank sends.
@@ -1560,6 +1564,7 @@ class CommonKVManager(BaseKVManager):
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.ring_cp_sharded
+                or info.state_cp_size > 1
                 or info.enable_dsa_cache_layer_split
                 or info.enable_kv_cache_sharding
             )
@@ -1636,7 +1641,10 @@ class CommonKVManager(BaseKVManager):
         url = f"{bootstrap_na.to_url()}/route"
         attn_tp = (self.attn_tp_size, self.attn_tp_rank)
         attn_cp = (self.attn_cp_size, self.attn_cp_rank)
-        if get_parallel().enable_cp_tp_group_sharing:
+        if (
+            get_parallel().enable_cp_tp_group_sharing
+            and self.kv_args.state_cp_size == 1
+        ):
             # Decode pairs its TP rank r with this CP rank r (see __init__).
             attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
@@ -1654,6 +1662,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "ring_cp_sharded": self.ring_cp_sharded,
+            "state_cp_size": self.kv_args.state_cp_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
@@ -3105,6 +3114,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.ring_cp_sharded: Optional[bool] = None
+        self.state_cp_size: Optional[int] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
         self.stores_to_linker: Optional[bool] = None
@@ -3225,6 +3235,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        state_cp_size = int(data.get("state_cp_size", 1))
+        if state_cp_size not in (1, attn_cp_size):
+            return web.json_response({"error": "Invalid state CP size"}, status=400)
+        if self.state_cp_size is None:
+            self.state_cp_size = state_cp_size
+        elif self.state_cp_size != state_cp_size:
+            return web.json_response(
+                {"error": "State ownership differs across prefill ranks"}, status=400
+            )
         ring_cp = bool(data.get("ring_cp_sharded", False))
         if self.ring_cp_sharded is None:
             self.ring_cp_sharded = ring_cp
@@ -3311,6 +3330,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 ring_cp_sharded=bool(self.ring_cp_sharded),
+                state_cp_size=self.state_cp_size,
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 stores_to_linker=bool(self.stores_to_linker),
@@ -3318,6 +3338,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
+            if info.state_cp_size == 1:
+                payload.pop("state_cp_size")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:

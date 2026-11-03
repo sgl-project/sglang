@@ -194,3 +194,63 @@ def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch):
         )
     metadata.mlp_destination = None
     return hidden_states, residual
+
+
+class ContiguousContextParallelTransport(ComputeTransport):
+    """Move only the attention operand; HC residuals retain their source rows."""
+
+    def __init__(self, hidden_states, batch, context, rows, overlapped):
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        self.rows = rows
+        self.metadata = batch.gdn_cp_metadata
+        self.source_rows = hidden_states.shape[0]
+        self.input = hidden_states
+        self.sharded = is_cp_active(batch)
+        if self.metadata is None:
+            if not batch.forward_mode.is_idle():
+                raise RuntimeError("GDN CP compute requires prepared batch metadata")
+            return
+        metadata = self.metadata
+        if self.sharded:
+            valid_rows = len(metadata.attention[metadata.rank])
+            self.input = metadata.route("attention", "contiguous")(
+                hidden_states[:valid_rows]
+            )
+        else:
+            plan = metadata.gather_scatter_plans[metadata.layout_names["contiguous"]]
+            indices = plan.reduce_indices.narrow(
+                0, metadata.rank * plan.padded_rows, plan.local_rows
+            )
+            self.input = hidden_states.index_select(0, indices)
+
+    def return_output(self, output):
+        if self.metadata is None:
+            return output
+        if self.sharded:
+            output = self.metadata.route("contiguous", "attention")(output)
+        else:
+            output = self.metadata.gather_scatter_plans[
+                self.metadata.layout_names["contiguous"]
+            ].gather(output)
+        if output.shape[0] < self.source_rows:
+            import torch.nn.functional as F
+
+            output = F.pad(output, (0, 0, 0, self.source_rows - output.shape[0]))
+        return output
+
+
+def contiguous_context_parallel_transport():
+    """Declare full-head attention on contiguous CP rows with source-row return."""
+    from sglang.srt.layers.layer_boundary.factories import _row_layouts
+
+    rows = {}
+    _, compute, _, _ = _row_layouts(BatchVariant.CONTEXT_PARALLEL)
+    for variant in (
+        BatchVariant.ORDINARY,
+        BatchVariant.CONTEXT_PARALLEL,
+        BatchVariant.UNPADDED,
+    ):
+        _, source, _, _ = _row_layouts(variant)
+        rows[variant] = TransportRows(source=source, compute=compute, returned=source)
+    return RowTransport(rows, ContiguousContextParallelTransport)

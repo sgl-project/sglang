@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
+    partition_cp_sparse_indices,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
@@ -2230,6 +2231,245 @@ def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
             torch.softmax(q[row].double() @ keys.T * head_dim**-0.5, dim=-1) @ values
         )
         torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "prefix_lengths,extend_lengths",
+    [
+        ([0], [33]),
+        ([7, 19], [31, 18]),
+        ([0, 5, 9], [1, 3, 2]),
+        ([199], [260]),
+        ([0], [1]),
+    ],
+)
+@pytest.mark.parametrize("per_head_indices", [False, True])
+@pytest.mark.parametrize("partitioned", [False, True])
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_sparse_prefill_ring_shards_match_global_attention(
+    prefix_lengths, extend_lengths, cp_size, head_dim, partitioned, per_head_indices
+):
+    from sglang.srt.layers.attention.merge_state import merge_state
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(51)
+    device = "cuda"
+    tensor = lambda x: torch.tensor(x, device=device, dtype=torch.int32)
+    lengths = [p + e for p, e in zip(prefix_lengths, extend_lengths)]
+    starts = [0, *accumulate(extend_lengths)]
+    full_starts = [0, *accumulate(lengths)]
+    prefix_starts = [0, *accumulate(prefix_lengths)]
+    q = torch.randn(
+        sum(extend_lengths), 24, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(sum(lengths), 2, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    new_rows = torch.cat(
+        [
+            torch.arange(full_starts[i] + p, full_starts[i + 1], device=device)
+            for i, p in enumerate(prefix_lengths)
+        ]
+    )
+    prefix_rows = torch.cat(
+        [
+            torch.arange(full_starts[i], full_starts[i] + p, device=device)
+            for i, p in enumerate(prefix_lengths)
+        ]
+    )
+    indices = torch.full(
+        (q.shape[0], max(lengths)), -1, device=device, dtype=torch.int32
+    )
+    expected = torch.empty_like(q)
+    for i, (prefix, extend) in enumerate(zip(prefix_lengths, extend_lengths)):
+        for t in range(extend):
+            row = starts[i] + t
+            visible = prefix + t + 1
+            # Include causal sparse selection, not only a dense prefix.
+            selected = torch.arange(0, visible, 2, device=device)
+            indices[row, : len(selected)] = selected.int()
+            kk = k[full_starts[i] + selected].repeat_interleave(12, dim=1).float()
+            vv = v[full_starts[i] + selected].repeat_interleave(12, dim=1).float()
+            scores = torch.einsum("hd,thd->ht", q[row].float(), kk) * head_dim**-0.5
+            expected[row] = torch.einsum("ht,thd->hd", scores.softmax(-1), vv).to(
+                q.dtype
+            )
+    if per_head_indices:
+        indices = indices[:, None, :].expand(-1, 2, -1).contiguous()
+    for rank in range(cp_size):
+        first = [(rank - start) % cp_size for start in starts[:-1]]
+        counts = [
+            max(0, (e - f + cp_size - 1) // cp_size)
+            for e, f in zip(extend_lengths, first)
+        ]
+        local_q = q[rank::cp_size].contiguous()
+        common = dict(
+            q=local_q,
+            indices=indices[rank::cp_size].contiguous(),
+            cu_q=tensor([0, *accumulate(counts)]),
+            kv_lens=tensor(lengths),
+            scale=head_dim**-0.5,
+            max_q=max(counts),
+            cp_size=cp_size,
+            q_first_positions=tensor([p + f for p, f in zip(prefix_lengths, first)]),
+            prefix_lens=tensor(prefix_lengths),
+            extend_starts=tensor(starts[:-1]),
+            return_lse=True,
+        )
+        gathered = sparse_gqa_fwd_interface_triton_ck(
+            **{**common, "return_lse": False},
+            k=k,
+            v=v,
+            cu_k=tensor(full_starts),
+            cp_mode=3,
+        )
+        torch.testing.assert_close(
+            gathered, expected[rank::cp_size], atol=0.025, rtol=0.025
+        )
+        if partitioned:
+            common["indices"], common["partition_offsets"] = (
+                partition_cp_sparse_indices(
+                    common["indices"],
+                    common["cu_q"],
+                    common["kv_lens"],
+                    common["q_first_positions"],
+                    common["prefix_lens"],
+                    common["extend_starts"],
+                    cp_size=cp_size,
+                    max_q=common["max_q"],
+                )
+            )
+        out = torch.zeros_like(local_q, dtype=torch.float32)
+        lse = torch.full(local_q.shape[:2], -torch.inf, device=device)
+        if sum(prefix_lengths):
+            out, lse = sparse_gqa_fwd_interface_triton_ck(
+                **common,
+                k=k[prefix_rows],
+                v=v[prefix_rows],
+                cu_k=tensor(prefix_starts),
+                cp_mode=1,
+            )
+        for owner in range(cp_size):
+            selected = new_rows[owner::cp_size]
+            partial, plse = sparse_gqa_fwd_interface_triton_ck(
+                **common,
+                k=k[selected],
+                v=v[selected],
+                cu_k=tensor([0] * (len(lengths) + 1)),
+                cp_mode=2,
+                kv_owner=owner,
+            )
+            if local_q.shape[0]:
+                merge_state(
+                    prefix_output=out,
+                    prefix_lse=lse,
+                    suffix_output=partial,
+                    suffix_lse=plse,
+                    output=out,
+                    output_lse=lse,
+                )
+        torch.testing.assert_close(
+            out.to(q.dtype), expected[rank::cp_size], atol=0.025, rtol=0.025
+        )
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("prefix_lens", [[7, 0, 19], [8189, 0, 1]])
+@pytest.mark.parametrize(
+    "cp_size,store,explicit_indices",
+    [(1, False, False), (2, True, False), (4, True, True), (2, False, True)],
+)
+def test_qsa_prefill_packing_preserves_unstored_new_kv(
+    cache_dtype, prefix_lens, cp_size, store, explicit_indices
+):
+    """Reorder/store preserves fresh BF16 values and never consumes CP padding.
+
+    Cache writes must match pool division/clamping, leave prefix slots intact,
+    and use global fresh-token slots rather than rank-major source positions.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(81)
+    device = "cuda"
+    extend_lens = [3, 2, 2]
+    lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    width = max(lens)
+    # Noncontiguous table and KV pool protect physical stride addressing.
+    table = torch.randperm(3 * width * 2, device=device).reshape(3, -1)[:, ::2]
+    req = torch.tensor([2, 0, 1], device=device)
+    buffers = []
+    expected = []
+    new_kv = []
+    expected_pools = []
+    locations = torch.cat(
+        [
+            table[req[i], p : p + e]
+            for i, (p, e) in enumerate(zip(prefix_lens, extend_lens))
+        ]
+    )
+    for scale in (0.3, 0.7):
+        storage = torch.randn(6 * width, 2, 512, device=device).to(cache_dtype)
+        pool = storage[..., ::2]
+        new = torch.randn(sum(extend_lens), 2, 256, device=device).to(torch.bfloat16)
+        new[0, 0, :4] = torch.tensor([1000, -1000, 400, -400], device=device)
+        parts = []
+        start = 0
+        for i, (prefix, extend) in enumerate(zip(prefix_lens, extend_lens)):
+            slots = table[req[i], :prefix]
+            cached = pool.index_select(0, slots).float()
+            if cache_dtype == torch.float8_e4m3fn:
+                cached *= scale
+            parts.extend([cached.to(torch.bfloat16), new[start : start + extend]])
+            pool[table[req[i], prefix : prefix + extend]] = float("nan")
+            start += extend
+        buffers.append(pool)
+        new_kv.append(new)
+        expected.append(torch.cat(parts))
+        expected_pool = pool.clone()
+        if store:
+            to_store = new.clone()
+            if cache_dtype == torch.float8_e4m3fn:
+                to_store.div_(scale).clamp_(-448, 448)
+            expected_pool[locations] = to_store.to(cache_dtype)
+        expected_pools.append(expected_pool)
+    rank_rows = (sum(extend_lens) + cp_size - 1) // cp_size
+    # K/V remain noncontiguous views of one gathered [rank, token, K+V] buffer.
+    gathered = torch.full(
+        (cp_size * rank_rows, 1024), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    for rank in range(cp_size):
+        local = torch.cat([x[rank::cp_size].flatten(1) for x in new_kv], dim=1)
+        gathered[rank * rank_rows : rank * rank_rows + local.shape[0]] = local
+    new_kv = tuple(x.view(-1, 2, 256) for x in gathered.split(512, dim=-1))
+    source_indices = None
+    if explicit_indices:
+        logical = torch.arange(sum(extend_lens), device=device)
+        source_indices = (logical % cp_size) * rank_rows + logical // cp_size
+    actual = pack_qsa_prefill_kv(
+        k=buffers[0],
+        v=buffers[1],
+        req_to_token=table,
+        req_indices=req,
+        cu_k=torch.tensor([0, *accumulate(lens)], device=device, dtype=torch.int32),
+        total_k=sum(lens),
+        max_k=max(lens),
+        output_dtype=torch.bfloat16,
+        k_scale=0.3,
+        v_scale=0.7,
+        new_kv=tuple(new_kv),
+        prefix_lens=torch.tensor(prefix_lens, device=device, dtype=torch.int32),
+        extend_starts=torch.tensor([0, 3, 5], device=device, dtype=torch.int32),
+        new_kv_cp_size=cp_size,
+        new_kv_token_indices=source_indices,
+        cache_loc=locations if store else None,
+    )
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, atol=0, rtol=0)
+    for result, reference in zip(buffers, expected_pools):
+        torch.testing.assert_close(
+            result.float(), reference.float(), atol=0, rtol=0, equal_nan=True
+        )
 
 
 if __name__ == "__main__":

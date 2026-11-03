@@ -366,8 +366,8 @@ def qwen3_5_gdn_prefill_projection_views(
     """
     if min(num_heads_qk, num_heads_v, head_qk, head_v) <= 0:
         raise ValueError("GDN projection head counts and dimensions must be positive")
-    if num_heads_v % num_heads_qk or num_heads_v // num_heads_qk not in (1, 2, 4):
-        raise ValueError("GDN projection views require a V/QK head ratio of 1, 2 or 4")
+    if num_heads_v % num_heads_qk:
+        raise ValueError("GDN projection views require an integer V/QK head ratio")
     if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
         raise ValueError("GDN projection views require two-dimensional inputs")
     if (

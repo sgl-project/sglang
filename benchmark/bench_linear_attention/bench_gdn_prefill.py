@@ -619,12 +619,14 @@ def main():
         default="prefill",
     )
     parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--cp-key-heads", type=int, default=16)
+    parser.add_argument("--cp-value-heads", type=int, default=64)
     args = parser.parse_args()
     if args.component == "peer":
         benchmark_peer(args.tokens)
         return 0
     if args.component == "checkpoints":
-        benchmark_cp_checkpoints(args.tokens)
+        benchmark_cp_checkpoints(args.tokens, args.cp_key_heads, args.cp_value_heads)
         return 0
     if args.component == "conv-halo":
         benchmark_conv_halo(args.tokens)
@@ -710,7 +712,7 @@ def benchmark_conv_halo(tokens):
             )
 
 
-def benchmark_cp_checkpoints(tokens):
+def benchmark_cp_checkpoints(tokens, key_heads=16, value_heads=64):
     """Measure shard-end export overhead with a fixed collective iteration count.
 
     Run with torchrun --nproc-per-node=4 FILE --component checkpoints --tokens 4096.
@@ -733,15 +735,56 @@ def benchmark_cp_checkpoints(tokens):
         torch.manual_seed(397 + rank)
         with torch.inference_mode():
             kernel = FlashQLAGDNKernel(fallback=None, cp_group=dist.group.WORLD)
-            q = torch.randn(1, tokens, 16, 128, device="cuda", dtype=torch.bfloat16)
-            v = torch.randn(1, tokens, 64, 128, device="cuda", dtype=q.dtype)
+            q = torch.randn(
+                1, tokens, key_heads, 128, device="cuda", dtype=torch.bfloat16
+            )
+            v = torch.randn(1, tokens, value_heads, 128, device="cuda", dtype=q.dtype)
             inputs = [q, torch.randn_like(q), v]
             inputs += [
-                -torch.rand(1, tokens, 64, device="cuda") * 0.1,
-                torch.rand(1, tokens, 64, device="cuda"),
+                -torch.rand(1, tokens, value_heads, device="cuda") * 0.1,
+                torch.rand(1, tokens, value_heads, device="cuda"),
             ]
-            initial = torch.zeros(1, 64, 128, 128, device="cuda")
+            initial = torch.randn(1, value_heads, 128, 128, device="cuda") * 0.1
+            dist.broadcast(initial, src=0)
+            full_inputs = []
+            for value in inputs:
+                gathered = [torch.empty_like(value) for _ in range(world)]
+                dist.all_gather(gathered, value)
+                full_inputs.append(torch.cat(gathered, dim=1))
+            reference = FlashQLAGDNKernel(fallback=None)
+            expected, expected_final = reference._sequence(full_inputs, initial)
             for positions in ((), tuple(tokens * r for r in range(1, world))):
+                actual, final, checkpoints = kernel.extend(
+                    *inputs,
+                    ssm_states=initial,
+                    cache_indices=None,
+                    query_start_loc=None,
+                    cp_metadata=ContextParallelMetadata(
+                        group=kernel._group, rank=rank, world=world
+                    ),
+                    initial_state=initial,
+                    inplace_update=False,
+                    checkpoint_indices=positions,
+                )
+                torch.testing.assert_close(
+                    actual,
+                    expected[:, rank * tokens : (rank + 1) * tokens],
+                    atol=0.03,
+                    rtol=0.03,
+                )
+                torch.testing.assert_close(final, expected_final, atol=0.03, rtol=0.03)
+                for position, state in zip(positions, checkpoints):
+                    _, expected_state = reference._sequence(
+                        [x[:, :position].contiguous() for x in full_inputs], initial
+                    )
+                    torch.testing.assert_close(
+                        state, expected_state, atol=0.03, rtol=0.03
+                    )
+                if rank == 0:
+                    print(
+                        f"correctness PASS heads={key_heads}:{value_heads} checkpoints={positions}",
+                        flush=True,
+                    )
                 for _ in range(5):
                     kernel.extend(
                         *inputs,

@@ -40,8 +40,13 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         if model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
         else "zigzag"
     )
-    if cfg.cp_strategy != strategy:
-        raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
+    allowed_strategies = (
+        ("zigzag", "interleave")
+        if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        else (strategy,)
+    )
+    if cfg.cp_strategy not in allowed_strategies:
+        raise ValueError(f"CP-TP group sharing requires one of {allowed_strategies}.")
 
     # This hook runs before speculative defaults and NEXTN alias resolution.
     # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
@@ -71,8 +76,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
-            "ep-size > 1": view.ep_size > 1,
-            "moe-a2a-backend": view.moe_a2a_backend != "none",
+            "ep-size without MegaMoE": view.ep_size > 1
+            and view.moe_a2a_backend != "megamoe",
+            "moe-a2a-backend": view.moe_a2a_backend not in ("none", "megamoe"),
             "enable-waterfill": cfg.enable_waterfill,
             "pp-size > 1": cfg.pp_size > 1,
             # Prefill only: a decode node serves plain TP.

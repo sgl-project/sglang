@@ -264,13 +264,14 @@ class BaseRunner(ABC):
         if mr.device != "cuda":
             return
 
-        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+        from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
 
-        if is_sharded_cp_enabled():
+        if is_gdn_cp_enabled():
             from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
             if isinstance(mr.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator):
                 mr.token_to_kv_pool_allocator.warmup(mr.max_running_requests)
+        if is_gdn_cp_enabled() or mr.server_args.enable_prefill_cp:
             mr.attn_backend.warmup(mr)
 
         self._pre_initialize_flashinfer_allreduce_workspace()

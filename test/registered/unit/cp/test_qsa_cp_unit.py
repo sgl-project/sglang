@@ -1,4 +1,4 @@
-"""CPU checks for QSA's zigzag-only context parallel entrypoints."""
+"""CPU checks for QSA context parallel entrypoints."""
 
 import sys
 from contextlib import contextmanager
@@ -27,7 +27,6 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
     "strategy",
     [
         None,
-        SimpleNamespace(name="interleave", kind=ContextParallelStrategyKind.INTERLEAVE),
     ],
 )
 @pytest.mark.parametrize("entrypoint", ["indexer", "attention"])
@@ -40,7 +39,8 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
     monkeypatch.setattr(module, "cp_materialize_global_token_order", gather)
     # None metadata and tensors ensure rejection precedes zigzag-specific access.
     with pytest.raises(
-        NotImplementedError, match="QSA prefill CP only supports the zigzag strategy"
+        NotImplementedError,
+        match="QSA prefill CP supports zigzag and interleave strategies",
     ):
         if entrypoint == "indexer":
             QSAIndexer.forward_cuda_cp(None, None, None, None, None, None)
@@ -544,3 +544,27 @@ def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_indexer_rope_uses_host_bound_without_device_scalar_read(monkeypatch):
+    positions = torch.tensor([3, 7])
+    value = torch.randn(2, 1, 4)
+    rotary = SimpleNamespace(
+        _ensure_cos_sin_cache_length=Mock(),
+        get_cos_sin_with_position=Mock(),
+        rotary_dim=4,
+        is_neox_style=True,
+        position_cos=torch.ones(2, 4),
+        position_sin=torch.zeros(2, 4),
+    )
+    monkeypatch.setattr(qsa_indexer, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(qsa_indexer, "apply_rotary_emb", lambda x, *args: x)
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            torch.Tensor, "item", Mock(side_effect=AssertionError("device scalar read"))
+        )
+        actual = QSAIndexer.apply_rope(
+            SimpleNamespace(rotary_emb=rotary), positions, value, rope_max_position=7
+        )
+    rotary._ensure_cos_sin_cache_length.assert_called_once_with(7)
+    torch.testing.assert_close(actual, value)

@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -1056,6 +1057,9 @@ class HummingLinearMethod(LinearMethodBase):
 
 class HummingMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: HummingLayerQuantizationConfig) -> None:
+        self.native_mxfp4_mega = get_exec().moe.enable_mxfp4_mega and getattr(
+            quant_config, "is_redslim_mxfp4", False
+        )
         self.quant_config = quant_config
         self.weight_schema = quant_config.weight_schema
         self.input_schema = quant_config.input_schema
@@ -1132,7 +1136,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.model_loader.weight_utils import default_weight_loader
 
-        layer.num_experts = num_experts
+        if not self.native_mxfp4_mega:
+            layer.num_experts = num_experts
         layer.param_dtype = params_dtype
         layer.intermediate_size = intermediate_size_per_partition
         layer.with_bias = with_bias
@@ -1195,6 +1200,38 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(self, "processed", False):
+            return
+        if self.native_mxfp4_mega:
+            from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl.weights import (
+                preprocess_mega_weights,
+            )
+            from flashinfer.moe_ep.weights import PrequantizedMoEWeights
+
+            packed = {}
+            for name in ("w13", "w2"):
+                config = layer.sublayer_configs[name]
+                n, k = config["shape_n"], config["shape_k"]
+                packed[name] = (
+                    getattr(layer, name + "_weight")
+                    .view(torch.uint8)[:, :n, : k // 2]
+                    .contiguous()
+                )
+                packed[name + "_scale"] = (
+                    getattr(layer, name + "_weight_scale")
+                    .view(torch.uint8)[:, :n, : k // 32]
+                    .contiguous()
+                )
+            layer.mega_l1_weights, layer.mega_l2_weights = preprocess_mega_weights(
+                PrequantizedMoEWeights(**packed),
+                intermediate_size=layer.intermediate_size_per_partition,
+                hidden_size=layer.hidden_size,
+                expert_chunk_size=1,
+            )
+            for name in ("w13", "w2"):
+                delattr(layer, name + "_weight")
+                delattr(layer, name + "_weight_scale")
+            layer._mega_moe_weights_built = True
+            self.processed = True
             return
         from sglang.srt.layers.quantization.humming_utils import (
             configure_humming_deepep_dispatch,
@@ -1283,6 +1320,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         moe_runner_config: MoeRunnerConfig,
     ):
+        if self.native_mxfp4_mega:
+            return
         moe_runner_backend = get_moe_runner_backend()
         if not (moe_runner_backend.is_auto() or moe_runner_backend.is_humming()):
             raise ValueError(

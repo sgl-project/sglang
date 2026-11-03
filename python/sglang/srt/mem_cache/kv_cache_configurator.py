@@ -39,7 +39,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+from sglang.srt.layers.cp.utils import is_gdn_cp_enabled, is_sharded_cp_enabled
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1569,7 +1569,7 @@ class KVCacheConfigurator:
         req_to_token_pool = HybridReqToTokenPool(
             context_parallel_group=(
                 get_parallel().attn_cp_group.device_group
-                if is_sharded_cp_enabled()
+                if is_gdn_cp_enabled()
                 else None
             ),
             size=max_num_reqs,
@@ -3448,7 +3448,7 @@ class KVCacheConfigurator:
                     ),
                 )
 
-        cp_size = get_parallel().attn_cp_size if is_sharded_cp_enabled() else 1
+        cp_size = get_parallel().attn_cp_size if is_gdn_cp_enabled() else 1
         if cp_size > 1 and get_server_args().max_mamba_cache_size is None:
             get_context().override(
                 "mamba_pool.cp_memory_budget",

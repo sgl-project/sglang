@@ -1019,17 +1019,18 @@ class ModelRunner:
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
-        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+        from sglang.srt.layers.cp.utils import is_gdn_cp_enabled, is_sharded_cp_enabled
 
         self.cp_kv_exchange = None
-        if is_sharded_cp_enabled():
+        if is_gdn_cp_enabled():
             from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
             from sglang.srt.model_executor.model_runner_components.load_model_utils import (
                 warmup_context_parallel,
             )
 
             warmup_context_parallel(self)
-            self.cp_kv_exchange = AttentionBackend.reserve_cp_kv_exchange(self)
+            if is_sharded_cp_enabled():
+                self.cp_kv_exchange = AttentionBackend.reserve_cp_kv_exchange(self)
         if get_exec().moe.enable_mxfp4_mega:
             from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
             from sglang.srt.layers.moe.sm90_mxfp4_mega import warmup_experts
@@ -1899,7 +1900,13 @@ class ModelRunner:
         return kwargs
 
     def prepare_cp_metadata(self, batch, *, lengths=None, prefixes=None):
-        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+        from sglang.srt.layers.cp.utils import is_gdn_cp_enabled, is_sharded_cp_enabled
+
+        if get_parallel().enable_cp_tp_group_sharing and is_gdn_cp_enabled():
+            self.attn_backend.linear_attn_backend.prepare_cp_metadata(
+                batch, lengths=lengths, prefixes=prefixes
+            )
+            return
 
         if not (
             is_sharded_cp_enabled(self.server_args)

@@ -1008,8 +1008,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         if (
             forward_batch.prefill_cp_metadata is not None
-            and hidden_states.shape[0] == 0
-        ):
+            or forward_batch.gdn_cp_metadata is not None
+        ) and hidden_states.shape[0] == 0:
             raw = hidden_states.new_empty((0, self.conv_dim))
             gates = hidden_states.new_empty((0, self.num_v_heads))
             self.attn(forward_batch, mixed_qkv=raw, a=gates, b=gates)

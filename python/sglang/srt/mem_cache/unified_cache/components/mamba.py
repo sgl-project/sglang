@@ -747,40 +747,14 @@ class MambaComponent(TreeComponent):
 
     def prepare_mamba_checkpoints(self, req, positions, *, reserve_slots):
         assert not req.kv.mamba_pending_checkpoints, "Previous chunk was not cached"
-        if self.cache.disable or not positions:
+        if self.cache.disable or req.skip_radix_cache_insert or not positions:
             return
         if self.int8_ckpt_pool is not None:
             raise ValueError("Sharded CP checkpoints require the native state pool")
         allocator = self.cache.req_to_token_pool.mamba_allocator
-        target = len(positions) + reserve_slots
-        ct = self.component_type
-        lru = self.tree_core.lru_lists[ct]
-        node = lru.get_lru_no_lock()
-        tracker = {component: 0 for component in self.cache.tree_components}
-        while (
-            allocator.available_size() < target
-            and node is not None
-            and lru.in_list(node)
-        ):
-            previous = lru.get_prev_no_lock(node)
-            state = node.component_data[ct]
-            if (
-                node.children
-                and node not in self.tree_core.evictable_device_leaves
-                and state.lock_ref == 0
-                and state.session_ref == 0
-            ):
-                device_frees, host_frees = defaultdict(list), defaultdict(list)
-                self.tree_core._evict_component_and_detach_lru(
-                    node,
-                    self,
-                    device_frees,
-                    host_frees,
-                    target=EvictLayer.DEVICE,
-                    tracker=tracker,
-                )
-                self.cache._free_values(device_frees, host_frees)
-            node = previous
+        # Extra CP snapshots are optional. Admit them only from spare slots;
+        # preserve the ordinary checkpoints and the tree's existing prefixes.
+        # The allocator contract is shared by Python and Rust tree cores.
         count = min(len(positions), max(0, allocator.available_size() - reserve_slots))
         if count:
             slots = allocator.alloc(count)

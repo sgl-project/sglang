@@ -57,7 +57,7 @@ def _step(stage, variant):
     return stage.plan.paths[variant].entry.prepare.keywords["step"]
 
 
-def _build_layers(parallel):
+def _build_layers(parallel, linear_group=None, *, gdn_cp=False):
     """A linear-attention layer, then a sparse-attention layer."""
     config = SimpleNamespace(
         model_type="qwen4_exp_text", num_hidden_layers=2, ple_layer_ids=[]
@@ -67,6 +67,7 @@ def _build_layers(parallel):
         get_parallel().override(
             enable_cp_tp_group_sharing=parallel.enable_cp_tp_group_sharing
         ),
+        patch("sglang.srt.layers.cp.utils.is_gdn_cp_enabled", return_value=gdn_cp),
         layer_stack(),
     ):
         linear = qwen4_exp._build_qwen4_exp_stages(
@@ -133,6 +134,23 @@ class TestTokenOrderAttention(CustomTestCase):
         self.assertEqual(
             [steps(stage) for stage in linear], [steps(stage) for stage in sparse]
         )
+
+    def test_gdn_cp_moves_only_compute_rows_without_tp_sum(self):
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        (attn, ffn), _ = _build_layers(parallel, "attn_tp", gdn_cp=True)
+        self.assertIsNone(attn.plan.paths[CP].entry.input_move)
+        transport = attn.declaration.row_transport
+        self.assertIsNotNone(transport)
+        self.assertEqual(transport.rows[CP].source, transport.rows[CP].returned)
+        self.assertIn(TokenAxis.ATTN_CP, transport.rows[CP].source.sharded)
+        self.assertIsNone(transport.rows[CP].group)
+        self.assertIsNone(ffn.plan.paths[CP].entry.declared_sum)
 
     def test_token_order_needs_an_always_partial_attention(self):
         with self.assertRaises(ValueError):

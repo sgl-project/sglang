@@ -393,7 +393,12 @@ class TestGDNProjectionViews(unittest.TestCase):
             for dtype, tokens, geometry, padding in itertools.product(
                 (torch.bfloat16, torch.float16),
                 (0, 1, 17),
-                ((2, 2, 64, 128), (2, 4, 128, 64), (16, 64, 128, 128)),
+                (
+                    (2, 2, 64, 128),
+                    (2, 4, 128, 64),
+                    (8, 24, 128, 128),
+                    (16, 64, 128, 128),
+                ),
                 (0, 16),
             ):
                 kh, vh, kd, vd = geometry
@@ -429,7 +434,7 @@ class TestGDNProjectionViews(unittest.TestCase):
                 torch.testing.assert_close(packed, saved_packed, rtol=0, atol=0)
                 torch.testing.assert_close(gates, saved_gates, rtol=0, atol=0)
                 count += 1
-        self.assertEqual(count, 36)
+        self.assertEqual(count, 48)
 
     def test_3d_z_matches_2d_and_torch(self):
         count = 0

@@ -101,6 +101,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+from sglang.srt.utils.nvtx_utils import profile_method, profile_range
 
 _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -1500,6 +1501,14 @@ def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
 def _linear_attn_options():
     """Linear attention scans the sequence in token order, and its output owes
     the sum over the group its heads are partitioned over."""
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    if is_gdn_cp_enabled():
+        from sglang.srt.layers.layer_boundary.row_transport import (
+            contiguous_context_parallel_transport,
+        )
+
+        return dict(row_transport=contiguous_context_parallel_transport())
     return dict(
         tp_group=(
             SumGroup.TP if linear_attn_parallel_group() == "tp" else SumGroup.ATTN_TP
@@ -1742,6 +1751,7 @@ class Qwen4ExpLayerExtensionMixin:
         finally:
             self._ple_forward_batch = self._ple_batch = None
 
+    @profile_method("sglang.layer.mlp")
     def _run_ffn_stage(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -1807,14 +1817,15 @@ class Qwen4ExpLinearDecoderLayer(
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states = self._prepare_attn_stage(
-            hidden_states, forward_batch, kwargs.get("ple_batch")
-        )
+        with profile_range("sglang.layer.attention.gdn"):
+            hidden_states = self._prepare_attn_stage(
+                hidden_states, forward_batch, kwargs.get("ple_batch")
+            )
 
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.linear_attn(hidden_states, forward_batch)
 
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
@@ -1888,6 +1899,7 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
+    @profile_method("sglang.attention.qsa.indexer")
     def _compute_qsa_topk_indices_eager(
         self,
         hidden_states: torch.Tensor,
@@ -2008,18 +2020,19 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        hidden_states = self._prepare_attn_stage(
-            hidden_states, forward_batch, kwargs.get("ple_batch")
-        )
-
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        with profile_range("sglang.layer.attention.qsa"):
+            hidden_states = self._prepare_attn_stage(
+                hidden_states, forward_batch, kwargs.get("ple_batch")
             )
 
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
