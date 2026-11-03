@@ -58,6 +58,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
+from sglang.srt.layers.layer_boundary.ops import move_rows
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -70,10 +71,8 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
-    adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
-    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -318,15 +317,23 @@ class LongcatFlashMoE(nn.Module):
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        zero_expert_result = None
 
         if _is_npu and num_tokens == 0:
             # An empty DP rank must still participate in expert dispatch/combine.
-            return self.experts(
+            final_hidden_states = self.experts(
                 hidden_states, self.topk.empty_topk_output(hidden_states.device)
             ).view(num_tokens, hidden_dim)
+            # Keep empty identity rows for any boundary gather on this rank.
+            return (
+                final_hidden_states,
+                hidden_states if self.zero_expert_type is not None else None,
+            )
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
@@ -353,17 +360,10 @@ class LongcatFlashMoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if (
-            self.zero_expert_type is not None
-            and num_tokens > 0
-            and (
-                not _is_npu
-                or is_moe_input_scattered_across_dp_ranks()
-                or adds_replicated_output_to_partial()
-            )
-        ):
-            # A2A outputs are complete on each rank. For replicated inputs, the
-            # boundary sums partial outputs, so count the identity branch once.
+        if _is_npu:
+            return final_hidden_states.view(num_tokens, hidden_dim), zero_expert_result
+
+        if zero_expert_result is not None:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -513,9 +513,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         # moe
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.moe_boundary.prepare(hidden_states, forward_batch)
+        moe_hidden_states = self.mlp(hidden_states.clone())
+        if _is_npu:
+            moe_hidden_states, zero_expert_result = moe_hidden_states
         moe_hidden_states = self.moe_boundary.branch_output(
-            self.mlp(hidden_states.clone()), forward_batch
+            moe_hidden_states, forward_batch
         )
+        if _is_npu and zero_expert_result is not None:
+            # Add identity after the expert sum, on the same output token rows.
+            rows, _, to = self.moe_boundary.plan.branch_rows(forward_batch)
+            moe_hidden_states += move_rows(zero_expert_result, rows, to, forward_batch)
 
         hidden_states, prev_topk_indices = self.forward_mlp(
             hidden_states,
