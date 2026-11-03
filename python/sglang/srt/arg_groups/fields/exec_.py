@@ -172,6 +172,13 @@ class ExecFeatures(msgspec.Struct):
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
+    routed_experts_dtype: A[
+        Literal["int32", "int16"],
+        "Storage and response dtype of the routed experts returned with "
+        "--enable-return-routed-experts. int16 halves the device buffer, the "
+        "pinned host cache and the response, and requires at most 32768 routed "
+        "experts. Responses name the dtype in routed_experts_dtype.",
+    ] = "int32"
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

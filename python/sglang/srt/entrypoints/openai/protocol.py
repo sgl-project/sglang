@@ -476,6 +476,8 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    # numpy dtype name to decode routed_experts with (--routed-experts-dtype).
+    routed_experts_dtype: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None

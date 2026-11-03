@@ -11,6 +11,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     SpecTokensDetails,
     StreamOptions,
 )
+from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,13 @@ def process_routed_experts_from_ret(
     if not getattr(request, "return_routed_experts", False):
         return None
     return ret_item["meta_info"].get("routed_experts", None)
+
+
+def routed_experts_dtype_for(routed_experts: str | None) -> str | None:
+    """The dtype clients decode ``routed_experts`` with; None without them."""
+    if routed_experts is None:
+        return None
+    return get_exec().features.routed_experts_dtype
 
 
 def cached_tokens_details_from_dict(

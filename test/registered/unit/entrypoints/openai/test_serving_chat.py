@@ -60,7 +60,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateToolDetector,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import get_context, get_exec, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
@@ -4732,6 +4732,36 @@ class ServingChatTestCase(CustomTestCase):
         dumped_response = response.model_dump()
         self.assertIn("sglext", dumped_response)
         self.assertNotIn("meta_info", dumped_response["choices"][0])
+
+    def test_sglext_routed_experts_name_their_dtype(self):
+        """Clients decode sglext.routed_experts with the server's dtype."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            return_routed_experts=True,
+        )
+        ret = [
+            {
+                "text": "Response",
+                "meta_info": {
+                    "id": "chatcmpl-dtype-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "routed_experts": "cm91dGUtYQ==",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+        for dtype in ("int32", "int16"):
+            with (
+                self.subTest(dtype=dtype),
+                get_exec().features.override(routed_experts_dtype=dtype),
+            ):
+                response = self.chat._build_chat_response(req, ret, 1234567890)
+                self.assertEqual(response.sglext.routed_experts_dtype, dtype)
 
     def test_non_streaming_meta_info_omits_response_level_routed_experts(self):
         req = ChatCompletionRequest(
