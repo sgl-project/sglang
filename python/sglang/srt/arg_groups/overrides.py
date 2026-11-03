@@ -948,6 +948,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -979,7 +980,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
             and not view.encoder_only
-            and not view.enable_pdmux
         ):
             return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.

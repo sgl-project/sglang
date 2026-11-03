@@ -26,6 +26,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
@@ -37,6 +38,19 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+# Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which
+# only the pickle codec sends.
+_pickle_ipc = patch.object(io_struct, "_USE_PICKLE_IPC", True)
+
+
+def setUpModule():
+    _pickle_ipc.start()
+
+
+def tearDownModule():
+    _pickle_ipc.stop()
 
 
 _BASE_LOAD = msgspec.structs.replace(
@@ -77,14 +91,19 @@ def _req(
     input_ids=None,
     rid="USER",
     time_stats=None,
+    input_embeds=None,
 ):
-    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
+    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
+
+    As with a real input_embeds request, passing input_embeds leaves input_ids None.
+    """
     return SimpleNamespace(
         time_stats=time_stats,
         rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
-        input_ids=input_ids or [],
+        input_ids=None if input_embeds is not None else (input_ids or []),
+        input_embeds=input_embeds,
     )
 
 
@@ -489,6 +508,17 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+class TestTotalTokensScheduler(CustomTestCase):
+    def test_input_embeds_request_is_counted_by_embedding_rows(self):
+        # input_embeds requests carry input_ids=None.
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.total_tokens = [10, 0]
+        ctl.total_tokens_scheduler(_req(input_embeds=[[0.0] * 4] * 3))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):

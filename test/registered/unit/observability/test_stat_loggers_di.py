@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 import prometheus_client
 
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
