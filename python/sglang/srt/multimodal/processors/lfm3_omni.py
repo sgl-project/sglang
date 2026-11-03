@@ -12,11 +12,11 @@ from typing import ClassVar
 import torch
 
 from sglang.srt.managers.req_types import (
-    Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.lfm3_omni import Lfm3OmniForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.lfm3_audio import Lfm3AudioMultimodalProcessor
 from sglang.srt.multimodal.processors.lfm3_vl import Lfm3VlImageProcessor

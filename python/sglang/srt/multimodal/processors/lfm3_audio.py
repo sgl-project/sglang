@@ -12,12 +12,12 @@ from typing import ClassVar
 import torch
 
 from sglang.srt.managers.req_types import (
-    Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.lfm3_audio import Lfm3AudioForConditionalGeneration
 from sglang.srt.multimodal.lfm3_audio import AUDIO_TOKEN
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
