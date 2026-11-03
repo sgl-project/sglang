@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -16,9 +16,6 @@ class TokenSpaceServingSpec:
     models: tuple[str, ...] = ()
     # Media IO threads when neither --mm-io-worker-num nor SGLANG_IO_WORKERS is set.
     auto_mm_io_worker_num: int = 4
-    # Device every medium of a video request preprocesses and decodes on, unless
-    # mm_process_config sets video_preprocessing_device; None keeps the defaults.
-    video_preprocessing_device: Optional[str] = None
 
     def __init__(self, hf_config):
         self.hf_config = hf_config
@@ -37,6 +34,7 @@ class TokenSpaceServingSpec:
 
         Runs on processor worker threads, so it must not mutate the spec. The default
         is the legacy processor's split, which finds media boundaries by field name.
+        The wrapper then sets each media item's offsets from its mm_spans row.
         """
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
