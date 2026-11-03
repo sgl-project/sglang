@@ -18,9 +18,7 @@ from sglang.srt.layers.moe.topk import TopK, fused_topk_torch_native
 from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
     enable_num_token_non_padded,
 )
@@ -30,6 +28,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
