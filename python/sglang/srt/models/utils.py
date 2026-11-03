@@ -415,6 +415,9 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
     # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
     if get_fp4_gemm_runner_backend().is_marlin():
         return
+    # The fused kernel never writes the scale padding, which exists when K % 64 != 0.
+    if mlp.down_proj.input_size_per_partition % 64 != 0:
+        return
     try:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
     except ImportError:

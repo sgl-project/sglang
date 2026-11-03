@@ -9,8 +9,9 @@ Covers four things:
   3. QWEN3_5_KV_SCALE_MAPPER remaps the checkpoint's baked KV-scale names onto the
      RadixAttention parameter names.
   4. The dense-MLP SiLU+FP4 fusion turns on for NVFP4 W4A4 and stays off where
-     down_proj cannot take its (fp4, scale) tuple: NVFP4 AWQ, the Marlin FP4 GEMM
-     backend, sequence parallelism, a LoRA-wrapped down_proj.
+     its (fp4, scale) tuple would be wrong or unusable: NVFP4 AWQ, the Marlin FP4
+     GEMM backend, K not a multiple of 64, sequence parallelism, a LoRA-wrapped
+     down_proj.
 """
 
 import sys
@@ -188,13 +189,17 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
             self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
 
     @staticmethod
-    def _enables_fusion(*, is_awq: bool, backend: Fp4GemmRunnerBackend) -> bool:
+    def _enables_fusion(
+        *, is_awq: bool, backend: Fp4GemmRunnerBackend, down_proj_k: int = 128
+    ) -> bool:
         method = MagicMock(spec=ModelOptFp4LinearMethod, quant_mode="w4a4")
         method.quant_config = SimpleNamespace(is_awq=is_awq)
         mlp = SimpleNamespace(
             _enable_silu_fp4_quant_fusion=False,
             gate_up_proj=SimpleNamespace(quant_method=method),
-            down_proj=SimpleNamespace(quant_method=method),
+            down_proj=SimpleNamespace(
+                quant_method=method, input_size_per_partition=down_proj_k
+            ),
         )
         # A stand-in FlashInfer keeps the result independent of the installed one.
         flashinfer = SimpleNamespace(silu_and_mul_scaled_nvfp4_experts_quantize=None)
@@ -217,6 +222,17 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
         self.assertFalse(
             self._enables_fusion(
                 is_awq=True, backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
+            )
+        )
+
+    def test_stays_off_when_k_is_not_a_multiple_of_64(self):
+        """K = 1376 pads 86 scale columns to 88; the fused kernel never writes the
+        padding, so leftover NaN bytes there turned the whole GEMM output into NaN."""
+        self.assertFalse(
+            self._enables_fusion(
+                is_awq=False,
+                backend=Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                down_proj_k=1376,
             )
         )
 
