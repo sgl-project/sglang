@@ -19,7 +19,6 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     layer_stack,
 )
-from sglang.srt.layers.layer_boundary.contracts import SumImplementation
 from sglang.srt.layers.layer_boundary.facts import (
     ReadFacts,
     TransformFacts,
@@ -30,6 +29,7 @@ from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.output import (
     DeferredFinalize,
     OutputTransform,
+    SumImplementation,
     UnreducedOutput,
 )
 from sglang.srt.layers.layer_boundary.residual import PendingUpdateRead
@@ -40,7 +40,7 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PlainAdd,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -673,8 +673,9 @@ class TestProducerCompletion(CustomTestCase):
 
     def test_invocation_read_reaches_normal_and_cp_consumers(self):
         from sglang.srt.layers.layer_boundary import prepare
-        from sglang.srt.layers.layer_boundary.boundary import CpMoves, bind_entry
+        from sglang.srt.layers.layer_boundary.boundary import bind_entry
         from sglang.srt.layers.layer_boundary.contracts import (
+            CpMoves,
             EdgeContract,
             InputContract,
             OutputContract,

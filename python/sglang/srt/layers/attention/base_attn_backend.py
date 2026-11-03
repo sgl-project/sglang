@@ -9,13 +9,14 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
         BaseIndexerMetadata,
     )
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
@@ -203,6 +204,11 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        """Allocate backend-owned stable buffers before prefill capture."""
+
     supports_draft_extend_metadata_staging: bool = False
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
@@ -244,6 +250,12 @@ class AttentionBackend(ABC):
     # captures depends on the context length.
     prefill_cuda_graph_default_max_seq_len: Optional[int] = None
     dllm_attention = None
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        """Decode graph variants to capture, or None for one graph per batch size."""
+        return None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
