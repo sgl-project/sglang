@@ -30,9 +30,9 @@ as ``num_heads == intermediate_size`` and ``head_dim == 1`` (see
   - single-token **decode** uses the shared ``selective_state_update`` kernel,
     which already supports a full-rank ``A`` of shape ``(nheads, dim, dstate)``
     and applies the ``silu(z)`` output gate;
-  - multi-token **prefill** runs a portable pure-torch selective scan (there is
-    no Mamba-1 chunked-scan kernel in-tree), which is device-agnostic and works
-    on Intel XPU.
+  - multi-token **prefill** runs the fused Triton varlen scan
+    ``mamba1_scan_prefill`` on XPU (one launch per batch); other devices, or
+    ``SGLANG_DISABLE_MAMBA1_TRITON_SCAN=1``, use the per-token pure-torch scan.
 
 Falcon-Mamba adds a weightless RMSNorm to ``B``, ``C`` and ``dt`` (the "Falcon"
 stabilization trick), applied here via :func:`rms_normalize` gated on
@@ -45,8 +45,12 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.mamba.triton_ops import selective_state_update
+from sglang.kernels.ops.mamba.triton_ops import (
+    mamba1_scan_prefill,
+    selective_state_update,
+)
 from sglang.srt.distributed import divide
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba import (
     causal_conv1d_fn,
     causal_conv1d_fn_triton,
@@ -61,7 +65,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import is_xpu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +187,10 @@ class MambaMixer1(nn.Module):
             "dt_bias_zero",
             torch.zeros(self.intermediate_size_per_tp, 1),
             persistent=False,
+        )
+        # Validated on XPU only; other devices keep the per-token PyTorch loop.
+        self.use_triton_scan = (
+            is_xpu() and not envs.SGLANG_DISABLE_MAMBA1_TRITON_SCAN.get()
         )
 
         # out_proj: intermediate -> hidden (input sharded, RowParallel reduces).
@@ -355,6 +363,23 @@ class MambaMixer1(nn.Module):
         )  # (tokens, dim)
 
         dt, B, C = self._ssm_params(conv_out)
+
+        if self.use_triton_scan:
+            mamba1_scan_prefill(
+                x=conv_out,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=self.D,
+                gate=gate,
+                out=out,
+                ssm_state=ssm_state,
+                state_indices=state_indices,
+                query_start_loc=query_start_loc,
+                has_initial=has_initial,
+            )
+            return
 
         # Sequential selective scan per sequence (portable, device-agnostic).
         seq_lens = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
