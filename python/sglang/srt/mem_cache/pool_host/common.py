@@ -15,7 +15,7 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap_ex
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
 
@@ -32,6 +32,9 @@ class HostTensorAllocator:
         """Initialize the HostTensorAllocator."""
         self.dtype = None
         self.dims = None
+        # Storage base address -> mapped length, for allocators whose mapping is
+        # rounded up past the tensor's own bytes. See mapped_size_for().
+        self._mapped_sizes = {}
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert device == "cpu", (
@@ -39,7 +42,24 @@ class HostTensorAllocator:
         )
         self.dtype = dtype
         self.dims = dims
-        return alloc_mmap(dims, dtype)
+        tensor, mapped_size = alloc_mmap_ex(dims, dtype)
+        if tensor.numel() > 0 and mapped_size > 0:
+            self._mapped_sizes[int(tensor.untyped_storage().data_ptr())] = int(
+                mapped_size
+            )
+        return tensor
+
+    def mapped_size_for(self, ptr: int) -> int:
+        """Mapped length in bytes of the allocation whose storage base is *ptr*.
+
+        Larger than the tensor's own bytes whenever the mapping was rounded up
+        to the page size. RDMA registration needs the mapped length, because a
+        HugeTLB VMA cannot be split inside a huge page. Subclasses whose
+        backing allocator already places the mapping on registration-sized
+        boundaries (e.g. MooncakeHostTensorAllocator, whose C++ side widens a
+        registration to the whole shared-memory segment) return 0.
+        """
+        return int(getattr(self, "_mapped_sizes", {}).get(int(ptr), 0))
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):

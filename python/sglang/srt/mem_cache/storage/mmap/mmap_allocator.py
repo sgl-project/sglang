@@ -169,6 +169,20 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
 
     The tensor owns the mapping; munmap fires when the tensor is freed.
     """
+    return alloc_mmap_ex(dims, dtype)[0]
+
+
+def alloc_mmap_ex(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int]:
+    """`alloc_mmap`, additionally returning the mapped length in bytes.
+
+    The mapping is rounded up to the page size (the HugeTLB page size when
+    SGLANG_HUGEPAGE_SIZE is set), so it can be longer than the tensor's own
+    ``numel() * element_size()``. Callers that hand the tensor to an RDMA
+    registration must register the *mapped* length instead: a HugeTLB VMA
+    cannot be split at a boundary that falls inside a huge page, and the
+    transfer engine madvise()s the registered range, so a registration sized to
+    the tensor alone fails with EINVAL.
+    """
     # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
     # works correctly in tests.
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
@@ -200,9 +214,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         else:
             try:
                 array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
-                return torch.frombuffer(
+                tensor = torch.frombuffer(
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
+                return tensor, alloc_bytes
             except OSError as e:
                 logger.error(
                     "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
@@ -219,9 +234,10 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     if num_threads > 0:
         try:
             mm = _mmap_private_parallel_prefaulted(alloc_bytes, num_threads)
-            return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(
+            tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(
                 dims
             )
+            return tensor, alloc_bytes
         except OSError as e:
             logger.error(
                 "Parallel private host allocation failed (%s); falling back to the "
@@ -229,7 +245,8 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
                 e,
             )
     mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
-    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    tensor = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    return tensor, alloc_bytes
 
 
 def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.mmap]:
