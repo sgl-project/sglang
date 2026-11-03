@@ -20,6 +20,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_test_utils import _flush_cache
 from sglang.test.mooncake_utils import MooncakeTestServices
@@ -70,6 +72,9 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
                 "--mem-fraction-static",
                 "0.85",
                 "--enable-cache-report",
+                # The restored round must prove it read the store, not just
+                # reproduce the same answers with an empty cache.
+                "--enable-metrics",
                 "--enable-unified-cache-external-linker",
             ],
             env=unified_radix_tree_server_env("python", **cls.mooncake.server_env()),
@@ -77,6 +82,21 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
         cls.addClassCleanup(
             terminate_and_kill_process_tree, cls.process, wait_timeout=60
         )
+
+    def _store_cached_tokens(self) -> float:
+        """Store-served prompt tokens so far, from the Prometheus counters.
+
+        The linker reports its hits as the `host` cache source; a device hit is
+        what an unchanged prompt would get within one round.
+        """
+        total = 0.0
+        metrics = requests.get(f"{self.base_url}/metrics", timeout=30).text
+        for line in metrics.splitlines():
+            if not line.startswith("sglang:cached_tokens_total"):
+                continue
+            if 'cache_source="host"' in line:
+                total += float(line.rsplit(" ", 1)[1])
+        return total
 
     def _score(self) -> tuple[dict, list[str]]:
         metrics = run_sgl_eval(
@@ -106,8 +126,18 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
         cold_metrics, cold_generations = self._score()
 
         _flush_cache(self.base_url)
+        store_tokens_before = self._store_cached_tokens()
 
         restored_metrics, restored_generations = self._score()
+        restored_store_tokens = self._store_cached_tokens() - store_tokens_before
+
+        # Without this the equality checks below would also pass on a run whose
+        # lookup missed: deterministic decoding hides an entirely cold cache.
+        self.assertGreater(
+            restored_store_tokens,
+            0,
+            "the restored round served no prompt tokens from the store",
+        )
 
         for name, metrics in (("cold", cold_metrics), ("restored", restored_metrics)):
             self.assertGreaterEqual(
@@ -128,6 +158,7 @@ class TestPlainMLALinkerAccuracy(CustomTestCase):
             f"{_DATASET}: cold={cold_metrics['score']:.4f} "
             f"restored={restored_metrics['score']:.4f} "
             f"examples={_NUM_EXAMPLES} "
+            f"store_tokens={restored_store_tokens:.0f} "
             f"latency cold={cold_metrics['latency']:.1f}s "
             f"restored={restored_metrics['latency']:.1f}s",
             flush=True,
