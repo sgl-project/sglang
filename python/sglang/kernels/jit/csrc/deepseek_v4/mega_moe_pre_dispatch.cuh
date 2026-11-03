@@ -3,6 +3,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -182,6 +183,8 @@ struct MegaMoEPreDispatchKernel {
       mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 1, kWriteSharedSF, kCopyTopk>;
   static constexpr auto kernel_two_chunks =
       mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 2, kWriteSharedSF, kCopyTopk>;
+  static constexpr auto kernel_four_chunks =
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, 4, kWriteSharedSF, kCopyTopk>;
   static constexpr auto kernel_multi_chunk =
       mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, 1, kWriteSharedSF, kCopyTopk>;
 
@@ -273,7 +276,10 @@ struct MegaMoEPreDispatchKernel {
     const bool two_chunks_per_thread =
         one_chunk_per_thread && num_chunks % (2u * device::kWarpThreads) == 0 && top_k <= num_chunks / 2u &&
         2u * num_chunks > static_cast<uint32_t>(max_threads_per_sm(device.unwrap().device_id));
-    const uint32_t chunks_per_thread = two_chunks_per_thread ? 2u : 1u;
+    const bool four_chunks_per_thread = two_chunks_per_thread && num_chunks % (4u * device::kWarpThreads) == 0 &&
+                                        top_k <= num_chunks / 4u &&
+                                        num_tokens >= 6u * runtime::get_sm_count(device.unwrap().device_id);
+    const uint32_t chunks_per_thread = four_chunks_per_thread ? 4u : (two_chunks_per_thread ? 2u : 1u);
     const auto block_size = std::min(num_chunks, kMaxBlockThreads) / chunks_per_thread;
     // The quant group absmax is a full-warp-mask shuffle, so either the row fits
     // one iteration or its tail iteration is entered by whole warps.
@@ -323,9 +329,10 @@ struct MegaMoEPreDispatchKernel {
     };
 
     if (num_total_blocks == 0) return;
-    const auto kernel = two_chunks_per_thread  ? kernel_two_chunks
-                        : one_chunk_per_thread ? kernel_one_chunk
-                                               : kernel_multi_chunk;
+    const auto kernel = four_chunks_per_thread  ? kernel_four_chunks
+                        : two_chunks_per_thread ? kernel_two_chunks
+                        : one_chunk_per_thread  ? kernel_one_chunk
+                                                : kernel_multi_chunk;
     LaunchKernel(num_total_blocks, block_size, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
