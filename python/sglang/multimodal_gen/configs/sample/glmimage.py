@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -16,10 +16,21 @@ class GlmImageSamplingParams(SamplingParams):
     guidance_scale: float = 1.5
     num_inference_steps: int = 30
 
+    # Preserve the user-facing canvas before width/height are expanded to the
+    # D32 generation grid. These fields intentionally participate in dynamic
+    # batch compatibility because every item in a decoded tensor batch must use
+    # the same crop.
+    requested_width: int | None = field(default=None, init=False)
+    requested_height: int | None = field(default=None, init=False)
+
     def _adjust(self, server_args):
         requested_width = self.width
         requested_height = self.height
         if self.width is not None and self.height is not None:
+            if self.requested_width is None:
+                self.requested_width = requested_width
+            if self.requested_height is None:
+                self.requested_height = requested_height
             self.width, self.height = align_glm_image_resolution(
                 self.width, self.height
             )

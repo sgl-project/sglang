@@ -1,6 +1,6 @@
 import re
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.glmasr import GlmAsrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -75,7 +75,7 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
         )
         if base_output is None:
             return None
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         return MultimodalProcessorOutput(

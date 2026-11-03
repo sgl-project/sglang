@@ -11,6 +11,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    msgpack_encode,
     sock_recv,
 )
 
@@ -23,7 +24,6 @@ _WORK_REQ_TYPES = (
 
 
 class ScriptedTokenizerRecvProxy:
-
     def __init__(self, *, underlying: zmq.Socket) -> None:
         self._underlying = underlying
         self._buffer: deque = deque()
@@ -42,9 +42,7 @@ class ScriptedTokenizerRecvProxy:
         )
 
     def recv(self, flags: int = 0) -> bytes:
-        raise NotImplementedError(
-            "TODO: support ScriptedTokenizerRecvProxy.recv for msgpack IPC"
-        )
+        return msgpack_encode(self.recv_pyobj(flags))
 
     def wait_until_arrived(
         self,

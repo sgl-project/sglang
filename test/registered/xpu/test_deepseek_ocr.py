@@ -11,8 +11,9 @@ from unittest.mock import patch
 import requests
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -42,8 +43,9 @@ class TestDeepSeekOCR(CustomTestCase):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--mem-fraction-static",
+            "0.7",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,6 +38,7 @@ __all__ = [
     "make_write_plan",
     "make_write_plan_pair",
     "read_slot_fields",
+    "run_canary_info_kernel_pair",
     "stamp_clean_chain",
     "stamp_pair",
     "to_signed_int64",
@@ -324,9 +326,9 @@ def assert_canary_state_equal(
     *, log_a: FakeViolationLog, log_b: FakeViolationLog
 ) -> None:
     for name in ("ring", "write_index", "slot_run_counter", "kernel_run_counter"):
-        assert torch.equal(
-            getattr(log_a, name), getattr(log_b, name)
-        ), f"{name} diverged (CUDA vs ref)"
+        assert torch.equal(getattr(log_a, name), getattr(log_b, name)), (
+            f"{name} diverged (CUDA vs ref)"
+        )
 
 
 def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None:
@@ -334,11 +336,23 @@ def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None
 
 
 def assert_only_bits_set(fail_bits: int, expected_bits: int) -> None:
-    assert (
-        fail_bits & expected_bits
-    ) == expected_bits, (
+    assert (fail_bits & expected_bits) == expected_bits, (
         f"missing expected bits: expected {expected_bits:#b} got {fail_bits:#b}"
     )
-    assert (
-        fail_bits & ~expected_bits
-    ) == 0, f"unexpected extra bits: got {fail_bits:#b} extras {fail_bits & ~expected_bits:#b}"
+    assert (fail_bits & ~expected_bits) == 0, (
+        f"unexpected extra bits: got {fail_bits:#b} extras {fail_bits & ~expected_bits:#b}"
+    )
+
+
+def run_canary_info_kernel_pair(
+    *,
+    launch: Callable[..., None],
+    launch_ref: Callable[..., None],
+    out_like: torch.Tensor,
+    **inputs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_kernel = torch.full_like(out_like, -1)
+    out_ref = torch.full_like(out_like, -1)
+    launch(**inputs, out=out_kernel)
+    launch_ref(**inputs, out=out_ref)
+    return out_kernel, out_ref

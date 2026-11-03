@@ -1,4 +1,4 @@
-"""Online (config-driven) quantized FusedMoE methods for Ascend NPU.
+"""Online (config-driven) quantized FusedMoE methods for NPU.
 
 These are the ``--quantization <scheme>`` entry points: the checkpoint holds
 BF16/FP16 expert weights and the per-gmm kernels quantize them at load time.
@@ -15,8 +15,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
-from sglang.srt.layers.moe.moe_runner import MoeRunner
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    create_ascend_moe_runner,
+)
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
 if TYPE_CHECKING:
@@ -28,7 +30,7 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
     """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on A5).
 
     Weight creation, weight post-processing and the forward pass are identical
-    to the unquantized Ascend path — the only difference is which per-gmm kernel
+    to the unquantized NPU path — the only difference is which per-gmm kernel
     the layer gets, so everything but ``create_moe_runner`` is inherited.
     ``NPUMXFP8MoEMethod`` then quantizes the BF16 expert weights to MXFP8 in
     ``process_weights_after_loading``.
@@ -54,12 +56,12 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
                 f"'ascend', got {backend.value!r}."
             )
 
-        # The kernels must be attached before the runner is built:
-        # AscendRunnerCore.__init__ reads layer.w2_kernel to pick its activation.
-        layer.w13_kernel = NPUMXFP8MoEMethod("w13")
-        layer.w2_kernel = NPUMXFP8MoEMethod("w2")
-        moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        self.runner = create_ascend_moe_runner(
+            layer,
+            moe_runner_config,
+            w13_kernel=NPUMXFP8MoEMethod("w13"),
+            w2_kernel=NPUMXFP8MoEMethod("w2"),
+        )
         # Inherited apply() consults this; aiter is CUDA/ROCm-only.
         self._aiter_runner = None

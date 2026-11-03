@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 if is_cuda():
     from sglang.kernels.ops.gemm import bmm_fp8
@@ -72,8 +72,7 @@ class MiniCPM3MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -94,7 +93,6 @@ def input_to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 class MiniCPM3AttentionMLA(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

@@ -3,7 +3,7 @@ import unittest
 import openai
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -57,9 +57,9 @@ class TestFimCompletion(CustomTestCase):
         assert response.id
         assert response.created
         assert response.object == "text_completion"
-        assert (
-            response.usage.prompt_tokens == num_prompt_tokens
-        ), f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        assert response.usage.prompt_tokens == num_prompt_tokens, (
+            f"{response.usage.prompt_tokens} vs {num_prompt_tokens}"
+        )
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 

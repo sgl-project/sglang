@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -271,8 +273,12 @@ def _selector_walk_kernel(
             tl.float32
         )
         if greedy:
-            best = tl.max(scores, axis=0)
-            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            # Same pick as torch.argmax: the first NaN if any, else the first max.
+            is_nan = scores != scores
+            best = tl.max(tl.where(is_nan, -float("inf"), scores), axis=0)
+            has_nan = tl.max(is_nan.to(tl.int32), axis=0) > 0
+            hit = tl.where(has_nan, is_nan, scores == best)
+            index = tl.min(tl.where(hit, offsets, top_k), axis=0)
             probabilities = tl.where(offsets == index, 1.0, 0.0)
         else:
             scaled = scores / temperature
@@ -314,3 +320,82 @@ def selector_walk_triton(
         num_warps=1,
     )
     return tokens, q_rows
+
+
+@triton.jit
+def _fused_correct_drafts_and_bonus_kernel(
+    candidates_ptr,
+    target_predict_ptr,
+    num_correct_drafts_ptr,
+    bonus_tokens_ptr,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    in_row = offs < block_size - 1
+    drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
+    targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
+    eq = (drafts == targets) & in_row
+    # Leading-match count = index of the first mismatch lane; lanes past the
+    # row and all-match rows both resolve to block_size - 1 via the min.
+    num_correct = tl.min(tl.where(eq, BLOCK, offs), 0)
+    bonus_token = tl.load(target_predict_ptr + b * block_size + num_correct)
+    tl.store(num_correct_drafts_ptr + b, num_correct.to(tl.int32))
+    tl.store(bonus_tokens_ptr + b, bonus_token.to(tl.int64))
+
+
+def compute_dflash_correct_drafts_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
+
+    Args:
+        candidates: Token ids proposed by the DFlash draft, including the current token.
+            Shape: [bs, block_size]. candidates[:, 0] is the current token.
+        target_predict: Token ids predicted by the target model for each position in the block.
+            Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
+
+    Returns:
+        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
+        bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
+
+    Notes:
+        Matches the reference implementation rule:
+          accept while candidates[:, 1:] == target_predict[:, :-1] consecutively.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if target_predict.shape != candidates.shape:
+        raise ValueError(
+            "target_predict must have the same shape as candidates. "
+            f"candidates.shape={tuple(candidates.shape)}, target_predict.shape={tuple(target_predict.shape)}"
+        )
+
+    bs, block_size = candidates.shape
+    if bs <= 0:
+        raise ValueError(f"batch size must be positive, got {bs}.")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+
+    if candidates.is_cuda:
+        num_correct_drafts = torch.empty(
+            bs, dtype=torch.int32, device=candidates.device
+        )
+        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
+        _fused_correct_drafts_and_bonus_kernel[(bs,)](
+            candidates.contiguous(),
+            target_predict.contiguous(),
+            num_correct_drafts,
+            bonus_tokens,
+            block_size,
+            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
+        )
+        return num_correct_drafts, bonus_tokens
+
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
+    return correct_len.to(torch.int32), bonus.to(torch.int64)

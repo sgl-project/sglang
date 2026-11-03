@@ -511,9 +511,7 @@ def _single_xtml_type(
 def _nonempty_argument_format(key: str, xtml_type: str) -> Format:
     # A token-based end keeps the first close token out of both content formats.
     argument = TagFormat(
-        begin=(
-            f'<|open|>argument key="{_escape_attr(key)}" ' f'type="{xtml_type}"<|sep|>'
-        ),
+        begin=(f'<|open|>argument key="{_escape_attr(key)}" type="{xtml_type}"<|sep|>'),
         content=SequenceFormat(elements=[ExcludeTokenFormat(), AnyTokensFormat()]),
         end=TokenFormat(token=_CLOSE_TOKEN),
     )

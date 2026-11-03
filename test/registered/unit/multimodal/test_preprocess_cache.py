@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.cache import (
     CacheMiss,
     MultimodalPreprocessCache,
@@ -21,11 +21,12 @@ from sglang.srt.multimodal.cache import (
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestMediaIdentity(unittest.TestCase):

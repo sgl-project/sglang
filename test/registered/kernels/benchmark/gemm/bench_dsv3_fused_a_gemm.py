@@ -1,15 +1,15 @@
 """Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs torch.
 
 Run on SM90+ (Hopper or later):
-    python test/registered/jit/benchmark/bench_dsv3_fused_a_gemm.py
+    python test/registered/kernels/benchmark/gemm/bench_dsv3_fused_a_gemm.py
 """
 
 import torch
 import torch.nn.functional as F
 import triton.testing
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
@@ -78,7 +78,7 @@ def benchmark(num_tokens, provider, hd_in):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         print(
             "dsv3_fused_a_gemm JIT kernel requires SM90+ (Hopper). Skipping benchmark."
         )

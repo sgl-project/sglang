@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
     _should_use_verify_shared_kv,
 )
+from sglang.srt.utils import get_hip_version
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,6 +29,7 @@ def _build_inputs(
     h_q,
     head_dim,
     v_head_dim,
+    h_kv=1,
     cache_dtype=torch.bfloat16,
 ):
     device = "cuda"
@@ -42,10 +44,10 @@ def _build_inputs(
         return torch.randn(*shape, dtype=dtype, device=device, generator=generator)
 
     q = randn(num_extend_tokens, h_q, head_dim)
-    k = randn(num_extend_tokens, 1, head_dim)
-    v = randn(num_extend_tokens, 1, v_head_dim)
-    k_buffer = randn(total_prefix, 1, head_dim).to(cache_dtype)
-    v_buffer = randn(total_prefix, 1, v_head_dim).to(cache_dtype)
+    k = randn(num_extend_tokens, h_kv, head_dim)
+    v = randn(num_extend_tokens, h_kv, v_head_dim)
+    k_buffer = randn(total_prefix, h_kv, head_dim).to(cache_dtype)
+    v_buffer = randn(total_prefix, h_kv, v_head_dim).to(cache_dtype)
     qo_indptr = torch.arange(
         0, num_extend_tokens + 1, l_ext, dtype=torch.int32, device=device
     )
@@ -62,17 +64,22 @@ class TestVerifySharedKV(CustomTestCase):
         head_dim,
         v_head_dim,
         h_q=4,
+        h_kv=1,
+        is_causal=True,
         cache_dtype=torch.bfloat16,
         k_scale=1.0,
         v_scale=1.0,
         l_ext=4,
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
+        prefix_lens=(512, 2048),
+        sliding_window_size=-1,
     ):
         inputs = _build_inputs(
-            prefix_lens=[512, 2048],
+            prefix_lens=list(prefix_lens),
             l_ext=l_ext,
             h_q=h_q,
+            h_kv=h_kv,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
             cache_dtype=cache_dtype,
@@ -94,12 +101,13 @@ class TestVerifySharedKV(CustomTestCase):
             kv_indptr,
             kv_indices,
             None,
-            True,
+            is_causal,
             None,
             l_ext,
             k_scale,
             v_scale,
             sm_scale=scale,
+            sliding_window_size=sliding_window_size,
         )
         ran = verify_shared_kv_fwd(
             q,
@@ -112,13 +120,15 @@ class TestVerifySharedKV(CustomTestCase):
             kv_indptr,
             kv_indices,
             None,
-            True,
+            is_causal,
             None,
             l_ext,
             k_scale,
             v_scale,
             sm_scale=scale,
+            sliding_window_size=sliding_window_size,
             max_bs=len(kv_indptr) - 1,
+            allow_sliding_window=sliding_window_size > 0,
         )
 
         self.assertTrue(ran)
@@ -137,6 +147,11 @@ class TestVerifySharedKV(CustomTestCase):
             with self.subTest(l_ext=l_ext):
                 self._run_parity(head_dim=256, v_head_dim=256, l_ext=l_ext)
 
+    @unittest.skipIf(
+        get_hip_version()[:2] == (7, 0),
+        "Triton 3.4 on ROCm 7.0 aborts gfx950 fp8 KV tl.dot "
+        "(triton-lang/triton#8278). Remove once the image uses Triton >= 3.6.",
+    )
     def test_qwen3_5_fp8_kv_cache(self):
         self._run_parity(
             head_dim=256,
@@ -152,18 +167,115 @@ class TestVerifySharedKV(CustomTestCase):
     def test_kimi_k3_absorbed_mla_shape(self):
         self._run_parity(head_dim=576, v_head_dim=512)
 
-    def test_rejects_multiple_local_kv_heads(self):
-        inputs = list(
-            _build_inputs(
-                prefix_lens=[512],
-                l_ext=4,
-                h_q=4,
-                head_dim=256,
-                v_head_dim=256,
+    def test_kimi_k3_dspark_gqa_shape(self):
+        self._run_parity(
+            head_dim=64,
+            v_head_dim=64,
+            h_q=8,
+            h_kv=2,
+            is_causal=False,
+            l_ext=7,
+        )
+
+    def test_windowed_verify_matches_the_extend_kernel(self):
+        """Windowed verify must match the extend kernel at the M3.1 draft's window;
+        prefix lists are pre-windowed by the backend, at most one window long."""
+        for prefix_lens, window in (
+            ((300, 4095), 4095),
+            # The short window hides 0-6 of 16 keys per query, so an off-by-one shows.
+            ((16, 13), 16),
+            # Past 16 requests the combine merges several draft rows per program.
+            ((300, 4095) * 9, 4095),
+        ):
+            with self.subTest(window=window):
+                self._run_parity(
+                    head_dim=128,
+                    v_head_dim=128,
+                    h_q=16,
+                    is_causal=False,
+                    l_ext=7,
+                    prefix_lens=prefix_lens,
+                    sliding_window_size=window,
+                )
+
+    def test_strided_draft_rows_match_contiguous_rows(self):
+        """K/V rows split out of a packed qkv projection (the attention hands them
+        over uncopied) give the bits contiguous rows give."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[300, 4095], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        tokens = q.shape[0]
+        qkv = torch.cat([q.reshape(tokens, -1), k[:, 0], v[:, 0]], dim=-1)
+        k_rows = qkv[:, 16 * 128 : 17 * 128].view(tokens, 1, 128)
+        v_rows = qkv[:, 17 * 128 :].view(tokens, 1, 128)
+        self.assertFalse(v_rows.is_contiguous())
+        outs = []
+        for k_ext, v_ext in (
+            (k_rows, v_rows),
+            (k_rows.contiguous(), v_rows.contiguous()),
+        ):
+            out = torch.empty_like(q)
+            self.assertTrue(
+                verify_shared_kv_fwd(
+                    q,
+                    k_ext,
+                    v_ext,
+                    out,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    False,
+                    None,
+                    7,
+                    1.0,
+                    1.0,
+                    sm_scale=128**-0.5,
+                    sliding_window_size=4095,
+                    max_bs=2,
+                    allow_sliding_window=True,
+                )
+            )
+            outs.append(out)
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+
+    def test_sliding_window_is_declined_unless_the_caller_opts_in(self):
+        """Only the M3.1 draft opts in; every other windowed caller keeps the extend kernel."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[16], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        self.assertFalse(
+            verify_shared_kv_fwd(
+                q,
+                k,
+                v,
+                torch.empty_like(q),
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                7,
+                1.0,
+                1.0,
+                sliding_window_size=16,
             )
         )
-        for index in (1, 2, 3, 4):
-            inputs[index] = inputs[index].expand(-1, 2, -1).contiguous()
+
+    def test_rejects_non_power_of_two_kv_group(self):
+        inputs = _build_inputs(
+            prefix_lens=[512],
+            l_ext=4,
+            h_q=6,
+            h_kv=2,
+            head_dim=256,
+            v_head_dim=256,
+        )
         q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
         output = torch.empty_like(q)
         self.assertFalse(

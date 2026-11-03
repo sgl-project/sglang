@@ -9,11 +9,10 @@ This package contains diffusion pipelines for generating videos and images.
 
 from typing import cast
 
-from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -43,6 +42,8 @@ def build_pipeline(
     2. verify the model config and directory
     3. based on the config, determine the pipeline class
     """
+    from sglang.multimodal_gen.registry import get_model_info
+
     model_path = server_args.model_path
 
     # Check if pipeline class is explicitly specified

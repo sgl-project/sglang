@@ -28,7 +28,7 @@ from sglang.srt.function_call.kimik3_structural_tag import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _CLOSE_TOKEN = "<|close|>"
 _CLOSE_TOKEN_ID = 256
@@ -197,7 +197,7 @@ def test_strict_schema_rejects_invalid_parameters(arguments):
 
 def test_required_allows_response_prefix_but_requires_tools():
     grammar = _grammar([_tool()], tool_choice="required")
-    response = "<|open|>response<|sep|>Checking." "<|close|>response<|sep|>"
+    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)

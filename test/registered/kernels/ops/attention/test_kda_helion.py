@@ -9,10 +9,10 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
+from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
     fused_recurrent_linear_replayssm_decode,
 )
-from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
 from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
@@ -706,6 +706,7 @@ def _compare_prefill(
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    beta_is_raw: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, tokens, heads, key_dim = q.shape
     value_dim = v.size(-1)
@@ -740,7 +741,8 @@ def _compare_prefill(
     k_rows = reference_k.view(batch * tokens, heads, key_dim)
     v_rows = v.view(batch * tokens, heads, value_dim).float()
     gate_rows = reference_gate.view(batch * tokens, heads, key_dim)
-    beta_rows = beta.view(batch * tokens, heads).float()
+    reference_beta = beta.float().sigmoid() if beta_is_raw else beta
+    beta_rows = reference_beta.view(batch * tokens, heads).float()
     out_rows = reference_out.view(batch * tokens, heads, value_dim)
 
     if cu_seqlens is None:
@@ -811,6 +813,7 @@ def _compare_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        beta_is_raw=beta_is_raw,
     )
 
     assert helion_out.data_ptr() == helion_v.data_ptr()
@@ -850,6 +853,42 @@ def test_fixed_partial_prefill_and_state_pool_contract() -> None:
 
     untouched = torch.tensor([0, 2, 4], device="cuda")
     assert torch.equal(helion_state[untouched], state[untouched])
+
+
+def test_raw_beta_prefill_contract() -> None:
+    torch.manual_seed(811)
+    batch, tokens, heads, key_dim, value_dim = 2, 17, 2, 32, 32
+    q = torch.randn(batch, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+    # Keep the unnormalized recurrence numerically contractive while still
+    # exercising the no-QK-L2-normalization path. Unit-scale random keys make
+    # (I - beta * k k^T) expansive and obscure the raw-beta contract with
+    # exponentially amplified BF16 round-off.
+    k = torch.randn_like(q) * 0.05
+    v = torch.randn(
+        batch, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16
+    )
+    # Keep the recurrent decay contractive so the raw-beta check measures the
+    # sigmoid conversion instead of amplifying BF16 round-off exponentially.
+    gate = -torch.rand_like(q) * 0.2
+    raw_beta = torch.linspace(
+        -2,
+        2,
+        steps=batch * tokens * heads,
+        device="cuda",
+    ).reshape(batch, tokens, heads)
+    indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    state = torch.randn(5, heads, value_dim, key_dim, device="cuda") * 0.01
+
+    _compare_prefill(
+        q,
+        k,
+        v,
+        gate,
+        raw_beta,
+        state,
+        indices,
+        beta_is_raw=True,
+    )
 
 
 @pytest.mark.parametrize("is_varlen", [False, True], ids=["fixed", "varlen"])
@@ -1137,6 +1176,111 @@ def test_packed_varlen_prefill_contract(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("tree", [False, True])
+def test_target_verify_contract(dtype, lower_bound, tree):
+    from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+    from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
+    from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+    torch.manual_seed(42)
+    n, t, h, hv, k, v = 4, 6, 2, 4, 128, 128
+    total = 15
+    qkv = torch.randn(1, total, 2 * h * k + hv * v, device="cuda", dtype=torch.bfloat16)
+    q, keys, values = qkv.split([h * k, h * k, hv * v], -1)
+    q = q.view(1, total, h, k)
+    keys = keys.view(1, total, h, k)
+    values = values.view(1, total, hv, v)
+    state = torch.randn(8, hv, v, k, device="cuda", dtype=dtype) * 0.01
+    initial = state.clone()
+    snapshots = torch.full((8, t + 1, hv, v, k), -99.0, device="cuda", dtype=dtype)
+    actual_snapshots = snapshots.clone()
+    args = dict(
+        q=q,
+        k=keys,
+        v=values,
+        a=torch.randn(total, hv * k, device="cuda", dtype=torch.bfloat16),
+        b=torch.randn(total, hv, device="cuda", dtype=torch.bfloat16),
+        A_log=torch.randn(hv, device="cuda"),
+        dt_bias=torch.randn(hv * k, device="cuda"),
+        ssm_states=state,
+        cache_indices=torch.tensor([3, 5, 0, -1], device="cuda", dtype=torch.int32),
+        query_start_loc=torch.tensor(
+            [0, 6, 9, 9, 15], device="cuda", dtype=torch.int32
+        ),
+        intermediate_states_buffer=snapshots,
+        intermediate_state_indices=torch.tensor(
+            [2, 4, 1, -1], device="cuda", dtype=torch.int64
+        ),
+        cache_steps=t,
+        retrieve_parent_token=torch.tensor(
+            [[0, 0, 0, 1, 1, 3]] * n, device="cuda", dtype=torch.int64
+        )
+        if tree
+        else None,
+        lower_bound=lower_bound,
+    )
+    dispatcher = KDAKernelDispatcher(
+        decode_backend=LinearAttnKernelBackend.TRITON,
+        prefill_backend=LinearAttnKernelBackend.TRITON,
+        verify_backend=LinearAttnKernelBackend.HELION,
+    )
+    reference = TritonKDAKernel()
+    reference_args = args.copy()
+    expected = reference.target_verify(**reference_args)
+    actual_state = state.clone()
+    args["ssm_states"] = actual_state
+    args["intermediate_states_buffer"] = actual_snapshots
+    actual = dispatcher.target_verify(**args)
+    torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(state, initial, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, initial, atol=0, rtol=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = dispatcher.target_verify(**args)
+    actual_snapshots.fill_(-99.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+    torch.testing.assert_close(captured, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_state, initial, atol=0, rtol=0)
+
+    # Accept two tokens from row 0 and one from row 1. The path 0 -> 1
+    # is also valid for the tree case. Commit each backend's own snapshots.
+    state[3].copy_(snapshots[2, 1])
+    state[5].copy_(snapshots[4, 0])
+    actual_state[3].copy_(actual_snapshots[2, 1])
+    actual_state[5].copy_(actual_snapshots[4, 0])
+    torch.testing.assert_close(actual_state, state, atol=0.003, rtol=0.02)
+    committed = state.clone()
+    actual_committed = actual_state.clone()
+
+    # Keep captured addresses fixed while changing inputs and reusing the
+    # state/snapshot slots in a different request order for the next round.
+    qkv.copy_(torch.randn_like(qkv))
+    args["a"].copy_(torch.randn_like(args["a"]))
+    args["b"].copy_(torch.randn_like(args["b"]))
+    args["cache_indices"].copy_(
+        torch.tensor([5, 3, 6, -1], device="cuda", dtype=torch.int32)
+    )
+    args["intermediate_state_indices"].copy_(
+        torch.tensor([4, 2, 7, -1], device="cuda", dtype=torch.int64)
+    )
+    snapshots.fill_(-99.0)
+    actual_snapshots.fill_(-99.0)
+    expected = reference.target_verify(**reference_args)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(actual_snapshots, snapshots, atol=0.003, rtol=0.02)
+    torch.testing.assert_close(state, committed, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, actual_committed, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

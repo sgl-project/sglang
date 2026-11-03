@@ -49,11 +49,7 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
-    suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
-    )
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
 
     expected = {}
     for suite_name, suite_info in suites.items():
@@ -156,7 +152,7 @@ def print_missing_standalone_estimates_summary(
     print("\n" + "=" * 60)
     print(
         "Add standalone estimate(s) to "
-        "python/sglang/multimodal_gen/test/run_suite.py"
+        "python/sglang/multimodal_gen/test/runner/diffusion_suite_runner.py"
     )
     print("=" * 60)
     print("The following standalone file(s) used fallback estimate 300.0s.")

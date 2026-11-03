@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config(server_args) -> SparseConfig:
+def _parse_sparse_config() -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
@@ -66,7 +67,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
-    extra_config_str = server_args.hisparse_config
+    extra_config_str = get_memory().hisparse_config
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)
@@ -111,9 +112,9 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     )
 
 
-def parse_hisparse_config(server_args) -> SparseConfig:
-    """Parse hisparse config from server_args, returning defaults if no config provided."""
-    return _parse_sparse_config(server_args)
+def parse_hisparse_config() -> SparseConfig:
+    """The hisparse config as resolved, with defaults where none was given."""
+    return _parse_sparse_config()
 
 
 def create_sparse_coordinator(
@@ -122,10 +123,9 @@ def create_sparse_coordinator(
     token_to_kv_pool,
     start_layer: int,
     end_layer: int,
-    server_args,
     **kwargs,
 ) -> SparseCoordinator:
-    config = _parse_sparse_config(server_args)
+    config = _parse_sparse_config()
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool

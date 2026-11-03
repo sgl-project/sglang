@@ -4,13 +4,17 @@ from functools import lru_cache
 
 import torch
 
+from sglang.kernels.ops.gemm.fp8_kernel import (
+    w8a8_block_fp8_matmul_deepgemm,
+    w8a8_block_fp8_matmul_triton,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
-    w8a8_block_fp8_matmul,
 )
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -46,9 +50,9 @@ def native_per_token_group_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
     Note that only `torch.float8_e4m3fn` is supported for now.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
@@ -342,8 +346,17 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
     return C
 
 
-class TestW8A8BlockFP8Matmul(CustomTestCase):
+def w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype):
+    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return w8a8_block_fp8_matmul_deepgemm(
+            A, B, As, Bs, block_size, output_dtype=output_dtype
+        )
+    return w8a8_block_fp8_matmul_triton(
+        A, B, As, Bs, block_size, output_dtype=output_dtype
+    )
 
+
+class TestW8A8BlockFP8Matmul(CustomTestCase):
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
         M = [1, 7, 83, 512, 2048]
@@ -748,7 +761,6 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         )
 
     def test_w8a8_block_fp8_batched_deep_gemm(self):
-
         for params in itertools.product(
             self.M,
             self.N,

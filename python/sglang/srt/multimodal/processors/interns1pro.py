@@ -1,12 +1,9 @@
 import time
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1pro import InternS1ProForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
     preprocess_video,
@@ -26,7 +23,7 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
             MultimodalDataItem(
                 modality=Modality.IMAGE,
                 offsets=offsets,
-                precomputed_embeddings=embeddings,
+                precomputed_embeddings=embeddings[Modality.IMAGE],
             )
         ]
 
@@ -69,7 +66,7 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
 
         preprocess_time = time.perf_counter()
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             video_metadata=video_metadata,

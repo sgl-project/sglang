@@ -2,11 +2,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -199,7 +196,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             )
             if base_output is None:
                 return None
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 base_output, self.mm_tokens
             )
             ret = MultimodalProcessorOutput(

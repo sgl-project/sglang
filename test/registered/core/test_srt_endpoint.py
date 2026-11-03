@@ -19,7 +19,7 @@ import requests
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=260, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=239, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
@@ -259,7 +259,6 @@ class TestSRTEndpoint(CustomTestCase):
                 for logprob_start_len in [0, 500, 2500, 5000, 25000]:
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
-
                             if logprob_start_len >= input_len:
                                 continue
 
@@ -888,7 +887,7 @@ class TestTokenizeDetokenize(CustomTestCase):
         r2 = self.session.post(
             self.detokenize_url, json={"model": self.model, "tokens": [1, -1, 2]}
         )
-        self.assertEqual(r2.status_code, 500)
+        self.assertEqual(r2.status_code, 400)
 
 
 # ---------------------------------------------------------------------------

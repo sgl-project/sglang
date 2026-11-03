@@ -94,7 +94,9 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         assert config.symmetric, "Only symmetric quantization is supported"
         assert (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
-        ), f"W4AFP8MoE requires pack-quantized format, got {self.quant_config.quant_format}"
+        ), (
+            f"W4AFP8MoE requires pack-quantized format, got {self.quant_config.quant_format}"
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -288,9 +290,9 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

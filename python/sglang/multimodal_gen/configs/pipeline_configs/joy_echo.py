@@ -4,8 +4,8 @@ from typing import Optional
 
 from sglang.multimodal_gen.configs.models.dits.joy_echo import JoyEchoConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def _default_joy_echo_vae_config() -> LTXVideoVAEConfig:
@@ -58,3 +58,24 @@ class JoyEchoPipelineConfig(LTX2PipelineConfig):
     video_memory_frame_selection_mode: str = "center"
 
     late_layer_ratio: float = 0.7
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.joy_echo import (
+        JoyEchoSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=JoyEchoSamplingParams,
+        pipeline_config_cls=JoyEchoPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Echo",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+                and "image-edit" not in hf_id.lower()
+            ),
+        ],
+    )

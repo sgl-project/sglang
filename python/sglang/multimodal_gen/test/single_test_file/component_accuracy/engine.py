@@ -26,10 +26,12 @@ except ImportError:
     AutoVisionTextModel = None
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
+    get_local_torch_device,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     destroy_model_parallel,
-    get_local_torch_device,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
@@ -431,9 +433,9 @@ class AccuracyEngine:
         ).item()
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         logger.info("[%s] Rank %s CosSim=%.6f", name, rank, cos_sim)
-        assert (
-            cos_sim > threshold
-        ), f"Accuracy failure in {name}: CosSim {cos_sim:.4f} < {threshold}"
+        assert cos_sim > threshold, (
+            f"Accuracy failure in {name}: CosSim {cos_sim:.4f} < {threshold}"
+        )
 
     @staticmethod
     def transfer_weights(
@@ -452,7 +454,9 @@ class AccuracyEngine:
         )
         if mapping:
             source_state, _ = hf_to_custom_state_dict(
-                source_state, get_param_names_mapping(mapping)
+                source_state,
+                get_param_names_mapping(mapping),
+                valid_target_names=set(target.state_dict()),
             )
 
         lookup = build_state_lookup(source_state)

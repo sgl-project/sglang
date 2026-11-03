@@ -5,7 +5,6 @@
 """Utilities for downloading, loading, initializing and verifying model weights."""
 
 import hashlib
-import json
 import os
 import tempfile
 from collections import defaultdict
@@ -19,6 +18,10 @@ from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _DEFAULT_SAFETENSORS_INDEX,
+    _list_safetensors_files,
+)
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_readers import (
     FALLBACK_READER,
@@ -31,6 +34,40 @@ from sglang.multimodal_gen.runtime.loader.weight_readers.runai_streamer import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def checkpoint_weights_iterator(
+    model_path: str,
+    *,
+    to_cpu: bool = True,
+    key_filter: Callable[[str], bool] | None = None,
+    index_file: str = _DEFAULT_SAFETENSORS_INDEX,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Read a materialized component checkpoint, preferring indexed safetensors."""
+    files = _list_safetensors_files(
+        model_path, index_file=index_file, key_filter=key_filter
+    )
+    if files:
+        yield from safetensors_weights_iterator(
+            files, to_cpu=to_cpu, key_filter=key_filter
+        )
+        return
+    if os.path.isfile(model_path):
+        files = [model_path] if model_path.endswith((".bin", ".pt")) else []
+    else:
+        for suffix in ("*.bin", "*.pt"):
+            files = filter_files_not_needed_for_inference(
+                sorted(str(path) for path in Path(model_path).glob(suffix))
+            )
+            if files:
+                break
+    if not files:
+        raise ValueError(
+            f"No safetensors, bin, or pt checkpoint found at {model_path!r}"
+        )
+    for name, tensor in pt_weights_iterator(files, to_cpu=to_cpu):
+        if key_filter is None or key_filter(name):
+            yield name, tensor
 
 
 def _disable_runai_streamer_rank_discovery_collective() -> None:
@@ -77,7 +114,6 @@ temp_dir = tempfile.gettempdir()
 
 
 class DisabledTqdm(tqdm):
-
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)
@@ -100,38 +136,6 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
-
-
-# For models like Mistral-7B-v0.3, there are both sharded
-# safetensors files and a consolidated safetensors file.
-# Passing both of these to the weight loader functionality breaks.
-# So, we use the index_file to
-# look up which safetensors files should be used.
-def filter_duplicate_safetensors_files(
-    hf_weights_files: list[str],
-    hf_folder: str,
-    index_file: str,
-    key_filter: Callable[[str], bool] | None = None,
-) -> list[str]:
-    # model.safetensors.index.json is a mapping from keys in the
-    # torch state_dict to safetensors file holding that weight.
-    index_file_name = os.path.join(hf_folder, index_file)
-    if not os.path.isfile(index_file_name):
-        return hf_weights_files
-
-    # Iterate through the weight_map (weight_name: safetensors files)
-    # to identify weights that we should use.
-    with open(index_file_name) as f:
-        weight_map = json.load(f)["weight_map"]
-    weight_files_in_index = set()
-    for weight_name in weight_map:
-        # remove only shards whose indexed tensors are all filtered
-        if key_filter is not None and not key_filter(weight_name):
-            continue
-        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
-    # Filter out any fields that are not found in the index file.
-    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
-    return hf_weights_files
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
@@ -164,7 +168,7 @@ def _scan_safetensors_files(
     hf_weights_files: list[str],
 ) -> tuple[list[str], dict[str, set[str]]]:
     """Validate headers and detect cross-file duplicate keys in one pass."""
-    corrupted_files: list[str] = []
+    unreadable_files: list[str] = []
     key_to_file: dict[str, str] = {}
     duplicate_files_by_key: dict[str, set[str]] = defaultdict(set)
 
@@ -179,14 +183,14 @@ def _scan_safetensors_files(
                         duplicate_files_by_key[name].update((previous_file, st_file))
         except Exception as e:
             logger.error(
-                "Corrupted safetensors file detected: %s - %s: %s",
+                "Failed to read safetensors file: %s - %s: %s",
                 st_file,
                 type(e).__name__,
                 str(e),
             )
-            corrupted_files.append(st_file)
+            unreadable_files.append(st_file)
 
-    return corrupted_files, duplicate_files_by_key
+    return unreadable_files, duplicate_files_by_key
 
 
 def _raise_if_duplicate_safetensors_keys(
@@ -240,40 +244,27 @@ def safetensors_weights_iterator(
             if use_runai_model_streamer
             else FALLBACK_READER.name
         )
+    elif to_cpu:
+        # A host-bound load keeps the checkpoint mapping: mapped pages are the
+        # zero-copy optimum there, and everything downstream that budgets host
+        # memory (layerwise offload, pinning, the mapped-weight gate) assumes
+        # them. The streamer materializes anonymous copies instead -- measured
+        # as the whole 61.7 GB DiT landing in host anon on the 5090 CI runner
+        # -- and its strengths (direct-to-GPU, remote streaming) do not apply
+        # to a local file headed for the CPU.
+        requested = FALLBACK_READER.name
     backend = select_weight_reader(
         requested=requested, needs_key_filter=key_filter is not None
     )
 
-    # Validate files before loading
-    corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
-
-    if corrupted_files:
-        # Delete corrupted files (both symlink and blob if applicable)
-        for file_path in corrupted_files:
-            try:
-                if os.path.islink(file_path):
-                    blob_path = os.path.realpath(file_path)
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted symlink: %s", os.path.basename(file_path)
-                    )
-                    if os.path.exists(blob_path):
-                        os.remove(blob_path)
-                        logger.info(
-                            "Removed corrupted blob: %s", os.path.basename(blob_path)
-                        )
-                elif os.path.isfile(file_path):
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted file: %s", os.path.basename(file_path)
-                    )
-            except Exception as e:
-                logger.warning("Failed to remove corrupted file %s: %s", file_path, e)
-
+    # validation must not modify checkpoints or shared cache blobs
+    unreadable_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
+    if unreadable_files:
         raise RuntimeError(
-            f"Found {len(corrupted_files)} corrupted safetensors file(s). "
-            f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
-            "Please retry - the files will be re-downloaded automatically."
+            f"Cannot read {len(unreadable_files)} safetensors file(s): "
+            f"{[os.path.basename(f) for f in unreadable_files]}. "
+            "Files were not modified. Check permissions and checkpoint integrity; "
+            "repair or re-download the checkpoint if needed."
         )
 
     _raise_if_duplicate_safetensors_keys(duplicate_files_by_key)
@@ -289,23 +280,8 @@ def safetensors_weights_iterator(
 
 
 def _load_pt_file(bin_file: str, device: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
-
-    PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
-    """
-    try:
-        return torch.load(bin_file, map_location=device, weights_only=True)
-    except RuntimeError as e:
-        if "legacy .tar format" in str(e):
-            logger.warning(
-                "Loading %s with weights_only=False (legacy tar format)",
-                os.path.basename(bin_file),
-            )
-            return torch.load(bin_file, map_location=device, weights_only=False)
-        raise
+    """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
+    return torch.load(bin_file, map_location=device, weights_only=True)
 
 
 def pt_weights_iterator(
@@ -330,23 +306,46 @@ def pt_weights_iterator(
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        assert param.size() == loaded_weight.size(), (
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
 
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
+        param.data.copy_(loaded_weight)
+
+
+def load_stacked_weight(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict[str, torch.nn.Parameter],
+    stacked_params_mapping: Iterable[tuple[str, str, str | int]],
+) -> str | None:
+    """Load a known parameter or its fused shard; return None for unknown names."""
+    for param_name, weight_name, shard_id in stacked_params_mapping:
+        if weight_name not in name:
+            continue
+        name = name.replace(weight_name, param_name)
+        if name not in params_dict:
+            continue
+        param = params_dict[name]
+        param.weight_loader(param, loaded_weight, shard_id)
+        return name
+
+    if name not in params_dict:
+        return None
+    param = params_dict[name]
+    try:
+        weight_loader = param.weight_loader
+    except AttributeError:
+        weight_loader = default_weight_loader
+    weight_loader(param, loaded_weight)
+    return name
 
 
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
@@ -409,6 +408,36 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+def load_llm_encoder_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    stacked_params_mapping: Iterable[tuple[str, str, str | int]],
+    *,
+    strip_prefix: str = "",
+) -> set[str]:
+    """Load Llama/Qwen-style encoder weights, excluding rotary cache tensors."""
+    loaded_params: set[str] = set()
+    for name, loaded_weight in weights:
+        if strip_prefix and name.startswith(strip_prefix):
+            name = name[len(strip_prefix) :]
+        if (
+            "rotary_emb.inv_freq" in name
+            or "rotary_emb.cos_cached" in name
+            or "rotary_emb.sin_cached" in name
+        ):
+            continue
+        if "scale" in name:
+            name = maybe_remap_kv_scale_name(name, params_dict)
+            if name is None:
+                continue
+        name = load_stacked_weight(
+            name, loaded_weight, params_dict, stacked_params_mapping
+        )
+        if name is not None:
+            loaded_params.add(name)
+    return loaded_params
 
 
 def compute_weights_checksum(

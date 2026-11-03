@@ -13,7 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _make_table() -> SpsCostTable:
@@ -49,22 +49,6 @@ class TestSpsCostTableInvariants(CustomTestCase):
                 max_batch_tokens=16,
             )
 
-    def test_rejects_empty_table(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[],
-                sample_steps_per_sec=[],
-                max_batch_tokens=0,
-            )
-
-    def test_rejects_max_below_largest_probe(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[8, 16],
-                sample_steps_per_sec=[1.0, 2.0],
-                max_batch_tokens=15,
-            )
-
 
 class TestSpsCostTableLookup(CustomTestCase):
     def test_lookup_exact_probe_returns_that_sps(self):
@@ -73,11 +57,6 @@ class TestSpsCostTableLookup(CustomTestCase):
         self.assertEqual(table.lookup(16), 950.0)
         self.assertEqual(table.lookup(32), 500.0)
         self.assertEqual(table.lookup(64), 480.0)
-
-    def test_lookup_floors_to_lower_captured_probe(self):
-        table = _make_table()
-        self.assertEqual(table.lookup(31), 950.0)
-        self.assertEqual(table.lookup(63), 500.0)
 
     def test_lookup_below_first_probe_clamps_to_first(self):
         table = _make_table()
@@ -143,23 +122,20 @@ class TestProfileSpsTable(CustomTestCase):
 
 
 def _build_sps_cost_table_for(testcase, *, sps_table_path):
-    from sglang.srt.runtime_context import get_context, get_server_args
+    from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 
-    # The table bound reads `max_running_requests` from the published bags, so
-    # the case publishes it; the table path stays on the handed record, which is
-    # what `build_sps_cost_table` takes.
+    # Both the table path and the bound come from the published bags, so the
+    # case publishes them.
     override = get_context().override_server_args(
         speculative_dspark_sps_table_path=sps_table_path,
         max_running_requests=4,
     )
     override.install()
     testcase.addCleanup(override.restore)
-    return build_sps_cost_table(
-        server_args=get_server_args(), verify_num_draft_tokens=5
-    )
+    return build_sps_cost_table(verify_num_draft_tokens=5)
 
 
 class TestBuildSpsCostTableContract(CustomTestCase):

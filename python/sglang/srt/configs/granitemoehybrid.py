@@ -26,6 +26,12 @@ MAMBA = "mamba"
 ATTENTION = "attention"
 
 
+def _to_sglang_layer_types(layer_types: list[str]) -> list[str]:
+    # transformers >= 5.15 uses "linear_attention" / "full_attention"
+    aliases = {"linear_attention": MAMBA, "full_attention": ATTENTION}
+    return [aliases.get(t, t) for t in layer_types]
+
+
 class GraniteMoeHybridConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`GraniteMoeHybridModel`]. It is used to instantiate a
@@ -186,7 +192,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
                 else:
                     self.layer_types.append(MAMBA)
         else:
-            self.layer_types = layer_types
+            self.layer_types = _to_sglang_layer_types(layer_types)
 
         # Validate layer_types
         if len(self.layer_types) != self.num_hidden_layers:
@@ -265,6 +271,9 @@ class GraniteMoeHybridConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        # `PreTrainedConfig` rewrites legacy layer_types on init, so map them back.
+        self.layer_types = _to_sglang_layer_types(self.layer_types)
 
     @property
     def mamba_layer_ids(self):

@@ -9,7 +9,6 @@ if TYPE_CHECKING:
 
 
 class ScriptedKvPoolExhauster:
-
     def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
         self._held: List[torch.Tensor] = []
@@ -23,9 +22,9 @@ class ScriptedKvPoolExhauster:
             return
 
         held = allocator.alloc(need)
-        assert (
-            held is not None
-        ), f"exhaust_kv: allocator could not grab {need} tokens to create pressure"
+        assert held is not None, (
+            f"exhaust_kv: allocator could not grab {need} tokens to create pressure"
+        )
         self._held.append(held)
 
     def release(self) -> None:

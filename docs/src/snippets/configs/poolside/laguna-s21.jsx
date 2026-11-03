@@ -63,7 +63,7 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -72,7 +72,7 @@ export const config = {
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
     accuracy: {
       gsm8k_pct:
-`# pip install git+https://github.com/sgl-project/sgl-eval
+`# pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 128`,
@@ -80,7 +80,7 @@ sgl-eval run gsm8k \\
       // Serve with a copy of the model's chat template whose enable_thinking default
       // is flipped to true. For BF16: use --max-tokens 131072 (see Configuration Tips).
       aime25_pct:
-`# pip install git+https://github.com/sgl-project/sgl-eval
+`# pip install sgl-eval
 # Serve with an enable_thinking=true chat template (see Configuration Tips: Thinking).
 # For BF16: use --max-tokens 131072 (see Configuration Tips: BF16 reasoning length).
 sgl-eval run aime25 \\

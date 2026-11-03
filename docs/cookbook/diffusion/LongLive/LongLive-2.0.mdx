@@ -7,7 +7,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["video", "text/image-to-video", "4-step", "multi-shot", "Wan2.2 5B"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/nvidia/longlive2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LongLive 2.0](https://nvlabs.github.io/LongLive/LongLive2/) is NVIDIA's 4-step text/image-to-video model distilled from Wan2.2-TI2V-5B. Its main strength is extending few-step causal generation across prompt changes, so a single request can produce multi-shot sequences without paying a full diffusion schedule for every shot.
 
@@ -15,15 +28,16 @@ Choose it for low-step long or multi-shot generation rather than maximum one-sho
 
 The model weights use the NVIDIA Open Model License. See the [paper](https://arxiv.org/abs/2605.18739) and [GitHub repository](https://github.com/NVlabs/LongLive) for training details.
 
-## 2. SGLang-diffusion Installation
-
-Please refer to the [official SGLang-diffusion installation guide](/docs/sglang-diffusion/installation) for installation instructions.
-
 ## 3. Deployment
 
 ```bash Command
 sglang serve --model-path Rabinovich/LongLive-2.0-5B-Diffusers
 ```
+
+In `auto` mode, GPUs with at least 60 GiB available keep the DiT, text encoder,
+and VAE resident. This uses about 44 GiB on H200 for the 832x480 preset and
+avoids moving encoder and decoder layers from host memory on every request.
+Smaller GPUs retain the layerwise-offload defaults.
 
 If the GPU runs out of memory, move the text encoder, VAE, and DiT to CPU between stages:
 
@@ -36,6 +50,12 @@ sglang serve \
 ```
 
 `Rabinovich/LongLive-2.0-5B-Diffusers` is the Diffusers-format conversion of the official `Efficient-Large-Model/LongLive-2.0-5B` weights.
+
+Intel Xeon CPU deployment is supported with `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu` and the selected LongLive checkpoint.
+
+```bash Command
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu sglang serve --model-path Rabinovich/LongLive-2.0-5B-Diffusers
+```
 
 ## 4. Generation
 
@@ -112,3 +132,9 @@ The image is used as the first-frame condition.
 - SGLang supports T2V sizes 1280x704, 704x1280, 832x480, and 480x832.
 - I2V request images follow the Wan TI2V preprocessing path in SGLang. This is different from the original LongLive dataset resize path.
 - For multi-shot runs, set `num_frames` to match `len(shot_prompts) * chunks_per_shot * 8` latent frames, that is `num_frames = (len(shot_prompts) * chunks_per_shot * 8 - 1) * 4 + 1`.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />

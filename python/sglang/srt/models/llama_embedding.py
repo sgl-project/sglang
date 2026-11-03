@@ -5,7 +5,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
 from sglang.srt.utils import add_prefix
@@ -33,9 +33,9 @@ class LlamaEmbeddingModel(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        assert get_embedding, (
+            "LlamaEmbeddingModel / MistralModel is only used for embedding"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.pooler(hidden_states, forward_batch)
 

@@ -4,7 +4,7 @@ import math
 import torch
 
 from sglang.kernels.ops.attention.linear.lightning_attn import (
-    BailingLinearKernel,
+    lightning_attention,
     linear_decode_forward_triton,
 )
 from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
@@ -21,6 +21,46 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BailingLinearKernel:
+    """
+    Linear attention kernel implementation for Bailing models.
+
+    This class is adapted from MiniMaxText01LinearKernel in vllm:
+    https://github.com/vllm-project/vllm/blob/a9138e85b14047e06300685b48e3485b995425fb/vllm/model_executor/models/minimax_text_01.py#L289
+
+    The implementation maintains the same functionality while being renamed to
+    match our Bailing model naming convention.
+    """
+
+    @staticmethod
+    def jit_linear_forward_prefix(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_caches: torch.Tensor,
+        slope_rate: torch.Tensor,
+        block_size: int,
+        layer_idx: int = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        slope_rate = slope_rate.to(torch.float32)
+        should_pad_dim = q.dim() == 3
+        if should_pad_dim:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        b, h, n, d = q.shape
+        e = d
+        kv_history = kv_caches.reshape(1, h, d, e).contiguous()
+        output, kv_history = lightning_attention(
+            q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
+        )
+        kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
+        assert output.shape[0] == 1, "batch size must be 1"
+        return output.squeeze(0).transpose(0, 1).reshape([n, h * d]).contiguous()
 
 
 class LightningAttentionBackend(MambaAttnBackendBase):
@@ -53,9 +93,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 "--speculative-eagle-topk 1."
             )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -74,14 +112,20 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             if hasattr(model_runner.model_config, "block")
             else 256
         )
-        total_num_heads = model_runner.model_config.hf_config.num_attention_heads
-        num_hidden_layers = model_runner.model_config.hf_config.num_hidden_layers
+        config = model_runner.model_config.hf_config
+        total_num_heads = getattr(
+            config, "num_linear_key_value_heads", config.num_attention_heads
+        )
+        layerwise_decay = getattr(config, "lightning_layerwise_decay", True)
+        assert total_num_heads % get_parallel().attn_tp_size == 0
+        num_hidden_layers = config.num_hidden_layers
         self.tp_slope = LightningAttentionBackend._build_slope_tensor(
-            total_num_heads, num_hidden_layers, self.device
+            total_num_heads,
+            num_hidden_layers,
+            self.device,
+            layerwise_decay=layerwise_decay,
         )
-        self.linear_backend = getattr(
-            model_runner.model_config.hf_config, "linear_backend", "seg_la"
-        )
+        self.linear_backend = getattr(config, "linear_backend", "seg_la")
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
@@ -105,6 +149,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
             metadata.query_start_loc,
@@ -130,7 +175,10 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     @staticmethod
     def _build_slope_tensor(
-        n_attention_heads: int, num_hidden_layers: int, device="cuda"
+        n_attention_heads: int,
+        num_hidden_layers: int,
+        device="cuda",
+        layerwise_decay: bool = True,
     ):
         def get_slopes(n):
             def get_slopes_power_of_2(n):
@@ -153,7 +201,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         tp_heads = n_attention_heads // get_parallel().attn_tp_size
         tp_rank = get_parallel().attn_tp_rank
-        if num_hidden_layers <= 1:
+        if not layerwise_decay:
+            slope_rate_list = [slopes] * num_hidden_layers
+        elif num_hidden_layers <= 1:
             slope_rate_list = [slopes * (1 + 1e-5)]
         else:
             slope_rate_list = [
@@ -285,7 +335,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             cache_indices=intermediate_state_indices,
             track_lens=track_lens,
             track_state_indices=track_state_indices,
-            decouple=True,
+            softmax_scale=layer.scaling,
         )
         return hidden
 
@@ -356,7 +406,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._prefill_and_mix_infer(
@@ -448,7 +498,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         # Do linear attention
         cache_indices = self.forward_metadata.mamba_cache_indices
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        mamba_cache_params = self.state_layer_cache(layer_id)
         ssm_states = mamba_cache_params.temporal
         if self.linear_backend == "minimax":
             o = self._decode_infer(q, k, v, ssm_states, cache_indices, metadata, layer)

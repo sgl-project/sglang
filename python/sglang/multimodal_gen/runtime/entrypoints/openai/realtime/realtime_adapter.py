@@ -83,7 +83,9 @@ async def save_realtime_first_frame(
     else:
         target_path = os.path.join(uploads_dir, f"{session.id}_first_frame")
 
-    request.first_frame = await save_image_to_path(first_frame, target_path)
+    request.first_frame = await save_image_to_path(
+        first_frame, target_path, uploads_root=uploads_dir
+    )
 
 
 def build_realtime_sampling_params(
@@ -126,6 +128,7 @@ def build_realtime_sampling_params(
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        quality=getattr(request, "quality", None),
         condition_inputs=chunk_inputs.condition_inputs,
         realtime_chunk_size=chunk_size,
     )

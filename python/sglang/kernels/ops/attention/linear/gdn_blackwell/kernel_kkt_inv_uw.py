@@ -18,6 +18,9 @@ from sglang.kernels.ops.attention.cute_utils import (
     mma_bf16,
     simple_tma_copy,
 )
+from sglang.kernels.ops.attention.linear.tma import (
+    make_chunk_tma_args,
+)
 
 
 class Sm100ChunkUWKernel:
@@ -51,33 +54,6 @@ class Sm100ChunkUWKernel:
         self.num_warps = 2 + 4 + 4
 
     @cute.jit
-    def _make_tma_args(
-        self,
-        tensor: cute.Tensor,
-        dim: cutlass.Constexpr[int],
-        num_stages: int,
-        op: cpasync.TmaCopyOp,
-    ):
-        # logical layout: [BT, dim]
-        # permute for TMA: [dim/64, BT, 64] with swizzling
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
-        slayout = cute.make_layout(
-            (self.BT, 1, (64, dim // 64), num_stages),
-            stride=(64, 0, (1, self.BT * 64), self.BT * dim),
-        )
-        slayout = cute.make_composed_layout(swizzle_128B, 0, slayout)
-
-        # we need to convert gmem layout to (T, H, (64, D/64)) for make_tiled_tma_atom()
-        # to emit a single 4D TMA. otherwise, it will emit (D/64)x 3D TMA.
-        atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            cute.logical_divide(tensor, (None, None, 64)),
-            slayout,
-            cta_tiler=(self.BT, 1, dim),
-        )
-        return atom, tma_tensor, slayout
-
-    @cute.jit
     def __call__(
         self,
         K: cute.Tensor,
@@ -96,10 +72,10 @@ class Sm100ChunkUWKernel:
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
         tma_s2g = cpasync.CopyBulkTensorTileS2GOp()
 
-        K_args = self._make_tma_args(K, self.K_dim, self.num_stages, tma_g2s)
-        V_args = self._make_tma_args(V, self.V_dim, self.num_stages, tma_g2s)
-        U_args = self._make_tma_args(U, self.V_dim, 1, tma_s2g)
-        W_args = self._make_tma_args(W, self.K_dim, 1, tma_s2g)
+        K_args = make_chunk_tma_args(K, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        V_args = make_chunk_tma_args(V, self.V_dim, tma_g2s, self.num_stages, self.BT)
+        U_args = make_chunk_tma_args(U, self.V_dim, tma_s2g, 1, self.BT)
+        W_args = make_chunk_tma_args(W, self.K_dim, tma_s2g, 1, self.BT)
 
         grid = (num_sms // self.Hv, self.Hv, 1)
         block = (self.num_warps * 32, 1, 1)

@@ -2,7 +2,9 @@
 title: SGLang Diffusion
 description: Accelerated image and video generation with diffusion models.
 ---
-SGLang Diffusion is a high-performance inference framework for image and video generation. It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
+SGLang Diffusion is SGLang's built-in inference engine for image and video generation. It ships in the same [repository](https://github.com/sgl-project/sglang) and `sglang` Python package, using the shared `sglang generate` and `sglang serve` commands.
+
+It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
 
 ## Key Features
 
@@ -13,9 +15,9 @@ SGLang Diffusion is a high-performance inference framework for image and video g
 
 ## Quick Start
 
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
+Start with the [recommended Docker setup](/docs/sglang-diffusion/installation) for Linux GPU deployments. The installation guide also covers pip/uv, source installation, and other platforms.
+
+Run the following commands inside the container or your activated Python environment. Generate an image:
 
 ```bash
 sglang generate --model-path Qwen/Qwen-Image \
@@ -23,19 +25,22 @@ sglang generate --model-path Qwen/Qwen-Image \
   --save-output
 ```
 
+Or start an HTTP server:
+
 ```bash
-sglang serve --model-path Qwen/Qwen-Image --port 30010
+sglang serve --model-path Qwen/Qwen-Image --host 0.0.0.0 --port 30000
 ```
 
 ## Start Here
 
 - [Installation](/docs/sglang-diffusion/installation): install SGLang Diffusion and platform dependencies
-- [Supported Models and Optimization Compatibility](/docs/sglang-diffusion/compatibility_matrix): check supported model families, long-tail coverage, and optimization support
+- [Supported Models](/docs/sglang-diffusion/compatibility_matrix): browse supported model families, tasks, and public checkpoints
 - [CLI](/docs/sglang-diffusion/api/cli): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api): send image and video requests to the HTTP server
+- [ComfyUI plugin](/docs/sglang-diffusion/comfyui): use SGLang from ComfyUI in server mode or as a per-step DiT backend
 - [Performance Overview](/docs/sglang-diffusion/performance-optimization): choose speed, memory, parallelism, caching, and quality-tradeoff levers
 - [Caching Acceleration](/docs/sglang-diffusion/caching-acceleration): use Cache-DiT, TeaCache, or Spectrum to reduce denoising cost
-- [Quantization](/docs/sglang-diffusion/quantization): configure transformer weight and causal KV-cache quantization
+- [Quantization](/docs/sglang-diffusion/quantization): configure component checkpoint and causal KV-cache quantization
 - [Realtime and Causal Video Models](/docs/sglang-diffusion/realtime_models): understand session state, causal caches, and realtime-only controls
 - [Contributing](/docs/sglang-diffusion/contributing): contribution workflow, adding new models, and CI perf baselines
 
