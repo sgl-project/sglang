@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
