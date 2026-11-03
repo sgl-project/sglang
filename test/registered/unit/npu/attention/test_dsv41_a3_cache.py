@@ -6,18 +6,21 @@ Device operator execution and ACLGraph replay still require the A3 smoke test.
 """
 
 import ast
+import dataclasses
 import math
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[5]
 POOL_FILE = ROOT / "python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py"
 BUDGET_FILE = ROOT / "python/sglang/srt/model_executor/pool_configurator.py"
+STATE_FILE = ROOT / "python/sglang/srt/mem_cache/deepseek_v4_compress_state.py"
 
 
 def _load_definitions(path, names, namespace):
@@ -101,6 +104,76 @@ def _index_pool(classes, size=256):
     pool.memory_saver_adapter = SimpleNamespace(region=lambda _: nullcontext())
     pool._create_buffer()
     return pool
+
+
+class TestA3PairStatePool(unittest.TestCase):
+    def _make(self, num_req_slots, padded_batch, *, arch35=False):
+        # Exercise the real shared allocator/layout on CPU; only memory-pool
+        # integration and the runtime parallel configuration are stubbed.
+        state = _load_definitions(
+            STATE_FILE,
+            {"_lcm", "KVAndScore", "CompressStatePool"},
+            {
+                "__name__": __name__,
+                "dataclasses": dataclasses,
+                "gcd": math.gcd,
+                "np": np,
+                "torch": torch,
+                "nullcontext": nullcontext,
+                "GPU_MEMORY_TYPE_KV_CACHE": "kv_cache",
+                "TorchMemorySaverAdapter": SimpleNamespace(
+                    create=lambda **_: SimpleNamespace(region=lambda _: nullcontext())
+                ),
+                "maybe_init_custom_mem_pool": lambda **_: (False, None, None),
+            },
+        )
+        classes = _pool_classes(arch35=arch35)
+        padding = Mock(return_value=padded_batch)
+        classes.update(
+            CompressStatePool=state["CompressStatePool"],
+            get_eager_max_batch_size=padding,
+        )
+        owner = SimpleNamespace(
+            num_req_slots=num_req_slots,
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            device="cpu",
+            get_ring_size=lambda _: 2,
+        )
+        pool = classes["DSV4NPUTokenToKVPool"]._make_pair_state_pool(owner, False)
+        self.assertEqual(owner.num_req_slots, num_req_slots)
+        return pool, padding
+
+    def test_a3_single_request_covers_tp8_decode_padding(self):
+        pool, padding = self._make(num_req_slots=2, padded_batch=8)
+        padding.assert_called_once_with(1)
+        cache = pool.state_cache_3d
+        self.assertGreaterEqual(cache.shape[0], 8)
+        self.assertEqual(cache.shape[1:], (2, 1024))
+        self.assertEqual(cache.dtype, torch.float32)
+        self.assertTrue((cache[..., :512] == 0).all())
+        self.assertTrue(torch.isneginf(cache[..., 512:]).all())
+        # Request IDs still address their original rings, not the new padding.
+        loc = pool.translate_from_req_position_to_state_loc(
+            torch.tensor([1, 1]), torch.tensor([0, 1])
+        )
+        self.assertEqual(loc.tolist(), [2, 3])
+        self.assertEqual(pool.transfer_indices(1, 3).tolist(), [1])
+
+    def test_a3_preserves_and_aligns_preallocated_request_capacity(self):
+        for slots, padded in ((17, 16), (22, 24)):
+            with self.subTest(slots=slots):
+                pool, padding = self._make(slots, padded)
+                padding.assert_called_once_with(slots - 1)
+                self.assertGreaterEqual(
+                    pool.state_cache_3d.shape[0], max(slots, padded)
+                )
+                self.assertEqual(pool.state_cache_3d.shape[0], max(slots, padded) + 2)
+
+    def test_a5_pair_state_allocation_is_unchanged(self):
+        pool, padding = self._make(num_req_slots=2, padded_batch=8, arch35=True)
+        padding.assert_not_called()
+        self.assertEqual(pool.state_cache_3d.shape, (4, 2, 1024))
 
 
 class TestA3Cache(unittest.TestCase):

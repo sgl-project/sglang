@@ -186,6 +186,33 @@ class TestA3Backend(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_tp_padded_decode_compressor_rows_have_zero_used_length(self):
+        ns = _definitions(
+            BACKEND,
+            {"CompressorAscendBackendMixin", "_build_cycle_state_block_table"},
+            {"torch": torch},
+        )
+        backend = ns["CompressorAscendBackendMixin"]()
+        backend._dsv4_unique_compress_ratios = (0, 1, 2)
+        req = torch.tensor([1] + [0] * 7, dtype=torch.int64)
+        metadata = backend._compute_compress_locs(
+            pool=None,
+            req_to_token=None,
+            req_pool_indices=req,
+            seq_lens=torch.tensor([17] + [0] * 7, dtype=torch.int32),
+            out_cache_loc=torch.tensor([256] + [0] * 7),
+            is_decode=True,
+            bs=8,
+            device="cpu",
+            req_to_token_pool=None,
+            out_cache_loc_dsv4=None,
+        )
+        self.assertEqual(metadata["seqused"].tolist(), [1] + [0] * 7)
+        self.assertEqual(metadata["start_pos"].tolist(), [16] + [0] * 7)
+        self.assertEqual(
+            ns["_build_cycle_state_block_table"](req).tolist(), req.tolist()
+        )
+
     def test_a3_attention_ratios_use_bf16_normal_window_and_no_a5_lengths(self):
         for ratio in (0, 1, 2):
             out = self.backend._forward_low_ratio_attention(
