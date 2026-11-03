@@ -1152,7 +1152,7 @@ class MuseSpark1xModel(nn.Module):
                     or moe_layers[0].expert_hidden_size % 256
                     or comm.max_push_size < moe_layers[0].expert_hidden_size * 2
                     or not 0
-                    < comm._push_counter.numel()
+                    < comm.config.num_push_blocks
                     <= torch.cuda.get_device_properties(
                         comm.device
                     ).multi_processor_count

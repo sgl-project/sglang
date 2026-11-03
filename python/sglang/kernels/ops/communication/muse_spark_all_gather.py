@@ -86,7 +86,6 @@ def gemm_ag_supported(
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
         and m * n * 2 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 2
         and weight.is_contiguous()
     )
 

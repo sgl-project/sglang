@@ -107,7 +107,8 @@ class FinalizePushWorkspace:
 
     @property
     def controller_count(self) -> int:
-        return self.counter.numel()
+        # The finalize grid width; the phase is one shared word regardless.
+        return self.communicator.config.num_push_blocks
 
     def validate(self, output: torch.Tensor, cluster_size: int = 1) -> None:
         if (
