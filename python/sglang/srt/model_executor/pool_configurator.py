@@ -387,12 +387,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # slots (e.g. the mamba state cap), whose hot rows then hold tokens.
         unused = get_schedule().max_running_requests - config.max_running_requests
         if unused > 0 and get_schedule().max_total_tokens is None:
-            config.max_total_num_tokens = (
-                self._qsa_kv_offload.tokens_with_unused_slots(
-                    max_total_tokens=config.max_total_num_tokens,
-                    cell_bytes=self._cell_size,
-                    unused_slots=unused,
-                )
+            config.max_total_num_tokens = self._qsa_kv_offload.tokens_with_unused_slots(
+                max_total_tokens=config.max_total_num_tokens,
+                cell_bytes=self._cell_size,
+                unused_slots=unused,
             )
         return config
 
