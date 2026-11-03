@@ -18,7 +18,6 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.auxiliary_output import append_auxiliary_output
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
@@ -33,6 +32,7 @@ if TYPE_CHECKING:
         DeviceAuxiliaryOutput,
         HostAuxiliaryOutput,
     )
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,

@@ -102,6 +102,7 @@ from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
+    get_request_return_hidden_states_mode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -164,17 +165,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-
-
-def get_request_return_hidden_states_mode(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> CaptureHiddenMode:
-    if isinstance(return_hidden_states, list):
-        return max(
-            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
-            default=CaptureHiddenMode.NULL,
-        )
-    return get_return_hidden_states_mode(return_hidden_states)
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:

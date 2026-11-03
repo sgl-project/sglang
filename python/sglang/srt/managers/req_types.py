@@ -63,6 +63,17 @@ def get_return_hidden_states_mode(
     )
 
 
+def get_request_return_hidden_states_mode(
+    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
+) -> CaptureHiddenMode:
+    if isinstance(return_hidden_states, list):
+        return max(
+            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
+            default=CaptureHiddenMode.NULL,
+        )
+    return get_return_hidden_states_mode(return_hidden_states)
+
+
 def _compute_pad_values(identity: bytes) -> Tuple[int, ...]:
     """derive shared wide sentinels from an item hash or full identity digest"""
     digest = hashlib.sha256(_MM_WIDE_PAD_TAG + identity).digest()
