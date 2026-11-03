@@ -1019,6 +1019,9 @@ class Envs:
     # Kill-switch for the gfx115x row-stride pad on unquantized linear and lm_head
     # weights (see maybe_pad_weight_for_gfx115). Speed only; outputs do not depend on it.
     SGLANG_DISABLE_GFX115_WEIGHT_PADDING = EnvBool(False)
+    # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
+    # attention, GDN prefill); each also falls back to the generic path where it does not apply.
+    SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -2356,9 +2359,6 @@ class Envs:
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
-
-    # gfx1151 (Strix Halo) kernels; each falls back to the generic path where it does not apply
-    SGLANG_GFX1151_KERNELS = EnvBool(True)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

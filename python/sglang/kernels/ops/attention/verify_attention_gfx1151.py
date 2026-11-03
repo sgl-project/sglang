@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Speculative target-verify attention (a causal chain of ``T <= 8`` draft tokens per
-request) for the Triton attention backend on gfx1151.
+request) for the Triton attention backend on gfx115x (RDNA3.5; tuned on gfx1151).
 
 ``extend_attention_fwd`` walks the cached prefix once per query block, and the split-KV
 verify kernels are gfx95-only. Here one program per (request, kv head, group of ``HG`` q
@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import use_gfx1151_kernels
+from sglang.srt.utils import use_gfx115_kernels
 
 # (BT, warps, HG) = (32, 4, 6) and 20 splits per kv head, swept on gfx1151 with Qwen3.8
 # shapes; HG = 3 avoids the accumulator's register spills but is 2-3x slower
@@ -139,11 +139,11 @@ def _verify_combine_kernel(
 
 
 def covered(q, o, k_buffer, v_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
-    """Whether ``verify_attention_gfx1151`` takes this layer: gfx1151, bf16, at most 8 draft
+    """Whether ``verify_attention_gfx1151`` takes this layer: gfx115x, bf16, at most 8 draft
     tokens per request and 8 q heads per kv head, dense ``[B * T, H, D]`` q and o (the
     kernel addresses them without strides), int32-addressable contiguous caches."""
     return (
-        use_gfx1151_kernels()
+        use_gfx115_kernels()
         and 0 < num_tokens_per_req <= 8
         and hq % hkv == 0
         and hq // hkv <= 8

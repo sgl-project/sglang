@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """W4A16 GEMM for a few activation rows (``M <= 16``: decode and speculative verify) on
-gfx1151 (RDNA3.5) WMMA, in Gluon.
+gfx115x (RDNA3.5) WMMA, in Gluon.
 
 Weights use the HIP skinny int4 layout of ``w4a16_skinny_gemm``: ``w[n, k // 8]``
 int32 with eight codes per word, zero point 8, lane ``j`` at bit ``(j // 2) * 4 +
@@ -26,7 +26,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import AMDWMMALayout, rdna3
 
-from sglang.srt.utils import use_gfx1151_kernels
+from sglang.srt.utils import use_gfx115_kernels
 
 GROUP = gl.constexpr(128)
 
@@ -505,9 +505,9 @@ GROUP_SIZE = 128
 
 
 def covered(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> bool:
-    """Whether ``w4a16_small_m_gemm`` takes these operands (gfx1151, 2D bf16 ``x`` with at
+    """Whether ``w4a16_small_m_gemm`` takes these operands (gfx115x, 2D bf16 ``x`` with at
     most 16 rows, contiguous, a shape its config table supports)."""
-    if not (use_gfx1151_kernels() and x.dim() == 2 and 0 < x.shape[0] <= 16):
+    if not (use_gfx115_kernels() and x.dim() == 2 and 0 < x.shape[0] <= 16):
         return False
     n, k8 = w.shape
     k = x.shape[1]

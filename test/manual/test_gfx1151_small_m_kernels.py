@@ -1,19 +1,19 @@
-"""Correctness of the gfx1151 small-batch kernels against torch references.
+"""Correctness of the gfx115x small-batch kernels against torch references.
 
     python3 -m pytest test/manual/test_gfx1151_small_m_kernels.py -q
 
-Needs a gfx1151 GPU (Strix Halo); every test skips elsewhere.
+Needs a gfx115x GPU (RDNA3.5, e.g. Strix Halo gfx1151); every test skips elsewhere.
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_gfx1151_supported
+from sglang.srt.utils import is_gfx115_supported
 
-gfx1151 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx1151_supported()),
-    reason="needs a gfx1151 GPU",
+gfx115 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx115_supported()),
+    reason="needs a gfx115x GPU",
 )
 
 
@@ -37,7 +37,7 @@ def _rel_err(got: torch.Tensor, ref: torch.Tensor) -> float:
     return ((got.float() - ref.float()).norm() / ref.float().norm()).item()
 
 
-@gfx1151
+@gfx115
 @pytest.mark.parametrize("m", [1, 5, 8, 16])
 @pytest.mark.parametrize(
     "n,k", [(34816, 5120), (5120, 17408), (5120, 6144), (16384, 5120)]
@@ -58,7 +58,7 @@ def test_w4a16_small_m_gemm(m, n, k, padded):
         assert torch.equal(got, w4.w4a16_small_m_gemm(x, w, s))
 
 
-@gfx1151
+@gfx115
 def test_quantize_w4a16_roundtrip():
     from sglang.kernels.ops.quantization import w4a16_small_m_gfx1151 as w4
 
@@ -71,7 +71,7 @@ def test_quantize_w4a16_roundtrip():
     assert _rel_err(w4.w4a16_small_m_gemm(x, w, s), x.float() @ deq.T) < 1e-2
 
 
-@gfx1151
+@gfx115
 def test_w4a16_prefill_gemm():
     from sglang.kernels.ops.quantization import w4a16_prefill_gfx1151 as pf
 
@@ -86,7 +86,7 @@ def test_w4a16_prefill_gemm():
     assert torch.equal(out, pf.w4a16_prefill_gemm(x, pad_rows(w), s))
 
 
-@gfx1151
+@gfx115
 @pytest.mark.parametrize("m", [8, 40, 300])
 def test_skinny_gemm_padded_rows(m):
     from sglang.kernels.ops.quantization.w4a16_skinny_triton import (
@@ -102,7 +102,7 @@ def test_skinny_gemm_padded_rows(m):
     assert torch.equal(out, w4a16_skinny_gemm(x, pad_rows(w), s, 128))
 
 
-@gfx1151
+@gfx115
 @pytest.mark.parametrize("prefix", [1, 37, 1024, 5000])
 @pytest.mark.parametrize("bs", [1, 2])
 @pytest.mark.parametrize(
@@ -141,7 +141,7 @@ def test_verify_attention(prefix, bs, hq, hkv, d, t):
             assert cos > 0.9999
 
 
-@gfx1151
+@gfx115
 def test_verify_attention_rejects_strided_q():
     from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
 
@@ -184,7 +184,7 @@ def _gdn_forward(q, k, v, g, beta, cu):
     return (o[0] if isinstance(o, tuple) else o), state
 
 
-@gfx1151
+@gfx115
 @pytest.mark.parametrize("T", [64, 777, 2048])
 def test_gdn_head_major_and_grouped_chunk_o(T, monkeypatch):
     """Qwen3.8-27B GDN shapes (16 q/k heads, 48 value heads): the head-major grids are
@@ -195,12 +195,12 @@ def test_gdn_head_major_and_grouped_chunk_o(T, monkeypatch):
     import sglang.kernels.ops.attention.fla.wy_fast as wf
 
     inputs = _gdn_inputs(T)
-    o_all, s_all = _gdn_forward(*inputs)  # head-major + grouped (the gfx1151 default)
+    o_all, s_all = _gdn_forward(*inputs)  # head-major + grouped (the gfx115x default)
 
     monkeypatch.setattr(co, "_use_grouped_three_head", lambda *a, **kw: False)
     o_hm, s_hm = _gdn_forward(*inputs)  # head-major only
-    monkeypatch.setattr(cf, "use_gfx1151_kernels", lambda: False)
-    monkeypatch.setattr(wf, "use_gfx1151_kernels", lambda: False)
+    monkeypatch.setattr(cf, "use_gfx115_kernels", lambda: False)
+    monkeypatch.setattr(wf, "use_gfx115_kernels", lambda: False)
     o_ref, s_ref = _gdn_forward(*inputs)  # default order, generic chunk_fwd_o
 
     assert torch.equal(o_hm, o_ref) and torch.equal(s_hm, s_ref)
@@ -208,7 +208,7 @@ def test_gdn_head_major_and_grouped_chunk_o(T, monkeypatch):
     assert (o_all.float() - o_ref.float()).abs().max().item() < 1e-3
 
 
-@gfx1151
+@gfx115
 def test_gluon_small_m_falls_back_without_triton_3_7(monkeypatch):
     """With a pre-3.7 ``AMDWMMALayout`` (no register / warp bases) the Quark scheme leaves
     small-M calls to the skinny GEMM instead of failing at launch."""
@@ -224,11 +224,11 @@ def test_gluon_small_m_falls_back_without_triton_3_7(monkeypatch):
     x = torch.randn(8, 6144, device="cuda", dtype=torch.bfloat16)
     qs._gluon_small_m_available.cache_clear()
     assert qs._gluon_small_m_available()
-    assert qs._gfx1151_w4a16_gemm(x, w, s) is not None
+    assert qs._gfx115_w4a16_gemm(x, w, s) is not None
     monkeypatch.setattr(amd, "AMDWMMALayout", OldLayout)
     qs._gluon_small_m_available.cache_clear()
     try:
         assert not qs._gluon_small_m_available()
-        assert qs._gfx1151_w4a16_gemm(x, w, s) is None  # 8 rows: skinny GEMM
+        assert qs._gfx115_w4a16_gemm(x, w, s) is None  # 8 rows: skinny GEMM
     finally:
         qs._gluon_small_m_available.cache_clear()

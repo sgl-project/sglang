@@ -14,11 +14,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import use_gfx1151_kernels
+from sglang.srt.utils import use_gfx115_kernels
 
 # Offline-tuned on Radeon 8060S (gfx1151), ROCm 7.2.4, Triton 3.5.1.
 # Key: (M bucket, K, N), value: (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages).
-_GFX1151_W4A16_CONFIGS = {
+_GFX115_W4A16_CONFIGS = {
     (8, 5120, 16384): (16, 64, 128, 4, 1),
     (8, 17408, 5120): (16, 32, 128, 2, 1),
     (12, 5120, 16384): (16, 64, 128, 4, 1),
@@ -56,10 +56,10 @@ _GFX1151_W4A16_CONFIGS = {
 }
 
 
-def _gfx1151_w4a16_config(
+def _gfx115_w4a16_config(
     m: int, k: int, n: int, group_size: int
 ) -> tuple[int, int, int, int, int] | None:
-    if group_size != 128 or not use_gfx1151_kernels():
+    if group_size != 128 or not use_gfx115_kernels():
         return None
     if m in (8, 12, 16):
         bucket = m
@@ -77,11 +77,11 @@ def _gfx1151_w4a16_config(
         bucket = 4096
     else:
         return None
-    return _GFX1151_W4A16_CONFIGS.get((bucket, k, n))
+    return _GFX115_W4A16_CONFIGS.get((bucket, k, n))
 
 
 # Rows of an int4 weight read together alias onto the same L2/MALL channels on gfx11. A
-# 128 B pad per row speeds up the gfx1151 W4A16 GEMMs on the Qwen3.8 shapes: prefill by
+# 128 B pad per row speeds up the W4A16 GEMMs on gfx1151 on the Qwen3.8 shapes: prefill by
 # 1.10x and an 8-row verify step by 1.06x (summed over the projections), with single-row
 # decode unchanged or faster depending on the stack; 512 B is slower. The int4 counterpart
 # of the bf16 row pad of #46327.
@@ -90,7 +90,7 @@ ROW_PAD_WORDS = 32
 
 def pad_rows(w: torch.Tensor) -> torch.Tensor:
     """``w[n, k // 8]`` as a view of rows padded by ``ROW_PAD_WORDS`` int32 words (the pad
-    holds zero-point codes and is never read). ``w4a16_skinny_gemm`` and the gfx1151 W4A16
+    holds zero-point codes and is never read). ``w4a16_skinny_gemm`` and the gfx115x W4A16
     kernels take the row stride from the tensor."""
     n, k8 = w.shape
     buf = torch.full(
@@ -285,7 +285,7 @@ def w4a16_skinny_gemm(
             f"expected {(n // 8, num_groups)}"
         )
 
-    tuned_config = _gfx1151_w4a16_config(m, k, n, effective_group_size)
+    tuned_config = _gfx115_w4a16_config(m, k, n, effective_group_size)
     num_stages = None
     if tuned_config is not None:
         block_m, block_n, block_k, num_warps, num_stages = tuned_config

@@ -1277,24 +1277,12 @@ def is_gfx115_supported():
 
 
 @lru_cache(maxsize=1)
-def is_gfx1151_supported():
-    """
-    Returns whether the current platform is AMD RDNA3.5 gfx1151 (Strix Halo).
-    """
-    if torch.version.hip and torch.cuda.is_available():
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return gcn_arch.split(":", 1)[0] == "gfx1151"
-    else:
-        return False
-
-
-@lru_cache(maxsize=1)
-def use_gfx1151_kernels() -> bool:
-    """gfx1151 and the gfx1151 kernels not turned off (``SGLANG_GFX1151_KERNELS=0``); read
-    once."""
+def use_gfx115_kernels() -> bool:
+    """gfx115x and the gfx115x kernels not turned off (``SGLANG_DISABLE_GFX115_KERNELS``);
+    read once."""
     from sglang.srt.environ import envs
 
-    return is_gfx1151_supported() and envs.SGLANG_GFX1151_KERNELS.get()
+    return is_gfx115_supported() and not envs.SGLANG_DISABLE_GFX115_KERNELS.get()
 
 
 @lru_cache(maxsize=1)

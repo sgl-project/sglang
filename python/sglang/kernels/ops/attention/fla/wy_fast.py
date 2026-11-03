@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.srt.utils import use_gfx1151_kernels
+from sglang.srt.utils import use_gfx115_kernels
 
 
 # @triton.autotune(
@@ -118,7 +118,7 @@ def recompute_w_u_fwd(
     BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    head_major = use_gfx1151_kernels()
+    head_major = use_gfx115_kernels()
     recompute_w_u_fwd_kernel[(B * H, NT) if head_major else (NT, B * H)](
         HEAD_MAJOR=head_major,
         k=k,

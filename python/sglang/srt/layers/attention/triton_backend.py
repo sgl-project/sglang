@@ -61,7 +61,7 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
     next_power_of_2,
-    use_gfx1151_kernels,
+    use_gfx115_kernels,
 )
 
 _is_cuda = is_cuda()
@@ -255,8 +255,8 @@ class TritonAttnBackend(AttentionBackend):
             self.use_verify_splitkv,
         )
         # gfx1151 verify attention reads full-space slot ids straight from req_to_token
-        self.use_verify_gfx1151 = (
-            use_gfx1151_kernels()
+        self.use_verify_gfx115 = (
+            use_gfx115_kernels()
             and self.page_size == 1
             and not self.runner_ids.is_translating
         )
@@ -1671,8 +1671,8 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
-    def _gfx1151_verify_attention(self, q, o, layer, forward_batch) -> bool:
-        """Target-verify attention on gfx1151 that reads the cached prefix once for the
+    def _gfx115_verify_attention(self, q, o, layer, forward_batch) -> bool:
+        """Target-verify attention on gfx115x that reads the cached prefix once for the
         whole draft block (the block's K/V are already in the cache). Returns whether it
         ran."""
         from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
@@ -1894,7 +1894,7 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         if (
-            self.use_verify_gfx1151
+            self.use_verify_gfx115
             and forward_batch.forward_mode.is_target_verify()
             and save_kv_cache
             and k is not None
@@ -1912,7 +1912,7 @@ class TritonAttnBackend(AttentionBackend):
                 and self.kv_layers.route(layer.layer_id).sub_pool
                 == IdSpaceKind.SLIDING_WINDOW
             )
-            and self._gfx1151_verify_attention(q, o, layer, forward_batch)
+            and self._gfx115_verify_attention(q, o, layer, forward_batch)
         ):
             return o
 

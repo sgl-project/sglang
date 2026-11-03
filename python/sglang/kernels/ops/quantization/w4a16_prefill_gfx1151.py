@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""W4A16 GEMM for prefill (M in the hundreds or thousands) on the gfx1151 matrix cores.
+"""W4A16 GEMM for prefill (M in the hundreds or thousands) on the gfx115x (RDNA3.5) matrix cores.
 
 Weights are the Quark W4A16 layout SGLang leaves after loading: ``w[n, k // 8]`` int32,
 eight codes per word with zero point 8, lane ``j`` at bit ``(j // 2) * 4 + (j % 2) * 16``,
@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import use_gfx1151_kernels
+from sglang.srt.utils import use_gfx115_kernels
 
 GROUP = tl.constexpr(128)
 
@@ -119,12 +119,12 @@ MIN_ROWS = 256
 
 
 def covered(x: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> bool:
-    """Whether ``w4a16_prefill_gemm`` should run: gfx1151, at least ``MIN_ROWS`` contiguous
+    """Whether ``w4a16_prefill_gemm`` should run: gfx115x, at least ``MIN_ROWS`` contiguous
     bf16 rows, symmetric group-128 weights in the skinny layout."""
     return (
         x.dim() == 2
         and x.shape[0] >= MIN_ROWS
-        and use_gfx1151_kernels()
+        and use_gfx115_kernels()
         # the weight operand is built as bf16
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
