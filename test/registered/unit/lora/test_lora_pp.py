@@ -34,9 +34,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    WaitingQueue,
-    _RequestList,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 
@@ -116,7 +116,7 @@ class TestAllPPLoras(CustomTestCase):
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
-        waiting_queue = WaitingQueue()
+        waiting_queue = IndexedReqList(ListKind.WAITING)
         waiting_queue.join([waiting])
         first, second = _batch(short), _batch(long)
         for batch in (first, second):
@@ -131,14 +131,14 @@ class TestAllPPLoras(CustomTestCase):
         scheduler.__dict__.update(
             running_mbs=[first, second],
             mbs=[first, second],
-            running_reqs=_RequestList(ListKind.DECODING),
+            running_reqs=KeyedReqList(ListKind.DECODING),
             waiting_queue=waiting_queue,
             lora_drainer=LoRADrainer(max_loras_per_batch=2, max_wait_time_secs=3),
             enable_lora=True,
             enable_lora_overlap_loading=False,
             enable_priority_preemption=False,
             is_hybrid_swa=False,
-            chunked_reqs=_RequestList(ListKind.CHUNKED),
+            chunked_reqs=KeyedReqList(ListKind.CHUNKED),
             min_free_slots_delayer=None,
             is_mixed_chunk=False,
             dllm_config=None,

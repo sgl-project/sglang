@@ -29,8 +29,8 @@ from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -222,7 +222,7 @@ class TestRunningTimeout(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            queue=_RequestList(ListKind.PD_BOOTSTRAP)
+            queue=KeyedReqList(ListKind.PD_BOOTSTRAP)
         )
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()

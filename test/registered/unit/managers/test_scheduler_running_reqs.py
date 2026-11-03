@@ -25,8 +25,8 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -139,10 +139,10 @@ def _launch(s, batch):
         pass
 
 
-class TestRequestList(CustomTestCase):
+class TestKeyedReqList(CustomTestCase):
     def test_join_keeps_order_and_leave_ignores_outsiders(self):
         a, b, c, outsider = (_req(rid) for rid in "abcx")
-        running = _RequestList(ListKind.DECODING)
+        running = KeyedReqList(ListKind.DECODING)
         running.join([a, b])
         running.join([c, b])
         self.assertEqual(list(running), [a, b, c])

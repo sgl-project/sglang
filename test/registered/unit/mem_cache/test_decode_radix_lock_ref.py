@@ -44,8 +44,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    WaitingQueue,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -573,7 +573,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.req_pool_idx = 0
         req.kv.kv_committed_len = 4
         req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
-        waiting_queue = WaitingQueue()
+        waiting_queue = IndexedReqList(ListKind.WAITING)
         waiting_queue.join([req])
 
         scheduler = SimpleNamespace(

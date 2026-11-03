@@ -10,8 +10,8 @@ from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
 from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -142,7 +142,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         scheduler.future_map.output_tokens_buf.zero_()
         scheduler.uocr_runtime = _hooks(lambda: graph_io)
         scheduler.beam_coordinator = Mock()
-        scheduler.chunked_reqs = _RequestList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
 
         indices = torch.tensor([2, 5])
         published = torch.tensor([41, 43], dtype=torch.int32)

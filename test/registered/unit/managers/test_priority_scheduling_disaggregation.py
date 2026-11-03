@@ -26,9 +26,9 @@ from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    WaitingQueue,
-    _RequestList,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
@@ -67,7 +67,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.enable_hicache_storage = False
         scheduler.enable_unified_cache_external_linker = False
         scheduler.processed_tokens_counter = 0
-        scheduler.waiting_queue = WaitingQueue()
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
@@ -251,7 +251,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             kv=SimpleNamespace(cache_protected_len=2),
             time_stats=MagicMock(),
         )
-        queue.queue = _RequestList(ListKind.PD_BOOTSTRAP)
+        queue.queue = KeyedReqList(ListKind.PD_BOOTSTRAP)
         queue.queue.join([req])
 
         with (
@@ -969,7 +969,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
-        scheduler.waiting_queue = WaitingQueue()
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
@@ -985,7 +985,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
-        scheduler.chunked_reqs = _RequestList(ListKind.CHUNKED)
+        scheduler.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):

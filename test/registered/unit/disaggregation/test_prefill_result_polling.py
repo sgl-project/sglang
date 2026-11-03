@@ -32,9 +32,9 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    WaitingQueue,
-    _RequestList,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -123,7 +123,7 @@ def _input(batch):
 
 
 def _sending(reqs=()):
-    sending = _RequestList(ListKind.PD_SENDING)
+    sending = KeyedReqList(ListKind.PD_SENDING)
     sending.join(reqs)
     return sending
 
@@ -185,11 +185,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
-        self.running_reqs = _RequestList(ListKind.DECODING)
-        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
-        self.waiting_queue = WaitingQueue()
+        self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
         self._engine_paused = False
         self._pause_started_at = None
@@ -1273,8 +1273,8 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.dllm_config = None
-        self.running_reqs = _RequestList(ListKind.DECODING)
-        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

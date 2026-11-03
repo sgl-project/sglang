@@ -41,7 +41,7 @@ class ListKind(enum.Enum):
     DEFERRED = enum.auto()
 
 
-class RequestList(ABC):
+class ReqList(ABC):
     """A list of live requests. Every live request is in exactly one list."""
 
     kind: ListKind
@@ -73,7 +73,7 @@ class RequestList(ABC):
         return sum(1 for _ in self)
 
 
-class _RequestList(RequestList):
+class KeyedReqList(ReqList):
     """Requests in join order, held by identity and changed in place: a loop that
     changes the list iterates a copy. An owner that wraps each request joins the
     wrappers and passes `req_of` to unwrap them."""
@@ -124,14 +124,18 @@ class _RequestList(RequestList):
         return req in self._items
 
 
-class WaitingQueue(RequestList):
-    """The requests waiting for prefill admission, in queue order. Held in a list:
-    the queue is read by index and slice, joined at the front, and reordered by
-    the scheduling policy through `replace`."""
+class IndexedReqList(ReqList):
+    """Requests in an order the owner sets, held in a list: read by index and
+    slice, joined at the front, and reordered through `replace` (the waiting
+    queue's scheduling policy)."""
 
-    kind = ListKind.WAITING
-
-    def __init__(self, *, abort: Optional[Callable[[AbortReq], None]] = None) -> None:
+    def __init__(
+        self,
+        kind: ListKind,
+        *,
+        abort: Optional[Callable[[AbortReq], None]] = None,
+    ) -> None:
+        self.kind = kind
         self._abort = abort
         self._reqs: List[Req] = []
 
@@ -173,7 +177,7 @@ class WaitingQueue(RequestList):
         return self._reqs[index]
 
 
-def move(reqs: Iterable[Req], src: RequestList, dst: RequestList) -> None:
+def move(reqs: Iterable[Req], src: ReqList, dst: ReqList) -> None:
     """Move requests from `src` to `dst`; each must be in `src`."""
     reqs = list(reqs)
     missing = [req.rid for req in reqs if req not in src]

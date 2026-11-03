@@ -21,8 +21,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    WaitingQueue,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -184,7 +184,7 @@ class TestHeldDestinationPublication(CustomTestCase):
             enable_decode_hicache=False,
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
-            waiting_queue=WaitingQueue(),
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
         receiver.send_metadata.assert_called_once_with("pages", 3, None)

@@ -10,8 +10,8 @@ from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -453,7 +453,7 @@ class DllmManager:
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
-        self.waiting_queue = _RequestList(ListKind.DLLM, abort=self._abort)
+        self.waiting_queue = KeyedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
         self._release_aborted = release_aborted

@@ -10,7 +10,7 @@ Life cycle of a request in the decode server
     a. Poll the receiver to check the transfer state
     b. If the transfer has finished, move the request to waiting queue
 
-3. WaitingQueue:
+3. IndexedReqList:
     a. Use the requests in the queue to construct a PrebuiltExtendBatch
     b. Skip the prefill forward but only populate metadata
 
@@ -96,9 +96,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
 )
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -493,12 +493,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
-        self.queue = _RequestList(
+        self.queue = KeyedReqList(
             ListKind.PD_PREALLOC,
             abort=self._abort_prealloc,
             req_of=lambda x: x.req,
         )
-        self.retracted_queue = _RequestList(
+        self.retracted_queue = KeyedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
         self.pending_reqs: List[DecodeRequest] = []
@@ -513,7 +513,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
-        self.held_rebootstrap_reqs = _RequestList(
+        self.held_rebootstrap_reqs = KeyedReqList(
             ListKind.PD_HELD, abort=self._abort_held
         )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1097,7 +1097,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
             ListKind.PD_PREALLOC: self.queue,
             ListKind.PD_RETRACTED: self.retracted_queue,
@@ -2854,7 +2854,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
-        self.queue = _RequestList(
+        self.queue = KeyedReqList(
             ListKind.PD_RECEIVING,
             abort=self._abort_receiving,
             req_of=lambda x: x.req,
@@ -2882,11 +2882,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
-        self._deferred_releases = _RequestList(
+        self._deferred_releases = KeyedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
             ListKind.PD_RECEIVING: self.queue,
             # Aborted, with KV held until the transfer drains.

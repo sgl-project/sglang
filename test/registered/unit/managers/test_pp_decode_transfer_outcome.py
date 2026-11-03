@@ -15,8 +15,8 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    WaitingQueue,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -190,7 +190,7 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
                 ),
             ),
             enable_hisparse=False,
-            waiting_queue=WaitingQueue(),
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         forwarded = SchedulerPPMixin.process_decode_transfer_queue(
             scheduler, {"s": False, "f": True, "h": False}

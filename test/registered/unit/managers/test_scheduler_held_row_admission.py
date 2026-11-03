@@ -14,9 +14,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    WaitingQueue,
-    _RequestList,
 )
 from sglang.srt.runtime_context import get_context
 
@@ -66,9 +66,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = WaitingQueue()
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
         s.waiting_queue.join(waiting)
-        s.chunked_reqs = _RequestList(ListKind.CHUNKED)
+        s.chunked_reqs = KeyedReqList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
@@ -106,7 +106,7 @@ class TestHeldRowAdmission(CustomTestCase):
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-        s.running_reqs = _RequestList(ListKind.DECODING)
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
         return s
 
     def _admitted(self, disaggregation_mode):

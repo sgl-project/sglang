@@ -39,7 +39,7 @@ _OWNERS = (
     DeferredResponses,
 )
 
-# Fields annotated as holding requests that are not a `RequestList`. Only
+# Fields annotated as holding requests that are not a `ReqList`. Only
 # shrinks: a list that migrates leaves it.
 _NOT_YET_LISTS = {
     # Shares its entries with `queue`.

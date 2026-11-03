@@ -73,9 +73,9 @@ from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indi
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
     move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -208,7 +208,7 @@ class PrefillBootstrapQueue:
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue = _RequestList(ListKind.PD_BOOTSTRAP, abort=self._abort)
+        self.queue = KeyedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.
@@ -1908,9 +1908,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
-    def optimistic_release_and_requeue(
-        self: Scheduler, req: Req, src: RequestList
-    ) -> None:
+    def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
         """Release KV cache and requeue an optimistic prefill request out of `src`."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
