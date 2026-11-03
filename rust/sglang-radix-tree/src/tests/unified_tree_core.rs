@@ -3869,6 +3869,10 @@ fn finish_write_through_emits_cpu_stored_events() {
     tc.set_hicache_enabled();
     tc.insert(&insert_params(&vec![1], &[10]));
     let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+        .expect("live test node");
+    tc.mark_write_through_pending(vec![leaf], leaf)
+        .expect("live test node");
     let _ = tc.take_events();
     tc.finish_write_through(vec![leaf], leaf)
         .expect("live test node");

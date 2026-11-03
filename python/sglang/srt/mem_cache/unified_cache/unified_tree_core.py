@@ -3154,7 +3154,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if not queued_copy:
                     # The backed-up copy becomes a tracked duplicate only now.
                     self._update_duplicate_tracking(node)
-            self.kv_events.record_store(node, medium=StorageMedium.CPU)
+            # A queued SWA backup can cover an ancestor whose settled Full
+            # host copy was reclaimed before this ack. Do not republish it.
+            if node.backuped:
+                self.kv_events.record_store(node, medium=StorageMedium.CPU)
 
     def _walk_span(self, key: RadixKey, end: int):
         """Yield nodes and their matched spans along ``key`` through ``end``."""

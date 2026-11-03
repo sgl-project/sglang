@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -265,6 +266,66 @@ class _WriteBackBatchingSuite:
         cc.assert_copies_behind_the_fence(self)
         for seq in chains:
             self.assertEqual(match_seq(cache, seq).host_hit_length, SEQ_TOKENS)
+        cache.sanity_check()
+
+    def test_swa_backup_ack_does_not_republish_reclaimed_full_host_copy(self):
+        """A delayed SWA ack must not advertise an ancestor's reclaimed Full KV."""
+        cache, allocator, kv_host, _ = hybrid_write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            swa_device_tokens=4 * BATCH_TOKENS,
+            host_tokens=BATCH_TOKENS,
+            swa_host_tokens=BATCH_TOKENS,
+            sliding_window=3 * PAGE,
+            enable_kv_cache_events=True,
+        )
+        seq = batch_seqs(0)[0]
+        insert_hybrid_seq(cache, allocator, seq[:PAGE])
+        insert_hybrid_seq(cache, allocator, seq)
+        parent = match_seq(cache, seq[:PAGE]).last_device_node
+        leaf = match_seq(cache, seq).last_device_node
+        # Only Full is on host; the leaf's SWA backup must also cover parent.
+        host_indices = kv_host.alloc(PAGE)
+        self.assertIsNotNone(host_indices)
+        cache.tree_core.commit_backup(parent, host_indices, {})
+        cache.tree_core.mark_write_through_pending([parent], parent)
+        cache.tree_core.finish_write_through([parent], parent)
+        cache.take_events()
+        cache.tree_core.evict_device_start(ComponentType.FULL, PAGE)
+
+        self.assertEqual(
+            cache._execute_and_commit_kv_backup(
+                BackupKV(node_ids=[leaf]), write_back=True
+            ),
+            PAGE,
+        )
+        copied = cache.ongoing_write_through[leaf].publish_node_ids
+        self.assertIn(parent, copied)
+        cache.tree_core.mark_write_back_queued(leaf, copied)
+        self.assertEqual(cache.evict_host(PAGE), PAGE)
+        self.assertFalse(cache.tree_core.is_backuped(parent))
+        removed = [
+            event
+            for event in cache.take_events()
+            if isinstance(event, BlockRemoved) and event.medium == StorageMedium.CPU
+        ]
+        self.assertEqual(len(removed), 1)
+
+        cache.writing_check(write_back=True)
+        stored = [
+            event
+            for event in cache.take_events()
+            if isinstance(event, BlockStored) and event.medium == StorageMedium.CPU
+        ]
+        # The leaf is still backed up and must retain its positive store event.
+        self.assertEqual([event.token_ids for event in stored], [seq[PAGE:]])
+        removed_hashes = set(removed[0].block_hashes)
+        self.assertTrue(
+            all(removed_hashes.isdisjoint(event.block_hashes) for event in stored)
+        )
+        self.assertFalse(cache.tree_core.is_backuped(parent))
+        cache._demote(leaf, {ct: 0 for ct in cache.tree_components})
+        cache.tree_core.evict_device_end(ComponentType.FULL)
         cache.sanity_check()
 
     def _evict_until_reclaimed(self, *, batched):

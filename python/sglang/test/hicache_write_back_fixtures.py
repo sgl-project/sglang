@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.tree_slots import tree_slots_of
 
 PAGE = 4
 # A write-back batch: eight two-page sequences.
@@ -192,7 +193,7 @@ def write_back_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=PAGE,
             disable=False,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
             tree_core_backend=tree_core_backend,
             enable_kv_cache_events=enable_kv_cache_events,
         )
@@ -270,7 +271,9 @@ def hybrid_write_back_cache(
             page_size=PAGE,
             disable=False,
             sliding_window_size=sliding_window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA), window=sliding_window
+            ),
             tree_core_backend=tree_core_backend,
             enable_kv_cache_events=enable_kv_cache_events,
         )

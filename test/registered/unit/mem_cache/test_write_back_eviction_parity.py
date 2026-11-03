@@ -141,7 +141,7 @@ class _Workload:
         self.sessions = [self._new_session(0) for _ in range(SESSIONS)]
         self.locks = deque()  # (release step, lock, session)
         self.inserted_keys = {}  # sid -> last inserted key
-        self.resident = {"GPU": Counter(), "CPU_PINNED": Counter()}
+        self.resident = {"GPU": set(), "CPU_PINNED": set()}
         self.snapshots = []
         self.copy_waits = 0
         self._instrument()
@@ -188,10 +188,12 @@ class _Workload:
             if isinstance(event, (BlockStored, BlockRemoved)):
                 assert event.medium is not None
                 blocks = self.resident[event.medium]
-                for block in event.block_hashes:
-                    blocks[block] += 1 if isinstance(event, BlockStored) else -1
-                    if blocks[block] == 0:
-                        del blocks[block]
+                # Store events publish residency, not a reference count: an
+                # overlapping SWA backup may announce the same Full copy again.
+                if isinstance(event, BlockStored):
+                    blocks.update(event.block_hashes)
+                else:
+                    blocks.difference_update(event.block_hashes)
         state: dict[str, object] = {
             medium: frozenset(blocks) for medium, blocks in self.resident.items()
         }
@@ -203,7 +205,9 @@ class _Workload:
         if self.swa:
             tree_core = cache.tree_core
             state["swa tombstones"] = tuple(
-                tuple(tree_core.swa_tombstone_ranges(key, 0, len(key)))
+                tuple(
+                    tree_core.swa_tombstone_ranges(key, 0, len(key), ComponentType.SWA)
+                )
                 for _, key in sorted(self.inserted_keys.items())
             )
             state["swa sizes"] = (

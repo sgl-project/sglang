@@ -3,7 +3,7 @@ use crate::cache_action::UpdatePendingBackupOnNodeSplit;
 use crate::components::{ComponentSet, FULL};
 use crate::node::NodeAccessError;
 use crate::test_utils::accumulate_step;
-use crate::unified_tree_core::CacheInitParams;
+use crate::unified_tree_core::{CacheInitParams, KvCacheEvent, StorageMedium};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
@@ -439,6 +439,7 @@ fn a_queued_copy_leaves_the_full_copies_it_covers_reclaimable() {
     // (an SWA window) but writes none of its Full slots, so [1]'s copy is
     // reclaimable as it is once that copy lands.
     let mut tc = write_back_core();
+    tc.enable_kv_cache_events = true;
     let (parent, a, _b, _other) = queued_walk_setup(&mut tc);
     let parent_handle = tc.arena.node(parent).id;
     tc.commit_backup(parent_handle, Tensor::from_slice(&[50i64]), HashMap::new())
@@ -447,13 +448,40 @@ fn a_queued_copy_leaves_the_full_copies_it_covers_reclaimable() {
         .expect("live test node");
     tc.finish_write_through(vec![parent_handle], parent_handle)
         .expect("live test node");
+    tc.evict_device_start(FULL, 1);
     queue_write_back(&mut tc, a, 100);
     tc.mark_write_through_pending(vec![parent_handle], tc.arena.node(a).id)
         .expect("live test node");
 
+    tc.take_events();
     let step = tc.drive_host_eviction(FULL, /* num_tokens = */ 1);
     assert_eq!(step.host_frees[&FULL][0].int64_value(&[0]), 50);
     assert!(!tc.arena.node(parent).has_host_value(FULL));
+    assert!(matches!(
+        tc.take_events().as_slice(),
+        [KvCacheEvent::BlockRemoved {
+            medium: StorageMedium::Cpu,
+            ..
+        }]
+    ));
+    let a_handle = tc.arena.node(a).id;
+    tc.finish_write_through(vec![parent_handle, a_handle], a_handle)
+        .expect("live test nodes");
+    // The SWA ack must not restore the reclaimed parent's Full residency.
+    let events = tc.take_events();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        KvCacheEvent::BlockStored {
+            token_ids, medium, ..
+        } => {
+            assert_eq!(token_ids, &vec![2]);
+            assert_eq!(*medium, StorageMedium::Cpu);
+        }
+        other => panic!("expected the leaf's CPU store, got {other:?}"),
+    }
+    assert!(tc.arena.node(parent).write_through_pending_id.is_none());
+    tc.demote(a_handle).expect("a backed victim");
+    tc.evict_device_end(FULL);
 }
 
 #[test]

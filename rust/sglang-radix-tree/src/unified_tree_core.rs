@@ -4988,7 +4988,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     self.update_full_coexisting_host_tracking_(node_idx);
                 }
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
+            // A queued SWA backup can cover an ancestor whose settled Full
+            // host copy was reclaimed before this ack. Do not republish it.
+            if self.arena.node(node_idx).has_host_value(FULL) {
+                self.record_store_event_(
+                    node_idx,
+                    StorageMedium::Cpu,
+                    /* session_id = */ None,
+                );
+            }
         }
         Ok(())
     }
