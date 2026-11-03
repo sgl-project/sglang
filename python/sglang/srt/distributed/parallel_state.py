@@ -2505,6 +2505,7 @@ def init_distributed_environment(
                 moe = get_exec().moe
                 if moe.mooncake_ib_device is not None:
                     from mooncake.pg import set_device_filter
+
                     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
                         get_ib_devices_for_gpu,
                     )
