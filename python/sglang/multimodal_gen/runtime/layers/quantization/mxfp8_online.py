@@ -8,6 +8,10 @@ a prequantized ``(fp8, swizzled scales)`` tuple; the GEMM is cuBLASLt's
 block-scaled ``torch.nn.functional.scaled_mm``. Layers with K not a multiple
 of 32, N not a multiple of 16, non-bf16 params, or pre-Blackwell GPUs keep
 the per-channel fp8 path.
+
+On Intel XPU weights and activations quantize with sgl-kernel's group-32 UE8M0
+quantizer to e4m3 + row-major E8M0 [rows, K/32] scales, and the GEMM is oneDNN's
+block-scaled ``torch._scaled_mm``.
 """
 
 from typing import Optional
@@ -21,8 +25,10 @@ from sglang.kernels.ops.diffusion import (
     mxfp8_quantize_swizzled,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _E8M0 = torch.float8_e8m0fnu
+_MXFP8_GROUP_SIZE = 32
 
 
 def mxfp8_scaled_mm(
@@ -48,6 +54,44 @@ def mxfp8_scaled_mm(
     )
 
 
+def _xpu_mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from sgl_kernel import sgl_per_token_group_quant_8bit
+
+    x = x.contiguous()
+    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(
+        x.shape[0], x.shape[1] // _MXFP8_GROUP_SIZE, dtype=_E8M0, device=x.device
+    )
+    info = torch.finfo(torch.float8_e4m3fn)
+    sgl_per_token_group_quant_8bit(
+        input=x,
+        output_q=q,
+        output_s=scale,
+        group_size=_MXFP8_GROUP_SIZE,
+        eps=1e-10,
+        fp8_min=info.min,
+        fp8_max=info.max,
+        scale_ue8m0=True,
+        enable_v2=True,
+    )
+    return q, scale
+
+
+def _xpu_mxfp8_linear(
+    layer: Module, x: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    qx, x_scale = _xpu_mxfp8_quantize(x.reshape(-1, x.shape[-1]))
+    out = torch._scaled_mm(
+        qx,
+        layer.weight.t(),
+        x_scale,
+        layer.weight_scale.t(),
+        bias=bias,
+        out_dtype=x.dtype,
+    )
+    return out.view(*x.shape[:-1], out.shape[-1])
+
+
 class MXFP8OnlineLinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config) -> None:
         super().__init__(quant_config)
@@ -55,6 +99,18 @@ class MXFP8OnlineLinearMethod(Fp8LinearMethod):
         self.block_quant = False
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        layer.xpu_mxfp8 = (
+            current_platform.is_xpu()
+            and layer.weight.dtype == torch.bfloat16
+            and layer.weight.shape[1] % _MXFP8_GROUP_SIZE == 0
+        )
+        if layer.xpu_mxfp8:
+            qweight, scale = _xpu_mxfp8_quantize(layer.weight.data)
+            layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+            layer.input_scale = None
+            layer.mxfp8 = False
+            return
         layer.mxfp8 = (
             not self.use_marlin
             and can_use_mxfp8_swizzled(layer.weight)
@@ -78,6 +134,8 @@ class MXFP8OnlineLinearMethod(Fp8LinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if layer.xpu_mxfp8:
+            return _xpu_mxfp8_linear(layer, x, bias)
         if not layer.mxfp8:
             return super().apply(layer, x, bias)
         if isinstance(x, tuple):
