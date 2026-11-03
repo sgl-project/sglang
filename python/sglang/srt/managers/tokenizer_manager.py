@@ -61,7 +61,7 @@ from sglang.srt.beam_search.output import (
     build_beam_search_out,
     try_build_beam_search_out_dict,
 )
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, indexer_slots_at
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1530,6 +1530,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     raise ValueError(
                         "return_outputs_via_store does not support streaming yet."
                     )
+            if obj.replay_layer_splits:
+                self._validate_replay_layer_splits(obj)
+
+    def _validate_replay_layer_splits(self, obj: GenerateReqInput) -> None:
+        splits = obj.replay_layer_splits
+        if not obj.return_outputs_via_store:
+            raise ValueError(
+                "replay_layer_splits requires return_outputs_via_store=true."
+            )
+        hf_text_config = self.model_config.hf_text_config
+        num_layers = hf_text_config.num_hidden_layers
+        if not (
+            0 < splits[0]
+            and splits[-1] < num_layers
+            and all(a < b for a, b in zip(splits, splits[1:]))
+        ):
+            raise ValueError(
+                "replay_layer_splits must be strictly increasing layer ids in "
+                f"(0, {num_layers}), got {splits}."
+            )
+        if obj.return_indexer_topk:
+            # Raises when this model's indexer slots cannot be mapped to layers.
+            indexer_slots_at(hf_text_config, splits)
 
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -2114,7 +2137,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if collector.is_empty():
             return
 
-        future = self.output_store.submit_put(collector)
+        splits = state.obj.replay_layer_splits or []
+        future = self.output_store.submit_put(
+            collector,
+            routed_experts_splits=splits,
+            indexer_topk_splits=(
+                indexer_slots_at(self.model_config.hf_text_config, splits)
+                if splits and collector.indexer_topk is not None
+                else []
+            ),
+        )
         try:
             ref = await asyncio.wrap_future(future)
         except asyncio.CancelledError:

@@ -86,15 +86,17 @@ class BytesStash(msgspec.Struct, frozen=True):
 
 
 def token_stash(seed: int, *, routed_dtype=np.int32, num_tokens=6, mask_rows=None):
+    """Routed experts in two layer blocks, the indexer top-k in one."""
     rng = np.random.default_rng(seed)
     lengths = rng.integers(
         1, 4, size=num_tokens if mask_rows is None else mask_rows
     ).astype(np.int32)
+    routed = rng.integers(0, 128, size=(num_tokens, 48, 8)).astype(routed_dtype)
     return TokenOutputStash(
-        routed_experts=rng.integers(0, 128, size=(num_tokens, 48, 8)).astype(
-            routed_dtype
-        ),
-        indexer_topk=rng.integers(0, 4096, size=(num_tokens, 2, 16)).astype(np.int32),
+        routed_experts={(0, 20): routed[:, :20], (20, 48): routed[:, 20:]},
+        indexer_topk={
+            (0, 2): rng.integers(0, 4096, size=(num_tokens, 2, 16)).astype(np.int32)
+        },
         output_token_sampling_mask_lengths=lengths,
         output_token_sampling_mask_token_ids=rng.integers(
             0, 151936, size=int(lengths.sum())
@@ -105,12 +107,19 @@ def token_stash(seed: int, *, routed_dtype=np.int32, num_tokens=6, mask_rows=Non
     )
 
 
+def stored_arrays(stash: TokenOutputStash) -> dict[str, np.ndarray]:
+    """Each stored field's array, keyed by its stored name."""
+    return {
+        name: np.frombuffer(field.data, dtype=field.dtype).reshape(field.shape)
+        for name, field in stash.to_fields().items()
+    }
+
+
 def assert_stash_equal(got: TokenOutputStash, want: TokenOutputStash):
-    for name in TokenOutputStash.__struct_fields__:
-        g, w = getattr(got, name), getattr(want, name)
-        if w is None:
-            assert g is None, name
-            continue
+    got_arrays, want_arrays = stored_arrays(got), stored_arrays(want)
+    assert got_arrays.keys() == want_arrays.keys()
+    for name, w in want_arrays.items():
+        g = got_arrays[name]
         assert g.dtype == w.dtype and g.shape == w.shape, name
         np.testing.assert_array_equal(g, w)
 
@@ -133,12 +142,24 @@ def test_round_trip_through_a_json_ref():
     refs = store.put_many(stashes)
 
     assert [ref.backend for ref in refs] == ["memory", "memory"]
-    spec = {s.name: s for s in refs[0].fields}["routed_experts"]
+    shapes = {s.name: s.shape for s in refs[0].fields}
+    # Readers name the blocks they read: "{field}.{start}-{end}", [tokens, end - start, k].
+    assert sorted(shapes) == [
+        "indexer_topk.0-2",
+        "output_token_sampling_logprobs",
+        "output_token_sampling_mask_lengths",
+        "output_token_sampling_mask_token_ids",
+        "routed_experts.0-20",
+        "routed_experts.20-48",
+    ]
+    assert shapes["routed_experts.0-20"] == (6, 20, 8)
+    assert shapes["indexer_topk.0-2"] == (6, 2, 16)
+    spec = {s.name: s for s in refs[0].fields}["routed_experts.20-48"]
     assert (spec.dtype, spec.shape, spec.codec, spec.nbytes) == (
         "int32",
-        (6, 48, 8),
+        (6, 28, 8),
         "identity",
-        6 * 48 * 8 * 4,
+        6 * 28 * 8 * 4,
     )
 
     got = read_all(
@@ -153,7 +174,7 @@ def test_any_routed_experts_dtype_round_trips(dtype):
     store = OutputStore(backend=MemoryBackend())
     stash = token_stash(3, routed_dtype=dtype)
     (ref,) = store.put_many([stash])
-    assert {s.name: s.dtype for s in ref.fields}["routed_experts"] == np.dtype(
+    assert {s.name: s.dtype for s in ref.fields}["routed_experts.0-20"] == np.dtype(
         dtype
     ).name
     (got,) = read_all(store, [ref], stash_type=TokenOutputStash)
@@ -166,9 +187,14 @@ def test_reading_a_subset_fetches_only_those_parts():
     stash = token_stash(4)
     (ref,) = store.put_many([stash])
 
-    (got,) = store.read_many([(ref, ["routed_experts"])], stash_type=TokenOutputStash)
-    assert backend.reads[-1] == ["routed_experts"]
-    np.testing.assert_array_equal(got.routed_experts, stash.routed_experts)
+    (got,) = store.read_many(
+        [(ref, ["routed_experts.20-48"])], stash_type=TokenOutputStash
+    )
+    assert backend.reads[-1] == ["routed_experts.20-48"]
+    assert got.routed_experts.keys() == {(20, 48)}
+    np.testing.assert_array_equal(
+        got.routed_experts[(20, 48)], stash.routed_experts[(20, 48)]
+    )
     assert got.indexer_topk is None and got.output_token_sampling_logprobs is None
 
 
@@ -199,8 +225,9 @@ def test_dtype_is_opaque_to_the_store():
 
 def test_fields_share_memory_with_the_arrays():
     stash = token_stash(6)
-    data = stash.to_fields()["routed_experts"].data
-    assert np.shares_memory(np.frombuffer(data, dtype=np.uint8), stash.routed_experts)
+    (indexer,) = stash.indexer_topk.values()
+    data = stash.to_fields()["indexer_topk.0-2"].data
+    assert np.shares_memory(np.frombuffer(data, dtype=np.uint8), indexer)
 
 
 def test_delete_removes_every_stored_part():
@@ -216,7 +243,7 @@ def test_refs_of_another_backend_are_rejected():
     (ref,) = store.put_many([token_stash(9)])
     other = msgspec.structs.replace(ref, backend="mooncake")
     with pytest.raises(ValueError, match="mooncake"):
-        store.read_many([(other, ["routed_experts"])], stash_type=TokenOutputStash)
+        store.read_many([(other, ["routed_experts.0-20"])], stash_type=TokenOutputStash)
     with pytest.raises(ValueError, match="mooncake"):
         store.delete_many([other])
 
@@ -253,8 +280,16 @@ def test_field_names_cannot_hold_a_slash():
 
 def test_unknown_fields_are_rejected_by_the_stash():
     raw = RawField(dtype="int32", shape=(0,), data=memoryview(b""))
-    with pytest.raises(ValueError, match="unknown token output fields"):
-        TokenOutputStash.from_fields({"routed_experts": raw, "hidden_states": raw})
+    # Per-layer fields are stored only as blocks, and only they have blocks.
+    for name in (
+        "hidden_states",
+        "routed_experts",
+        "routed_experts.3",
+        "routed_experts.a-b",
+        "output_token_sampling_mask_lengths.0-1",
+    ):
+        with pytest.raises(ValueError, match="unknown token output fields"):
+            TokenOutputStash.from_fields({"routed_experts.0-1": raw, name: raw})
 
 
 def test_empty_stash():
@@ -270,16 +305,18 @@ def test_read_many_reads_named_fields_into_arrays_the_caller_owns():
     refs = store.put_many(stashes)
 
     got = store.read_many(
-        [(ref, ["routed_experts", "indexer_topk"]) for ref in refs],
+        [(ref, ["routed_experts.0-20", "indexer_topk.0-2"]) for ref in refs],
         stash_type=TokenOutputStash,
     )
 
-    assert backend.reads == [["routed_experts", "indexer_topk"]] * 3
+    assert backend.reads == [["routed_experts.0-20", "indexer_topk.0-2"]] * 3
     for g, w in zip(got, stashes):
-        np.testing.assert_array_equal(g.routed_experts, w.routed_experts)
-        np.testing.assert_array_equal(g.indexer_topk, w.indexer_topk)
+        np.testing.assert_array_equal(
+            g.routed_experts[(0, 20)], w.routed_experts[(0, 20)]
+        )
+        np.testing.assert_array_equal(g.indexer_topk[(0, 2)], w.indexer_topk[(0, 2)])
         assert g.output_token_sampling_mask_lengths is None
-        assert g.routed_experts.flags.writeable
+        assert g.routed_experts[(0, 20)].flags.writeable
 
 
 def test_read_many_fails_before_reading_a_missing_field():
@@ -288,7 +325,8 @@ def test_read_many_fails_before_reading_a_missing_field():
     (ref,) = store.put_many([token_stash(31)])
     with pytest.raises(ValueError, match="no fields"):
         store.read_many(
-            [(ref, ["routed_experts", "hidden_states"])], stash_type=TokenOutputStash
+            [(ref, ["routed_experts.0-20", "hidden_states"])],
+            stash_type=TokenOutputStash,
         )
     assert backend.reads == []
 
@@ -297,8 +335,10 @@ def test_read_many_returns_empty_fields_without_reading():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
     (ref,) = store.put_many([token_stash(32, num_tokens=0, mask_rows=0)])
-    (got,) = store.read_many([(ref, ["routed_experts"])], stash_type=TokenOutputStash)
-    assert got.routed_experts.shape == (0, 48, 8)
+    (got,) = store.read_many(
+        [(ref, ["routed_experts.20-48"])], stash_type=TokenOutputStash
+    )
+    assert got.routed_experts[(20, 48)].shape == (0, 28, 8)
     assert backend.reads == [[]]
 
 
@@ -307,13 +347,14 @@ def test_read_ranges_match_numpy_slices():
     store = OutputStore(backend=backend)
     stashes = [token_stash(40 + i) for i in range(3)]
     refs = store.put_many(stashes)
+    arrays = [stored_arrays(stash) for stash in stashes]
     rng = np.random.default_rng(0)
     # Random row slices of random fields, packed into `into` in the order drawn.
     reads, wants, end = [], [], 0
     for _ in range(12):
         i = int(rng.integers(len(refs)))
-        name = str(rng.choice(TokenOutputStash.__struct_fields__))
-        array = getattr(stashes[i], name)
+        name = str(rng.choice(sorted(arrays[i])))
+        array = arrays[i][name]
         start = int(rng.integers(len(array)))
         want = array[start : int(rng.integers(start + 1, len(array) + 1))]
         reads.append(
@@ -340,12 +381,12 @@ def test_a_read_buffer_registers_once_for_every_read_until_closed():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
     (ref,) = store.put_many([token_stash(30, num_tokens=30)])
-    rows = token_stash(30, num_tokens=30).routed_experts
+    rows = token_stash(30, num_tokens=30).routed_experts[(20, 48)]
     into = store.read_buffer(rows[0].nbytes * 2)
     for row in (3, 17, 29):
         read = RangeRead(
             ref=ref,
-            field="routed_experts",
+            field="routed_experts.20-48",
             src_offset=row * rows[0].nbytes,
             nbytes=rows[0].nbytes,
             dst_offset=rows[0].nbytes,
@@ -371,9 +412,9 @@ def test_read_ranges_check_every_range_before_reading():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
     (ref,) = store.put_many([token_stash(50)])
-    size = {s.name: s.nbytes for s in ref.fields}["indexer_topk"]
+    size = {s.name: s.nbytes for s in ref.fields}["indexer_topk.0-2"]
     good = RangeRead(
-        ref=ref, field="indexer_topk", src_offset=0, nbytes=size, dst_offset=0
+        ref=ref, field="indexer_topk.0-2", src_offset=0, nbytes=size, dst_offset=0
     )
     zstd = msgspec.structs.replace(
         ref, fields=tuple(msgspec.structs.replace(s, codec="zstd") for s in ref.fields)

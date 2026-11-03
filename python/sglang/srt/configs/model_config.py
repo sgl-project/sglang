@@ -568,6 +568,24 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def indexer_slots_at(config, layer_ids: List[int]) -> List[int]:
+    """The indexer-topk capturer slot at each global layer id: the slots below it are
+    those of the layers below it. Capture runs on one pipeline stage only."""
+    if is_deepseek_dsa(config):
+        return list(layer_ids)
+    if is_deepseek_v4(config):
+        # Slots are the C4 layers' compress_layer_id: the C4 layers before them
+        # (DeepSeekV4TokenToKVPool._init_compressed_layer_mapping).
+        return [
+            sum(1 for ratio in config.compress_ratios[:layer_id] if ratio == 4)
+            for layer_id in layer_ids
+        ]
+    raise ValueError(
+        f"The indexer top-k of {_hf_arch(config)} cannot be split by layer: "
+        "its capturer slots are not mapped to layers."
+    )
+
+
 class ModelConfig:
     def __init__(
         self,

@@ -35,6 +35,9 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
+_NO_SPLITS = dict(routed_experts_splits=[], indexer_topk_splits=[])
+
+
 def _chunk(lengths, token_ids, logprobs):
     return SamplingMaskChunk(
         lengths=np.array(lengths, np.int32),
@@ -129,8 +132,9 @@ class TestTokenOutputCollector(CustomTestCase):
         collector.add_sampling_mask(_chunk([2], [5, 6], [-0.5, -1.0]))
         collector.add_sampling_mask(_chunk([1, 1], [7, 8], [-2.0, -3.0]))
 
-        stash = collector.to_stash()
-        self.assertTrue(np.shares_memory(stash.routed_experts, routed.numpy()))
+        stash = collector.to_stash(**_NO_SPLITS)
+        (block,) = stash.routed_experts.values()
+        self.assertTrue(np.shares_memory(block, routed.numpy()))
         np.testing.assert_array_equal(
             stash.output_token_sampling_mask_lengths, [2, 1, 1]
         )
@@ -144,6 +148,36 @@ class TestTokenOutputCollector(CustomTestCase):
         self.assertEqual(
             collector.inline_meta_info(), {"output_token_sampling_mask_length": 3}
         )
+
+    def test_stash_cuts_per_layer_fields_into_blocks_at_their_splits(self):
+        """Each block is the numpy slice of its range, the blocks tile the axis, and
+        no splits is one whole block; a trainer stage reads exactly its block."""
+        routed = torch.randint(0, 128, (5, 6, 4), dtype=torch.int32)
+        indexer = torch.randint(0, 4096, (5, 3, 8), dtype=torch.int32)
+        collector = TokenOutputCollector(routed_experts=routed, indexer_topk=indexer)
+        for routed_splits, indexer_splits, routed_blocks, indexer_blocks in (
+            ([], [], [(0, 6)], [(0, 3)]),
+            ([2, 4], [1, 2], [(0, 2), (2, 4), (4, 6)], [(0, 1), (1, 2), (2, 3)]),
+            # DeepSeek-V4: layers 2 and 4 map to the same indexer slot.
+            ([2, 4], [1, 1], [(0, 2), (2, 4), (4, 6)], [(0, 1), (1, 3)]),
+        ):
+            with self.subTest(routed=routed_splits, indexer=indexer_splits):
+                stash = collector.to_stash(
+                    routed_experts_splits=routed_splits,
+                    indexer_topk_splits=indexer_splits,
+                )
+                for blocks, want_ranges, tensor in (
+                    (stash.routed_experts, routed_blocks, routed),
+                    (stash.indexer_topk, indexer_blocks, indexer),
+                ):
+                    self.assertEqual(list(blocks), want_ranges)
+                    for (start, end), block in blocks.items():
+                        self.assertEqual(
+                            block.tobytes(),
+                            np.ascontiguousarray(
+                                tensor.numpy()[:, start:end]
+                            ).tobytes(),
+                        )
 
 
 class TestTokenizerSupportLogprobs(CustomTestCase):
@@ -184,7 +218,7 @@ class TestTokenizerSupportLogprobs(CustomTestCase):
             meta_info, {"output_token_sampling_selected_logprobs": [-1.0, -0.25, -3.0]}
         )
         np.testing.assert_array_equal(
-            collector.to_stash().output_token_sampling_logprobs,
+            collector.to_stash(**_NO_SPLITS).output_token_sampling_logprobs,
             [-0.5, -1.0, -0.25, -2.0, -3.0],
         )
 
@@ -196,17 +230,28 @@ class TestOutputStoreWriter(CustomTestCase):
 
     def test_put_resolves_to_a_ref_of_the_stored_stash(self):
         writer, backend = self._writer()
-        routed = torch.arange(8, dtype=torch.int32).reshape(2, 2, 2)
-        ref = writer.submit_put(TokenOutputCollector(routed_experts=routed)).result()
+        routed = torch.arange(12, dtype=torch.int32).reshape(2, 3, 2)
+        ref = writer.submit_put(
+            TokenOutputCollector(routed_experts=routed),
+            routed_experts_splits=[1],
+            indexer_topk_splits=[],
+        ).result()
         self.assertEqual(ref.backend, "memory")
         self.assertEqual(
-            backend.objects[ref.key], {"routed_experts": routed.numpy().tobytes()}
+            backend.objects[ref.key],
+            {
+                "routed_experts.0-1": routed[:, :1].numpy().tobytes(),
+                "routed_experts.1-3": routed[:, 1:].numpy().tobytes(),
+            },
         )
 
     def test_undelivered_objects_are_deleted(self):
         writer, backend = self._writer()
         written = writer.submit_put(
-            TokenOutputCollector(routed_experts=torch.zeros(1, 1, 1, dtype=torch.int32))
+            TokenOutputCollector(
+                routed_experts=torch.zeros(1, 1, 1, dtype=torch.int32)
+            ),
+            **_NO_SPLITS,
         )
         written.result()
         failed = concurrent.futures.Future()
@@ -215,7 +260,8 @@ class TestOutputStoreWriter(CustomTestCase):
         writer.cleanup_after(failed)
 
         other = writer.submit_put(
-            TokenOutputCollector(routed_experts=torch.ones(1, 1, 1, dtype=torch.int32))
+            TokenOutputCollector(routed_experts=torch.ones(1, 1, 1, dtype=torch.int32)),
+            **_NO_SPLITS,
         ).result()
         writer.cleanup_refs([other.to_builtins()])
         writer._executor.shutdown(wait=True)
@@ -228,7 +274,10 @@ class TestOutputStoreWriter(CustomTestCase):
         backend = _BlockingPutBackend()
         writer = OutputStoreWriter(OutputStore(backend=backend))
         put = writer.submit_put(
-            TokenOutputCollector(routed_experts=torch.zeros(1, 1, 1, dtype=torch.int32))
+            TokenOutputCollector(
+                routed_experts=torch.zeros(1, 1, 1, dtype=torch.int32)
+            ),
+            **_NO_SPLITS,
         )
         self.assertTrue(backend.put_started.wait(timeout=10))
         writer.cleanup_after(put)

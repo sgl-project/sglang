@@ -2973,6 +2973,8 @@ class TestPipelineParallelCompat(CustomTestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
+            enable_return_routed_experts=False,
+            enable_return_indexer_topk=False,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -3033,6 +3035,14 @@ class TestPipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(cfg)
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
                 check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+
+    def test_capture_is_rejected(self):
+        """Each stage captures only its layers into a zeroed buffer and only the last
+        stage returns it, so a PP engine would return zeros for the other layers."""
+        for flag in ("enable_return_routed_experts", "enable_return_indexer_topk"):
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(AssertionError, "pipeline parallelism"):
+                    check_pipeline_parallel_compat(self._cfg(**{flag: True}))
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
