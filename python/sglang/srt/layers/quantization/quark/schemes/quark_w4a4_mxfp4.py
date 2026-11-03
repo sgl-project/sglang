@@ -20,7 +20,10 @@ from sglang.srt.layers.quantization.dequantization import (
     dequantize_fp8,
     dequantize_nvfp4,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    is_mxfp4_gemm_supported,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -417,10 +420,10 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.dequantization_config = dequantization_config
         # Unlike the Triton path, AITER's gemm_a4w4 consumes the
         # a4w4_blockscale_tuned_gemm CSVs. --fp4-gemm-backend aiter uses it for
-        # every eligible layer; auto (gfx95 only) for the shapes those CSVs tune.
+        # every eligible layer; auto (native MXFP4 only) for the shapes those CSVs tune.
         backend = get_fp4_gemm_runner_backend()
         self.use_aiter_fp4_gemm = _is_hip and (
-            backend.is_aiter() or (backend.is_auto() and is_gfx95_supported())
+            backend.is_aiter() or (backend.is_auto() and is_mxfp4_gemm_supported())
         )
         self.aiter_fp4_gemm_tuned_shapes_only = backend.is_auto()
 

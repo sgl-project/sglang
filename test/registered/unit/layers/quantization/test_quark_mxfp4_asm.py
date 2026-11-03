@@ -35,10 +35,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
-def _resolve(backend, *, is_gfx95=True, legacy_use_aiter_asm=None):
+def _resolve(backend, *, mxfp4=True, legacy_use_aiter_asm=None):
     return resolve_rocm_fp4_gemm_backend(
         backend=backend,
-        is_gfx95=is_gfx95,
+        mxfp4_gemm_supported=mxfp4,
         legacy_use_aiter_asm=legacy_use_aiter_asm,
     )
 
@@ -62,36 +62,36 @@ class TestFp4GemmBackendCli(CustomTestCase):
 
 
 class TestResolveRocmFp4GemmBackend(CustomTestCase):
-    def test_auto_is_per_layer_on_gfx95_only(self):
-        """On gfx95, auto is left for the Quark scheme to resolve per layer
+    def test_auto_is_per_layer_with_mxfp4_only(self):
+        """With native MXFP4, auto is left for the Quark scheme to resolve per layer
         (tuned shape -> AITER); elsewhere it is the Triton GEMM."""
         self.assertEqual(_resolve("auto"), "auto")
-        self.assertEqual(_resolve("auto", is_gfx95=False), "triton")
+        self.assertEqual(_resolve("auto", mxfp4=False), "triton")
 
     def test_explicit_backends(self):
         self.assertEqual(_resolve("aiter"), "aiter")
         self.assertEqual(_resolve("triton"), "triton")
-        self.assertEqual(_resolve("triton", is_gfx95=False), "triton")
+        self.assertEqual(_resolve("triton", mxfp4=False), "triton")
 
-    def test_aiter_requires_gfx95(self):
-        with self.assertRaisesRegex(ValueError, "gfx95"):
-            _resolve("aiter", is_gfx95=False)
+    def test_aiter_requires_mxfp4(self):
+        with self.assertRaisesRegex(ValueError, "native MXFP4"):
+            _resolve("aiter", mxfp4=False)
 
     def test_legacy_env_is_honored_under_auto(self):
         cases = [
-            # (legacy value, is_gfx95, expected backend)
+            # (legacy value, mxfp4, expected backend)
             (True, True, "aiter"),
-            # The env var was a no-op off gfx95; it must not start raising.
+            # The env var was a no-op without native MXFP4; it must not start raising.
             (True, False, "triton"),
             (False, True, "triton"),
         ]
-        for legacy, is_gfx95, expected in cases:
-            with self.subTest(legacy=legacy, is_gfx95=is_gfx95):
+        for legacy, mxfp4, expected in cases:
+            with self.subTest(legacy=legacy, mxfp4=mxfp4):
                 with self.assertWarnsRegex(
                     DeprecationWarning, "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM"
                 ):
                     backend = _resolve(
-                        "auto", is_gfx95=is_gfx95, legacy_use_aiter_asm=legacy
+                        "auto", mxfp4=mxfp4, legacy_use_aiter_asm=legacy
                     )
                 self.assertEqual(backend, expected)
 
@@ -111,28 +111,28 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
         saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
         self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
 
-    def _initialize(self, backend, *, is_hip, is_gfx95=True):
+    def _initialize(self, backend, *, is_hip, mxfp4=True):
         exec_ctx = SimpleNamespace(
             kernel=SimpleNamespace(fp4_gemm_runner_backend=backend)
         )
         with (
             mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
             mock.patch.object(fp4_utils, "is_hip", return_value=is_hip),
-            mock.patch.object(fp4_utils, "is_gfx95_supported", return_value=is_gfx95),
+            mock.patch.object(fp4_utils, "is_mxfp4_gemm_supported", return_value=mxfp4),
         ):
             initialize_fp4_gemm_config()
         return fp4_utils.get_fp4_gemm_runner_backend()
 
     def test_rocm_auto(self):
-        for is_gfx95, expected in (
+        for mxfp4, expected in (
             (True, Fp4GemmRunnerBackend.AUTO),
             (False, Fp4GemmRunnerBackend.TRITON),
         ):
-            with self.subTest(is_gfx95=is_gfx95):
+            with self.subTest(mxfp4=mxfp4):
                 with envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.override(False):
                     # Restored to the pre-test state when the override exits.
                     envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.clear()
-                    backend = self._initialize("auto", is_hip=True, is_gfx95=is_gfx95)
+                    backend = self._initialize("auto", is_hip=True, mxfp4=mxfp4)
                 self.assertEqual(backend, expected)
 
     def test_rocm_legacy_env_reaches_global_backend(self):
@@ -153,12 +153,12 @@ class TestQuarkMxfp4BackendSelection(CustomTestCase):
         saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
         self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
 
-    def _make_scheme(self, backend, is_gfx95=True):
+    def _make_scheme(self, backend, mxfp4=True):
         fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
             mock.patch.object(
-                quark_w4a4_mxfp4, "is_gfx95_supported", return_value=is_gfx95
+                quark_w4a4_mxfp4, "is_mxfp4_gemm_supported", return_value=mxfp4
             ),
         ):
             return quark_w4a4_mxfp4.QuarkW4A4MXFP4(
@@ -181,10 +181,10 @@ class TestQuarkMxfp4BackendSelection(CustomTestCase):
             with self.subTest(backend=backend):
                 self.assertFalse(self._make_scheme(backend).use_aiter_fp4_gemm)
 
-    def test_uninitialized_auto_off_gfx95_stays_on_triton(self):
+    def test_uninitialized_auto_without_mxfp4_stays_on_triton(self):
         # get_fp4_gemm_runner_backend() returns AUTO before the scheduler has
         # resolved the flag; that must not enable the AITER path on e.g. MI300.
-        scheme = self._make_scheme(Fp4GemmRunnerBackend.AUTO, is_gfx95=False)
+        scheme = self._make_scheme(Fp4GemmRunnerBackend.AUTO, mxfp4=False)
         self.assertFalse(scheme.use_aiter_fp4_gemm)
 
 
@@ -314,7 +314,7 @@ class TestQuarkMxfp4AutoLayerSelection(CustomTestCase):
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
             mock.patch.object(
-                quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+                quark_w4a4_mxfp4, "is_mxfp4_gemm_supported", return_value=True
             ),
             mock.patch.object(
                 quark_w4a4_mxfp4,

@@ -168,14 +168,24 @@ def _warn_legacy_aiter_fp4_asm_gemm_env(message: str) -> None:
     logger.warning(message)
 
 
+def is_mxfp4_gemm_supported() -> bool:
+    """Whether this ROCm GPU has the native MXFP4 GEMM that AITER's a4w4 uses.
+
+    The one place to extend when more architectures gain it (gfx95, i.e.
+    MI350/MI355, today).
+    """
+    return is_gfx95_supported()
+
+
 def resolve_rocm_fp4_gemm_backend(
     *,
     backend: str,
-    is_gfx95: bool,
+    mxfp4_gemm_supported: bool,
     legacy_use_aiter_asm: Optional[bool],
 ) -> str:
     """Resolve --fp4-gemm-backend for ROCm.
 
+    ``mxfp4_gemm_supported`` is ``is_mxfp4_gemm_supported()``.
     ``legacy_use_aiter_asm`` is the value of the deprecated
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM, or None when it is unset.
     """
@@ -192,17 +202,17 @@ def resolve_rocm_fp4_gemm_backend(
             )
         else:
             _warn_legacy_aiter_fp4_asm_gemm_env(message)
-            # The env var was a silent no-op off gfx95; keep it that way.
-            return "aiter" if legacy_use_aiter_asm and is_gfx95 else "triton"
+            # The env var was a silent no-op without native MXFP4; keep it that way.
+            return "aiter" if legacy_use_aiter_asm and mxfp4_gemm_supported else "triton"
 
     if backend == "auto":
-        # On gfx95, auto stays unresolved: each Quark MXFP4 layer then uses the
-        # AITER GEMM if AITER's a4w4 tuned CSV covers its shape, else Triton.
-        return "auto" if is_gfx95 else "triton"
-    if backend == "aiter" and not is_gfx95:
+        # With native MXFP4, auto stays unresolved: each Quark MXFP4 layer then
+        # uses the AITER GEMM if AITER's a4w4 tuned CSV covers its shape, else Triton.
+        return "auto" if mxfp4_gemm_supported else "triton"
+    if backend == "aiter" and not mxfp4_gemm_supported:
         raise ValueError(
-            "--fp4-gemm-backend=aiter requires an AMD gfx95 GPU (MI350/MI355). "
-            "Use --fp4-gemm-backend triton instead."
+            "--fp4-gemm-backend=aiter requires a GPU with native MXFP4 GEMM support "
+            "(AMD gfx95: MI350/MI355). Use --fp4-gemm-backend triton instead."
         )
     return backend
 
@@ -216,7 +226,7 @@ def initialize_fp4_gemm_config() -> None:
         legacy_env = envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM
         backend = resolve_rocm_fp4_gemm_backend(
             backend=backend,
-            is_gfx95=is_gfx95_supported(),
+            mxfp4_gemm_supported=is_mxfp4_gemm_supported(),
             legacy_use_aiter_asm=legacy_env.get() if legacy_env.is_set() else None,
         )
     elif backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
