@@ -22,6 +22,12 @@ from sglang.srt.managers.mm_schedule import (
     PrefetchedEmbeddingFunc,
     _move_items_to_device,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    ListKind,
+    RequestList,
+    _RequestList,
+    move,
+)
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     forced_len,
     req_state,
@@ -29,6 +35,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
 from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_KEEP
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.managers.schedule_batch import Req
 
@@ -179,19 +186,25 @@ class DocPrefetch:
         device: torch.device,
         forward_stream: Optional[torch.cuda.Stream],
         tp_size: int,
+        abort_windows: Callable[..., None],
     ):
+        self._abort_windows = abort_windows
         # None when the model encodes nothing ahead (no early embeddings).
         self._early = early
         self._device = device
         self._forward_stream = forward_stream
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
         self._encode_ahead = early is not None and tp_size == 1
-        # Parked follow-ups, keyed by the rid they wait for.
-        self._parked: Dict[str, Req] = {}
+        # Follow-ups waiting for their predecessor.
+        self._parked = _RequestList(
+            ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
+        )
         # Completion tokens of finished predecessors whose follow-up has not arrived.
         self._finished: Dict[str, int] = {}
         # Follow-ups whose predecessor finished, for the scheduler to queue.
-        self._released: List[Req] = []
+        self._released = _RequestList(
+            ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
+        )
 
     def park(self, req: Req) -> bool:
         """Hold a follow-up until its predecessor finishes; True if it was parked."""
@@ -207,7 +220,7 @@ class DocPrefetch:
             return False
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
-        self._parked[after] = req
+        self._parked.join([req])
         mm = req.multimodal_inputs
         if self._encode_ahead and mm is not None and mm.mm_items:
             self._early.encode_ahead(
@@ -220,7 +233,7 @@ class DocPrefetch:
         return True
 
     def on_window_finished(self, req: Req) -> None:
-        """Mark the follow-up of a finished ``req`` released, budget capped.
+        """Mark every follow-up of a finished ``req`` released, budget capped.
 
         Called from the KV-release path after the window's KV was retained; the
         scheduler queues released windows with ``take_released``. A retracted
@@ -233,30 +246,30 @@ class DocPrefetch:
         self.release_early(req.rid)
         out = len(req.output_ids) if req.finished_len is None else req.finished_len
         used = max(0, out - forced_len(req))
-        follow = self._parked.pop(req.rid, None)
-        if follow is None:
+        follows = [r for r in self._parked if _after(r) == req.rid]
+        if not follows:
             if _is_predecessor(req):
                 self._finished[req.rid] = used
             return
-        _apply_budget(follow, used)
-        self._released.append(follow)
+        for follow in follows:
+            _apply_budget(follow, used)
+        move(follows, self._parked, self._released)
 
     def take_released(self) -> List[Req]:
         """Follow-ups released since the last call, in release order."""
-        out, self._released = self._released, []
-        return out
+        return self._released.take()
 
-    def drop(self, rid_prefix: str) -> List[Req]:
-        """Remove the parked or released follow-ups an abort names."""
-        hit = [k for k, r in self._parked.items() if r.rid.startswith(rid_prefix)]
-        out = [self._parked.pop(k) for k in hit]
-        kept = []
-        for r in self._released:
-            (out if r.rid.startswith(rid_prefix) else kept).append(r)
-        self._released = kept
-        for r in out:
+    def request_lists(self) -> Dict[ListKind, RequestList]:
+        return {
+            ListKind.UOCR_PARKED: self._parked,
+            ListKind.UOCR_RELEASED: self._released,
+        }
+
+    def _abort(self, windows: RequestList, recv_req: AbortReq) -> None:
+        aborted = windows.take(lambda r: recv_req.matches(r.rid))
+        for r in aborted:
             self.release_early(r.rid)
-        return out
+        self._abort_windows(aborted, finished_reason=recv_req.finished_reason)
 
     def forget_doc(self, doc_id: str) -> None:
         """Drop finished-predecessor records of a document that is done."""
@@ -267,10 +280,6 @@ class DocPrefetch:
         """Follow-up windows held off the waiting queue."""
         return len(self._parked) + len(self._released)
 
-    def held_reqs(self) -> List[Req]:
-        """Follow-up windows held off the waiting queue, parked then released."""
-        return [*self._parked.values(), *self._released]
-
     def release_early(self, rid: str) -> None:
         """Free a window's early embeddings once it no longer needs them."""
         if self._early is not None:
@@ -278,9 +287,9 @@ class DocPrefetch:
 
     def reset(self) -> List[Req]:
         """Forget everything; returns the held follow-ups for the caller to abort."""
-        held = list(self._parked.values()) + self._released
+        held = [*self._parked, *self._released]
         self._parked.clear()
-        self._released = []
+        self._released.clear()
         self._finished.clear()
         if self._early is not None:
             self._early.clear()

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -244,7 +244,7 @@ class TestMambaCapacity(unittest.TestCase):
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
         queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
         queue.retracted_queue.join([req])
@@ -276,7 +276,7 @@ class TestMambaCapacity(unittest.TestCase):
             ),
         ):
             self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(list(queue.queue.items()), [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
