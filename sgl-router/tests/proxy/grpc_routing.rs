@@ -655,7 +655,7 @@ async fn stream_outcomes_reach_the_breaker_by_status() {
                         _ => stream::iter(
                             late.then(|| Ok(frame("hi", false)))
                                 .into_iter()
-                                .chain([Ok(error(500))]),
+                                .chain([Ok(error(502))]),
                         )
                         .boxed(),
                     }
@@ -663,12 +663,16 @@ async fn stream_outcomes_reach_the_breaker_by_status() {
             )
             .start()
             .await;
-        let mut client = serve_grpc(router_ctx(&[(
-            WorkerMode::Plain,
-            "http://127.0.0.1:1",
-            Some(port),
-        )]))
-        .await;
+        let ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+        let mut client = serve_grpc(Arc::clone(&ctx)).await;
+        let breaker_state = || {
+            ctx.registry
+                .get(&WorkerId("http://127.0.0.1:1".into()))
+                .unwrap()
+                .breaker
+                .snapshot()
+                .state_code
+        };
         for _ in 0..3 {
             assert_eq!(
                 collect(client.generate(generate(true)).await)
@@ -678,16 +682,15 @@ async fn stream_outcomes_reach_the_breaker_by_status() {
                 Code::ResourceExhausted
             );
         }
+        assert_eq!(breaker_state(), 0, "backpressure leaves the breaker closed");
         for _ in 0..3 {
             let items = collect(client.generate(generate(true)).await)
                 .await
                 .unwrap();
-            assert_eq!(items.last(), Some(&error(500)));
+            assert_eq!(items.last(), Some(&error(502)));
         }
-        assert_eq!(
-            client.generate(generate(true)).await.unwrap_err().code(),
-            Code::Unavailable
-        );
+        // A single worker may fail open, so inspect the breaker directly.
+        assert_eq!(breaker_state(), 1, "three 502s open the breaker");
         assert_eq!(*calls.lock().unwrap(), 6);
     }
 }
