@@ -22,6 +22,7 @@ _KDA_M_BY_PROJECTION = {
     (4096, 4096): _SUPPORTED_KDA_M,
     (5120, 7168): _SUPPORTED_KDA_M,
     (5120, 5120): (2, 4, 8, 9),
+    (3072, 5120): (2, 4, 8),
     (5120, 34816): (1, 2, 4, 8, 9),
 }
 _KDA_PRODUCTION_SHAPES = frozenset(
