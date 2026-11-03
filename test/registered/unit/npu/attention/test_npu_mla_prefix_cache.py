@@ -34,27 +34,38 @@ class TestNpuMlaPrefixCache(unittest.TestCase):
         # Repeat a shared block and visit physical pages out of order.
         block_ids = [3, 1, 3, 0, 6, 2, 5, 4][:total_pages]
         pages = torch.arange(8 * page_size * head_dim, dtype=torch.float32)
-        pages = pages.remainder(1009).reshape(8, page_size, 1, head_dim).to(dtype)
+        pages = pages.remainder(1009)
+        is_fp8 = dtype == torch.float8_e4m3fn
+        if is_fp8:
+            pages = pages.remainder(97) - 48
+        pages = pages.reshape(8, page_size, 1, head_dim).to(dtype)
+        reference_pages = pages.float() if is_fp8 else pages
         expected_parts = []
         block_start = 0
         for length, count in zip(lengths, counts, strict=True):
             request_pages = block_ids[block_start : block_start + count]
-            expected_parts.append(pages[request_pages].flatten(0, 1)[:length])
+            expected_parts.append(reference_pages[request_pages].flatten(0, 1)[:length])
             block_start += count
         expected = torch.cat(expected_parts)
 
+        backing_pages = pages.view(torch.uint8) if is_fp8 else pages
         if is_nz:
+            tile_size = 32 if is_fp8 else 16
             storage = (
-                pages.view(8, page_size, head_dim // 16, 16)
+                backing_pages.view(8, page_size, head_dim // tile_size, tile_size)
                 .permute(0, 2, 1, 3)
                 .contiguous()
-                .view_as(pages)
+                .view_as(backing_pages)
             )
         else:
             # Also cover a noncontiguous ND view, as in sliced cache buffers.
-            backing = torch.empty(8, page_size, 1, head_dim * 2, dtype=dtype)
+            backing = torch.empty(
+                8, page_size, 1, head_dim * 2, dtype=backing_pages.dtype
+            )
             storage = backing[..., ::2]
-            storage.copy_(pages)
+            storage.copy_(backing_pages)
+        if is_fp8:
+            storage = storage.view(dtype)
 
         indices = (
             build_mla_prefix_token_indices(
@@ -76,9 +87,31 @@ class TestNpuMlaPrefixCache(unittest.TestCase):
         expected_selects = 0 if sum(lengths) == 0 else 1 + int(compact)
         self.assertEqual(select.call_count, expected_selects)
         self.assertEqual(actual.shape, (sum(lengths), 1, head_dim))
+        self.assertEqual(actual.dtype, dtype)
         if indices is not None:
             self.assertEqual(indices.dtype, torch.int64)
-        torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+        actual_cpu = actual.cpu().float() if is_fp8 else actual.cpu()
+        torch.testing.assert_close(actual_cpu, expected, atol=0, rtol=0)
+
+    def test_fp8_aligned_and_partial_prefixes(self):
+        for device in DEVICES:
+            for is_nz in (False, True):
+                for lengths, page, head_dim in (
+                    ([5, 3, 0], 4, 32),
+                    ([4, 8, 0], 4, 64),
+                    ([128, 255, 129], 128, 512),
+                    ([0, 0], 4, 32),
+                ):
+                    with self.subTest(device=device, is_nz=is_nz, lengths=lengths):
+                        self.check_gather(
+                            lengths,
+                            page,
+                            head_dim,
+                            torch.float8_e4m3fn,
+                            device,
+                            is_nz,
+                            compact=any(length % page for length in lengths),
+                        )
 
     def test_aligned_prefixes_skip_token_compaction(self):
         for device in DEVICES:

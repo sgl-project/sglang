@@ -33,10 +33,8 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,

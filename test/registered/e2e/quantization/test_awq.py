@@ -43,7 +43,10 @@ class TestAWQ(CustomTestCase):
         )
 
         metrics = run_sgl_eval(args)
-        self.assertGreater(metrics["score"], 0.64)
+        # On main's scheduled runs (10-03 to 11-02) this scores 0.633-0.672,
+        # mean 0.652, sd 0.0095 (about 2.5 of the 256 questions). 0.64 was
+        # 1.3 sd below the mean and failed 5 of 48 attempts.
+        self.assertGreater(metrics["score"], 0.62)
 
 
 @unittest.skipIf(is_in_amd_ci(), "AWQ Marlin is not supported on AMD GPUs")

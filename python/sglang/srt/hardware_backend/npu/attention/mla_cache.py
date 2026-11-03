@@ -33,17 +33,22 @@ def gather_mla_cache_pages(
     """Return selected pages in logical [blocks, page_size, 1, head_dim] order.
 
     NZ buffers retain that public shape, but their physical contents are
-    [blocks, head_dim // 16, page_size, 16]. Restore token-major order before
+    [blocks, head_dim // D0, page_size, D0], where D0 spans 32 bytes.
+    Restore token-major order before
     projecting cached latent vectors or concatenating their RoPE features.
     """
-    pages = torch.index_select(cache, 0, block_ids)
+    # Gather backing bytes, because index_select need not implement FP8.
+    backing = cache.view(torch.uint8) if cache.dtype == torch.float8_e4m3fn else cache
+    pages = torch.index_select(backing, 0, block_ids)
     if not is_nz:
-        return pages
+        return pages.view(cache.dtype)
     page_size, head_dim = cache.shape[1], cache.shape[-1]
+    tile_size = 32 if cache.dtype == torch.float8_e4m3fn else 16
     return (
-        pages.view(block_ids.numel(), head_dim // 16, page_size, 16)
+        pages.view(block_ids.numel(), head_dim // tile_size, page_size, tile_size)
         .permute(0, 2, 1, 3)
         .reshape(block_ids.numel(), page_size, 1, head_dim)
+        .view(cache.dtype)
     )
 
 
@@ -68,4 +73,8 @@ def gather_mla_cache_tokens(
     tokens = pages.flatten(0, 1)
     if token_indices is None:
         return tokens
-    return torch.index_select(tokens, 0, token_indices)
+    # Match page gathering: FP8 copies use bytes until cache dequantization.
+    backing = (
+        tokens.view(torch.uint8) if tokens.dtype == torch.float8_e4m3fn else tokens
+    )
+    return torch.index_select(backing, 0, token_indices).view(cache.dtype)

@@ -561,6 +561,135 @@ class TestGenerateAlibiBias(unittest.TestCase):
 
 
 class TestMlaPrefixCacheDcp(unittest.TestCase):
+    def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
+        from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+            build_mla_prefix_token_indices,
+        )
+
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        page = 4
+        for local_lens in ([5, 3], [4, 4]):
+            counts = [(length + page - 1) // page for length in local_lens]
+            blocks = sum(counts)
+            ids = torch.arange(blocks - 1, -1, -1)
+            latent = (
+                (torch.arange(blocks * page * 32).remainder(97) - 48)
+                .reshape(blocks, page, 1, 32)
+                .to(torch.float8_e4m3fn)
+            )
+            rope = (
+                torch.arange(blocks * page * 32).reshape(blocks, page, 1, 32).bfloat16()
+            )
+            expected_k, expected_pe, offset = [], [], 0
+            for length, count in zip(local_lens, counts):
+                request_ids = ids[offset : offset + count]
+                expected_k.append(latent.float()[request_ids].flatten(0, 1)[:length])
+                expected_pe.append(rope[request_ids].flatten(0, 1)[:length])
+                offset += count
+            expected_k = torch.cat(expected_k)
+            expected_pe = torch.cat(expected_pe)
+            expected_dequantized = (expected_k * 0.25).bfloat16()
+
+            for is_nz in (False, True):
+
+                def encode(data):
+                    if not is_nz:
+                        return data
+                    tile = 32 if data.dtype == torch.float8_e4m3fn else 16
+                    backing = data.view(torch.uint8) if tile == 32 else data
+                    return (
+                        backing.reshape(blocks, page, 32 // tile, tile)
+                        .permute(0, 2, 1, 3)
+                        .contiguous()
+                        .reshape_as(backing)
+                        .view(data.dtype)
+                    )
+
+                for size in (1, 2):
+                    with self.subTest(lengths=local_lens, nz=is_nz, dcp_size=size):
+                        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+                        backend.dcp_size, backend.page_size = size, page
+                        backend.kv_lora_rank = backend.qk_rope_head_dim = 32
+                        global_lens = (
+                            local_lens
+                            if size == 1
+                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                        )
+                        backend.forward_metadata = ForwardMetadata(
+                            prefix_lens=torch.tensor(global_lens),
+                            flatten_prefix_block_tables=ids,
+                            prefix_token_indices=(
+                                build_mla_prefix_token_indices(
+                                    local_lens, page, device=torch.device("cpu")
+                                )
+                                if any(length % page for length in local_lens)
+                                else None
+                            ),
+                        )
+                        k_buffer, pe_buffer = encode(latent), encode(rope)
+                        backend.token_to_kv_pool = SimpleNamespace(
+                            get_key_buffer=lambda _: k_buffer,
+                            get_value_buffer=lambda _: pe_buffer,
+                        )
+                        dequantize = MagicMock(
+                            side_effect=lambda value: (
+                                (value.float() * 0.25).bfloat16(),
+                                None,
+                            )
+                        )
+                        full_prefix = torch.randn(sum(global_lens), 1, 64).bfloat16()
+                        with (
+                            patch(f"{module}.is_fia_nz", return_value=is_nz),
+                            patch(
+                                f"{module}.all_gather_kv_cache_for_dcp",
+                                return_value=full_prefix,
+                            ) as gather,
+                        ):
+                            result_k, result_pe = backend._load_mla_prefix_cache(
+                                SimpleNamespace(
+                                    layer_id=0,
+                                    scheme=SimpleNamespace(dequantize_cache=dequantize),
+                                )
+                            )
+                        dequantize.assert_called_once()
+                        encoded = dequantize.call_args.args[0]
+                        self.assertEqual(encoded.dtype, torch.float8_e4m3fn)
+                        torch.testing.assert_close(
+                            encoded.float(), expected_k, atol=0, rtol=0
+                        )
+                        if size == 1:
+                            gather.assert_not_called()
+                            torch.testing.assert_close(
+                                result_k, expected_dequantized, atol=0, rtol=0
+                            )
+                            torch.testing.assert_close(
+                                result_pe, expected_pe, atol=0, rtol=0
+                            )
+                        else:
+                            gather.assert_called_once()
+                            torch.testing.assert_close(
+                                gather.call_args.args[0],
+                                expected_dequantized,
+                                atol=0,
+                                rtol=0,
+                            )
+                            torch.testing.assert_close(
+                                gather.call_args.args[1], expected_pe, atol=0, rtol=0
+                            )
+                            self.assertIs(
+                                gather.call_args.args[2],
+                                backend.forward_metadata.prefix_lens,
+                            )
+                            self.assertEqual(
+                                gather.call_args.kwargs, {"interleave_size": page}
+                            )
+                            torch.testing.assert_close(
+                                torch.cat((result_k, result_pe), -1),
+                                full_prefix,
+                                atol=0,
+                                rtol=0,
+                            )
+
     def _check_prefix_cache(self, lengths, page_size, size, rank, is_nz, mode):
         module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
         queries = torch.tensor([3, 1, 1], dtype=torch.int32)

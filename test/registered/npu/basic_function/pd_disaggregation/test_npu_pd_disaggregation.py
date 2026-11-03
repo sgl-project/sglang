@@ -9,7 +9,7 @@ from typing import Dict
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline
 from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
