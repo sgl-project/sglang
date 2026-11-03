@@ -488,9 +488,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_memory_saver",
     "enable_weights_cpu_backup",
     "enable_draft_weights_cpu_backup",
-    "enable_weightbridge_receiver",
-    "weightbridge_pause_mode",
-    "weightbridge_hub_addr",
     "enable_custom_logit_processor",
     "enable_return_hidden_states",
     "return_hidden_states_mode",
@@ -568,5 +565,8 @@ POSITIONAL_FIELD_ORDER = (
     "output_store_backend_extra_config",
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
+    "enable_weightbridge_receiver",
+    "weightbridge_pause_mode",
+    "weightbridge_hub_addr",
 )
 # fmt: on
