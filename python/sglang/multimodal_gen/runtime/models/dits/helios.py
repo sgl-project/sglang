@@ -945,8 +945,7 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 batch_size, history_context_length, -1
             )
             timestep_proj_t0 = (
-                timestep_proj_t0.unflatten(-1, (6, -1))
-                .float()
+                timestep_proj_t0.float()
                 .view(1, 6, 1, -1)
                 .expand(batch_size, -1, -1, -1)
             )
@@ -961,21 +960,19 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_hidden_states, forward_batch
         )
         # Keep one row per timestep; blocks broadcast it within each token span.
-        timestep_proj = timestep_proj.unflatten(-1, (6, -1)).float()
+        timestep_proj = timestep_proj.float().view(batch_size, 6, 1, -1)
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
             main_repeat_size = hidden_states.shape[1]
         else:
             main_repeat_size = effective_context_length
         temb = temb.view(batch_size, 1, -1).expand(batch_size, main_repeat_size, -1)
-        timestep_proj = timestep_proj.view(batch_size, 6, 1, -1)
 
         if indices_hidden_states is not None and self.zero_history_timestep:
             temb = torch.cat([temb_t0, temb], dim=1)
             timestep_proj = torch.cat([timestep_proj_t0, timestep_proj], dim=2)
 
-        if timestep_proj.ndim == 4:
-            timestep_proj = timestep_proj.permute(0, 2, 1, 3)
+        timestep_proj = timestep_proj.permute(0, 2, 1, 3)
         modulation_lengths = (
             (history_context_length, effective_context_length)
             if timestep_proj.shape[1] == 2
