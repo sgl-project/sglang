@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -84,9 +85,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
-
-# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
-# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -109,13 +107,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    NodeId,
     uses_joint_lru,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -692,6 +685,19 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def _linker_offload_skip_prefix(self, req: Req, token_ids):
+        # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
+        # Convert the request's raw-token skip boundary to page-aligned radix-key units.
+        if self.linker is None:
+            return nullcontext()
+        skip_key = RadixKey(
+            token_ids[: req.linker_offload_skip_prefix_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        return self.linker.skip_offload_prefix(len(skip_key))
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -1366,7 +1372,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if reuse_existing_mamba:
             insert_params.allow_missing_mamba = True
         try:
-            result = self.insert(insert_params)
+            with self._linker_offload_skip_prefix(req, token_ids):
+                result = self.insert(insert_params)
         finally:
             if reuse_existing_mamba:
                 insert_params.allow_missing_mamba = False
@@ -3177,6 +3184,9 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
+        # The op is retired without an IO transfer, so retire its hicache root
+        # span now (idempotent with the zero-hit finish in prefetch_thread_func).
+        self.cache_controller._finish_op_trace(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -4054,6 +4064,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
+
+    def retained_window_tokens(self) -> int:
+        return 0 if self.uocr_doc_reuse is None else self.uocr_doc_reuse.held_tokens()
+
+    def retained_window_req_count(self) -> int:
+        return (
+            0 if self.uocr_doc_reuse is None else len(self.uocr_doc_reuse.held_slots())
+        )
 
     def enable_uocr_doc_reuse(self, doc_reuse: DocReuse) -> None:
         """Let Unlimited-OCR v2 document windows reuse their predecessor's KV."""

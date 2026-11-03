@@ -11,7 +11,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -74,6 +75,7 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
+    empty_request_lists(s)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
     s.waiting_queue = waiting_queue
@@ -92,7 +94,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -150,7 +152,7 @@ class TestQueuedAbort(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
         patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         )
         patcher.start()
@@ -162,19 +164,18 @@ class TestQueuedAbort(CustomTestCase):
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
         s.disaggregation_mode = DisaggregationMode.NULL
-        s._deferred_responses = {}
         s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
-        s._release_aborted_request = MagicMock()
+        s.release_aborted_request = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s._release_aborted_request.assert_called_once_with(req)
+        s.release_aborted_request.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):
@@ -216,7 +217,7 @@ class TestRunningTimeout(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        s.disagg_prefill_inflight_queue = []
+        s.disagg_prefill_transfer_queue = []
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])
