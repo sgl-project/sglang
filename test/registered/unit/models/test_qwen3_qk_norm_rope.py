@@ -58,6 +58,23 @@ def make_layer(d=128, dtype=torch.bfloat16, **kwargs):
     return layer
 
 
+MROPE = {
+    "rope_type": "default",
+    "mrope_section": [24, 20, 20],
+    "mrope_interleaved": True,
+}
+
+
+def decode_positions(layer, positions):
+    if layer.table_rope_positions_ndim == 2:
+        # Distinct axes also cover models with precomputed spatial decode positions;
+        # the decode graph runner passes a [:, :bs] slice of a [3, max_bs] buffer.
+        padded = torch.nn.functional.pad(positions, (0, 8))
+        axes = torch.stack([padded, padded + 5, padded * 3])
+        return (axes % len(layer.rotary_emb.cos_sin_cache))[:, : len(positions)]
+    return positions
+
+
 def separate(layer, positions, x, batch):
     with patch.object(layer, "use_table_qk_norm_rope", False):
         return layer.forward_prepare_native(positions, x, batch)
@@ -68,6 +85,7 @@ def assert_same_qkv(actual, expected):
         assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
 
 
+@pytest.mark.parametrize("rope_scaling", [None, MROPE])
 @pytest.mark.parametrize(
     "mode,dtype,should_fuse",
     [
@@ -77,11 +95,11 @@ def assert_same_qkv(actual, expected):
         (ForwardMode.DECODE, torch.float16, False),
     ],
 )
-def test_model_dispatch(mode, dtype, should_fuse):
-    layer = make_layer(dtype=dtype)
+def test_model_dispatch(rope_scaling, mode, dtype, should_fuse):
+    layer = make_layer(dtype=dtype, rope_scaling=rope_scaling)
     assert layer.use_table_qk_norm_rope
     x = torch.randn(4, layer.hidden_size, device="cuda", dtype=dtype)
-    positions = torch.arange(4, device="cuda") + 17
+    positions = decode_positions(layer, torch.arange(4, device="cuda") + 17)
     batch = SimpleNamespace(forward_mode=mode)
     expected = separate(layer, positions, x, batch)
     # Only attention itself is stubbed: construction, projections, norm and RoPE are real.
@@ -115,6 +133,11 @@ def test_model_dispatch(mode, dtype, should_fuse):
         ),
         ({}, {"d": 512}, False),
         ({}, {"rope_scaling": {"rope_type": "linear", "factor": 2.0}}, False),
+        (
+            {},
+            {"d": 256, "rope_scaling": {**MROPE, "mrope_section": [48, 40, 40]}},
+            False,
+        ),
         ({}, {}, True),
     ],
 )
@@ -126,11 +149,21 @@ def test_constructor_exclusions(runtime, settings, layer_args, deterministic_env
         assert not make_layer(**layer_args).use_table_qk_norm_rope
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_changing_input_graph_replay(batch_size):
-    layer = make_layer()
+def test_mrope_one_d_positions_stay_separate():
+    layer = make_layer(rope_scaling=MROPE)
+    x = torch.randn(4, layer.hidden_size, device="cuda", dtype=torch.bfloat16)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    with patch.object(qwen3, "table_qk_norm_rope_") as fused:
+        layer.forward_prepare_native(torch.arange(4, device="cuda"), x, batch)
+    fused.assert_not_called()
+
+
+@pytest.mark.parametrize("rope_scaling", [None, MROPE])
+@pytest.mark.parametrize("batch_size", [1, 4, 128])
+def test_changing_input_graph_replay(rope_scaling, batch_size):
+    layer = make_layer(rope_scaling=rope_scaling)
     x = torch.randn(batch_size, layer.hidden_size, device="cuda", dtype=torch.bfloat16)
-    positions = torch.arange(batch_size, device="cuda")
+    positions = decode_positions(layer, torch.arange(batch_size, device="cuda"))
     batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
     layer.forward_prepare_native(positions, x, batch)  # JIT warmup before capture.
     graph = torch.cuda.CUDAGraph()
@@ -144,7 +177,9 @@ def test_changing_input_graph_replay(batch_size):
     fused.assert_called_once()
     for offset in (0, 17, 2048):
         x.normal_()
-        positions.copy_(torch.arange(batch_size, device="cuda") + offset)
+        positions.copy_(
+            decode_positions(layer, torch.arange(batch_size, device="cuda") + offset)
+        )
         graph.replay()
         assert_same_qkv(actual, separate(layer, positions, x, batch))
 
