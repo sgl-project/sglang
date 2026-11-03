@@ -410,3 +410,39 @@ curl http://127.0.0.1:8000/v1/completions \
 ```
 
 > **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.
+
+## Distributed Weight Data Parallelism (DWDP) on Intel XPU [Experimental]
+
+DWDP runs MoE prefill data-parallel: each card keeps the attention weights and its
+own shard of the experts, and copies the other cards' experts for the next layers
+from peer memory while the current layer computes. Prefill needs no all-reduce, at
+the cost of the prefetch buffers. It is meant for the prefill side of a P/D
+deployment; with `--disaggregation-mode null`, every decode step copies the remote
+experts again.
+
+**Requirements:**
+
+- A single node: expert handles are exchanged as POSIX fds, which cannot cross hosts.
+- Peer access between every pair of cards in the group (`zeDeviceCanAccessPeer`);
+  startup fails with the unreachable devices listed otherwise.
+- A Level Zero loader >= 1.28 (`libze_loader.so.1` exporting `zePhysicalMemGetProperties`).
+- `--dwdp-size` equal to `--tp-size`.
+
+**Launch (2 cards):**
+
+```bash
+python -m sglang.launch_server --model-path openai/gpt-oss-20b --device xpu \
+    --attention-backend intel_xpu --tp-size 2 --dwdp-size 2 \
+    --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
+    --mem-fraction-static 0.85
+```
+
+Tested with gpt-oss-20b on 2 and 4 Arc Pro B60 cards and Qwen3-30B-A3B on 4, and in
+P/D with DWDP prefill on 2 cards and TP decode on 2 over NIXL. NIXL needs a UCX built
+with Level Zero support (`--with-ze`), as in `docker/xpu.Dockerfile`; the PyPI wheel
+is CUDA-only.
+
+Level Zero cannot map one physical page into two virtual ranges, so DWDP on XPU
+remaps its buffer pages per layer and keeps three prefetch slots instead of two.
+DWDP does not support EPLB, speculative decoding, pipeline parallelism, two-batch
+overlap, or shared-expert fusion; these are refused at startup.
