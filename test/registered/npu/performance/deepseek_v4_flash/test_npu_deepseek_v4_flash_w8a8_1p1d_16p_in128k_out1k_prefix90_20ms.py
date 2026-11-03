@@ -5,7 +5,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK,
     BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    TestNpuPerfMultiNodePdSepTestCaseBase,
+    TestNpuPerfMultiNodePdSepTestCaseBase, AISBENCHMARK_DATASET_GSM8K,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -242,6 +242,9 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     repeat_rate = 0.9
     request_rate = 3
     warmup_requests = 16
+    # Keep the shared-prefix warmup cache: SGLANG_IS_IN_CI would otherwise make
+    # bench_serving flush the cache right after warmup.
+    pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
@@ -254,7 +257,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiN
     """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
-    dataset_type = "gsm8k-shared-prefix"
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
     dataset_path = None
     input_len = 131072
     output_len = 1024
@@ -262,17 +265,9 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiN
     max_concurrency = 54
     # num_prompts = 20
     # max_concurrency = 10
-    random_range_ratio = 1
-    request_rate = 0
-    # Use raw /v1/completions instead of the chat API: the shared-prefix rows
-    # are natural-text continuations, and the chat template turns them into a
-    # digit-heavy assistant QA task that collapses DSPARK draft acceptance.
-    api_type = "raw"
-    # Fill the shared prefix on every DP rank before the scored run, otherwise
-    # most requests pay a cold 128k prefill and blow the TTFT baseline.
-    warmup_dp = 16
-    warmup_shape = 1
-    pop_sglang_is_in_ci_for_gsp = True
+    repeat_rate = 0.9
+    request_rate = 3
+    dp = 16
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
