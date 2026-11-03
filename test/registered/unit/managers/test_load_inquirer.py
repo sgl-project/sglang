@@ -134,12 +134,13 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             get_running_batch=lambda: SimpleNamespace(reqs=[]),
             get_stats=SchedulerStats,
-            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(
-                queue=prealloc, retracted_queue=_RequestList(ListKind.PD_RETRACTED)
-            ),
-            get_disagg_decode_transfer_queue=lambda: SimpleNamespace(
-                queue=decode_queue(ListKind.PD_RECEIVING)
-            ),
+            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(queue=prealloc),
+            get_request_lists=lambda: {
+                ListKind.WAITING: [],
+                ListKind.PD_PREALLOC: prealloc,
+                ListKind.PD_RECEIVING: decode_queue(ListKind.PD_RECEIVING),
+                ListKind.PD_RETRACTED: _RequestList(ListKind.PD_RETRACTED),
+            },
             get_total_prefill_uncached_tokens=lambda: 0,
             get_total_prefill_busy_us=lambda: 0,
             get_decode_moment_totals=lambda: (0,),
