@@ -845,6 +845,8 @@ class HiCacheController:
         self, model_name: Optional[str], attn_cp_size: int
     ) -> Optional[UnifiedKVPlan]:
         """Pair topology-free chunk coordinates with local page ranges."""
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
         memory = get_memory()
         if memory.hicache_storage_key_scheme != "unified":
             return None

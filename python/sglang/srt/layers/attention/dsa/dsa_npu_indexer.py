@@ -70,10 +70,14 @@ class DSANPUIndexerMixin:
         attn_backend = get_attn_backend()
         if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
             attn_backend.prepare_dsa_cp_metadata(forward_batch)
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+        # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
+        # the forward metadata consumed here lives on the full-attn side.
+        if hasattr(attn_backend, "full_attn_backend"):
+            attn_backend = attn_backend.full_attn_backend
+        if attn_backend.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -219,11 +223,9 @@ class DSANPUIndexerMixin:
         if (
             parallel.dcp_enabled
             and parallel.attn_dcp_size > 1
-            and not get_attn_backend().is_draft_worker
+            and not attn_backend.is_draft_worker
         ):
-            indexer_cache_loc = (
-                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
-            )
+            indexer_cache_loc = attn_backend.forward_metadata.dcp_origin_out_cache_loc
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
@@ -232,6 +234,13 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
+        # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
+        # full-attn pool, which is keyed by compact (dense) layer ids;
+        # translate the global layer id before unwrapping the wrapper.
+        if hasattr(pool, "full_kv_pool"):
+            pool._wait_for_layer(layer_id)
+            layer_id = pool._transfer_full_attention_id(layer_id)
+            pool = pool.full_kv_pool
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
@@ -246,21 +255,21 @@ class DSANPUIndexerMixin:
             ):
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
                 actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
+                    attn_backend.forward_metadata.actual_seq_lengths_kv
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
+            if attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
                 ):
-                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
+                    num_draft_tokens = attn_backend.speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
                         num_draft_tokens + bs,
@@ -276,10 +285,10 @@ class DSANPUIndexerMixin:
                     )
             else:
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
+        past_key_states = pool.get_index_k_buffer(layer_id)
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
@@ -287,7 +296,7 @@ class DSANPUIndexerMixin:
             torch.npu.current_stream().wait_event(weights_event)
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        block_table = attn_backend.forward_metadata.block_tables
         if (
             is_prefill
             and self.dsa_enable_prefill_cp

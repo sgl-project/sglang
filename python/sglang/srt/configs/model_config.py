@@ -209,6 +209,7 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
             "KimiK31ForConditionalGeneration",
             "KimiK31LinearForCausalLM",
+            "KimiLinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -1251,6 +1252,22 @@ class ModelConfig:
                 else dict(text_config)
             )
             self.hf_config.text_config = KimiLinearConfig(**config_dict)
+            # Mirror native KimiK3Config: DSA fields must also live on the
+            # top-level config, which is what the KV-cache configurator and
+            # memory sizing read (is_deepseek_dsa on hf_config, not text_config).
+            if getattr(self.hf_config.text_config, "dsa_config", None) is not None:
+                self.hf_config.text_config.architectures = ["KimiK31LinearForCausalLM"]
+                self.hf_config.index_topk = self.hf_config.text_config.index_topk
+                self.hf_config.index_head_dim = (
+                    self.hf_config.text_config.index_head_dim
+                )
+                self.hf_config.index_n_heads = self.hf_config.text_config.index_n_heads
+                self.hf_config.index_topk_freq = (
+                    self.hf_config.text_config.index_topk_freq
+                )
+                self.hf_config.index_skip_topk_offset = (
+                    self.hf_config.text_config.index_skip_topk_offset
+                )
             return
 
         # Text-only Kimi K3.1 checkpoints expose KimiLinearConfig as the

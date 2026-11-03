@@ -2706,6 +2706,12 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
+        # A DSA attention's forward core returns (output, topk_indices)
+        # (deepseek_v2's forward_absorb contract); keep only the output so
+        # the stage boundary records a plain tensor. K3.1's index_topk_freq
+        # is 1, so no layer reuses another layer's indices.
+        if isinstance(result, tuple):
+            result = result[0]
         return result
 
     def forward(
