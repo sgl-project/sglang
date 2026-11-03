@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (  # noqa: E4
 )
 from sglang.srt.managers import schedule_batch as sb  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -296,7 +296,7 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _prepare_kv_cache_release=lambda req: None,
             _maybe_collect_routed_experts=lambda req: None,
             _maybe_collect_indexer_topk=lambda req: None,
-            _maybe_collect_customized_info=lambda i, req, out: None,
+            _maybe_collect_customized_info=lambda i, req, out, n: None,
         )
         released = []
         with (

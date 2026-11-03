@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -15,6 +16,7 @@ import sglang.kernels.selector as sel
 from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
@@ -155,7 +157,7 @@ def test_platform_detection_distinguishes_musa_cuda_alias(
     if musa_available is not None:
         torch.musa = SimpleNamespace(is_available=lambda: musa_available)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert PlatformInfo.detect().device_type == expected_device
+    assert PlatformInfo.detect(use_cache=False).device_type == expected_device
 
 
 def test_capabilities_or_semantics():
@@ -165,6 +167,101 @@ def test_capabilities_or_semantics():
     assert not K.capabilities_satisfied(both, _CPU)
     assert K.capabilities_satisfied((), _CPU)  # empty = unrestricted
     assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
+
+
+class TestCakeSoftmaxCapability(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.kernels.cake_kernels import sampling as cake_sampling
+
+        self.cake_sampling = cake_sampling
+        self.cake_sampling._device_supported.cache_clear()
+
+    def tearDown(self):
+        self.cake_sampling._device_supported.cache_clear()
+        super().tearDown()
+
+    @staticmethod
+    def _logits(shape, dtype):
+        return SimpleNamespace(
+            is_cuda=True,
+            dtype=dtype,
+            ndim=len(shape),
+            shape=shape,
+            is_contiguous=lambda: True,
+            device=SimpleNamespace(index=0),
+        )
+
+    def test_sampling_softmax_uses_cake_for_qualified_sm100_inputs(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        logits = self._logits((1, 131072), torch.float32)
+        cake_result = object()
+        fallback_result = object()
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch.object(self.cake_sampling, "find_spec", return_value=object()),
+            patch.object(torch.version, "cuda", "13.0"),
+            patch.object(sampling_ops, "cake_softmax", return_value=cake_result),
+            patch.object(torch, "softmax", return_value=fallback_result) as fallback,
+        ):
+            result = sampling_ops.softmax(logits)
+
+        self.assertIs(result, cake_result)
+        fallback.assert_not_called()
+
+    def test_sampling_softmax_falls_back_outside_qualified_domain(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        for arch, shape in (
+            ((10, 2), (1, 131072)),
+            ((10, 0), (65, 131072)),
+        ):
+            with self.subTest(arch=arch, shape=shape):
+                self.cake_sampling._device_supported.cache_clear()
+                logits = self._logits(shape, torch.float32)
+                cake_result = object()
+                fallback_result = object()
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=arch),
+                    patch.object(
+                        self.cake_sampling, "find_spec", return_value=object()
+                    ),
+                    patch.object(torch.version, "cuda", "13.0"),
+                    patch.object(
+                        sampling_ops, "cake_softmax", return_value=cake_result
+                    ) as cake,
+                    patch.object(
+                        torch, "softmax", return_value=fallback_result
+                    ) as fallback,
+                ):
+                    result = sampling_ops.softmax(logits)
+
+                self.assertIs(result, fallback_result)
+                cake.assert_not_called()
+                fallback.assert_called_once_with(logits, dim=-1)
+
+    def test_sampling_softmax_registry_matches_supported_architectures(self):
+        spec = K.select_kernel("sampling.softmax", backend=KernelBackend.CAKE)
+        supported = ((10, 0), (10, 3))
+        unsupported = ((9, 0), (10, 1), (10, 2), (12, 0))
+
+        for arch in supported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertTrue(spec.is_available(platform), arch)
+        for arch in unsupported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertFalse(spec.is_available(platform), arch)
+        self.assertFalse(spec.is_available(_CPU))
+        self.assertFalse(spec.is_available(_HIP))
 
 
 @pytest.mark.parametrize(
@@ -216,6 +313,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.activation.softcap', "
         "'sglang.kernels.ops.attention.dllm_kv_pack', "
         "'sglang.kernels.ops.attention.flash_attention_v4', "
+        "'sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
         "'sglang.kernels.ops.speculative.row_argmax')) or any("
@@ -332,6 +430,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "attention.dsa.kpool_topk_transform",
         "attention.dsa.indexer_k",
         "attention.dsv4.wo_a",
+        "attention.dsv4.cute_sparse_mla_h16",
         "attention.helion.kda_replayssm",
         "attention.helion.kda_verify",
         "attention.minimax_sparse.common.index",
@@ -352,7 +451,6 @@ def test_reclassified_public_entry_points_are_inventoried():
         "gemm.sm120_fp8_gemv",
         "gemm.fp8_blockwise_gemm",
         "gemm.gptq_marlin",
-        "layernorm.rmsnorm_hf",
         "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
@@ -488,6 +586,20 @@ def test_registered_architecture_boundaries(op, sm, expected):
     )
     assert K.capabilities_satisfied(spec.capabilities, platform) is expected
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_native_h16_registry_is_sm90_only():
+    spec = K.select_kernel("attention.cute_sparse_mla_h16_fwd")
+    assert spec.backend is KernelBackend.CUTE_DSL
+    assert spec.is_available(_SM90)
+    for platform in (_CPU, _HIP, _MUSA, _SM100):
+        assert not spec.is_available(platform)
+    for major, minor in ((8, 9), (9, 1)):
+        assert not spec.is_available(
+            PlatformInfo(
+                device_type="cuda", cuda_arch_major=major, cuda_arch_minor=minor
+            )
+        )
 
 
 def test_convrot_int8_specs_match_wrapper_capabilities():

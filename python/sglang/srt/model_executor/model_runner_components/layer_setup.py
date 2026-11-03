@@ -184,6 +184,29 @@ def resolve_layer_indices(
     )
 
 
+def check_layer_types_hybrid_swa_split(*, model: nn.Module, model_config: ModelConfig):
+    """Fail if `layer_types` put a layer in the KV pool its attention does not use.
+
+    Only a split taken from `layer_types` alone is checked: the model code decides
+    each layer's window, and it may not read `layer_types`.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    swa_layer_ids = set(model_config.swa_attention_layer_ids)
+    misplaced = sorted(
+        module.layer_id
+        for module in model.modules()
+        if isinstance(module, RadixAttention)
+        and (module.layer_id in swa_layer_ids) != (module.sliding_window_size > 0)
+    )
+    if misplaced:
+        raise ValueError(
+            f"{model_config.hf_config.architectures[0]}: layer_types puts layers "
+            f"{misplaced} in the wrong KV pool for the attention the model builds. "
+            "Pass --disable-hybrid-swa-memory to serve it from a single KV pool."
+        )
+
+
 def _resolve_local_hybrid_swa_layer_ids(
     *,
     model_config: ModelConfig,
