@@ -7,7 +7,7 @@ import torch
 from sglang.srt.mem_cache.pool_host.mha import AsymmetricMHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 # These tests use AsymmetricMHATokenToKVPoolHost methods and let that class call
@@ -51,6 +51,7 @@ def make_host_pool(dtype, layout="page_first"):
     host.page_size = PAGE_SIZE
     host.page_num = TOTAL_ITEMS // PAGE_SIZE
     host.layer_num = NUM_LAYERS
+    host.target_layer_num = NUM_LAYERS
     host.head_num = HEAD_NUM
     host.head_dim = K_HEAD_DIM
     host.v_head_dim = V_HEAD_DIM

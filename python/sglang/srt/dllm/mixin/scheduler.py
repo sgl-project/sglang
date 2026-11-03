@@ -9,14 +9,15 @@ from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 
 class SchedulerDllmMixin:
@@ -173,7 +174,7 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
             release_kv_cache(
@@ -198,8 +199,7 @@ class SchedulerDllmMixin:
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv.kv_committed_len = context_len
-        req.kv.kv_allocated_len = context_len
+        req.kv.set_row_len(context_len)
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
         self.stash_chunked_request(req)
@@ -330,7 +330,6 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_inflight_middle_chunks()
 
     def _create_dllm_batch(
         self: Scheduler,
@@ -376,7 +375,10 @@ class SchedulerDllmMixin:
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, num_held_rows=num_held_rows
+            ):
                 running_batch.batch_is_full = True
 
             # Try preemption if batch is full
@@ -469,11 +471,6 @@ class DllmManager:
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
-
-    def increment_inflight_middle_chunks(self) -> None:
-        """Increment chunked count for all staging requests."""
-        for req in self.staging_queue:
-            req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

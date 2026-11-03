@@ -126,6 +126,7 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
                 layer_id=layer_id,
                 custom_routing_function=self._custom_routing_function,
             )
+            self.mlp.topk.bind_runner_backend(self.mlp.experts.runner_backend)
 
     @staticmethod
     @functools.lru_cache
