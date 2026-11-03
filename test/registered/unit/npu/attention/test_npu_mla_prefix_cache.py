@@ -6,6 +6,7 @@ NPU: run the same command with SGLANG_TEST_NPU=1 in an Ascend environment.
 
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -25,7 +26,9 @@ if os.environ.get("SGLANG_TEST_NPU") == "1":
 
 
 class TestNpuMlaPrefixCache(unittest.TestCase):
-    def check_gather(self, lengths, page_size, head_dim, dtype, device, is_nz):
+    def check_gather(
+        self, lengths, page_size, head_dim, dtype, device, is_nz, *, compact=True
+    ):
         counts = [(length + page_size - 1) // page_size for length in lengths]
         total_pages = sum(counts)
         # Repeat a shared block and visit physical pages out of order.
@@ -53,18 +56,42 @@ class TestNpuMlaPrefixCache(unittest.TestCase):
             storage = backing[..., ::2]
             storage.copy_(pages)
 
-        indices = build_mla_prefix_token_indices(
-            lengths, page_size, device=torch.device(device)
+        indices = (
+            build_mla_prefix_token_indices(
+                lengths, page_size, device=torch.device(device)
+            )
+            if compact
+            else None
         )
-        actual = gather_mla_cache_tokens(
-            storage.to(device),
-            torch.tensor(block_ids, device=device, dtype=torch.int32),
-            indices,
-            is_nz=is_nz,
-        )
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.mla_cache.torch.index_select",
+            wraps=torch.index_select,
+        ) as select:
+            actual = gather_mla_cache_tokens(
+                storage.to(device),
+                torch.tensor(block_ids, device=device, dtype=torch.int32),
+                indices,
+                is_nz=is_nz,
+            )
+        expected_selects = 0 if sum(lengths) == 0 else 1 + int(compact)
+        self.assertEqual(select.call_count, expected_selects)
         self.assertEqual(actual.shape, (sum(lengths), 1, head_dim))
-        self.assertEqual(indices.dtype, torch.int64)
+        if indices is not None:
+            self.assertEqual(indices.dtype, torch.int64)
         torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+    def test_aligned_prefixes_skip_token_compaction(self):
+        for device in DEVICES:
+            for is_nz in (False, True):
+                for lengths, page, head_dim, dtype in (
+                    ([4, 8, 0], 4, 32, torch.float32),
+                    ([128, 0, 256], 128, 512, torch.bfloat16),
+                    ([0, 0], 4, 32, torch.float32),
+                ):
+                    with self.subTest(device=device, is_nz=is_nz, lengths=lengths):
+                        self.check_gather(
+                            lengths, page, head_dim, dtype, device, is_nz, compact=False
+                        )
 
     def test_partial_middle_page_and_shared_blocks(self):
         for device in DEVICES:

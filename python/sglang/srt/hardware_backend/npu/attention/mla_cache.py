@@ -50,7 +50,7 @@ def gather_mla_cache_pages(
 def gather_mla_cache_tokens(
     cache: torch.Tensor,
     block_ids: torch.Tensor,
-    token_indices: torch.Tensor,
+    token_indices: torch.Tensor | None,
     *,
     is_nz: bool,
 ) -> torch.Tensor:
@@ -58,8 +58,14 @@ def gather_mla_cache_tokens(
 
     Restore NZ token order before compacting. Truncating the concatenated
     pages would retain padding between requests and shift their boundaries.
+    Pass None when all request lengths are page-aligned to skip compaction.
     """
-    if token_indices.numel() == 0:
+    if block_ids.numel() == 0 or (
+        token_indices is not None and token_indices.numel() == 0
+    ):
         return cache.new_empty((0, 1, cache.shape[-1]))
     pages = gather_mla_cache_pages(cache, block_ids, is_nz=is_nz)
-    return torch.index_select(pages.flatten(0, 1), 0, token_indices)
+    tokens = pages.flatten(0, 1)
+    if token_indices is None:
+        return tokens
+    return torch.index_select(tokens, 0, token_indices)

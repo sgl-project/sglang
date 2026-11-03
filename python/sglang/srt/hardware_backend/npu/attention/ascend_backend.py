@@ -133,6 +133,7 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
+    # None means the local prefix pages are full and need no token compaction.
     prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
@@ -811,9 +812,12 @@ class AscendAttnBackend(AttentionBackend):
                     )
             # Indices address the pages stored by this rank. DCP reconstructs
             # the global prefix only after these local page tails are removed.
-            self.forward_metadata.prefix_token_indices = build_mla_prefix_token_indices(
-                seq_prefix_lens, self.page_size, device=self.device
-            )
+            if any(length % self.page_size for length in seq_prefix_lens):
+                self.forward_metadata.prefix_token_indices = (
+                    build_mla_prefix_token_indices(
+                        seq_prefix_lens, self.page_size, device=self.device
+                    )
+                )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.forward_metadata.swa_out_cache_loc = (

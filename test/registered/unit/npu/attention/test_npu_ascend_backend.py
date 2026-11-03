@@ -595,7 +595,13 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             out_cache_loc=None,
         )
         parallel = SimpleNamespace(attn_dcp_size=size, attn_dcp_rank=rank)
-        with patch(f"{module}.get_parallel", return_value=parallel):
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(
+                f"{module}.build_mla_prefix_token_indices",
+                wraps=sys.modules[module].build_mla_prefix_token_indices,
+            ) as build_indices,
+        ):
             backend.init_forward_metadata(batch)
         metadata = backend.forward_metadata
         self.assertEqual(metadata.prefix_lens.tolist(), lengths)
@@ -611,7 +617,14 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             local.append(values[(positions // page_size) % size == rank])
         expected_local = torch.cat(local)
         expected_full = torch.cat(full)
-        self.assertEqual(metadata.prefix_token_indices.numel(), expected_local.shape[0])
+        needs_compaction = any(len(values) % page_size for values in local)
+        if needs_compaction:
+            self.assertEqual(
+                metadata.prefix_token_indices.numel(), expected_local.shape[0]
+            )
+        else:
+            self.assertIsNone(metadata.prefix_token_indices)
+        self.assertEqual(build_indices.call_count, int(needs_compaction))
 
         blocks = metadata.flatten_prefix_block_tables.tolist()
         pages = torch.full((max(blocks, default=0) + 1, page_size, 1, 48), -999.0)
@@ -663,7 +676,13 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         self.assertEqual(collective.call_count, int(size > 1))
 
     def test_rank_local_compaction_and_global_prefix_contract(self):
-        for lengths, page in (([5, 3, 0], 4), ([0, 9, 2], 4), ([128, 255, 129], 128)):
+        for lengths, page in (
+            ([5, 3, 0], 4),
+            ([0, 9, 2], 4),
+            ([128, 255, 129], 128),
+            ([4, 8, 0], 4),
+            ([128, 256, 0], 128),
+        ):
             for size in (1, 2, 4):
                 for rank in range(size):
                     for is_nz in (False, True):
@@ -759,7 +778,6 @@ class TestMlaPrefixFia(unittest.TestCase):
         backend.forward_metadata = ForwardMetadata(
             extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
             prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
-            prefix_token_indices=torch.arange(prefix_tokens),
             flatten_prefix_block_tables=indices,
         )
         backend.token_to_kv_pool = SimpleNamespace(
