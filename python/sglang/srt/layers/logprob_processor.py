@@ -102,7 +102,15 @@ def get_top_logprobs_raw(
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
     no_copy_to_cpu: bool = False,
 ):
-    max_k = max(top_logprobs_nums)
+    vocab_size = logprobs.shape[-1]
+    max_k = max(min(k, vocab_size) for k in top_logprobs_nums)
+    if max_k <= 0:
+        top_logprobs_val = []
+        top_logprobs_idx = []
+        for k in top_logprobs_nums:
+            top_logprobs_val.append([])
+            top_logprobs_idx.append([])
+        return top_logprobs_val, top_logprobs_idx
     values, indices = logprobs.topk(max_k, dim=-1)
     if not no_copy_to_cpu:
         values = values.tolist()
@@ -113,8 +121,9 @@ def get_top_logprobs_raw(
 
     if stage == LogprobStage.DECODE:
         for i, k in enumerate(top_logprobs_nums):
-            top_logprobs_val.append(values[i][:k])
-            top_logprobs_idx.append(indices[i][:k])
+            clamped_k = min(k, vocab_size)
+            top_logprobs_val.append(values[i][:clamped_k])
+            top_logprobs_idx.append(indices[i][:clamped_k])
     else:
         pt = 0
         for k, pruned_len in zip(top_logprobs_nums, extend_logprob_pruned_lens_cpu):
@@ -123,8 +132,9 @@ def get_top_logprobs_raw(
                 top_logprobs_idx.append([])
                 continue
 
-            top_logprobs_val.append([values[pt + j][:k] for j in range(pruned_len)])
-            top_logprobs_idx.append([indices[pt + j][:k] for j in range(pruned_len)])
+            clamped_k = min(k, vocab_size)
+            top_logprobs_val.append([values[pt + j][:clamped_k] for j in range(pruned_len)])
+            top_logprobs_idx.append([indices[pt + j][:clamped_k] for j in range(pruned_len)])
             pt += pruned_len
 
     return top_logprobs_val, top_logprobs_idx
@@ -232,11 +242,43 @@ def get_top_logprobs_chunk(
         int: Number of remaining tokens to process in next chunk
     """
     # Empty chunks still walk the slice to emit placeholder entries.
-    max_k = max(top_k_nums)
+    vocab_size = logprobs.shape[-1]
+    max_k = max(min(k, vocab_size) for k in top_k_nums)
+    if max_k <= 0:
+        pt = 0
+        next_split_pruned_len = 0
+        for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
+            if n == 0:
+                pruned_len -= split_pruned_len
+            else:
+                split_pruned_len = 0
+            if pruned_len <= 0:
+                top_logprobs_val.append([])
+                top_logprobs_idx.append([])
+                continue
+            available_len = min(pruned_len, 0)
+            if available_len < pruned_len:
+                next_split_pruned_len = split_pruned_len + available_len
+            val = []
+            idx = []
+            if split_pruned_len > 0:
+                top_logprobs_val[-1].extend(val)
+                top_logprobs_idx[-1].extend(idx)
+            else:
+                top_logprobs_val.append(val)
+                top_logprobs_idx.append(idx)
+            pt += pruned_len
+        return next_split_pruned_len
     if log_normalizer is not None:
         row_max, row_log_sum = log_normalizer
         if precomputed_topk is not None:
             values_tensor, indices_tensor = precomputed_topk
+            precomputed_k = values_tensor.shape[-1]
+            if max_k < precomputed_k:
+                values_tensor = values_tensor[..., :max_k]
+                indices_tensor = indices_tensor[..., :max_k]
+            elif max_k > precomputed_k:
+                values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
         else:
             values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
         values_tensor = (values_tensor.float() - row_max[:, None]) - row_log_sum[
@@ -276,13 +318,14 @@ def get_top_logprobs_chunk(
             next_split_pruned_len = split_pruned_len + available_len
 
         # Get the top-k logprobs
+        clamped_k = min(k, vocab_size)
         if copy_to_pinned_cpu:
             # Keep one span per sequence to avoid per-row tensor slicing.
-            val = [values[pt : pt + available_len, :k]] if available_len else []
-            idx = [indices[pt : pt + available_len, :k]] if available_len else []
+            val = [values[pt : pt + available_len, :clamped_k]] if available_len else []
+            idx = [indices[pt : pt + available_len, :clamped_k]] if available_len else []
         else:
-            val = [values[pt + j][:k] for j in range(available_len)]
-            idx = [indices[pt + j][:k] for j in range(available_len)]
+            val = [values[pt + j][:clamped_k] for j in range(available_len)]
+            idx = [indices[pt + j][:clamped_k] for j in range(available_len)]
 
         # Append or extend based on whether the sequence was split across chunks
         # Split-sequence continuations extend; everyone else owns a fresh
@@ -712,7 +755,7 @@ class InputLogprobProcessor:
                     # is requested, the fused kernel produces the normalizer and
                     # the top-k in the same single read of the logits.
                     max_k = (
-                        max(logits_metadata.top_logprobs_nums[chunk_slice])
+                        max(min(k, chunk_logprobs.shape[-1]) for k in logits_metadata.top_logprobs_nums[chunk_slice])
                         if logits_metadata.extend_return_top_logprob
                         else 0
                     )

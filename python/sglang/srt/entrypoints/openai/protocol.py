@@ -453,6 +453,13 @@ class CompletionRequest(PDRoutingFields):
             raise ValueError("max_tokens must be positive")
         return v
 
+    @field_validator("logprobs")
+    @classmethod
+    def validate_logprobs(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("logprobs must be non-negative")
+        return v
+
 
 class SpecTokensDetails(BaseModel):
     """Per-request speculative decoding statistics."""
@@ -1104,6 +1111,13 @@ class ChatCompletionRequest(PDRoutingFields):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("top_logprobs must be non-negative")
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -2022,6 +2036,13 @@ class ResponsesRequest(PDRoutingFields):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def validate_top_logprobs(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("top_logprobs must be non-negative")
+        return v
 
     @model_validator(mode="before")
     @classmethod
