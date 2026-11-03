@@ -186,6 +186,26 @@ def get_sparse_kv_budget(
             if not graph.disable_cuda_graph and decode is not None and decode.bs
             else 0
         )
+    if use_fused_sparse_kv_offload():
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+            resolve_sparse_kv_budget as resolve_fused_budget,
+        )
+
+        return resolve_fused_budget(
+            request_rows=request_rows,
+            context_len=context_len,
+            num_layers=num_layers,
+            top_k=top_k,
+            kv_bytes_per_token=kv_bytes_per_token,
+            cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
+            hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
+            max_query_width=get_sparse_kv_max_query_width(),
+            copy_sfa_query_heads=copy_sfa_query_heads,
+            graph_batch_capacity=sparse_batch_capacity(
+                request_rows,
+                max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
+            ),
+        )
     return resolve_sparse_kv_budget(
         request_rows=request_rows,
         context_len=context_len,

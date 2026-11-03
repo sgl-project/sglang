@@ -21,6 +21,8 @@ def _lim_copy_sfa_metadata_kernel(
     num_cache_tokens_ptr,
     hbm_block_table_ptr,
     dram_block_table_ptr,
+    host_block_table_ptr,
+    seq_lens_ptr,
     B: tl.constexpr,
     K: tl.constexpr,
     Q: tl.constexpr,
@@ -31,6 +33,10 @@ def _lim_copy_sfa_metadata_kernel(
     DRAM_PAGES: tl.constexpr,
     B_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
+    PAGED_HOST: tl.constexpr,
+    HOST_COLS: tl.constexpr,
+    HOST_S0: tl.constexpr,
+    HOST_S1: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -41,7 +47,7 @@ def _lim_copy_sfa_metadata_kernel(
     is_sparse = tl.load(sparse_rows_ptr + row_id) != 0
     request_slot = tl.load(request_slots_ptr + row_id).to(tl.int32)
     active = is_valid & is_sparse
-    base_request = tl.where(active, request_slot, 0).to(tl.int32)
+    base_request = tl.where(is_valid, request_slot, 0).to(tl.int32)
 
     col = tile_id * BLOCK + tl.arange(0, BLOCK).to(tl.int32)
     if tile_id * BLOCK < K:
@@ -64,7 +70,15 @@ def _lim_copy_sfa_metadata_kernel(
 
     if tile_id * BLOCK < DRAM_PAGES:
         dram_base = row_id.to(tl.int64) * DRAM_PAGES
-        dram_values = base_request * DRAM_PAGES + col
+        if PAGED_HOST:
+            pages = tl.load(
+                host_block_table_ptr + row_id * HOST_S0 + col * HOST_S1,
+                mask=col < HOST_COLS,
+                other=0,
+            ).to(tl.int32)
+            dram_values = tl.where(is_valid, pages, 0)
+        else:
+            dram_values = base_request * DRAM_PAGES + col
         tl.store(
             dram_block_table_ptr + dram_base + col.to(tl.int64),
             dram_values,
@@ -76,9 +90,12 @@ def _lim_copy_sfa_metadata_kernel(
             tl.store(topk_misses_ptr + row_id * Q + route, 0, mask=~active)
         tl.store(miss_counts_ptr + row_id, 0, mask=~active)
         cache_length = tl.where(active, C, 0).to(tl.int32)
+        seq_len = tl.load(seq_lens_ptr + row_id)
+        sparse_length = C + Q - 1
+        logical_length = tl.where(is_sparse, sparse_length, seq_len)
         tl.store(
             actual_seq_lengths_kv_ptr + row_id,
-            tl.where(active, C + Q - 1, 0).to(tl.int32),
+            tl.where(is_valid, logical_length, 0).to(tl.int32),
         )
         tl.store(num_cache_tokens_ptr + row_id, cache_length)
         tl.store(
@@ -133,7 +150,9 @@ def fused_lim_copy_sfa_metadata(
     capacity: int,
     host_context_len: int,
     request_rows: int,
+    seq_lens: torch.Tensor,
     query_width: int = 1,
+    host_block_table: torch.Tensor | None = None,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -142,8 +161,8 @@ def fused_lim_copy_sfa_metadata(
     request rows are reset to -1 across all their query rows.
     The miss source/slot buffers and all KV payloads are deliberately untouched.
     """
-    if query_width not in (1, 4):
-        raise ValueError("query_width must be 1 or 4.")
+    if not 1 <= query_width <= 14:
+        raise ValueError("query_width must be in [1,14].")
     if not isinstance(capacity, int) or not 2048 <= capacity <= 32640:
         raise ValueError("capacity must be an integer in [2048, 32640].")
     if capacity % 128:
@@ -197,6 +216,13 @@ def fused_lim_copy_sfa_metadata(
         raise ValueError("all per-row metadata tensors must have shape [B].")
     if last_prefix.ndim != 1 or last_prefix.shape[0] != request_rows + 1:
         raise ValueError("last_prefix must have shape [request_rows + 1].")
+    if (
+        seq_lens.shape != (batch,)
+        or seq_lens.dtype != torch.int32
+        or seq_lens.device != source_ids.device
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError("Sequence lengths must be contiguous same-device int32[B].")
     if hbm_block_table.shape != (batch, capacity // 128):
         raise ValueError("hbm_block_table must have shape [B, capacity // 128].")
     if dram_block_table.shape != (batch, host_context_len // 128):
@@ -207,6 +233,16 @@ def fused_lim_copy_sfa_metadata(
     device = source_ids.device
     if device.type != "npu":
         raise ValueError("fused_lim_copy_sfa_metadata requires NPU tensors.")
+    if host_block_table is not None:
+        if (
+            host_block_table.dtype != torch.int32
+            or host_block_table.device != device
+            or host_block_table.ndim != 2
+            or host_block_table.shape[0] != batch
+            or host_block_table.shape[1] > dram_block_table.shape[1]
+            or any(s < 0 for s in host_block_table.stride())
+        ):
+            raise ValueError("host_block_table must be same-device int32 [B, pages].")
     int32_tensors = (
         source_ids,
         topk_misses,
@@ -254,6 +290,8 @@ def fused_lim_copy_sfa_metadata(
         num_cache_tokens,
         hbm_block_table,
         dram_block_table,
+        host_block_table if host_block_table is not None else dram_block_table,
+        seq_lens,
         batch,
         2048,
         query_width,
@@ -264,6 +302,10 @@ def fused_lim_copy_sfa_metadata(
         dram_pages,
         triton.next_power_of_2(batch),
         2048,
+        host_block_table is not None,
+        host_block_table.shape[1] if host_block_table is not None else 0,
+        host_block_table.stride(0) if host_block_table is not None else 0,
+        host_block_table.stride(1) if host_block_table is not None else 0,
     )
 
 

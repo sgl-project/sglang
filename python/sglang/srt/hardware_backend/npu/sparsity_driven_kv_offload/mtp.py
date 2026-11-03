@@ -5,6 +5,16 @@ from __future__ import annotations
 import torch
 
 
+def sparse_query_width(forward_batch):
+    """Read the actual chain width; decode always has one query per row."""
+    if forward_batch.forward_mode.is_decode():
+        return 1
+    width = getattr(forward_batch.spec_info, "num_tokens_per_req", None)
+    if not isinstance(width, int) or width <= 0:
+        raise ValueError("Sparse target verify requires its actual chain query width.")
+    return width
+
+
 def is_sparse_mtp_batch(forward_batch) -> bool:
     mode = forward_batch.forward_mode
     return (

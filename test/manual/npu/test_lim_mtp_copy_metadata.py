@@ -10,8 +10,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa
 )
 
 
-@pytest.mark.parametrize("width", [1, 4])
-def test_fused_copy_sfa_metadata_width_and_graph(width):
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5, 8, 14])
+@pytest.mark.parametrize("paged_host", [False, True])
+def test_fused_copy_sfa_metadata_width_and_graph(width, paged_host):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device = torch.device("npu", torch.npu.current_device())
@@ -31,6 +32,12 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
     cache = torch.empty_like(kv)
     hbm = torch.empty((batch, capacity // 128), dtype=torch.int32, device=device)
     dram = torch.empty((batch, context // 128), dtype=torch.int32, device=device)
+    host_pages = (
+        torch.arange(batch * (context // 128), dtype=torch.int32, device=device)
+        .view(batch, -1)
+        .flip(1)
+        .contiguous()
+    )
 
     def run():
         fused_lim_copy_sfa_metadata(
@@ -41,6 +48,7 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
             sparse_rows=sparse,
             request_slots=slots,
             next_prefix=prefix,
+            seq_lens=prefix,
             last_prefix=last,
             actual_seq_lengths_kv=kv,
             num_cache_tokens=cache,
@@ -50,12 +58,16 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
             host_context_len=context,
             request_rows=request_rows,
             query_width=width,
+            host_block_table=host_pages if paged_host else None,
         )
 
     def check(valid_cpu, sparse_cpu, slots_cpu):
         torch.npu.synchronize()
         active = [v and s for v, s in zip(valid_cpu, sparse_cpu)]
-        assert kv.cpu().tolist() == [capacity + width - 1 if a else 0 for a in active]
+        assert kv.cpu().tolist() == [
+            capacity + width - 1 if sp else (int(prefix[row].cpu()) if v else 0)
+            for row, (v, sp) in enumerate(zip(valid_cpu, sparse_cpu))
+        ]
         assert cache.cpu().tolist() == [capacity if a else 0 for a in active]
         assert topk.cpu().tolist() == [
             7 if a else 0 for a in active for _ in range(width)
@@ -69,14 +81,21 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
                 )
             else:
                 assert torch.all(source[indices] == -1)
-            hbm_start = slots_cpu[row] * (capacity // 128) if active[row] else 0
-            dram_start = slots_cpu[row] * (context // 128) if active[row] else 0
+            hbm_start = slots_cpu[row] * (capacity // 128) if valid_cpu[row] else 0
+            dram_start = slots_cpu[row] * (context // 128) if valid_cpu[row] else 0
             assert hbm[row].cpu().tolist() == list(
                 range(hbm_start, hbm_start + capacity // 128)
             )
-            assert dram[row].cpu().tolist() == list(
-                range(dram_start, dram_start + context // 128)
+            expected_dram = (
+                (
+                    host_pages[row].cpu().tolist()
+                    if valid_cpu[row]
+                    else [0] * (context // 128)
+                )
+                if paged_host
+                else list(range(dram_start, dram_start + context // 128))
             )
+            assert dram[row].cpu().tolist() == expected_dram
 
     run()
     check([True, True, False], [True, False, False], [1, 2, request_rows])
