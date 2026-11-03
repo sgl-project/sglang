@@ -19,6 +19,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_with_halo,
 )
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import empty_gpu_cache
@@ -64,6 +65,62 @@ def causal_conv1d_ref(
             final_states_out = final_states
     out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
     return (out, None) if not return_final_states else (out, final_states_out)
+
+
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("lengths", [(0,), (1,), (2, 7, 0, 17), (2048,)])
+@pytest.mark.parametrize("projection_padding", [0, 64])
+def test_causal_conv1d_read_only_halo(width, lengths, projection_padding):
+    device = get_device()
+    channels = 256
+    dtype = torch.bfloat16
+    total = sum(lengths)
+    projection = torch.randn(
+        total + width - 1 + 8,
+        channels + projection_padding,
+        device=device,
+        dtype=dtype,
+    )
+    x = projection[width - 1 : width - 1 + total, :channels].T
+    if len(lengths) == 1:
+        halo = projection[: width - 1, :channels].T.unsqueeze(0)
+    else:
+        halo = torch.randn(
+            len(lengths), width - 1, channels, device=device, dtype=dtype
+        ).transpose(1, 2)
+    original_projection, original_halo = projection.clone(), halo.clone()
+    weight = torch.randn(channels, width, device=device, dtype=dtype)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+    initial = torch.ones(len(lengths), device=device, dtype=torch.bool)
+    metadata = dict(
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=list(lengths),
+        has_initial_state=initial,
+    )
+    reference_state = halo.clone()
+    expected = causal_conv1d_fn(
+        x, weight, None, conv_states=reference_state, **metadata
+    )
+    actual = causal_conv1d_with_halo(x, halo, weight, **metadata)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(projection, original_projection, rtol=0, atol=0)
+    torch.testing.assert_close(halo, original_halo, rtol=0, atol=0)
+    if total:
+        # The boundary and interior launches share the same valid-token output.
+        blocks = (max(lengths) + 7) // 8
+        split = torch.empty_like(actual)
+        causal_conv1d_with_halo(
+            x, halo, weight, out=split, token_block_range=(1, blocks), **metadata
+        )
+        causal_conv1d_with_halo(
+            x, halo, weight, out=split, token_block_range=(0, 1), **metadata
+        )
+        torch.testing.assert_close(split, expected, rtol=0, atol=0)
+        torch.testing.assert_close(halo, original_halo, rtol=0, atol=0)
 
 
 def causal_conv1d_update_ref(

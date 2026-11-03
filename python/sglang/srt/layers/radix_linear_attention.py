@@ -92,6 +92,7 @@ class RadixLinearAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        return_cp_output: bool = False,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if (
@@ -154,6 +155,7 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            return_cp_output=return_cp_output,
         )
 
     @eager_on_graph
