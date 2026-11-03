@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -83,8 +84,10 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         cache_controller = MagicMock()
         cache = MagicMock(page_size=4)
         kvcache = MagicMock()
-        kvcache.index_k_pool = object()
-        kvcache.main_pool.layer_num = 8
+        kvcache.get_device_pool_infos.return_value = (
+            SimpleNamespace(pool_name=PoolName.KV),
+            SimpleNamespace(pool_name=PoolName.INDEXER),
+        )
         params = MagicMock()
         params.tp_cache_group = None
         params.pp_rank = 0
@@ -137,6 +140,10 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         for cls in (SWAKVPool, DeepSeekV4TokenToKVPool):
             kvcache = _mock_kvcache(cls)
             kvcache.swa_kv_pool = MagicMock()
+            # A paged window KV keeps DeepSeek-V4 off the FULL-only stack.
+            kvcache.get_device_pool_infos.return_value = (
+                SimpleNamespace(pool_name=PoolName.SWA),
+            )
             with self.assertRaises(AssertionError) as cm:
                 _select_strategy(kvcache, {FULL})
             self.assertIn("No matching HiCache strategy", str(cm.exception))

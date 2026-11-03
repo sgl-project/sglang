@@ -264,6 +264,11 @@ class SWAKVPool(BaseSWAKVPool):
                 )
         return tuple(infos)
 
+    def device_pools_by_name(self) -> Dict[PoolName, Optional[KVCache]]:
+        pools = self.full_kv_pool.device_pools_by_name()
+        pools[PoolName.SWA] = self.swa_kv_pool
+        return pools
+
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
             self.full_kv_pool.get_contiguous_buf_infos()

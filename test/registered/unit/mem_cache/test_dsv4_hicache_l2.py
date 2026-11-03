@@ -322,6 +322,11 @@ class TestDSV4PoolAssembly(CustomTestCase):
             swa_page_size=256,
             c4_kv_pool=c4_pool,
             c4_indexer_kv_pool=indexer_pool,
+            device_pools_by_name=lambda: {
+                PoolName.DEEPSEEK_V4_C4: c4_pool,
+                PoolName.DEEPSEEK_V4_C4_INDEXER: indexer_pool,
+                PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE: indexer_pool,
+            },
             start_layer=5,
             stage_layer_ids=(5,),
             get_device_pool_infos=lambda: tuple(

@@ -107,6 +107,23 @@ class TestMiniMaxSparseHiCacheIntegration(CustomTestCase):
                     buffer[4, 0, 0] = -1
                     self.assertEqual(pages[1, 0, 0, 0].item(), -1)
 
+    def test_device_infos_bind_sparse_kv_and_k_only_index(self):
+        """The wrapper reports main KV and K-only index, each bound to its pool."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        pool = _make_cpu_minimax_sparse_pool()
+        kv, index = pool.get_device_pool_infos()
+        self.assertEqual(
+            (kv.pool_name, index.pool_name), (PoolName.KV, PoolName.INDEXER)
+        )
+        self.assertEqual(
+            pool.device_pools_by_name(),
+            {PoolName.KV: pool.main_pool, PoolName.INDEXER: pool.index_k_pool},
+        )
+        for info, sub_pool in ((kv, pool.main_pool), (index, pool.index_k_pool)):
+            (own,) = sub_pool.get_device_pool_infos()
+            self.assertEqual(info.layer_ids, own.layer_ids)
+
     def test_index_k_waits_for_full_local_layer(self):
         pool = _make_cpu_minimax_sparse_pool()
         counter = _FakeLayerTransferCounter()

@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
+    from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
 logger = logging.getLogger(__name__)
@@ -1916,6 +1917,14 @@ class KVCache(abc.ABC):
         Consumers must not use exceptions or empty descriptions to pick a path.
         """
         raise NotImplementedError(f"{type(self).__name__} has no device pool provider")
+
+    def device_pools_by_name(self) -> Dict[PoolName, Optional[KVCache]]:
+        """The device pool each described buffer's transfers and allocation bind to.
+
+        Infos stay plain buffer facts, so the binding is reported separately.
+        A region that only its host pool moves binds to None.
+        """
+        return {info.pool_name: self for info in self.get_device_pool_infos()}
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -6011,6 +6020,19 @@ class MiniMaxSparseKVPool(KVCache):
         self.store_dtype = self.main_pool.store_dtype
         self.layer_transfer_counter = None
         self._enable_hisparse = enable_hisparse
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Sparse-layer KV and its K-only index; dense layers stay device-only."""
+        infos = self.main_pool.get_device_pool_infos()
+        if self.index_k_pool is not None:
+            infos += self.index_k_pool.get_device_pool_infos()
+        return infos
+
+    def device_pools_by_name(self) -> Dict[PoolName, Optional[KVCache]]:
+        pools = self.main_pool.device_pools_by_name()
+        if self.index_k_pool is not None:
+            pools |= self.index_k_pool.device_pools_by_name()
+        return pools
 
     def register_mapping(self, mapping: torch.Tensor) -> None:
         assert self._enable_hisparse
