@@ -435,7 +435,7 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
 
-        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
+        # In multi-tokenizer mode the N tokenizer worker processes cannot each
         # bind the zmq PULL socket used for load snapshots, so the single
         # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
         # read SHM only. Drain it event-driven via the socket's fd instead of
@@ -464,7 +464,7 @@ class MultiTokenizerRouter:
         """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
 
         zmq exposes an edge-triggered fd; ``poll()`` drains it until empty, which
-        also re-arms the fd, so TokenizerWorkers reading SHM stay up to date
+        also re-arms the fd, so tokenizer workers reading SHM stay up to date
         without any timer.
         """
         assert self.load_snapshot_reader is not None
