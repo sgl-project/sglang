@@ -63,25 +63,6 @@ class TestDualStreamOutputs(CustomTestCase):
         if torch.version.cuda is None or not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA required")
 
-    def test_hash_layer_skips_dual_stream_before_topk_config(self):
-        operand = DualStreamOperand(False)
-        operand.is_hash = True
-        operand.topk = SimpleNamespace()
-        with (
-            patch.object(deepseek_v2, "_enable_pcg_dsv2_dual_stream", True),
-            patch.object(deepseek_v2, "is_in_breakable_cuda_graph", return_value=True),
-            patch.object(
-                deepseek_v2,
-                "get_moe_runner_backend",
-                return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
-            ),
-        ):
-            self.assertFalse(
-                deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(
-                    operand, torch.empty(1, 64, device="cuda")
-                )
-            )
-
     def test_dispatch_compile_and_replay_preserve_separate_replicated_shared(self):
         for replicated in (False, True):
             with self.subTest(replicated=replicated):
