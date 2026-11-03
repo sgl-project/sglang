@@ -58,14 +58,14 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -570,6 +570,18 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            # A single request's media list holds all of its items; batch fields hold one entry per request.
+            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
+            for field_name in (
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_hashes",
+                "mm_content_hashes",
+            ):
+                value = getattr(self, field_name)
+                if isinstance(value, list) and value and not isinstance(value[0], list):
+                    setattr(self, field_name, [value])
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
