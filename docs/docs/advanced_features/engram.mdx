@@ -44,7 +44,8 @@ CUDA FABRIC handles, checkpoint identity and a generation ID through a trusted
 control endpoint. The SGLang workers import read-only GPU mappings and run the
 existing `engram_gather` kernel against them. Lookup IDs and rows do not pass
 through the control endpoint. The current compatible provider protocol is in
-[vLLM #64082](https://github.com/vllm-project/vllm/pull/64082).
+[the vLLM VMM port](https://github.com/foraxe/vllm/tree/nyx/engram-vmm-port-6b3488cc),
+intended for [vLLM #64082](https://github.com/vllm-project/vllm/pull/64082).
 The complete four-GPU owner, P TP2, D TP2 and router launch recipe is in
 `examples/engram_shared/`, including a routed request.
 
@@ -74,6 +75,9 @@ the full process group so workers can detach in order. The importer uses
 FABRIC handles so it is designed
 for one NVLink/IMEX domain. Only same-host GB200 import and serving have been
 validated so far; a second host is required to qualify remote NVL72 reads.
+The VMM-only port on pinned main `99fd01047d67` passed a local P TP2+D TP2
+NIXL request and a full-model TP2 decode-graph run with two matching
+32-token outputs; both runs drained all owner leases normally.
 
 ## Choosing a configuration
 
