@@ -22,11 +22,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import pad_mm_tokens
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -39,12 +36,10 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     drop_folded_rows,
     folded_replay_rows,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
