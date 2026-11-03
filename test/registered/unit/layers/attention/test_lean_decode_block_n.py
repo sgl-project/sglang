@@ -69,7 +69,9 @@ class TestLeanDecodeBlockN(unittest.TestCase):
                 self.assertEqual(self._block_n(lds, head_dim), 16)
 
     def test_cuda_is_unchanged(self):
-        self.assertEqual(self._block_n(GFS1151_LDS, _STANDARD_HEAD_DIM, is_hip=False), 64)
+        self.assertEqual(
+            self._block_n(GFS1151_LDS, _STANDARD_HEAD_DIM, is_hip=False), 64
+        )
 
     def test_every_choice_fits_the_budget(self):
         for lds in (48 * 1024, GFS1151_LDS, 96 * 1024, MI300X_LDS):
