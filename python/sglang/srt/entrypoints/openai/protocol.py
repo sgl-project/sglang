@@ -1099,6 +1099,14 @@ class ChatCompletionRequest(PDRoutingFields):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
 
+    @field_validator("max_tokens", "max_completion_tokens", mode="before")
+    @classmethod
+    def validate_output_limit_type(cls, value, info):
+        # Lax int parsing would read a boolean as a 0- or 1-token limit.
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):

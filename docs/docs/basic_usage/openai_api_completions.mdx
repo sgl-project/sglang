@@ -355,7 +355,7 @@ Requests with invalid sampling parameters are rejected with HTTP 400 before gene
 | Parameter | Accepted values | Applies to |
 | --- | --- | --- |
 | `n` | Integer from 1 to 128 | Chat completions and completions |
-| `max_tokens`, `max_completion_tokens` | Integer greater than or equal to 0 | Chat completions |
+| `max_tokens`, `max_completion_tokens` | Integer greater than or equal to 0; booleans are rejected | Chat completions |
 | `temperature` | Finite number greater than or equal to 0 (negative, `inf` and `nan` are rejected) | Chat completions |
 | `top_logprobs` | Integer greater than or equal to 0; with `logprobs=true` it must also not exceed the vocabulary size | Chat completions |
 | `logit_bias` values | Finite numbers with a magnitude of at most `1e30` | Chat completions and completions |

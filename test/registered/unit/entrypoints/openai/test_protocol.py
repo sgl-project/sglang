@@ -573,12 +573,18 @@ class TestChatCompletionRequest(CustomTestCase):
             with self.subTest(field=field, value=value):
                 self._assert_rejected_field(field, **{field: value}, logprobs=True)
 
-    def test_negative_output_limits_are_rejected(self):
-        """A preferred completion limit previously hid a negative legacy limit."""
+    def test_invalid_output_limits_are_rejected(self):
+        """Invalid limits must not be hidden by precedence or coerced from booleans."""
         for params, field in (
             ({"max_tokens": -1}, "max_tokens"),
             ({"max_completion_tokens": -1}, "max_completion_tokens"),
             ({"max_tokens": -1, "max_completion_tokens": 1}, "max_tokens"),
+            ({"max_tokens": False}, "max_tokens"),
+            ({"max_tokens": True}, "max_tokens"),
+            (
+                {"max_tokens": 5, "max_completion_tokens": False},
+                "max_completion_tokens",
+            ),
         ):
             with self.subTest(params=params):
                 self._assert_rejected_field(field, **params)
