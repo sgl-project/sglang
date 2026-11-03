@@ -64,6 +64,10 @@ class RequestList(ABC):
         self.leave(taken)
         return taken
 
+    def clear(self) -> None:
+        """Drop every request."""
+        self.leave(list(self))
+
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
@@ -94,6 +98,9 @@ class _RequestList(RequestList):
 
     def leave_finished(self) -> None:
         self._drop({req for req in self._reqs if req.finished()})
+
+    def clear(self) -> None:
+        self._reqs = {}
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:

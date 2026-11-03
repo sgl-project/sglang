@@ -586,7 +586,7 @@ class PrefillBootstrapQueue:
         return bootstrapped_reqs
 
     def release_memory_occupation(self):
-        self.queue.leave(list(self.queue))
+        self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 

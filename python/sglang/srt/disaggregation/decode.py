@@ -1025,8 +1025,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
-        held = list(self.held_rebootstrap_reqs)
-        self.held_rebootstrap_reqs.leave(held)
+        held = self.held_rebootstrap_reqs.take(lambda req: True)
         for req in held:
             self.add(req, is_rebootstrap=True)
 
@@ -1112,7 +1111,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
-        self.retracted_queue.leave(list(self.retracted_queue))
+        self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
