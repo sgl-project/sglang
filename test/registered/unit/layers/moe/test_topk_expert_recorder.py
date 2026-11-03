@@ -1,5 +1,6 @@
-import unittest
 """Keep TRT-LLM routing observable when expert recording is enabled."""
+
+import unittest
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
